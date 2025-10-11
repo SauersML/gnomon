@@ -28,7 +28,7 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str;
 use std::sync::{Arc, Mutex};
 
@@ -73,8 +73,6 @@ pub fn open_virtual_plink19_from_paths(
         pgen,
         &mut *pvar_for_plan,
         &mut *psam_for_plan,
-        Some(pvar_path.to_path_buf()),
-        Some(psam_path.to_path_buf()),
     )
 }
 
@@ -84,44 +82,57 @@ pub fn open_virtual_plink19_from_sources(
     pgen: Arc<dyn ByteRangeSource>,
     pvar_for_plan: &mut dyn TextSource,
     psam_for_plan: &mut dyn TextSource,
-    pvar_path_hint: Option<PathBuf>,
-    psam_path_hint: Option<PathBuf>,
 ) -> Result<VirtualPlink19, PipelineError> {
-    // 1) Parse .psam header + count rows → sample count N and column mapping.
+    let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
-
-    // 2) Build VariantPlan by scanning .pvar once (always split multiallelic).
     let plan = VariantPlan::from_pvar(pvar_for_plan)?;
 
-    // 3) Construct PGEN decoder (pure-Rust subset; extend as needed).
-    let pgen_decoder = PgenDecoder::new(pgen.clone(), psam_info.n_samples, plan.in_variants)?;
+    if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
+        return Err(PipelineError::Io(format!(
+            "Variant count mismatch: .pgen header has {}, .pvar expands to {}",
+            header.m_variants, plan.in_variants
+        )));
+    }
 
-    let sex_by_sample_arc: Arc<[u8]> = Arc::from(
-        psam_info
-            .sex_by_sample
-            .clone()
-            .into_boxed_slice(),
-    );
+    if header.n_samples != 0 && header.n_samples as usize != psam_info.n_samples {
+        return Err(PipelineError::Io(format!(
+            "Sample-count mismatch: .pgen header has {}, .psam has {}",
+            header.n_samples, psam_info.n_samples
+        )));
+    }
 
-    // 4) Publish virtual streams
-    let bed = Arc::new(VirtualBed::new(
-        pgen_decoder,
-        plan.clone(),
-        psam_info.n_samples,
-        sex_by_sample_arc,
-    ));
+    let bim_lines = plan.bim_lines().to_vec();
+    let fam_rows = psam_info.fam_rows.clone();
 
-    // Re-open the text sidecars for streaming transforms (we consumed the planning pass).
-    let bim: Box<dyn TextSource> = match pvar_path_hint {
-        Some(path) => Box::new(VirtualBim::from_path(path)?),
-        None => return Err(PipelineError::Io("VirtualBIM requires a .pvar path".into())),
+    let bed_source: Arc<dyn ByteRangeSource> = match header.mode {
+        PgenMode::Bed => {
+            if plan.out_variants != plan.in_variants {
+                return Err(PipelineError::Io(
+                    "Cannot split multiallelic variants when .pgen mode is 0x01 (embedded .bed)".into(),
+                ));
+            }
+            pgen.clone()
+        }
+        _ => {
+            let decoder = PgenDecoder::new(pgen.clone(), header, psam_info.n_samples, plan.in_variants)?;
+            let sex_by_sample_arc: Arc<[u8]> = Arc::from(
+                psam_info
+                    .sex_by_sample
+                    .clone()
+                    .into_boxed_slice(),
+            );
+            Arc::new(VirtualBed::new(decoder, plan.clone(), psam_info.n_samples, sex_by_sample_arc)?)
+        }
     };
-    let fam: Box<dyn TextSource> = match psam_path_hint {
-        Some(path) => Box::new(VirtualFam::from_path(path)?),
-        None => return Err(PipelineError::Io("VirtualFAM requires a .psam path".into())),
-    };
 
-    Ok(VirtualPlink19 { bed, bim, fam })
+    let bim: Box<dyn TextSource> = Box::new(VirtualBim::from_lines(bim_lines));
+    let fam: Box<dyn TextSource> = Box::new(VirtualFam::from_rows(fam_rows));
+
+    Ok(VirtualPlink19 {
+        bed: bed_source,
+        bim,
+        fam,
+    })
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -133,6 +144,7 @@ struct PsamInfo {
     n_samples: usize,
     columns: PsamColumns,
     sex_by_sample: Vec<u8>,
+    fam_rows: Vec<FamRow>,
 }
 
 #[derive(Clone, Default)]
@@ -144,25 +156,44 @@ struct PsamColumns {
     sex_idx: Option<usize>,
     pheno_idx: Option<usize>,
     pheno1_idx: Option<usize>,
+    sid_idx: Option<usize>,
+}
+
+#[derive(Clone, Default)]
+struct FamRow {
+    fid: String,
+    iid: String,
+    pat: String,
+    mat: String,
+    sex: String,
+    phe: String,
+}
+
+impl FamRow {
+    fn as_line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            self.fid, self.iid, self.pat, self.mat, self.sex, self.phe
+        )
+    }
 }
 
 impl PsamInfo {
     fn from_psam(source: &mut dyn TextSource) -> Result<Self, PipelineError> {
-        // `.psam` may have multiple header lines; only the final header line
-        // begins with `#FID` or `#IID`. We track the last header encountered and
-        // parse rows as we stream them to capture per-sample sex information.
-        let mut header: Option<Vec<String>> = None;
-        let mut cols_cache: Option<PsamColumns> = None;
+        let mut header_tokens: Option<Vec<String>> = None;
+        let mut columns: Option<PsamColumns> = None;
         let mut sex_by_sample: Vec<u8> = Vec::new();
+        let mut fam_rows: Vec<FamRow> = Vec::new();
 
         while let Some(line) = source.next_line()? {
             let s = str::from_utf8(line)
                 .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam: {e}")))?;
+
             if s.starts_with('#') {
                 let cols = s.trim_start_matches('#').trim();
-                if !cols.is_empty() {
-                    header = Some(cols.split_whitespace().map(|t| t.to_string()).collect());
-                    cols_cache = None; // reset; only the final header counts
+                if !cols.is_empty() && !cols.starts_with('#') {
+                    header_tokens = Some(cols.split_whitespace().map(|t| t.to_string()).collect());
+                    columns = None; // the last header wins
                 }
                 continue;
             }
@@ -172,34 +203,38 @@ impl PsamInfo {
                 continue;
             }
 
-            let header_vec = header
-                .as_ref()
-                .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
-            if cols_cache.is_none() {
-                cols_cache = Some(PsamColumns::from_header(header_vec)?);
-            }
-            let cols = cols_cache.as_ref().unwrap();
             let fields: Vec<&str> = trimmed.split_whitespace().collect();
-            let sex_code = cols
-                .sex_idx
-                .and_then(|idx| fields.get(idx).copied())
-                .map(parse_sex_token)
-                .unwrap_or(0);
+            if fields.is_empty() {
+                continue;
+            }
+
+            if columns.is_none() {
+                columns = match header_tokens.as_ref() {
+                    Some(tokens) => PsamColumns::from_header(tokens),
+                    None => PsamColumns::from_headerless(fields.len()),
+                }?;
+            }
+
+            let cols = columns.as_ref().unwrap();
+            let fam_row = FamRow::from_fields(&fields, cols);
+            let sex_code = parse_sex_token(&fam_row.sex);
             sex_by_sample.push(sex_code);
+            fam_rows.push(fam_row);
         }
 
-        let header_vec = header
-            .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
-        let columns = if let Some(cached) = cols_cache {
-            cached
+        let columns = if let Some(cols) = columns {
+            cols
         } else {
-            PsamColumns::from_header(&header_vec)?
+            let tokens = header_tokens
+                .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
+            PsamColumns::from_header(&tokens)?
         };
 
         Ok(Self {
             n_samples: sex_by_sample.len(),
             columns,
             sex_by_sample,
+            fam_rows,
         })
     }
 }
@@ -219,7 +254,7 @@ impl PsamColumns {
     fn from_header(cols: &[String]) -> Result<Self, PipelineError> {
         let mut out = PsamColumns::default();
         for (i, c) in cols.iter().enumerate() {
-            match c.as_str() {
+            match c.to_ascii_uppercase().as_str() {
                 "FID" => out.fid_idx = Some(i),
                 "IID" => out.iid_idx = Some(i),
                 "PAT" => out.pat_idx = Some(i),
@@ -227,6 +262,7 @@ impl PsamColumns {
                 "SEX" => out.sex_idx = Some(i),
                 "PHENO" | "PHENOTYPE" => out.pheno_idx = Some(i),
                 "PHENO1" => out.pheno1_idx = Some(i),
+                "SID" => out.sid_idx = Some(i),
                 _ => {}
             }
         }
@@ -236,6 +272,62 @@ impl PsamColumns {
             ));
         }
         Ok(out)
+    }
+
+    fn from_headerless(field_count: usize) -> Result<Self, PipelineError> {
+        if field_count >= 6 {
+            Ok(PsamColumns {
+                fid_idx: Some(0),
+                iid_idx: Some(1),
+                pat_idx: Some(2),
+                mat_idx: Some(3),
+                sex_idx: Some(4),
+                pheno_idx: None,
+                pheno1_idx: Some(5),
+                sid_idx: None,
+            })
+        } else if field_count == 5 {
+            Ok(PsamColumns {
+                fid_idx: Some(0),
+                iid_idx: Some(1),
+                pat_idx: Some(2),
+                mat_idx: Some(3),
+                sex_idx: Some(4),
+                pheno_idx: None,
+                pheno1_idx: None,
+                sid_idx: None,
+            })
+        } else {
+            Err(PipelineError::Io(
+                "Headerless .psam requires 5 or 6 columns".to_string(),
+            ))
+        }
+    }
+}
+
+impl FamRow {
+    fn from_fields(fields: &[&str], cols: &PsamColumns) -> FamRow {
+        let default = |val: &str| val.to_string();
+        let get_opt = |idx: Option<usize>| idx.and_then(|i| fields.get(i)).map(|s| (*s).to_string());
+        let iid = get_opt(cols.iid_idx).or_else(|| get_opt(cols.fid_idx)).unwrap_or_else(|| "0".to_string());
+        let fid = get_opt(cols.fid_idx).unwrap_or_else(|| iid.clone());
+        let pat = get_opt(cols.pat_idx).unwrap_or_else(|| default("0"));
+        let mat = get_opt(cols.mat_idx).unwrap_or_else(|| default("0"));
+        let sex = get_opt(cols.sex_idx).unwrap_or_else(|| default("0"));
+        let phe = cols
+            .pheno1_idx
+            .and_then(|i| fields.get(i))
+            .or_else(|| cols.pheno_idx.and_then(|i| fields.get(i)))
+            .map(|s| (*s).to_string())
+            .unwrap_or_else(|| "-9".to_string());
+        FamRow {
+            fid,
+            iid,
+            pat,
+            mat,
+            sex,
+            phe,
+        }
     }
 }
 
@@ -263,6 +355,8 @@ struct VariantPlan {
     out_to_in: Vec<(u32, u16)>,
     /// Per-output variant haploidy behaviour.
     haploidy: Vec<HaploidyKind>,
+    /// BIM lines corresponding to each output variant.
+    bim_lines: Vec<BimLine>,
 }
 
 #[derive(Clone)]
@@ -273,12 +367,91 @@ struct VariantRangeEntry {
     out_end: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PvarCols {
+    chrom: usize,
+    id: usize,
+    pos: usize,
+    refa: usize,
+    alt: usize,
+}
+
+impl PvarCols {
+    fn from_header_line(line: &str) -> Result<Self, PipelineError> {
+        let body = line.trim_start_matches('#').trim();
+        let tokens: Vec<&str> = body.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Err(PipelineError::Io("Empty .pvar header line".to_string()));
+        }
+        Self::from_tokens(&tokens)
+    }
+
+    fn from_tokens(tokens: &[&str]) -> Result<Self, PipelineError> {
+        let mut chrom = None;
+        let mut id = None;
+        let mut pos = None;
+        let mut refa = None;
+        let mut alt = None;
+
+        for (i, token) in tokens.iter().enumerate() {
+            let upper = token.trim().trim_start_matches('#').to_ascii_uppercase();
+            match upper.as_str() {
+                "CHROM" => chrom = Some(i),
+                "ID" => id = Some(i),
+                "POS" | "BP" => pos = Some(i),
+                "REF" => refa = Some(i),
+                "ALT" => alt = Some(i),
+                _ => {}
+            }
+        }
+
+        let chrom = chrom.ok_or_else(|| PipelineError::Io(".pvar header missing CHROM".into()))?;
+        let id = id.ok_or_else(|| PipelineError::Io(".pvar header missing ID".into()))?;
+        let pos = pos.ok_or_else(|| PipelineError::Io(".pvar header missing POS".into()))?;
+        let refa = refa.ok_or_else(|| PipelineError::Io(".pvar header missing REF".into()))?;
+        let alt = alt.ok_or_else(|| PipelineError::Io(".pvar header missing ALT".into()))?;
+
+        Ok(PvarCols {
+            chrom,
+            id,
+            pos,
+            refa,
+            alt,
+        })
+    }
+
+    fn from_headerless(field_count: usize) -> Result<Self, PipelineError> {
+        if field_count >= 6 {
+            Ok(PvarCols {
+                chrom: 0,
+                id: 1,
+                pos: 3,
+                refa: 4,
+                alt: 5,
+            })
+        } else if field_count == 5 {
+            Ok(PvarCols {
+                chrom: 0,
+                id: 1,
+                pos: 2,
+                refa: 3,
+                alt: 4,
+            })
+        } else {
+            Err(PipelineError::Io(
+                "Headerless .pvar requires ≥5 columns".to_string(),
+            ))
+        }
+    }
+}
+
 impl VariantPlan {
     fn from_pvar(pvar: &mut dyn TextSource) -> Result<Self, PipelineError> {
         let mut out_to_in: Vec<(u32, u16)> = Vec::with_capacity(1 << 20);
         let mut haploidy: Vec<HaploidyKind> = Vec::with_capacity(1 << 20);
         let mut per_variant: Vec<VariantRangeEntry> = Vec::with_capacity(1 << 16);
-        let mut have_header = false;
+        let mut bim_lines: Vec<BimLine> = Vec::with_capacity(1 << 20);
+        let mut header_cols: Option<PvarCols> = None;
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
         let mut max_x_pos: u64 = 0;
@@ -290,40 +463,41 @@ impl VariantPlan {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.starts_with('#') {
-                let header_body = trimmed.trim_start_matches('#');
-                if header_body
-                    .split_whitespace()
-                    .next()
-                    .map(|t| t.eq_ignore_ascii_case("CHROM"))
-                    .unwrap_or(false)
-                {
-                    have_header = true;
-                }
+            if trimmed.starts_with("##") {
                 continue;
             }
-            if !have_header {
-                return Err(PipelineError::Io(
-                    "Missing .pvar header (#CHROM ... ALT)".to_string(),
-                ));
+            if trimmed.starts_with('#') {
+                header_cols = Some(PvarCols::from_header_line(trimmed)?);
+                continue;
             }
 
-            let mut fields = trimmed.split_whitespace();
-            let chrom_raw = fields
-                .next()
-                .ok_or_else(|| ioerr(".pvar missing #CHROM"))?;
-            let pos_raw = fields
-                .next()
-                .ok_or_else(|| ioerr(".pvar missing POS"))?;
-            let _ = fields
-                .next()
-                .ok_or_else(|| ioerr(".pvar missing ID"))?;
-            let _ = fields
-                .next()
-                .ok_or_else(|| ioerr(".pvar missing REF"))?;
-            let alt_raw = fields
-                .next()
-                .ok_or_else(|| ioerr(".pvar missing ALT"))?;
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            if fields.is_empty() {
+                continue;
+            }
+            let cols = if let Some(cols) = header_cols {
+                cols
+            } else {
+                let derived = PvarCols::from_headerless(fields.len())?;
+                header_cols = Some(derived);
+                derived
+            };
+
+            let chrom_raw = *fields
+                .get(cols.chrom)
+                .ok_or_else(|| ioerr(".pvar missing CHROM column"))?;
+            let pos_raw = *fields
+                .get(cols.pos)
+                .ok_or_else(|| ioerr(".pvar missing POS column"))?;
+            let id_raw = *fields
+                .get(cols.id)
+                .ok_or_else(|| ioerr(".pvar missing ID column"))?;
+            let ref_raw = *fields
+                .get(cols.refa)
+                .ok_or_else(|| ioerr(".pvar missing REF column"))?;
+            let alt_raw = *fields
+                .get(cols.alt)
+                .ok_or_else(|| ioerr(".pvar missing ALT column"))?;
 
             let chrom = normalize_chrom(chrom_raw);
             let pos = pos_raw
@@ -335,10 +509,23 @@ impl VariantPlan {
 
             let out_start = out_to_in.len();
             let mut alt_ord: u16 = 1;
-            for alt in alt_raw.split(',').map(|t| t.trim()).filter(|t| !t.is_empty() && *t != ".") {
+            let mut emitted = 0usize;
+            for alt in alt_raw.split(',') {
+                let alt = alt.trim();
+                if alt.is_empty() || alt == "." {
+                    continue;
+                }
                 out_to_in.push((in_idx, alt_ord));
-                haploidy.push(HaploidyKind::Diploid); // placeholder, patched later
+                haploidy.push(HaploidyKind::Diploid);
+                bim_lines.push(BimLine {
+                    chrom: chrom.clone(),
+                    pos,
+                    id: id_raw.to_string(),
+                    refa: ref_raw.to_string(),
+                    alt: alt.to_string(),
+                });
                 alt_ord += 1;
+                emitted += 1;
             }
             let out_end = out_to_in.len();
             per_variant.push(VariantRangeEntry {
@@ -350,6 +537,12 @@ impl VariantPlan {
 
             in_idx += 1;
             in_variants += 1;
+        }
+
+        if header_cols.is_none() {
+            return Err(PipelineError::Io(
+                "Missing .pvar header or inferable columns".to_string(),
+            ));
         }
 
         let build = infer_genome_build(max_x_pos);
@@ -367,6 +560,7 @@ impl VariantPlan {
             out_variants: out_to_in.len(),
             out_to_in,
             haploidy,
+            bim_lines,
         })
     }
 
@@ -376,8 +570,12 @@ impl VariantPlan {
     }
 
     #[inline]
-    fn haploidy(&self, out_idx: usize) -> Option<HaploidyKind> {
+    fn haploidy_of(&self, out_idx: usize) -> Option<HaploidyKind> {
         self.haploidy.get(out_idx).copied()
+    }
+
+    fn bim_lines(&self) -> &[BimLine] {
+        &self.bim_lines
     }
 }
 
@@ -449,125 +647,57 @@ fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKi
 // Virtual .bim (TextSource): split multiallelic, A1=ALT, A2=REF, cM=0, stable IDs
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#[derive(Clone)]
+struct BimLine {
+    chrom: String,
+    pos: u64,
+    id: String,
+    refa: String,
+    alt: String,
+}
+
+#[derive(Clone)]
 struct VirtualBim {
-    inner: Box<dyn TextSource>,
-    header_seen: bool,
-    // carry state for multi-ALT expansion of the current PVAR row
-    current_emitted: usize,
-    current_alts: Vec<String>,
-    current_fixed: (String, String, String, String), // (chr, pos, id, ref)
-    carry_buf: Option<Box<[u8]>>,                    // reused backing for returned &[]
+    lines: Vec<BimLine>,
+    next_idx: usize,
+    carry: Option<Box<[u8]>>,
 }
 
 impl VirtualBim {
-    fn from_path(path: PathBuf) -> Result<Self, PipelineError> {
-        let inner = open_text_source(&path)?;
-        Ok(Self::from_text(inner))
-    }
-
-    fn from_text(inner: Box<dyn TextSource>) -> Self {
+    fn from_lines(lines: Vec<BimLine>) -> Self {
         Self {
-            inner,
-            header_seen: false,
-            current_emitted: 0,
-            current_alts: Vec::new(),
-            current_fixed: (String::new(), String::new(), String::new(), String::new()),
-            carry_buf: None,
+            lines,
+            next_idx: 0,
+            carry: None,
         }
     }
 
-    /// Build the next BIM line from the carry state.
-    fn emit_split_line(&mut self) -> Option<&[u8]> {
-        if self.current_emitted >= self.current_alts.len() {
-            return None;
-        }
-        let alt = &self.current_alts[self.current_emitted];
-        self.current_emitted += 1;
-
-        let (ref chr, ref pos, ref id, ref refa) = self.current_fixed;
-        let id_out = if id != "." && !id.is_empty() {
-            format!("{id}__ALT={alt}")
+    fn format_line(entry: &BimLine) -> String {
+        let id_out = if entry.id != "." && !entry.id.is_empty() {
+            format!("{}__ALT={}", entry.id, entry.alt)
         } else {
-            format!("{chr}:{pos}:{refa}:{alt}")
+            format!("{}:{}:{}:{}", entry.chrom, entry.pos, entry.refa, entry.alt)
         };
-
-        // BIM columns: CHR  ID  cM  POS  A1  A2   (cM=0)
-        let line = format!("{chr}\t{id_out}\t0\t{pos}\t{alt}\t{refa}");
-        self.carry_buf = Some(line.into_bytes().into_boxed_slice());
-        self.carry_buf.as_deref()
+        format!(
+            "{}\t{}\t0\t{}\t{}\t{}",
+            entry.chrom, id_out, entry.pos, entry.alt, entry.refa
+        )
     }
 }
 
 impl TextSource for VirtualBim {
     fn len(&self) -> Option<u64> {
-        None // unknown for streaming transform
+        Some(self.lines.len() as u64)
     }
 
     fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
-        // If we still have ALT splits to emit for the current row, do it now.
-        if let Some(bytes) = self.emit_split_line() {
-            return Ok(Some(bytes));
+        if self.next_idx >= self.lines.len() {
+            return Ok(None);
         }
-
-        // Otherwise, consume lines until we find a data row and prime current_alts.
-        loop {
-            match self.inner.next_line()? {
-                None => return Ok(None),
-                Some(bytes) => {
-                    let s = str::from_utf8(bytes)
-                        .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .pvar: {e}")))?;
-                    if s.trim().starts_with('#') {
-                        self.header_seen = true;
-                        continue;
-                    }
-                    if !self.header_seen {
-                        return Err(ioerr("Missing .pvar header before data rows"));
-                    }
-                    if s.trim().is_empty() {
-                        continue;
-                    }
-                    let mut fields = s.split_whitespace();
-                    let chr = fields
-                        .next()
-                        .ok_or_else(|| ioerr(".pvar missing #CHROM"))?
-                        .trim();
-                    let chr = normalize_chrom(chr);
-                    let pos = fields
-                        .next()
-                        .ok_or_else(|| ioerr(".pvar missing POS"))?
-                        .trim()
-                        .to_string();
-                    let id = fields
-                        .next()
-                        .ok_or_else(|| ioerr(".pvar missing ID"))?
-                        .trim()
-                        .to_string();
-                    let refa = fields
-                        .next()
-                        .ok_or_else(|| ioerr(".pvar missing REF"))?
-                        .trim()
-                        .to_string();
-                    let alt = fields
-                        .next()
-                        .ok_or_else(|| ioerr(".pvar missing ALT"))?;
-
-                    self.current_alts.clear();
-                    for a in alt.split(',') {
-                        let a = a.trim();
-                        if !a.is_empty() && a != "." {
-                            self.current_alts.push(a.to_string());
-                        }
-                    }
-                    self.current_fixed = (chr, pos, id, refa);
-                    self.current_emitted = 0;
-
-                    if let Some(bytes) = self.emit_split_line() {
-                        return Ok(Some(bytes));
-                    }
-                    // Edge case: empty ALT list → skip quietly and continue loop
-                }
-            }
-        }
+        let line = Self::format_line(&self.lines[self.next_idx]);
+        self.next_idx += 1;
+        self.carry = Some(line.into_bytes().into_boxed_slice());
+        Ok(self.carry.as_deref())
     }
 }
 
@@ -576,117 +706,35 @@ impl TextSource for VirtualBim {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct VirtualFam {
-    inner: Box<dyn TextSource>,
-    header_cols: Option<Vec<String>>,
-    header_resolved: bool,
-    first_row_raw: Option<Box<[u8]>>,
-    pending_line: Option<Box<[u8]>>,
+    rows: Vec<FamRow>,
+    next_idx: usize,
+    carry: Option<Box<[u8]>>,
 }
 
 impl VirtualFam {
-    fn from_path(path: PathBuf) -> Result<Self, PipelineError> {
-        let inner = open_text_source(&path)?;
-        Ok(Self {
-            inner,
-            header_cols: None,
-            header_resolved: false,
-            first_row_raw: None,
-            pending_line: None,
-        })
-    }
-
-    fn ensure_header(&mut self) -> Result<(), PipelineError> {
-        if self.header_resolved {
-            return Ok(());
+    fn from_rows(rows: Vec<FamRow>) -> Self {
+        Self {
+            rows,
+            next_idx: 0,
+            carry: None,
         }
-        // Scan until the last header line (starting with '#') then stop on first data row.
-        let mut last_header: Option<Vec<String>> = None;
-        loop {
-            match self.inner.next_line()? {
-                None => break,
-                Some(bytes) => {
-                    let s = str::from_utf8(bytes)
-                        .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam: {e}")))?;
-                    if s.starts_with('#') {
-                        let cols = s.trim_start_matches('#').trim();
-                        if !cols.is_empty() {
-                            last_header =
-                                Some(cols.split_whitespace().map(|t| t.to_string()).collect());
-                        }
-                        continue;
-                    } else {
-                        // We've read the first data line; stash it so it's returned on the next call.
-                        self.header_cols = last_header;
-                        self.header_resolved = true;
-                        let carry = bytes.to_vec().into_boxed_slice();
-                        self.first_row_raw = Some(carry);
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        self.header_cols = last_header;
-        self.header_resolved = true;
-        Ok(())
     }
 }
 
 impl TextSource for VirtualFam {
     fn len(&self) -> Option<u64> {
-        None
+        Some(self.rows.len() as u64)
     }
 
     fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
-        self.pending_line = None;
-        self.ensure_header()?;
-        let cols = self
-            .header_cols
-            .clone()
-            .ok_or_else(|| ioerr("Missing .psam header"))?;
-        let idx = PsamColumns::from_header(&cols)?;
-
-        // If we stashed a first data row during header parsing, consume it now.
-        if let Some(raw) = self.first_row_raw.take() {
-            let vec = raw.into_vec();
-            let s = String::from_utf8(vec)
-                .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam row: {e}")))?;
-            let line = fam_map_line(&s, &idx)?;
-            self.pending_line = Some(line.into_bytes().into_boxed_slice());
-            return Ok(self.pending_line.as_deref());
+        if self.next_idx >= self.rows.len() {
+            return Ok(None);
         }
-
-        // Stream rows: map to FID IID PAT MAT SEX PHENO, with defaults.
-        match self.inner.next_line()? {
-            None => Ok(None),
-            Some(bytes) => {
-                let s = str::from_utf8(bytes)
-                    .map_err(|e| PipelineError::Io(format!("Invalid UTF-8 in .psam row: {e}")))?;
-                if s.starts_with('#') {
-                    // Ignore stray header-like lines interspersed (defensive).
-                    return self.next_line();
-                }
-                let line = fam_map_line(s, &idx)?;
-                self.pending_line = Some(line.into_bytes().into_boxed_slice());
-                Ok(self.pending_line.as_deref())
-            }
-        }
+        let line = self.rows[self.next_idx].as_line();
+        self.next_idx += 1;
+        self.carry = Some(line.into_bytes().into_boxed_slice());
+        Ok(self.carry.as_deref())
     }
-}
-
-fn fam_map_line(s: &str, idx: &PsamColumns) -> Result<String, PipelineError> {
-    let fields: Vec<&str> = s.split_whitespace().collect();
-    let get = |opt: Option<usize>| opt.and_then(|i| fields.get(i).copied());
-
-    let iid = get(idx.iid_idx).unwrap_or_else(|| get(idx.fid_idx).unwrap_or("0"));
-    let fid = get(idx.fid_idx).unwrap_or(iid);
-    let pat = get(idx.pat_idx).unwrap_or("0");
-    let mat = get(idx.mat_idx).unwrap_or("0");
-    let sex = get(idx.sex_idx).unwrap_or("0"); // 0=unknown, 1=male, 2=female
-    let phe = get(idx.pheno1_idx)
-        .or_else(|| get(idx.pheno_idx))
-        .unwrap_or("-9");
-
-    Ok(format!("{fid}\t{iid}\t{pat}\t{mat}\t{sex}\t{phe}"))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -714,17 +762,21 @@ impl VirtualBed {
         plan: VariantPlan,
         n_samples: usize,
         sex_by_sample: Arc<[u8]>,
-    ) -> Self {
+    ) -> Result<Self, PipelineError> {
+        if sex_by_sample.len() != n_samples {
+            return Err(PipelineError::Compute(
+                "SEX column count mismatch with sample count".into(),
+            ));
+        }
         let block_bytes = (n_samples + 3) / 4;
-        debug_assert_eq!(sex_by_sample.len(), n_samples);
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(decoder)),
             plan,
             n_samples,
             block_bytes,
             cache: Arc::new(Mutex::new(BlockCache::new(256))),
             sex_by_sample,
-        }
+        })
     }
 
     #[inline]
@@ -863,7 +915,7 @@ impl ByteRangeSource for VirtualBed {
                 let mut hard = vec![255u8; self.n_samples]; // 255 = missing
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard)?;
 
-                if let Some(kind) = self.plan.haploidy(out_idx) {
+                if let Some(kind) = self.plan.haploidy_of(out_idx) {
                     if !matches!(kind, HaploidyKind::Diploid) {
                         enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
                     }
@@ -970,235 +1022,365 @@ impl ByteRangeSource for LocalFileByteRangeSource {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// PGEN decoder (functional subset)
-// - Dense 2-bit hard-calls
-// - Dosage-only → hard-calls via ±0.10 rule
-// - Multiallelic projection by ALT ordinal
-//
-// NOTE: This implementation assumes per-variant records are addressable via
-// an offset table `rec_offsets`, which we build linearly at init if no index
-// is discoverable. For very large inputs, this is modest (8 bytes * variants).
+// PGEN decoder (spec-aligned subset)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Pure-Rust PGEN decoder (working subset).
-struct PgenDecoder {
-    src: Arc<dyn ByteRangeSource>,
-    n_samples: usize,
-    rec_offsets: Vec<u64>, // in-variant index → byte offset of the record
-    // Scratch buffers to avoid reallocation
-    g_buf: Vec<u8>,    // raw record bytes
-    hc_buf: Vec<u8>,   // per-sample hard-calls (0/1/2/255)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgenMode {
+    Bed = 0x01,
+    FixHard = 0x02,
+    FixDosage = 0x03,
+    FixPhDosage = 0x04,
+    Var = 0x10,
+    VarIgnorable = 0x11,
 }
 
-impl PgenDecoder {
-    fn new(src: Arc<dyn ByteRangeSource>, n_samples: usize, in_variants: usize) -> Result<Self, PipelineError> {
-        // In absence of a public PGEN index format here, we conservatively build a
-        // linear offset table by scanning the file once to discover record boundaries.
-        //
-        // We assume a simple, self-delimiting record format:
-        // [varlen u32 LE][payload bytes…] repeated per variant.
-        //
-        // This matches many containerized binary formats and is sufficient for a
-        // working subset. If your PGENs use an embedded index, replace this scan
-        // with proper index parsing and set rec_offsets from it.
-        let mut offsets = Vec::with_capacity(in_variants);
-        let mut cursor: u64 = 0;
+fn read_le_u32(src: &dyn ByteRangeSource, off: u64) -> Result<u32, PipelineError> {
+    let mut buf = [0u8; 4];
+    src.read_at(off, &mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
 
-        // Heuristic: first bytes form a header we must skip—probe a small fixed header.
-        // We assume a PGEN “magic” + small header, then records.
-        // If the very beginning looks like BED (0x6c 0x1b), we *cannot* decode as PGEN.
+fn read_le_u64(src: &dyn ByteRangeSource, off: u64) -> Result<u64, PipelineError> {
+    let mut buf = [0u8; 8];
+    src.read_at(off, &mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+#[derive(Debug, Clone)]
+struct PgenHeader {
+    mode: PgenMode,
+    m_variants: u32,
+    n_samples: u32,
+    fmt_byte: u8,
+    block_offsets: Vec<u64>,
+    rec_types: Vec<u8>,
+    rec_lens: Vec<u32>,
+}
+
+impl PgenHeader {
+    fn parse(src: &dyn ByteRangeSource) -> Result<Self, PipelineError> {
         let mut magic = [0u8; 3];
-        let read_len = magic.len().min(src.len() as usize);
-        if read_len < 3 {
+        if src.len() < 3 {
             return Err(PipelineError::Io("PGEN file too small".into()));
         }
         src.read_at(0, &mut magic)?;
-        if magic == [0x6c, 0x1b, 0x01] || magic == [0x6c, 0x1b, 0x00] {
-            return Err(PipelineError::Io(
-                "Input appears to be PLINK 1 .bed, not a PGEN with per-variant records".into(),
-            ));
+        if magic[0] != 0x6c || magic[1] != 0x1b {
+            return Err(PipelineError::Io("Not a PGEN (bad magic)".into()));
+        }
+        let mode = match magic[2] {
+            0x01 => PgenMode::Bed,
+            0x02 => PgenMode::FixHard,
+            0x03 => PgenMode::FixDosage,
+            0x04 => PgenMode::FixPhDosage,
+            0x10 => PgenMode::Var,
+            0x11 => PgenMode::VarIgnorable,
+            0x20 | 0x21 => {
+                return Err(PipelineError::Io(
+                    "PGEN external index modes (0x20/0x21) are not supported".into(),
+                ))
+            }
+            other => {
+                return Err(PipelineError::Io(format!(
+                    "Unsupported PGEN mode 0x{other:02x}"
+                )))
+            }
+        };
+
+        if mode == PgenMode::Bed {
+            return Ok(Self {
+                mode,
+                m_variants: 0,
+                n_samples: 0,
+                fmt_byte: 0,
+                block_offsets: Vec::new(),
+                rec_types: Vec::new(),
+                rec_lens: Vec::new(),
+            });
         }
 
-        // For this subset, assume a small fixed-size header of 64 bytes before records.
-        // (If fewer, we fall back to 16.)
-        let header_guess = if src.len() >= 64 { 64 } else { 16 } as u64;
-        cursor = header_guess;
+        let m_variants = read_le_u32(src, 3)?;
+        let n_samples = read_le_u32(src, 7)?;
 
-        // Linear scan to build offsets: read a u32 length, step by that many bytes, repeat.
-        // Stop when we collected `in_variants` records or ran out of file.
-        let mut len_buf = [0u8; 4];
-        for _ in 0..in_variants {
-            if cursor + 4 > src.len() {
-                break;
-            }
-            src.read_at(cursor, &mut len_buf)?;
-            let var_len = u32::from_le_bytes(len_buf) as u64;
-            let rec_start = cursor + 4;
-            if rec_start + var_len > src.len() {
-                break;
-            }
-            offsets.push(rec_start);
-            cursor = rec_start + var_len;
+        if matches!(mode, PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage) {
+            return Ok(Self {
+                mode,
+                m_variants,
+                n_samples,
+                fmt_byte: 0,
+                block_offsets: Vec::new(),
+                rec_types: Vec::new(),
+                rec_lens: Vec::new(),
+            });
         }
 
-        if offsets.is_empty() {
-            return Err(PipelineError::Io(
-                "Could not discover any PGEN variant records (unexpected layout)".into(),
-            ));
+        let fmt = {
+            let mut b = [0u8; 1];
+            src.read_at(11, &mut b)?;
+            b[0]
+        };
+        let blocks = ((m_variants as u64) + ((1u64 << 16) - 1)) >> 16;
+        let mut block_offsets = Vec::with_capacity(blocks as usize);
+        let mut off = 12u64;
+        for _ in 0..blocks {
+            block_offsets.push(read_le_u64(src, off)?);
+            off += 8;
+        }
+
+        let type_bits = if (fmt & 0x0f) <= 3 { 4 } else { 8 };
+        let len_bytes = match fmt & 0x07 {
+            0 | 4 => 1,
+            1 | 5 => 2,
+            2 | 6 => 3,
+            3 | 7 => 4,
+            _ => unreachable!(),
+        };
+
+        let mut rec_types = Vec::with_capacity(m_variants as usize);
+        if type_bits == 4 {
+            let n_bytes = ((m_variants as usize) + 1) / 2;
+            let mut buf = vec![0u8; n_bytes];
+            src.read_at(off, &mut buf)?;
+            off += n_bytes as u64;
+            for (i, &byte) in buf.iter().enumerate() {
+                rec_types.push(byte & 0x0f);
+                if (2 * i + 1) < m_variants as usize {
+                    rec_types.push((byte >> 4) & 0x0f);
+                }
+            }
+        } else {
+            let mut buf = vec![0u8; m_variants as usize];
+            src.read_at(off, &mut buf)?;
+            off += m_variants as u64;
+            rec_types.extend(buf);
+        }
+
+        let mut rec_lens = Vec::with_capacity(m_variants as usize);
+        let mut buf = vec![0u8; (m_variants as usize) * (len_bytes as usize)];
+        if !buf.is_empty() {
+            src.read_at(off, &mut buf)?;
+        }
+        for i in 0..(m_variants as usize) {
+            let start = i * (len_bytes as usize);
+            let len = match len_bytes {
+                1 => u32::from(buf[start]),
+                2 => u32::from_le_bytes([buf[start], buf[start + 1], 0, 0]),
+                3 => u32::from_le_bytes([buf[start], buf[start + 1], buf[start + 2], 0]),
+                4 => u32::from_le_bytes([
+                    buf[start],
+                    buf[start + 1],
+                    buf[start + 2],
+                    buf[start + 3],
+                ]),
+                _ => unreachable!(),
+            };
+            rec_lens.push(len);
+        }
+
+        Ok(Self {
+            mode,
+            m_variants,
+            n_samples,
+            fmt_byte: fmt,
+            block_offsets,
+            rec_types,
+            rec_lens,
+        })
+    }
+}
+
+struct PgenDecoder {
+    src: Arc<dyn ByteRangeSource>,
+    hdr: PgenHeader,
+    n: usize,
+    scratch: Vec<u8>,
+}
+
+impl PgenDecoder {
+    fn new(
+        src: Arc<dyn ByteRangeSource>,
+        hdr: PgenHeader,
+        n_samples_from_psam: usize,
+        in_variants: usize,
+    ) -> Result<Self, PipelineError> {
+        match hdr.mode {
+            PgenMode::Bed => {
+                return Err(PipelineError::Io(
+                    "PGEN mode 0x01 should be handled as passthrough BED".into(),
+                ))
+            }
+            PgenMode::FixDosage | PgenMode::FixPhDosage => {
+                return Err(PipelineError::Io(
+                    "Fixed-width dosage modes (0x03/0x04) do not carry hard-calls".into(),
+                ))
+            }
+            _ => {}
+        }
+
+        if hdr.m_variants as usize != in_variants {
+            return Err(PipelineError::Io(format!(
+                "Variant count mismatch: .pgen header {0} vs .pvar {1}",
+                hdr.m_variants, in_variants
+            )));
         }
 
         Ok(Self {
             src,
-            n_samples,
-            rec_offsets: offsets,
-            g_buf: Vec::new(),
-            hc_buf: vec![255u8; n_samples],
+            hdr,
+            n: n_samples_from_psam,
+            scratch: Vec::new(),
         })
     }
 
-    /// Decode variant `in_idx` for ALT ordinal `alt_ord` (1-based), and write
-    /// hard-calls into `dst` (len == N). Values:
-    ///   - 0 → homozygous for A2 (ALT absent; A1 dosage 0)
-    ///   - 1 → heterozygous (A1 dosage 1)
-    ///   - 2 → homozygous for A1 (ALT present twice; A1 dosage 2)
-    ///   - 255 → missing
-    ///
-    /// Working subset: record payload layout
-    ///   [flags u8]
-    ///      bit0: 1 = has hard-calls (dense 2-bit blocks) for each ALT
-    ///      bit1: 1 = has dosage (per-ALT, 1 byte per sample, scaled by 100)
-    ///   [k_alts u8]  (number of ALT alleles)
-    ///   If has hard-calls:
-    ///       Repeated k_alts times:
-    ///         Dense 2-bit array of N samples → ceil(N/4) bytes (A1 dosage codes: 00,10,11,01)
-    ///   If has dosage:
-    ///       Repeated k_alts times:
-    ///         N bytes of dosage scaled by 100 (e.g., 0..200; 255 = missing)
-    ///
-    /// This is a *subset* format that’s easy to produce upstream and sufficient for a
-    /// fully streaming façade. Extend to your exact PGEN layout if different.
+    fn record_offset_len(&self, idx: usize) -> Result<(u64, usize, u8), PipelineError> {
+        match self.hdr.mode {
+            PgenMode::FixHard => {
+                let rec_len = (self.n + 3) / 4;
+                let header_bytes = 12u64;
+                let off = header_bytes + (idx as u64) * (rec_len as u64);
+                Ok((off, rec_len, 0))
+            }
+            PgenMode::Var | PgenMode::VarIgnorable => {
+                let block_idx = idx >> 16;
+                let block_off = *self
+                    .hdr
+                    .block_offsets
+                    .get(block_idx)
+                    .ok_or_else(|| ioerr("PGEN block offset missing"))?;
+                let mut off = block_off;
+                let mut cursor = block_idx << 16;
+                while cursor < idx {
+                    let len = *self
+                        .hdr
+                        .rec_lens
+                        .get(cursor)
+                        .ok_or_else(|| ioerr("PGEN record length missing"))? as u64;
+                    off += len;
+                    cursor += 1;
+                }
+                let rec_len = *self
+                    .hdr
+                    .rec_lens
+                    .get(idx)
+                    .ok_or_else(|| ioerr("PGEN record length missing"))? as usize;
+                let rec_ty = *self
+                    .hdr
+                    .rec_types
+                    .get(idx)
+                    .ok_or_else(|| ioerr("PGEN record type missing"))?;
+                Ok((off, rec_len, rec_ty))
+            }
+            _ => Err(ioerr("Unsupported PGEN mode for offset lookup")),
+        }
+    }
+
     fn decode_variant_hardcalls(
         &mut self,
         in_idx: u32,
-        alt_ord: u16,
+        alt_ord_1b: u16,
         dst: &mut [u8],
     ) -> Result<(), PipelineError> {
-        if dst.len() != self.n_samples {
+        if dst.len() != self.n {
             return Err(PipelineError::Compute(
-                "Hardcall buffer length must equal N-samples".into(),
+                "Hardcall buffer length must equal sample count".into(),
             ));
         }
-        let in_idx = in_idx as usize;
-        if in_idx >= self.rec_offsets.len() {
+        let idx = in_idx as usize;
+        if idx >= self.hdr.m_variants as usize {
             return Err(PipelineError::Compute("Variant index out of bounds".into()));
         }
-        let rec_off = self.rec_offsets[in_idx];
 
-        // First read the record length from 4 bytes right before rec_off.
-        let mut len_buf = [0u8; 4];
-        let len_pos = rec_off - 4;
-        self.src.read_at(len_pos, &mut len_buf)?;
-        let var_len = u32::from_le_bytes(len_buf) as usize;
-
-        // Ensure g_buf big enough; fetch payload.
-        if self.g_buf.len() < var_len {
-            self.g_buf.resize(var_len, 0);
+        let (off, len, rec_ty) = self.record_offset_len(idx)?;
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
         }
-        self.src.read_at(rec_off, &mut self.g_buf[..var_len])?;
+        self.src.read_at(off, &mut self.scratch[..len])?;
 
-        let buf = &self.g_buf[..var_len];
-        if buf.len() < 2 {
-            return Err(PipelineError::Compute("PGEN record too short".into()));
-        }
-        let flags = buf[0];
-        let has_hc = (flags & 0b0000_0001) != 0;
-        let has_ds = (flags & 0b0000_0010) != 0;
-        let k_alts = buf[1] as usize;
-        if k_alts == 0 {
-            // No ALT → no emission; mark missing.
-            dst.fill(255);
-            return Ok(());
-        }
-        let alt_ix = (alt_ord as usize).saturating_sub(1);
-        if alt_ix >= k_alts {
-            dst.fill(255);
-            return Ok(());
-        }
-
-        // Cursor after flags + k_alts
-        let mut p = 2usize;
-        let n = self.n_samples;
-        let packed_len = (n + 3) / 4;
-
-        // Try hard-calls first.
-        if has_hc {
-            let needed = k_alts
-                .checked_mul(packed_len)
-                .ok_or_else(|| PipelineError::Compute("overflow sizing HC blocks".into()))?;
-            if p + needed > buf.len() {
-                return Err(PipelineError::Compute("PGEN HC block truncated".into()));
+        match self.hdr.mode {
+            PgenMode::FixHard => {
+                unpack_pgen2bit_to_a1dosage(&self.scratch[..len], dst, self.n);
+                project_alt_ordinal(dst, alt_ord_1b)?;
+                return Ok(());
             }
-            let start = p + alt_ix * packed_len;
-            let end = start + packed_len;
-            let block = &buf[start..end];
-            // Unpack into dst (A1-dosage 0/1/2/255)
-            unpack_2bit_block_to_hardcalls(block, dst, n);
-            return Ok(());
-        }
-        p += if has_hc { k_alts * packed_len } else { 0 };
-
-        // Fall back to dosage (1 byte per sample scaled by 100; 255=missing)
-        if has_ds {
-            // HC section absent, so dosage section starts at p
-            let needed = k_alts
-                .checked_mul(n)
-                .ok_or_else(|| PipelineError::Compute("overflow sizing DS blocks".into()))?;
-            if p + needed > buf.len() {
-                return Err(PipelineError::Compute("PGEN DS block truncated".into()));
+            PgenMode::Var | PgenMode::VarIgnorable => {
+                let main_kind = rec_ty & 0x07;
+                match main_kind {
+                    0 => {
+                        let need = (self.n + 3) / 4;
+                        if need > len {
+                            return Err(ioerr("PGEN type-0 record truncated"));
+                        }
+                        unpack_pgen2bit_to_a1dosage(&self.scratch[..need], dst, self.n);
+                        if alt_ord_1b > 1 {
+                            return Err(PipelineError::Io(
+                                "ALT ordinal >1 requires multiallelic patch decoding".into(),
+                            ));
+                        }
+                        if (rec_ty & 0b0000_1000) != 0 {
+                            return Err(PipelineError::Io(
+                                "Multiallelic patch present; decoder does not implement it".into(),
+                            ));
+                        }
+                        if (rec_ty & 0b0001_0000) != 0 {
+                            return Err(PipelineError::Io(
+                                "Hardcall phase present; not supported".into(),
+                            ));
+                        }
+                        if (rec_ty & 0b0110_0000) != 0 {
+                            return Err(PipelineError::Io(
+                                "Dosage tracks present; not supported in this build".into(),
+                            ));
+                        }
+                    }
+                    4 => {
+                        return Err(PipelineError::Io(format!(
+                            "Unsupported main-track type 4 at variant {idx}"
+                        )))
+                    }
+                    other => {
+                        return Err(PipelineError::Io(format!(
+                            "Unsupported main-track type {other} at variant {idx}"
+                        )))
+                    }
+                }
+                project_alt_ordinal(dst, alt_ord_1b)?;
+                return Ok(());
             }
-            let start = p + alt_ix * n;
-            let end = start + n;
-            let ds_bytes = &buf[start..end];
-            // Apply ±0.10 tolerance to nearest integer hard-call rule.
-            dosage_bytes_to_hardcalls(ds_bytes, dst);
-            return Ok(());
+            _ => {}
         }
 
-        // Neither HC nor DS → treat as all missing
-        dst.fill(255);
-        Ok(())
+        Err(ioerr("Unsupported PGEN mode for decoding"))
     }
 }
 
-fn unpack_2bit_block_to_hardcalls(block: &[u8], dst: &mut [u8], n: usize) {
-    // 2-bit codes (LSB-first per field):
-    // 00 -> 2
-    // 10 -> 1
-    // 11 -> 0
-    // 01 -> 255 (missing)
+fn unpack_pgen2bit_to_a1dosage(block: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0usize;
-    for byte in block {
-        let b = *byte;
-        for j in 0..4 {
+    for &byte in block {
+        for shift in 0..4 {
             if i >= n {
                 return;
             }
-            let code = (b >> (2 * j)) & 0b11;
-            dst[i] = match code {
-                0b00 => 2,
-                0b10 => 1,
-                0b11 => 0,
-                _ => 255,
-            };
+            match (byte >> (2 * shift)) & 0b11 {
+                0 => dst[i] = 0,
+                1 => dst[i] = 1,
+                2 => dst[i] = 2,
+                _ => dst[i] = 255,
+            }
             i += 1;
         }
     }
 }
 
+fn project_alt_ordinal(dst: &mut [u8], alt_ord_1b: u16) -> Result<(), PipelineError> {
+    if alt_ord_1b > 1 {
+        return Err(PipelineError::Io(
+            "ALT ordinal >1 requires multiallelic patch decoding, which is not implemented".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn dosage_bytes_to_hardcalls(ds_bytes: &[u8], dst: &mut [u8]) {
-    // ds_bytes hold dosage scaled by 100 (0..200), 255 = missing
-    // Rule: nearest integer with ±0.10 tolerance (i.e., 10 in scaled units).
-    // If outside tolerance to 0/1/2, mark missing.
     for (i, &b) in ds_bytes.iter().enumerate() {
         if b == 255 {
             dst[i] = 255;
@@ -1223,6 +1405,25 @@ fn dosage_bytes_to_hardcalls(ds_bytes: &[u8], dst: &mut [u8]) {
     }
 }
 
+fn unpack_plink1_block(block: &[u8], dst: &mut [u8], n: usize) {
+    let mut i = 0usize;
+    for &byte in block {
+        for shift in 0..4 {
+            if i >= n {
+                return;
+            }
+            let code = (byte >> (2 * shift)) & 0b11;
+            dst[i] = match code {
+                0b00 => 2,
+                0b10 => 1,
+                0b11 => 0,
+                _ => 255,
+            };
+            i += 1;
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Tests (subset) – validates packing and basic decode scaffolding behavior
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1233,26 +1434,20 @@ mod tests {
 
     #[test]
     fn pack_contract_smoke() {
-        // A small 10-sample variant with values: 0 1 2 255 | 0 0 1 2 | 255 255
         let hard = [0u8, 1, 2, 255, 0, 0, 1, 2, 255, 255];
         let mut block = vec![0u8; (hard.len() + 3) / 4];
         VirtualBed::pack_to_block(&mut block, &hard);
-        // byte0 packs samples 0..3: codes 11,10,00,01 => 0b01001011 = 0x4B
         assert_eq!(block[0], 0x4B);
-        // byte1 packs 4..7: 11,11,10,00 => 0b00101111 = 0x2F
         assert_eq!(block[1], 0x2F);
-        // byte2 packs 8..9 (+ 2 missings): 01,01,01,01 => 0b01010101 = 0x55
         assert_eq!(block[2], 0x55);
 
-        // And roundtrip unpack should match
         let mut round = vec![0u8; hard.len()];
-        unpack_2bit_block_to_hardcalls(&block, &mut round, hard.len());
+        unpack_plink1_block(&block, &mut round, hard.len());
         assert_eq!(&hard, &round[..]);
     }
 
     #[test]
     fn dosage_to_hardcalls_rule() {
-        // 0, 0.09, 0.11, 1.0, 1.09, 1.11, 2.0, missing
         let ds = [0u8, 9, 11, 100, 109, 111, 200, 255];
         let mut out = vec![0u8; ds.len()];
         dosage_bytes_to_hardcalls(&ds, &mut out);
