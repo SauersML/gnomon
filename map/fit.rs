@@ -1601,7 +1601,12 @@ fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64
         .iter()
         .zip(sample_scores.col_iter_mut())
     {
-        let sigma = ((n_samples - 1) as f64 * lambda).sqrt();
+        let scaled = (n_samples - 1) as f64 * lambda;
+        let sigma = if scaled > 0.0 {
+            scaled.sqrt()
+        } else {
+            0.0
+        };
         singular_values.push(sigma);
         zip!(&mut column).for_each(|unzip!(value)| {
             *value *= sigma;
@@ -1805,6 +1810,32 @@ mod tests {
     use super::*;
     use crate::map::io::GenotypeDataset;
     use std::path::Path;
+
+    #[test]
+    fn negative_eigenvalues_do_not_produce_nan_scores() {
+        let n_samples = 3;
+        let eigenpairs = Eigenpairs {
+            values: vec![-1.0e-12, 0.5],
+            vectors: Mat::from_fn(n_samples, 2, |row, col| {
+                if row == col { 1.0 } else { 0.0 }
+            }),
+        };
+
+        let (singular_values, scores) = build_sample_scores(n_samples, &eigenpairs);
+
+        assert_eq!(singular_values.len(), 2);
+        assert!(singular_values.iter().all(|value| value.is_finite()));
+        for row in 0..scores.nrows() {
+            for col in 0..scores.ncols() {
+                assert!(scores[(row, col)].is_finite());
+            }
+        }
+
+        assert_eq!(singular_values[0], 0.0);
+        for row in 0..scores.nrows() {
+            assert_eq!(scores[(row, 0)], 0.0);
+        }
+    }
 
     const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
     const MAX_TEST_VARIANTS: usize = 32;
