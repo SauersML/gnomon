@@ -7,7 +7,7 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1004,8 +1004,36 @@ pub struct VcfLikeDataset {
     parts: Vec<PathBuf>,
     sample_names: Arc<Vec<String>>,
     samples: Vec<SampleRecord>,
-    n_variants_hint: Option<usize>,
+    variant_count: Arc<VariantCountTracker>,
     output_hint: OutputHint,
+}
+
+#[derive(Debug)]
+struct VariantCountTracker {
+    known: AtomicBool,
+    value: AtomicUsize,
+}
+
+impl VariantCountTracker {
+    fn new(initial: Option<usize>) -> Self {
+        Self {
+            known: AtomicBool::new(initial.is_some()),
+            value: AtomicUsize::new(initial.unwrap_or(0)),
+        }
+    }
+
+    fn get(&self) -> Option<usize> {
+        if self.known.load(Ordering::Acquire) {
+            Some(self.value.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
+    fn set(&self, value: usize) {
+        self.value.store(value, Ordering::Relaxed);
+        self.known.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1088,7 +1116,7 @@ impl VcfLikeDataset {
             parts,
             sample_names: Arc::new(expected_sample_names),
             samples,
-            n_variants_hint: None,
+            variant_count: Arc::new(VariantCountTracker::new(None)),
             output_hint,
         })
     }
@@ -1102,11 +1130,11 @@ impl VcfLikeDataset {
     }
 
     pub fn n_variants(&self) -> usize {
-        self.n_variants_hint.unwrap_or(0)
+        self.variant_count.get().unwrap_or(0)
     }
 
     pub fn variant_count_hint(&self) -> Option<usize> {
-        self.n_variants_hint
+        self.variant_count.get()
     }
 
     pub fn input_path(&self) -> &Path {
@@ -1124,7 +1152,7 @@ impl VcfLikeDataset {
         VcfLikeVariantBlockSource::new(
             self.parts.clone(),
             Arc::clone(&self.sample_names),
-            self.n_variants_hint,
+            Arc::clone(&self.variant_count),
             plan,
         )
     }
@@ -1230,6 +1258,7 @@ pub struct VcfLikeVariantBlockSource {
     record: RecordBuf,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
+    variant_count: Arc<VariantCountTracker>,
     total_variants_hint: Option<usize>,
     filtered_variants_hint: usize,
     selection_plan: SelectionPlan,
@@ -1754,6 +1783,10 @@ impl VcfLikeVariantBlockSource {
         }
 
         if is_remote_path(&path) {
+            if let Ok(result) = create_variant_reader_for_file(&path) {
+                return Ok(result);
+            }
+
             if self.spool_entries.len() <= idx {
                 self.spool_entries.resize(idx + 1, None);
             }
@@ -1793,10 +1826,11 @@ impl VcfLikeVariantBlockSource {
     fn new(
         parts: Vec<PathBuf>,
         sample_names: Arc<Vec<String>>,
-        n_variants_hint: Option<usize>,
+        variant_count: Arc<VariantCountTracker>,
         selection_plan: SelectionPlan,
     ) -> Result<Self, VariantIoError> {
         let n_samples = sample_names.len();
+        let n_variants_hint = variant_count.get();
         let filtered_variants_hint = match &selection_plan {
             SelectionPlan::All => n_variants_hint.unwrap_or(0),
             SelectionPlan::ByIndices(indices) => indices.len(),
@@ -1817,6 +1851,7 @@ impl VcfLikeVariantBlockSource {
             record: RecordBuf::default(),
             sample_names,
             n_samples,
+            variant_count,
             total_variants_hint: n_variants_hint,
             filtered_variants_hint,
             selection_plan,
@@ -2167,6 +2202,7 @@ impl VcfLikeVariantBlockSource {
             SelectionPlan::All => {
                 self.filtered_variants_hint = self.emitted;
                 self.total_variants_hint = Some(self.processed);
+                self.variant_count.set(self.emitted);
             }
             SelectionPlan::ByIndices(_) => {
                 self.total_variants_hint = Some(self.processed);
