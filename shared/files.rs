@@ -8,6 +8,7 @@ use natord::compare;
 use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::io::Reader as VcfReader;
 use reqwest::StatusCode;
+use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use std::collections::{HashMap, VecDeque};
@@ -709,6 +710,63 @@ fn is_not_found_error(err: &PipelineError) -> bool {
     }
 }
 
+fn should_attempt_http_fallback(err: &PipelineError) -> bool {
+    match err {
+        PipelineError::Io(msg) => {
+            let lower = msg.to_lowercase();
+            lower.contains("the service is currently unavailable")
+                || lower.contains("tcp connect error")
+                || lower.contains("dns error")
+                || lower.contains("cannot create the authentication headers")
+                || lower.contains("failed to create cloud storage client")
+                || lower.contains("failed to load adc credentials")
+        }
+        _ => false,
+    }
+}
+
+fn gcs_http_fallback_url(bucket: &str, object: &str) -> Result<String, PipelineError> {
+    let mut url = Url::parse("https://storage.googleapis.com/")
+        .map_err(|e| PipelineError::Io(format!("Failed to construct GCS HTTP base URL: {e}")))?;
+    url.set_path(&format!("{bucket}/{object}"));
+    Ok(url.to_string())
+}
+
+fn create_remote_byte_source(
+    bucket: &str,
+    object: &str,
+) -> Result<Arc<dyn ByteRangeSource>, PipelineError> {
+    match RemoteByteRangeSource::new(bucket, object) {
+        Ok(remote) => Ok(Arc::new(remote)),
+        Err(err) => {
+            if is_not_found_error(&err) {
+                return Err(err);
+            }
+            if !should_attempt_http_fallback(&err) {
+                return Err(err);
+            }
+
+            let url = gcs_http_fallback_url(bucket, object)?;
+            match HttpByteRangeSource::new(&url) {
+                Ok(http_source) => {
+                    warn!(
+                        "Falling back to HTTPS access for gs://{bucket}/{object} after Cloud Storage error: {err}"
+                    );
+                    Ok(Arc::new(http_source))
+                }
+                Err(http_err) => {
+                    let combined = format!("{http_err} (after Cloud Storage error: {err})");
+                    match http_err {
+                        PipelineError::Io(_) => Err(PipelineError::Io(combined)),
+                        PipelineError::Producer(_) => Err(PipelineError::Producer(combined)),
+                        PipelineError::Compute(_) => Err(PipelineError::Compute(combined)),
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn convert_list_error(
     bucket: &str,
     prefix: &str,
@@ -815,7 +873,7 @@ fn resolve_remote_variant_objects(path: &Path) -> Result<(String, Vec<String>), 
     let mut objects: Vec<String>;
 
     if !treat_as_directory {
-        match RemoteByteRangeSource::new(&bucket, &object) {
+        match create_remote_byte_source(&bucket, &object) {
             Ok(_) => {
                 objects = vec![object.clone()];
             }
@@ -856,8 +914,7 @@ fn open_remote_variant_source(path: &Path) -> Result<VariantSource, PipelineErro
     let (bucket, objects) = resolve_remote_variant_objects(path)?;
     let mut readers = Vec::with_capacity(objects.len());
     for object in objects {
-        let remote = RemoteByteRangeSource::new(&bucket, &object)?;
-        let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
+        let source = create_remote_byte_source(&bucket, &object)?;
         let path_display = format!("gs://{bucket}/{object}");
         readers.push(prepare_streaming_variant_reader(path_display, source)?);
     }
