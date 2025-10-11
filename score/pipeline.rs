@@ -3,16 +3,21 @@ use crate::score::complex::{ComplexVariantResolver, resolve_complex_variants};
 use crate::score::decide::{self, DecisionContext, RunStrategy};
 use crate::score::io;
 use crate::score::types::{
-    EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult, ReconciledVariantIndex,
-    WorkItem,
+    BimRowIndex, EffectAlleleDosage, FilesetBoundary, PipelineKind, PreparationResult,
+    ReconciledVariantIndex, WorkItem,
 };
+use ahash::AHashMap;
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::Mmap;
 use num_cpus;
 use rayon::prelude::*;
+use std::env;
 use std::error::Error;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -30,6 +35,14 @@ const DENSE_CHANNEL_BOUND: usize = 4096;
 const DENSE_BATCH_SIZE: usize = 256;
 /// The number of reusable memory buffers for variant data.
 const BUFFER_POOL_SIZE: usize = 16384;
+/// The buffer size for complex variant spooling.
+const SPOOL_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+struct SpoolState {
+    writer: BufWriter<File>,
+    offsets: AHashMap<BimRowIndex, u64>,
+    cursor: u64,
+}
 
 // ========================================================================================
 //                          Public API, context & error handling
@@ -227,117 +240,246 @@ fn run_single_file_pipeline(
             },
         );
 
-    // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
-    let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        // Spawn the UI updater thread. This thread is responsible for polling the
-        // atomic counter and updating the progress bar on the screen.
-        let updater_thread_count = Arc::clone(&variants_processed_count);
-        let updater_pb = pb.clone();
-        let total_variants = variants_to_process;
-        s.spawn(move || {
-            // This loop terminates when the number of processed items reaches the
-            // total, ensuring this thread finishes before the scope ends
-            while updater_thread_count.load(Ordering::Relaxed) < total_variants {
-                let processed = updater_thread_count.load(Ordering::Relaxed);
-                updater_pb.set_position(processed);
-                thread::sleep(Duration::from_millis(200));
-            }
-            // Perform one final update to ensure the bar shows 100% completion.
-            updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
-        });
-
-        let producer_logic = {
-            let source = Arc::clone(&shared_source);
-            let prep_result = Arc::clone(&context.prep_result);
-            let buffer_pool = Arc::clone(&buffer_pool);
-            let producer_thread_count = Arc::clone(&variants_processed_count);
-
-            move || match strategy {
-                RunStrategy::UseSimpleTree => {
-                    let global_path = decide::decide_path_without_freq(&run_ctx);
-                    let path_decider = |_: &[u8]| global_path;
-                    io::producer_thread(
-                        Arc::clone(&source),
-                        prep_result,
-                        sparse_tx,
-                        dense_tx,
-                        buffer_pool,
-                        producer_thread_count,
-                        path_decider,
-                    );
-                }
-                RunStrategy::UseComplexTree => {
-                    let path_decider = |variant_data: &[u8]| {
-                        let current_freq =
-                            batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
-                        let variant_ctx = DecisionContext {
-                            freq: current_freq,
-                            ..run_ctx
-                        };
-                        decide::decide_path_with_freq(&variant_ctx)
-                    };
-                    io::producer_thread(
-                        Arc::clone(&source),
-                        prep_result,
-                        sparse_tx,
-                        dense_tx,
-                        buffer_pool,
-                        producer_thread_count,
-                        path_decider,
-                    );
-                }
-            }
+    let has_complex = !prep_result.complex_rules.is_empty();
+    let is_remote = bed_source.mmap().is_none();
+    let should_spool = has_complex && is_remote;
+    let mut spool_state: Option<SpoolState> = None;
+    let mut spool_path: Option<PathBuf> = None;
+    if should_spool {
+        let (spool_dir, spool_stem) = derive_spool_destination(bed_path);
+        fs::create_dir_all(&spool_dir).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to create spool directory {}: {e}",
+                spool_dir.display()
+            ))
+        })?;
+        let path = spool_dir.join(format!("{}.complex_spool.bin", spool_stem));
+        let file = File::create(&path).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to create spool file {}: {e}",
+                path.display()
+            ))
+        })?;
+        let complex_variant_count = prep_result
+            .required_is_complex()
+            .iter()
+            .filter(|&&flag| flag != 0)
+            .count() as u64;
+        let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+        let approx_mb = if spool_bytes_per_variant == 0 {
+            0.0
+        } else {
+            (complex_variant_count * spool_bytes_per_variant) as f64 / (1024.0 * 1024.0)
         };
-
-        let producer_handle = s.spawn(producer_logic);
-        let (sparse_result, dense_result) = rayon::join(
-            || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
-            || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
+        eprintln!(
+            "> Spooling complex genotypes locally ({} variants, {} bytes/variant ≈ {:.2} MiB)...",
+            complex_variant_count, spool_bytes_per_variant, approx_mb
         );
-        producer_handle
-            .join()
-            .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))?;
+        spool_state = Some(SpoolState {
+            writer: BufWriter::with_capacity(SPOOL_BUFFER_SIZE, file),
+            offsets: AHashMap::with_capacity(prep_result.complex_rules.len()),
+            cursor: 0,
+        });
+        spool_path = Some(path);
+    }
 
-        // --- 4. Aggregate final results ---
-        let (sparse_adjustments, sparse_counts) = sparse_result?;
-        let (dense_adjustments, dense_counts) = dense_result?;
-        let num_people = prep_result.num_people_to_score;
-        let mut final_scores = Vec::with_capacity(num_people * num_scores);
-        for _ in 0..num_people {
-            final_scores.extend_from_slice(&master_baseline);
-        }
-        let mut final_counts = vec![0u32; num_people * num_scores];
-        final_counts
-            .par_iter_mut()
-            .zip(sparse_counts)
-            .for_each(|(m, p)| *m += p);
-        final_counts
-            .par_iter_mut()
-            .zip(dense_counts)
-            .for_each(|(m, p)| *m += p);
-        final_scores
-            .par_iter_mut()
-            .zip(sparse_adjustments)
-            .for_each(|(m, p)| *m += p);
-        final_scores
-            .par_iter_mut()
-            .zip(dense_adjustments)
-            .for_each(|(m, p)| *m += p);
+    // --- 3. Orchestration: Use a scoped thread for safe producer/consumer execution ---
+    let run_ctx_for_closure = run_ctx;
+    let strategy_for_closure = strategy;
+    let final_result: Result<((Vec<f64>, Vec<u32>), Option<SpoolState>), PipelineError> =
+        thread::scope(|s| {
+            // Spawn the UI updater thread. This thread is responsible for polling the
+            // atomic counter and updating the progress bar on the screen.
+            let updater_thread_count = Arc::clone(&variants_processed_count);
+            let updater_pb = pb.clone();
+            let total_variants = variants_to_process;
+            s.spawn(move || {
+                // This loop terminates when the number of processed items reaches the
+                // total, ensuring this thread finishes before the scope ends
+                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
+                    let processed = updater_thread_count.load(Ordering::Relaxed);
+                    updater_pb.set_position(processed);
+                    thread::sleep(Duration::from_millis(200));
+                }
+                // Perform one final update to ensure the bar shows 100% completion.
+                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+            });
 
-        // --- 5. Resolve complex variants ---
-        if !prep_result.complex_rules.is_empty() {
-            eprintln!(
-                "> Resolving {} unique complex variant rule(s)...",
-                prep_result.complex_rules.len()
+            let mut local_spool_state = spool_state.take();
+            let producer_logic = {
+                let source = Arc::clone(&shared_source);
+                let prep_result = Arc::clone(&context.prep_result);
+                let buffer_pool = Arc::clone(&buffer_pool);
+                let producer_thread_count = Arc::clone(&variants_processed_count);
+                let spool_enabled = should_spool;
+                let run_ctx = run_ctx_for_closure;
+                let strategy = strategy_for_closure;
+
+                move || -> Result<Option<SpoolState>, PipelineError> {
+                    match strategy {
+                        RunStrategy::UseSimpleTree => {
+                            let global_path = decide::decide_path_without_freq(&run_ctx);
+                            let path_decider = |_: &[u8]| global_path;
+                            let spool_plan = if spool_enabled {
+                                let state = local_spool_state
+                                    .as_mut()
+                                    .expect("spool state missing despite spooling enabled");
+                                Some(io::SpoolPlan {
+                                    is_complex_for_required: prep_result.required_is_complex(),
+                                    compact_byte_index: prep_result.spool_compact_byte_index(),
+                                    bytes_per_spooled_variant: prep_result
+                                        .spool_bytes_per_variant(),
+                                    file: &mut state.writer,
+                                    offsets: &mut state.offsets,
+                                    cursor: &mut state.cursor,
+                                })
+                            } else {
+                                None
+                            };
+                            io::producer_thread(
+                                Arc::clone(&source),
+                                Arc::clone(&prep_result),
+                                sparse_tx,
+                                dense_tx,
+                                buffer_pool,
+                                producer_thread_count,
+                                path_decider,
+                                spool_plan,
+                            );
+                        }
+                        RunStrategy::UseComplexTree => {
+                            let path_decider = |variant_data: &[u8]| {
+                                let current_freq = batch::assess_variant_density(
+                                    variant_data,
+                                    run_ctx.n_cohort as usize,
+                                );
+                                let variant_ctx = DecisionContext {
+                                    freq: current_freq,
+                                    ..run_ctx
+                                };
+                                decide::decide_path_with_freq(&variant_ctx)
+                            };
+                            let spool_plan = if spool_enabled {
+                                let state = local_spool_state
+                                    .as_mut()
+                                    .expect("spool state missing despite spooling enabled");
+                                Some(io::SpoolPlan {
+                                    is_complex_for_required: prep_result.required_is_complex(),
+                                    compact_byte_index: prep_result.spool_compact_byte_index(),
+                                    bytes_per_spooled_variant: prep_result
+                                        .spool_bytes_per_variant(),
+                                    file: &mut state.writer,
+                                    offsets: &mut state.offsets,
+                                    cursor: &mut state.cursor,
+                                })
+                            } else {
+                                None
+                            };
+                            io::producer_thread(
+                                Arc::clone(&source),
+                                Arc::clone(&prep_result),
+                                sparse_tx,
+                                dense_tx,
+                                buffer_pool,
+                                producer_thread_count,
+                                path_decider,
+                                spool_plan,
+                            );
+                        }
+                    }
+                    Ok(local_spool_state)
+                }
+            };
+
+            let producer_handle = s.spawn(producer_logic);
+            let (sparse_result, dense_result) = rayon::join(
+                || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
+                || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
             );
-            // The resolver is created once with the single mmap.
+            let local_spool_state = producer_handle
+                .join()
+                .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))??;
+
+            // --- 4. Aggregate final results ---
+            let (sparse_adjustments, sparse_counts) = sparse_result?;
+            let (dense_adjustments, dense_counts) = dense_result?;
+            let num_people = prep_result.num_people_to_score;
+            let mut final_scores = Vec::with_capacity(num_people * num_scores);
+            for _ in 0..num_people {
+                final_scores.extend_from_slice(&master_baseline);
+            }
+            let mut final_counts = vec![0u32; num_people * num_scores];
+            final_counts
+                .par_iter_mut()
+                .zip(sparse_counts)
+                .for_each(|(m, p)| *m += p);
+            final_counts
+                .par_iter_mut()
+                .zip(dense_counts)
+                .for_each(|(m, p)| *m += p);
+            final_scores
+                .par_iter_mut()
+                .zip(sparse_adjustments)
+                .for_each(|(m, p)| *m += p);
+            final_scores
+                .par_iter_mut()
+                .zip(dense_adjustments)
+                .for_each(|(m, p)| *m += p);
+
+            pb.finish_with_message("Computation complete.");
+            Ok(((final_scores, final_counts), local_spool_state))
+        });
+    let ((mut final_scores, mut final_counts), mut spool_state) = final_result?;
+
+    if !prep_result.complex_rules.is_empty() {
+        eprintln!(
+            "> Resolving {} unique complex variant rule(s)...",
+            prep_result.complex_rules.len()
+        );
+        if should_spool {
+            let spool_file_path = spool_path
+                .clone()
+                .expect("spool path missing despite spooling enabled");
+            let mut state = spool_state
+                .take()
+                .expect("spool state missing despite spooling enabled");
+            state.writer.flush().map_err(|e| {
+                PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
+            })?;
+            drop(state.writer);
+            let spool_file = File::open(&spool_file_path).map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to open complex variant spool {}: {e}",
+                    spool_file_path.display()
+                ))
+            })?;
+            let mmap = unsafe { Mmap::map(&spool_file) }.map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to memory-map complex variant spool {}: {e}",
+                    spool_file_path.display()
+                ))
+            })?;
+            let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
+            let resolver = ComplexVariantResolver::from_spool(
+                Arc::new(mmap),
+                state.offsets,
+                prep_result.spool_bytes_per_variant(),
+                dense_map,
+            );
+            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+            let keep_spool = env::var("GNOMON_KEEP_SPOOL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !keep_spool {
+                let _ = fs::remove_file(&spool_file_path);
+            }
+        } else {
             let resolver = ComplexVariantResolver::from_single_source(bed_source.clone());
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
-        pb.finish_with_message("Computation complete.");
-        Ok((final_scores, final_counts))
-    });
-    final_result
+    }
+
+    Ok((final_scores, final_counts))
 }
 
 /// The pipeline implementation for the multi-fileset case.
@@ -349,6 +491,7 @@ fn run_multi_file_pipeline(
         .iter()
         .map(|b| io::open_bed_source(&b.bed_path))
         .collect::<Result<_, _>>()?;
+    let any_remote = bed_sources.iter().any(|s| s.mmap().is_none());
     let shared_sources = Arc::new(bed_sources);
 
     // --- 1. Setup: No mmap here. Producer manages its own. ---
@@ -417,123 +560,271 @@ fn run_multi_file_pipeline(
             )
     };
 
-    // --- 3. Orchestration with multi-file producer ---
-    let final_result: Result<(Vec<f64>, Vec<u32>), PipelineError> = thread::scope(|s| {
-        // Spawn the UI updater thread. This thread is responsible for polling the
-        // atomic counter and updating the progress bar on the screen.
-        let updater_thread_count = Arc::clone(&variants_processed_count);
-        let updater_pb = pb.clone();
-        let total_variants = variants_to_process;
-        s.spawn(move || {
-            // This loop terminates when the number of processed items reaches the
-            // total, ensuring this thread finishes before the scope ends
-            while updater_thread_count.load(Ordering::Relaxed) < total_variants {
-                let processed = updater_thread_count.load(Ordering::Relaxed);
-                updater_pb.set_position(processed);
-                thread::sleep(Duration::from_millis(200));
-            }
-            // Perform one final update to ensure the bar shows 100% completion.
-            updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
-        });
-
-        let producer_logic = {
-            let sources = Arc::clone(&shared_sources);
-            let prep_result = Arc::clone(&context.prep_result);
-            let buffer_pool = Arc::clone(&buffer_pool);
-            let producer_thread_count = Arc::clone(&variants_processed_count);
-
-            move || match strategy {
-                RunStrategy::UseSimpleTree => {
-                    let global_path = decide::decide_path_without_freq(&run_ctx);
-                    let path_decider = |_: &[u8]| global_path;
-                    io::multi_file_producer_thread(
-                        prep_result,
-                        boundaries,
-                        sources.as_ref(),
-                        sparse_tx,
-                        dense_tx,
-                        buffer_pool,
-                        producer_thread_count,
-                        path_decider,
-                    );
-                }
-                RunStrategy::UseComplexTree => {
-                    let path_decider = |variant_data: &[u8]| {
-                        let current_freq =
-                            batch::assess_variant_density(variant_data, run_ctx.n_cohort as usize);
-                        let variant_ctx = DecisionContext {
-                            freq: current_freq,
-                            ..run_ctx
-                        };
-                        decide::decide_path_with_freq(&variant_ctx)
-                    };
-                    io::multi_file_producer_thread(
-                        prep_result,
-                        boundaries,
-                        sources.as_ref(),
-                        sparse_tx,
-                        dense_tx,
-                        buffer_pool,
-                        producer_thread_count,
-                        path_decider,
-                    );
-                }
-            }
+    let has_complex = !prep_result.complex_rules.is_empty();
+    let should_spool = has_complex && any_remote;
+    let mut spool_state: Option<SpoolState> = None;
+    let mut spool_path: Option<PathBuf> = None;
+    if should_spool {
+        let (spool_dir, spool_stem) = derive_spool_destination(&boundaries[0].bed_path);
+        fs::create_dir_all(&spool_dir).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to create spool directory {}: {e}",
+                spool_dir.display()
+            ))
+        })?;
+        let path = spool_dir.join(format!("{}.complex_spool.bin", spool_stem));
+        let file = File::create(&path).map_err(|e| {
+            PipelineError::Io(format!(
+                "Failed to create spool file {}: {e}",
+                path.display()
+            ))
+        })?;
+        let complex_variant_count = prep_result
+            .required_is_complex()
+            .iter()
+            .filter(|&&flag| flag != 0)
+            .count() as u64;
+        let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+        let approx_mb = if spool_bytes_per_variant == 0 {
+            0.0
+        } else {
+            (complex_variant_count * spool_bytes_per_variant) as f64 / (1024.0 * 1024.0)
         };
-
-        let producer_handle = s.spawn(producer_logic);
-        let (sparse_result, dense_result) = rayon::join(
-            || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
-            || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
+        eprintln!(
+            "> Spooling complex genotypes locally ({} variants, {} bytes/variant ≈ {:.2} MiB)...",
+            complex_variant_count, spool_bytes_per_variant, approx_mb
         );
-        producer_handle
-            .join()
-            .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))?;
+        spool_state = Some(SpoolState {
+            writer: BufWriter::with_capacity(SPOOL_BUFFER_SIZE, file),
+            offsets: AHashMap::with_capacity(prep_result.complex_rules.len()),
+            cursor: 0,
+        });
+        spool_path = Some(path);
+    }
 
-        // --- 4. Aggregate final results (same as single-file) ---
-        let (sparse_adjustments, sparse_counts) = sparse_result?;
-        let (dense_adjustments, dense_counts) = dense_result?;
-        let num_people = prep_result.num_people_to_score;
-        let num_scores = prep_result.score_names.len();
-        let mut final_scores = Vec::with_capacity(num_people * num_scores);
-        for _ in 0..num_people {
-            final_scores.extend_from_slice(&master_baseline);
-        }
-        let mut final_counts = vec![0u32; num_people * num_scores];
-        final_counts
-            .par_iter_mut()
-            .zip(sparse_counts)
-            .for_each(|(m, p)| *m += p);
-        final_counts
-            .par_iter_mut()
-            .zip(dense_counts)
-            .for_each(|(m, p)| *m += p);
-        final_scores
-            .par_iter_mut()
-            .zip(sparse_adjustments)
-            .for_each(|(m, p)| *m += p);
-        final_scores
-            .par_iter_mut()
-            .zip(dense_adjustments)
-            .for_each(|(m, p)| *m += p);
+    // --- 3. Orchestration with multi-file producer ---
+    let run_ctx_for_closure = run_ctx;
+    let strategy_for_closure = strategy;
+    let final_result: Result<((Vec<f64>, Vec<u32>), Option<SpoolState>), PipelineError> =
+        thread::scope(|s| {
+            // Spawn the UI updater thread. This thread is responsible for polling the
+            // atomic counter and updating the progress bar on the screen.
+            let updater_thread_count = Arc::clone(&variants_processed_count);
+            let updater_pb = pb.clone();
+            let total_variants = variants_to_process;
+            s.spawn(move || {
+                // This loop terminates when the number of processed items reaches the
+                // total, ensuring this thread finishes before the scope ends
+                while updater_thread_count.load(Ordering::Relaxed) < total_variants {
+                    let processed = updater_thread_count.load(Ordering::Relaxed);
+                    updater_pb.set_position(processed);
+                    thread::sleep(Duration::from_millis(200));
+                }
+                // Perform one final update to ensure the bar shows 100% completion.
+                updater_pb.set_position(updater_thread_count.load(Ordering::Relaxed));
+            });
 
-        // --- 5. Resolve complex variants ---
-        if !prep_result.complex_rules.is_empty() {
-            eprintln!(
-                "> Resolving {} unique complex variant rule(s)...",
-                prep_result.complex_rules.len()
+            let mut local_spool_state = spool_state.take();
+            let producer_logic = {
+                let sources = Arc::clone(&shared_sources);
+                let prep_result = Arc::clone(&context.prep_result);
+                let buffer_pool = Arc::clone(&buffer_pool);
+                let producer_thread_count = Arc::clone(&variants_processed_count);
+                let spool_enabled = should_spool;
+                let run_ctx = run_ctx_for_closure;
+                let strategy = strategy_for_closure;
+
+                move || -> Result<Option<SpoolState>, PipelineError> {
+                    match strategy {
+                        RunStrategy::UseSimpleTree => {
+                            let global_path = decide::decide_path_without_freq(&run_ctx);
+                            let path_decider = |_: &[u8]| global_path;
+                            let spool_plan = if spool_enabled {
+                                let state = local_spool_state
+                                    .as_mut()
+                                    .expect("spool state missing despite spooling enabled");
+                                Some(io::SpoolPlan {
+                                    is_complex_for_required: prep_result.required_is_complex(),
+                                    compact_byte_index: prep_result.spool_compact_byte_index(),
+                                    bytes_per_spooled_variant: prep_result
+                                        .spool_bytes_per_variant(),
+                                    file: &mut state.writer,
+                                    offsets: &mut state.offsets,
+                                    cursor: &mut state.cursor,
+                                })
+                            } else {
+                                None
+                            };
+                            io::multi_file_producer_thread(
+                                Arc::clone(&prep_result),
+                                boundaries,
+                                sources.as_ref(),
+                                sparse_tx,
+                                dense_tx,
+                                buffer_pool,
+                                producer_thread_count,
+                                path_decider,
+                                spool_plan,
+                            );
+                        }
+                        RunStrategy::UseComplexTree => {
+                            let path_decider = |variant_data: &[u8]| {
+                                let current_freq = batch::assess_variant_density(
+                                    variant_data,
+                                    run_ctx.n_cohort as usize,
+                                );
+                                let variant_ctx = DecisionContext {
+                                    freq: current_freq,
+                                    ..run_ctx
+                                };
+                                decide::decide_path_with_freq(&variant_ctx)
+                            };
+                            let spool_plan = if spool_enabled {
+                                let state = local_spool_state
+                                    .as_mut()
+                                    .expect("spool state missing despite spooling enabled");
+                                Some(io::SpoolPlan {
+                                    is_complex_for_required: prep_result.required_is_complex(),
+                                    compact_byte_index: prep_result.spool_compact_byte_index(),
+                                    bytes_per_spooled_variant: prep_result
+                                        .spool_bytes_per_variant(),
+                                    file: &mut state.writer,
+                                    offsets: &mut state.offsets,
+                                    cursor: &mut state.cursor,
+                                })
+                            } else {
+                                None
+                            };
+                            io::multi_file_producer_thread(
+                                Arc::clone(&prep_result),
+                                boundaries,
+                                sources.as_ref(),
+                                sparse_tx,
+                                dense_tx,
+                                buffer_pool,
+                                producer_thread_count,
+                                path_decider,
+                                spool_plan,
+                            );
+                        }
+                    }
+                    Ok(local_spool_state)
+                }
+            };
+
+            let producer_handle = s.spawn(producer_logic);
+            let (sparse_result, dense_result) = rayon::join(
+                || process_sparse_stream(sparse_rx, context, Arc::clone(&buffer_pool)),
+                || process_dense_stream(dense_rx, context, Arc::clone(&buffer_pool)),
             );
-            // The resolver is created once with the shared byte sources.
+            let local_spool_state = producer_handle
+                .join()
+                .map_err(|_| PipelineError::Producer("Producer thread panicked.".to_string()))??;
+
+            // --- 4. Aggregate final results (same as single-file) ---
+            let (sparse_adjustments, sparse_counts) = sparse_result?;
+            let (dense_adjustments, dense_counts) = dense_result?;
+            let num_people = prep_result.num_people_to_score;
+            let num_scores = prep_result.score_names.len();
+            let mut final_scores = Vec::with_capacity(num_people * num_scores);
+            for _ in 0..num_people {
+                final_scores.extend_from_slice(&master_baseline);
+            }
+            let mut final_counts = vec![0u32; num_people * num_scores];
+            final_counts
+                .par_iter_mut()
+                .zip(sparse_counts)
+                .for_each(|(m, p)| *m += p);
+            final_counts
+                .par_iter_mut()
+                .zip(dense_counts)
+                .for_each(|(m, p)| *m += p);
+            final_scores
+                .par_iter_mut()
+                .zip(sparse_adjustments)
+                .for_each(|(m, p)| *m += p);
+            final_scores
+                .par_iter_mut()
+                .zip(dense_adjustments)
+                .for_each(|(m, p)| *m += p);
+
+            pb.finish_with_message("Computation complete.");
+            Ok(((final_scores, final_counts), local_spool_state))
+        });
+    let ((mut final_scores, mut final_counts), mut spool_state) = final_result?;
+
+    if !prep_result.complex_rules.is_empty() {
+        eprintln!(
+            "> Resolving {} unique complex variant rule(s)...",
+            prep_result.complex_rules.len()
+        );
+        if should_spool {
+            let spool_file_path = spool_path
+                .clone()
+                .expect("spool path missing despite spooling enabled");
+            let mut state = spool_state
+                .take()
+                .expect("spool state missing despite spooling enabled");
+            state.writer.flush().map_err(|e| {
+                PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
+            })?;
+            drop(state.writer);
+            let spool_file = File::open(&spool_file_path).map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to open complex variant spool {}: {e}",
+                    spool_file_path.display()
+                ))
+            })?;
+            let mmap = unsafe { Mmap::map(&spool_file) }.map_err(|e| {
+                PipelineError::Io(format!(
+                    "Failed to memory-map complex variant spool {}: {e}",
+                    spool_file_path.display()
+                ))
+            })?;
+            let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
+            let resolver = ComplexVariantResolver::from_spool(
+                Arc::new(mmap),
+                state.offsets,
+                prep_result.spool_bytes_per_variant(),
+                dense_map,
+            );
+            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+            let keep_spool = env::var("GNOMON_KEEP_SPOOL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !keep_spool {
+                let _ = fs::remove_file(&spool_file_path);
+            }
+        } else {
             let resolver = ComplexVariantResolver::from_multi_sources(
                 shared_sources.as_ref().clone(),
                 boundaries.to_vec(),
             )?;
             resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
         }
-        pb.finish_with_message("Computation complete.");
-        Ok((final_scores, final_counts))
-    });
-    final_result
+    }
+
+    Ok((final_scores, final_counts))
+}
+
+fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {
+    let stem = base_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "gnomon_results".to_string());
+    let path_str = base_path.to_string_lossy();
+    if path_str.starts_with("gs://")
+        || path_str.starts_with("http://")
+        || path_str.starts_with("https://")
+    {
+        (Path::new(".").to_path_buf(), stem)
+    } else {
+        let dir = base_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        (dir, stem)
+    }
 }
 
 /// A RAII guard that ensures a byte buffer is automatically returned to the shared
