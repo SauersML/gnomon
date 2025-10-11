@@ -235,6 +235,9 @@ impl PsamInfo {
 
             let cols = columns.as_ref().unwrap();
             let fam_row = FamRow::from_fields(&fields, cols);
+            if fam_row.iid == "0" {
+                return Err(PipelineError::Io("IID must not be '0' (PSAM/FAM contract)".into()));
+            }
             let sex_code = parse_sex_token(&fam_row.sex);
             sex_by_sample.push(sex_code);
             fam_rows.push(fam_row);
@@ -352,16 +355,25 @@ fn coerce_pheno_token(tok: &str) -> String {
 
 impl FamRow {
     fn from_fields(fields: &[&str], cols: &PsamColumns) -> FamRow {
-        let default = |val: &str| val.to_string();
-        let get_opt =
-            |idx: Option<usize>| idx.and_then(|i| fields.get(i)).map(|s| (*s).to_string());
-        let iid = get_opt(cols.iid_idx)
-            .or_else(|| get_opt(cols.fid_idx))
+        let get_clean = |idx: Option<usize>| -> Option<String> {
+            idx.and_then(|i| fields.get(i))
+                .map(|s| s.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+        };
+
+        let mut iid = get_clean(cols.iid_idx)
+            .or_else(|| get_clean(cols.sid_idx))
+            .or_else(|| get_clean(cols.fid_idx))
             .unwrap_or_else(|| "0".to_string());
-        let fid = get_opt(cols.fid_idx).unwrap_or_else(|| iid.clone());
-        let pat = get_opt(cols.pat_idx).unwrap_or_else(|| default("0"));
-        let mat = get_opt(cols.mat_idx).unwrap_or_else(|| default("0"));
-        let sex = get_opt(cols.sex_idx).unwrap_or_else(|| default("0"));
+        if iid == "0" {
+            iid = get_clean(cols.sid_idx).unwrap_or_else(|| "0".to_string());
+        }
+
+        let fid = get_clean(cols.fid_idx).unwrap_or_else(|| iid.clone());
+        let pat = get_clean(cols.pat_idx).unwrap_or_else(|| "0".to_string());
+        let mat = get_clean(cols.mat_idx).unwrap_or_else(|| "0".to_string());
+        let sex = get_clean(cols.sex_idx).unwrap_or_else(|| "0".to_string());
         // PHENO1 takes precedence when both PHENO and PHENO1 are present.
         let phe = cols
             .pheno1_idx
@@ -1305,15 +1317,15 @@ impl PgenHeader {
         let m_variants = read_le_u32(src, 3)?;
         let n_samples = read_le_u32(src, 7)?;
 
-        if matches!(
-            mode,
-            PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage
-        ) {
+        if matches!(mode, PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage) {
+            let mut b = [0u8; 1];
+            src.read_at(11, &mut b)?;
+            let fmt = b[0];
             return Ok(Self {
                 mode,
                 m_variants,
                 n_samples,
-                fmt_byte: 0,
+                fmt_byte: fmt,
                 block_offsets: vec![],
                 rec_types: vec![],
                 rec_lens: vec![],
@@ -1420,30 +1432,33 @@ impl PgenHeader {
             let mut ext_off = off;
             let header_flags = read_varint_from_source(src, &mut ext_off)?;
             let footer_flags = read_varint_from_source(src, &mut ext_off)?;
+
             if footer_flags != 0 {
-                let end = ext_off
-                    .checked_add(8)
-                    .ok_or_else(|| ioerr("Footer offset overflow"))?;
-                if end > src.len() {
+                if ext_off.checked_add(8).ok_or_else(|| ioerr("Footer offset overflow"))? > src.len() {
                     return Err(ioerr("EOF reading footer offset"));
                 }
-                ext_off = end;
+                ext_off += 8;
             }
+
+            let mut lengths = Vec::new();
             let mut mask = header_flags;
             while mask != 0 {
                 if (mask & 1) != 0 {
-                    let len = read_varint_from_source(src, &mut ext_off)?;
-                    let end = ext_off
-                        .checked_add(len)
-                        .ok_or_else(|| ioerr("Header extension length overflow"))?;
-                    if end > src.len() {
-                        return Err(ioerr("Header extension overruns file"));
-                    }
-                    ext_off = end;
+                    lengths.push(read_varint_from_source(src, &mut ext_off)?);
                 }
                 mask >>= 1;
             }
-            off = ext_off;
+            let sum: u64 = lengths.into_iter().try_fold(0u64, |acc, x| {
+                acc.checked_add(x).ok_or_else(|| ioerr("Header extension length overflow"))
+            })?;
+            if ext_off
+                .checked_add(sum)
+                .ok_or_else(|| ioerr("Header extension overflow"))?
+                > src.len()
+            {
+                return Err(ioerr("Header extensions overrun file"));
+            }
+            off = ext_off + sum;
         }
 
         Ok(Self {
@@ -1573,6 +1588,7 @@ fn difflist_ids(
     }
     let g = (l + 63) / 64;
     let sid_bytes = sample_id_bytes(n_samples);
+
     let mut first_ids = Vec::with_capacity(g);
     for _ in 0..g {
         let v = match sid_bytes {
@@ -1609,65 +1625,53 @@ fn difflist_ids(
         };
         first_ids.push(v);
     }
-    let mut group_sizes: Vec<usize> = Vec::with_capacity(g);
+
+    let mut group_delta_bytes = Vec::with_capacity(g.saturating_sub(1));
     if g > 1 {
         if *cursor + (g - 1) > buf.len() {
-            return Err(ioerr("EOF in difflist group sizes"));
+            return Err(ioerr("EOF in difflist group byte-lengths"));
         }
         for raw in &buf[*cursor..*cursor + g - 1] {
-            let sz = *raw as usize;
-            if sz == 0 || sz > 64 {
-                return Err(ioerr("Invalid difflist group size"));
-            }
-            group_sizes.push(sz);
+            group_delta_bytes.push((*raw as usize) + 63);
         }
         *cursor += g - 1;
     }
 
-    let known: usize = group_sizes.iter().sum();
-    let last_size = l
-        .checked_sub(known)
-        .ok_or_else(|| ioerr("Difflist group sizes exceed entry count"))?;
-    if last_size == 0 || last_size > 64 {
-        return Err(ioerr("Invalid final difflist group size"));
-    }
-    group_sizes.push(last_size);
-    if group_sizes.len() != g {
-        return Err(ioerr("Difflist group count mismatch"));
-    }
+    let mut ids = Vec::with_capacity(l);
+    let mut delta_cur = *cursor;
 
-    let m = l - g;
-    let mut deltas = Vec::with_capacity(m);
-    for _ in 0..m {
-        deltas.push(read_base128_varint(buf, cursor)? as u32);
-    }
+    for gi in 0..g {
+        let group_elems = if gi < g - 1 {
+            64
+        } else {
+            l - 64 * (g - 1)
+        };
+        if group_elems == 0 {
+            return Err(ioerr("Empty difflist group"));
+        }
 
-    let mut out = vec![0u32; l];
-    let mut di = 0usize;
-    let mut offset = 0usize;
-    for (gi, &size) in group_sizes.iter().enumerate() {
-        if gi >= first_ids.len() {
-            return Err(ioerr("Difflist first-ID count mismatch"));
+        ids.push(first_ids[gi]);
+
+        let start = delta_cur;
+        for _ in 1..group_elems {
+            let d = read_base128_varint(buf, &mut delta_cur)? as u32;
+            let last = *ids.last().unwrap();
+            ids.push(last.checked_add(d).ok_or_else(|| ioerr("Difflist delta overflow"))?);
         }
-        if offset >= l || size == 0 || offset + size > l {
-            return Err(ioerr("Difflist group overruns entry count"));
-        }
-        out[offset] = first_ids[gi];
-        for k in 1..size {
-            if di >= deltas.len() {
-                return Err(ioerr("Difflist delta underrun"));
+        if gi < g - 1 {
+            let used = delta_cur - start;
+            let expected = group_delta_bytes[gi];
+            if used != expected {
+                return Err(ioerr("Difflist group byte-length mismatch"));
             }
-            out[offset + k] = out[offset + k - 1]
-                .checked_add(deltas[di])
-                .ok_or_else(|| ioerr("Difflist delta overflow"))?;
-            di += 1;
         }
-        offset += size;
     }
-    if offset != l || di != deltas.len() {
+
+    *cursor = delta_cur;
+    if ids.len() != l {
         return Err(ioerr("Difflist decode count mismatch"));
     }
-    Ok(out)
+    Ok(ids)
 }
 
 fn difflist_pairs(
@@ -1681,6 +1685,7 @@ fn difflist_pairs(
     }
     let g = (l + 63) / 64;
     let sid_bytes = sample_id_bytes(n_samples);
+
     let mut first_ids = Vec::with_capacity(g);
     for _ in 0..g {
         let v = match sid_bytes {
@@ -1717,34 +1722,19 @@ fn difflist_pairs(
         };
         first_ids.push(v);
     }
-    let mut group_sizes: Vec<usize> = Vec::with_capacity(g);
+
+    let mut group_delta_bytes = Vec::with_capacity(g.saturating_sub(1));
     if g > 1 {
         if *cursor + (g - 1) > buf.len() {
-            return Err(ioerr("EOF in difflist group sizes"));
+            return Err(ioerr("EOF in difflist group byte-lengths"));
         }
         for raw in &buf[*cursor..*cursor + g - 1] {
-            let sz = *raw as usize;
-            if sz == 0 || sz > 64 {
-                return Err(ioerr("Invalid difflist group size"));
-            }
-            group_sizes.push(sz);
+            group_delta_bytes.push((*raw as usize) + 63);
         }
         *cursor += g - 1;
     }
 
-    let known: usize = group_sizes.iter().sum();
-    let last_size = l
-        .checked_sub(known)
-        .ok_or_else(|| ioerr("Difflist group sizes exceed entry count"))?;
-    if last_size == 0 || last_size > 64 {
-        return Err(ioerr("Invalid final difflist group size"));
-    }
-    group_sizes.push(last_size);
-    if group_sizes.len() != g {
-        return Err(ioerr("Difflist group count mismatch"));
-    }
-
-    let vals_packed = ((l + 3) / 4) as usize;
+    let vals_packed = (l + 3) / 4;
     if *cursor + vals_packed > buf.len() {
         return Err(ioerr("EOF in difflist values"));
     }
@@ -1766,42 +1756,41 @@ fn difflist_pairs(
         vals.push((b >> 6) & 0b11);
     }
     *cursor += vals_packed;
-    if vals.len() != l {
-        return Err(ioerr("Difflist values count mismatch"));
-    }
 
-    let m = l - g;
-    let mut deltas = Vec::with_capacity(m);
-    for _ in 0..m {
-        deltas.push(read_base128_varint(buf, cursor)? as u32);
-    }
+    let mut ids = Vec::with_capacity(l);
+    let mut delta_cur = *cursor;
 
-    let mut ids = vec![0u32; l];
-    let mut di = 0usize;
-    let mut offset = 0usize;
-    for (gi, &size) in group_sizes.iter().enumerate() {
-        if gi >= first_ids.len() {
-            return Err(ioerr("Difflist first-ID count mismatch"));
+    for gi in 0..g {
+        let group_elems = if gi < g - 1 {
+            64
+        } else {
+            l - 64 * (g - 1)
+        };
+        if group_elems == 0 {
+            return Err(ioerr("Empty difflist group"));
         }
-        if offset >= l || size == 0 || offset + size > l {
-            return Err(ioerr("Difflist group overruns entry count"));
+
+        ids.push(first_ids[gi]);
+
+        let start = delta_cur;
+        for _ in 1..group_elems {
+            let d = read_base128_varint(buf, &mut delta_cur)? as u32;
+            let last = *ids.last().unwrap();
+            ids.push(last.checked_add(d).ok_or_else(|| ioerr("Difflist delta overflow"))?);
         }
-        ids[offset] = first_ids[gi];
-        for k in 1..size {
-            if di >= deltas.len() {
-                return Err(ioerr("Difflist delta underrun"));
+        if gi < g - 1 {
+            let used = delta_cur - start;
+            let expected = group_delta_bytes[gi];
+            if used != expected {
+                return Err(ioerr("Difflist group byte-length mismatch"));
             }
-            ids[offset + k] = ids[offset + k - 1]
-                .checked_add(deltas[di])
-                .ok_or_else(|| ioerr("Difflist delta overflow"))?;
-            di += 1;
         }
-        offset += size;
     }
-    if offset != l || di != deltas.len() {
+
+    *cursor = delta_cur;
+    if ids.len() != l || vals.len() != l {
         return Err(ioerr("Difflist decode count mismatch"));
     }
-
     Ok(ids
         .into_iter()
         .zip(vals.into_iter().map(|v| v as u8))
@@ -1861,7 +1850,14 @@ impl PgenDecoder {
         match self.hdr.mode {
             PgenMode::FixHard => {
                 let rec_len = (self.n + 3) / 4;
-                Ok((12 + (idx as u64) * (rec_len as u64), rec_len, 0))
+                let ref_flag_mode = (self.hdr.fmt_byte >> 6) & 0x03;
+                let mut base = 12u64 + 1; // header + format byte
+                if ref_flag_mode == 3 {
+                    base = base
+                        .checked_add(((self.hdr.m_variants as u64) + 7) / 8)
+                        .ok_or_else(|| ioerr("Header overflow"))?;
+                }
+                Ok((base + (idx as u64) * (rec_len as u64), rec_len, 0))
             }
             PgenMode::Var | PgenMode::VarIgnorable => {
                 let block_idx = idx >> 16;
@@ -1977,15 +1973,6 @@ impl PgenDecoder {
                     .ok_or_else(|| ioerr("Missing LD anchor"))?
                     .clone();
                 let mut base = anchor;
-                if main_kind == 3 {
-                    for c in &mut base {
-                        if *c == 0 {
-                            *c = 2;
-                        } else if *c == 2 {
-                            *c = 0;
-                        }
-                    }
-                }
                 let pairs = difflist_pairs(buf, &mut cursor, self.n)?;
                 for (sid, val) in pairs {
                     if (sid as usize) < self.n {
@@ -2099,9 +2086,8 @@ impl PgenDecoder {
 
         let has_dosage = (rec_ty & 0b0110_0000) != 0;
         if has_dosage && alt_count > 1 {
-            return Err(PipelineError::Io(format!(
-                "Multi-allelic dosage tracks unsupported (variant #{idx})"
-            )));
+            // Multiallelic dosage tracks (#5-#10) are intentionally ignored; keep
+            // hard-call derived values (which may remain missing).
         }
 
         let mut dosage_entries = 0usize;
@@ -2276,7 +2262,7 @@ fn apply_multiallelic_and_project(
     alt_ord_1b: u16,
     out: &mut [u8],
 ) -> Result<(), PipelineError> {
-    if alt_count <= 1 || alt_ord_1b == 1 {
+    if alt_count <= 1 {
         cats_to_a1dosage(out, cats);
         return Ok(());
     }
@@ -2513,6 +2499,67 @@ fn unpack_plink1_block(block: &[u8], dst: &mut [u8], n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::TryFrom;
+    use std::sync::Arc;
+
+    struct VecSource {
+        data: Vec<u8>,
+    }
+
+    impl VecSource {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data }
+        }
+    }
+
+    impl ByteRangeSource for VecSource {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
+            let off = usize::try_from(offset).map_err(|_| ioerr("Offset too large"))?;
+            let end = off + dst.len();
+            if end > self.data.len() {
+                return Err(ioerr("Read past end"));
+            }
+            dst.copy_from_slice(&self.data[off..end]);
+            Ok(())
+        }
+    }
+
+    fn encode_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if v == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn pack_twobit_values(values: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in values.chunks(4) {
+            let mut byte = 0u8;
+            for (i, &val) in chunk.iter().enumerate() {
+                byte |= (val & 0b11) << (2 * i);
+            }
+            out.push(byte);
+        }
+        out
+    }
+
+    fn push_sid(buf: &mut Vec<u8>, sid: u32, bytes: usize) {
+        let le = sid.to_le_bytes();
+        buf.extend_from_slice(&le[..bytes]);
+    }
 
     #[test]
     fn pack_contract_smoke() {
@@ -2551,6 +2598,237 @@ mod tests {
     }
 
     #[test]
+    fn difflist_two_group_round_trip() {
+        let n_samples = 2_000_000usize;
+        let sid_bytes = sample_id_bytes(n_samples);
+        assert_eq!(sid_bytes, 3);
+
+        let mut group0_ids = Vec::with_capacity(64);
+        let mut group0_deltas = Vec::with_capacity(63);
+        let mut cur = 1_000u32;
+        group0_ids.push(cur);
+        let pattern0 = [1u32, 200, 20_000, 2, 3, 150, 4_000];
+        for i in 0..63 {
+            let delta = pattern0[i % pattern0.len()];
+            cur += delta;
+            group0_ids.push(cur);
+            group0_deltas.push(delta);
+        }
+
+        let mut group1_ids = Vec::with_capacity(15);
+        let mut group1_deltas = Vec::with_capacity(14);
+        cur = 1_200_000u32;
+        group1_ids.push(cur);
+        let pattern1 = [
+            2u32, 5_000, 180_000, 1, 2, 7_000, 3, 1, 400, 80_000, 2, 1, 1, 2,
+        ];
+        for &delta in &pattern1 {
+            cur += delta;
+            group1_ids.push(cur);
+            group1_deltas.push(delta);
+        }
+
+        assert_eq!(group0_ids.len(), 64);
+        assert_eq!(group1_ids.len(), 15);
+        assert!(group0_ids.last().unwrap() < group1_ids.first().unwrap());
+        assert!(*group1_ids.last().unwrap() < n_samples as u32);
+
+        let expected_ids: Vec<u32> = group0_ids
+            .iter()
+            .chain(group1_ids.iter())
+            .copied()
+            .collect();
+
+        let delta_bytes_g0: Vec<u8> = group0_deltas
+            .iter()
+            .flat_map(|&d| encode_varint(d as u64))
+            .collect();
+        let delta_bytes_g1: Vec<u8> = group1_deltas
+            .iter()
+            .flat_map(|&d| encode_varint(d as u64))
+            .collect();
+        assert!(delta_bytes_g0.len() > 63);
+        let sentinel = u8::try_from(delta_bytes_g0.len() - 63).unwrap();
+
+        let mut buf_ids = Vec::new();
+        buf_ids.extend_from_slice(&encode_varint(expected_ids.len() as u64));
+        push_sid(&mut buf_ids, group0_ids[0], sid_bytes);
+        push_sid(&mut buf_ids, group1_ids[0], sid_bytes);
+        buf_ids.push(sentinel);
+        buf_ids.extend_from_slice(&delta_bytes_g0);
+        buf_ids.extend_from_slice(&delta_bytes_g1);
+
+        let mut cursor = 0usize;
+        let decoded_ids = difflist_ids(&buf_ids, &mut cursor, n_samples).unwrap();
+        assert_eq!(decoded_ids, expected_ids);
+        assert_eq!(cursor, buf_ids.len());
+
+        let expected_vals: Vec<u8> = (0..expected_ids.len())
+            .map(|i| (i as u8) & 0b11)
+            .collect();
+        let mut buf_pairs = Vec::new();
+        buf_pairs.extend_from_slice(&encode_varint(expected_ids.len() as u64));
+        push_sid(&mut buf_pairs, group0_ids[0], sid_bytes);
+        push_sid(&mut buf_pairs, group1_ids[0], sid_bytes);
+        buf_pairs.push(sentinel);
+        buf_pairs.extend_from_slice(&pack_twobit_values(&expected_vals));
+        buf_pairs.extend_from_slice(&delta_bytes_g0);
+        buf_pairs.extend_from_slice(&delta_bytes_g1);
+
+        let mut cursor_pairs = 0usize;
+        let decoded_pairs = difflist_pairs(&buf_pairs, &mut cursor_pairs, n_samples).unwrap();
+        let (ids_again, vals_again): (Vec<_>, Vec<_>) = decoded_pairs.into_iter().unzip();
+        assert_eq!(ids_again, expected_ids);
+        assert_eq!(vals_again, expected_vals);
+        assert_eq!(cursor_pairs, buf_pairs.len());
+    }
+
+    #[test]
+    fn type3_ld_record_inverts_after_patch() {
+        let n = 8usize;
+        let anchor_cats = [0u8, 1, 2, 0, 2, 1, 3, 2];
+        let rec0 = pack_twobit_values(&anchor_cats);
+        assert_eq!(rec0.len(), 2);
+
+        let mut rec1 = Vec::new();
+        let difflist_vals = [2u8, 0, 2];
+        rec1.extend_from_slice(&encode_varint(difflist_vals.len() as u64));
+        rec1.push(0); // first sample ID
+        rec1.extend_from_slice(&pack_twobit_values(&difflist_vals));
+        rec1.extend_from_slice(&encode_varint(2));
+        rec1.extend_from_slice(&encode_varint(3));
+        assert_eq!(rec1.len(), 5);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&rec0);
+        data.extend_from_slice(&rec1);
+
+        let src = Arc::new(VecSource::new(data));
+        let hdr = PgenHeader {
+            mode: PgenMode::Var,
+            m_variants: 2,
+            n_samples: n as u32,
+            fmt_byte: 0,
+            block_offsets: vec![0],
+            rec_types: vec![0, 3],
+            rec_lens: vec![rec0.len() as u32, rec1.len() as u32],
+        };
+        let mut decoder = PgenDecoder {
+            src,
+            hdr,
+            n,
+            scratch: Vec::new(),
+            anchor_cats: None,
+            alt_counts: vec![1, 1],
+        };
+
+        let mut out0 = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(0, 1, &mut out0, None)
+            .unwrap();
+        assert_eq!(out0, vec![0, 1, 2, 0, 2, 1, 255, 2]);
+
+        let mut out1 = vec![0u8; n];
+        decoder
+            .decode_variant_hardcalls(1, 1, &mut out1, None)
+            .unwrap();
+        assert_eq!(out1, vec![0, 1, 2, 2, 0, 0, 255, 0]);
+
+        assert_eq!(
+            decoder.anchor_cats.as_ref().unwrap(),
+            &anchor_cats.to_vec()
+        );
+    }
+
+    #[test]
+    fn multiallelic_alt1_patches_apply() {
+        let mut record = vec![0u8, 0x01, 0x01, 0x01, 0x0A];
+        let mut cats = vec![1u8, 2, 2];
+        let mut out = vec![255u8; 3];
+        let mut cursor = 0usize;
+        apply_multiallelic_and_project(&record, &mut cursor, 3, &mut cats, 3, 1, &mut out)
+            .unwrap();
+        assert_eq!(out, vec![0, 0, 2]);
+        assert_eq!(cursor, record.len());
+    }
+
+    #[test]
+    fn fixed_width_offsets_include_header_components() {
+        let n_samples = 10usize;
+        let m_variants = 10u32;
+        let rec_len = (n_samples + 3) / 4;
+
+        let hdr_plain = PgenHeader {
+            mode: PgenMode::FixHard,
+            m_variants,
+            n_samples: n_samples as u32,
+            fmt_byte: 0,
+            block_offsets: vec![],
+            rec_types: vec![],
+            rec_lens: vec![],
+        };
+        let src = Arc::new(VecSource::new(vec![]));
+        let mut decoder_plain = PgenDecoder {
+            src: Arc::clone(&src),
+            hdr: hdr_plain,
+            n: n_samples,
+            scratch: Vec::new(),
+            anchor_cats: None,
+            alt_counts: vec![0; m_variants as usize],
+        };
+        let (off0, len0, ty0) = decoder_plain.record_offset_len(0).unwrap();
+        assert_eq!(off0, 12 + 1);
+        assert_eq!(len0, rec_len);
+        assert_eq!(ty0, 0);
+        let (off1, _, _) = decoder_plain.record_offset_len(1).unwrap();
+        assert_eq!(off1, 12 + 1 + rec_len as u64);
+
+        let hdr_ref = PgenHeader {
+            mode: PgenMode::FixHard,
+            m_variants,
+            n_samples: n_samples as u32,
+            fmt_byte: 0b1100_0000,
+            block_offsets: vec![],
+            rec_types: vec![],
+            rec_lens: vec![],
+        };
+        let mut decoder_ref = PgenDecoder {
+            src,
+            hdr: hdr_ref,
+            n: n_samples,
+            scratch: Vec::new(),
+            anchor_cats: None,
+            alt_counts: vec![0; m_variants as usize],
+        };
+        let (off0_ref, len_ref, _) = decoder_ref.record_offset_len(0).unwrap();
+        let expected_base = 12 + 1 + ((m_variants as u64 + 7) / 8);
+        assert_eq!(off0_ref, expected_base);
+        assert_eq!(len_ref, rec_len);
+        let (off2_ref, _, _) = decoder_ref.record_offset_len(2).unwrap();
+        assert_eq!(off2_ref, expected_base + (rec_len as u64) * 2);
+    }
+
+    #[test]
+    fn parse_fixhard_reads_fmt_byte() {
+        let m_variants = 3u32;
+        let n_samples = 8u32;
+        let fmt = 0b1100_0000u8;
+        let mut data = vec![0u8; 12];
+        data[0] = 0x6c;
+        data[1] = 0x1b;
+        data[2] = 0x02;
+        data[3..7].copy_from_slice(&m_variants.to_le_bytes());
+        data[7..11].copy_from_slice(&n_samples.to_le_bytes());
+        data[11] = fmt;
+        let src = VecSource::new(data);
+        let header = PgenHeader::parse(&src).unwrap();
+        assert_eq!(header.mode, PgenMode::FixHard);
+        assert_eq!(header.m_variants, m_variants);
+        assert_eq!(header.n_samples, n_samples);
+        assert_eq!(header.fmt_byte, fmt);
+    }
+
+    #[test]
     fn fam_row_uses_sid_when_iid_missing() {
         let fields = ["", "unused", "sid123", "1"];
         let cols = PsamColumns {
@@ -2567,6 +2845,19 @@ mod tests {
         assert_eq!(fam.iid, "sid123");
         assert_eq!(fam.fid, "sid123");
         assert_eq!(fam.sex, "1");
+    }
+
+    #[test]
+    fn fam_row_defaults_fid_to_resolved_iid() {
+        let fields = ["iid789", ""];
+        let cols = PsamColumns {
+            fid_idx: Some(1),
+            iid_idx: Some(0),
+            ..PsamColumns::default()
+        };
+        let fam = FamRow::from_fields(&fields, &cols);
+        assert_eq!(fam.iid, "iid789");
+        assert_eq!(fam.fid, "iid789");
     }
 
     #[test]
