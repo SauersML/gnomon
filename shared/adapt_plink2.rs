@@ -35,12 +35,12 @@ use std::sync::{Arc, Mutex};
 /// Bring in your crate-local traits and error type.
 /// These are expected to already exist (per your provided infrastructure).
 use crate::score::pipeline::PipelineError;
-use crate::{
-    ByteRangeSource,
-    // Traits
-    TextSource,
+use crate::files::{
     // Helpers
     open_text_source,
+    // Traits
+    ByteRangeSource,
+    TextSource,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -160,7 +160,6 @@ pub fn open_virtual_plink19_from_sources(
 #[derive(Clone)]
 struct PsamInfo {
     n_samples: usize,
-    columns: PsamColumns,
     sex_by_sample: Vec<u8>,
     fam_rows: Vec<FamRow>,
 }
@@ -227,10 +226,10 @@ impl PsamInfo {
             }
 
             if columns.is_none() {
-                columns = match header_tokens.as_ref() {
+                columns = Some(match header_tokens.as_ref() {
                     Some(tokens) => PsamColumns::from_header(tokens),
                     None => PsamColumns::from_headerless(fields.len()),
-                }?;
+                }?);
             }
 
             let cols = columns.as_ref().unwrap();
@@ -243,7 +242,7 @@ impl PsamInfo {
             fam_rows.push(fam_row);
         }
 
-        let columns = if let Some(cols) = columns {
+        let final_columns = if let Some(cols) = columns {
             cols
         } else {
             let tokens = header_tokens
@@ -251,9 +250,10 @@ impl PsamInfo {
             PsamColumns::from_header(&tokens)?
         };
 
+        drop(final_columns);
+
         Ok(Self {
             n_samples: sex_by_sample.len(),
-            columns,
             sex_by_sample,
             fam_rows,
         })
@@ -599,7 +599,6 @@ impl VariantPlan {
 
             let out_start = out_to_in.len();
             let mut alt_ord: u16 = 1;
-            let mut emitted = 0usize;
             for alt in alts.iter() {
                 out_to_in.push((in_idx, alt_ord));
                 haploidy.push(HaploidyKind::Diploid);
@@ -611,7 +610,6 @@ impl VariantPlan {
                     alt: (*alt).to_string(),
                 });
                 alt_ord += 1;
-                emitted += 1;
             }
             let out_end = out_to_in.len();
             per_variant.push(VariantRangeEntry {
@@ -2290,7 +2288,7 @@ fn apply_multiallelic_and_project(
                     4..=5 => 2,
                     6..=17 => 4,
                     18..=257 => 8,
-                    258..=65537 => 16,
+                    258..=65535 => 16,
                     _ => 24,
                 } as usize;
                 let vals = read_packed_fixed_width(record, cursor, width, k)?;
@@ -2309,7 +2307,7 @@ fn apply_multiallelic_and_project(
                     4..=5 => 2,
                     6..=17 => 4,
                     18..=257 => 8,
-                    258..=65537 => 16,
+                    258..=65535 => 16,
                     _ => 24,
                 } as usize;
                 let vals = read_packed_fixed_width(record, cursor, width, k)?;
@@ -2346,7 +2344,7 @@ fn apply_multiallelic_and_project(
                         3..=4 => 2,
                         5..=16 => 4,
                         17..=256 => 8,
-                        257..=65536 => 16,
+                        257..=65535 => 16,
                         _ => 24,
                     } as usize;
                     let vals = read_packed_fixed_width(record, cursor, width, 2 * k)?;
@@ -2379,7 +2377,7 @@ fn apply_multiallelic_and_project(
                         3..=4 => 2,
                         5..=16 => 4,
                         17..=256 => 8,
-                        257..=65536 => 16,
+                        257..=65535 => 16,
                         _ => 24,
                     } as usize;
                     let vals = read_packed_fixed_width(record, cursor, width, 2 * k)?;
@@ -2473,6 +2471,7 @@ fn u16_to_hardcall_biallelic(v: u16, ploidy: u8) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn unpack_plink1_block(block: &[u8], dst: &mut [u8], n: usize) {
     let mut i = 0usize;
     for &byte in block {
@@ -2703,7 +2702,7 @@ mod tests {
         data.extend_from_slice(&rec0);
         data.extend_from_slice(&rec1);
 
-        let src = Arc::new(VecSource::new(data));
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(data));
         let hdr = PgenHeader {
             mode: PgenMode::Var,
             m_variants: 2,
@@ -2767,7 +2766,7 @@ mod tests {
             rec_types: vec![],
             rec_lens: vec![],
         };
-        let src = Arc::new(VecSource::new(vec![]));
+        let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(vec![]));
         let mut decoder_plain = PgenDecoder {
             src: Arc::clone(&src),
             hdr: hdr_plain,
