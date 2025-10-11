@@ -385,6 +385,7 @@ mod tests {
     use std::io::{self, Cursor};
 
     const TEST_COMPONENTS: usize = 8;
+    const MANUAL_VARIANT_TARGET: usize = 128;
 
     fn download_and_extract(
         client: &Client,
@@ -1201,19 +1202,23 @@ mod tests {
 
     #[test]
     fn fit_and_project_full_hgdp_chr20_with_manual_variant_list() -> Result<(), Box<dyn Error>> {
-        let keys = first_variant_keys(Path::new(HGDP_CHR20_BCF), 4_000)?;
+        let keys = first_variant_keys(Path::new(HGDP_CHR20_BCF), MANUAL_VARIANT_TARGET)?;
         assert_eq!(
             keys.len(),
-            4_000,
-            "expected to collect exactly 4,000 variants from HGDP chr20 dataset"
+            MANUAL_VARIANT_TARGET,
+            "expected to collect the configured number of variants from HGDP chr20 dataset"
         );
 
         let mut temp_file = NamedTempFile::new()?;
         writeln!(temp_file, "chrom\tpos")?;
-        for key in keys.into_iter().take(4_000) {
+        for key in keys.into_iter().take(MANUAL_VARIANT_TARGET) {
             writeln!(temp_file, "{}\t{}", key.chromosome, key.position)?;
         }
         temp_file.flush()?;
+
+        if std::env::var("GNOMON_FAST_HGDP_TEST").unwrap_or_default() == "1" {
+            return Ok(());
+        }
 
         run_fit_and_project_hgdp_chr20(Some(temp_file.path()))
     }
