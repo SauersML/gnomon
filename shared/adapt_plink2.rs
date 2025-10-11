@@ -1456,7 +1456,6 @@ impl PgenHeader {
             {
                 return Err(ioerr("Header extensions overrun file"));
             }
-            off = ext_off + sum;
         }
 
         Ok(Self {
@@ -2206,6 +2205,20 @@ impl PgenDecoder {
             }
         }
 
+        match len.checked_sub(cursor) {
+            Some(0) => {}
+            Some(remaining) => {
+                return Err(PipelineError::Io(format!(
+                    "Trailing data ({remaining} bytes) after variant #{idx}"
+                )));
+            }
+            None => {
+                return Err(PipelineError::Io(format!(
+                    "Cursor advanced beyond end of record for variant #{idx}"
+                )));
+            }
+        }
+
         if !matches!(main_kind, 2 | 3) {
             self.anchor_cats = Some(cats.clone());
         }
@@ -2741,7 +2754,7 @@ mod tests {
 
     #[test]
     fn multiallelic_alt1_patches_apply() {
-        let mut record = vec![0u8, 0x01, 0x01, 0x01, 0x0A];
+        let record = vec![0u8, 0x01, 0x01, 0x01, 0x0A];
         let mut cats = vec![1u8, 2, 2];
         let mut out = vec![255u8; 3];
         let mut cursor = 0usize;
@@ -2767,7 +2780,7 @@ mod tests {
             rec_lens: vec![],
         };
         let src: Arc<dyn ByteRangeSource> = Arc::new(VecSource::new(vec![]));
-        let mut decoder_plain = PgenDecoder {
+        let decoder_plain = PgenDecoder {
             src: Arc::clone(&src),
             hdr: hdr_plain,
             n: n_samples,
@@ -2791,7 +2804,7 @@ mod tests {
             rec_types: vec![],
             rec_lens: vec![],
         };
-        let mut decoder_ref = PgenDecoder {
+        let decoder_ref = PgenDecoder {
             src,
             hdr: hdr_ref,
             n: n_samples,
