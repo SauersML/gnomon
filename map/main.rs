@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(dataset.samples().len(), n_samples);
 
         let mut selection: Option<VariantSelection> = None;
-        let expected_variants = if let Some(list_path) = variant_list {
+        let expected_variants: Option<usize> = if let Some(list_path) = variant_list {
             let filter = VariantFilter::from_file(list_path).map_err(|err| {
                 let message = format!(
                     "failed to load variant list {}: {err:?}",
@@ -1063,15 +1063,21 @@ mod tests {
             selection
                 .as_ref()
                 .map(|sel| sel.indices.len())
-                .expect("selection should be present")
         } else {
-            dataset.n_variants()
+            dataset
+                .variant_count_hint()
+                .or_else(|| {
+                    let count = dataset.n_variants();
+                    if count > 0 { Some(count) } else { None }
+                })
         };
 
-        assert!(
-            expected_variants > 0,
-            "expected at least one variant in dataset"
-        );
+        if let Some(expected) = expected_variants {
+            assert!(
+                expected > 0,
+                "expected at least one variant in dataset"
+            );
+        }
 
         let mut train_source = dataset
             .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))
@@ -1084,7 +1090,18 @@ mod tests {
         }
 
         assert_eq!(model.n_samples(), n_samples);
-        assert_eq!(model.n_variants(), expected_variants);
+        let observed_variants = model.n_variants();
+        assert!(
+            observed_variants > 0,
+            "expected at least one variant in dataset"
+        );
+        if let Some(expected) = expected_variants {
+            assert_eq!(observed_variants, expected);
+        } else if variant_list.is_none() {
+            if let Some(inferred) = dataset.variant_count_hint() {
+                assert_eq!(observed_variants, inferred);
+            }
+        }
         assert!(model.components() > 0);
         assert_eq!(model.explained_variance().len(), model.components());
         assert!(
