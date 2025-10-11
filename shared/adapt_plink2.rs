@@ -263,6 +263,11 @@ fn parse_sex_token(token: &str) -> u8 {
         "2" => 2,
         "M" | "m" => 1,
         "F" | "f" => 2,
+        t if t.eq_ignore_ascii_case("male") => 1,
+        t if t.eq_ignore_ascii_case("female") => 2,
+        t if t.eq_ignore_ascii_case("unknown") => 0,
+        t if t.eq_ignore_ascii_case("unk") => 0,
+        t if t.eq_ignore_ascii_case("u") => 0,
         "0" | "NA" | "na" | "Na" | "nA" | "." | "nan" | "NaN" | "NAN" => 0,
         _ => 0,
     }
@@ -2543,5 +2548,40 @@ mod tests {
         for (v, expect) in hap_vals {
             assert_eq!(u16_to_hardcall_biallelic(v, 1), expect);
         }
+    }
+
+    #[test]
+    fn fam_row_uses_sid_when_iid_missing() {
+        let fields = ["", "unused", "sid123", "1"];
+        let cols = PsamColumns {
+            fid_idx: Some(0),
+            iid_idx: None,
+            pat_idx: None,
+            mat_idx: None,
+            sex_idx: Some(3),
+            pheno_idx: None,
+            pheno1_idx: None,
+            sid_idx: Some(2),
+        };
+        let fam = FamRow::from_fields(&fields, &cols);
+        assert_eq!(fam.iid, "sid123");
+        assert_eq!(fam.fid, "sid123");
+        assert_eq!(fam.sex, "1");
+    }
+
+    #[test]
+    fn parse_sex_token_supports_common_words() {
+        assert_eq!(parse_sex_token("male"), 1);
+        assert_eq!(parse_sex_token("FEMALE"), 2);
+        assert_eq!(parse_sex_token("Unknown"), 0);
+        assert_eq!(parse_sex_token("UNK"), 0);
+    }
+
+    #[test]
+    fn coerce_pheno_token_handles_missing_values() {
+        assert_eq!(coerce_pheno_token("   "), "-9");
+        assert_eq!(coerce_pheno_token("NaN"), "-9");
+        assert_eq!(coerce_pheno_token("1.5"), "1.5");
+        assert_eq!(coerce_pheno_token("nonsense"), "-9");
     }
 }
