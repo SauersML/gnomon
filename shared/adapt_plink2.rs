@@ -36,8 +36,9 @@ use std::sync::{Arc, Mutex};
 /// These are expected to already exist (per your provided infrastructure).
 use crate::score::pipeline::PipelineError;
 use crate::{
+    ByteRangeSource,
     // Traits
-    TextSource, ByteRangeSource,
+    TextSource,
     // Helpers
     open_text_source,
 };
@@ -54,6 +55,17 @@ pub struct VirtualPlink19 {
     pub bim: Box<dyn TextSource>,
     /// Streaming virtual `.fam` (PLINK-1.9 tab text).
     pub fam: Box<dyn TextSource>,
+    build: GenomeBuild,
+}
+
+impl VirtualPlink19 {
+    /// Returns the inferred genome build (`"GRCh37"` or `"GRCh38"`).
+    pub fn inferred_genome_build(&self) -> &'static str {
+        match self.build {
+            GenomeBuild::Grch37 => "GRCh37",
+            GenomeBuild::Grch38 => "GRCh38",
+        }
+    }
 }
 
 /// Open from filesystem paths. `.pvar` and `.psam` are opened with your existing
@@ -69,11 +81,7 @@ pub fn open_virtual_plink19_from_paths(
     let mut psam_for_plan = open_text_source(psam_path)?;
     let pgen = Arc::new(LocalFileByteRangeSource::open(pgen_path)?);
 
-    open_virtual_plink19_from_sources(
-        pgen,
-        &mut *pvar_for_plan,
-        &mut *psam_for_plan,
-    )
+    open_virtual_plink19_from_sources(pgen, &mut *pvar_for_plan, &mut *psam_for_plan)
 }
 
 /// Open from caller-provided sources. Callers may pass custom/remote-capable
@@ -86,6 +94,7 @@ pub fn open_virtual_plink19_from_sources(
     let header = PgenHeader::parse(&*pgen)?;
     let psam_info = PsamInfo::from_psam(psam_for_plan)?;
     let plan = VariantPlan::from_pvar(pvar_for_plan)?;
+    let inferred_build = plan.inferred_build();
 
     if header.m_variants != 0 && header.m_variants as usize != plan.in_variants {
         return Err(PipelineError::Io(format!(
@@ -108,7 +117,8 @@ pub fn open_virtual_plink19_from_sources(
         PgenMode::Bed => {
             if plan.out_variants != plan.in_variants {
                 return Err(PipelineError::Io(
-                    "Cannot split multiallelic variants when .pgen mode is 0x01 (embedded .bed)".into(),
+                    "Mode 0x01 (.bed) cannot expand multiallelic variants; re-encode the input to mode 0x10/0x11"
+                        .into(),
                 ));
             }
             pgen.clone()
@@ -121,13 +131,14 @@ pub fn open_virtual_plink19_from_sources(
                 plan.in_variants,
                 plan.alts_per_in.clone(),
             )?;
-            let sex_by_sample_arc: Arc<[u8]> = Arc::from(
-                psam_info
-                    .sex_by_sample
-                    .clone()
-                    .into_boxed_slice(),
-            );
-            Arc::new(VirtualBed::new(decoder, plan.clone(), psam_info.n_samples, sex_by_sample_arc)?)
+            let sex_by_sample_arc: Arc<[u8]> =
+                Arc::from(psam_info.sex_by_sample.clone().into_boxed_slice());
+            Arc::new(VirtualBed::new(
+                decoder,
+                plan.clone(),
+                psam_info.n_samples,
+                sex_by_sample_arc,
+            )?)
         }
     };
 
@@ -138,6 +149,7 @@ pub fn open_virtual_plink19_from_sources(
         bed: bed_source,
         bim,
         fam,
+        build: inferred_build,
     })
 }
 
@@ -323,6 +335,9 @@ fn coerce_pheno_token(tok: &str) -> String {
     {
         return "-9".to_string();
     }
+    if t == "0" {
+        return "-9".to_string();
+    }
     if t.parse::<f64>().is_ok() {
         t.to_string()
     } else {
@@ -333,7 +348,8 @@ fn coerce_pheno_token(tok: &str) -> String {
 impl FamRow {
     fn from_fields(fields: &[&str], cols: &PsamColumns) -> FamRow {
         let default = |val: &str| val.to_string();
-        let get_opt = |idx: Option<usize>| idx.and_then(|i| fields.get(i)).map(|s| (*s).to_string());
+        let get_opt =
+            |idx: Option<usize>| idx.and_then(|i| fields.get(i)).map(|s| (*s).to_string());
         let iid = get_opt(cols.iid_idx)
             .or_else(|| get_opt(cols.fid_idx))
             .unwrap_or_else(|| "0".to_string());
@@ -341,6 +357,7 @@ impl FamRow {
         let pat = get_opt(cols.pat_idx).unwrap_or_else(|| default("0"));
         let mat = get_opt(cols.mat_idx).unwrap_or_else(|| default("0"));
         let sex = get_opt(cols.sex_idx).unwrap_or_else(|| default("0"));
+        // PHENO1 takes precedence when both PHENO and PHENO1 are present.
         let phe = cols
             .pheno1_idx
             .and_then(|i| fields.get(i))
@@ -386,6 +403,7 @@ struct VariantPlan {
     bim_lines: Vec<BimLine>,
     /// ALT allele count per input variant.
     alts_per_in: Vec<u16>,
+    build: GenomeBuild,
 }
 
 #[derive(Clone)]
@@ -485,6 +503,8 @@ impl VariantPlan {
         let mut in_idx: u32 = 0;
         let mut in_variants: usize = 0;
         let mut max_x_pos: u64 = 0;
+        let mut saw_x_par37_only = false;
+        let mut saw_x_par38_only = false;
 
         while let Some(line) = pvar.next_line()? {
             let s = str::from_utf8(line)
@@ -535,23 +555,35 @@ impl VariantPlan {
                 .map_err(|_| ioerr("Invalid POS in .pvar (expected integer)"))?;
             if chrom == "X" {
                 max_x_pos = max_x_pos.max(pos);
+                let in37 = in_any_range(pos, GRCH37_X_PAR);
+                let in38 = in_any_range(pos, GRCH38_X_PAR);
+                if in37 && !in38 {
+                    saw_x_par37_only = true;
+                }
+                if in38 && !in37 {
+                    saw_x_par38_only = true;
+                }
+            }
+
+            let alts: Vec<&str> = alt_raw
+                .split(',')
+                .map(|a| a.trim())
+                .filter(|a| !a.is_empty() && *a != ".")
+                .collect();
+
+            for alt in &alts {
+                if is_symbolic_alt(alt) {
+                    return Err(PipelineError::Io(format!(
+                        "Symbolic ALT '{}' unsupported for variant {}:{} (ID {})",
+                        alt, chrom, pos, id_raw
+                    )));
+                }
             }
 
             let out_start = out_to_in.len();
             let mut alt_ord: u16 = 1;
             let mut emitted = 0usize;
-            let alt_cnt = alt_raw
-                .split(',')
-                .filter(|a| {
-                    let t = a.trim();
-                    !t.is_empty() && t != &"."
-                })
-                .count() as u16;
-            for alt in alt_raw.split(',') {
-                let alt = alt.trim();
-                if alt.is_empty() || alt == "." {
-                    continue;
-                }
+            for alt in alts.iter() {
                 out_to_in.push((in_idx, alt_ord));
                 haploidy.push(HaploidyKind::Diploid);
                 bim_lines.push(BimLine {
@@ -559,7 +591,7 @@ impl VariantPlan {
                     pos,
                     id: id_raw.to_string(),
                     refa: ref_raw.to_string(),
-                    alt: alt.to_string(),
+                    alt: (*alt).to_string(),
                 });
                 alt_ord += 1;
                 emitted += 1;
@@ -572,7 +604,7 @@ impl VariantPlan {
                 out_end,
             });
 
-            alts_per_in.push(alt_cnt);
+            alts_per_in.push(alts.len() as u16);
             in_idx += 1;
             in_variants += 1;
         }
@@ -583,7 +615,20 @@ impl VariantPlan {
             ));
         }
 
-        let build = infer_genome_build(max_x_pos);
+        if saw_x_par37_only && saw_x_par38_only {
+            return Err(PipelineError::Io(
+                "Encountered X PAR loci matching both GRCh37-only and GRCh38-only ranges; cannot infer a single build"
+                    .to_string(),
+            ));
+        }
+
+        let build = if saw_x_par37_only {
+            GenomeBuild::Grch37
+        } else if saw_x_par38_only {
+            GenomeBuild::Grch38
+        } else {
+            infer_genome_build(max_x_pos)
+        };
         for entry in per_variant {
             let hap = haploidy_for_variant(&entry.chrom, entry.pos, build);
             for idx in entry.out_start..entry.out_end {
@@ -600,6 +645,7 @@ impl VariantPlan {
             haploidy,
             bim_lines,
             alts_per_in,
+            build,
         })
     }
 
@@ -619,10 +665,12 @@ impl VariantPlan {
 
     #[inline]
     fn alt_count_of_in(&self, in_idx: u32) -> u16 {
-        self.alts_per_in
-            .get(in_idx as usize)
-            .copied()
-            .unwrap_or(1)
+        self.alts_per_in.get(in_idx as usize).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn inferred_build(&self) -> GenomeBuild {
+        self.build
     }
 }
 
@@ -664,11 +712,24 @@ fn normalize_chrom(raw: &str) -> String {
     }
 }
 
+fn is_symbolic_alt(alt: &str) -> bool {
+    let trimmed = alt.trim();
+    if trimmed == "*" {
+        return true;
+    }
+    if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        return true;
+    }
+    trimmed.contains('[') || trimmed.contains(']')
+}
+
 const GRCH37_X_PAR: &[(u64, u64)] = &[(60_001, 2_699_520), (154_931_044, 155_260_560)];
 const GRCH38_X_PAR: &[(u64, u64)] = &[(10_001, 2_781_479), (155_701_383, 156_030_895)];
 
 fn in_any_range(pos: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|(start, end)| pos >= *start && pos <= *end)
+    ranges
+        .iter()
+        .any(|(start, end)| pos >= *start && pos <= *end)
 }
 
 fn haploidy_for_variant(chrom: &str, pos: u64, build: GenomeBuild) -> HaploidyKind {
@@ -895,6 +956,42 @@ fn enforce_haploidy(hardcalls: &mut [u8], sex_by_sample: &[u8], kind: HaploidyKi
     }
 }
 
+fn fill_sample_ploidy(
+    buf: &mut Vec<u8>,
+    kind: HaploidyKind,
+    sex_by_sample: &[u8],
+    n_samples: usize,
+) {
+    buf.clear();
+    buf.resize(n_samples, 2);
+    match kind {
+        HaploidyKind::Diploid => {}
+        HaploidyKind::HaploidAll => {
+            for v in buf.iter_mut() {
+                *v = 1;
+            }
+        }
+        HaploidyKind::HaploidMales => {
+            let limit = sex_by_sample.len().min(n_samples);
+            for i in 0..limit {
+                if sex_by_sample[i] == 1 {
+                    buf[i] = 1;
+                }
+            }
+        }
+        HaploidyKind::HaploidMalesFemalesMissing => {
+            let limit = sex_by_sample.len().min(n_samples);
+            for i in 0..limit {
+                match sex_by_sample[i] {
+                    1 => buf[i] = 1,
+                    2 => buf[i] = 0,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 impl ByteRangeSource for VirtualBed {
     fn len(&self) -> u64 {
         self.total_len()
@@ -914,6 +1011,7 @@ impl ByteRangeSource for VirtualBed {
         }
 
         let mut written = 0usize;
+        let mut sample_ploidy_buf: Vec<u8> = Vec::new();
 
         // 1) Serve the 3-byte header if requested.
         if offset < 3 {
@@ -960,13 +1058,34 @@ impl ByteRangeSource for VirtualBed {
                     .mapping(out_idx)
                     .ok_or_else(|| ioerr("VariantPlan mapping out of bounds"))?;
                 let alt_count = self.plan.alt_count_of_in(in_idx);
+                if alt_count == 0 {
+                    return Err(PipelineError::Io(format!(
+                        "ALT count missing for variant {} in .pvar plan",
+                        in_idx
+                    )));
+                }
                 if alt_count != 0 && alt_ord > alt_count {
                     return Err(ioerr("ALT ordinal exceeds allele count in .pvar"));
                 }
-                let mut hard = vec![255u8; self.n_samples]; // 255 = missing
-                decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard)?;
+                let haploidy_kind = self.plan.haploidy_of(out_idx);
+                let sample_ploidy = haploidy_kind.and_then(|kind| {
+                    if matches!(kind, HaploidyKind::Diploid) {
+                        None
+                    } else {
+                        fill_sample_ploidy(
+                            &mut sample_ploidy_buf,
+                            kind,
+                            &self.sex_by_sample,
+                            self.n_samples,
+                        );
+                        Some(sample_ploidy_buf.as_slice())
+                    }
+                });
 
-                if let Some(kind) = self.plan.haploidy_of(out_idx) {
+                let mut hard = vec![255u8; self.n_samples]; // 255 = missing
+                decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard, sample_ploidy)?;
+
+                if let Some(kind) = haploidy_kind {
                     if !matches!(kind, HaploidyKind::Diploid) {
                         enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
                     }
@@ -1006,7 +1125,10 @@ struct BlockCache {
 
 impl BlockCache {
     fn new(cap: usize) -> Self {
-        Self { cap, vals: VecDeque::new() }
+        Self {
+            cap,
+            vals: VecDeque::new(),
+        }
     }
 
     fn get(&mut self, k: usize) -> Option<&Vec<u8>> {
@@ -1046,7 +1168,10 @@ impl LocalFileByteRangeSource {
             .metadata()
             .map_err(|e| PipelineError::Io(format!("Metadata {}: {e}", path.display())))?
             .len();
-        Ok(Self { file: Mutex::new(f), len })
+        Ok(Self {
+            file: Mutex::new(f),
+            len,
+        })
     }
 }
 impl ByteRangeSource for LocalFileByteRangeSource {
@@ -1057,11 +1182,7 @@ impl ByteRangeSource for LocalFileByteRangeSource {
         if dst.is_empty() {
             return Ok(());
         }
-        if offset
-            .checked_add(dst.len() as u64)
-            .unwrap_or(u64::MAX)
-            > self.len
-        {
+        if offset.checked_add(dst.len() as u64).unwrap_or(u64::MAX) > self.len {
             return Err(ioerr("Attempted to read past end of local .pgen"));
         }
         let mut f = self.file.lock().unwrap();
@@ -1098,6 +1219,31 @@ fn read_le_u64(src: &dyn ByteRangeSource, off: u64) -> Result<u64, PipelineError
     Ok(u64::from_le_bytes(buf))
 }
 
+fn read_varint_from_source(
+    src: &dyn ByteRangeSource,
+    offset: &mut u64,
+) -> Result<u64, PipelineError> {
+    let mut out: u64 = 0;
+    let mut shift = 0;
+    loop {
+        if *offset >= src.len() {
+            return Err(ioerr("Unexpected EOF in header varint"));
+        }
+        let mut byte = [0u8; 1];
+        src.read_at(*offset, &mut byte)?;
+        *offset += 1;
+        out |= ((byte[0] & 0x7f) as u64) << shift;
+        if (byte[0] & 0x80) == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(ioerr("Header varint too large"));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone)]
 struct PgenHeader {
     mode: PgenMode,
@@ -1128,10 +1274,14 @@ impl PgenHeader {
             0x10 => PgenMode::Var,
             0x11 => PgenMode::VarIgnorable,
             0x20 | 0x21 => {
-                return Err(ioerr("External index modes (0x20/0x21) unsupported here"))
+                return Err(ioerr(
+                    "External index modes (0x20/0x21) unsupported; re-encode with `plink2 --pgen ... --make-pgen`",
+                ))
             }
             other => {
-                return Err(PipelineError::Io(format!("Unsupported PGEN mode 0x{other:02x}")))
+                return Err(PipelineError::Io(format!(
+                    "Unsupported PGEN mode 0x{other:02x}"
+                )));
             }
         };
 
@@ -1150,7 +1300,10 @@ impl PgenHeader {
         let m_variants = read_le_u32(src, 3)?;
         let n_samples = read_le_u32(src, 7)?;
 
-        if matches!(mode, PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage) {
+        if matches!(
+            mode,
+            PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage
+        ) {
             return Ok(Self {
                 mode,
                 m_variants,
@@ -1256,6 +1409,36 @@ impl PgenHeader {
             }
 
             idx += cnt;
+        }
+
+        if mode == PgenMode::VarIgnorable {
+            let mut ext_off = off;
+            let header_flags = read_varint_from_source(src, &mut ext_off)?;
+            let footer_flags = read_varint_from_source(src, &mut ext_off)?;
+            if footer_flags != 0 {
+                let end = ext_off
+                    .checked_add(8)
+                    .ok_or_else(|| ioerr("Footer offset overflow"))?;
+                if end > src.len() {
+                    return Err(ioerr("EOF reading footer offset"));
+                }
+                ext_off = end;
+            }
+            let mut mask = header_flags;
+            while mask != 0 {
+                if (mask & 1) != 0 {
+                    let len = read_varint_from_source(src, &mut ext_off)?;
+                    let end = ext_off
+                        .checked_add(len)
+                        .ok_or_else(|| ioerr("Header extension length overflow"))?;
+                    if end > src.len() {
+                        return Err(ioerr("Header extension overruns file"));
+                    }
+                    ext_off = end;
+                }
+                mask >>= 1;
+            }
+            off = ext_off;
         }
 
         Ok(Self {
@@ -1421,11 +1604,31 @@ fn difflist_ids(
         };
         first_ids.push(v);
     }
+    let mut group_sizes: Vec<usize> = Vec::with_capacity(g);
     if g > 1 {
         if *cursor + (g - 1) > buf.len() {
             return Err(ioerr("EOF in difflist group sizes"));
         }
+        for raw in &buf[*cursor..*cursor + g - 1] {
+            let sz = *raw as usize;
+            if sz == 0 || sz > 64 {
+                return Err(ioerr("Invalid difflist group size"));
+            }
+            group_sizes.push(sz);
+        }
         *cursor += g - 1;
+    }
+
+    let known: usize = group_sizes.iter().sum();
+    let last_size = l
+        .checked_sub(known)
+        .ok_or_else(|| ioerr("Difflist group sizes exceed entry count"))?;
+    if last_size == 0 || last_size > 64 {
+        return Err(ioerr("Invalid final difflist group size"));
+    }
+    group_sizes.push(last_size);
+    if group_sizes.len() != g {
+        return Err(ioerr("Difflist group count mismatch"));
     }
 
     let m = l - g;
@@ -1436,14 +1639,28 @@ fn difflist_ids(
 
     let mut out = vec![0u32; l];
     let mut di = 0usize;
-    for gi in 0..g {
-        let start = gi * 64;
-        out[start] = first_ids[gi];
-        let end = ((gi + 1) * 64).min(l);
-        for k in start + 1..end {
-            out[k] = out[k - 1] + deltas[di];
+    let mut offset = 0usize;
+    for (gi, &size) in group_sizes.iter().enumerate() {
+        if gi >= first_ids.len() {
+            return Err(ioerr("Difflist first-ID count mismatch"));
+        }
+        if offset >= l || size == 0 || offset + size > l {
+            return Err(ioerr("Difflist group overruns entry count"));
+        }
+        out[offset] = first_ids[gi];
+        for k in 1..size {
+            if di >= deltas.len() {
+                return Err(ioerr("Difflist delta underrun"));
+            }
+            out[offset + k] = out[offset + k - 1]
+                .checked_add(deltas[di])
+                .ok_or_else(|| ioerr("Difflist delta overflow"))?;
             di += 1;
         }
+        offset += size;
+    }
+    if offset != l || di != deltas.len() {
+        return Err(ioerr("Difflist decode count mismatch"));
     }
     Ok(out)
 }
@@ -1495,11 +1712,31 @@ fn difflist_pairs(
         };
         first_ids.push(v);
     }
+    let mut group_sizes: Vec<usize> = Vec::with_capacity(g);
     if g > 1 {
         if *cursor + (g - 1) > buf.len() {
             return Err(ioerr("EOF in difflist group sizes"));
         }
+        for raw in &buf[*cursor..*cursor + g - 1] {
+            let sz = *raw as usize;
+            if sz == 0 || sz > 64 {
+                return Err(ioerr("Invalid difflist group size"));
+            }
+            group_sizes.push(sz);
+        }
         *cursor += g - 1;
+    }
+
+    let known: usize = group_sizes.iter().sum();
+    let last_size = l
+        .checked_sub(known)
+        .ok_or_else(|| ioerr("Difflist group sizes exceed entry count"))?;
+    if last_size == 0 || last_size > 64 {
+        return Err(ioerr("Invalid final difflist group size"));
+    }
+    group_sizes.push(last_size);
+    if group_sizes.len() != g {
+        return Err(ioerr("Difflist group count mismatch"));
     }
 
     let vals_packed = ((l + 3) / 4) as usize;
@@ -1524,6 +1761,9 @@ fn difflist_pairs(
         vals.push((b >> 6) & 0b11);
     }
     *cursor += vals_packed;
+    if vals.len() != l {
+        return Err(ioerr("Difflist values count mismatch"));
+    }
 
     let m = l - g;
     let mut deltas = Vec::with_capacity(m);
@@ -1533,14 +1773,28 @@ fn difflist_pairs(
 
     let mut ids = vec![0u32; l];
     let mut di = 0usize;
-    for gi in 0..g {
-        let start = gi * 64;
-        ids[start] = first_ids[gi];
-        let end = ((gi + 1) * 64).min(l);
-        for k in start + 1..end {
-            ids[k] = ids[k - 1] + deltas[di];
+    let mut offset = 0usize;
+    for (gi, &size) in group_sizes.iter().enumerate() {
+        if gi >= first_ids.len() {
+            return Err(ioerr("Difflist first-ID count mismatch"));
+        }
+        if offset >= l || size == 0 || offset + size > l {
+            return Err(ioerr("Difflist group overruns entry count"));
+        }
+        ids[offset] = first_ids[gi];
+        for k in 1..size {
+            if di >= deltas.len() {
+                return Err(ioerr("Difflist delta underrun"));
+            }
+            ids[offset + k] = ids[offset + k - 1]
+                .checked_add(deltas[di])
+                .ok_or_else(|| ioerr("Difflist delta overflow"))?;
             di += 1;
         }
+        offset += size;
+    }
+    if offset != l || di != deltas.len() {
+        return Err(ioerr("Difflist decode count mismatch"));
     }
 
     Ok(ids
@@ -1625,7 +1879,8 @@ impl PgenDecoder {
                     .hdr
                     .rec_lens
                     .get(idx)
-                    .ok_or_else(|| ioerr("Missing rec_len"))? as usize;
+                    .ok_or_else(|| ioerr("Missing rec_len"))?
+                    as usize;
                 let rec_ty = *self
                     .hdr
                     .rec_types
@@ -1642,9 +1897,15 @@ impl PgenDecoder {
         in_idx: u32,
         alt_ord_1b: u16,
         dst: &mut [u8],
+        sample_ploidy: Option<&[u8]>,
     ) -> Result<(), PipelineError> {
         if dst.len() != self.n {
             return Err(ioerr("Hardcall buffer length must equal sample count"));
+        }
+        if let Some(ploidy) = sample_ploidy {
+            if ploidy.len() != self.n {
+                return Err(ioerr("Sample ploidy length mismatch"));
+            }
         }
         let idx = in_idx as usize;
         if idx >= self.hdr.m_variants as usize {
@@ -1763,7 +2024,7 @@ impl PgenDecoder {
         }
 
         let has_multiallelic = (rec_ty & 0b0000_1000) != 0;
-        let alt_count = self.alt_counts.get(idx).copied().unwrap_or(1);
+        let alt_count = self.alt_counts.get(idx).copied().unwrap_or(0);
         let mut a1dosage = vec![255u8; self.n];
         if has_multiallelic {
             apply_multiallelic_and_project(
@@ -1781,23 +2042,64 @@ impl PgenDecoder {
 
         if (rec_ty & 0b0001_0000) != 0 {
             if cursor >= len {
-                return Err(ioerr("EOF in phase header"));
+                return Err(PipelineError::Io(format!(
+                    "EOF in phase header (variant #{idx})"
+                )));
             }
             let start = cursor;
-            let first_byte = buf[cursor];
-            cursor += 1;
-            let phasepresent = (first_byte & 1) == 1;
+            let mut bit_cursor = 0usize;
+            let phasepresent = (buf[start] & 1) == 1;
+            bit_cursor += 1;
             let h = cats.iter().filter(|&&c| c == 1).count();
-            let p = h; // safe upper bound when presence mask is sparse
-            let total_bits = 1 + if phasepresent { h } else { 0 } + p;
-            let bytes_needed = (total_bits + 7) / 8;
+            let mut phased_count = h;
+            if phasepresent {
+                let mut present_count = 0usize;
+                for _ in 0..h {
+                    let bit_idx = bit_cursor;
+                    let byte_idx = start + (bit_idx >> 3);
+                    if byte_idx >= len {
+                        return Err(PipelineError::Io(format!(
+                            "EOF in phase presence (variant #{idx})"
+                        )));
+                    }
+                    let byte = buf[byte_idx];
+                    if (byte >> (bit_idx & 7)) & 1 == 1 {
+                        present_count += 1;
+                    }
+                    bit_cursor += 1;
+                }
+                phased_count = present_count;
+                if bit_cursor & 7 != 0 {
+                    bit_cursor += 8 - (bit_cursor & 7);
+                }
+            }
+            for _ in 0..phased_count {
+                let bit_idx = bit_cursor;
+                let byte_idx = start + (bit_idx >> 3);
+                if byte_idx >= len {
+                    return Err(PipelineError::Io(format!(
+                        "EOF in phase info (variant #{idx})"
+                    )));
+                }
+                bit_cursor += 1;
+            }
+            let bytes_needed = (bit_cursor + 7) / 8;
             if start + bytes_needed > len {
-                return Err(ioerr("EOF in phase track"));
+                return Err(PipelineError::Io(format!(
+                    "EOF in phase track (variant #{idx})"
+                )));
             }
             cursor = start + bytes_needed;
         }
 
         let has_dosage = (rec_ty & 0b0110_0000) != 0;
+        if has_dosage && alt_count > 1 {
+            return Err(PipelineError::Io(format!(
+                "Multi-allelic dosage tracks unsupported (variant #{idx})"
+            )));
+        }
+
+        let mut dosage_entries = 0usize;
         if has_dosage && (alt_count <= 1 || alt_ord_1b == 1) {
             let b5 = (rec_ty & 0b0010_0000) != 0;
             let b6 = (rec_ty & 0b0100_0000) != 0;
@@ -1807,52 +2109,109 @@ impl PgenDecoder {
                 let cnt = ids.len();
                 let need = cnt * 2;
                 if cursor + need > len {
-                    return Err(ioerr("EOF in dosage values"));
+                    return Err(PipelineError::Io(format!(
+                        "EOF in dosage values (variant #{idx})"
+                    )));
                 }
-                for (i, sid) in ids.iter().enumerate() {
-                    if (*sid as usize) < self.n {
-                        let v = u16::from_le_bytes([
-                            buf[cursor + 2 * i],
-                            buf[cursor + 2 * i + 1],
-                        ]);
-                        if a1dosage[*sid as usize] == 255 && v != 65535 {
-                            a1dosage[*sid as usize] = u16_to_hardcall_biallelic(v, 2.0);
+                for (i, &sid) in ids.iter().enumerate() {
+                    if (sid as usize) < self.n {
+                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                        if a1dosage[sid as usize] == 255 && v != 65535 {
+                            let pl = sample_ploidy
+                                .and_then(|p| p.get(sid as usize))
+                                .copied()
+                                .unwrap_or(2);
+                            let hc = u16_to_hardcall_biallelic(v, pl);
+                            if hc != 255 {
+                                a1dosage[sid as usize] = hc;
+                            }
                         }
                     }
                 }
                 cursor += need;
+                dosage_entries = cnt;
             } else if !b5 && b6 {
                 let need = self.n * 2;
                 if cursor + need > len {
-                    return Err(ioerr("EOF in dense dosage values"));
+                    return Err(PipelineError::Io(format!(
+                        "EOF in dense dosage values (variant #{idx})"
+                    )));
                 }
                 for s in 0..self.n {
-                    let v = u16::from_le_bytes([
-                        buf[cursor + 2 * s],
-                        buf[cursor + 2 * s + 1],
-                    ]);
+                    let v = u16::from_le_bytes([buf[cursor + 2 * s], buf[cursor + 2 * s + 1]]);
                     if a1dosage[s] == 255 && v != 65535 {
-                        a1dosage[s] = u16_to_hardcall_biallelic(v, 2.0);
+                        let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
+                        let hc = u16_to_hardcall_biallelic(v, pl);
+                        if hc != 255 {
+                            a1dosage[s] = hc;
+                        }
                     }
                 }
                 cursor += need;
+                dosage_entries = self.n;
             } else {
                 let present = read_bitarray_indices(buf, &mut cursor, self.n)?;
                 let cnt = present.len();
                 let need = cnt * 2;
                 if cursor + need > len {
-                    return Err(ioerr("EOF in sparse dosage values"));
+                    return Err(PipelineError::Io(format!(
+                        "EOF in sparse dosage values (variant #{idx})"
+                    )));
                 }
-                for (i, s) in present.into_iter().enumerate() {
+                for (i, &s) in present.iter().enumerate() {
                     if s < self.n {
-                        let v = u16::from_le_bytes([
-                            buf[cursor + 2 * i],
-                            buf[cursor + 2 * i + 1],
-                        ]);
+                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
                         if a1dosage[s] == 255 && v != 65535 {
-                            a1dosage[s] = u16_to_hardcall_biallelic(v, 2.0);
+                            let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
+                            let hc = u16_to_hardcall_biallelic(v, pl);
+                            if hc != 255 {
+                                a1dosage[s] = hc;
+                            }
                         }
                     }
+                }
+                cursor += need;
+                dosage_entries = cnt;
+            }
+        }
+
+        if (rec_ty & 0b1000_0000) != 0 {
+            if !has_dosage {
+                return Err(PipelineError::Io(format!(
+                    "Phased dosage track present without dosage (variant #{idx})"
+                )));
+            }
+            let b5 = (rec_ty & 0b0010_0000) != 0;
+            let b6 = (rec_ty & 0b0100_0000) != 0;
+            if !b5 && b6 {
+                let need = self.n * 2;
+                if cursor + need > len {
+                    return Err(PipelineError::Io(format!(
+                        "EOF in phased dense dosage values (variant #{idx})"
+                    )));
+                }
+                cursor += need;
+            } else {
+                let d = dosage_entries;
+                let nbytes = (d + 7) / 8;
+                if cursor + nbytes > len {
+                    return Err(PipelineError::Io(format!(
+                        "EOF in phased dosage presence (variant #{idx})"
+                    )));
+                }
+                let mut present_count = 0usize;
+                for bit in 0..d {
+                    let byte = buf[cursor + (bit >> 3)];
+                    if (byte >> (bit & 7)) & 1 == 1 {
+                        present_count += 1;
+                    }
+                }
+                cursor += nbytes;
+                let need = present_count * 2;
+                if cursor + need > len {
+                    return Err(PipelineError::Io(format!(
+                        "EOF in phased dosage values (variant #{idx})"
+                    )));
                 }
                 cursor += need;
             }
@@ -2082,22 +2441,45 @@ fn apply_multiallelic_and_project(
     Ok(())
 }
 
-fn u16_to_hardcall_biallelic(v: u16, max_dosage: f32) -> u8 {
-    if v == 65535 {
+fn u16_to_hardcall_biallelic(v: u16, ploidy: u8) -> u8 {
+    if v == 65535 || ploidy == 0 {
         return 255;
     }
-    let ds = (v as f32) * (1.0 / 32768.0) * max_dosage;
-    let candidates = [0.0f32, 1.0, 2.0];
-    let mut best = 255u8;
-    let mut best_d = f32::INFINITY;
-    for (i, &c) in candidates.iter().enumerate() {
-        let d = (ds - c).abs();
-        if d < best_d {
-            best_d = d;
-            best = i as u8;
+    if ploidy <= 1 {
+        let ds = (v as f32) * (1.0 / 32768.0) * 1.0;
+        let candidates = [0.0f32, 1.0];
+        let mut best = 255u8;
+        let mut best_d = f32::INFINITY;
+        for (i, &c) in candidates.iter().enumerate() {
+            let d = (ds - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = i as u8;
+            }
         }
+        if best_d <= 0.10 {
+            match best {
+                0 => 0,
+                1 => 2,
+                _ => 255,
+            }
+        } else {
+            255
+        }
+    } else {
+        let ds = (v as f32) * (1.0 / 32768.0) * 2.0;
+        let candidates = [0.0f32, 1.0, 2.0];
+        let mut best = 255u8;
+        let mut best_d = f32::INFINITY;
+        for (i, &c) in candidates.iter().enumerate() {
+            let d = (ds - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = i as u8;
+            }
+        }
+        if best_d <= 0.10 { best } else { 255 }
     }
-    if best_d <= 0.10 { best } else { 255 }
 }
 
 fn unpack_plink1_block(block: &[u8], dst: &mut [u8], n: usize) {
@@ -2150,7 +2532,16 @@ mod tests {
             (((2.00 / 2.0) * 32768.0) as u16, 2u8),
         ];
         for (v, expect) in vals {
-            assert_eq!(u16_to_hardcall_biallelic(v, 2.0), expect);
+            assert_eq!(u16_to_hardcall_biallelic(v, 2), expect);
+        }
+
+        let hap_vals = [
+            (((0.02 / 1.0) * 32768.0) as u16, 0u8),
+            (((0.50 / 1.0) * 32768.0) as u16, 255u8),
+            (((0.95 / 1.0) * 32768.0) as u16, 2u8),
+        ];
+        for (v, expect) in hap_vals {
+            assert_eq!(u16_to_hardcall_biallelic(v, 1), expect);
         }
     }
 }
