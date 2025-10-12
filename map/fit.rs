@@ -42,6 +42,19 @@ const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
 const DEFAULT_GRAM_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
+#[inline]
+fn select_top_k_desc(ordering: &mut [(usize, f64)], k: usize) -> usize {
+    let mid = k.min(ordering.len());
+    if mid == 0 {
+        return 0;
+    }
+    let desc =
+        |a: &(usize, f64), b: &(usize, f64)| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal);
+    ordering.select_nth_unstable_by(mid - 1, desc);
+    ordering[..mid].sort_by(desc);
+    mid
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CovarianceComputationMode {
     Dense,
@@ -1209,20 +1222,12 @@ where
         let (info, eigvals, eigvecs) = run_partial_eigensolver(operator, target, par, &v0, params)?;
 
         let n_converged = info.n_converged_eigen.min(target);
-        let mut ordering = Vec::with_capacity(n_converged);
-        for idx in 0..n_converged {
-            ordering.push((idx, eigvals[idx]));
-        }
 
-        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
-
-        let mut positive = 0usize;
-        for &(_, value) in &ordering {
-            if value <= EIGENVALUE_EPSILON {
-                break;
-            }
-            positive += 1;
-        }
+        let positive = eigvals
+            .iter()
+            .take(n_converged)
+            .filter(|&&v| v > EIGENVALUE_EPSILON)
+            .count();
 
         if positive == 0 {
             return Ok(Eigenpairs {
@@ -1232,9 +1237,16 @@ where
         }
 
         let keep = positive.min(desired);
-        let mut values = Vec::with_capacity(keep);
-        let mut vectors = Mat::zeros(n, keep);
-        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
             values.push(value);
             for row in 0..n {
                 vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
@@ -1291,20 +1303,7 @@ where
         let diag = eig.S();
         let basis = eig.U();
 
-        let mut ordering = Vec::with_capacity(n);
-        for idx in 0..n {
-            ordering.push((idx, diag[idx]));
-        }
-
-        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
-
-        let mut positive = 0usize;
-        for &(_, value) in &ordering {
-            if value <= EIGENVALUE_EPSILON {
-                break;
-            }
-            positive += 1;
-        }
+        let positive = (0..n).filter(|&i| diag[i] > EIGENVALUE_EPSILON).count();
 
         let keep = positive.min(top_k);
         if keep == 0 {
@@ -1314,9 +1313,16 @@ where
             });
         }
 
-        let mut values = Vec::with_capacity(keep);
-        let mut vectors = Mat::zeros(n, keep);
-        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
+        let mut ordering = Vec::with_capacity(n);
+        for idx in 0..n {
+            ordering.push((idx, diag[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
             values.push(value);
             for row in 0..n {
                 vectors[(row, out_idx)] = basis[(row, src_idx)];
@@ -1355,20 +1361,10 @@ where
         };
 
         let n_converged = info.n_converged_eigen.min(target);
-        let mut ordering = Vec::with_capacity(n_converged);
-        for idx in 0..n_converged {
-            ordering.push((idx, eigvals[idx]));
-        }
 
-        ordering.sort_by(|lhs, rhs| rhs.1.partial_cmp(&lhs.1).unwrap_or(Ordering::Equal));
-
-        let mut positive = 0usize;
-        for &(_, value) in &ordering {
-            if value <= EIGENVALUE_EPSILON {
-                break;
-            }
-            positive += 1;
-        }
+        let positive = (0..n_converged)
+            .filter(|&i| eigvals[i] > EIGENVALUE_EPSILON)
+            .count();
 
         if positive == 0 {
             return Ok(Eigenpairs {
@@ -1378,9 +1374,16 @@ where
         }
 
         let keep = positive.min(top_k);
-        let mut values = Vec::with_capacity(keep);
-        let mut vectors = Mat::zeros(n, keep);
-        for (out_idx, (src_idx, value)) in ordering.into_iter().take(keep).enumerate() {
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
             values.push(value);
             for row in 0..n {
                 vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
