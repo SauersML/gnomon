@@ -520,8 +520,8 @@ pub fn train_model(
         layout.total_coeffs, layout.num_penalties
     );
 
-    let design_condition = calculate_condition_number(&x_matrix)
-        .map_err(EstimationError::EigendecompositionFailed)?;
+    let design_condition =
+        calculate_condition_number(&x_matrix).map_err(EstimationError::EigendecompositionFailed)?;
     if matches!(config.link_function, LinkFunction::Identity) {
         if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
             let reported_condition = if design_condition.is_finite() {

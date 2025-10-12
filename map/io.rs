@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::str::{self, FromStr};
+use std::str;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -20,16 +20,16 @@ use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
 };
+use noodles_bcf::Record as BcfRecord;
 use noodles_bcf::io::Reader as BcfReader;
 use noodles_bgzf::io::Reader as BgzfReader;
 use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::{
-    self as vcf,
+    self as vcf, Record as VcfRecord,
     variant::RecordBuf,
-    variant::record::samples::keys::key,
-    variant::record_buf::samples::sample::{
-        self, Value,
-        value::{Array, genotype::Genotype as SampleGenotype},
+    variant::record::samples::{
+        keys::key,
+        series::{self, Value as SeriesValue, value::Array as SeriesArray},
     },
 };
 use thiserror::Error;
@@ -1255,7 +1255,9 @@ pub struct VcfLikeVariantBlockSource {
     compression: Option<VariantCompression>,
     format: Option<VariantFormat>,
     header: Option<Arc<vcf::Header>>,
-    record: RecordBuf,
+    vcf_record: VcfRecord,
+    bcf_record: BcfRecord,
+    prefer_ds: bool,
     sample_names: Arc<Vec<String>>,
     n_samples: usize,
     variant_count: Arc<VariantCountTracker>,
@@ -1848,7 +1850,9 @@ impl VcfLikeVariantBlockSource {
             compression: None,
             format: None,
             header: None,
-            record: RecordBuf::default(),
+            vcf_record: VcfRecord::default(),
+            bcf_record: BcfRecord::default(),
+            prefer_ds: false,
             sample_names,
             n_samples,
             variant_count,
@@ -1901,6 +1905,9 @@ impl VcfLikeVariantBlockSource {
             VariantIoError::Io(err)
         })?;
 
+        let formats = header.formats();
+        self.prefer_ds = formats.contains_key("DS");
+
         let observed = header.sample_names();
         if observed.len() != self.sample_names.len()
             || !observed
@@ -1921,19 +1928,15 @@ impl VcfLikeVariantBlockSource {
         self.compression = Some(compression);
         self.format = Some(format);
         self.header = Some(Arc::new(header));
-        self.record = RecordBuf::default();
         Ok(())
     }
 
     fn read_next_variant(&mut self) -> Result<Option<usize>, VariantIoError> {
         loop {
-            let header = match self.header.as_ref() {
-                Some(header) => Arc::clone(header),
-                None => {
-                    self.stream_exhausted = true;
-                    return Ok(None);
-                }
-            };
+            if self.header.is_none() {
+                self.stream_exhausted = true;
+                return Ok(None);
+            }
 
             let reader = match self.reader.as_mut() {
                 Some(reader) => reader,
@@ -1946,20 +1949,36 @@ impl VcfLikeVariantBlockSource {
             let compression = self.compression;
             let format = self.format;
             let path = self.parts.get(self.part_idx).cloned();
-            let bytes = reader
-                .read_record_buf(header.as_ref(), &mut self.record)
-                .map_err(|err| {
-                    if let Some(part_path) = path.as_ref() {
-                        print_variant_diagnostics(
-                            part_path,
-                            compression,
-                            format,
-                            "reading variant record block",
-                            &err,
-                        );
-                    }
-                    VariantIoError::Io(err)
-                })?;
+            let bytes = match reader {
+                VariantStreamReader::Bcf(bcf_reader) => bcf_reader
+                    .read_record(&mut self.bcf_record)
+                    .map_err(|err| {
+                        if let Some(part_path) = path.as_ref() {
+                            print_variant_diagnostics(
+                                part_path,
+                                compression,
+                                format,
+                                "reading variant record block",
+                                &err,
+                            );
+                        }
+                        VariantIoError::Io(err)
+                    })?,
+                VariantStreamReader::Vcf(vcf_reader) => vcf_reader
+                    .read_record(&mut self.vcf_record)
+                    .map_err(|err| {
+                        if let Some(part_path) = path.as_ref() {
+                            print_variant_diagnostics(
+                                part_path,
+                                compression,
+                                format,
+                                "reading variant record block",
+                                &err,
+                            );
+                        }
+                        VariantIoError::Io(err)
+                    })?,
+            };
 
             if bytes == 0 {
                 let next_idx = self.part_idx + 1;
@@ -2077,6 +2096,73 @@ impl VcfLikeVariantBlockSource {
         Some((total_read, aggregated_total))
     }
 
+    fn decode_current_variant(&self, dest: &mut [f64]) -> Result<(), VariantIoError> {
+        if dest.len() < self.n_samples {
+            return Err(VariantIoError::Decode(
+                "destination buffer shorter than number of samples".to_string(),
+            ));
+        }
+
+        match self.format {
+            Some(VariantFormat::Vcf) => {
+                decode_vcf_record(&self.vcf_record, self.n_samples, self.prefer_ds, dest)
+            }
+            Some(VariantFormat::Bcf) => {
+                let header = self
+                    .header
+                    .as_ref()
+                    .ok_or_else(|| VariantIoError::Decode("BCF header missing".to_string()))?;
+                decode_bcf_record(
+                    &self.bcf_record,
+                    header.as_ref(),
+                    self.n_samples,
+                    self.prefer_ds,
+                    dest,
+                )
+            }
+            None => Err(VariantIoError::Decode(
+                "variant stream format unknown".to_string(),
+            )),
+        }
+    }
+
+    fn current_variant_key(&self) -> Result<Option<VariantKey>, VariantIoError> {
+        match self.format {
+            Some(VariantFormat::Vcf) => {
+                let chrom = self.vcf_record.reference_sequence_name().to_string();
+                let Some(start) = self.vcf_record.variant_start() else {
+                    return Ok(None);
+                };
+                let position = start.map_err(|err| {
+                    VariantIoError::Decode(format!("failed to read VCF position: {err}"))
+                })?;
+                Ok(Some(VariantKey::new(&chrom, position.get() as u64)))
+            }
+            Some(VariantFormat::Bcf) => {
+                let header = self
+                    .header
+                    .as_ref()
+                    .ok_or_else(|| VariantIoError::Decode("BCF header missing".to_string()))?;
+                let chrom = self
+                    .bcf_record
+                    .reference_sequence_name(header.string_maps())
+                    .map_err(|err| {
+                        VariantIoError::Decode(format!(
+                            "failed to read BCF reference sequence: {err}"
+                        ))
+                    })?;
+                let Some(start) = self.bcf_record.variant_start() else {
+                    return Ok(None);
+                };
+                let position = start.map_err(|err| {
+                    VariantIoError::Decode(format!("failed to read BCF position: {err}"))
+                })?;
+                Ok(Some(VariantKey::new(chrom, position.get() as u64)))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn next_block_all(
         &mut self,
         max_variants: usize,
@@ -2090,7 +2176,7 @@ impl VcfLikeVariantBlockSource {
 
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
-            decode_variant_record(&self.record, dest, self.n_samples)?;
+            self.decode_current_variant(dest)?;
             filled += 1;
         }
 
@@ -2128,7 +2214,7 @@ impl VcfLikeVariantBlockSource {
 
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
-            decode_variant_record(&self.record, dest, self.n_samples)?;
+            self.decode_current_variant(dest)?;
             filled += 1;
         }
 
@@ -2161,16 +2247,13 @@ impl VcfLikeVariantBlockSource {
                 break;
             };
 
-            let chrom = self.record.reference_sequence_name().to_string();
-            if let Some(position) = self.record.variant_start() {
-                let pos = position.get() as u64;
-                let key = VariantKey::new(&chrom, pos);
+            if let Some(key) = self.current_variant_key()? {
                 if filter.contains(&key) {
                     let is_new_match = self.matched_seen.insert(key.clone());
                     if is_new_match {
                         let offset = filled * self.n_samples;
                         let dest = &mut storage[offset..offset + self.n_samples];
-                        decode_variant_record(&self.record, dest, self.n_samples)?;
+                        self.decode_current_variant(dest)?;
                         if !self.selection_finalized {
                             self.matched_keys.push(key);
                         }
@@ -2369,70 +2452,61 @@ fn print_variant_diagnostics(
     }
 }
 
-fn decode_variant_record(
-    record: &RecordBuf,
-    dest: &mut [f64],
+fn decode_vcf_record(
+    record: &VcfRecord,
     n_samples: usize,
+    prefer_ds: bool,
+    dest: &mut [f64],
 ) -> Result<(), VariantIoError> {
-    if dest.len() < n_samples {
-        return Err(VariantIoError::Decode(
-            "destination buffer shorter than number of samples".to_string(),
-        ));
-    }
-
     dest[..n_samples].fill(f64::NAN);
 
     let samples = record.samples();
-    let ds_series = samples.select("DS");
-    let gt_series = samples.select(key::GENOTYPE);
+    if samples.is_empty() {
+        return Ok(());
+    }
 
-    for sample_idx in 0..n_samples {
-        if let Some(series) = ds_series.as_ref() {
-            match series.get(sample_idx) {
-                Some(Some(value)) => {
-                    if let Some(dosage) = numeric_from_value(value)? {
-                        dest[sample_idx] = dosage;
-                        continue;
-                    }
-                }
-                Some(None) => {
-                    dest[sample_idx] = f64::NAN;
-                    continue;
-                }
-                None => {}
+    let mut ds_index = None;
+    let mut gt_index = None;
+    for (idx, key) in samples.keys().iter().enumerate() {
+        if prefer_ds && ds_index.is_none() && key == "DS" {
+            ds_index = Some(idx);
+        }
+        if gt_index.is_none() && key == key::GENOTYPE {
+            gt_index = Some(idx);
+        }
+    }
+
+    let Some(gt_idx) = gt_index else {
+        return Err(VariantIoError::Decode(
+            "VCF record is missing the required GT FORMAT field".to_string(),
+        ));
+    };
+
+    for (sample_idx, sample) in samples.iter().enumerate().take(n_samples) {
+        let mut ds_field: Option<&str> = None;
+        let mut gt_field: Option<&str> = None;
+
+        for (idx, field) in sample.as_ref().split(':').enumerate() {
+            if prefer_ds && ds_index == Some(idx) {
+                ds_field = Some(field);
+            }
+            if idx == gt_idx {
+                gt_field = Some(field);
             }
         }
 
-        if let Some(series) = gt_series.as_ref() {
-            match series.get(sample_idx) {
-                Some(Some(Value::Genotype(genotype))) => {
-                    if let Some(dosage) = dosage_from_genotype(genotype.as_ref())? {
-                        dest[sample_idx] = dosage;
-                        continue;
-                    }
-                }
-                Some(Some(Value::String(text))) => {
-                    let genotype = SampleGenotype::from_str(text).map_err(|err| {
-                        VariantIoError::Decode(format!(
-                            "failed to parse genotype string '{text}': {err}"
-                        ))
-                    })?;
-                    if let Some(dosage) = dosage_from_genotype(genotype.as_ref())? {
-                        dest[sample_idx] = dosage;
-                        continue;
-                    }
-                }
-                Some(Some(value)) => {
-                    if let Some(dosage) = numeric_from_value(value)? {
-                        dest[sample_idx] = dosage;
-                        continue;
-                    }
-                }
-                Some(None) => {
-                    dest[sample_idx] = f64::NAN;
+        if prefer_ds {
+            if let Some(value) = ds_field {
+                if let Some(parsed) = parse_numeric_str(value)? {
+                    dest[sample_idx] = parsed;
                     continue;
                 }
-                None => {}
+            }
+        }
+
+        if let Some(value) = gt_field {
+            if let Some(parsed) = parse_vcf_genotype(value)? {
+                dest[sample_idx] = parsed;
             }
         }
     }
@@ -2440,46 +2514,231 @@ fn decode_variant_record(
     Ok(())
 }
 
-fn numeric_from_value(value: &Value) -> Result<Option<f64>, VariantIoError> {
-    match value {
-        Value::Integer(n) => Ok(Some(*n as f64)),
-        Value::Float(n) => Ok(Some(*n as f64)),
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                trimmed.parse::<f64>().map(Some).map_err(|err| {
-                    VariantIoError::Decode(format!(
-                        "failed to parse numeric string '{trimmed}': {err}"
-                    ))
-                })
+fn decode_bcf_record(
+    record: &BcfRecord,
+    header: &vcf::Header,
+    n_samples: usize,
+    prefer_ds: bool,
+    dest: &mut [f64],
+) -> Result<(), VariantIoError> {
+    dest[..n_samples].fill(f64::NAN);
+
+    let samples = record
+        .samples()
+        .map_err(|err| VariantIoError::Decode(format!("failed to access BCF samples: {err}")))?;
+
+    if samples.format_count() == 0 {
+        return Ok(());
+    }
+
+    let mut saw_gt = false;
+    let mut used_ds = false;
+
+    for result in samples.series() {
+        let series = result
+            .map_err(|err| VariantIoError::Decode(format!("failed to read BCF series: {err}")))?;
+        let name = series.name(header).map_err(|err| {
+            VariantIoError::Decode(format!("failed to resolve BCF FORMAT name: {err}"))
+        })?;
+
+        if prefer_ds && name == "DS" {
+            decode_bcf_numeric_series(series, header, dest)?;
+            used_ds = true;
+        } else if name == key::GENOTYPE {
+            decode_bcf_genotype_series(series, header, dest)?;
+            saw_gt = true;
+        }
+    }
+
+    if !saw_gt && !(prefer_ds && used_ds) {
+        return Err(VariantIoError::Decode(
+            "BCF record is missing the required GT FORMAT field".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn decode_bcf_numeric_series(
+    series: noodles_bcf::record::samples::Series<'_>,
+    header: &vcf::Header,
+    dest: &mut [f64],
+) -> Result<(), VariantIoError> {
+    for (sample_idx, slot) in dest.iter_mut().enumerate() {
+        if let Some(value) = series.get(header, sample_idx) {
+            match value {
+                Some(Ok(series_value)) => {
+                    if let Some(parsed) = numeric_from_series_value(series_value)? {
+                        *slot = parsed;
+                    }
+                }
+                Some(Err(err)) => {
+                    return Err(VariantIoError::Decode(format!(
+                        "failed to decode BCF FORMAT value: {err}"
+                    )));
+                }
+                None => {}
             }
+        } else {
+            return Err(VariantIoError::Decode(
+                "BCF FORMAT series shorter than expected".to_string(),
+            ));
         }
-        Value::Array(Array::Integer(values)) => {
-            Ok(values.get(0).copied().flatten().map(|n| n as f64))
+    }
+    Ok(())
+}
+
+fn decode_bcf_genotype_series(
+    series: noodles_bcf::record::samples::Series<'_>,
+    header: &vcf::Header,
+    dest: &mut [f64],
+) -> Result<(), VariantIoError> {
+    for (sample_idx, slot) in dest.iter_mut().enumerate() {
+        if !slot.is_nan() {
+            continue;
         }
-        Value::Array(Array::Float(values)) => {
-            Ok(values.get(0).copied().flatten().map(|n| n as f64))
+
+        let Some(value) = series.get(header, sample_idx) else {
+            return Err(VariantIoError::Decode(
+                "BCF FORMAT series shorter than expected".to_string(),
+            ));
+        };
+
+        match value {
+            Some(Ok(series_value)) => {
+                let parsed = match series_value {
+                    SeriesValue::Genotype(genotype) => {
+                        dosage_from_series_genotype(genotype.as_ref())?
+                    }
+                    other => numeric_from_series_value(other)?,
+                };
+                if let Some(value) = parsed {
+                    *slot = value;
+                }
+            }
+            Some(Err(err)) => {
+                return Err(VariantIoError::Decode(format!(
+                    "failed to decode BCF genotype value: {err}"
+                )));
+            }
+            None => {}
         }
-        Value::Array(_) => Ok(None),
-        Value::Genotype(genotype) => dosage_from_genotype(genotype.as_ref()),
-        Value::Character(_) => Ok(None),
+    }
+    Ok(())
+}
+
+fn numeric_from_series_value(value: SeriesValue<'_>) -> Result<Option<f64>, VariantIoError> {
+    match value {
+        SeriesValue::Integer(n) => Ok(Some(n as f64)),
+        SeriesValue::Float(n) => Ok(Some(n as f64)),
+        SeriesValue::String(text) => parse_numeric_str(text.as_ref()),
+        SeriesValue::Array(array) => numeric_from_series_array(array),
+        SeriesValue::Genotype(genotype) => dosage_from_series_genotype(genotype.as_ref()),
+        SeriesValue::Character(_) => Ok(None),
     }
 }
 
-fn dosage_from_genotype(
-    genotype: &[sample::value::genotype::Allele],
+fn numeric_from_series_array(array: SeriesArray<'_>) -> Result<Option<f64>, VariantIoError> {
+    match array {
+        SeriesArray::Integer(values) => match values.iter().next() {
+            Some(Ok(Some(value))) => Ok(Some(value as f64)),
+            Some(Ok(None)) | None => Ok(None),
+            Some(Err(err)) => Err(VariantIoError::Decode(format!(
+                "failed to decode BCF integer array: {err}"
+            ))),
+        },
+        SeriesArray::Float(values) => match values.iter().next() {
+            Some(Ok(Some(value))) => Ok(Some(value as f64)),
+            Some(Ok(None)) | None => Ok(None),
+            Some(Err(err)) => Err(VariantIoError::Decode(format!(
+                "failed to decode BCF float array: {err}"
+            ))),
+        },
+        SeriesArray::String(values) => match values.iter().next() {
+            Some(Ok(Some(value))) => parse_numeric_str(value.as_ref()),
+            Some(Ok(None)) | None => Ok(None),
+            Some(Err(err)) => Err(VariantIoError::Decode(format!(
+                "failed to decode BCF string array: {err}"
+            ))),
+        },
+        SeriesArray::Character(_) => Ok(None),
+    }
+}
+
+fn dosage_from_series_genotype(
+    genotype: &dyn series::value::Genotype,
 ) -> Result<Option<f64>, VariantIoError> {
-    let mut total = 0.0f64;
-    for allele in genotype {
-        match allele.position() {
-            Some(0) => {}
-            Some(_) => total += 1.0,
+    let mut dosage = 0.0f64;
+    let mut seen = false;
+    for result in genotype.iter() {
+        let (position, _) = result.map_err(|err| {
+            VariantIoError::Decode(format!("failed to decode genotype allele: {err}"))
+        })?;
+        match position {
+            Some(0) => {
+                seen = true;
+            }
+            Some(_) => {
+                dosage += 1.0;
+                seen = true;
+            }
             None => return Ok(None),
         }
     }
-    Ok(Some(total))
+    if seen { Ok(Some(dosage)) } else { Ok(None) }
+}
+
+fn parse_numeric_str(text: &str) -> Result<Option<f64>, VariantIoError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        Ok(None)
+    } else {
+        trimmed.parse::<f64>().map(Some).map_err(|err| {
+            VariantIoError::Decode(format!("failed to parse numeric string '{trimmed}': {err}"))
+        })
+    }
+}
+
+fn parse_vcf_genotype(field: &str) -> Result<Option<f64>, VariantIoError> {
+    if field.is_empty() {
+        return Ok(None);
+    }
+
+    let mut dosage = 0.0f64;
+    let mut seen = false;
+    let bytes = field.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'/' | b'|' => {
+                idx += 1;
+            }
+            b'.' => return Ok(None),
+            b'0'..=b'9' => {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                    idx += 1;
+                }
+                let allele = field[start..idx].parse::<usize>().map_err(|err| {
+                    VariantIoError::Decode(format!(
+                        "failed to parse genotype allele '{field}': {err}"
+                    ))
+                })?;
+                if allele > 0 {
+                    dosage += 1.0;
+                }
+                seen = true;
+            }
+            other => {
+                return Err(VariantIoError::Decode(format!(
+                    "unexpected character '{other}' in genotype field"
+                )));
+            }
+        }
+    }
+
+    if seen { Ok(Some(dosage)) } else { Ok(None) }
 }
 
 fn decode_plink_variant(bytes: &[u8], dest: &mut [f64], n_samples: usize, table: &[[f64; 4]; 256]) {

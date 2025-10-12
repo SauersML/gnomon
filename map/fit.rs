@@ -405,16 +405,22 @@ struct VariantStatsCache {
     scales: Vec<f64>,
     block_sums: Vec<f64>,
     block_calls: Vec<usize>,
+    filled: usize,
     finalized_len: Option<usize>,
 }
 
 impl VariantStatsCache {
-    fn new(block_capacity: usize) -> Self {
+    fn new(block_capacity: usize, variant_capacity_hint: usize) -> Self {
+        let mut frequencies = Vec::with_capacity(variant_capacity_hint);
+        frequencies.resize(variant_capacity_hint, 0.0);
+        let mut scales = Vec::with_capacity(variant_capacity_hint);
+        scales.resize(variant_capacity_hint, 0.0);
         Self {
-            frequencies: Vec::new(),
-            scales: Vec::new(),
+            frequencies,
+            scales,
             block_sums: vec![0.0; block_capacity],
             block_calls: vec![0usize; block_capacity],
+            filled: 0,
             finalized_len: None,
         }
     }
@@ -424,7 +430,7 @@ impl VariantStatsCache {
     }
 
     fn len(&self) -> usize {
-        self.finalized_len.unwrap_or(self.frequencies.len())
+        self.finalized_len.unwrap_or(self.filled)
     }
 
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
@@ -432,46 +438,60 @@ impl VariantStatsCache {
             return;
         }
 
-        debug_assert!(variant_range.start == self.frequencies.len());
+        debug_assert!(variant_range.start == self.filled);
 
         let filled = block.ncols();
-        let sums_slice = &mut self.block_sums[..filled];
-        let calls_slice = &mut self.block_calls[..filled];
+        {
+            let sums_slice = &mut self.block_sums[..filled];
+            let calls_slice = &mut self.block_calls[..filled];
 
-        let use_parallel = filled >= 32 && par.degree() > 1;
+            let use_parallel = filled >= 32 && par.degree() > 1;
 
-        if use_parallel {
-            sums_slice
-                .par_iter_mut()
-                .zip(calls_slice.par_iter_mut())
-                .zip(block.par_col_iter())
-                .for_each(|((sum_slot, calls_slot), column)| {
-                    let contiguous = column
-                        .try_as_col_major()
-                        .expect("variant block column must be contiguous");
-                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
-                    *sum_slot = sum;
-                    *calls_slot = calls;
-                });
-        } else {
-            sums_slice
-                .iter_mut()
-                .zip(calls_slice.iter_mut())
-                .zip(block.col_iter())
-                .for_each(|((sum_slot, calls_slot), column)| {
-                    let contiguous = column
-                        .try_as_col_major()
-                        .expect("variant block column must be contiguous");
-                    let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
-                    *sum_slot = sum;
-                    *calls_slot = calls;
-                });
+            if use_parallel {
+                sums_slice
+                    .par_iter_mut()
+                    .zip(calls_slice.par_iter_mut())
+                    .zip(block.par_col_iter())
+                    .for_each(|((sum_slot, calls_slot), column)| {
+                        let contiguous = column
+                            .try_as_col_major()
+                            .expect("variant block column must be contiguous");
+                        let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                        *sum_slot = sum;
+                        *calls_slot = calls;
+                    });
+            } else {
+                sums_slice
+                    .iter_mut()
+                    .zip(calls_slice.iter_mut())
+                    .zip(block.col_iter())
+                    .for_each(|((sum_slot, calls_slot), column)| {
+                        let contiguous = column
+                            .try_as_col_major()
+                            .expect("variant block column must be contiguous");
+                        let (sum, calls) = sum_and_count_finite(contiguous.as_slice());
+                        *sum_slot = sum;
+                        *calls_slot = calls;
+                    });
+            }
         }
 
-        for (&sum, &calls) in sums_slice.iter().zip(calls_slice.iter()) {
+        self.ensure_capacity(variant_range.end);
+
+        let freq_slice = &mut self.frequencies[variant_range.clone()];
+        let scale_slice = &mut self.scales[variant_range.clone()];
+        let sums_slice = &self.block_sums[..filled];
+        let calls_slice = &self.block_calls[..filled];
+
+        for (((freq_slot, scale_slot), &sum), &calls) in freq_slice
+            .iter_mut()
+            .zip(scale_slice.iter_mut())
+            .zip(sums_slice.iter())
+            .zip(calls_slice.iter())
+        {
             if calls == 0 {
-                self.frequencies.push(0.0);
-                self.scales.push(HWE_SCALE_FLOOR);
+                *freq_slot = 0.0;
+                *scale_slot = HWE_SCALE_FLOOR;
                 continue;
             }
 
@@ -480,16 +500,15 @@ impl VariantStatsCache {
             let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
             let derived_scale = variance.sqrt();
 
-            self.frequencies.push(allele_freq);
-            self.scales.push(if derived_scale < HWE_SCALE_FLOOR {
+            *freq_slot = allele_freq;
+            *scale_slot = if derived_scale < HWE_SCALE_FLOOR {
                 HWE_SCALE_FLOOR
             } else {
                 derived_scale
-            });
+            };
         }
 
-        debug_assert_eq!(self.frequencies.len(), variant_range.end);
-        debug_assert_eq!(self.scales.len(), variant_range.end);
+        self.filled = variant_range.end;
     }
 
     fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
@@ -506,6 +525,8 @@ impl VariantStatsCache {
     }
 
     fn finalize(&mut self) {
+        self.frequencies.truncate(self.filled);
+        self.scales.truncate(self.filled);
         self.finalized_len = Some(self.frequencies.len());
     }
 
@@ -514,6 +535,15 @@ impl VariantStatsCache {
             Some(HweScaler::new(self.frequencies, self.scales))
         } else {
             None
+        }
+    }
+
+    fn ensure_capacity(&mut self, required: usize) {
+        if self.frequencies.len() < required {
+            let additional = required - self.frequencies.len();
+            self.frequencies
+                .extend(std::iter::repeat(0.0).take(additional));
+            self.scales.extend(std::iter::repeat(0.0).take(additional));
         }
     }
 }
@@ -953,7 +983,7 @@ where
             n_variants_hint,
             block_capacity,
             scale,
-            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity)),
+            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity, n_variants_hint)),
             observed_variants: UnsafeCell::new(None),
             stats_progress: UnsafeCell::new(stats_progress),
             error: UnsafeCell::new(None),
