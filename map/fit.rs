@@ -369,11 +369,6 @@ impl VariantStatsCache {
         self.finalized_len.is_some()
     }
 
-    fn len(&self) -> usize {
-        self.finalized_len.unwrap_or(self.write_pos)
-    }
-
-
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
         if self.is_finalized() {
             return;
