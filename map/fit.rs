@@ -324,6 +324,68 @@ fn standardize_block_impl(block: MatMut<'_, f64>, freqs: &[f64], scales: &[f64],
     }
 }
 
+fn standardize_block_with_calls(
+    block: MatMut<'_, f64>,
+    freqs: &[f64],
+    scales: &[f64],
+    calls: &[usize],
+    n_samples: usize,
+    par: Par,
+) {
+    let filled = freqs.len();
+
+    debug_assert_eq!(filled, block.ncols());
+    debug_assert_eq!(filled, scales.len());
+    debug_assert!(calls.len() >= filled);
+
+    let block = block.subcols_mut(0, filled);
+    let use_parallel = filled >= 32 && par.degree() > 1;
+
+    let standardize_column =
+        |mut column: ColMut<'_, f64>, mean: f64, inv: f64, use_fast_path: bool| {
+            if inv == 0.0 {
+                column.fill(0.0);
+                return;
+            }
+
+            let contiguous = column
+                .try_as_col_major_mut()
+                .expect("projection block column must be contiguous");
+            let values = contiguous.as_slice_mut();
+
+            if use_fast_path {
+                standardize_column_simd_full(values, mean, inv);
+            } else {
+                standardize_column_simd(values, mean, inv);
+            }
+        };
+
+    if use_parallel {
+        block
+            .par_col_iter_mut()
+            .enumerate()
+            .for_each(|(idx, column)| {
+                let freq = freqs[idx];
+                let scale = scales[idx];
+                let mean = 2.0 * freq;
+                let denom = scale.max(HWE_SCALE_FLOOR);
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                let use_fast_path = calls[idx] == n_samples;
+                standardize_column(column, mean, inv, use_fast_path);
+            });
+    } else {
+        for (idx, column) in block.col_iter_mut().enumerate() {
+            let freq = freqs[idx];
+            let scale = scales[idx];
+            let mean = 2.0 * freq;
+            let denom = scale.max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            let use_fast_path = calls[idx] == n_samples;
+            standardize_column(column, mean, inv, use_fast_path);
+        }
+    }
+}
+
 struct VariantStatsCache {
     frequencies: Vec<f64>,
     scales: Vec<f64>,
@@ -495,6 +557,31 @@ where
         } else {
             0.0
         };
+    }
+}
+
+#[inline(always)]
+fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
+    standardize_column_simd_full_impl::<STANDARDIZATION_SIMD_LANES>(values, mean, inv);
+}
+
+#[inline(always)]
+fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
+where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let mean_simd = Simd::<f64, LANES>::splat(mean);
+    let inv_simd = Simd::<f64, LANES>::splat(inv);
+
+    let (chunks, remainder) = values.as_chunks_mut::<LANES>();
+    for chunk in chunks {
+        let lane = Simd::<f64, LANES>::from_array(*chunk);
+        let standardized = (lane - mean_simd) * inv_simd;
+        *chunk = standardized.to_array();
+    }
+
+    for value in remainder {
+        *value = (*value - mean) * inv;
     }
 }
 
@@ -1067,7 +1154,25 @@ where
             let mut block =
                 MatMut::from_column_major_slice_mut(block_slice, self.n_samples, filled);
             let variant_range = processed..processed + filled;
-            self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+            if !stats_ready {
+                let stats = unsafe { &mut *self.stats.get() };
+                stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+
+                let freqs = &stats.frequencies[variant_range.clone()];
+                let scales = &stats.scales[variant_range.clone()];
+                let calls_slice = &stats.block_calls[..filled];
+
+                standardize_block_with_calls(
+                    block.rb_mut(),
+                    freqs,
+                    scales,
+                    calls_slice,
+                    self.n_samples,
+                    par,
+                );
+            } else {
+                self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+            }
 
             let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
 
@@ -1261,7 +1366,7 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + 'static,
 {
-    let mut covariance = accumulate_covariance_matrix(operator, par, progress)?;
+    let covariance = accumulate_covariance_matrix(operator, par, progress)?;
     let n = covariance.nrows();
 
     if n == 0 || top_k == 0 {
@@ -1425,6 +1530,7 @@ where
     let mut processed = 0usize;
     let mut observed = operator.observed_n_variants();
     let mut used_source_progress = false;
+    let stats_ready = operator.stats_computed();
 
     loop {
         let filled = source
@@ -1443,7 +1549,7 @@ where
             }
         } else if operator.n_variants_hint > 0
             && processed + filled > operator.n_variants_hint
-            && !operator.stats_computed()
+            && !stats_ready
         {
             return Err(HwePcaError::InvalidInput(
                 "VariantBlockSource returned more variants than reported hint",
@@ -1457,7 +1563,25 @@ where
         );
 
         let variant_range = processed..processed + filled;
-        operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+        if !stats_ready {
+            let stats = unsafe { &mut *operator.stats.get() };
+            stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+
+            let freqs = &stats.frequencies[variant_range.clone()];
+            let scales = &stats.scales[variant_range.clone()];
+            let calls_slice = &stats.block_calls[..filled];
+
+            standardize_block_with_calls(
+                block.rb_mut(),
+                freqs,
+                scales,
+                calls_slice,
+                operator.n_samples,
+                par,
+            );
+        } else {
+            operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+        }
 
         matmul(
             covariance.as_mut(),
@@ -1514,7 +1638,7 @@ where
         }
     }
 
-    if !operator.stats_computed() {
+    if !stats_ready {
         operator.mark_stats_computed();
     }
 
@@ -1602,11 +1726,7 @@ fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64
         .zip(sample_scores.col_iter_mut())
     {
         let scaled = (n_samples - 1) as f64 * lambda;
-        let sigma = if scaled > 0.0 {
-            scaled.sqrt()
-        } else {
-            0.0
-        };
+        let sigma = if scaled > 0.0 { scaled.sqrt() } else { 0.0 };
         singular_values.push(sigma);
         zip!(&mut column).for_each(|unzip!(value)| {
             *value *= sigma;
@@ -1812,13 +1932,28 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn fast_path_matches_masked_when_no_missingness() {
+        let mut masked = (0..128)
+            .map(|i| f64::from(i % 7) * 0.25)
+            .collect::<Vec<_>>();
+        let mut fast = masked.clone();
+        let mean = 0.75;
+        let inv = 0.5;
+
+        standardize_column_simd(masked.as_mut_slice(), mean, inv);
+        standardize_column_simd_full(fast.as_mut_slice(), mean, inv);
+
+        for (lhs, rhs) in masked.iter().zip(fast.iter()) {
+            assert!((lhs - rhs).abs() < 1e-15);
+        }
+    }
+
+    #[test]
     fn negative_eigenvalues_do_not_produce_nan_scores() {
         let n_samples = 3;
         let eigenpairs = Eigenpairs {
             values: vec![-1.0e-12, 0.5],
-            vectors: Mat::from_fn(n_samples, 2, |row, col| {
-                if row == col { 1.0 } else { 0.0 }
-            }),
+            vectors: Mat::from_fn(n_samples, 2, |row, col| if row == col { 1.0 } else { 0.0 }),
         };
 
         let (singular_values, scores) = build_sample_scores(n_samples, &eigenpairs);
