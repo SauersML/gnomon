@@ -358,7 +358,7 @@ mod tests {
         save_projection_results,
     };
     use crate::map::project::ProjectionOptions;
-    use crate::map::variant_filter::{VariantFilter, VariantSelection};
+    use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
     use crate::shared::files::{VariantCompression, VariantFormat, open_variant_source};
     use noodles_bcf::io::Reader as BcfReader;
     use noodles_bgzf::io::Reader as BgzfReader;
@@ -373,12 +373,12 @@ mod tests {
     use std::error::Error;
     use std::fmt::Write as _;
     use std::fs::{self, File};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::str::FromStr;
     use std::time::Duration;
-    use tempfile::tempdir;
+    use tempfile::{NamedTempFile, tempdir};
     use zip::read::ZipArchive;
 
     use reqwest::blocking::Client;
@@ -387,6 +387,52 @@ mod tests {
     const TEST_COMPONENTS: usize = 8;
     const HGDP_REMOTE_VARIANT_LIST: &str =
         "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv";
+    const MANUAL_VARIANT_TARGET: usize = 128;
+
+    fn first_variant_keys(path: &Path, limit: usize) -> Result<Vec<VariantKey>, Box<dyn Error>> {
+        let source =
+            open_variant_source(path).map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        match (source.format(), source.compression()) {
+            (VariantFormat::Bcf, VariantCompression::Plain) => {
+                collect_bcf_variant_keys(BcfReader::from(source), limit)
+            }
+            (VariantFormat::Bcf, VariantCompression::Bgzf) => {
+                collect_bcf_variant_keys(BcfReader::from(BgzfReader::new(source)), limit)
+            }
+            (other_format, other_compression) => Err(format!(
+                "unsupported variant source combination: format={other_format:?} compression={other_compression:?}"
+            )
+            .into()),
+        }
+    }
+
+    fn collect_bcf_variant_keys<R: Read>(
+        mut reader: BcfReader<R>,
+        limit: usize,
+    ) -> Result<Vec<VariantKey>, Box<dyn Error>> {
+        let header = reader
+            .read_header()
+            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+        let mut record = RecordBuf::default();
+        let mut keys = Vec::new();
+
+        while keys.len() < limit {
+            let bytes = reader
+                .read_record_buf(&header, &mut record)
+                .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+            if bytes == 0 {
+                break;
+            }
+
+            if let Some(position) = record.variant_start() {
+                let chrom = record.reference_sequence_name().to_string();
+                let key = VariantKey::new(&chrom, position.get() as u64);
+                keys.push(key);
+            }
+        }
+
+        Ok(keys)
+    }
 
     fn download_and_extract(
         client: &Client,
@@ -1158,6 +1204,25 @@ mod tests {
     #[test]
     fn fit_and_project_hgdp_chr20() -> Result<(), Box<dyn Error>> {
         run_fit_and_project_hgdp_chr20(None)
+    }
+
+    #[test]
+    fn fit_and_project_full_hgdp_chr20_with_manual_variant_list() -> Result<(), Box<dyn Error>> {
+        let keys = first_variant_keys(Path::new(HGDP_CHR20_BCF), MANUAL_VARIANT_TARGET)?;
+        assert_eq!(
+            keys.len(),
+            MANUAL_VARIANT_TARGET,
+            "expected to collect the configured number of variants from HGDP chr20 dataset"
+        );
+
+        let mut temp_file = NamedTempFile::new()?;
+        writeln!(temp_file, "chrom\tpos")?;
+        for key in keys.into_iter().take(MANUAL_VARIANT_TARGET) {
+            writeln!(temp_file, "{}\t{}", key.chromosome, key.position)?;
+        }
+        temp_file.flush()?;
+
+        run_fit_and_project_hgdp_chr20(Some(temp_file.path()))
     }
 
     #[test]
