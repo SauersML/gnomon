@@ -349,6 +349,7 @@ struct VariantStatsCache {
     block_calls: Vec<usize>,
     filled: usize,
     finalized_len: Option<usize>,
+    write_pos: usize,
 }
 
 impl VariantStatsCache {
@@ -364,6 +365,7 @@ impl VariantStatsCache {
             block_calls: vec![0usize; block_capacity],
             filled: 0,
             finalized_len: None,
+            write_pos: 0,
         }
     }
 
@@ -371,12 +373,19 @@ impl VariantStatsCache {
         self.finalized_len.is_some()
     }
 
+    fn len(&self) -> usize {
+        self.finalized_len.unwrap_or(self.write_pos)
+    }
+
+
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
         if self.is_finalized() {
             return;
         }
 
-        debug_assert!(variant_range.start == self.filled);
+        debug_assert!(variant_range.start == self.write_pos);
+
+        // debug_assert!(variant_range.start == self.filled);
 
         let filled = block.ncols();
         {
@@ -414,22 +423,22 @@ impl VariantStatsCache {
             }
         }
 
-        self.ensure_capacity(variant_range.end);
+        let end = variant_range.end;
+        if self.frequencies.len() < end {
+            self.frequencies.resize(end, 0.0);
+            self.scales.resize(end, 0.0);
+        }
 
         let freq_slice = &mut self.frequencies[variant_range.clone()];
         let scale_slice = &mut self.scales[variant_range.clone()];
-        let sums_slice = &self.block_sums[..filled];
-        let calls_slice = &self.block_calls[..filled];
 
-        for (((freq_slot, scale_slot), &sum), &calls) in freq_slice
-            .iter_mut()
-            .zip(scale_slice.iter_mut())
-            .zip(sums_slice.iter())
-            .zip(calls_slice.iter())
-        {
+        for idx in 0..filled {
+            let sum = sums_slice[idx];
+            let calls = calls_slice[idx];
             if calls == 0 {
-                *freq_slot = 0.0;
-                *scale_slot = HWE_SCALE_FLOOR;
+                freq_slice[idx] = 0.0;
+                scale_slice[idx] = HWE_SCALE_FLOOR;
+
                 continue;
             }
 
@@ -438,21 +447,39 @@ impl VariantStatsCache {
             let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
             let derived_scale = variance.sqrt();
 
-            *freq_slot = allele_freq;
-            *scale_slot = if derived_scale < HWE_SCALE_FLOOR {
+            freq_slice[idx] = allele_freq;
+            scale_slice[idx] = if derived_scale < HWE_SCALE_FLOOR {
+
                 HWE_SCALE_FLOOR
             } else {
                 derived_scale
             };
         }
 
-        self.filled = variant_range.end;
+        self.write_pos = end;
+
+        debug_assert!(self.frequencies.len() >= end);
+        debug_assert!(self.scales.len() >= end);
+    }
+
+    fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
+        let end = variant_range.end;
+        let len = self.len();
+        assert!(
+            end <= len,
+            "standardization requested beyond computed statistics"
+        );
+        let start = variant_range.start;
+        let freqs = &self.frequencies[start..end];
+        let scales = &self.scales[start..end];
+        standardize_block_impl(block, freqs, scales, par);
     }
 
     fn finalize(&mut self) {
-        self.frequencies.truncate(self.filled);
-        self.scales.truncate(self.filled);
-        self.finalized_len = Some(self.frequencies.len());
+        self.frequencies.truncate(self.write_pos);
+        self.scales.truncate(self.write_pos);
+        self.finalized_len = Some(self.write_pos);
+
     }
 
     fn into_scaler(self) -> Option<HweScaler> {
@@ -898,11 +925,9 @@ where
             n_samples,
             n_variants_hint,
             block_capacity,
-            // scale, idk?
-            scaler,
-            //observed_variants,
+            scale,
             stats: UnsafeCell::new(VariantStatsCache::new(block_capacity, n_variants_hint)),
-            //observed_variants: UnsafeCell::new(None),
+            observed_variants: UnsafeCell::new(None),
             stats_progress: UnsafeCell::new(stats_progress),
             error: UnsafeCell::new(None),
             apply_lock: Mutex::new(()),
