@@ -520,17 +520,19 @@ pub fn train_model(
         layout.total_coeffs, layout.num_penalties
     );
 
-    let design_condition =
-        calculate_condition_number(&x_matrix).map_err(EstimationError::EigendecompositionFailed)?;
-    if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
-        let reported_condition = if design_condition.is_finite() {
-            design_condition
-        } else {
-            f64::INFINITY
-        };
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: reported_condition,
-        });
+    if matches!(config.link_function, LinkFunction::Identity) && layout.num_penalties == 0 {
+        let design_condition = calculate_condition_number(&x_matrix)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
+            let reported_condition = if design_condition.is_finite() {
+                design_condition
+            } else {
+                f64::INFINITY
+            };
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: reported_condition,
+            });
+        }
     }
 
     // --- Setup the unified state and computation object ---
