@@ -1261,14 +1261,6 @@ where
     let mut covariance = accumulate_covariance_matrix(operator, par, progress)?;
     let n = covariance.nrows();
 
-    for col in 0..n {
-        for row in 0..col {
-            let avg = 0.5 * (covariance[(row, col)] + covariance[(col, row)]);
-            covariance[(row, col)] = avg;
-            covariance[(col, row)] = avg;
-        }
-    }
-
     if n == 0 || top_k == 0 {
         return Ok(Eigenpairs {
             values: Vec::new(),
