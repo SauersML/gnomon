@@ -8,6 +8,7 @@ use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::col::Col;
 use faer::linalg::matmul::matmul;
+use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
@@ -1314,6 +1315,8 @@ where
         return Ok(Eigenpairs { values, vectors });
     }
 
+    mirror_lower_to_upper(&mut covariance);
+
     let gram = covariance.as_ref();
     let upper_target = n.min(MAX_PARTIAL_COMPONENTS.max(top_k));
     let mut target = top_k.min(upper_target).max(1);
@@ -1459,11 +1462,14 @@ where
         let variant_range = processed..processed + filled;
         operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
 
-        matmul(
+        triangular_matmul::matmul(
             covariance.as_mut(),
+            triangular_matmul::BlockStructure::TriangularLower,
             Accum::Add,
             block.as_ref(),
+            triangular_matmul::BlockStructure::Rectangular,
             block.as_ref().transpose(),
+            triangular_matmul::BlockStructure::Rectangular,
             operator.scale,
             par,
         );
@@ -1519,6 +1525,17 @@ where
     }
 
     Ok(covariance)
+}
+
+fn mirror_lower_to_upper(matrix: &mut Mat<f64>) {
+    debug_assert_eq!(matrix.nrows(), matrix.ncols());
+    let n = matrix.nrows();
+    for col in 0..n {
+        for row in 0..col {
+            let value = matrix[(col, row)];
+            matrix[(row, col)] = value;
+        }
+    }
 }
 
 fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
