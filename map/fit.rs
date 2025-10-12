@@ -1379,7 +1379,7 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + 'static,
 {
-    let covariance = accumulate_covariance_matrix(operator, par, progress)?;
+    let mut covariance = accumulate_covariance_matrix(operator, par, progress)?;
     let n = covariance.nrows();
 
     if n == 0 || top_k == 0 {
