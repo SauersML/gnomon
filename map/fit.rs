@@ -24,16 +24,15 @@ use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::cell::UnsafeCell;
 use std::convert::Infallible;
 use std::error::Error;
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
@@ -83,6 +82,11 @@ fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceCompu
         _ => CovarianceComputationMode::Partial,
     }
 }
+
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f64);
+
+unsafe impl Send for SendPtr {}
 
 struct ParallelismGuard {
     previous: Par,
@@ -338,68 +342,6 @@ fn standardize_block_impl(block: MatMut<'_, f64>, freqs: &[f64], scales: &[f64],
     }
 }
 
-fn standardize_block_with_calls(
-    block: MatMut<'_, f64>,
-    freqs: &[f64],
-    scales: &[f64],
-    calls: &[usize],
-    n_samples: usize,
-    par: Par,
-) {
-    let filled = freqs.len();
-
-    debug_assert_eq!(filled, block.ncols());
-    debug_assert_eq!(filled, scales.len());
-    debug_assert!(calls.len() >= filled);
-
-    let block = block.subcols_mut(0, filled);
-    let use_parallel = filled >= 32 && par.degree() > 1;
-
-    let standardize_column =
-        |mut column: ColMut<'_, f64>, mean: f64, inv: f64, use_fast_path: bool| {
-            if inv == 0.0 {
-                column.fill(0.0);
-                return;
-            }
-
-            let contiguous = column
-                .try_as_col_major_mut()
-                .expect("projection block column must be contiguous");
-            let values = contiguous.as_slice_mut();
-
-            if use_fast_path {
-                standardize_column_simd_full(values, mean, inv);
-            } else {
-                standardize_column_simd(values, mean, inv);
-            }
-        };
-
-    if use_parallel {
-        block
-            .par_col_iter_mut()
-            .enumerate()
-            .for_each(|(idx, column)| {
-                let freq = freqs[idx];
-                let scale = scales[idx];
-                let mean = 2.0 * freq;
-                let denom = scale.max(HWE_SCALE_FLOOR);
-                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                let use_fast_path = calls[idx] == n_samples;
-                standardize_column(column, mean, inv, use_fast_path);
-            });
-    } else {
-        for (idx, column) in block.col_iter_mut().enumerate() {
-            let freq = freqs[idx];
-            let scale = scales[idx];
-            let mean = 2.0 * freq;
-            let denom = scale.max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            let use_fast_path = calls[idx] == n_samples;
-            standardize_column(column, mean, inv, use_fast_path);
-        }
-    }
-}
-
 struct VariantStatsCache {
     frequencies: Vec<f64>,
     scales: Vec<f64>,
@@ -421,10 +363,6 @@ impl VariantStatsCache {
 
     fn is_finalized(&self) -> bool {
         self.finalized_len.is_some()
-    }
-
-    fn len(&self) -> usize {
-        self.finalized_len.unwrap_or(self.frequencies.len())
     }
 
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
@@ -490,19 +428,6 @@ impl VariantStatsCache {
 
         debug_assert_eq!(self.frequencies.len(), variant_range.end);
         debug_assert_eq!(self.scales.len(), variant_range.end);
-    }
-
-    fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
-        let end = variant_range.end;
-        let len = self.len();
-        assert!(
-            end <= len,
-            "standardization requested beyond computed statistics"
-        );
-        let start = variant_range.start;
-        let freqs = &self.frequencies[start..end];
-        let scales = &self.scales[start..end];
-        standardize_block_impl(block, freqs, scales, par);
     }
 
     fn finalize(&mut self) {
@@ -574,11 +499,13 @@ where
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
     standardize_column_simd_full_impl::<STANDARDIZATION_SIMD_LANES>(values, mean, inv);
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
 where
@@ -690,17 +617,23 @@ impl HwePcaModel {
         } else {
             DEFAULT_BLOCK_WIDTH.max(1)
         };
-        let block_storage = vec![0.0f64; n_samples * block_capacity];
-
         progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
         let stats_progress =
             StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+        let (scaler, observed_variants) = compute_variant_statistics(
+            source,
+            block_capacity,
+            par,
+            stats_progress,
+            n_variants_hint,
+        )?;
 
         let operator = StandardizedCovarianceOp::new(
             source,
             block_capacity,
-            block_storage,
-            Some(stats_progress),
+            n_variants_hint,
+            observed_variants,
+            scaler,
         );
 
         let gram_budget = gram_matrix_budget_bytes();
@@ -744,13 +677,9 @@ impl HwePcaModel {
             target_components,
             gram_progress_handle.as_ref(),
         );
-        let observed_variants = operator
-            .observed_n_variants()
-            .expect("covariance operator must observe variants during first pass");
-        let (source, mut block_storage, scaler_opt) = operator.into_parts();
+        let (source, scaler) = operator.into_parts();
         let decomposition = decomposition_result?;
 
-        let scaler = scaler_opt.expect("covariance operator statistics missing after execution");
         let variant_count = scaler.variant_scales().len();
         debug_assert_eq!(variant_count, observed_variants);
         if variant_count == 0 {
@@ -775,15 +704,11 @@ impl HwePcaModel {
 
         let (singular_values, sample_scores) = build_sample_scores(n_samples, &decomposition);
 
-        source
-            .reset()
-            .map_err(|e| HwePcaError::Source(Box::new(e)))?;
         let loadings = compute_variant_loadings(
             source,
             &scaler,
             variant_count,
             block_capacity,
-            &mut block_storage,
             decomposition.vectors.as_ref(),
             &singular_values,
             progress,
@@ -912,18 +837,15 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + 'static,
 {
-    source: *mut S,
-    block_storage: UnsafeCell<Option<Vec<f64>>>,
+    source: Mutex<&'a mut S>,
     n_samples: usize,
     n_variants_hint: usize,
     block_capacity: usize,
     scale: f64,
-    stats: UnsafeCell<VariantStatsCache>,
-    observed_variants: UnsafeCell<Option<usize>>,
-    stats_progress: UnsafeCell<Option<StageProgressHandle<P>>>,
-    error: UnsafeCell<Option<HwePcaError>>,
-    apply_lock: Mutex<()>,
-    marker: PhantomData<&'a mut S>,
+    scaler: HweScaler,
+    observed_variants: usize,
+    error: Mutex<Option<HwePcaError>>,
+    marker: PhantomData<P>,
 }
 
 impl<'a, S, P> StandardizedCovarianceOp<'a, S, P>
@@ -935,57 +857,50 @@ where
     fn new(
         source: &'a mut S,
         block_capacity: usize,
-        block_storage: Vec<f64>,
-        stats_progress: Option<StageProgressHandle<P>>,
+        n_variants_hint: usize,
+        observed_variants: usize,
+        scaler: HweScaler,
     ) -> Self {
         let n_samples = source.n_samples();
-        let n_variants_hint = source.n_variants();
-        assert_eq!(
-            block_storage.len(),
-            n_samples * block_capacity,
-            "block storage size must match block capacity",
-        );
         let scale = 1.0 / ((n_samples - 1) as f64);
         Self {
-            source: source as *mut S,
-            block_storage: UnsafeCell::new(Some(block_storage)),
+            source: Mutex::new(source),
             n_samples,
             n_variants_hint,
             block_capacity,
             scale,
-            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity)),
-            observed_variants: UnsafeCell::new(None),
-            stats_progress: UnsafeCell::new(stats_progress),
-            error: UnsafeCell::new(None),
-            apply_lock: Mutex::new(()),
+            scaler,
+            observed_variants,
+            error: Mutex::new(None),
             marker: PhantomData,
         }
     }
 
-    fn into_parts(self) -> (&'a mut S, Vec<f64>, Option<HweScaler>) {
-        let this = ManuallyDrop::new(self);
-        let source = this.source;
-        let storage = unsafe {
-            (*this.block_storage.get())
-                .take()
-                .expect("block storage already taken")
-        };
-        let stats = unsafe { ptr::read(this.stats.get()) };
-        let scaler = stats.into_scaler();
-        if let Some(handle) = unsafe { (*this.stats_progress.get()).take() } {
-            handle.finish();
-        }
-        let error = unsafe { ptr::read(this.error.get()) };
-        drop(error);
-        (unsafe { &mut *source }, storage, scaler)
+    fn into_parts(self) -> (&'a mut S, HweScaler) {
+        let Self {
+            source,
+            n_samples: _,
+            n_variants_hint: _,
+            block_capacity: _,
+            scale: _,
+            scaler,
+            observed_variants: _,
+            error: _,
+            marker: _,
+        } = self;
+        (
+            source
+                .into_inner()
+                .expect("covariance source mutex poisoned during teardown"),
+            scaler,
+        )
     }
 
     fn take_error(&self) -> Option<HwePcaError> {
-        unsafe { (*self.error.get()).take() }
-    }
-
-    fn fail_source(&self, err: S::Error) -> ! {
-        self.record_error(HwePcaError::Source(Box::new(err)))
+        self.error
+            .lock()
+            .expect("operator error mutex poisoned")
+            .take()
     }
 
     fn fail_invalid(&self, msg: &'static str) -> ! {
@@ -993,7 +908,7 @@ where
     }
 
     fn record_error(&self, err: HwePcaError) -> ! {
-        let slot = unsafe { &mut *self.error.get() };
+        let mut slot = self.error.lock().expect("operator error mutex poisoned");
         if slot.is_none() {
             *slot = Some(err);
         }
@@ -1004,32 +919,14 @@ where
         self.n_samples
     }
 
-    fn observed_n_variants(&self) -> Option<usize> {
-        unsafe { *self.observed_variants.get() }
-    }
-
-    fn stats_computed(&self) -> bool {
-        unsafe { (*self.stats.get()).is_finalized() }
-    }
-
     fn standardize_block_in_place(
         &self,
         block: MatMut<'_, f64>,
         variant_range: Range<usize>,
         par: Par,
     ) {
-        let stats = unsafe { &mut *self.stats.get() };
-        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
-        stats.standardize_block(block, variant_range, par);
-    }
-
-    fn mark_stats_computed(&self) {
-        let stats = unsafe { &mut *self.stats.get() };
-        stats.finalize();
-        let slot = unsafe { &mut *self.stats_progress.get() };
-        if let Some(handle) = slot.take() {
-            handle.finish();
-        }
+        self.scaler
+            .standardize_block(block, variant_range.clone(), par);
     }
 }
 
@@ -1043,33 +940,9 @@ where
         f.debug_struct("StandardizedCovarianceOp")
             .field("n_samples", &self.n_samples)
             .field("n_variants_hint", &self.n_variants_hint)
-            .field("observed_variants", &unsafe {
-                *self.observed_variants.get()
-            })
+            .field("observed_variants", &self.observed_variants)
             .field("block_capacity", &self.block_capacity)
             .finish()
-    }
-}
-
-unsafe impl<'a, S, P> Sync for StandardizedCovarianceOp<'a, S, P>
-where
-    S: VariantBlockSource + Send,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
-{
-}
-
-impl<'a, S, P> Drop for StandardizedCovarianceOp<'a, S, P>
-where
-    S: VariantBlockSource + Send,
-    S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
-{
-    fn drop(&mut self) {
-        let slot = unsafe { &mut *self.stats_progress.get() };
-        if let Some(handle) = slot.take() {
-            handle.finish();
-        }
     }
 }
 
@@ -1080,11 +953,11 @@ where
     P: FitProgressObserver + 'static,
 {
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        match par {
-            Par::Seq => {}
-            _ => {}
-        }
-        temp_mat_scratch::<f64>(self.block_capacity, rhs_ncols)
+        let _ = par;
+        let block_len = self.n_samples * self.block_capacity;
+        let block_req = StackReq::new::<f64>(block_len);
+        let proj_req = temp_mat_scratch::<f64>(self.block_capacity, rhs_ncols);
+        block_req.and(block_req).and(proj_req)
     }
 
     fn nrows(&self) -> usize {
@@ -1102,15 +975,6 @@ where
         par: Par,
         stack: &mut MemStack,
     ) {
-        match par {
-            Par::Seq => {}
-            _ => {}
-        }
-        let apply_guard = self
-            .apply_lock
-            .lock()
-            .expect("standardized covariance op mutex poisoned");
-        let _ = &apply_guard;
         debug_assert_eq!(out.nrows(), self.n_samples);
         debug_assert_eq!(rhs.nrows(), self.n_samples);
 
@@ -1120,142 +984,164 @@ where
             return;
         }
 
-        let block_storage_opt = unsafe { &mut *self.block_storage.get() };
-        let block_storage = block_storage_opt
-            .as_mut()
-            .expect("block storage missing during operator application");
-
-        let source = unsafe { &mut *self.source };
-
-        if let Err(err) = source.reset() {
-            self.fail_source(err);
-        }
+        let block_len = self.n_samples * self.block_capacity;
+        let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        let buf0 = unsafe {
+            std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len)
+        };
+        let (buf1_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        let buf1 = unsafe {
+            std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len)
+        };
+        let mut buffer_slices = [buf0, buf1];
+        let [first_slice, second_slice] = &mut buffer_slices;
+        let buffer_ptrs = [
+            SendPtr(first_slice.as_mut_ptr()),
+            SendPtr(second_slice.as_mut_ptr()),
+        ];
 
         let (mut proj_uninit, _) =
             unsafe { temp_mat_uninit::<f64, _, _>(self.block_capacity, rhs.ncols(), stack) };
         let mut proj_storage = proj_uninit.as_mat_mut();
 
-        let mut processed = 0usize;
+        enum PrefetchMessage {
+            Data {
+                id: usize,
+                filled: usize,
+                start: usize,
+            },
+            End,
+            Error(HwePcaError),
+        }
 
-        let stats_ready = self.stats_computed();
-        let mut observed = unsafe { *self.observed_variants.get() };
-        let mut used_source_progress = false;
+        let buffer_count = buffer_ptrs.len();
+        let (filled_tx, filled_rx) = sync_channel::<PrefetchMessage>(buffer_count);
+        let (free_tx, free_rx) = sync_channel::<usize>(buffer_count);
+        for id in 0..buffer_count {
+            free_tx.send(id).expect("failed to seed prefetch buffers");
+        }
 
-        loop {
-            let filled = match source.next_block_into(self.block_capacity, &mut block_storage[..]) {
-                Ok(filled) => filled,
-                Err(err) => self.fail_source(err),
-            };
+        let source_mutex = &self.source;
+        let n_samples = self.n_samples;
+        let block_capacity = self.block_capacity;
+        let observed_total = self.observed_variants;
+        let scale = self.scale;
+        let block_len = block_len;
 
-            if filled == 0 {
-                break;
-            }
-
-            if let Some(expected_total) = observed {
-                if processed + filled > expected_total {
-                    self.fail_invalid(
-                        "VariantBlockSource returned more variants than previously observed",
-                    );
+        let processed = thread::scope(|scope| {
+            let buffer_ptrs_prefetch = buffer_ptrs;
+            let filled_sender = filled_tx;
+            let free_receiver = free_rx;
+            scope.spawn(move || {
+                if let Err(err) = {
+                    let mut guard = source_mutex
+                        .lock()
+                        .expect("covariance source mutex poisoned");
+                    let source: &mut S = &mut **guard;
+                    source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
+                } {
+                    let _ = filled_sender.send(PrefetchMessage::Error(err));
+                    return;
                 }
-            } else if self.n_variants_hint > 0
-                && processed + filled > self.n_variants_hint
-                && !stats_ready
-            {
-                self.fail_invalid("VariantBlockSource returned more variants than reported hint");
-            }
 
-            let block_slice = &mut block_storage[..self.n_samples * filled];
-            let mut block =
-                MatMut::from_column_major_slice_mut(block_slice, self.n_samples, filled);
-            let variant_range = processed..processed + filled;
-            if !stats_ready {
-                let stats = unsafe { &mut *self.stats.get() };
-                stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+                let mut start = 0usize;
+                while let Ok(id) = free_receiver.recv() {
+                    let buffer_slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
+                    };
+                    let filled_res = {
+                        let mut guard = source_mutex
+                            .lock()
+                            .expect("covariance source mutex poisoned");
+                        let source: &mut S = &mut **guard;
+                        source.next_block_into(block_capacity, buffer_slice)
+                    };
 
-                let freqs = &stats.frequencies[variant_range.clone()];
-                let scales = &stats.scales[variant_range.clone()];
-                let calls_slice = &stats.block_calls[..filled];
+                    match filled_res {
+                        Ok(filled) => {
+                            if filled == 0 {
+                                let _ = filled_sender.send(PrefetchMessage::End);
+                                break;
+                            }
 
-                standardize_block_with_calls(
-                    block.rb_mut(),
-                    freqs,
-                    scales,
-                    calls_slice,
-                    self.n_samples,
-                    par,
-                );
-            } else {
-                self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
-            }
-
-            let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
-
-            matmul(
-                proj_block.as_mut(),
-                Accum::Replace,
-                block.as_ref().transpose(),
-                rhs,
-                1.0,
-                par,
-            );
-
-            matmul(
-                out.rb_mut(),
-                Accum::Add,
-                block.as_ref(),
-                proj_block.as_ref(),
-                self.scale,
-                par,
-            );
-
-            processed += filled;
-
-            if !stats_ready {
-                if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
-                    if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                        used_source_progress = true;
-                        handle.advance_bytes(bytes_read, total_bytes);
-                    } else if let Some((work_done, total_work)) = source.progress_variants() {
-                        used_source_progress = true;
-                        if let Some(total) = total_work {
-                            handle.set_total(total);
-                        } else if self.n_variants_hint > 0 {
-                            handle.estimate(self.n_variants_hint);
+                            let _ = filled_sender.send(PrefetchMessage::Data { id, filled, start });
+                            start += filled;
                         }
-                        handle.advance(work_done);
-                    } else {
-                        handle.advance(processed);
+                        Err(err) => {
+                            let _ = filled_sender
+                                .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let free_sender = free_tx;
+            let mut processed = 0usize;
+            let buffer_ptrs_compute = buffer_ptrs;
+            while let Ok(message) = filled_rx.recv() {
+                match message {
+                    PrefetchMessage::Data { id, filled, start } => {
+                        if start != processed {
+                            self.fail_invalid("prefetch produced out-of-order variant ranges");
+                        }
+                        if start + filled > observed_total {
+                            self.fail_invalid(
+                                "VariantBlockSource returned more variants than observed",
+                            );
+                        }
+
+                        let block_slice = unsafe {
+                            std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
+                        };
+                        let mut block = MatMut::from_column_major_slice_mut(
+                            &mut block_slice[..n_samples * filled],
+                            n_samples,
+                            filled,
+                        );
+                        let variant_range = start..start + filled;
+                        self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+
+                        let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
+
+                        matmul(
+                            proj_block.as_mut(),
+                            Accum::Replace,
+                            block.as_ref().transpose(),
+                            rhs,
+                            1.0,
+                            par,
+                        );
+
+                        matmul(
+                            out.rb_mut(),
+                            Accum::Add,
+                            block.as_ref(),
+                            proj_block.as_ref(),
+                            scale,
+                            par,
+                        );
+
+                        processed = start + filled;
+
+                        if free_sender.send(id).is_err() {
+                            break;
+                        }
+                    }
+                    PrefetchMessage::End => {
+                        break;
+                    }
+                    PrefetchMessage::Error(err) => {
+                        self.record_error(err);
                     }
                 }
             }
-        }
 
-        if processed == 0 {
-            self.fail_invalid("VariantBlockSource yielded no variants");
-        }
+            processed
+        });
 
-        if let Some(expected_total) = observed {
-            if processed != expected_total {
-                self.fail_invalid(
-                    "VariantBlockSource terminated early during covariance accumulation",
-                );
-            }
-        } else {
-            observed = Some(processed);
-            unsafe {
-                *self.observed_variants.get() = observed;
-            }
-        }
-
-        if !stats_ready {
-            if let Some(handle) = unsafe { &*self.stats_progress.get() }.as_ref() {
-                if let Some((_, Some(total))) = source.progress_variants() {
-                    handle.set_total(total);
-                } else if !used_source_progress {
-                    handle.set_total(processed);
-                }
-            }
-            self.mark_stats_computed();
+        if processed != self.observed_variants {
+            self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
         }
     }
 
@@ -1509,149 +1395,205 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + 'static,
 {
-    let apply_guard = operator
-        .apply_lock
-        .lock()
-        .expect("standardized covariance op mutex poisoned");
-    let _ = &apply_guard;
     let n_samples = operator.n_samples;
-    let mut covariance = Mat::zeros(n_samples, n_samples);
+    let covariance = Mat::zeros(n_samples, n_samples);
 
     if n_samples == 0 {
         return Ok(covariance);
     }
 
     let block_capacity = operator.block_capacity;
+    let block_len = n_samples * block_capacity;
+    let buffer_req = StackReq::new::<f64>(block_len).and(StackReq::new::<f64>(block_len));
+    let mut mem = MemBuffer::new(buffer_req);
+    let stack = MemStack::new(&mut mem);
+    let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+    let buf0 =
+        unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
+    let buf1 =
+        unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let mut buffer_slices = [buf0, buf1];
+    let [first_slice, second_slice] = &mut buffer_slices;
+    let buffer_ptrs = [
+        SendPtr(first_slice.as_mut_ptr()),
+        SendPtr(second_slice.as_mut_ptr()),
+    ];
 
-    let block_storage_opt = unsafe { &mut *operator.block_storage.get() };
-    let block_storage = block_storage_opt
-        .as_mut()
-        .expect("block storage missing during covariance accumulation");
+    enum PrefetchMessage {
+        Data {
+            id: usize,
+            filled: usize,
+            start: usize,
+        },
+        End,
+        Error(HwePcaError),
+    }
 
-    let source = unsafe { &mut *operator.source };
-    source
-        .reset()
-        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    let buffer_count = buffer_ptrs.len();
+    let (filled_tx, filled_rx) = sync_channel::<PrefetchMessage>(buffer_count);
+    let (free_tx, free_rx) = sync_channel::<usize>(buffer_count);
+    for id in 0..buffer_count {
+        free_tx.send(id).expect("failed to seed covariance buffers");
+    }
 
-    let mut processed = 0usize;
-    let mut observed = operator.observed_n_variants();
-    let mut used_source_progress = false;
-    let stats_ready = operator.stats_computed();
+    let source_mutex = &operator.source;
+    let n_variants_hint = operator.n_variants_hint;
+    let observed_total = operator.observed_variants;
+    let scale = operator.scale;
+    let block_capacity = operator.block_capacity;
+    let block_len = block_len;
+    let progress_handle = progress;
 
-    loop {
-        let filled = source
-            .next_block_into(block_capacity, &mut block_storage[..])
-            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+    let result = thread::scope(|scope| {
+        let buffer_ptrs_prefetch = buffer_ptrs;
+        let filled_sender = filled_tx;
+        let free_receiver = free_rx;
+        let progress_handle = progress_handle;
+        scope.spawn(move || {
+            if let Err(err) = {
+                let mut guard = source_mutex
+                    .lock()
+                    .expect("covariance source mutex poisoned");
+                let source: &mut S = &mut **guard;
+                source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
+            } {
+                let _ = filled_sender.send(PrefetchMessage::Error(err));
+                return;
+            }
 
-        if filled == 0 {
-            break;
+            let mut start = 0usize;
+            let mut used_source_progress = false;
+            while let Ok(id) = free_receiver.recv() {
+                let buffer_slice = unsafe {
+                    std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
+                };
+                let (filled_res, progress_bytes, progress_variants) = {
+                    let mut guard = source_mutex
+                        .lock()
+                        .expect("covariance source mutex poisoned");
+                    let source: &mut S = &mut **guard;
+                    let filled = source.next_block_into(block_capacity, buffer_slice);
+                    let bytes = source.progress_bytes();
+                    let variants = source.progress_variants();
+                    (filled, bytes, variants)
+                };
+
+                match filled_res {
+                    Ok(filled) => {
+                        if filled == 0 {
+                            if let Some(handle) = progress_handle {
+                                if let Some((_, Some(total))) = progress_variants {
+                                    handle.set_total(total);
+                                } else if !used_source_progress {
+                                    handle.set_total(start);
+                                }
+                            }
+                            let _ = filled_sender.send(PrefetchMessage::End);
+                            break;
+                        }
+
+                        if let Some(handle) = progress_handle {
+                            if let Some((bytes_read, total_bytes)) = progress_bytes {
+                                used_source_progress = true;
+                                handle.advance_bytes(bytes_read, total_bytes);
+                            } else if let Some((work_done, total_work)) = progress_variants {
+                                used_source_progress = true;
+                                if let Some(total) = total_work {
+                                    handle.set_total(total);
+                                } else if n_variants_hint > 0 {
+                                    handle.estimate(n_variants_hint);
+                                }
+                                handle.advance(work_done);
+                            } else {
+                                handle.advance(start + filled);
+                            }
+                        }
+
+                        let _ = filled_sender.send(PrefetchMessage::Data { id, filled, start });
+                        start += filled;
+                    }
+                    Err(err) => {
+                        let _ = filled_sender
+                            .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let free_sender = free_tx;
+        let mut processed = 0usize;
+        let buffer_ptrs_compute = buffer_ptrs;
+        let mut covariance = covariance;
+        while let Ok(message) = filled_rx.recv() {
+            match message {
+                PrefetchMessage::Data { id, filled, start } => {
+                    if start != processed {
+                        return Err(HwePcaError::InvalidInput(
+                            "prefetch produced out-of-order variant ranges",
+                        ));
+                    }
+                    if start + filled > observed_total {
+                        return Err(HwePcaError::InvalidInput(
+                            "VariantBlockSource returned more variants than observed",
+                        ));
+                    }
+
+                    let block_slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
+                    };
+                    let mut block = MatMut::from_column_major_slice_mut(
+                        &mut block_slice[..n_samples * filled],
+                        n_samples,
+                        filled,
+                    );
+                    let variant_range = start..start + filled;
+                    operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+
+                    triangular_matmul::matmul(
+                        covariance.as_mut(),
+                        triangular_matmul::BlockStructure::TriangularLower,
+                        Accum::Add,
+                        block.as_ref(),
+                        triangular_matmul::BlockStructure::Rectangular,
+                        block.as_ref().transpose(),
+                        triangular_matmul::BlockStructure::Rectangular,
+                        scale,
+                        par,
+                    );
+
+                    processed = start + filled;
+
+                    if free_sender.send(id).is_err() {
+                        break;
+                    }
+                }
+                PrefetchMessage::End => {
+                    break;
+                }
+                PrefetchMessage::Error(err) => {
+                    return Err(err);
+                }
+            }
         }
 
-        if let Some(expected_total) = observed {
-            if processed + filled > expected_total {
-                return Err(HwePcaError::InvalidInput(
-                    "VariantBlockSource returned more variants than previously observed",
-                ));
-            }
-        } else if operator.n_variants_hint > 0
-            && processed + filled > operator.n_variants_hint
-            && !stats_ready
-        {
+        if processed == 0 {
             return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported hint",
+                "VariantBlockSource yielded no variants",
             ));
         }
 
-        let mut block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-
-        let variant_range = processed..processed + filled;
-        if !stats_ready {
-            let stats = unsafe { &mut *operator.stats.get() };
-            stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
-
-            let freqs = &stats.frequencies[variant_range.clone()];
-            let scales = &stats.scales[variant_range.clone()];
-            let calls_slice = &stats.block_calls[..filled];
-
-            standardize_block_with_calls(
-                block.rb_mut(),
-                freqs,
-                scales,
-                calls_slice,
-                operator.n_samples,
-                par,
-            );
-        } else {
-            operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
-        }
-
-        triangular_matmul::matmul(
-            covariance.as_mut(),
-            triangular_matmul::BlockStructure::TriangularLower,
-            Accum::Add,
-            block.as_ref(),
-            triangular_matmul::BlockStructure::Rectangular,
-            block.as_ref().transpose(),
-            triangular_matmul::BlockStructure::Rectangular,
-            operator.scale,
-            par,
-        );
-
-        processed += filled;
-
-        if let Some(handle) = progress {
-            if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
-                used_source_progress = true;
-                handle.advance_bytes(bytes_read, total_bytes);
-            } else if let Some((work_done, total_work)) = source.progress_variants() {
-                used_source_progress = true;
-                if let Some(total) = total_work {
-                    handle.set_total(total);
-                } else if operator.n_variants_hint > 0 {
-                    handle.estimate(operator.n_variants_hint);
-                }
-                handle.advance(work_done);
-            } else {
-                handle.advance(processed);
-            }
-        }
-    }
-
-    if processed == 0 {
-        return Err(HwePcaError::InvalidInput(
-            "VariantBlockSource yielded no variants",
-        ));
-    }
-
-    if let Some(expected_total) = observed {
-        if processed != expected_total {
+        if processed != observed_total {
             return Err(HwePcaError::InvalidInput(
                 "VariantBlockSource terminated early during covariance accumulation",
             ));
         }
-    } else {
-        observed = Some(processed);
-        unsafe {
-            *operator.observed_variants.get() = observed;
-        }
-        if let Some(handle) = progress {
-            if let Some((_, Some(total))) = source.progress_variants() {
-                handle.set_total(total);
-            } else if !used_source_progress {
-                handle.set_total(processed);
-            }
-        }
-    }
 
-    if !stats_ready {
-        operator.mark_stats_computed();
-    }
+        Ok(covariance)
+    });
 
-    Ok(covariance)
+    result
 }
 
 fn mirror_lower_to_upper(matrix: &mut Mat<f64>) {
@@ -1756,26 +1698,111 @@ fn build_sample_scores(n_samples: usize, decomposition: &Eigenpairs) -> (Vec<f64
     (singular_values, sample_scores)
 }
 
-fn compute_variant_loadings<S, P>(
+fn compute_variant_statistics<S, P>(
     source: &mut S,
-    scaler: &HweScaler,
-    expected_variants: usize,
     block_capacity: usize,
-    block_storage: &mut [f64],
-    sample_basis: MatRef<'_, f64>,
-    singular_values: &[f64],
-    progress: &Arc<P>,
     par: Par,
-) -> Result<Mat<f64>, HwePcaError>
+    progress: StageProgressHandle<P>,
+    n_variants_hint: usize,
+) -> Result<(HweScaler, usize), HwePcaError>
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
-    let n_components = singular_values.len();
-    let mut loadings = Mat::zeros(expected_variants, n_components);
+    let mut stats = VariantStatsCache::new(block_capacity);
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
     let mut processed = 0usize;
+    let mut used_source_progress = false;
+
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if n_variants_hint > 0 && processed + filled > n_variants_hint {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported hint",
+            ));
+        }
+
+        let block = MatMut::from_column_major_slice_mut(
+            &mut block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+
+        let variant_range = processed..processed + filled;
+        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+
+        processed += filled;
+
+        if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
+            used_source_progress = true;
+            progress.advance_bytes(bytes_read, total_bytes);
+        } else if let Some((work_done, total_work)) = source.progress_variants() {
+            used_source_progress = true;
+            if let Some(total) = total_work {
+                progress.set_total(total);
+            } else if n_variants_hint > 0 {
+                progress.estimate(n_variants_hint);
+            }
+            progress.advance(work_done);
+        } else {
+            progress.advance(processed);
+        }
+    }
+
+    if processed == 0 {
+        progress.finish();
+        return Err(HwePcaError::InvalidInput(
+            "VariantBlockSource yielded no variants",
+        ));
+    }
+
+    if let Some((_, Some(total))) = source.progress_variants() {
+        progress.set_total(total);
+    } else if !used_source_progress {
+        progress.set_total(processed);
+    }
+
+    stats.finalize();
+    let scaler = stats
+        .into_scaler()
+        .expect("finalized statistics must produce a scaler");
+    progress.finish();
+
+    Ok((scaler, processed))
+}
+
+fn compute_variant_loadings<S, P>(
+    source: &mut S,
+    scaler: &HweScaler,
+    expected_variants: usize,
+    block_capacity: usize,
+    sample_basis: MatRef<'_, f64>,
+    singular_values: &[f64],
+    progress: &Arc<P>,
+    par: Par,
+) -> Result<Mat<f64>, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver,
+{
+    let n_samples = source.n_samples();
+    let n_components = singular_values.len();
+    let loadings = Mat::zeros(expected_variants, n_components);
     let mut chunk_storage = vec![0.0f64; block_capacity * n_components];
     let inverse_singular: Vec<f64> = singular_values
         .iter()
@@ -1784,69 +1811,175 @@ where
 
     progress.on_stage_start(FitProgressStage::Loadings, expected_variants);
 
-    loop {
-        let filled = source
-            .next_block_into(block_capacity, block_storage)
-            .map_err(|e| HwePcaError::Source(Box::new(e)))?;
-        if filled == 0 {
-            break;
-        }
-        if processed + filled > expected_variants {
-            return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource returned more variants than reported",
-            ));
-        }
+    let block_len = n_samples * block_capacity;
+    let buffer_req = StackReq::new::<f64>(block_len).and(StackReq::new::<f64>(block_len));
+    let mut mem = MemBuffer::new(buffer_req);
+    let stack = MemStack::new(&mut mem);
+    let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+    let buf0 =
+        unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
+    let buf1 =
+        unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let mut buffer_slices = [buf0, buf1];
+    let [first_slice, second_slice] = &mut buffer_slices;
+    let buffer_ptrs = [
+        SendPtr(first_slice.as_mut_ptr()),
+        SendPtr(second_slice.as_mut_ptr()),
+    ];
 
-        let mut block = MatMut::from_column_major_slice_mut(
-            &mut block_storage[..n_samples * filled],
-            n_samples,
-            filled,
-        );
-        scaler.standardize_block(block.as_mut(), processed..processed + filled, par);
+    enum PrefetchMessage {
+        Data {
+            id: usize,
+            filled: usize,
+            start: usize,
+        },
+        End,
+        Error(HwePcaError),
+    }
 
-        let block_ref = block.as_ref();
+    let buffer_count = buffer_ptrs.len();
+    let (filled_tx, filled_rx) = sync_channel::<PrefetchMessage>(buffer_count);
+    let (free_tx, free_rx) = sync_channel::<usize>(buffer_count);
+    for id in 0..buffer_count {
+        free_tx.send(id).expect("failed to seed loading buffers");
+    }
 
-        let mut chunk = MatMut::from_column_major_slice_mut(
-            &mut chunk_storage[..filled * n_components],
-            filled,
-            n_components,
-        );
+    let observer = Arc::clone(progress);
+    let block_capacity = block_capacity;
+    let block_len = block_len;
+    let expected_variants = expected_variants;
 
-        matmul(
-            chunk.as_mut(),
-            Accum::Replace,
-            block_ref.transpose(),
-            sample_basis,
-            1.0,
-            par,
-        );
+    let result = thread::scope(|scope| {
+        let buffer_ptrs_prefetch = buffer_ptrs;
+        let filled_sender = filled_tx;
+        let free_receiver = free_rx;
+        scope.spawn(move || {
+            if let Err(err) = source.reset().map_err(|e| HwePcaError::Source(Box::new(e))) {
+                let _ = filled_sender.send(PrefetchMessage::Error(err));
+                return;
+            }
 
-        {
-            let chunk_view = chunk.as_mut();
-            for (column, &inv_sigma) in chunk_view.col_iter_mut().zip(inverse_singular.iter()) {
-                zip!(column).for_each(|unzip!(value)| {
-                    *value *= inv_sigma;
-                });
+            let mut start = 0usize;
+            while let Ok(id) = free_receiver.recv() {
+                let buffer_slice = unsafe {
+                    std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
+                };
+                let filled = match source.next_block_into(block_capacity, buffer_slice) {
+                    Ok(filled) => filled,
+                    Err(err) => {
+                        let _ = filled_sender
+                            .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                        break;
+                    }
+                };
+
+                if filled == 0 {
+                    let _ = filled_sender.send(PrefetchMessage::End);
+                    break;
+                }
+
+                observer.on_stage_advance(
+                    FitProgressStage::Loadings,
+                    (start + filled).min(expected_variants),
+                );
+
+                if filled_sender
+                    .send(PrefetchMessage::Data { id, filled, start })
+                    .is_err()
+                {
+                    break;
+                }
+                start += filled;
+            }
+        });
+
+        let free_sender = free_tx;
+        let mut processed = 0usize;
+        let buffer_ptrs_compute = buffer_ptrs;
+        let mut loadings = loadings;
+        while let Ok(message) = filled_rx.recv() {
+            match message {
+                PrefetchMessage::Data { id, filled, start } => {
+                    if start != processed {
+                        return Err(HwePcaError::InvalidInput(
+                            "prefetch produced out-of-order variant ranges",
+                        ));
+                    }
+                    if start + filled > expected_variants {
+                        return Err(HwePcaError::InvalidInput(
+                            "VariantBlockSource returned more variants than reported",
+                        ));
+                    }
+
+                    let block_slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
+                    };
+                    let mut block = MatMut::from_column_major_slice_mut(
+                        &mut block_slice[..n_samples * filled],
+                        n_samples,
+                        filled,
+                    );
+                    scaler.standardize_block(block.as_mut(), start..start + filled, par);
+
+                    let block_ref = block.as_ref();
+                    let mut chunk = MatMut::from_column_major_slice_mut(
+                        &mut chunk_storage[..filled * n_components],
+                        filled,
+                        n_components,
+                    );
+
+                    matmul(
+                        chunk.as_mut(),
+                        Accum::Replace,
+                        block_ref.transpose(),
+                        sample_basis,
+                        1.0,
+                        par,
+                    );
+
+                    {
+                        let chunk_view = chunk.as_mut();
+                        for (column, &inv_sigma) in
+                            chunk_view.col_iter_mut().zip(inverse_singular.iter())
+                        {
+                            zip!(column).for_each(|unzip!(value)| {
+                                *value *= inv_sigma;
+                            });
+                        }
+                    }
+
+                    loadings
+                        .submatrix_mut(start, 0, filled, n_components)
+                        .copy_from(chunk.as_ref());
+
+                    processed = start + filled;
+
+                    if free_sender.send(id).is_err() {
+                        break;
+                    }
+                }
+                PrefetchMessage::End => {
+                    break;
+                }
+                PrefetchMessage::Error(err) => {
+                    return Err(err);
+                }
             }
         }
 
-        loadings
-            .submatrix_mut(processed, 0, filled, n_components)
-            .copy_from(chunk.as_ref());
+        if processed != expected_variants {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource terminated early while computing loadings",
+            ));
+        }
 
-        processed += filled;
-        progress.on_stage_advance(FitProgressStage::Loadings, processed);
-    }
+        progress.on_stage_finish(FitProgressStage::Loadings);
 
-    if processed != expected_variants {
-        return Err(HwePcaError::InvalidInput(
-            "VariantBlockSource terminated early while computing loadings",
-        ));
-    }
+        Ok(loadings)
+    });
 
-    progress.on_stage_finish(FitProgressStage::Loadings);
-
-    Ok(loadings)
+    result
 }
 
 #[derive(Serialize, Deserialize)]
