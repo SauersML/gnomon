@@ -518,11 +518,7 @@ where
         let mask = lane.is_finite();
         let finite = mask.select(lane, zero);
         sum += finite.reduce_sum();
-        count += mask
-            .to_array()
-            .into_iter()
-            .map(|flag| flag as usize)
-            .sum::<usize>();
+        count += mask.to_bitmask().count_ones() as usize;
     }
 
     for &value in remainder {
