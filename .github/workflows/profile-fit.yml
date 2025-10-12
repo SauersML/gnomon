@@ -45,11 +45,7 @@ jobs:
           PERF_DATA: perf.data
         run: |
           set -euxo pipefail
-          perf record -g -o "$PERF_DATA" -- \
-            target/profiling/gnomon \
-            --fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" \
-            --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
-            --components 16"
+          perf record -g -o "$PERF_DATA" -- target/profiling/gnomon --fit "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/hgdp1kgp_chr20.filtered.SNV_INDEL.phased.shapeit5.bcf" --components 16 --list "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv"
 
       - name: Render perf reports
         env:
