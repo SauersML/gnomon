@@ -715,14 +715,6 @@ pub fn train_model(
         seed_candidates = unique;
     }
 
-    if let Ok(limit_str) = std::env::var("GNOMON_SEED_LIMIT") {
-        if let Ok(limit) = limit_str.parse::<usize>() {
-            if limit > 0 && seed_candidates.len() > limit {
-                seed_candidates.truncate(limit);
-            }
-        }
-    }
-
     // Evaluate all seeds, separating symmetric from asymmetric candidates
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
     let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
