@@ -35,9 +35,8 @@ jobs:
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=0
 
-      - name: Build release and profiling binaries
+      - name: Build profiling binary
         run: |
-          cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
 
       - name: Profile gnomon fit workload
