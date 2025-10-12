@@ -2082,13 +2082,13 @@ impl PgenDecoder {
         }
 
         let has_dosage = (rec_ty & 0b0110_0000) != 0;
-        if has_dosage && alt_count > 1 {
-            // Multiallelic dosage tracks (#5-#10) are intentionally ignored; keep
-            // hard-call derived values (which may remain missing).
-        }
 
         let mut dosage_entries = 0usize;
-        if has_dosage && (alt_count <= 1 || alt_ord_1b == 1) {
+        if has_dosage {
+            // Multiallelic dosage tracks (#5-#10) are intentionally ignored for
+            // alternate alleles beyond the first; keep hard-call derived values
+            // (which may remain missing).
+            let decode_dosage = alt_count <= 1 || alt_ord_1b == 1;
             let b5 = (rec_ty & 0b0010_0000) != 0;
             let b6 = (rec_ty & 0b0100_0000) != 0;
 
@@ -2101,17 +2101,19 @@ impl PgenDecoder {
                         "EOF in dosage values (variant #{idx})"
                     )));
                 }
-                for (i, &sid) in ids.iter().enumerate() {
-                    if (sid as usize) < self.n {
-                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
-                        if a1dosage[sid as usize] == 255 && v != 65535 {
-                            let pl = sample_ploidy
-                                .and_then(|p| p.get(sid as usize))
-                                .copied()
-                                .unwrap_or(2);
-                            let hc = u16_to_hardcall_biallelic(v, pl);
-                            if hc != 255 {
-                                a1dosage[sid as usize] = hc;
+                if decode_dosage {
+                    for (i, &sid) in ids.iter().enumerate() {
+                        if (sid as usize) < self.n {
+                            let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                            if a1dosage[sid as usize] == 255 && v != 65535 {
+                                let pl = sample_ploidy
+                                    .and_then(|p| p.get(sid as usize))
+                                    .copied()
+                                    .unwrap_or(2);
+                                let hc = u16_to_hardcall_biallelic(v, pl);
+                                if hc != 255 {
+                                    a1dosage[sid as usize] = hc;
+                                }
                             }
                         }
                     }
@@ -2125,13 +2127,15 @@ impl PgenDecoder {
                         "EOF in dense dosage values (variant #{idx})"
                     )));
                 }
-                for s in 0..self.n {
-                    let v = u16::from_le_bytes([buf[cursor + 2 * s], buf[cursor + 2 * s + 1]]);
-                    if a1dosage[s] == 255 && v != 65535 {
-                        let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
-                        let hc = u16_to_hardcall_biallelic(v, pl);
-                        if hc != 255 {
-                            a1dosage[s] = hc;
+                if decode_dosage {
+                    for s in 0..self.n {
+                        let v = u16::from_le_bytes([buf[cursor + 2 * s], buf[cursor + 2 * s + 1]]);
+                        if a1dosage[s] == 255 && v != 65535 {
+                            let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
+                            let hc = u16_to_hardcall_biallelic(v, pl);
+                            if hc != 255 {
+                                a1dosage[s] = hc;
+                            }
                         }
                     }
                 }
@@ -2146,14 +2150,16 @@ impl PgenDecoder {
                         "EOF in sparse dosage values (variant #{idx})"
                     )));
                 }
-                for (i, &s) in present.iter().enumerate() {
-                    if s < self.n {
-                        let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
-                        if a1dosage[s] == 255 && v != 65535 {
-                            let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
-                            let hc = u16_to_hardcall_biallelic(v, pl);
-                            if hc != 255 {
-                                a1dosage[s] = hc;
+                if decode_dosage {
+                    for (i, &s) in present.iter().enumerate() {
+                        if s < self.n {
+                            let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                            if a1dosage[s] == 255 && v != 65535 {
+                                let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
+                                let hc = u16_to_hardcall_biallelic(v, pl);
+                                if hc != 255 {
+                                    a1dosage[s] = hc;
+                                }
                             }
                         }
                     }
