@@ -84,6 +84,7 @@ const RHO_SOFT_PRIOR_WEIGHT: f64 = 1e-6;
 const RHO_SOFT_PRIOR_SHARPNESS: f64 = 4.0;
 const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
 const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
+const DESIGN_MATRIX_CONDITION_THRESHOLD: f64 = 1e12;
 
 fn atanh_clamped(x: f64) -> f64 {
     0.5 * ((1.0 + x) / (1.0 - x)).ln()
@@ -519,6 +520,19 @@ pub fn train_model(
         layout.total_coeffs, layout.num_penalties
     );
 
+    let design_condition =
+        calculate_condition_number(&x_matrix).map_err(EstimationError::EigendecompositionFailed)?;
+    if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
+        let reported_condition = if design_condition.is_finite() {
+            design_condition
+        } else {
+            f64::INFINITY
+        };
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: reported_condition,
+        });
+    }
+
     // --- Setup the unified state and computation object ---
     // This now encapsulates everything needed for the optimization.
     let reml_state = internal::RemlState::new(
@@ -650,47 +664,35 @@ pub fn train_model(
         seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
     }
 
-    // Asymmetric seeds to break symmetry (crucial for distinguishing PC relevance)
-    if layout.num_penalties >= 2 {
-        // A diverse palette of asymmetric starting points
-        let asym_pairs: &[[f64; 2]] = &[
-            [12.0, 0.0],
-            [0.0, 12.0],
-            [10.0, 2.0],
-            [2.0, 10.0],
-            [8.0, -4.0],
-            [-4.0, 8.0],
-            [6.0, -2.0],
-            [-2.0, 6.0],
-            [8.0, 6.0],
-            [6.0, 8.0],
-            [4.0, 2.0],
-            [2.0, 4.0],
-            [-8.0, 0.0],
-            [0.0, -8.0],
-            [-10.0, -2.0],
-            [-2.0, -10.0],
-        ];
-        for p in asym_pairs {
-            seed_candidates.push(Array1::from_vec(p.to_vec()));
+    // Ensure each penalty index is explored individually (useful when only one needs extreme smoothing)
+    for idx in 0..layout.num_penalties {
+        for &val in &[12.0, 4.0, -4.0, -12.0] {
+            let mut seed = Array1::zeros(layout.num_penalties);
+            seed[idx] = val;
+            seed_candidates.push(seed);
         }
+    }
 
-        // A small grid over a coarse set to increase diversity without exploding combinations
-        let grid_vals: &[f64] = &[-8.0, -4.0, 0.0, 4.0, 8.0];
-        for &a in grid_vals {
-            for &b in grid_vals {
-                seed_candidates.push(Array1::from(vec![a, b]));
+    // Pairwise asymmetric seeds to break symmetry between every pair of penalties
+    if layout.num_penalties >= 2 {
+        let pair_templates: &[(f64, f64)] = &[(12.0, 0.0), (8.0, -4.0), (6.0, -2.0)];
+
+        for i in 0..layout.num_penalties {
+            for j in (i + 1)..layout.num_penalties {
+                for &(hi, lo) in pair_templates {
+                    let mut seed_ij = Array1::zeros(layout.num_penalties);
+                    seed_ij[i] = hi;
+                    seed_ij[j] = lo;
+                    seed_candidates.push(seed_ij);
+
+                    let mut seed_ji = Array1::zeros(layout.num_penalties);
+                    seed_ji[i] = lo;
+                    seed_ji[j] = hi;
+                    seed_candidates.push(seed_ji);
+                }
             }
         }
     }
-
-    // For higher dimensions, extend asymmetric patterns
-    if layout.num_penalties >= 4 {
-        seed_candidates.push(Array1::from(vec![8.0, 6.0, 4.0, 2.0])); // Decreasing
-        seed_candidates.push(Array1::from(vec![2.0, 4.0, 6.0, 8.0])); // Increasing  
-        seed_candidates.push(Array1::from(vec![8.0, 2.0, 8.0, 2.0])); // Alternating
-    }
-
     // Extend shorter seeds to match layout.num_penalties
     for seed in &mut seed_candidates {
         // Convert to Vec, resize, then back to Array1
@@ -711,6 +713,14 @@ pub fn train_model(
             }
         }
         seed_candidates = unique;
+    }
+
+    if let Ok(limit_str) = std::env::var("GNOMON_SEED_LIMIT") {
+        if let Ok(limit) = limit_str.parse::<usize>() {
+            if limit > 0 && seed_candidates.len() > limit {
+                seed_candidates.truncate(limit);
+            }
+        }
     }
 
     // Evaluate all seeds, separating symmetric from asymmetric candidates
