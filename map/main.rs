@@ -1206,7 +1206,10 @@ mod tests {
 
     #[test]
     fn fit_and_project_full_hgdp_chr20() -> Result<(), Box<dyn Error>> {
-        run_fit_and_project_hgdp_chr20(None)
+        let list_url = Path::new(
+            "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv",
+        );
+        run_fit_and_project_hgdp_chr20(Some(list_url))
     }
 
     #[test]
