@@ -32,7 +32,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
@@ -481,7 +481,7 @@ where
 
     let (chunks, remainder) = values.as_chunks_mut::<LANES>();
     for chunk in chunks {
-        let lane = Simd::<f64, LANES>::from_slice(chunk);
+        let lane = Simd::<f64, LANES>::from_array(*chunk);
         let mask = lane.is_finite();
         let standardized = (lane - mean_simd) * inv_simd;
         let result = mask.select(standardized, zero);
@@ -514,7 +514,7 @@ where
 
     let (chunks, remainder) = values.as_chunks::<LANES>();
     for chunk in chunks {
-        let lane = Simd::<f64, LANES>::from_slice(chunk);
+        let lane = Simd::<f64, LANES>::from_array(*chunk);
         let mask = lane.is_finite();
         let finite = mask.select(lane, zero);
         sum += finite.reduce_sum();
@@ -825,6 +825,7 @@ where
     observed_variants: UnsafeCell<Option<usize>>,
     stats_progress: UnsafeCell<Option<StageProgressHandle<P>>>,
     error: UnsafeCell<Option<HwePcaError>>,
+    apply_lock: Mutex<()>,
     marker: PhantomData<&'a mut S>,
 }
 
@@ -859,6 +860,7 @@ where
             observed_variants: UnsafeCell::new(None),
             stats_progress: UnsafeCell::new(stats_progress),
             error: UnsafeCell::new(None),
+            apply_lock: Mutex::new(()),
             marker: PhantomData,
         }
     }
@@ -1007,6 +1009,11 @@ where
             Par::Seq => {}
             _ => {}
         }
+        let apply_guard = self
+            .apply_lock
+            .lock()
+            .expect("standardized covariance op mutex poisoned");
+        let _ = &apply_guard;
         debug_assert_eq!(out.nrows(), self.n_samples);
         debug_assert_eq!(rhs.nrows(), self.n_samples);
 
@@ -1403,6 +1410,11 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + 'static,
 {
+    let apply_guard = operator
+        .apply_lock
+        .lock()
+        .expect("standardized covariance op mutex poisoned");
+    let _ = &apply_guard;
     let n_samples = operator.n_samples;
     let mut covariance = Mat::zeros(n_samples, n_samples);
 
