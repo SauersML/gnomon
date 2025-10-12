@@ -406,16 +406,21 @@ struct VariantStatsCache {
     block_sums: Vec<f64>,
     block_calls: Vec<usize>,
     finalized_len: Option<usize>,
+    write_pos: usize,
 }
 
 impl VariantStatsCache {
-    fn new(block_capacity: usize) -> Self {
+    fn new(block_capacity: usize, variant_capacity_hint: usize) -> Self {
+        let frequencies = Vec::with_capacity(variant_capacity_hint);
+        let scales = Vec::with_capacity(variant_capacity_hint);
+
         Self {
-            frequencies: Vec::new(),
-            scales: Vec::new(),
+            frequencies,
+            scales,
             block_sums: vec![0.0; block_capacity],
             block_calls: vec![0usize; block_capacity],
             finalized_len: None,
+            write_pos: 0,
         }
     }
 
@@ -424,7 +429,7 @@ impl VariantStatsCache {
     }
 
     fn len(&self) -> usize {
-        self.finalized_len.unwrap_or(self.frequencies.len())
+        self.finalized_len.unwrap_or(self.write_pos)
     }
 
     fn ensure_statistics(&mut self, block: MatRef<'_, f64>, variant_range: Range<usize>, par: Par) {
@@ -432,7 +437,7 @@ impl VariantStatsCache {
             return;
         }
 
-        debug_assert!(variant_range.start == self.frequencies.len());
+        debug_assert!(variant_range.start == self.write_pos);
 
         let filled = block.ncols();
         let sums_slice = &mut self.block_sums[..filled];
@@ -468,10 +473,21 @@ impl VariantStatsCache {
                 });
         }
 
-        for (&sum, &calls) in sums_slice.iter().zip(calls_slice.iter()) {
+        let end = variant_range.end;
+        if self.frequencies.len() < end {
+            self.frequencies.resize(end, 0.0);
+            self.scales.resize(end, 0.0);
+        }
+
+        let freq_slice = &mut self.frequencies[variant_range.clone()];
+        let scale_slice = &mut self.scales[variant_range.clone()];
+
+        for idx in 0..filled {
+            let sum = sums_slice[idx];
+            let calls = calls_slice[idx];
             if calls == 0 {
-                self.frequencies.push(0.0);
-                self.scales.push(HWE_SCALE_FLOOR);
+                freq_slice[idx] = 0.0;
+                scale_slice[idx] = HWE_SCALE_FLOOR;
                 continue;
             }
 
@@ -480,16 +496,18 @@ impl VariantStatsCache {
             let variance = (2.0 * allele_freq * (1.0 - allele_freq)).max(HWE_VARIANCE_EPSILON);
             let derived_scale = variance.sqrt();
 
-            self.frequencies.push(allele_freq);
-            self.scales.push(if derived_scale < HWE_SCALE_FLOOR {
+            freq_slice[idx] = allele_freq;
+            scale_slice[idx] = if derived_scale < HWE_SCALE_FLOOR {
                 HWE_SCALE_FLOOR
             } else {
                 derived_scale
-            });
+            };
         }
 
-        debug_assert_eq!(self.frequencies.len(), variant_range.end);
-        debug_assert_eq!(self.scales.len(), variant_range.end);
+        self.write_pos = end;
+
+        debug_assert!(self.frequencies.len() >= end);
+        debug_assert!(self.scales.len() >= end);
     }
 
     fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
@@ -506,7 +524,9 @@ impl VariantStatsCache {
     }
 
     fn finalize(&mut self) {
-        self.finalized_len = Some(self.frequencies.len());
+        self.frequencies.truncate(self.write_pos);
+        self.scales.truncate(self.write_pos);
+        self.finalized_len = Some(self.write_pos);
     }
 
     fn into_scaler(self) -> Option<HweScaler> {
@@ -953,7 +973,7 @@ where
             n_variants_hint,
             block_capacity,
             scale,
-            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity)),
+            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity, n_variants_hint)),
             observed_variants: UnsafeCell::new(None),
             stats_progress: UnsafeCell::new(stats_progress),
             error: UnsafeCell::new(None),
