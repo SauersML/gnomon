@@ -32,16 +32,16 @@ use std::path::Path;
 use std::str;
 use std::sync::{Arc, Mutex};
 
-/// Bring in your crate-local traits and error type.
-/// These are expected to already exist (per your provided infrastructure).
-use crate::score::pipeline::PipelineError;
 use crate::files::{
-    // Helpers
-    open_text_source,
     // Traits
     ByteRangeSource,
     TextSource,
+    // Helpers
+    open_text_source,
 };
+/// Bring in your crate-local traits and error type.
+/// These are expected to already exist (per your provided infrastructure).
+use crate::score::pipeline::PipelineError;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Public entrypoints
@@ -235,7 +235,9 @@ impl PsamInfo {
             let cols = columns.as_ref().unwrap();
             let fam_row = FamRow::from_fields(&fields, cols);
             if fam_row.iid == "0" {
-                return Err(PipelineError::Io("IID must not be '0' (PSAM/FAM contract)".into()));
+                return Err(PipelineError::Io(
+                    "IID must not be '0' (PSAM/FAM contract)".into(),
+                ));
             }
             let sex_code = parse_sex_token(&fam_row.sex);
             sex_by_sample.push(sex_code);
@@ -1291,7 +1293,7 @@ impl PgenHeader {
             0x20 | 0x21 => {
                 return Err(ioerr(
                     "External index modes (0x20/0x21) unsupported; re-encode with `plink2 --pgen ... --make-pgen`",
-                ))
+                ));
             }
             other => {
                 return Err(PipelineError::Io(format!(
@@ -1315,7 +1317,10 @@ impl PgenHeader {
         let m_variants = read_le_u32(src, 3)?;
         let n_samples = read_le_u32(src, 7)?;
 
-        if matches!(mode, PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage) {
+        if matches!(
+            mode,
+            PgenMode::FixHard | PgenMode::FixDosage | PgenMode::FixPhDosage
+        ) {
             let mut b = [0u8; 1];
             src.read_at(11, &mut b)?;
             let fmt = b[0];
@@ -1432,7 +1437,11 @@ impl PgenHeader {
             let footer_flags = read_varint_from_source(src, &mut ext_off)?;
 
             if footer_flags != 0 {
-                if ext_off.checked_add(8).ok_or_else(|| ioerr("Footer offset overflow"))? > src.len() {
+                if ext_off
+                    .checked_add(8)
+                    .ok_or_else(|| ioerr("Footer offset overflow"))?
+                    > src.len()
+                {
                     return Err(ioerr("EOF reading footer offset"));
                 }
                 ext_off += 8;
@@ -1447,7 +1456,8 @@ impl PgenHeader {
                 mask >>= 1;
             }
             let sum: u64 = lengths.into_iter().try_fold(0u64, |acc, x| {
-                acc.checked_add(x).ok_or_else(|| ioerr("Header extension length overflow"))
+                acc.checked_add(x)
+                    .ok_or_else(|| ioerr("Header extension length overflow"))
             })?;
             if ext_off
                 .checked_add(sum)
@@ -1638,11 +1648,7 @@ fn difflist_ids(
     let mut delta_cur = *cursor;
 
     for gi in 0..g {
-        let group_elems = if gi < g - 1 {
-            64
-        } else {
-            l - 64 * (g - 1)
-        };
+        let group_elems = if gi < g - 1 { 64 } else { l - 64 * (g - 1) };
         if group_elems == 0 {
             return Err(ioerr("Empty difflist group"));
         }
@@ -1653,7 +1659,10 @@ fn difflist_ids(
         for _ in 1..group_elems {
             let d = read_base128_varint(buf, &mut delta_cur)? as u32;
             let last = *ids.last().unwrap();
-            ids.push(last.checked_add(d).ok_or_else(|| ioerr("Difflist delta overflow"))?);
+            ids.push(
+                last.checked_add(d)
+                    .ok_or_else(|| ioerr("Difflist delta overflow"))?,
+            );
         }
         if gi < g - 1 {
             let used = delta_cur - start;
@@ -1758,11 +1767,7 @@ fn difflist_pairs(
     let mut delta_cur = *cursor;
 
     for gi in 0..g {
-        let group_elems = if gi < g - 1 {
-            64
-        } else {
-            l - 64 * (g - 1)
-        };
+        let group_elems = if gi < g - 1 { 64 } else { l - 64 * (g - 1) };
         if group_elems == 0 {
             return Err(ioerr("Empty difflist group"));
         }
@@ -1773,7 +1778,10 @@ fn difflist_pairs(
         for _ in 1..group_elems {
             let d = read_base128_varint(buf, &mut delta_cur)? as u32;
             let last = *ids.last().unwrap();
-            ids.push(last.checked_add(d).ok_or_else(|| ioerr("Difflist delta overflow"))?);
+            ids.push(
+                last.checked_add(d)
+                    .ok_or_else(|| ioerr("Difflist delta overflow"))?,
+            );
         }
         if gi < g - 1 {
             let used = delta_cur - start;
@@ -2104,7 +2112,8 @@ impl PgenDecoder {
                 if decode_dosage {
                     for (i, &sid) in ids.iter().enumerate() {
                         if (sid as usize) < self.n {
-                            let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                            let v =
+                                u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
                             if a1dosage[sid as usize] == 255 && v != 65535 {
                                 let pl = sample_ploidy
                                     .and_then(|p| p.get(sid as usize))
@@ -2153,7 +2162,8 @@ impl PgenDecoder {
                 if decode_dosage {
                     for (i, &s) in present.iter().enumerate() {
                         if s < self.n {
-                            let v = u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
+                            let v =
+                                u16::from_le_bytes([buf[cursor + 2 * i], buf[cursor + 2 * i + 1]]);
                             if a1dosage[s] == 255 && v != 65535 {
                                 let pl = sample_ploidy.and_then(|p| p.get(s)).copied().unwrap_or(2);
                                 let hc = u16_to_hardcall_biallelic(v, pl);
@@ -2681,9 +2691,7 @@ mod tests {
         assert_eq!(decoded_ids, expected_ids);
         assert_eq!(cursor, buf_ids.len());
 
-        let expected_vals: Vec<u8> = (0..expected_ids.len())
-            .map(|i| (i as u8) & 0b11)
-            .collect();
+        let expected_vals: Vec<u8> = (0..expected_ids.len()).map(|i| (i as u8) & 0b11).collect();
         let mut buf_pairs = Vec::new();
         buf_pairs.extend_from_slice(&encode_varint(expected_ids.len() as u64));
         push_sid(&mut buf_pairs, group0_ids[0], sid_bytes);
@@ -2752,10 +2760,7 @@ mod tests {
             .unwrap();
         assert_eq!(out1, vec![0, 1, 2, 2, 0, 0, 255, 0]);
 
-        assert_eq!(
-            decoder.anchor_cats.as_ref().unwrap(),
-            &anchor_cats.to_vec()
-        );
+        assert_eq!(decoder.anchor_cats.as_ref().unwrap(), &anchor_cats.to_vec());
     }
 
     #[test]
@@ -2764,8 +2769,7 @@ mod tests {
         let mut cats = vec![1u8, 2, 2];
         let mut out = vec![255u8; 3];
         let mut cursor = 0usize;
-        apply_multiallelic_and_project(&record, &mut cursor, 3, &mut cats, 3, 1, &mut out)
-            .unwrap();
+        apply_multiallelic_and_project(&record, &mut cursor, 3, &mut cats, 3, 1, &mut out).unwrap();
         assert_eq!(out, vec![0, 0, 2]);
         assert_eq!(cursor, record.len());
     }
