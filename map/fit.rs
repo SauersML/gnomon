@@ -347,23 +347,19 @@ struct VariantStatsCache {
     scales: Vec<f64>,
     block_sums: Vec<f64>,
     block_calls: Vec<usize>,
-    filled: usize,
     finalized_len: Option<usize>,
     write_pos: usize,
 }
 
 impl VariantStatsCache {
     fn new(block_capacity: usize, variant_capacity_hint: usize) -> Self {
-        let mut frequencies = Vec::with_capacity(variant_capacity_hint);
-        frequencies.resize(variant_capacity_hint, 0.0);
-        let mut scales = Vec::with_capacity(variant_capacity_hint);
-        scales.resize(variant_capacity_hint, 0.0);
+        let frequencies = Vec::with_capacity(variant_capacity_hint);
+        let scales = Vec::with_capacity(variant_capacity_hint);
         Self {
             frequencies,
             scales,
             block_sums: vec![0.0; block_capacity],
             block_calls: vec![0usize; block_capacity],
-            filled: 0,
             finalized_len: None,
             write_pos: 0,
         }
@@ -384,8 +380,6 @@ impl VariantStatsCache {
         }
 
         debug_assert!(variant_range.start == self.write_pos);
-
-        // debug_assert!(variant_range.start == self.filled);
 
         let filled = block.ncols();
         {
@@ -424,13 +418,12 @@ impl VariantStatsCache {
         }
 
         let end = variant_range.end;
-        if self.frequencies.len() < end {
-            self.frequencies.resize(end, 0.0);
-            self.scales.resize(end, 0.0);
-        }
+        self.ensure_capacity(end);
 
         let freq_slice = &mut self.frequencies[variant_range.clone()];
         let scale_slice = &mut self.scales[variant_range.clone()];
+        let sums_slice = &self.block_sums[..filled];
+        let calls_slice = &self.block_calls[..filled];
 
         for idx in 0..filled {
             let sum = sums_slice[idx];
@@ -462,19 +455,6 @@ impl VariantStatsCache {
         debug_assert!(self.scales.len() >= end);
     }
 
-    fn standardize_block(&self, block: MatMut<'_, f64>, variant_range: Range<usize>, par: Par) {
-        let end = variant_range.end;
-        let len = self.len();
-        assert!(
-            end <= len,
-            "standardization requested beyond computed statistics"
-        );
-        let start = variant_range.start;
-        let freqs = &self.frequencies[start..end];
-        let scales = &self.scales[start..end];
-        standardize_block_impl(block, freqs, scales, par);
-    }
-
     fn finalize(&mut self) {
         self.frequencies.truncate(self.write_pos);
         self.scales.truncate(self.write_pos);
@@ -491,12 +471,34 @@ impl VariantStatsCache {
     }
 
     fn ensure_capacity(&mut self, required: usize) {
-        if self.frequencies.len() < required {
-            let additional = required - self.frequencies.len();
-            self.frequencies
-                .extend(std::iter::repeat(0.0).take(additional));
-            self.scales.extend(std::iter::repeat(0.0).take(additional));
+        if self.frequencies.len() >= required {
+            return;
         }
+
+        let freq_capacity = self.frequencies.capacity();
+        if freq_capacity < required {
+            let block_capacity = self.block_sums.len();
+            let growth_from_capacity = freq_capacity + freq_capacity / 2;
+            let growth_from_block = self.write_pos.saturating_add(block_capacity);
+            let mut target = required
+                .max(growth_from_capacity)
+                .max(growth_from_block)
+                .max(1);
+
+            if target <= freq_capacity {
+                target = required;
+            }
+
+            let additional_capacity = target - freq_capacity;
+            self.frequencies.reserve_exact(additional_capacity);
+            self.scales.reserve_exact(additional_capacity);
+        }
+
+        let additional = required - self.frequencies.len();
+        self.frequencies
+            .extend(std::iter::repeat(0.0).take(additional));
+        self.scales
+            .extend(std::iter::repeat(0.0).take(additional));
     }
 }
 
@@ -926,11 +928,9 @@ where
             n_variants_hint,
             block_capacity,
             scale,
-            stats: UnsafeCell::new(VariantStatsCache::new(block_capacity, n_variants_hint)),
-            observed_variants: UnsafeCell::new(None),
-            stats_progress: UnsafeCell::new(stats_progress),
-            error: UnsafeCell::new(None),
-            apply_lock: Mutex::new(()),
+            scaler,
+            observed_variants,
+            error: Mutex::new(None),
             marker: PhantomData,
         }
     }
@@ -1770,7 +1770,7 @@ where
     P: FitProgressObserver,
 {
     let n_samples = source.n_samples();
-    let mut stats = VariantStatsCache::new(block_capacity);
+    let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
     let mut block_storage = vec![0.0f64; n_samples * block_capacity];
 
     source
@@ -2182,6 +2182,52 @@ mod tests {
         for row in 0..scores.nrows() {
             assert_eq!(scores[(row, 0)], 0.0);
         }
+    }
+
+    #[test]
+    fn variant_stats_cache_grows_lazily() {
+        let block_capacity = 8;
+        let hint = 1 << 15;
+        let mut cache = VariantStatsCache::new(block_capacity, hint);
+        let par = get_global_parallelism();
+        let n_samples = 4;
+
+        assert_eq!(cache.frequencies.len(), 0);
+        assert_eq!(cache.scales.len(), 0);
+
+        let first_block = Mat::from_fn(n_samples, 3, |row, col| (row + col) as f64);
+        cache.ensure_statistics(first_block.as_ref(), 0..3, par);
+        assert_eq!(cache.frequencies.len(), 3);
+        assert_eq!(cache.scales.len(), 3);
+        assert_eq!(cache.len(), 3);
+
+        let second_block = Mat::from_fn(n_samples, 2, |row, col| (row + col + 1) as f64);
+        cache.ensure_statistics(second_block.as_ref(), 3..5, par);
+        assert_eq!(cache.frequencies.len(), 5);
+        assert_eq!(cache.scales.len(), 5);
+        assert_eq!(cache.len(), 5);
+
+        cache.finalize();
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.frequencies.len(), 5);
+        assert_eq!(cache.scales.len(), 5);
+    }
+
+    #[test]
+    fn variant_stats_cache_handles_zero_hint() {
+        let block_capacity = 4;
+        let mut cache = VariantStatsCache::new(block_capacity, 0);
+        let par = get_global_parallelism();
+        let n_samples = 3;
+        let block = Mat::from_fn(n_samples, 2, |row, col| (row * 2 + col) as f64);
+
+        cache.ensure_statistics(block.as_ref(), 0..2, par);
+        assert_eq!(cache.frequencies.len(), 2);
+        assert_eq!(cache.scales.len(), 2);
+
+        cache.ensure_statistics(block.as_ref(), 2..4, par);
+        assert_eq!(cache.frequencies.len(), 4);
+        assert_eq!(cache.scales.len(), 4);
     }
 
     const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
