@@ -1044,7 +1044,7 @@ impl ByteRangeSource for VirtualBed {
         }
 
         // 2) Serve the body: contiguous blocks of size self.block_bytes per variant.
-        let mut body_off = offset - 3;
+        let body_off = offset - 3;
         let mut out_idx = (body_off / (self.block_bytes as u64)) as usize;
         let mut within_block = (body_off % (self.block_bytes as u64)) as usize;
 
@@ -1121,7 +1121,6 @@ impl ByteRangeSource for VirtualBed {
             }
 
             written += to_copy;
-            body_off += to_copy as u64;
             within_block = 0;
             out_idx += 1;
         }
