@@ -453,21 +453,34 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     # 2. Invocation
     gnomon_res = run_cmd_func([gnomon_path, "score", "--score", score_file.name, prefix.name], "Impossible Diploid Test", workdir)
     
-    # 3. Validation
+    # 3. Validation  (require new ambiguity-resolution success path)
     if gnomon_res is None:
         print("❌ Test failed: Gnomon command could not be executed.")
         return False
-        
-    expected_error_msg = "conflicting genotype data"
-    if expected_error_msg in gnomon_res.stderr:
-        print("\n✅ Verification successful: expected error message.")
-        print(f"   > stderr contained: \"...{expected_error_msg}...\"")
+
+    stderr = (gnomon_res.stderr or "").lower()
+
+    # New behavior: non-fatal, explicit resolution signal(s)
+    resolved_signal = (
+        ("ambiguity resolved" in stderr) or
+        ("complex variant resolution complete" in stderr)
+    )
+
+    if gnomon_res.returncode == 0 and resolved_signal:
+        out_path = workdir / f"{prefix.name}.sscore"
+        if out_path.exists():
+            print_file_header(out_path, "Gnomon")
+        print("\n✅ Verification successful: ambiguity detected and resolved (non-fatal).")
         print("\n✅ Impossible Diploid Test SUCCEEDED.")
         return True
+
+    # Otherwise fail with a clear hint
+    if "conflicting genotype data" in stderr:
+        print("   > Observed legacy fatal error. Update required to ensure ambiguity is resolved.")
     else:
-        print(f"   > Expected stderr to contain '{expected_error_msg}', it did not.")
-        print("\n❌ Impossible Diploid Test FAILED.")
-        return False
+        print("   > Expected explicit ambiguity resolution with exit code 0; conditions not met.")
+    print("\n❌ Impossible Diploid Test FAILED.")
+    return False
 
 # --- TEST: MULTIPLE SCORE FILES ---
 
