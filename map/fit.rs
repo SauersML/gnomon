@@ -454,7 +454,11 @@ impl VariantStatsCache {
         self.frequencies.truncate(self.write_pos);
         self.scales.truncate(self.write_pos);
         self.finalized_len = Some(self.write_pos);
+    }
 
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.finalized_len.unwrap_or(self.write_pos)
     }
 
     fn into_scaler(self) -> Option<HweScaler> {
