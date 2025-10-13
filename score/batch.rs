@@ -421,7 +421,7 @@ fn process_block<'a>(
         prep_result,
     );
 
-    process_tile(
+    process_tile_impl(
         &tile,
         prep_result,
         weights,
@@ -475,7 +475,7 @@ fn accumulate_simd_lane(
 /// calculating a baseline score and pre-computing sparse indices.
 #[cfg_attr(not(feature = "no-inline-profiling"), inline)]
 #[cfg_attr(feature = "no-inline-profiling", inline(never))]
-fn process_tile<'a>(
+pub(crate) fn process_tile_impl<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
     weights_for_batch: &'a [f32],
