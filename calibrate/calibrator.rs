@@ -6894,6 +6894,191 @@ mod tests {
     // These tests are intentionally designed to show discrepancies
     // rather than making pass/fail assertions
 
+    fn fit_sinusoidal_calibrator_fixture(n: usize, seed: u64) -> (Array1<f64>, Array1<f64>) {
+        let l = 6.0;
+        let s = Array1::from_vec(
+            (0..n)
+                .map(|i| -l + (2.0 * l) * (i as f64) / ((n as f64) - 1.0))
+                .collect(),
+        );
+
+        let omega = std::f64::consts::PI / l;
+        let amplitude = 0.9 / omega;
+
+        let eta_true = add_sinusoidal_miscalibration(&s, amplitude, omega);
+        let eta_base = s.clone();
+
+        let true_probs = eta_true
+            .mapv(|e| 1.0 / (1.0 + (-e).exp()))
+            .mapv(|p| p.clamp(1e-9, 1.0 - 1e-9));
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut y = Array1::zeros(n);
+        for i in 0..n {
+            let dist = Bernoulli::new(true_probs[i]).unwrap();
+            y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
+        }
+
+        let w = Array1::<f64>::ones(n);
+        let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| eta_base[i]);
+        let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
+
+        let mut alo_features = compute_alo_features(
+            &base_fit,
+            y.view(),
+            fake_x.view(),
+            None,
+            LinkFunction::Logit,
+        )
+        .unwrap();
+
+        alo_features.pred_identity = eta_base.clone();
+
+        let spec = CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: BasisConfig {
+                degree: 3,
+                num_knots: 10,
+            },
+            se_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            dist_basis: BasisConfig {
+                degree: 3,
+                num_knots: 5,
+            },
+            penalty_order_pred: 2,
+            penalty_order_se: 2,
+            penalty_order_dist: 2,
+            distance_hinge: false,
+            prior_weights: None,
+            firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
+        };
+
+        let (x_cal, penalties, schema, offset) =
+            build_calibrator_design(&alo_features, &spec).unwrap();
+
+        let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties);
+        let (beta, lambdas, _, _, _) = fit_calibrator(
+            y.view(),
+            w.view(),
+            x_cal.view(),
+            offset.view(),
+            &penalties,
+            &penalty_nullspace_dims,
+            LinkFunction::Logit,
+        )
+        .unwrap();
+
+        let cal_model = CalibratorModel {
+            spec: spec.clone(),
+            knots_pred: schema.knots_pred,
+            knots_se: schema.knots_se,
+            knots_dist: schema.knots_dist,
+            pred_constraint_transform: schema.pred_constraint_transform,
+            stz_se: schema.stz_se,
+            stz_dist: schema.stz_dist,
+            penalty_nullspace_dims: schema.penalty_nullspace_dims,
+            standardize_pred: schema.standardize_pred,
+            standardize_se: schema.standardize_se,
+            standardize_dist: schema.standardize_dist,
+            se_wiggle_only_drop: schema.se_wiggle_only_drop,
+            dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
+            lambda_pred: lambdas[0],
+            lambda_pred_param: lambdas[1],
+            lambda_se: lambdas[2],
+            lambda_dist: lambdas[3],
+            coefficients: beta,
+            column_spans: schema.column_spans,
+            pred_param_range: schema.pred_param_range.clone(),
+            scale: None,
+        };
+
+        let cal_probs = predict_calibrator(
+            &cal_model,
+            alo_features.pred_identity.view(),
+            alo_features.se.view(),
+            alo_features.dist.view(),
+        )
+        .unwrap();
+
+        (y, cal_probs)
+    }
+
+    fn logistic_recalibration_intercept_slope_for_check(
+        predictions: &Array1<f64>,
+        outcomes: &Array1<f64>,
+    ) -> (f64, f64) {
+        let logits: Vec<f64> = predictions
+            .iter()
+            .map(|&p| {
+                let clamped = p.clamp(1e-9, 1.0 - 1e-9);
+                (clamped / (1.0 - clamped)).ln()
+            })
+            .collect();
+
+        let mut intercept = 0.0;
+        let mut slope = 1.0;
+
+        for _ in 0..25 {
+            let mut g0 = 0.0;
+            let mut g1 = 0.0;
+            let mut h00 = 0.0;
+            let mut h01 = 0.0;
+            let mut h11 = 0.0;
+
+            for (idx, &logit) in logits.iter().enumerate() {
+                let eta = intercept + slope * logit;
+                let p_hat = 1.0 / (1.0 + (-eta).exp());
+                let w = p_hat * (1.0 - p_hat);
+                let residual = outcomes[idx] - p_hat;
+                g0 += residual;
+                g1 += residual * logit;
+                h00 += w;
+                h01 += w * logit;
+                h11 += w * logit * logit;
+            }
+
+            let det = h00 * h11 - h01 * h01;
+            if det.abs() < 1e-12 {
+                break;
+            }
+
+            let delta_intercept = (g0 * h11 - g1 * h01) / det;
+            let delta_slope = (-g0 * h01 + g1 * h00) / det;
+
+            intercept += delta_intercept;
+            slope += delta_slope;
+
+            if delta_intercept.abs().max(delta_slope.abs()) < 1e-6 {
+                break;
+            }
+        }
+
+        (intercept, slope)
+    }
+
+    #[test]
+    fn global_calibration_extreme_parameters_detected_for_large_sample() {
+        let n_small = 10; // Smaller sample reproduces the failure observed in production
+        let (outcomes, calibrated_probs) = fit_sinusoidal_calibrator_fixture(n_small, 4242);
+
+        let (intercept, slope) =
+            logistic_recalibration_intercept_slope_for_check(&calibrated_probs, &outcomes);
+
+        let slope_ok = slope >= -10.0 && slope <= 10.0;
+        let intercept_ok = intercept >= -10.0 && intercept <= 10.0;
+
+        if !slope_ok || !intercept_ok {
+            panic!(
+                "[FAIL][Global calibration :: slope] Calibration slope out of range: {:.3}\n\
+[FAIL][Global calibration :: intercept] Calibration intercept out of range: {:.3}",
+                slope, intercept
+            );
+        }
+    }
+
     #[test]
     fn test_alo_weighting_convention() {
         // Create a small hand-sized unpenalized logistic model with varying weights
