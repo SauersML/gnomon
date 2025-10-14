@@ -391,6 +391,10 @@ struct Cli {
     #[arg(long, value_name = "N", requires = "fit", conflicts_with = "project")]
     components: Option<usize>,
 
+    /// Enable LD normalization when fitting the PCA model
+    #[arg(long, requires = "fit", conflicts_with = "project")]
+    ld: bool,
+
     /// Project samples using an existing HWE PCA model
     #[arg(long, value_name = "PATH", conflicts_with = "fit")]
     project: Option<PathBuf>,
@@ -433,6 +437,7 @@ fn main() {
         project,
         command,
         components,
+        ld,
     } = cli;
 
     // Ensure each invocation starts with calibration enabled unless explicitly disabled.
@@ -445,7 +450,7 @@ fn main() {
 
     let result = if let Some(path) = fit {
         let components = components.expect("clap enforces --components with --fit");
-        run_map_fit(path, list, components)
+        run_map_fit(path, list, components, ld)
     } else if let Some(path) = project {
         run_map_project(path)
     } else {
@@ -475,11 +480,13 @@ fn run_map_fit(
     path: PathBuf,
     list: Option<PathBuf>,
     components: usize,
+    ld: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path: path,
         variant_list: list,
         components,
+        ld,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }

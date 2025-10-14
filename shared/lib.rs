@@ -25,8 +25,7 @@ pub mod batch {
         prep_result: &'a crate::score::types::PreparationResult,
         weights_for_batch: &'a [f32],
         flips_for_batch: &'a [u8],
-        reconciled_variant_indices_for_batch:
-            &'a [crate::score::types::ReconciledVariantIndex],
+        reconciled_variant_indices_for_batch: &'a [crate::score::types::ReconciledVariantIndex],
         block_scores_out: &mut [f64],
         block_missing_counts_out: &mut [u32],
     ) {
