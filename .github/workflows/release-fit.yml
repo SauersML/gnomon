@@ -1,0 +1,187 @@
+name: Release Fit Projection
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  release-fit:
+    name: Release build, timed fit, and plots
+    runs-on: ubuntu-22.04-4core
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build gnomon (release)
+        run: |
+          set -euxo pipefail
+          cargo build --release --locked --bin gnomon
+
+      - name: Timed gnomon fit run
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
+            target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 20 \
+            2>&1 | tee gnomon-fit.log
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas matplotlib tqdm numpy
+
+      - name: Generate PCA plots from projection output
+        run: |
+          python <<'PYTHON'
+import json
+import urllib.request
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+OUTPUT_DIR = Path('artifacts')
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+hwe_path = Path('phased_haplotypes_v2.hwe.json')
+if not hwe_path.exists():
+    raise FileNotFoundError(f"Expected model at {hwe_path} from gnomon fit run")
+
+with hwe_path.open('r', encoding='utf-8') as fh:
+    model = json.load(fh)
+
+scores_meta = model['sample_scores']
+rows = scores_meta['nrows']
+cols = scores_meta['ncols']
+values = scores_meta['data']
+if len(values) != rows * cols:
+    raise ValueError('sample_scores data length mismatch')
+
+scores = np.array(values, dtype=float).reshape((cols, rows)).T
+pcs_df = pd.DataFrame(scores, columns=[f'PC{i+1}' for i in range(cols)])
+
+samples_path = Path('phased_haplotypes_v2.samples.tsv')
+if not samples_path.exists():
+    raise FileNotFoundError('Sample manifest from fit run was not found')
+
+samples_df = pd.read_csv(samples_path, sep='\t', dtype=str)
+samples_df['SampleID'] = samples_df['IID'].astype(str).str.strip()
+pcs_df.insert(0, 'SampleID', samples_df['SampleID'])
+
+igsr_url = 'https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/igsr_samples.tsv'
+igsr_path = OUTPUT_DIR / 'igsr_samples.tsv'
+if not igsr_path.exists():
+    req = urllib.request.Request(igsr_url, headers={'User-Agent': 'python-urllib'})
+    with urllib.request.urlopen(req) as response, igsr_path.open('wb') as out:
+        total = response.getheader('Content-Length')
+        total_bytes = int(total) if total is not None else None
+        with tqdm(
+            total=total_bytes,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=f'Downloading {igsr_path.name}',
+            leave=False,
+            dynamic_ncols=True,
+        ) as progress:
+            while True:
+                chunk = response.read(1024 * 64)
+                if not chunk:
+                    break
+                out.write(chunk)
+                progress.update(len(chunk))
+
+igsr_df = pd.read_csv(igsr_path, sep='\t', dtype=str)
+igsr_df['SampleID'] = igsr_df['Sample name'].astype(str).str.strip()
+igsr_df['Population'] = igsr_df['Population code'].astype(str).str.strip()
+igsr_df['Superpopulation'] = igsr_df['Superpopulation code'].astype(str).str.strip()
+igsr_df['PopulationNameLong'] = igsr_df.get('Population name', igsr_df['Population'])
+igsr_df = igsr_df[['SampleID', 'Population', 'PopulationNameLong', 'Superpopulation']]
+
+ann_pca = pcs_df.merge(igsr_df, on='SampleID', how='left')
+ann_pca['Population'] = ann_pca['Population'].fillna('UNK')
+ann_pca['Superpopulation'] = ann_pca['Superpopulation'].fillna('OTH')
+ann_pca['PopulationNameLong'] = ann_pca['PopulationNameLong'].fillna(ann_pca['Population'])
+
+superpopulations = set(ann_pca['Superpopulation'])
+color_map = {}
+base_palette = plt.get_cmap('tab10')
+for idx, superpop in enumerate(sorted(superpopulations)):
+    base_color = np.array(mcolors.to_rgb(base_palette(idx % base_palette.N)))
+    subpopulations = sorted(set(ann_pca.loc[ann_pca['Superpopulation'] == superpop, 'Population']))
+    if not subpopulations:
+        continue
+    shades = np.linspace(0.45, 1.0, num=len(subpopulations))
+    for shade, subpop in zip(shades, subpopulations):
+        adjusted = np.clip(base_color * shade, 0, 1)
+        color_map[(superpop, subpop)] = adjusted
+
+def plot_projection(df: pd.DataFrame, x: str, y: str, output_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=150)
+    seen_labels = set()
+    for (superpop, subpop), group in df.groupby(['Superpopulation', 'Population']):
+        color = color_map.get((superpop, subpop), (0.4, 0.4, 0.4))
+        label = f"{superpop} – {subpop}"
+        scatter = ax.scatter(
+            group[x],
+            group[y],
+            s=14,
+            c=[color],
+            edgecolors='none',
+            alpha=0.8,
+            label=label,
+        )
+        if label not in seen_labels:
+            seen_labels.add(label)
+    ax.axhline(0, color='black', linewidth=0.4, alpha=0.5)
+    ax.axvline(0, color='black', linewidth=0.4, alpha=0.5)
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    ax.set_title(f'{x} vs {y} (annotated)')
+    handles, labels = [], []
+    for (superpop, subpop) in sorted(color_map.keys()):
+        label = f"{superpop} – {subpop}"
+        if label in seen_labels:
+            handles.append(plt.Line2D([0], [0], marker='o', linestyle='', color=color_map[(superpop, subpop)], label=label))
+            labels.append(label)
+    if handles:
+        ax.legend(handles, labels, loc='upper right', bbox_to_anchor=(1.35, 1), fontsize='small', ncol=1)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+plot_projection(ann_pca, 'PC1', 'PC2', OUTPUT_DIR / 'pc1_pc2.png')
+plot_projection(ann_pca, 'PC3', 'PC4', OUTPUT_DIR / 'pc3_pc4.png')
+PYTHON
+
+      - name: Upload PCA plot artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-plots
+          path: |
+            artifacts/pc1_pc2.png
+            artifacts/pc3_pc4.png
+            gnomon-fit.log
+
