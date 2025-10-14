@@ -415,7 +415,11 @@ fn standardize_block_impl(block: MatMut<'_, f64>, freqs: &[f64], scales: &[f64],
     }
 }
 
-fn apply_ld_weights(block: MatMut<'_, f64>, variant_range: Range<usize>, weights: &[f64]) {
+pub(crate) fn apply_ld_weights(
+    block: MatMut<'_, f64>,
+    variant_range: Range<usize>,
+    weights: &[f64],
+) {
     let start = variant_range.start.min(weights.len());
     let end = variant_range.end.min(weights.len());
     if end <= start {
