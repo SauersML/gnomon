@@ -1026,6 +1026,7 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + Send + Sync + 'static,
 {
+    apply_lock: Mutex<()>,
     source: Mutex<&'a mut S>,
     n_samples: usize,
     n_variants_hint: usize,
@@ -1055,6 +1056,7 @@ where
         let n_samples = source.n_samples();
         let scale = 1.0 / ((n_samples - 1) as f64);
         Self {
+            apply_lock: Mutex::new(()),
             source: Mutex::new(source),
             n_samples,
             n_variants_hint,
@@ -1070,6 +1072,7 @@ where
 
     fn into_parts(self) -> (&'a mut S, HweScaler) {
         let Self {
+            apply_lock: _,
             source,
             n_samples: _,
             n_variants_hint: _,
@@ -1189,6 +1192,11 @@ where
         par: Par,
         stack: &mut MemStack,
     ) {
+        let _apply_guard = self
+            .apply_lock
+            .lock()
+            .expect("covariance apply lock poisoned");
+
         debug_assert_eq!(out.nrows(), self.n_samples);
         debug_assert_eq!(rhs.nrows(), self.n_samples);
 
@@ -1609,6 +1617,11 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + Send + Sync + 'static,
 {
+    let _apply_guard = operator
+        .apply_lock
+        .lock()
+        .expect("covariance apply lock poisoned");
+
     let n_samples = operator.n_samples;
     let cross_products = Mat::zeros(n_samples, n_samples);
     let sum_products = Mat::zeros(n_samples, n_samples);

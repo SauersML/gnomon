@@ -521,8 +521,8 @@ pub fn train_model(
     );
 
     if matches!(config.link_function, LinkFunction::Identity) {
-        let design_condition =
-            calculate_condition_number(&x_matrix).map_err(EstimationError::EigendecompositionFailed)?;
+        let design_condition = calculate_condition_number(&x_matrix)
+            .map_err(EstimationError::EigendecompositionFailed)?;
         if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
             let reported_condition = if design_condition.is_finite() {
                 design_condition
