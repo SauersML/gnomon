@@ -1124,6 +1124,24 @@ where
             apply_ld_weights(block, variant_range, weights);
         }
     }
+
+    fn standardize_block_with_mask_in_place(
+        &self,
+        mut block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        mut presence: MatMut<'_, f64>,
+        par: Par,
+    ) {
+        self.scaler.standardize_block_with_mask(
+            block.as_mut(),
+            variant_range.clone(),
+            presence.as_mut(),
+            par,
+        );
+        if let Some(weights) = &self.ld_weights {
+            apply_ld_weights(block, variant_range, weights);
+        }
+    }
 }
 
 impl<'a, S, P> fmt::Debug for StandardizedCovarianceOp<'a, S, P>
@@ -1592,10 +1610,12 @@ where
     P: FitProgressObserver + Send + Sync + 'static,
 {
     let n_samples = operator.n_samples;
-    let covariance = Mat::zeros(n_samples, n_samples);
+    let cross_products = Mat::zeros(n_samples, n_samples);
+    let sum_products = Mat::zeros(n_samples, n_samples);
+    let pair_counts = Mat::zeros(n_samples, n_samples);
 
     if n_samples == 0 {
-        return Ok(covariance);
+        return Ok(Mat::zeros(n_samples, n_samples));
     }
 
     let block_capacity = operator.block_capacity;
@@ -1636,7 +1656,6 @@ where
     let source_mutex = &operator.source;
     let n_variants_hint = operator.n_variants_hint;
     let observed_total = operator.observed_variants;
-    let scale = operator.scale;
     let block_capacity = operator.block_capacity;
     let block_len = block_len;
     let progress_handle = progress;
@@ -1721,7 +1740,10 @@ where
         let free_sender = free_tx;
         let mut processed = 0usize;
         let buffer_ptrs_compute = buffer_ptrs;
-        let mut covariance = covariance;
+        let mut cross_products = cross_products;
+        let mut sum_products = sum_products;
+        let mut pair_counts = pair_counts;
+        let mut mask_storage = vec![0.0f64; block_len];
         while let Ok(message) = filled_rx.recv() {
             match message {
                 PrefetchMessage::Data { id, filled, start } => {
@@ -1744,18 +1766,52 @@ where
                         n_samples,
                         filled,
                     );
+                    let mut presence = MatMut::from_column_major_slice_mut(
+                        &mut mask_storage[..n_samples * filled],
+                        n_samples,
+                        filled,
+                    );
                     let variant_range = start..start + filled;
-                    operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+                    operator.standardize_block_with_mask_in_place(
+                        block.rb_mut(),
+                        variant_range.clone(),
+                        presence.rb_mut(),
+                        par,
+                    );
+
+                    let block_ref = block.as_ref();
+                    let mask_ref = presence.as_ref();
 
                     triangular_matmul::matmul(
-                        covariance.as_mut(),
+                        cross_products.as_mut(),
                         triangular_matmul::BlockStructure::TriangularLower,
                         Accum::Add,
-                        block.as_ref(),
+                        block_ref,
                         triangular_matmul::BlockStructure::Rectangular,
-                        block.as_ref().transpose(),
+                        block_ref.transpose(),
                         triangular_matmul::BlockStructure::Rectangular,
-                        scale,
+                        1.0,
+                        par,
+                    );
+
+                    matmul(
+                        sum_products.as_mut(),
+                        Accum::Add,
+                        block_ref,
+                        mask_ref.transpose(),
+                        1.0,
+                        par,
+                    );
+
+                    triangular_matmul::matmul(
+                        pair_counts.as_mut(),
+                        triangular_matmul::BlockStructure::TriangularLower,
+                        Accum::Add,
+                        mask_ref,
+                        triangular_matmul::BlockStructure::Rectangular,
+                        mask_ref.transpose(),
+                        triangular_matmul::BlockStructure::Rectangular,
+                        1.0,
                         par,
                     );
 
@@ -1786,10 +1842,34 @@ where
             ));
         }
 
-        Ok(covariance)
+        Ok((cross_products, sum_products, pair_counts))
     });
 
-    result
+    let (cross_products, sum_products, pair_counts) = result?;
+
+    let mut covariance = Mat::zeros(n_samples, n_samples);
+    for col in 0..n_samples {
+        for row in col..n_samples {
+            let count = pair_counts[(row, col)];
+            if !count.is_finite() || count < 2.0 {
+                continue;
+            }
+
+            let sum_row_col = sum_products[(row, col)];
+            let sum_col_row = sum_products[(col, row)];
+            let cov = cross_products[(row, col)] - (sum_row_col * sum_col_row) / count;
+            if !cov.is_finite() {
+                continue;
+            }
+            let denom = (count - 1.0).max(1.0);
+            covariance[(row, col)] = cov / denom;
+            if row != col {
+                covariance[(col, row)] = covariance[(row, col)];
+            }
+        }
+    }
+
+    Ok(covariance)
 }
 
 fn mirror_lower_to_upper(matrix: &mut Mat<f64>) {
@@ -2128,8 +2208,11 @@ where
 
     let mut values_scratch = Mat::zeros(n_samples, window_capacity);
     let mut mask_scratch = Mat::zeros(n_samples, window_capacity);
+    let mut square_scratch = Mat::zeros(n_samples, window_capacity);
     let mut gram_scratch = Mat::zeros(window_capacity, window_capacity);
     let mut count_scratch = Mat::zeros(window_capacity, window_capacity);
+    let mut sum_scratch = Mat::zeros(window_capacity, window_capacity);
+    let mut sq_scratch = Mat::zeros(window_capacity, window_capacity);
     let mut system_scratch = Mat::zeros(window_capacity, window_capacity);
     let mut rhs_scratch = Mat::zeros(window_capacity, 1);
 
@@ -2199,8 +2282,11 @@ where
                 config,
                 &mut values_scratch,
                 &mut mask_scratch,
+                &mut square_scratch,
                 &mut gram_scratch,
                 &mut count_scratch,
+                &mut sum_scratch,
+                &mut sq_scratch,
                 &mut system_scratch,
                 &mut rhs_scratch,
                 &stage_progress,
@@ -2218,8 +2304,11 @@ where
         config,
         &mut values_scratch,
         &mut mask_scratch,
+        &mut square_scratch,
         &mut gram_scratch,
         &mut count_scratch,
+        &mut sum_scratch,
+        &mut sq_scratch,
         &mut system_scratch,
         &mut rhs_scratch,
         &stage_progress,
@@ -2243,8 +2332,11 @@ fn assign_ready_weights<P: FitProgressObserver>(
     config: LdResolvedConfig,
     values_scratch: &mut Mat<f64>,
     mask_scratch: &mut Mat<f64>,
+    square_scratch: &mut Mat<f64>,
     gram_scratch: &mut Mat<f64>,
     count_scratch: &mut Mat<f64>,
+    sum_scratch: &mut Mat<f64>,
+    sq_scratch: &mut Mat<f64>,
     system_scratch: &mut Mat<f64>,
     rhs_scratch: &mut Mat<f64>,
     progress: &StageProgressHandle<P>,
@@ -2321,6 +2413,17 @@ fn assign_ready_weights<P: FitProgressObserver>(
             par,
         );
 
+        let mut squared_view = square_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, n_samples, window_len);
+        for col in 0..window_len {
+            let src = values_view.col(col);
+            let dst_col = squared_view.rb_mut().col_mut(col);
+            zip!(dst_col, src).for_each(|unzip!(dst, src)| {
+                *dst = src * src;
+            });
+        }
+
         let mut count_view = count_scratch
             .as_mut()
             .submatrix_mut(0, 0, window_len, window_len);
@@ -2333,12 +2436,38 @@ fn assign_ready_weights<P: FitProgressObserver>(
             par,
         );
 
+        let mut sum_view = sum_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, window_len, window_len);
+        matmul(
+            sum_view.as_mut(),
+            Accum::Replace,
+            values_view.transpose(),
+            mask_view,
+            1.0,
+            par,
+        );
+
+        let mut sq_view = sq_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, window_len, window_len);
+        matmul(
+            sq_view.as_mut(),
+            Accum::Replace,
+            squared_view.as_ref().transpose(),
+            mask_view,
+            1.0,
+            par,
+        );
+
         let mut system_view = system_scratch
             .as_mut()
             .submatrix_mut(0, 0, window_len, window_len);
         let mut rhs_view = rhs_scratch.as_mut().submatrix_mut(0, 0, window_len, 1);
-        let weight = solve_ld_window_from_gram(
+        let weight = solve_ld_window_from_stats(
             gram_view.as_ref(),
+            sum_view.as_ref(),
+            sq_view.as_ref(),
             count_view.as_ref(),
             center,
             config.ridge,
@@ -2356,8 +2485,10 @@ fn assign_ready_weights<P: FitProgressObserver>(
     Ok(())
 }
 
-fn solve_ld_window_from_gram(
+fn solve_ld_window_from_stats(
     gram: MatRef<'_, f64>,
+    sums: MatRef<'_, f64>,
+    squared_sums: MatRef<'_, f64>,
     counts: MatRef<'_, f64>,
     center: usize,
     ridge: f64,
@@ -2375,20 +2506,22 @@ fn solve_ld_window_from_gram(
             system[(i, i)] = 1.0 + adjusted_ridge;
             for j in 0..i {
                 let count = counts[(i, j)];
-                let value = if count.is_finite() && count > 1.0 {
-                    let den = count - 1.0;
-                    if den <= 0.0 {
+                let value = if count.is_finite() && count >= 2.0 {
+                    let sum_x = sums[(i, j)];
+                    let sum_y = sums[(j, i)];
+                    let cov = gram[(i, j)] - (sum_x * sum_y) / count;
+                    let var_x = squared_sums[(i, j)] - (sum_x * sum_x) / count;
+                    let var_y = squared_sums[(j, i)] - (sum_y * sum_y) / count;
+
+                    if !cov.is_finite() || !var_x.is_finite() || !var_y.is_finite() {
+                        0.0
+                    } else if var_x <= 0.0 || var_y <= 0.0 {
                         0.0
                     } else {
-                        let dot = gram[(i, j)];
-                        let corr = dot / den;
-                        let noise = 1.0 / den;
-                        let raw = corr * corr - noise;
-                        if raw.is_finite() && raw > 0.0 {
-                            raw
-                        } else {
-                            0.0
-                        }
+                        let denom = (count - 1.0).max(1.0);
+                        let corr = (cov / (var_x * var_y).sqrt()).clamp(-1.0, 1.0);
+                        let r2 = corr * corr - 1.0 / denom;
+                        if r2.is_finite() && r2 > 0.0 { r2 } else { 0.0 }
                     }
                 } else {
                     0.0
