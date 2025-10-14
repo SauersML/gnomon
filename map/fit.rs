@@ -41,7 +41,7 @@ pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
-const DEFAULT_GRAM_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const DEFAULT_GRAM_BUDGET_BYTES_U64: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
@@ -65,14 +65,21 @@ enum CovarianceComputationMode {
     Partial,
 }
 
+fn default_gram_budget_usize() -> usize {
+    DEFAULT_GRAM_BUDGET_BYTES_U64
+        .min(usize::MAX as u64)
+        .try_into()
+        .unwrap()
+}
+
 fn gram_matrix_budget_bytes() -> usize {
     match std::env::var("GNOMON_GRAM_BUDGET_BYTES") {
         Ok(value) => match value.parse::<u64>() {
             Ok(parsed) if parsed == 0 => usize::MAX,
-            Ok(parsed) => usize::try_from(parsed).unwrap_or(usize::MAX),
-            Err(_) => DEFAULT_GRAM_BUDGET_BYTES,
+            Ok(parsed) => (parsed.min(usize::MAX as u64)) as usize,
+            Err(_) => default_gram_budget_usize(),
         },
-        Err(_) => DEFAULT_GRAM_BUDGET_BYTES,
+        Err(_) => default_gram_budget_usize(),
     }
 }
 
@@ -731,7 +738,7 @@ impl HwePcaModel {
     where
         S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
-        P: FitProgressObserver + 'static,
+        P: FitProgressObserver + Send + Sync + 'static,
     {
         Self::fit_k_with_options_and_progress(source, components, &FitOptions::default(), progress)
     }
@@ -745,7 +752,7 @@ impl HwePcaModel {
     where
         S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
-        P: FitProgressObserver + 'static,
+        P: FitProgressObserver + Send + Sync + 'static,
     {
         let n_samples = source.n_samples();
         let n_variants_hint = source.n_variants();
@@ -1017,7 +1024,7 @@ struct StandardizedCovarianceOp<'a, S, P>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     source: Mutex<&'a mut S>,
     n_samples: usize,
@@ -1035,7 +1042,7 @@ impl<'a, S, P> StandardizedCovarianceOp<'a, S, P>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     fn new(
         source: &'a mut S,
@@ -1123,7 +1130,7 @@ impl<'a, S, P> fmt::Debug for StandardizedCovarianceOp<'a, S, P>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StandardizedCovarianceOp")
@@ -1139,7 +1146,7 @@ impl<'a, S, P> LinOp<f64> for StandardizedCovarianceOp<'a, S, P>
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _ = par;
@@ -1355,7 +1362,7 @@ fn compute_covariance_eigenpairs<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let n = operator.n_samples();
     if n == 0 || top_k == 0 {
@@ -1452,7 +1459,7 @@ fn compute_covariance_eigenpairs_dense<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let mut covariance = accumulate_covariance_matrix(operator, par, progress)?;
     let n = covariance.nrows();
@@ -1582,7 +1589,7 @@ fn accumulate_covariance_matrix<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let n_samples = operator.n_samples;
     let covariance = Mat::zeros(n_samples, n_samples);
@@ -1818,7 +1825,7 @@ fn run_partial_eigensolver<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let n = operator.n_samples();
     let mut eigvecs = Mat::zeros(n, target);
@@ -1897,7 +1904,7 @@ fn compute_variant_statistics<S, P>(
 where
     S: VariantBlockSource,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver,
+    P: FitProgressObserver + Send + Sync,
 {
     let n_samples = source.n_samples();
     let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
@@ -2096,7 +2103,7 @@ fn compute_ld_weights<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let mut weights = vec![1.0; observed_variants];
     progress.on_stage_start(FitProgressStage::LdWeights, observed_variants);
@@ -2432,7 +2439,7 @@ fn compute_variant_loadings<S, P>(
 where
     S: VariantBlockSource + Send,
     S::Error: Error + Send + Sync + 'static,
-    P: FitProgressObserver,
+    P: FitProgressObserver + Send + Sync + 'static,
 {
     let n_samples = source.n_samples();
     let n_components = singular_values.len();
