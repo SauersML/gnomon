@@ -454,27 +454,73 @@ jobs:
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
 
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
       - name: Ensure profiling binary is available
         id: profiling_binary
+        shell: bash
         run: |
-          if [ -f target/profiling/gnomon ]; then
-            chmod +x target/profiling/gnomon
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Profiling binary target/profiling/gnomon not found; skipping performance reports."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          find_profiling_binary() {
+            if [ -f target/profiling/gnomon ]; then
+              printf '%s' 'target/profiling/gnomon'
+              return
+            fi
+
+            if [ -d target/profiling ]; then
+              local found
+              found=$(find target/profiling -maxdepth 3 -type f -name 'gnomon' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            if [ -d target ]; then
+              local found
+              found=$(find target -maxdepth 5 -type f -name 'gnomon' -path '*/profiling/*' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            printf ''
+          }
+
+          BIN_PATH=$(find_profiling_binary)
+
+          if [ -z "$BIN_PATH" ]; then
+            echo "Profiling binary missing from artifact; rebuilding with cargo."
+            cargo +nightly build --profile profiling --features no-inline-profiling
+            BIN_PATH=$(find_profiling_binary)
           fi
 
+          if [ -z "$BIN_PATH" ]; then
+            echo "::error::Unable to locate profiling binary even after rebuild."
+            exit 1
+          fi
+
+          chmod +x "$BIN_PATH"
+
+          if [ "$BIN_PATH" != "target/profiling/gnomon" ]; then
+            mkdir -p target/profiling
+            cp "$BIN_PATH" target/profiling/gnomon
+            chmod +x target/profiling/gnomon
+            BIN_PATH="target/profiling/gnomon"
+          fi
+
+          echo "path=$BIN_PATH" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-python@v4
-        if: steps.profiling_binary.outputs.present == 'true'
         with: { python-version: '3.11' }
 
       - name: Install Python dependencies
-        if: steps.profiling_binary.outputs.present == 'true'
         run: pip install pandas numpy requests psutil
 
       - name: System Diagnostics
-        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           echo "--- System Information ---"
           echo "Kernel: $(uname -a)"
@@ -485,12 +531,10 @@ jobs:
           echo "------------------------"
 
       - name: Get Kernel Version for Cache Key
-        if: steps.profiling_binary.outputs.present == 'true'
         id: kernel_version
         run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
 
       - name: Cache APT packages for perf
-        if: steps.profiling_binary.outputs.present == 'true'
         id: apt_cache
         uses: actions/cache@v4
         with:
@@ -500,7 +544,6 @@ jobs:
           key: ${{ runner.os }}-apt-perf-tools-cache-${{ steps.kernel_version.outputs.version }}
 
       - name: Install Perf Tools
-        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           CURRENT_KERNEL=$(uname -r)
           REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
@@ -511,21 +554,19 @@ jobs:
           perf --version
 
       - name: Configure Profiler Permissions
-        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
 
       - name: Run Profiling Harness
-        if: steps.profiling_binary.outputs.present == 'true'
         run: python score/tests/perf.py
 
       - name: Grant Cache Permissions
-        if: steps.profiling_binary.outputs.present == 'true' && always()
+        if: always()
         run: sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
 
       - name: Upload Profiling Data
-        if: steps.profiling_binary.outputs.present == 'true' && always()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-data-${{ github.run_id }}
