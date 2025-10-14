@@ -11,6 +11,7 @@ const PROGRESS_TICK_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FitProgressStage {
     AlleleStatistics,
+    LdWeights,
     GramMatrix,
     Loadings,
 }
@@ -19,6 +20,7 @@ impl FitProgressStage {
     pub fn describe(self) -> &'static str {
         match self {
             Self::AlleleStatistics => "allele statistics",
+            Self::LdWeights => "LD weight computation",
             Self::GramMatrix => "Gram matrix accumulation",
             Self::Loadings => "variant loading computation",
         }
@@ -342,6 +344,7 @@ impl ConsoleFitProgress {
     pub fn stage_message(stage: FitProgressStage) -> &'static str {
         match stage {
             FitProgressStage::AlleleStatistics => "Estimating allele statistics",
+            FitProgressStage::LdWeights => "Computing LD weights",
             FitProgressStage::GramMatrix => "Accumulating Gram matrix",
             FitProgressStage::Loadings => "Computing variant loadings",
         }
@@ -350,6 +353,7 @@ impl ConsoleFitProgress {
     pub fn stage_complete(stage: FitProgressStage) -> &'static str {
         match stage {
             FitProgressStage::AlleleStatistics => "Allele statistics complete",
+            FitProgressStage::LdWeights => "LD weights computed",
             FitProgressStage::GramMatrix => "Gram matrix finalized",
             FitProgressStage::Loadings => "Variant loadings complete",
         }

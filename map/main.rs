@@ -1,4 +1,4 @@
-use super::fit::{HwePcaError, HwePcaModel};
+use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
@@ -18,6 +18,7 @@ pub enum MapCommand {
         genotype_path: PathBuf,
         variant_list: Option<PathBuf>,
         components: usize,
+        ld: bool,
     },
     Project {
         genotype_path: PathBuf,
@@ -99,7 +100,8 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             genotype_path,
             variant_list,
             components,
-        } => run_fit(&genotype_path, variant_list.as_deref(), components),
+            ld,
+        } => run_fit(&genotype_path, variant_list.as_deref(), components, ld),
         MapCommand::Project { genotype_path } => run_project(&genotype_path),
     }
 }
@@ -108,6 +110,7 @@ fn run_fit(
     genotype_path: &Path,
     variant_list: Option<&Path>,
     components: usize,
+    ld: bool,
 ) -> Result<(), MapDriverError> {
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
@@ -129,6 +132,11 @@ fn run_fit(
     );
 
     println!("Requested principal components: {components}");
+    if ld {
+        println!("LD flattening enabled via --ld flag.");
+    } else {
+        println!("LD flattening disabled (default).");
+    }
 
     let mut variant_keys: Option<Vec<_>> = None;
     let mut selection_plan = SelectionPlan::All;
@@ -174,7 +182,17 @@ fn run_fit(
 
     let mut source = dataset.block_source_with_plan(selection_plan)?;
     let progress = fit_progress();
-    let mut model = HwePcaModel::fit_k_with_progress(&mut source, components, &progress)?;
+    let mut fit_options = FitOptions::default();
+    if ld {
+        println!("Computing LD normalization weights (local best-diagonal).");
+        fit_options.ld = Some(LdConfig::default());
+    }
+    let mut model = HwePcaModel::fit_k_with_options_and_progress(
+        &mut source,
+        components,
+        &fit_options,
+        &progress,
+    )?;
 
     if let Some(outcome) = source.take_selection_outcome() {
         if outcome.requested_unique > 0 {
@@ -200,6 +218,15 @@ fn run_fit(
 
     if let Some(keys) = variant_keys {
         model.set_variant_keys(Some(keys));
+    }
+
+    if let Some(ld) = model.ld() {
+        println!(
+            "LD weighting summary: {} variants, window={} ridge={:.3e}",
+            ld.weights.len(),
+            ld.window,
+            ld.ridge
+        );
     }
 
     let retained = model.components();

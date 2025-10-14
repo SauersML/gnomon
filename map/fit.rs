@@ -9,6 +9,7 @@ use dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::col::Col;
 use faer::linalg::matmul::matmul;
 use faer::linalg::matmul::triangular as triangular_matmul;
+use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
 use faer::matrix_free::LinOp;
@@ -24,6 +25,7 @@ use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
@@ -41,6 +43,10 @@ pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
 const DEFAULT_GRAM_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const DEFAULT_LD_WINDOW: usize = 51;
+const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
+const MIN_LD_WEIGHT: f64 = 1.0e-3;
+const MAX_LD_WEIGHT: f64 = 1.0e3;
 
 #[inline]
 fn select_top_k_desc(ordering: &mut [(usize, f64)], k: usize) -> usize {
@@ -80,6 +86,68 @@ fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceCompu
     match gram_matrix_size_bytes(n) {
         Some(bytes) if bytes <= budget_bytes => CovarianceComputationMode::Dense,
         _ => CovarianceComputationMode::Partial,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FitOptions {
+    pub ld: Option<LdConfig>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LdConfig {
+    pub window: Option<usize>,
+    pub ridge: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LdWeights {
+    pub weights: Vec<f64>,
+    pub window: usize,
+    pub ridge: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LdResolvedConfig {
+    window: usize,
+    ridge: f64,
+}
+
+impl FitOptions {
+    fn resolved_ld(
+        &self,
+        observed_variants: usize,
+    ) -> Result<Option<LdResolvedConfig>, HwePcaError> {
+        match &self.ld {
+            Some(cfg) if observed_variants > 0 => {
+                let mut window = cfg.window.unwrap_or(DEFAULT_LD_WINDOW);
+                if window == 0 {
+                    return Err(HwePcaError::InvalidInput(
+                        "LD weighting window must be at least one variant",
+                    ));
+                }
+                window = window.min(observed_variants.max(1));
+                if window == 0 {
+                    window = 1;
+                }
+                if window % 2 == 0 {
+                    window = window.saturating_sub(1);
+                    if window == 0 {
+                        window = 1;
+                    }
+                }
+
+                let ridge = cfg.ridge.unwrap_or(DEFAULT_LD_RIDGE);
+                if !(ridge.is_finite() && ridge > 0.0) {
+                    return Err(HwePcaError::InvalidInput(
+                        "LD weighting ridge must be positive and finite",
+                    ));
+                }
+
+                Ok(Some(LdResolvedConfig { window, ridge }))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -342,6 +410,24 @@ fn standardize_block_impl(block: MatMut<'_, f64>, freqs: &[f64], scales: &[f64],
     }
 }
 
+fn apply_ld_weights(block: MatMut<'_, f64>, variant_range: Range<usize>, weights: &[f64]) {
+    let start = variant_range.start.min(weights.len());
+    let end = variant_range.end.min(weights.len());
+    if end <= start {
+        return;
+    }
+    let slice = &weights[start..end];
+    let columns = block.subcols_mut(0, slice.len());
+    for (column, &weight) in columns.col_iter_mut().zip(slice.iter()) {
+        if (weight - 1.0).abs() < f64::EPSILON {
+            continue;
+        }
+        zip!(column).for_each(|unzip!(value)| {
+            *value *= weight;
+        });
+    }
+}
+
 struct VariantStatsCache {
     frequencies: Vec<f64>,
     scales: Vec<f64>,
@@ -437,7 +523,6 @@ impl VariantStatsCache {
 
             freq_slice[idx] = allele_freq;
             scale_slice[idx] = if derived_scale < HWE_SCALE_FLOOR {
-
                 HWE_SCALE_FLOOR
             } else {
                 derived_scale
@@ -496,8 +581,7 @@ impl VariantStatsCache {
         let additional = required - self.frequencies.len();
         self.frequencies
             .extend(std::iter::repeat(0.0).take(additional));
-        self.scales
-            .extend(std::iter::repeat(0.0).take(additional));
+        self.scales.extend(std::iter::repeat(0.0).take(additional));
     }
 }
 
@@ -628,6 +712,7 @@ pub struct HwePcaModel {
     sample_scores: Mat<f64>,
     loadings: Mat<f64>,
     variant_keys: Option<Vec<VariantKey>>,
+    ld: Option<LdWeights>,
 }
 
 impl HwePcaModel {
@@ -637,12 +722,26 @@ impl HwePcaModel {
         S::Error: Error + Send + Sync + 'static,
     {
         let progress = Arc::new(NoopFitProgress::default());
-        Self::fit_k_with_progress(source, components, &progress)
+        Self::fit_k_with_options_and_progress(source, components, &FitOptions::default(), &progress)
     }
 
     pub fn fit_k_with_progress<S, P>(
         source: &mut S,
         components: usize,
+        progress: &Arc<P>,
+    ) -> Result<Self, HwePcaError>
+    where
+        S: VariantBlockSource + Send,
+        S::Error: Error + Send + Sync + 'static,
+        P: FitProgressObserver + 'static,
+    {
+        Self::fit_k_with_options_and_progress(source, components, &FitOptions::default(), progress)
+    }
+
+    pub fn fit_k_with_options_and_progress<S, P>(
+        source: &mut S,
+        components: usize,
+        options: &FitOptions,
         progress: &Arc<P>,
     ) -> Result<Self, HwePcaError>
     where
@@ -686,12 +785,33 @@ impl HwePcaModel {
             n_variants_hint,
         )?;
 
+        let ld_config = options.resolved_ld(observed_variants)?;
+        let ld_weights = if let Some(ld_cfg) = ld_config {
+            Some(compute_ld_weights(
+                source,
+                &scaler,
+                observed_variants,
+                block_capacity,
+                ld_cfg,
+                n_variants_hint,
+                progress,
+                par,
+            )?)
+        } else {
+            None
+        };
+
+        let ld_weights_arc = ld_weights
+            .as_ref()
+            .map(|ld| Arc::<[f64]>::from(ld.weights.clone().into_boxed_slice()));
+
         let operator = StandardizedCovarianceOp::new(
             source,
             block_capacity,
             n_variants_hint,
             observed_variants,
             scaler,
+            ld_weights_arc.clone(),
         );
 
         let gram_budget = gram_matrix_budget_bytes();
@@ -769,6 +889,7 @@ impl HwePcaModel {
             block_capacity,
             decomposition.vectors.as_ref(),
             &singular_values,
+            ld_weights_arc.as_deref(),
             progress,
             par,
         )?;
@@ -783,6 +904,7 @@ impl HwePcaModel {
             sample_scores,
             loadings,
             variant_keys: None,
+            ld: ld_weights,
         })
     }
 
@@ -840,6 +962,10 @@ impl HwePcaModel {
 
     pub fn variant_keys(&self) -> Option<&[VariantKey]> {
         self.variant_keys.as_deref()
+    }
+
+    pub fn ld(&self) -> Option<&LdWeights> {
+        self.ld.as_ref()
     }
 }
 
@@ -902,6 +1028,7 @@ where
     scale: f64,
     scaler: HweScaler,
     observed_variants: usize,
+    ld_weights: Option<Arc<[f64]>>,
     error: Mutex<Option<HwePcaError>>,
     marker: PhantomData<P>,
 }
@@ -918,6 +1045,7 @@ where
         n_variants_hint: usize,
         observed_variants: usize,
         scaler: HweScaler,
+        ld_weights: Option<Arc<[f64]>>,
     ) -> Self {
         let n_samples = source.n_samples();
         let scale = 1.0 / ((n_samples - 1) as f64);
@@ -929,6 +1057,7 @@ where
             scale,
             scaler,
             observed_variants,
+            ld_weights,
             error: Mutex::new(None),
             marker: PhantomData,
         }
@@ -943,6 +1072,7 @@ where
             scale: _,
             scaler,
             observed_variants: _,
+            ld_weights: _,
             error: _,
             marker: _,
         } = self;
@@ -979,12 +1109,15 @@ where
 
     fn standardize_block_in_place(
         &self,
-        block: MatMut<'_, f64>,
+        mut block: MatMut<'_, f64>,
         variant_range: Range<usize>,
         par: Par,
     ) {
         self.scaler
-            .standardize_block(block, variant_range.clone(), par);
+            .standardize_block(block.as_mut(), variant_range.clone(), par);
+        if let Some(weights) = &self.ld_weights {
+            apply_ld_weights(block, variant_range, weights);
+        }
     }
 }
 
@@ -1843,6 +1976,246 @@ where
     Ok((scaler, processed))
 }
 
+#[derive(Clone)]
+struct WindowColumn {
+    values: Vec<f64>,
+    presence: Vec<f64>,
+}
+
+fn compute_ld_weights<S, P>(
+    source: &mut S,
+    scaler: &HweScaler,
+    observed_variants: usize,
+    block_capacity: usize,
+    config: LdResolvedConfig,
+    n_variants_hint: usize,
+    progress: &Arc<P>,
+    par: Par,
+) -> Result<LdWeights, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + 'static,
+{
+    let mut weights = vec![1.0; observed_variants];
+    progress.on_stage_start(FitProgressStage::LdWeights, observed_variants);
+    let stage_progress =
+        StageProgressHandle::new(Arc::clone(progress), FitProgressStage::LdWeights);
+
+    if observed_variants == 0 {
+        stage_progress.finish();
+        return Ok(LdWeights {
+            weights,
+            window: config.window,
+            ridge: config.ridge,
+        });
+    }
+
+    let n_samples = source.n_samples();
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+    let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
+    let mut queue: VecDeque<WindowColumn> = VecDeque::new();
+    let mut indices: VecDeque<usize> = VecDeque::new();
+    let mut next_weight = 0usize;
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    let mut processed = 0usize;
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if n_variants_hint > 0 && processed + filled > n_variants_hint {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported hint",
+            ));
+        }
+
+        let mut block = MatMut::from_column_major_slice_mut(
+            &mut block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+        let mut presence = MatMut::from_column_major_slice_mut(
+            &mut presence_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+
+        let variant_range = processed..processed + filled;
+        scaler.standardize_block_with_mask(
+            block.as_mut(),
+            variant_range.clone(),
+            presence.as_mut(),
+            par,
+        );
+
+        for (local_idx, (column, present)) in block
+            .as_ref()
+            .col_iter()
+            .zip(presence.as_ref().col_iter())
+            .enumerate()
+        {
+            queue.push_back(WindowColumn {
+                values: column.iter().copied().collect(),
+                presence: present.iter().copied().collect(),
+            });
+            indices.push_back(processed + local_idx);
+            assign_ready_weights(
+                &mut queue,
+                &mut indices,
+                &mut weights,
+                &mut next_weight,
+                config,
+            )?;
+        }
+
+        processed += filled;
+        stage_progress.advance(processed.min(observed_variants));
+    }
+
+    assign_ready_weights(
+        &mut queue,
+        &mut indices,
+        &mut weights,
+        &mut next_weight,
+        config,
+    )?;
+
+    stage_progress.set_total(observed_variants);
+    stage_progress.finish();
+
+    Ok(LdWeights {
+        weights,
+        window: config.window,
+        ridge: config.ridge,
+    })
+}
+
+fn assign_ready_weights(
+    queue: &mut VecDeque<WindowColumn>,
+    indices: &mut VecDeque<usize>,
+    weights: &mut [f64],
+    next_weight: &mut usize,
+    config: LdResolvedConfig,
+) -> Result<(), HwePcaError> {
+    while *next_weight < weights.len() {
+        let position = match indices.iter().position(|&idx| idx == *next_weight) {
+            Some(pos) => pos,
+            None => break,
+        };
+
+        let available = queue.len();
+        if available == 0 {
+            break;
+        }
+
+        let window_size = config.window.min(available).max(1);
+        let half_window = window_size / 2;
+        let start = if available <= window_size {
+            0
+        } else if position <= half_window {
+            0
+        } else {
+            let tail_start = available.saturating_sub(window_size);
+            min(position - half_window, tail_start)
+        };
+        let end = min(start + window_size, available);
+        let subset: Vec<&WindowColumn> = queue.iter().skip(start).take(end - start).collect();
+        if subset.is_empty() {
+            break;
+        }
+        let center = position - start;
+        let weight = solve_ld_window(&subset, center, config.ridge)?;
+        weights[*next_weight] = weight;
+        *next_weight += 1;
+
+        let keep_from = next_weight.saturating_sub(config.window / 2);
+        while let Some(&front_idx) = indices.front() {
+            if front_idx < keep_from {
+                indices.pop_front();
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn solve_ld_window(
+    window: &[&WindowColumn],
+    center: usize,
+    ridge: f64,
+) -> Result<f64, HwePcaError> {
+    if window.is_empty() || center >= window.len() {
+        return Ok(1.0);
+    }
+
+    let size = window.len();
+    let mut system = Mat::zeros(size, size);
+    for i in 0..size {
+        system[(i, i)] = 1.0 + ridge;
+        for j in 0..i {
+            let (dot, count) = pairwise_stats(window[i], window[j]);
+            if count <= 0.0 {
+                system[(i, j)] = 0.0;
+                system[(j, i)] = 0.0;
+                continue;
+            }
+            let effective = count.max(1.0);
+            let corr = dot / effective;
+            let noise = 1.0 / effective;
+            let mut value = corr * corr - noise;
+            if !value.is_finite() || value < 0.0 {
+                value = 0.0;
+            }
+            if value > 1.0 {
+                value = 1.0;
+            }
+            system[(i, j)] = value;
+            system[(j, i)] = value;
+        }
+    }
+
+    let rhs = Mat::from_fn(size, 1, |_, _| 1.0);
+    let factor = match FaerLlt::new(system.as_ref(), Side::Lower) {
+        Ok(f) => f,
+        Err(_) => return Ok(1.0),
+    };
+    let solution = factor.solve(rhs.as_ref());
+    let mut weight_sq = solution[(center, 0)];
+    if !weight_sq.is_finite() || weight_sq <= 0.0 {
+        weight_sq = 1.0;
+    }
+    let weight = weight_sq.sqrt();
+    Ok(weight.clamp(MIN_LD_WEIGHT, MAX_LD_WEIGHT))
+}
+
+fn pairwise_stats(lhs: &WindowColumn, rhs: &WindowColumn) -> (f64, f64) {
+    let mut dot = 0.0;
+    let mut count = 0.0;
+    for (((&lv, &rv), &lp), &rp) in lhs
+        .values
+        .iter()
+        .zip(rhs.values.iter())
+        .zip(lhs.presence.iter())
+        .zip(rhs.presence.iter())
+    {
+        dot += lv * rv;
+        count += lp * rp;
+    }
+    (dot, count)
+}
+
 fn compute_variant_loadings<S, P>(
     source: &mut S,
     scaler: &HweScaler,
@@ -1850,6 +2223,7 @@ fn compute_variant_loadings<S, P>(
     block_capacity: usize,
     sample_basis: MatRef<'_, f64>,
     singular_values: &[f64],
+    ld_weights: Option<&[f64]>,
     progress: &Arc<P>,
     par: Par,
 ) -> Result<Mat<f64>, HwePcaError>
@@ -1979,6 +2353,9 @@ where
                         filled,
                     );
                     scaler.standardize_block(block.as_mut(), start..start + filled, par);
+                    if let Some(weights) = ld_weights {
+                        apply_ld_weights(block.as_mut(), start..start + filled, weights);
+                    }
 
                     let block_ref = block.as_ref();
                     let mut chunk = MatMut::from_column_major_slice_mut(
@@ -2082,7 +2459,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 9)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 10)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -2098,6 +2475,7 @@ impl Serialize for HwePcaModel {
         )?;
         state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
         state.serialize_field("variant_keys", &self.variant_keys)?;
+        state.serialize_field("ld", &self.ld)?;
         state.end()
     }
 }
@@ -2119,6 +2497,8 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             loadings: MatrixData,
             #[serde(default)]
             variant_keys: Option<Vec<VariantKey>>,
+            #[serde(default)]
+            ld: Option<LdWeights>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
@@ -2132,6 +2512,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             sample_scores: raw.sample_scores.into_mat().map_err(DeError::custom)?,
             loadings: raw.loadings.into_mat().map_err(DeError::custom)?,
             variant_keys: raw.variant_keys,
+            ld: raw.ld,
         })
     }
 }
@@ -2227,6 +2608,45 @@ mod tests {
         cache.ensure_statistics(block.as_ref(), 2..4, par);
         assert_eq!(cache.frequencies.len(), 4);
         assert_eq!(cache.scales.len(), 4);
+    }
+
+    #[test]
+    fn ld_weights_are_applied_during_standardization() {
+        use std::sync::Arc;
+
+        let scaler = HweScaler::new(vec![0.0, 0.0], vec![1.0, 1.0]);
+        let dense_data = vec![0.0; 8];
+        let mut source = DenseBlockSource::new(&dense_data, 4, 2).unwrap();
+        let weights = Arc::from(vec![0.5, 2.0].into_boxed_slice());
+        let operator: StandardizedCovarianceOp<'_, DenseBlockSource<'_>, NoopFitProgress> =
+            StandardizedCovarianceOp::new(&mut source, 2, 2, 2, scaler, Some(weights));
+
+        let mut block_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        {
+            let mut block = MatMut::from_column_major_slice_mut(&mut block_data, 4, 2);
+            operator.standardize_block_in_place(block.as_mut(), 0..2, get_global_parallelism());
+        }
+
+        let expected = vec![0.5, 1.0, 1.5, 2.0, 10.0, 12.0, 14.0, 16.0];
+        assert_eq!(block_data, expected);
+    }
+
+    #[test]
+    fn ld_weights_are_ignored_when_absent() {
+        let scaler = HweScaler::new(vec![0.0, 0.0], vec![1.0, 1.0]);
+        let dense_data = vec![0.0; 8];
+        let mut source = DenseBlockSource::new(&dense_data, 4, 2).unwrap();
+        let operator: StandardizedCovarianceOp<'_, DenseBlockSource<'_>, NoopFitProgress> =
+            StandardizedCovarianceOp::new(&mut source, 2, 2, 2, scaler, None);
+
+        let mut block_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        {
+            let mut block = MatMut::from_column_major_slice_mut(&mut block_data, 4, 2);
+            operator.standardize_block_in_place(block.as_mut(), 0..2, get_global_parallelism());
+        }
+
+        let expected = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        assert_eq!(block_data, expected);
     }
 
     const TEST_VCF_URL: &str = "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/tests/chr22_chunk.vcf.gz";
