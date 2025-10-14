@@ -454,8 +454,65 @@ jobs:
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
 
-      - name: Make profiling binary executable
-        run: chmod +x target/profiling/gnomon
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Ensure profiling binary is available
+        id: profiling_binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_profiling_binary() {
+            if [ -f target/profiling/gnomon ]; then
+              printf '%s' 'target/profiling/gnomon'
+              return
+            fi
+
+            if [ -d target/profiling ]; then
+              local found
+              found=$(find target/profiling -maxdepth 3 -type f -name 'gnomon' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            if [ -d target ]; then
+              local found
+              found=$(find target -maxdepth 5 -type f -name 'gnomon' -path '*/profiling/*' -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then
+                printf '%s' "$found"
+                return
+              fi
+            fi
+
+            printf ''
+          }
+
+          BIN_PATH=$(find_profiling_binary)
+
+          if [ -z "$BIN_PATH" ]; then
+            echo "Profiling binary missing from artifact; rebuilding with cargo."
+            cargo +nightly build --profile profiling --features no-inline-profiling
+            BIN_PATH=$(find_profiling_binary)
+          fi
+
+          if [ -z "$BIN_PATH" ]; then
+            echo "::error::Unable to locate profiling binary even after rebuild."
+            exit 1
+          fi
+
+          chmod +x "$BIN_PATH"
+
+          if [ "$BIN_PATH" != "target/profiling/gnomon" ]; then
+            mkdir -p target/profiling
+            cp "$BIN_PATH" target/profiling/gnomon
+            chmod +x target/profiling/gnomon
+            BIN_PATH="target/profiling/gnomon"
+          fi
+
+          echo "path=$BIN_PATH" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v4
         with: { python-version: '3.11' }
@@ -476,7 +533,7 @@ jobs:
       - name: Get Kernel Version for Cache Key
         id: kernel_version
         run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
-      
+
       - name: Cache APT packages for perf
         id: apt_cache
         uses: actions/cache@v4
@@ -500,14 +557,14 @@ jobs:
         run: |
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
-          
+
       - name: Run Profiling Harness
         run: python score/tests/perf.py
-          
+
       - name: Grant Cache Permissions
         if: always()
         run: sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
-          
+
       - name: Upload Profiling Data
         if: always()
         uses: actions/upload-artifact@v4
