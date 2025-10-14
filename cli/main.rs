@@ -369,36 +369,6 @@ mod score_main;
                  and training GAM models for score calibration."
 )]
 struct Cli {
-    /// Fit an HWE PCA model from the provided genotype dataset
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "project",
-        requires = "components"
-    )]
-    fit: Option<PathBuf>,
-
-    /// Optional variant list limiting SNVs used for PCA fitting
-    #[arg(
-        long,
-        value_name = "PATH",
-        requires = "fit",
-        conflicts_with = "project"
-    )]
-    list: Option<PathBuf>,
-
-    /// Number of principal components to retain when fitting the HWE PCA model
-    #[arg(long, value_name = "N", requires = "fit", conflicts_with = "project")]
-    components: Option<usize>,
-
-    /// Enable LD normalization when fitting the PCA model
-    #[arg(long, requires = "fit", conflicts_with = "project")]
-    ld: bool,
-
-    /// Project samples using an existing HWE PCA model
-    #[arg(long, value_name = "PATH", conflicts_with = "fit")]
-    project: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -408,16 +378,45 @@ enum Commands {
     /// Calculate polygenic scores from genotype data
     #[command(about = "Calculate raw polygenic scores")]
     Score {
-        /// Path to PLINK .bed file or directory containing .bed files
-        input_path: PathBuf,
-
         /// Path to score file or directory containing score files
-        #[arg(long)]
+        #[arg(value_name = "SCORE_PATH")]
         score: PathBuf,
+
+        /// Path to PLINK .bed file or directory containing .bed files
+        #[arg(value_name = "GENOTYPE_PATH")]
+        input_path: PathBuf,
 
         /// Path to file containing list of individual IDs to include (optional)
         #[arg(long)]
         keep: Option<PathBuf>,
+    },
+
+    /// Fit an HWE PCA model from the provided genotype dataset
+    #[command(about = "Fit an HWE PCA model")]
+    Fit {
+        /// Path to PLINK .bed file or directory containing .bed files
+        #[arg(value_name = "GENOTYPE_PATH")]
+        genotype_path: PathBuf,
+
+        /// Optional variant list limiting SNVs used for PCA fitting
+        #[arg(long, value_name = "PATH")]
+        list: Option<PathBuf>,
+
+        /// Number of principal components to retain when fitting the HWE PCA model
+        #[arg(long, value_name = "N")]
+        components: usize,
+
+        /// Enable LD normalization when fitting the PCA model
+        #[arg(long)]
+        ld: bool,
+    },
+
+    /// Project samples using an existing HWE PCA model
+    #[command(about = "Project samples using an existing HWE PCA model")]
+    Project {
+        /// Path to PLINK .bed file or directory containing .bed files
+        #[arg(value_name = "GENOTYPE_PATH")]
+        genotype_path: PathBuf,
     },
 
     /// Train a GAM calibration model from training data
@@ -431,42 +430,30 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let Cli {
-        fit,
-        list,
-        project,
-        command,
-        components,
-        ld,
-    } = cli;
+    let Cli { command } = cli;
 
     // Ensure each invocation starts with calibration enabled unless explicitly disabled.
     gnomon::calibrate::model::reset_calibrator_flag();
 
-    if (fit.is_some() || project.is_some()) && command.is_some() {
-        eprintln!("Error: --fit/--project cannot be combined with subcommands.");
-        process::exit(2);
-    }
-
-    let result = if let Some(path) = fit {
-        let components = components.expect("clap enforces --components with --fit");
-        run_map_fit(path, list, components, ld)
-    } else if let Some(path) = project {
-        run_map_project(path)
-    } else {
-        match command {
-            Some(Commands::Score {
-                input_path,
-                score,
-                keep,
-            }) => run_score(input_path, score, keep),
-            Some(Commands::Train(args)) => train(args),
-            Some(Commands::Infer(args)) => infer(args),
-            None => {
-                Cli::command().print_help().expect("print help");
-                println!();
-                Ok(())
-            }
+    let result = match command {
+        Some(Commands::Score {
+            score,
+            input_path,
+            keep,
+        }) => run_score(input_path, score, keep),
+        Some(Commands::Fit {
+            genotype_path,
+            list,
+            components,
+            ld,
+        }) => run_map_fit(genotype_path, list, components, ld),
+        Some(Commands::Project { genotype_path }) => run_map_project(genotype_path),
+        Some(Commands::Train(args)) => train(args),
+        Some(Commands::Infer(args)) => infer(args),
+        None => {
+            Cli::command().print_help().expect("print help");
+            println!();
+            Ok(())
         }
     };
 
@@ -477,13 +464,13 @@ fn main() {
 }
 
 fn run_map_fit(
-    path: PathBuf,
+    genotype_path: PathBuf,
     list: Option<PathBuf>,
     components: usize,
     ld: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Fit {
-        genotype_path: path,
+        genotype_path,
         variant_list: list,
         components,
         ld,
@@ -491,11 +478,9 @@ fn run_map_fit(
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
-fn run_map_project(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    map_cli::run(map_cli::MapCommand::Project {
-        genotype_path: path,
-    })
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+fn run_map_project(genotype_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Project { genotype_path })
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
 fn run_score(

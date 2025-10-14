@@ -285,7 +285,7 @@ def main():
 
             # The 'score' subcommand is added here as a string.
             command_str = (f'echo "--- Running workload: {name} on {PROFILING_SUBSET_PCT:.0%} subset ---" && '
-                           f'"{GNOMON_BINARY}" score --score "{score_dir}" --keep "{keep_file_path}" "{data_prefix}"')
+                           f'"{GNOMON_BINARY}" score "{score_dir}" "{data_prefix}" --keep "{keep_file_path}"')
             commands_to_profile.append(command_str)
 
         runner_script_path = WORKDIR / "run_all_workloads.sh"

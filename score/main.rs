@@ -41,7 +41,7 @@ use std::time::Instant;
 )]
 struct Args {
     /// Path to a single score file or a directory containing multiple score files.
-    #[clap(long)]
+    #[clap(value_name = "SCORE_PATH")]
     score: PathBuf,
 
     /// Path to a file containing a list of individual IDs (IIDs) to include.
@@ -50,6 +50,7 @@ struct Args {
     keep: Option<PathBuf>,
 
     /// Path to the PLINK .bed file, or a directory containing a single .bed file.
+    #[clap(value_name = "GENOTYPE_PATH")]
     input_path: PathBuf,
 }
 

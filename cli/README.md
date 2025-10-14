@@ -10,13 +10,23 @@ to see global usage information.
 Calculate raw polygenic scores from genotype data.
 
 Required arguments:
+- `score_path`: path to a single score file or to a directory of score files.
 - `input_path`: path to a PLINK `.bed` file or to a directory that contains `.bed`
   files.
-- `--score <path>`: path to a single score file or to a directory of score files.
 
 Optional arguments:
 - `--keep <path>`: optional file that lists individual IDs to include in the
   calculation.
+
+### `fit`
+Fit an HWE PCA model from genotype data.
+
+Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--list <PATH>] [--ld]`
+
+### `project`
+Project samples into an existing HWE PCA space.
+
+Usage: `gnomon project <GENOTYPE_PATH>`
 
 ### `train`
 Train a generalized additive model used for calibration and saves it to `model.toml`.
