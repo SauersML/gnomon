@@ -95,6 +95,8 @@ pub struct ModelConfig {
     pub max_iterations: usize,
     pub reml_convergence_tolerance: f64,
     pub reml_max_iterations: u64,
+    #[serde(default)]
+    pub firth_bias_reduction: bool,
     pub pgs_basis_config: BasisConfig,
     /// Bundled configuration for each principal component.
     /// This ensures that for each PC, we have the correct basis config, name, and range together.
@@ -125,7 +127,12 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Minimal configuration for external designs (calibrator adapter).
     /// Only the fields used by PIRLS/REML are populated; others are left empty.
-    pub fn external(link: LinkFunction, reml_tol: f64, reml_max_iter: usize) -> Self {
+    pub fn external(
+        link: LinkFunction,
+        reml_tol: f64,
+        reml_max_iter: usize,
+        firth_bias_reduction: bool,
+    ) -> Self {
         ModelConfig {
             link_function: link,
             penalty_order: 2,
@@ -133,6 +140,7 @@ impl ModelConfig {
             max_iterations: 50,
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
+            firth_bias_reduction,
             pgs_basis_config: BasisConfig {
                 num_knots: 0,
                 degree: 0,
@@ -1160,6 +1168,7 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 1, // Number of internal knots
                     degree,
@@ -1250,6 +1259,7 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 1,
@@ -1347,6 +1357,7 @@ mod tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
+            firth_bias_reduction: false,
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -1448,6 +1459,7 @@ mod tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
+            firth_bias_reduction: false,
             pgs_basis_config: pgs_basis_config.clone(),
             pc_configs: vec![PrincipalComponentConfig {
                 name: "PC1".to_string(),
@@ -1507,6 +1519,7 @@ mod tests {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
+                firth_bias_reduction: false,
                 pgs_basis_config: pgs_basis_config.clone(),
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),

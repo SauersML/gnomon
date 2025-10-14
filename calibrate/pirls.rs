@@ -107,6 +107,10 @@ pub struct PirlsResult {
     // This is beta_transformed' * S_transformed * beta_transformed
     pub stable_penalty_term: f64,
 
+    /// Optional Jeffreys prior log-determinant contribution (½ log |H|) when
+    /// Firth bias reduction is active.
+    pub firth_log_det: Option<f64>,
+
     // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
     // Additional PIRLS state captured at the accepted step to support
@@ -283,6 +287,9 @@ pub fn fit_model_for_fixed_rho(
     let mut last_gradient_norm = f64::NAN;
     let mut last_gradient_tol = f64::NAN;
     let mut last_step_halving = 0usize;
+    let firth_active =
+        config.firth_bias_reduction && matches!(config.link_function, LinkFunction::Logit);
+    let mut firth_log_det_value: Option<f64> = None;
 
     for iter in 1..=config.max_iterations {
         last_iter = iter; // Update on every iteration
@@ -291,13 +298,6 @@ pub fn fit_model_for_fixed_rho(
         let beta_current = beta_transformed.clone();
         let deviance_current = last_deviance;
 
-        // CRITICAL: Cache the weights and working response that will be used in the WLS solve
-        // These are needed later for the gradient check
-        let weights_solve = weights.clone();
-        let z_solve = z.clone();
-        // Persist for use in returns irrespective of exit status
-        last_weights_solve = weights_solve.clone();
-        last_z_solve = z_solve.clone();
         last_mu_solve = mu.clone();
 
         // Calculate the penalty for the current beta using the transformed total penalty matrix
@@ -317,6 +317,30 @@ pub fn fit_model_for_fixed_rho(
                 last_change: f64::NAN,
             });
         }
+
+        if firth_active {
+            let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
+                x_transformed.view(),
+                weights.view(),
+                s_transformed,
+                &mut workspace,
+            )?;
+            firth_log_det_value = Some(half_log_det);
+
+            for i in 0..z.len() {
+                let wi = weights[i];
+                if wi > 0.0 {
+                    let adjustment = hat_diag[i] * (0.5 - mu[i]);
+                    z[i] += adjustment / wi;
+                }
+            }
+        }
+
+        // CRITICAL: Cache the weights and working response actually used in the WLS solve
+        let weights_solve = weights.clone();
+        let z_solve = z.clone();
+        last_weights_solve = weights_solve.clone();
+        last_z_solve = z_solve.clone();
 
         // The penalized least squares solver computes coefficient updates using a rank-revealing
         // QR decomposition with careful handling of potential rank deficiencies in the weighted
@@ -388,9 +412,13 @@ pub fn fit_model_for_fixed_rho(
 
                 // If it's valid, NOW check if the penalized deviance has decreased.
                 // Use epsilon tolerance to handle numerical precision issues in Gaussian models
-                let accept_step = penalized_deviance_trial
-                    <= penalized_deviance_current * (1.0 + 1e-12)
-                    || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12;
+                let accept_step = if firth_active {
+                    true
+                } else {
+                    penalized_deviance_trial
+                        <= penalized_deviance_current * (1.0 + 1e-12)
+                        || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12
+                };
 
                 if accept_step {
                     // SUCCESS: The step is valid and improves the fit.
@@ -489,6 +517,7 @@ pub fn fit_model_for_fixed_rho(
                     0.0
                 },
                 stable_penalty_term,
+                firth_log_det: firth_log_det_value,
                 final_weights: weights.clone(),
                 final_mu: mu.clone(),
                 solve_weights: last_weights_solve.clone(),
@@ -608,6 +637,7 @@ pub fn fit_model_for_fixed_rho(
                         0.0
                     },
                     stable_penalty_term,
+                    firth_log_det: firth_log_det_value,
                     final_weights: weights.clone(),
                     final_mu: mu.clone(),
                     solve_weights: last_weights_solve.clone(),
@@ -748,6 +778,7 @@ pub fn fit_model_for_fixed_rho(
                     deviance: last_deviance,
                     edf: edf_from_solver,
                     stable_penalty_term,
+                    firth_log_det: firth_log_det_value,
                     final_weights: weights.clone(),
                     final_mu: mu.clone(),
                     solve_weights: last_weights_solve.clone(),
@@ -886,6 +917,7 @@ pub fn fit_model_for_fixed_rho(
             0.0
         },
         stable_penalty_term,
+        firth_log_det: firth_log_det_value,
         final_weights: weights.clone(),
         final_mu: mu.clone(),
         solve_weights: last_weights_solve.clone(),
@@ -2387,6 +2419,7 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
+            firth_bias_reduction: matches!(link_function, LinkFunction::Logit),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -2784,6 +2817,7 @@ mod tests {
             penalty_order: 2,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
+            firth_bias_reduction: false,
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -2911,6 +2945,7 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
+            firth_bias_reduction: true,
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -3041,6 +3076,7 @@ mod tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
+            firth_bias_reduction: true,
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -3715,7 +3751,77 @@ mod tests {
 /// Ensure positive definiteness by adding a small constant ridge to the diagonal if needed.
 /// This mirrors the outer objective/gradient stabilization (H_eff = H or H + c I),
 /// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
+fn compute_firth_hat_and_half_logdet(
+    x_transformed: ArrayView2<f64>,
+    weights: ArrayView1<f64>,
+    s_transformed: &Array2<f64>,
+    workspace: &mut PirlsWorkspace,
+) -> Result<(Array1<f64>, f64), EstimationError> {
+    let n = x_transformed.nrows();
+    let p = x_transformed.ncols();
+
+    workspace
+        .sqrt_w
+        .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
+    let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
+    if workspace.wx.dim() != x_transformed.dim() {
+        workspace.wx = Array2::zeros(x_transformed.dim());
+    }
+    workspace.wx.assign(&x_transformed);
+    workspace.wx *= &sqrt_w_col;
+
+    let xtwx = workspace.wx.t().dot(&workspace.wx);
+    let mut penalized_hessian = xtwx.clone() + s_transformed;
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+            penalized_hessian[[i, j]] = v;
+            penalized_hessian[[j, i]] = v;
+        }
+    }
+
+    let mut stabilized = penalized_hessian.clone();
+    ensure_positive_definite(&mut stabilized)?;
+
+    let mut fisher = xtwx.clone();
+    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
+    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+        EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: f64::NEG_INFINITY,
+        }
+    })?;
+    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+
+    let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| stabilized[[i, j]]);
+    let chol_faer = FaerLlt::new(h_faer.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let rhs = FaerMat::<f64>::from_fn(p, n, |i, j| workspace.wx[[j, i]]);
+    let sol = chol_faer.solve(rhs.as_ref());
+
+    let mut hat_diag = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut acc = 0.0;
+        for k in 0..p {
+            let val = sol[(k, i)];
+            acc += val * workspace.wx[[i, k]];
+        }
+        hat_diag[i] = acc;
+    }
+
+    Ok((hat_diag, half_log_det))
+}
+
 fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationError> {
+    ensure_positive_definite_with_label(hess, "Penalized Hessian")
+}
+
+fn ensure_positive_definite_with_label(
+    hess: &mut Array2<f64>,
+    label: &str,
+) -> Result<(), EstimationError> {
     // If already PD, do nothing
     if hess.cholesky(Side::Lower).is_ok() {
         return Ok(());
@@ -3730,7 +3836,8 @@ fn ensure_positive_definite(hess: &mut Array2<f64>) -> Result<(), EstimationErro
         }
         if hess.cholesky(Side::Lower).is_ok() {
             log::warn!(
-                "Penalized Hessian not PD; added ridge {:.1e} on attempt {} to ensure stability.",
+                "{} not PD; added ridge {:.1e} on attempt {} to ensure stability.",
+                label,
                 delta,
                 attempt + 1
             );

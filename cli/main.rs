@@ -147,6 +147,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_iterations: args.max_iterations,
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
+        firth_bias_reduction: false,
         pgs_basis_config,
         pc_configs,
         pgs_range,
