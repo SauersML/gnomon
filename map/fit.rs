@@ -25,7 +25,6 @@ use rayon::prelude::*;
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
@@ -45,8 +44,7 @@ const MAX_PARTIAL_COMPONENTS: usize = 512;
 const DEFAULT_GRAM_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
-const MIN_LD_WEIGHT: f64 = 1.0e-3;
-const MAX_LD_WEIGHT: f64 = 1.0e3;
+const MIN_LD_WEIGHT: f64 = 1.0e-6;
 
 #[inline]
 fn select_top_k_desc(ordering: &mut [(usize, f64)], k: usize) -> usize {
@@ -1976,10 +1974,113 @@ where
     Ok((scaler, processed))
 }
 
-#[derive(Clone)]
-struct WindowColumn {
-    values: Vec<f64>,
-    presence: Vec<f64>,
+struct LdRingBuffer {
+    values: Mat<f64>,
+    masks: Vec<u8>,
+    n_samples: usize,
+    indices: Vec<usize>,
+    start: usize,
+    len: usize,
+}
+
+impl LdRingBuffer {
+    fn new(n_samples: usize, capacity: usize) -> Self {
+        Self {
+            values: Mat::zeros(n_samples, capacity),
+            masks: vec![0u8; n_samples * capacity],
+            n_samples,
+            indices: vec![usize::MAX; capacity],
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn values(&self) -> MatRef<'_, f64> {
+        self.values.as_ref()
+    }
+
+    fn values_mut(&mut self) -> MatMut<'_, f64> {
+        self.values.as_mut()
+    }
+
+    fn mask_slice(&self, slot: usize) -> &[u8] {
+        let start = slot * self.n_samples;
+        &self.masks[start..start + self.n_samples]
+    }
+
+    fn mask_slice_mut(&mut self, slot: usize) -> &mut [u8] {
+        let start = slot * self.n_samples;
+        &mut self.masks[start..start + self.n_samples]
+    }
+
+    fn indices_mut(&mut self) -> &mut [usize] {
+        &mut self.indices
+    }
+
+    fn push_slot(&mut self) -> usize {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            return 0;
+        }
+        let slot = if self.len < capacity {
+            let slot = (self.start + self.len) % capacity;
+            self.len += 1;
+            slot
+        } else {
+            let slot = self.start;
+            self.start = (self.start + 1) % capacity;
+            slot
+        };
+        slot
+    }
+
+    fn position_of(&self, index: usize) -> Option<usize> {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            return None;
+        }
+        for offset in 0..self.len {
+            let slot = (self.start + offset) % capacity;
+            if self.indices[slot] == index {
+                return Some(offset);
+            }
+        }
+        None
+    }
+
+    fn slot_at(&self, offset: usize) -> usize {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            0
+        } else {
+            (self.start + offset) % capacity
+        }
+    }
+
+    fn truncate_front(&mut self, keep_from: usize) {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            return;
+        }
+        while self.len > 0 {
+            let slot = self.start;
+            if self.indices[slot] < keep_from {
+                self.indices[slot] = usize::MAX;
+                self.start = (self.start + 1) % capacity;
+                self.len -= 1;
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 fn compute_ld_weights<S, P>(
@@ -2014,9 +2115,16 @@ where
     let n_samples = source.n_samples();
     let mut block_storage = vec![0.0f64; n_samples * block_capacity];
     let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
-    let mut queue: VecDeque<WindowColumn> = VecDeque::new();
-    let mut indices: VecDeque<usize> = VecDeque::new();
+    let window_capacity = config.window.max(1);
+    let mut ring = LdRingBuffer::new(n_samples, window_capacity);
     let mut next_weight = 0usize;
+
+    let mut values_scratch = Mat::zeros(n_samples, window_capacity);
+    let mut mask_scratch = Mat::zeros(n_samples, window_capacity);
+    let mut gram_scratch = Mat::zeros(window_capacity, window_capacity);
+    let mut count_scratch = Mat::zeros(window_capacity, window_capacity);
+    let mut system_scratch = Mat::zeros(window_capacity, window_capacity);
+    let mut rhs_scratch = Mat::zeros(window_capacity, 1);
 
     source
         .reset()
@@ -2063,30 +2171,52 @@ where
             .zip(presence.as_ref().col_iter())
             .enumerate()
         {
-            queue.push_back(WindowColumn {
-                values: column.iter().copied().collect(),
-                presence: present.iter().copied().collect(),
-            });
-            indices.push_back(processed + local_idx);
+            let slot = ring.push_slot();
+            {
+                let dst_col = ring.values_mut().col_mut(slot);
+                zip!(dst_col, column).for_each(|unzip!(dst, src)| {
+                    *dst = *src;
+                });
+            }
+            {
+                let mask_slice = ring.mask_slice_mut(slot);
+                for (dst, &src) in mask_slice.iter_mut().zip(present.iter()) {
+                    *dst = if src != 0.0 { 1u8 } else { 0u8 };
+                }
+            }
+            ring.indices_mut()[slot] = processed + local_idx;
             assign_ready_weights(
-                &mut queue,
-                &mut indices,
+                &mut ring,
                 &mut weights,
                 &mut next_weight,
                 config,
+                &mut values_scratch,
+                &mut mask_scratch,
+                &mut gram_scratch,
+                &mut count_scratch,
+                &mut system_scratch,
+                &mut rhs_scratch,
+                &stage_progress,
+                par,
             )?;
         }
 
         processed += filled;
-        stage_progress.advance(processed.min(observed_variants));
     }
 
     assign_ready_weights(
-        &mut queue,
-        &mut indices,
+        &mut ring,
         &mut weights,
         &mut next_weight,
         config,
+        &mut values_scratch,
+        &mut mask_scratch,
+        &mut gram_scratch,
+        &mut count_scratch,
+        &mut system_scratch,
+        &mut rhs_scratch,
+        &stage_progress,
+        par,
     )?;
 
     stage_progress.set_total(observed_variants);
@@ -2099,20 +2229,27 @@ where
     })
 }
 
-fn assign_ready_weights(
-    queue: &mut VecDeque<WindowColumn>,
-    indices: &mut VecDeque<usize>,
+fn assign_ready_weights<P: FitProgressObserver>(
+    ring: &mut LdRingBuffer,
     weights: &mut [f64],
     next_weight: &mut usize,
     config: LdResolvedConfig,
+    values_scratch: &mut Mat<f64>,
+    mask_scratch: &mut Mat<f64>,
+    gram_scratch: &mut Mat<f64>,
+    count_scratch: &mut Mat<f64>,
+    system_scratch: &mut Mat<f64>,
+    rhs_scratch: &mut Mat<f64>,
+    progress: &StageProgressHandle<P>,
+    par: Par,
 ) -> Result<(), HwePcaError> {
     while *next_weight < weights.len() {
-        let position = match indices.iter().position(|&idx| idx == *next_weight) {
+        let position = match ring.position_of(*next_weight) {
             Some(pos) => pos,
             None => break,
         };
 
-        let available = queue.len();
+        let available = ring.len();
         if available == 0 {
             break;
         }
@@ -2128,92 +2265,157 @@ fn assign_ready_weights(
             min(position - half_window, tail_start)
         };
         let end = min(start + window_size, available);
-        let subset: Vec<&WindowColumn> = queue.iter().skip(start).take(end - start).collect();
-        if subset.is_empty() {
+        let window_len = end - start;
+        if window_len == 0 {
             break;
         }
         let center = position - start;
-        let weight = solve_ld_window(&subset, center, config.ridge)?;
+
+        let values_ref = ring.values();
+        let first_slot = ring.slot_at(start);
+        let contiguous = first_slot + window_len <= ring.capacity();
+        let n_samples = values_ref.nrows();
+
+        for col in 0..window_len {
+            let slot = ring.slot_at(start + col);
+            let src = ring.mask_slice(slot);
+            let dst_col = mask_scratch.as_mut().col_mut(col);
+            for (dst_value, &src_value) in dst_col.iter_mut().zip(src.iter()) {
+                *dst_value = f64::from(src_value);
+            }
+        }
+        let mask_view = mask_scratch.as_ref().submatrix(0, 0, n_samples, window_len);
+
+        let values_view = if contiguous {
+            values_ref.submatrix(0, first_slot, n_samples, window_len)
+        } else {
+            for col in 0..window_len {
+                let slot = ring.slot_at(start + col);
+                let src = values_ref.col(slot);
+                let dst_col = values_scratch.as_mut().col_mut(col);
+                zip!(dst_col, src).for_each(|unzip!(dst, src)| {
+                    *dst = *src;
+                });
+            }
+            values_scratch
+                .as_ref()
+                .submatrix(0, 0, n_samples, window_len)
+        };
+
+        let mut gram_view = gram_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, window_len, window_len);
+        matmul(
+            gram_view.as_mut(),
+            Accum::Replace,
+            values_view.transpose(),
+            values_view,
+            1.0,
+            par,
+        );
+
+        let mut count_view = count_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, window_len, window_len);
+        matmul(
+            count_view.as_mut(),
+            Accum::Replace,
+            mask_view.transpose(),
+            mask_view,
+            1.0,
+            par,
+        );
+
+        let mut system_view = system_scratch
+            .as_mut()
+            .submatrix_mut(0, 0, window_len, window_len);
+        let mut rhs_view = rhs_scratch.as_mut().submatrix_mut(0, 0, window_len, 1);
+        let weight = solve_ld_window_from_gram(
+            gram_view.as_ref(),
+            count_view.as_ref(),
+            center,
+            config.ridge,
+            system_view.as_mut(),
+            rhs_view.as_mut(),
+        );
         weights[*next_weight] = weight;
+        progress.advance(*next_weight + 1);
         *next_weight += 1;
 
         let keep_from = next_weight.saturating_sub(config.window / 2);
-        while let Some(&front_idx) = indices.front() {
-            if front_idx < keep_from {
-                indices.pop_front();
-                queue.pop_front();
-            } else {
-                break;
-            }
-        }
+        ring.truncate_front(keep_from);
     }
 
     Ok(())
 }
 
-fn solve_ld_window(
-    window: &[&WindowColumn],
+fn solve_ld_window_from_gram(
+    gram: MatRef<'_, f64>,
+    counts: MatRef<'_, f64>,
     center: usize,
     ridge: f64,
-) -> Result<f64, HwePcaError> {
-    if window.is_empty() || center >= window.len() {
-        return Ok(1.0);
+    mut system: MatMut<'_, f64>,
+    mut rhs: MatMut<'_, f64>,
+) -> f64 {
+    let size = gram.nrows();
+    if size == 0 || center >= size {
+        return 1.0;
     }
 
-    let size = window.len();
-    let mut system = Mat::zeros(size, size);
-    for i in 0..size {
-        system[(i, i)] = 1.0 + ridge;
-        for j in 0..i {
-            let (dot, count) = pairwise_stats(window[i], window[j]);
-            if count <= 0.0 {
-                system[(i, j)] = 0.0;
-                system[(j, i)] = 0.0;
-                continue;
+    let mut adjusted_ridge = ridge;
+    for attempt in 0..2 {
+        for i in 0..size {
+            system[(i, i)] = 1.0 + adjusted_ridge;
+            for j in 0..i {
+                let count = counts[(i, j)];
+                let value = if count.is_finite() && count > 1.0 {
+                    let den = count - 1.0;
+                    if den <= 0.0 {
+                        0.0
+                    } else {
+                        let dot = gram[(i, j)];
+                        let corr = dot / den;
+                        let noise = 1.0 / den;
+                        let raw = corr * corr - noise;
+                        if raw.is_finite() && raw > 0.0 {
+                            raw
+                        } else {
+                            0.0
+                        }
+                    }
+                } else {
+                    0.0
+                };
+                system[(i, j)] = value;
+                system[(j, i)] = value;
             }
-            let effective = count.max(1.0);
-            let corr = dot / effective;
-            let noise = 1.0 / effective;
-            let mut value = corr * corr - noise;
-            if !value.is_finite() || value < 0.0 {
-                value = 0.0;
+        }
+
+        for i in 0..size {
+            rhs[(i, 0)] = 1.0;
+        }
+
+        match FaerLlt::new(system.as_ref(), Side::Lower) {
+            Ok(factor) => {
+                let solution = factor.solve(rhs.as_ref());
+                let mut weight_sq = solution[(center, 0)];
+                if !weight_sq.is_finite() || weight_sq <= 0.0 {
+                    weight_sq = 1.0;
+                }
+                return weight_sq.sqrt().max(MIN_LD_WEIGHT);
             }
-            if value > 1.0 {
-                value = 1.0;
+            Err(_) => {
+                if attempt == 0 {
+                    adjusted_ridge *= 10.0;
+                    continue;
+                } else {
+                    return 1.0;
+                }
             }
-            system[(i, j)] = value;
-            system[(j, i)] = value;
         }
     }
 
-    let rhs = Mat::from_fn(size, 1, |_, _| 1.0);
-    let factor = match FaerLlt::new(system.as_ref(), Side::Lower) {
-        Ok(f) => f,
-        Err(_) => return Ok(1.0),
-    };
-    let solution = factor.solve(rhs.as_ref());
-    let mut weight_sq = solution[(center, 0)];
-    if !weight_sq.is_finite() || weight_sq <= 0.0 {
-        weight_sq = 1.0;
-    }
-    let weight = weight_sq.sqrt();
-    Ok(weight.clamp(MIN_LD_WEIGHT, MAX_LD_WEIGHT))
-}
-
-fn pairwise_stats(lhs: &WindowColumn, rhs: &WindowColumn) -> (f64, f64) {
-    let mut dot = 0.0;
-    let mut count = 0.0;
-    for (((&lv, &rv), &lp), &rp) in lhs
-        .values
-        .iter()
-        .zip(rhs.values.iter())
-        .zip(lhs.presence.iter())
-        .zip(rhs.presence.iter())
-    {
-        dot += lv * rv;
-        count += lp * rp;
-    }
-    (dot, count)
+    1.0
 }
 
 fn compute_variant_loadings<S, P>(
