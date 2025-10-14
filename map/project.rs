@@ -1,5 +1,6 @@
 use super::fit::{
     DEFAULT_BLOCK_WIDTH, DenseBlockSource, HwePcaError, HwePcaModel, HweScaler, VariantBlockSource,
+    apply_ld_weights,
 };
 use super::progress::{
     NoopProjectionProgress, ProjectionProgressObserver, ProjectionProgressStage,
@@ -226,6 +227,7 @@ impl<'model> HwePcaProjector<'model> {
         };
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
+        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
         let mut alignment_r2 = if opts.missing_axis_renormalization {
@@ -268,6 +270,10 @@ impl<'model> HwePcaProjector<'model> {
                     par,
                 );
 
+                if let Some(weights) = ld_weights {
+                    apply_ld_weights(block.as_mut(), processed..processed + filled, weights);
+                }
+
                 let standardized = block.as_ref();
                 let loadings_block = loadings.submatrix(processed, 0, filled, components);
 
@@ -285,10 +291,32 @@ impl<'model> HwePcaProjector<'model> {
                     filled,
                     components,
                 );
-                zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
-                    let value = *value;
-                    *sq = value * value;
-                });
+                if let Some(weights) = ld_weights {
+                    let start = processed.min(weights.len());
+                    let end = (processed + filled).min(weights.len());
+                    let weight_slice = &weights[start..end];
+                    let mut row_idx = 0usize;
+                    let weight_len = weight_slice.len();
+                    zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
+                        let value = *value;
+                        let weight_sq = if row_idx < weight_len {
+                            let weight = weight_slice[row_idx];
+                            weight * weight
+                        } else {
+                            1.0
+                        };
+                        *sq = weight_sq * value * value;
+                        row_idx += 1;
+                        if row_idx == filled {
+                            row_idx = 0;
+                        }
+                    });
+                } else {
+                    zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
+                        let value = *value;
+                        *sq = value * value;
+                    });
+                }
 
                 if let Some(ref mut r2) = alignment_r2 {
                     let presence_block_ref = presence_block.as_ref();
@@ -304,6 +332,10 @@ impl<'model> HwePcaProjector<'model> {
                 }
             } else {
                 standardize_projection_block(scaler, block.as_mut(), processed, filled, par);
+
+                if let Some(weights) = ld_weights {
+                    apply_ld_weights(block.as_mut(), processed..processed + filled, weights);
+                }
 
                 let standardized = block.as_ref();
                 let loadings_block = loadings.submatrix(processed, 0, filled, components);
