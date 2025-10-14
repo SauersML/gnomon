@@ -389,6 +389,32 @@ pub fn run_person_major_path(
 }
 
 // ========================================================================================
+//                            Public entry points
+// ========================================================================================
+
+#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
+#[cfg_attr(feature = "no-inline-profiling", inline(never))]
+pub fn process_tile<'a>(
+    tile: &'a [EffectAlleleDosage],
+    prep_result: &'a PreparationResult,
+    weights_for_batch: &'a [f32],
+    flips_for_batch: &'a [u8],
+    reconciled_variant_indices_for_batch: &'a [ReconciledVariantIndex],
+    block_scores_out: &mut [f64],
+    block_missing_counts_out: &mut [u32],
+) {
+    process_tile_impl(
+        tile,
+        prep_result,
+        weights_for_batch,
+        flips_for_batch,
+        reconciled_variant_indices_for_batch,
+        block_scores_out,
+        block_missing_counts_out,
+    );
+}
+
+// ========================================================================================
 //                            Private implementation
 // ========================================================================================
 
