@@ -1304,7 +1304,10 @@ pub fn optimize_external_design(
     let p = x.ncols();
     let k = s_list.len();
     let layout = ModelLayout::external(p, k);
-    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter);
+    let firth_active = opts.firth.as_ref().map_or(false, |spec| {
+        spec.enabled && matches!(opts.link, LinkFunction::Logit)
+    });
+    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let rs_list = compute_penalty_square_roots(&s_vec)?;
@@ -1609,7 +1612,10 @@ pub fn evaluate_external_gradients(
     use crate::calibrate::model::ModelConfig;
 
     let layout = ModelLayout::external(p, s_list.len());
-    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter);
+    let firth_active = opts.firth.as_ref().map_or(false, |spec| {
+        spec.enabled && matches!(opts.link, LinkFunction::Logit)
+    });
+    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
     let y_o = y.to_owned();
@@ -2087,9 +2093,16 @@ pub mod internal {
         /// Matches compute_cost’s definition: penalised_ll = -0.5*deviance - 0.5*beta'S_lambda beta.
         fn penalised_ll_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
-            let dev = pr.deviance;
             let penalty = pr.stable_penalty_term;
-            Ok(-0.5 * dev - 0.5 * penalty)
+            let mut penalised = -0.5 * pr.deviance - 0.5 * penalty;
+            if self.config.firth_bias_reduction
+                && matches!(self.config.link_function, LinkFunction::Logit)
+            {
+                if let Some(adj) = pr.firth_log_det {
+                    penalised += adj;
+                }
+            }
+            Ok(penalised)
         }
 
         /// Numerical gradient of the penalized log-likelihood part w.r.t. rho via central differences.
@@ -2497,8 +2510,15 @@ pub mod internal {
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use stable penalty term calculated in P-IRLS
-                    let penalised_ll =
+                    let mut penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
+                    if self.config.firth_bias_reduction
+                        && matches!(self.config.link_function, LinkFunction::Logit)
+                    {
+                        if let Some(adj) = pirls_result.firth_log_det {
+                            penalised_ll += adj;
+                        }
+                    }
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
                     let log_det_s = pirls_result.reparam_result.log_det;
@@ -3406,6 +3426,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 30,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 5,
                     degree: 3,
@@ -3661,7 +3682,7 @@ pub mod internal {
             let k = s_list.len();
 
             let layout = ModelLayout::external(p, k);
-            let config = ModelConfig::external(LinkFunction::Identity, 1e-10, 200);
+            let config = ModelConfig::external(LinkFunction::Identity, 1e-10, 200, false);
 
             let state = internal::RemlState::new_with_offset(
                 y.view(),
@@ -3801,6 +3822,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 6,
                     degree: 3,
@@ -3997,6 +4019,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4090,6 +4113,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 4,
                     degree: 3,
@@ -4357,6 +4381,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4466,6 +4491,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -5584,6 +5610,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -5708,6 +5735,7 @@ pub mod internal {
                 max_iterations: 100,         // Reasonable number of iterations
                 reml_convergence_tolerance: 1e-2,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 2, // Fewer knots for stability
                     degree: 2,    // Lower degree for stability
@@ -5935,6 +5963,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6058,6 +6087,7 @@ pub mod internal {
                 max_iterations: 150,         // Generous iterations for complex models
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -6192,6 +6222,7 @@ pub mod internal {
                 max_iterations: 150,         // Generous iterations for complex models
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3, // Smaller than original 5
                     degree: 3,
@@ -6317,6 +6348,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 15, // Too many knots for small data
                     degree: 3,
@@ -6495,6 +6527,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 50,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 6, // Reduced to avoid ModelOverparameterized
                     degree: 3,
@@ -6609,6 +6642,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6760,6 +6794,7 @@ pub mod internal {
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
+                    firth_bias_reduction: false,
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -6901,6 +6936,7 @@ pub mod internal {
                     max_iterations: 100,
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
+                    firth_bias_reduction: false,
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -7071,6 +7107,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -7268,6 +7305,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7389,6 +7427,7 @@ pub mod internal {
                 max_iterations: 100,
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
+                firth_bias_reduction: false,
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7501,6 +7540,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         max_iterations: 100,
         reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
+        firth_bias_reduction: false,
         pgs_basis_config: BasisConfig {
             num_knots: 5,
             degree: 3,
@@ -7575,6 +7615,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         max_iterations: 50,
         reml_convergence_tolerance: 1e-6,
         reml_max_iterations: 20,
+        firth_bias_reduction: false,
         pgs_basis_config: BasisConfig {
             num_knots: 3,
             degree: 3,
@@ -7783,6 +7824,7 @@ mod optimizer_progress_tests {
             max_iterations: 150,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
+            firth_bias_reduction: false,
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -7896,6 +7938,7 @@ mod reparam_consistency_tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
+            firth_bias_reduction: false,
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -8053,6 +8096,7 @@ mod gradient_validation_tests {
             max_iterations: 100,
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
+            firth_bias_reduction: false,
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,

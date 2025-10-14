@@ -2692,7 +2692,7 @@ mod tests {
         let offset = Array1::<f64>::zeros(n);
 
         let layout = ModelLayout::external(p, 0);
-        let cfg = ModelConfig::external(link, 1e-10, 100);
+        let cfg = ModelConfig::external(link, 1e-10, 100, matches!(link, LinkFunction::Logit));
 
         pirls::fit_model_for_fixed_rho(
             rho.view(),
@@ -3883,7 +3883,7 @@ mod tests {
         // Prepare fixed-ρ PIRLS inputs so we can compare explicit smoothing levels without REML
         let w = Array1::<f64>::ones(n);
         let layout = ModelLayout::external(x_with_ridge.ncols(), penalties_with_ridge.len());
-        let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75);
+        let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let penalty_roots =
             compute_penalty_square_roots(&penalties_with_ridge).expect("penalty roots");
 
@@ -7010,46 +7010,83 @@ mod tests {
         predictions: &Array1<f64>,
         outcomes: &Array1<f64>,
     ) -> (f64, f64) {
-        let logits: Vec<f64> = predictions
-            .iter()
-            .map(|&p| {
-                let clamped = p.clamp(1e-9, 1.0 - 1e-9);
-                (clamped / (1.0 - clamped)).ln()
-            })
-            .collect();
+        let n = predictions.len();
+        let mut logits = Vec::with_capacity(n);
+        for &p in predictions.iter() {
+            let clamped = p.clamp(1e-9, 1.0 - 1e-9);
+            logits.push((clamped / (1.0 - clamped)).ln());
+        }
 
-        let mut intercept = 0.0;
-        let mut slope = 1.0;
+        let mut intercept = 0.0f64;
+        let mut slope = 1.0f64;
 
-        for _ in 0..25 {
-            let mut g0 = 0.0;
-            let mut g1 = 0.0;
-            let mut h00 = 0.0;
-            let mut h01 = 0.0;
-            let mut h11 = 0.0;
+        for _ in 0..50 {
+            let mut mu = Vec::with_capacity(n);
+            let mut weights = Vec::with_capacity(n);
+            let mut z = Vec::with_capacity(n);
 
-            for (idx, &logit) in logits.iter().enumerate() {
-                let eta = intercept + slope * logit;
-                let p_hat = 1.0 / (1.0 + (-eta).exp());
-                let w = p_hat * (1.0 - p_hat);
-                let residual = outcomes[idx] - p_hat;
-                g0 += residual;
-                g1 += residual * logit;
-                h00 += w;
-                h01 += w * logit;
-                h11 += w * logit * logit;
+            for i in 0..n {
+                let linear = intercept + slope * logits[i];
+                let mu_i = 1.0 / (1.0 + (-linear).exp());
+                let mu_clamped = mu_i.clamp(1e-8, 1.0 - 1e-8);
+                let weight = (mu_clamped * (1.0 - mu_clamped)).max(1e-12);
+                let working = linear + (outcomes[i] - mu_clamped) / weight;
+                mu.push(mu_clamped);
+                weights.push(weight);
+                z.push(working);
             }
 
-            let det = h00 * h11 - h01 * h01;
+            let mut xtwx00 = 0.0;
+            let mut xtwx01 = 0.0;
+            let mut xtwx11 = 0.0;
+            for i in 0..n {
+                let w = weights[i];
+                let x1 = logits[i];
+                xtwx00 += w;
+                xtwx01 += w * x1;
+                xtwx11 += w * x1 * x1;
+            }
+
+            let mut det = xtwx00 * xtwx11 - xtwx01 * xtwx01;
             if det.abs() < 1e-12 {
-                break;
+                xtwx00 += 1e-8;
+                xtwx11 += 1e-8;
+                det = xtwx00 * xtwx11 - xtwx01 * xtwx01;
+                if det.abs() < 1e-16 {
+                    break;
+                }
             }
 
-            let delta_intercept = (g0 * h11 - g1 * h01) / det;
-            let delta_slope = (-g0 * h01 + g1 * h00) / det;
+            let inv00 = xtwx11 / det;
+            let inv01 = -xtwx01 / det;
+            let inv11 = xtwx00 / det;
 
-            intercept += delta_intercept;
-            slope += delta_slope;
+            for i in 0..n {
+                let w = weights[i];
+                let x1 = logits[i];
+                let hat = w * (inv00 + 2.0 * inv01 * x1 + inv11 * x1 * x1);
+                let adjustment = hat * (0.5 - mu[i]);
+                z[i] += adjustment / w;
+            }
+
+            let mut xtwz0 = 0.0;
+            let mut xtwz1 = 0.0;
+            for i in 0..n {
+                let w = weights[i];
+                let x1 = logits[i];
+                let zi = z[i];
+                xtwz0 += w * zi;
+                xtwz1 += w * zi * x1;
+            }
+
+            let new_intercept = inv00 * xtwz0 + inv01 * xtwz1;
+            let new_slope = inv01 * xtwz0 + inv11 * xtwz1;
+
+            let delta_intercept = new_intercept - intercept;
+            let delta_slope = new_slope - slope;
+
+            intercept = new_intercept;
+            slope = new_slope;
 
             if delta_intercept.abs().max(delta_slope.abs()) < 1e-6 {
                 break;
@@ -7077,6 +7114,28 @@ mod tests {
                 slope, intercept
             );
         }
+    }
+
+    #[test]
+    fn firth_bias_reduction_softens_perfect_ordering() {
+        let n_small = 10;
+        let (_, calibrated_probs) = fit_sinusoidal_calibrator_fixture(n_small, 2024);
+
+        let min_prob = calibrated_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p));
+        let max_prob = calibrated_probs
+            .iter()
+            .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p));
+
+        assert!(
+            min_prob > 1e-4,
+            "Calibrator probabilities should stay bounded away from 0 with Firth bias reduction, got min {:.6e}",
+            min_prob
+        );
+        assert!(
+            max_prob < 1.0 - 1e-4,
+            "Calibrator probabilities should stay bounded away from 1 with Firth bias reduction, got max {:.6e}",
+            max_prob
+        );
     }
 
     #[test]
