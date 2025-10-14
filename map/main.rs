@@ -961,7 +961,7 @@ mod tests {
         let binary = gnomon_binary_path()?;
 
         let fit_output = Command::new(&binary)
-            .arg("--fit")
+            .arg("fit")
             .arg(HGDP_FULL_DATASET)
             .arg("--list")
             .arg(HGDP_REMOTE_VARIANT_LIST)
@@ -972,21 +972,21 @@ mod tests {
 
         assert!(
             fit_output.status.success(),
-            "`gnomon --fit` failed: status={:?}\nstdout={}\nstderr={}",
+            "`gnomon fit` failed: status={:?}\nstdout={}\nstderr={}",
             fit_output.status,
             String::from_utf8_lossy(&fit_output.stdout),
             String::from_utf8_lossy(&fit_output.stderr)
         );
 
         let project_output = Command::new(&binary)
-            .arg("--project")
+            .arg("project")
             .arg(HGDP_FULL_DATASET)
             .output()
             .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
 
         assert!(
             project_output.status.success(),
-            "`gnomon --project` failed: status={:?}\nstdout={}\nstderr={}",
+            "`gnomon project` failed: status={:?}\nstdout={}\nstderr={}",
             project_output.status,
             String::from_utf8_lossy(&project_output.stdout),
             String::from_utf8_lossy(&project_output.stderr)

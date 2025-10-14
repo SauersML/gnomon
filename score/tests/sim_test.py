@@ -336,7 +336,11 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     _write_score_file(score_file, score_df)
 
     # --- Run all tools ---
-    gnomon_res = run_cmd_func([gnomon_path, "score", "--score", score_file.name, prefix.name], "Simple Gnomon Test", workdir)
+    gnomon_res = run_cmd_func(
+        [gnomon_path, "score", score_file.name, prefix.name],
+        "Simple Gnomon Test",
+        workdir,
+    )
     gnomon_output_path = workdir / f"{prefix.name}.sscore"
     if gnomon_res and gnomon_res.returncode == 0:
         print_file_header(gnomon_output_path, "Gnomon")
@@ -451,7 +455,11 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     _write_score_file(score_file, score_df)
 
     # 2. Invocation
-    gnomon_res = run_cmd_func([gnomon_path, "score", "--score", score_file.name, prefix.name], "Impossible Diploid Test", workdir)
+    gnomon_res = run_cmd_func(
+        [gnomon_path, "score", score_file.name, prefix.name],
+        "Impossible Diploid Test",
+        workdir,
+    )
     
     # 3. Validation  (require new ambiguity-resolution success path)
     if gnomon_res is None:
@@ -540,7 +548,12 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     scores_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy(score_file_A, scores_dir / score_file_A.name)
     shutil.copy(score_file_B, scores_dir / score_file_B.name)
-    cmd = [gnomon_path, "score", "--score", str(scores_dir.resolve()), str(prefix.resolve())]
+    cmd = [
+        gnomon_path,
+        "score",
+        str(scores_dir.resolve()),
+        str(prefix.resolve()),
+    ]
     gnomon_res = run_cmd_func(cmd, "Multi-Score-File Test", workdir)
 
     
@@ -696,7 +709,16 @@ def run_and_validate_tools(runtimes):
     print("="*80)
     
     if overall_success:
-        gnomon_res = run_command([GNOMON_BINARY_PATH, "score", "--score", f"{OUTPUT_PREFIX.name}.gnomon.score", OUTPUT_PREFIX.name], "Large-Scale Gnomon", WORKDIR)
+        gnomon_res = run_command(
+            [
+                GNOMON_BINARY_PATH,
+                "score",
+                f"{OUTPUT_PREFIX.name}.gnomon.score",
+                OUTPUT_PREFIX.name,
+            ],
+            "Large-Scale Gnomon",
+            WORKDIR,
+        )
         if not (gnomon_res and gnomon_res.returncode == 0):
             print("❌ Gnomon failed to run on the large-scale dataset.")
             overall_success = False
