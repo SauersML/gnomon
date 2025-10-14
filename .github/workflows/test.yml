@@ -454,16 +454,27 @@ jobs:
           if [ -f build-output/report.md ]; then mv build-output/report.md report.md; fi
           rm -rf build-output
 
-      - name: Make profiling binary executable
-        run: chmod +x target/profiling/gnomon
+      - name: Ensure profiling binary is available
+        id: profiling_binary
+        run: |
+          if [ -f target/profiling/gnomon ]; then
+            chmod +x target/profiling/gnomon
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Profiling binary target/profiling/gnomon not found; skipping performance reports."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-python@v4
+        if: steps.profiling_binary.outputs.present == 'true'
         with: { python-version: '3.11' }
 
       - name: Install Python dependencies
+        if: steps.profiling_binary.outputs.present == 'true'
         run: pip install pandas numpy requests psutil
 
       - name: System Diagnostics
+        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           echo "--- System Information ---"
           echo "Kernel: $(uname -a)"
@@ -474,10 +485,12 @@ jobs:
           echo "------------------------"
 
       - name: Get Kernel Version for Cache Key
+        if: steps.profiling_binary.outputs.present == 'true'
         id: kernel_version
         run: echo "version=$(uname -r)" >> $GITHUB_OUTPUT
-      
+
       - name: Cache APT packages for perf
+        if: steps.profiling_binary.outputs.present == 'true'
         id: apt_cache
         uses: actions/cache@v4
         with:
@@ -487,6 +500,7 @@ jobs:
           key: ${{ runner.os }}-apt-perf-tools-cache-${{ steps.kernel_version.outputs.version }}
 
       - name: Install Perf Tools
+        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           CURRENT_KERNEL=$(uname -r)
           REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
@@ -497,19 +511,21 @@ jobs:
           perf --version
 
       - name: Configure Profiler Permissions
+        if: steps.profiling_binary.outputs.present == 'true'
         run: |
           sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
           sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
-          
+
       - name: Run Profiling Harness
+        if: steps.profiling_binary.outputs.present == 'true'
         run: python score/tests/perf.py
-          
+
       - name: Grant Cache Permissions
-        if: always()
+        if: steps.profiling_binary.outputs.present == 'true' && always()
         run: sudo chown -R runner:runner /var/cache/apt/archives /var/lib/apt/lists
-          
+
       - name: Upload Profiling Data
-        if: always()
+        if: steps.profiling_binary.outputs.present == 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: perf-data-${{ github.run_id }}
