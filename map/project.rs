@@ -226,7 +226,6 @@ impl<'model> HwePcaProjector<'model> {
             Vec::new()
         };
         let scaler = self.model.scaler();
-        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let loadings = self.model.variant_loadings();
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let normalization_factors = if opts.missing_axis_renormalization {
