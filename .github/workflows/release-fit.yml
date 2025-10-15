@@ -14,7 +14,7 @@ env:
 jobs:
   release-fit:
     name: Release build, timed fit, and plots
-    runs-on: ubuntu-22.04-4core
+    runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - name: Checkout repository
