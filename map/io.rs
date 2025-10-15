@@ -2039,16 +2039,23 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
             return Ok(0);
         }
 
-        let selection_plan = self.selection_plan.clone();
-        let filled = match selection_plan {
-            SelectionPlan::All => self.next_block_all(max_variants, storage)?,
+        let selection_plan = std::mem::replace(&mut self.selection_plan, SelectionPlan::All);
+        let (restored_plan, filled_result) = match selection_plan {
+            SelectionPlan::All => (
+                SelectionPlan::All,
+                self.next_block_all(max_variants, storage),
+            ),
             SelectionPlan::ByIndices(indices) => {
-                self.next_block_indices(&indices, max_variants, storage)?
+                let result = self.next_block_indices(&indices, max_variants, storage);
+                (SelectionPlan::ByIndices(indices), result)
             }
             SelectionPlan::ByKeys(filter) => {
-                self.next_block_keys(filter.as_ref(), max_variants, storage)?
+                let result = self.next_block_keys(filter.as_ref(), max_variants, storage);
+                (SelectionPlan::ByKeys(filter), result)
             }
         };
+        self.selection_plan = restored_plan;
+        let filled = filled_result?;
 
         if filled == 0 && self.stream_exhausted {
             self.finalize_selection();
