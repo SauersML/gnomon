@@ -227,21 +227,49 @@ impl<'model> HwePcaProjector<'model> {
         };
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
+        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let normalization_factors = if opts.missing_axis_renormalization {
             let mut factors = Vec::with_capacity(components);
-            for col in 0..components {
-                let mut sumsq = 0.0f64;
-                for row in 0..loadings.nrows() {
-                    let v = loadings[(row, col)];
-                    sumsq += v * v;
+            match ld_weights {
+                Some(weights) => {
+                    let weight_len = weights.len();
+                    for col in 0..components {
+                        let mut sum = 0.0f64;
+                        let mut compensation = 0.0f64;
+                        for row in 0..loadings.nrows() {
+                            let weight = if row < weight_len { weights[row] } else { 1.0 };
+                            let weighted = weight * loadings[(row, col)];
+                            let square = weighted * weighted;
+                            let y = square - compensation;
+                            let t = sum + y;
+                            compensation = (t - sum) - y;
+                            sum = t;
+                        }
+                        factors.push(sum);
+                    }
                 }
-                factors.push(sumsq);
+                None => {
+                    for col in 0..components {
+                        let mut sum = 0.0f64;
+                        let mut compensation = 0.0f64;
+                        for row in 0..loadings.nrows() {
+                            let square = {
+                                let value = loadings[(row, col)];
+                                value * value
+                            };
+                            let y = square - compensation;
+                            let t = sum + y;
+                            compensation = (t - sum) - y;
+                            sum = t;
+                        }
+                        factors.push(sum);
+                    }
+                }
             }
             factors
         } else {
             Vec::new()
         };
-        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
         let mut alignment_r2 = if opts.missing_axis_renormalization {
