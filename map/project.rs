@@ -226,22 +226,40 @@ impl<'model> HwePcaProjector<'model> {
             Vec::new()
         };
         let scaler = self.model.scaler();
+        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let loadings = self.model.variant_loadings();
         let normalization_factors = if opts.missing_axis_renormalization {
             let mut factors = Vec::with_capacity(components);
-            for col in 0..components {
-                let mut sumsq = 0.0f64;
-                for row in 0..loadings.nrows() {
-                    let v = loadings[(row, col)];
-                    sumsq += v * v;
+            if let Some(weights) = ld_weights {
+                for col in 0..components {
+                    let mut sumsq = 0.0f64;
+                    for row in 0..loadings.nrows() {
+                        let weight = if row < weights.len() {
+                            weights[row]
+                        } else {
+                            1.0
+                        };
+                        let v = loadings[(row, col)];
+                        let weighted = weight * v;
+                        sumsq += weighted * weighted;
+                    }
+                    factors.push(sumsq);
                 }
-                factors.push(sumsq);
+            } else {
+                for col in 0..components {
+                    let mut sumsq = 0.0f64;
+                    for row in 0..loadings.nrows() {
+                        let v = loadings[(row, col)];
+                        sumsq += v * v;
+                    }
+                    factors.push(sumsq);
+                }
             }
             factors
         } else {
             Vec::new()
         };
-        let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
+        let ld_weights = ld_weights;
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
         let mut alignment_r2 = if opts.missing_axis_renormalization {
@@ -477,6 +495,10 @@ fn projection_block_capacity(
 mod tests {
     use super::*;
     use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use super::super::fit::{FitOptions, LdConfig};
+    use super::super::progress::NoopFitProgress;
 
     const N_SAMPLES: usize = 3;
     const N_VARIANTS: usize = 4;
@@ -496,6 +518,25 @@ mod tests {
         let data = sample_data();
         let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
         HwePcaModel::fit_k(&mut source, TEST_COMPONENTS).expect("model fit")
+    }
+
+    fn fit_example_model_with_ld() -> HwePcaModel {
+        let data = sample_data();
+        let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
+        let options = FitOptions {
+            ld: Some(LdConfig {
+                window: Some(3),
+                ridge: Some(1.0e-3),
+            }),
+        };
+        let progress = Arc::new(NoopFitProgress::default());
+        HwePcaModel::fit_k_with_options_and_progress(
+            &mut source,
+            TEST_COMPONENTS,
+            &options,
+            &progress,
+        )
+        .expect("model fit with ld")
     }
 
     fn assert_mats_close(a: &Mat<f64>, b: &Mat<f64>, tol: f64) {
@@ -558,7 +599,53 @@ mod tests {
         for row in 0..alignment.nrows() {
             for col in 0..alignment.ncols() {
                 let norm = alignment[(row, col)];
-                assert!((norm - 1.0).abs() <= 1e-12, "alignment mismatch at ({row}, {col})");
+                assert!(
+                    (norm - 1.0).abs() <= 1e-12,
+                    "alignment mismatch at ({row}, {col})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ld_weighted_renormalization_matches_baseline_without_missingness() {
+        let model = fit_example_model_with_ld();
+        let data = sample_data();
+
+        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let raw_scores = model
+            .projector()
+            .project_with_options(&mut raw_source, &raw_options)
+            .expect("raw projection")
+            .scores;
+
+        let mut renorm_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
+        let renorm_options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let renorm_result = model
+            .projector()
+            .project_with_options(&mut renorm_source, &renorm_options)
+            .expect("renormalized projection");
+
+        assert_mats_close(&raw_scores, &renorm_result.scores, TOLERANCE);
+
+        let alignment = renorm_result.alignment.expect("alignment");
+        for row in 0..alignment.nrows() {
+            for col in 0..alignment.ncols() {
+                let norm = alignment[(row, col)];
+                assert!(
+                    (norm - 1.0).abs() <= 1e-12,
+                    "alignment mismatch at ({row}, {col})"
+                );
             }
         }
     }
@@ -599,8 +686,14 @@ mod tests {
                 if norm > 0.0 {
                     let expected = raw_scores[(row, col)] / norm;
                     let diff = (result.scores[(row, col)] - expected).abs();
-                    assert!(diff <= 1e-10, "renormalized score mismatch at ({row}, {col})");
-                    assert!((norm - 1.0).abs() <= 1e-12, "alignment unexpectedly deviates from 1 at ({row}, {col})");
+                    assert!(
+                        diff <= 1e-10,
+                        "renormalized score mismatch at ({row}, {col})"
+                    );
+                    assert!(
+                        (norm - 1.0).abs() <= 1e-12,
+                        "alignment unexpectedly deviates from 1 at ({row}, {col})"
+                    );
                 }
             }
         }
@@ -666,12 +759,89 @@ mod tests {
                     let expected = raw_scores[(row, col)] / expected_norm;
                     let actual = result.scores[(row, col)];
                     let diff = (actual - expected).abs();
-                    assert!(diff <= 1e-10, "renormalized score mismatch at ({row}, {col})");
+                    assert!(
+                        diff <= 1e-10,
+                        "renormalized score mismatch at ({row}, {col})"
+                    );
                     let norm = alignment[(row, col)];
                     let norm_diff = (norm - expected_norm).abs();
                     assert!(norm_diff <= 1e-12, "alignment mismatch at ({row}, {col})");
                 } else {
                     assert_eq!(result.scores[(row, col)], 0.0);
+                    assert_eq!(alignment[(row, col)], 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ld_weighted_missingness_matches_manual_renormalization() {
+        let model = fit_example_model_with_ld();
+        let mut data = sample_data();
+        data[1 * N_SAMPLES + 0] = f64::NAN;
+        data[3 * N_SAMPLES + 2] = f64::NAN;
+
+        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let raw_scores = model
+            .projector()
+            .project_with_options(&mut raw_source, &raw_options)
+            .expect("raw projection")
+            .scores;
+
+        let mut renorm_source =
+            DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
+        let renorm_options = ProjectionOptions {
+            missing_axis_renormalization: true,
+            return_alignment: true,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let renorm_result = model
+            .projector()
+            .project_with_options(&mut renorm_source, &renorm_options)
+            .expect("renormalized projection");
+
+        let alignment = renorm_result.alignment.expect("alignment");
+        let renorm_scores = renorm_result.scores;
+        let loadings = model.variant_loadings();
+        let weights = model.ld().expect("ld weights").weights.clone();
+
+        for row in 0..renorm_scores.nrows() {
+            for col in 0..renorm_scores.ncols() {
+                let mut observed_mass = 0.0f64;
+                for variant in 0..loadings.nrows() {
+                    let value = data[variant * N_SAMPLES + row];
+                    if value.is_finite() {
+                        let weight = if variant < weights.len() {
+                            weights[variant]
+                        } else {
+                            1.0
+                        };
+                        let loading = loadings[(variant, col)];
+                        let weighted = weight * loading;
+                        observed_mass += weighted * weighted;
+                    }
+                }
+
+                if observed_mass > 0.0 {
+                    let expected_norm = observed_mass.sqrt();
+                    let expected_score = raw_scores[(row, col)] / expected_norm;
+                    let actual_score = renorm_scores[(row, col)];
+                    let actual_norm = alignment[(row, col)];
+                    assert!(
+                        (actual_score - expected_score).abs() <= 1e-10,
+                        "renormalized score mismatch at ({row}, {col})"
+                    );
+                    assert!(
+                        (actual_norm - expected_norm).abs() <= 1e-12,
+                        "alignment mismatch at ({row}, {col})"
+                    );
+                } else {
+                    assert_eq!(renorm_scores[(row, col)], 0.0);
                     assert_eq!(alignment[(row, col)], 0.0);
                 }
             }
