@@ -945,8 +945,27 @@ impl HwePcaModel {
         &self.eigenvalues
     }
 
+    /// Returns the singular values after renormalizing the variant loadings.
+    ///
+    /// These values remain consistent with [`HwePcaModel::variant_loadings`] and
+    /// [`HwePcaModel::sample_scores`] after the post-fit rescaling step. Use
+    /// [`HwePcaModel::canonical_singular_values`] or [`HwePcaModel::explained_variance`]
+    /// when deriving explained variance in the classical PCA metric.
     pub fn singular_values(&self) -> &[f64] {
         &self.singular_values
+    }
+
+    /// Returns the canonical singular values that satisfy σ²/(n−1)=λ.
+    pub fn canonical_singular_values(&self) -> Vec<f64> {
+        let scale = self.n_samples.saturating_sub(1) as f64;
+        if scale == 0.0 {
+            return vec![0.0; self.eigenvalues.len()];
+        }
+
+        self.eigenvalues
+            .iter()
+            .map(|&lambda| (lambda * scale).max(0.0).sqrt())
+            .collect()
     }
 
     pub fn explained_variance_ratio(&self) -> Vec<f64> {
@@ -2475,10 +2494,22 @@ fn solve_ld_window_from_stats(
                     } else if var_x <= 0.0 || var_y <= 0.0 {
                         0.0
                     } else {
-                        let denom = (count - 1.0).max(1.0);
                         let corr = (cov / (var_x * var_y).sqrt()).clamp(-1.0, 1.0);
-                        let r2 = corr * corr - 1.0 / denom;
-                        if r2.is_finite() && r2 > 0.0 { r2 } else { 0.0 }
+                        if !corr.is_finite() {
+                            0.0
+                        } else if count <= 2.0 {
+                            0.0
+                        } else {
+                            let corr_sq = corr * corr;
+                            let numerator = (count - 1.0) * corr_sq - 1.0;
+                            let denominator = count - 2.0;
+                            if denominator <= 0.0 {
+                                0.0
+                            } else {
+                                let estimate = numerator / denominator;
+                                estimate.max(0.0).min(1.0)
+                            }
+                        }
                     }
                 } else {
                     0.0
