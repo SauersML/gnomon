@@ -889,9 +889,10 @@ impl HwePcaModel {
             ));
         }
 
-        let (singular_values, sample_scores) = build_sample_scores(n_samples, &decomposition);
+        let (mut singular_values, mut sample_scores) =
+            build_sample_scores(n_samples, &decomposition);
 
-        let loadings = compute_variant_loadings(
+        let mut loadings = compute_variant_loadings(
             source,
             &scaler,
             variant_count,
@@ -902,6 +903,13 @@ impl HwePcaModel {
             progress,
             par,
         )?;
+
+        renormalize_variant_loadings(
+            loadings.as_mut(),
+            &mut singular_values,
+            sample_scores.as_mut(),
+            ld_weights_arc.as_deref(),
+        );
 
         Ok(Self {
             n_samples,
@@ -1127,24 +1135,6 @@ where
     ) {
         self.scaler
             .standardize_block(block.as_mut(), variant_range.clone(), par);
-        if let Some(weights) = &self.ld_weights {
-            apply_ld_weights(block, variant_range, weights);
-        }
-    }
-
-    fn standardize_block_with_mask_in_place(
-        &self,
-        mut block: MatMut<'_, f64>,
-        variant_range: Range<usize>,
-        mut presence: MatMut<'_, f64>,
-        par: Par,
-    ) {
-        self.scaler.standardize_block_with_mask(
-            block.as_mut(),
-            variant_range.clone(),
-            presence.as_mut(),
-            par,
-        );
         if let Some(weights) = &self.ld_weights {
             apply_ld_weights(block, variant_range, weights);
         }
@@ -1630,8 +1620,6 @@ where
 
     let n_samples = operator.n_samples;
     let cross_products = Mat::zeros(n_samples, n_samples);
-    let sum_products = Mat::zeros(n_samples, n_samples);
-    let pair_counts = Mat::zeros(n_samples, n_samples);
 
     if n_samples == 0 {
         return Ok(Mat::zeros(n_samples, n_samples));
@@ -1760,9 +1748,6 @@ where
         let mut processed = 0usize;
         let buffer_ptrs_compute = buffer_ptrs;
         let mut cross_products = cross_products;
-        let mut sum_products = sum_products;
-        let mut pair_counts = pair_counts;
-        let mut mask_storage = vec![0.0f64; block_len];
         while let Ok(message) = filled_rx.recv() {
             match message {
                 PrefetchMessage::Data { id, filled, start } => {
@@ -1785,21 +1770,10 @@ where
                         n_samples,
                         filled,
                     );
-                    let mut presence = MatMut::from_column_major_slice_mut(
-                        &mut mask_storage[..n_samples * filled],
-                        n_samples,
-                        filled,
-                    );
                     let variant_range = start..start + filled;
-                    operator.standardize_block_with_mask_in_place(
-                        block.rb_mut(),
-                        variant_range.clone(),
-                        presence.rb_mut(),
-                        par,
-                    );
+                    operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
 
                     let block_ref = block.as_ref();
-                    let mask_ref = presence.as_ref();
 
                     triangular_matmul::matmul(
                         cross_products.as_mut(),
@@ -1808,27 +1782,6 @@ where
                         block_ref,
                         triangular_matmul::BlockStructure::Rectangular,
                         block_ref.transpose(),
-                        triangular_matmul::BlockStructure::Rectangular,
-                        1.0,
-                        par,
-                    );
-
-                    matmul(
-                        sum_products.as_mut(),
-                        Accum::Add,
-                        block_ref,
-                        mask_ref.transpose(),
-                        1.0,
-                        par,
-                    );
-
-                    triangular_matmul::matmul(
-                        pair_counts.as_mut(),
-                        triangular_matmul::BlockStructure::TriangularLower,
-                        Accum::Add,
-                        mask_ref,
-                        triangular_matmul::BlockStructure::Rectangular,
-                        mask_ref.transpose(),
                         triangular_matmul::BlockStructure::Rectangular,
                         1.0,
                         par,
@@ -1861,32 +1814,17 @@ where
             ));
         }
 
-        Ok((cross_products, sum_products, pair_counts))
+        Ok(cross_products)
     });
 
-    let (cross_products, sum_products, pair_counts) = result?;
-
-    let mut covariance = Mat::zeros(n_samples, n_samples);
+    let mut covariance = result?;
+    let scale = operator.scale;
     for col in 0..n_samples {
         for row in col..n_samples {
-            let count = pair_counts[(row, col)];
-            if !count.is_finite() || count < 2.0 {
-                continue;
-            }
-
-            let sum_row_col = sum_products[(row, col)];
-            let sum_col_row = sum_products[(col, row)];
-            let cov = cross_products[(row, col)] - (sum_row_col * sum_col_row) / count;
-            if !cov.is_finite() {
-                continue;
-            }
-            let denom = (count - 1.0).max(1.0);
-            covariance[(row, col)] = cov / denom;
-            if row != col {
-                covariance[(col, row)] = covariance[(row, col)];
-            }
+            covariance[(row, col)] *= scale;
         }
     }
+    mirror_lower_to_upper(&mut covariance);
 
     Ok(covariance)
 }
@@ -2575,6 +2513,66 @@ fn solve_ld_window_from_stats(
     }
 
     1.0
+}
+
+fn renormalize_variant_loadings(
+    mut loadings: MatMut<'_, f64>,
+    singular_values: &mut [f64],
+    mut sample_scores: MatMut<'_, f64>,
+    ld_weights: Option<&[f64]>,
+) {
+    debug_assert_eq!(loadings.ncols(), singular_values.len());
+    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
+
+    let weights = ld_weights.unwrap_or(&[]);
+    let n_weights = weights.len();
+    let n_components = loadings.ncols();
+
+    for component in 0..n_components {
+        let column_ref = loadings.as_ref().col(component);
+        let mut sum = 0.0f64;
+        let mut compensation = 0.0f64;
+
+        if n_weights > 0 {
+            let mut idx = 0usize;
+            zip!(column_ref).for_each(|unzip!(value)| {
+                let weight = if idx < n_weights { weights[idx] } else { 1.0 };
+                let weighted = weight * *value;
+                let square = weighted * weighted;
+                let y = square - compensation;
+                let t = sum + y;
+                compensation = (t - sum) - y;
+                sum = t;
+                idx += 1;
+            });
+        } else {
+            zip!(column_ref).for_each(|unzip!(value)| {
+                let square = *value * *value;
+                let y = square - compensation;
+                let t = sum + y;
+                compensation = (t - sum) - y;
+                sum = t;
+            });
+        }
+
+        let norm = sum.sqrt();
+        if !(norm.is_finite() && norm > 0.0) {
+            continue;
+        }
+
+        let inv = norm.recip();
+        let column_mut = loadings.rb_mut().col_mut(component);
+        zip!(column_mut).for_each(|unzip!(value)| {
+            *value *= inv;
+        });
+
+        singular_values[component] *= norm;
+
+        let score_col = sample_scores.rb_mut().col_mut(component);
+        zip!(score_col).for_each(|unzip!(value)| {
+            *value *= norm;
+        });
+    }
 }
 
 fn compute_variant_loadings<S, P>(
