@@ -40,12 +40,46 @@ def _load_model_scores(model_path: Path) -> pd.DataFrame:
     return pd.DataFrame(scores, columns=[f"PC{i + 1}" for i in range(cols)])
 
 
-def _load_samples(samples_path: Path) -> pd.Series:
+def _load_samples(samples_path: Path) -> pd.DataFrame:
     if not samples_path.exists():
         raise FileNotFoundError("Sample manifest from fit run was not found")
 
-    samples_df = pd.read_csv(samples_path, sep="\t", dtype=str)
-    return samples_df["IID"].astype(str).str.strip()
+    samples_df = pd.read_csv(samples_path, sep="\t", dtype=str).applymap(
+        lambda value: value.strip() if isinstance(value, str) else value
+    )
+
+    lower_to_actual = {column.lower(): column for column in samples_df.columns}
+
+    sample_col: str | None = None
+    for candidate in ("iid", "sampleid", "sample id", "sample", "id"):
+        if candidate in lower_to_actual:
+            sample_col = lower_to_actual[candidate]
+            break
+
+    if sample_col is None:
+        raise ValueError("Sample manifest is missing a column containing sample IDs")
+
+    filename_col: str | None = None
+    for candidate in ("filename", "file", "filepath", "path", "source"):
+        if candidate in lower_to_actual:
+            filename_col = lower_to_actual[candidate]
+            break
+
+    if filename_col is None and "fid" in lower_to_actual:
+        fid_col = lower_to_actual["fid"]
+        fid_values = samples_df[fid_col].astype(str)
+        if fid_values.str.contains(r"[./]").any():
+            filename_col = fid_col
+
+    if filename_col is None:
+        # Fall back to using the sample identifier itself as the filename so
+        # downstream logic can still operate deterministically.
+        filename_col = sample_col
+
+    sample_ids = samples_df[sample_col].astype(str)
+    filenames = samples_df[filename_col].astype(str)
+
+    return pd.DataFrame({"Filename": filenames, "SampleID": sample_ids})
 
 
 def _download_igsr(target_path: Path) -> None:
@@ -168,8 +202,19 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pcs_df = _load_model_scores(HWE_PATH)
-    sample_ids = _load_samples(SAMPLES_PATH)
-    pcs_df.insert(0, "SampleID", sample_ids)
+    samples_df = _load_samples(SAMPLES_PATH)
+
+    if len(samples_df) != len(pcs_df):
+        raise ValueError(
+            "Sample manifest row count does not match the number of score rows"
+        )
+
+    pcs_df.insert(0, "Filename", samples_df["Filename"].tolist())
+    filename_to_sample = samples_df.drop_duplicates("Filename").set_index("Filename")[
+        "SampleID"
+    ]
+    pcs_df.insert(1, "SampleID", pcs_df["Filename"].map(filename_to_sample))
+    pcs_df["SampleID"] = pcs_df["SampleID"].fillna(pcs_df["Filename"])
 
     igsr_path = OUTPUT_DIR / IGSR_FILENAME
     _download_igsr(igsr_path)
