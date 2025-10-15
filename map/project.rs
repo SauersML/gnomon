@@ -227,6 +227,20 @@ impl<'model> HwePcaProjector<'model> {
         };
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
+        let normalization_factors = if opts.missing_axis_renormalization {
+            let mut factors = Vec::with_capacity(components);
+            for col in 0..components {
+                let mut sumsq = 0.0f64;
+                for row in 0..loadings.nrows() {
+                    let v = loadings[(row, col)];
+                    sumsq += v * v;
+                }
+                factors.push(sumsq);
+            }
+            factors
+        } else {
+            Vec::new()
+        };
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
@@ -363,13 +377,17 @@ impl<'model> HwePcaProjector<'model> {
         progress.on_stage_finish(ProjectionProgressStage::Projection);
 
         if let Some(r2) = alignment_r2 {
+            let normalization = &normalization_factors;
             match alignment_out.as_mut() {
                 Some(alignment_mat) => {
-                    zip!(scores.rb_mut(), r2.as_ref(), alignment_mat.rb_mut()).for_each(
-                        |unzip!(score, mass, align)| {
-                            let mass = *mass;
-                            if mass > 0.0 {
-                                let norm = mass.sqrt();
+                    for col in 0..components {
+                        let denom = normalization.get(col).copied().unwrap_or(0.0);
+                        for row in 0..n_samples {
+                            let mass = r2[(row, col)];
+                            let score = &mut scores[(row, col)];
+                            let align = &mut alignment_mat[(row, col)];
+                            if mass > 0.0 && denom > 0.0 {
+                                let norm = (mass / denom).sqrt();
                                 *score /= norm;
                                 *align = norm;
                             } else {
@@ -383,26 +401,30 @@ impl<'model> HwePcaProjector<'model> {
                                 }
                                 *align = 0.0;
                             }
-                        },
-                    );
+                        }
+                    }
                 }
                 None => {
-                    zip!(scores.rb_mut(), r2.as_ref()).for_each(|unzip!(score, mass)| {
-                        let mass = *mass;
-                        if mass > 0.0 {
-                            let norm = mass.sqrt();
-                            *score /= norm;
-                        } else {
-                            match opts.on_zero_alignment {
-                                ZeroAlignmentAction::Zero => {
-                                    *score = 0.0;
-                                }
-                                ZeroAlignmentAction::NaN => {
-                                    *score = f64::NAN;
+                    for col in 0..components {
+                        let denom = normalization.get(col).copied().unwrap_or(0.0);
+                        for row in 0..n_samples {
+                            let mass = r2[(row, col)];
+                            let score = &mut scores[(row, col)];
+                            if mass > 0.0 && denom > 0.0 {
+                                let norm = (mass / denom).sqrt();
+                                *score /= norm;
+                            } else {
+                                match opts.on_zero_alignment {
+                                    ZeroAlignmentAction::Zero => {
+                                        *score = 0.0;
+                                    }
+                                    ZeroAlignmentAction::NaN => {
+                                        *score = f64::NAN;
+                                    }
                                 }
                             }
                         }
-                    });
+                    }
                 }
             }
         } else if alignment_out.is_some() {
@@ -535,10 +557,8 @@ mod tests {
         let alignment = result.alignment.expect("alignment");
         for row in 0..alignment.nrows() {
             for col in 0..alignment.ncols() {
-                assert!(
-                    (alignment[(row, col)] - 1.0).abs() <= 1e-12,
-                    "alignment mismatch at ({row}, {col})"
-                );
+                let norm = alignment[(row, col)];
+                assert!((norm - 1.0).abs() <= 1e-12, "alignment mismatch at ({row}, {col})");
             }
         }
     }
@@ -578,14 +598,9 @@ mod tests {
                 let norm = alignment[(row, col)];
                 if norm > 0.0 {
                     let expected = raw_scores[(row, col)] / norm;
-                    assert!(
-                        (result.scores[(row, col)] - expected).abs() <= 1e-10,
-                        "renormalized score mismatch at ({row}, {col})"
-                    );
-                    assert!(
-                        (norm - 1.0).abs() <= 1e-12,
-                        "alignment unexpectedly deviates from 1 at ({row}, {col})"
-                    );
+                    let diff = (result.scores[(row, col)] - expected).abs();
+                    assert!(diff <= 1e-10, "renormalized score mismatch at ({row}, {col})");
+                    assert!((norm - 1.0).abs() <= 1e-12, "alignment unexpectedly deviates from 1 at ({row}, {col})");
                 }
             }
         }
@@ -628,21 +643,33 @@ mod tests {
         let alignment = result.alignment.expect("alignment");
 
         let loadings = model.variant_loadings();
+        let mut total_mass = Vec::with_capacity(result.scores.ncols());
+        for col in 0..result.scores.ncols() {
+            let mut sumsq = 0.0f64;
+            for row in 0..loadings.nrows() {
+                let value = loadings[(row, col)];
+                sumsq += value * value;
+            }
+            total_mass.push(sumsq);
+        }
         for col in 0..result.scores.ncols() {
             let missing = loadings[(dropped_variant, col)];
-            let retained_mass = (1.0 - missing * missing).max(0.0);
-            let expected_norm = retained_mass.sqrt();
+            let denom = total_mass[col];
+            let retained_mass = (denom - missing * missing).max(0.0);
+            let expected_norm = if denom > 0.0 {
+                (retained_mass / denom).sqrt()
+            } else {
+                0.0
+            };
             for row in 0..result.scores.nrows() {
                 if expected_norm > 0.0 {
                     let expected = raw_scores[(row, col)] / expected_norm;
-                    assert!(
-                        (result.scores[(row, col)] - expected).abs() <= 1e-10,
-                        "renormalized score mismatch at ({row}, {col})"
-                    );
-                    assert!(
-                        (alignment[(row, col)] - expected_norm).abs() <= 1e-12,
-                        "alignment mismatch at ({row}, {col})"
-                    );
+                    let actual = result.scores[(row, col)];
+                    let diff = (actual - expected).abs();
+                    assert!(diff <= 1e-10, "renormalized score mismatch at ({row}, {col})");
+                    let norm = alignment[(row, col)];
+                    let norm_diff = (norm - expected_norm).abs();
+                    assert!(norm_diff <= 1e-12, "alignment mismatch at ({row}, {col})");
                 } else {
                     assert_eq!(result.scores[(row, col)], 0.0);
                     assert_eq!(alignment[(row, col)], 0.0);
