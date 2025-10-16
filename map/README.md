@@ -44,8 +44,8 @@ Optional arguments:
   1-based position—with an optional header. Any variants that cannot be found
   are reported before the command exits.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
-  are estimated with a default window of 51 variants and a ridge term of
-  `1e-3`, and the resulting weights are stored inside `hwe.json` so projections
+  are estimated with a default window of 51 variants, and the resulting weights
+  are stored inside `hwe.json` so projections
   can apply the same normalization.
 
 ### `gnomon project`
@@ -63,8 +63,8 @@ library API when finer-grained monitoring is needed.
 2. A dense covariance build is attempted when the implied Gram matrix fits in
    memory; otherwise the partial self-adjoint eigensolver incrementally updates
    covariance from streamed blocks.
-3. `--ld` enables LD weighting with the default (`window=51`, `ridge=1e-3`)
-   configuration, truncated near dataset edges and validated before use.  The
+3. `--ld` enables LD weighting with the default window of 51 variants,
+   truncated near dataset edges and validated before use.  The
    resulting per-variant weights are saved inside the serialized model.
 4. Requested components beyond the intrinsic rank are clamped, and the driver
    reports the retained dimensionality.
