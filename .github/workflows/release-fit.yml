@@ -12,10 +12,10 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
-  release-fit:
-    name: Release build, timed fit, and plots
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+  build-release:
+    name: Build gnomon binary
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,7 +31,31 @@ jobs:
           set -euxo pipefail
           cargo build --release --bin gnomon
 
-      - name: Timed gnomon fit run
+      - name: Upload gnomon binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: target/release/gnomon
+
+  release-fit-no-ld:
+    name: Timed fit and plots (no --ld)
+    runs-on: ubuntu-22.04
+    needs: build-release
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download gnomon binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: target/release
+
+      - name: Make gnomon executable
+        run: chmod +x target/release/gnomon
+
+      - name: Timed gnomon fit run (no --ld)
         run: |
           set -euo pipefail
           /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
@@ -39,7 +63,7 @@ jobs:
             gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
             --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
             --components 20 \
-            2>&1 | tee gnomon-fit.log
+            2>&1 | tee gnomon-fit-no-ld.log
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -55,11 +79,75 @@ jobs:
       - name: Generate PCA plots from projection output
         run: python scripts/generate_release_fit_plots.py
 
-      - name: Upload PCA plot artifacts
+      - name: Prepare artifacts (no --ld)
+        run: |
+          set -euo pipefail
+          mv artifacts/pc1_pc2.png artifacts/pc1_pc2_no_ld.png
+          mv artifacts/pc3_pc4.png artifacts/pc3_pc4_no_ld.png
+
+      - name: Upload PCA plot artifacts (no --ld)
         uses: actions/upload-artifact@v4
         with:
-          name: gnomon-release-fit-plots
+          name: gnomon-release-fit-no-ld
           path: |
-            artifacts/pc1_pc2.png
-            artifacts/pc3_pc4.png
-            gnomon-fit.log
+            artifacts/pc1_pc2_no_ld.png
+            artifacts/pc3_pc4_no_ld.png
+            gnomon-fit-no-ld.log
+
+  release-fit-ld:
+    name: Timed fit and plots (--ld)
+    runs-on: ubuntu-24.04
+    needs: build-release
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download gnomon binary
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-binary
+          path: target/release
+
+      - name: Make gnomon executable
+        run: chmod +x target/release/gnomon
+
+      - name: Timed gnomon fit run (--ld)
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'elapsed=%E\nuser=%U\nsys=%S' \
+            target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
+            --components 20 \
+            --ld \
+            2>&1 | tee gnomon-fit-ld.log
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas matplotlib tqdm numpy
+
+      - name: Generate PCA plots from projection output
+        run: python scripts/generate_release_fit_plots.py
+
+      - name: Prepare artifacts (--ld)
+        run: |
+          set -euo pipefail
+          mv artifacts/pc1_pc2.png artifacts/pc1_pc2_ld.png
+          mv artifacts/pc3_pc4.png artifacts/pc3_pc4_ld.png
+
+      - name: Upload PCA plot artifacts (--ld)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnomon-release-fit-ld
+          path: |
+            artifacts/pc1_pc2_ld.png
+            artifacts/pc3_pc4_ld.png
+            gnomon-fit-ld.log
