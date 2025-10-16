@@ -62,7 +62,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: gnomon-release-binary
-          path: .
+          path: target/release
 
       - name: Make gnomon executable
         run: chmod +x target/release/gnomon
@@ -120,7 +120,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: gnomon-release-binary
-          path: .
+          path: target/release
 
       - name: Make gnomon executable
         run: chmod +x target/release/gnomon
