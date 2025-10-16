@@ -227,6 +227,23 @@ def main() -> None:
 
     color_map = _build_color_map(ann_pca)
 
+    score_columns = [column for column in pcs_df.columns if column.startswith("PC")]
+    export_columns = [
+        "SampleID",
+        "Population",
+        "Superpopulation",
+        *score_columns,
+    ]
+
+    available_columns = [
+        column for column in export_columns if column in ann_pca.columns
+    ]
+
+    projection_path = OUTPUT_DIR / "pca_projection_scores.tsv"
+    ann_pca.loc[:, available_columns].rename(
+        columns={"SampleID": "SampleName", "Population": "Subpopulation"}
+    ).to_csv(projection_path, sep="\t", index=False)
+
     _plot_projection(ann_pca, color_map, "PC1", "PC2", OUTPUT_DIR / "pc1_pc2.png")
     _plot_projection(ann_pca, color_map, "PC3", "PC4", OUTPUT_DIR / "pc3_pc4.png")
 

@@ -85,6 +85,7 @@ jobs:
           set -euo pipefail
           mv artifacts/pc1_pc2.png artifacts/pc1_pc2_no_ld.png
           mv artifacts/pc3_pc4.png artifacts/pc3_pc4_no_ld.png
+          mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_no_ld.tsv
 
       - name: Upload PCA plot artifacts (no --ld)
         uses: actions/upload-artifact@v4
@@ -93,6 +94,7 @@ jobs:
           path: |
             artifacts/pc1_pc2_no_ld.png
             artifacts/pc3_pc4_no_ld.png
+            artifacts/pca_projection_scores_no_ld.tsv
             gnomon-fit-no-ld.log
 
   release-fit-ld:
@@ -144,6 +146,7 @@ jobs:
           set -euo pipefail
           mv artifacts/pc1_pc2.png artifacts/pc1_pc2_ld.png
           mv artifacts/pc3_pc4.png artifacts/pc3_pc4_ld.png
+          mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_ld.tsv
 
       - name: Upload PCA plot artifacts (--ld)
         uses: actions/upload-artifact@v4
@@ -152,4 +155,5 @@ jobs:
           path: |
             artifacts/pc1_pc2_ld.png
             artifacts/pc3_pc4_ld.png
+            artifacts/pca_projection_scores_ld.tsv
             gnomon-fit-ld.log
