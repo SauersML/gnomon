@@ -469,6 +469,7 @@ impl<'model> HwePcaProjector<'model> {
         self.model
     }
 }
+
 fn standardize_projection_block(
     scaler: &HweScaler,
     block: MatMut<'_, f64>,
