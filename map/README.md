@@ -5,7 +5,7 @@ that expose model fitting, serialization, and projection.  The codebase assumes
 datasets that range from a handful of samples to biobank scale by streaming
 genotypes in fixed-width blocks, abstracting over PLINK `.bed` trios and
 VCF/BCF sources (local or remote), and picking a dense or iterative eigensolver
-based on the Gram matrix size implied by the requested components.
+based on whether the cohort's Gram matrix fits in memory.
 
 ## CLI entry points
 | Command | Purpose | Required input | Primary outputs |
@@ -52,10 +52,10 @@ streaming, and the final `SelectionOutcome` summarizes matches and misses.
   explained variance, and explained-variance ratios.
 
 ## High-dimensionality projection
-Because the biobank and the single individual are standardized on the same reference, and placed on the same per-axis scale, the directional geometry is preserved. Fitting on the projected biobank means residual magnitude shrinkage is just a shared, axis-wise rescaling, so both a single new datapoint and the biobank data inhabit the same commensurately shrunken space and distances. Consequently, de-shrinkage or OADP/AP rotations would merely re-inflate coordinates and risk needless perturbation.
+Because the biobank and the single individual are standardized on the same reference, and placed on the same per-axis scale, the directional geometry is preserved. Projecting onto the fitted biobank principal components means residual magnitude shrinkage is just a shared, axis-wise rescaling, so both a single new datapoint and the biobank data inhabit the same commensurately shrunken space and distances. Consequently, de-shrinkage or OADP/AP rotations would merely re-inflate coordinates and risk needless perturbation.
 
 ## Missing SNVs
-If we project onto a unit vector made only from the SNVs we have, missing SNVs don’t contribute signal or variance; their loading mass is subtracted from the denominator and the axis is renormalized. The projection for each PC is then computed only from those overlapping SNVs (i.e. the same as mean imputation after normalization). We take the standardized genotype values at the overlapping loci, weight them by the corresponding loadings, and sum. Because loadings for missing loci were effectively dropped, we renormalize the axis using the amount of loading mass that remains—i.e., divide by the Euclidean norm of the retained loadings—so we're still projecting onto a unit-length axis defined solely by the SNVs we actually have. Drop missing SNVs, rebuild the axis from the overlap, rescale it to unit length.
+If we project onto a unit vector made only from the SNVs we have, missing SNVs don’t contribute signal or variance; their loading mass is subtracted from the denominator and the axis is renormalized. The projection for each PC is then computed only from those overlapping SNVs, producing the same weighted sum we would obtain from mean-imputed, standardized genotypes before the final rescaling. We take the standardized genotype values at the overlapping loci, weight them by the corresponding loadings, and sum. Because loadings for missing loci were effectively dropped, we renormalize the axis using the amount of loading mass that remains—i.e., divide by the Euclidean norm of the retained loadings—so we're still projecting onto a unit-length axis defined solely by the SNVs we actually have. Drop missing SNVs, rebuild the axis from the overlap, rescale it to unit length.
 
 ## Projection workflow
 * `gnomon project` loads `hwe.json`, reconstructs any stored variant subset, and
