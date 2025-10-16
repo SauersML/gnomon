@@ -1374,34 +1374,21 @@ pub fn optimize_external_design(
     // Map beta back to original basis
     let beta_orig = pirls_res.reparam_result.qs.dot(&pirls_res.beta_transformed);
 
-    // Scale (Gaussian) or 1.0 (Logit)
-    let scale = match opts.link {
-        LinkFunction::Identity => {
-            let fitted = {
-                let mut eta = offset_o.clone();
-                eta += &x_o.dot(&beta_orig);
-                eta
-            };
-            let resid = y_o.to_owned() - &fitted;
-            let rss: f64 = w_o
-                .iter()
-                .zip(resid.iter())
-                .map(|(&wi, &ri)| wi * ri * ri)
-                .sum();
-            let penalty = pirls_res.stable_penalty_term;
-            let dp = rss + penalty;
-            let (dp_c, _) = smooth_floor_dp(dp);
-
-            let n = y_o.len() as f64;
-            let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
-            let mp = pirls_res
-                .beta_transformed
-                .len()
-                .saturating_sub(penalty_rank) as f64;
-            let denom = (n - mp).max(1.0);
-            dp_c / denom
-        }
-        LinkFunction::Logit => 1.0,
+    // Weighted residual sum of squares for Gaussian models
+    let n = y_o.len() as f64;
+    let weighted_rss = if matches!(opts.link, LinkFunction::Identity) {
+        let fitted = {
+            let mut eta = offset_o.clone();
+            eta += &x_o.dot(&beta_orig);
+            eta
+        };
+        let resid = y_o.to_owned() - &fitted;
+        w_o.iter()
+            .zip(resid.iter())
+            .map(|(&wi, &ri)| wi * ri * ri)
+            .sum()
+    } else {
+        0.0
     };
 
     // EDF by block using stabilized H and penalty roots in transformed basis
@@ -1457,6 +1444,15 @@ pub fn optimize_external_design(
         let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
         edf_by_block.push(edf_k);
     }
+
+    // Persist residual-based scale for Gaussian identity models
+    let scale = match opts.link {
+        LinkFunction::Identity => {
+            let denom = (n - edf_total).max(1.0);
+            weighted_rss / denom
+        }
+        LinkFunction::Logit => 1.0,
+    };
 
     // Compute gradient norm at final rho for reporting
     let final_grad = reml_state
