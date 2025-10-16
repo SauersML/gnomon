@@ -46,6 +46,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
       - name: Download gnomon binary
         uses: actions/download-artifact@v4
         with:
@@ -64,18 +76,6 @@ jobs:
             --list https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/GSAv2_hg38.tsv \
             --components 20 \
             2>&1 | tee gnomon-fit-no-ld.log
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: scripts/requirements-release-fit.txt
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r scripts/requirements-release-fit.txt
 
       - name: Generate PCA plots from projection output
         run: python scripts/generate_release_fit_plots.py
@@ -104,6 +104,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
       - name: Download gnomon binary
         uses: actions/download-artifact@v4
         with:
@@ -123,18 +135,6 @@ jobs:
             --components 20 \
             --ld \
             2>&1 | tee gnomon-fit-ld.log
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: scripts/requirements-release-fit.txt
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r scripts/requirements-release-fit.txt
 
       - name: Generate PCA plots from projection output
         run: python scripts/generate_release_fit_plots.py
