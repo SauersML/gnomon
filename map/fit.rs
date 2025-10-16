@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{Ordering, min};
+use core::cmp::{min, Ordering};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::LinOp;
 use faer::matrix_free::eigen::{
-    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
 };
+use faer::matrix_free::LinOp;
 use faer::prelude::ReborrowMut;
 use faer::{
-    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
-    unzip, zip,
+    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
+    Par, Side,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,12 +28,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use sysinfo::System;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
@@ -41,7 +42,8 @@ pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
-const DEFAULT_GRAM_BUDGET_BYTES_U64: u64 = 8 * 1024 * 1024 * 1024;
+const FALLBACK_GRAM_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_GRAM_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
@@ -66,10 +68,32 @@ enum CovarianceComputationMode {
 }
 
 fn default_gram_budget_usize() -> usize {
-    DEFAULT_GRAM_BUDGET_BYTES_U64
+    default_gram_budget_bytes()
         .min(usize::MAX as u64)
         .try_into()
         .unwrap()
+}
+
+fn default_gram_budget_bytes() -> u64 {
+    static DEFAULT_GRAM_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+    *DEFAULT_GRAM_BUDGET_BYTES.get_or_init(compute_default_gram_budget_bytes)
+}
+
+fn compute_default_gram_budget_bytes() -> u64 {
+    match detect_total_memory_bytes() {
+        Some(total) if total > 0 => {
+            let target = total.saturating_mul(3) / 4;
+            target.max(MIN_GRAM_BUDGET_BYTES).min(total).max(1)
+        }
+        _ => FALLBACK_GRAM_BUDGET_BYTES,
+    }
+}
+
+fn detect_total_memory_bytes() -> Option<u64> {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    system.total_memory().checked_mul(1024)
 }
 
 fn gram_matrix_budget_bytes() -> usize {
