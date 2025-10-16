@@ -127,7 +127,9 @@ jobs:
           echo "---"
           echo "--- ASSEMBLY FOR SIMD VERSION (from library) ---"
           echo "---"
-          cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::batch::process_tile
+          # `score::batch` now lives under the `score` module, so keep the inspected symbol
+          # aligned with the library's public path to avoid false CI failures.
+          cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::score::batch::process_tile
 
       - name: Cache getdoc binary
         id: getdoc_cache
