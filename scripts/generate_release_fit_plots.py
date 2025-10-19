@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import urllib.request
+from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib.colors as mcolors
@@ -19,6 +23,124 @@ HWE_PATH = Path("phased_haplotypes_v2.hwe.json")
 SAMPLES_PATH = Path("phased_haplotypes_v2.samples.tsv")
 IGSR_URL = "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/igsr_samples.tsv"
 IGSR_FILENAME = "igsr_samples.tsv"
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate release PCA projection plots with optional downsampling."
+    )
+    parser.add_argument(
+        "--downsample-factor",
+        type=int,
+        default=1,
+        help="Downsampling factor applied per population for visualization (>=1).",
+    )
+    return parser.parse_args(argv)
+
+
+def _normalize_value(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+
+    if not text or text.lower() == "nan":
+        return None
+
+    return text
+
+
+def _resolve_consensus(values: pd.Series) -> str | None:
+    cleaned = [_normalize_value(value) for value in values]
+    cleaned = [value for value in cleaned if value is not None]
+
+    if not cleaned:
+        return None
+
+    counts = Counter(cleaned)
+    most_common = counts.most_common()
+    if len(most_common) == 1 or most_common[0][1] > most_common[1][1]:
+        return most_common[0][0]
+
+    return None
+
+
+def _consolidate_sample_annotations(igsr_df: pd.DataFrame) -> pd.DataFrame:
+    records: list[dict[str, str | None]] = []
+
+    for sample_id, group in igsr_df.groupby("SampleID", sort=False):
+        population = _resolve_consensus(group["Population"])
+
+        normalized_population = group["Population"].map(_normalize_value)
+        if population is not None:
+            matching_rows = group.loc[normalized_population == population]
+            if matching_rows.empty:
+                matching_rows = group
+        else:
+            matching_rows = group
+
+        superpopulation = _resolve_consensus(matching_rows["Superpopulation"])
+        population_name = _resolve_consensus(matching_rows["PopulationNameLong"])
+        if population_name is None:
+            population_name = population
+
+        records.append(
+            {
+                "SampleID": sample_id,
+                "Population": population,
+                "PopulationNameLong": population_name,
+                "Superpopulation": superpopulation,
+            }
+        )
+
+    consolidated = pd.DataFrame.from_records(
+        records,
+        columns=["SampleID", "Population", "PopulationNameLong", "Superpopulation"],
+    )
+
+    if not consolidated.empty:
+        consolidated["SampleID"] = consolidated["SampleID"].astype("string")
+        for column in ("Population", "PopulationNameLong", "Superpopulation"):
+            consolidated[column] = consolidated[column].astype("string")
+
+    return consolidated
+
+
+def _downsample_dataframe(df: pd.DataFrame, factor: int) -> pd.DataFrame:
+    if factor <= 1 or df.empty:
+        return df
+
+    factor = max(1, factor)
+    group_columns = [
+        column
+        for column in ("Superpopulation", "Population")
+        if column in df.columns
+    ]
+
+    if not group_columns:
+        size = len(df)
+        target = max(1, math.ceil(size / factor))
+        if target >= size:
+            return df
+        indices = np.linspace(0, size - 1, num=target, dtype=int)
+        return df.iloc[indices].reset_index(drop=True)
+
+    groups: list[pd.DataFrame] = []
+    for _, group in df.groupby(group_columns, sort=False, dropna=False):
+        size = len(group)
+        target = max(1, math.ceil(size / factor))
+        if target >= size:
+            groups.append(group)
+            continue
+
+        indices = np.linspace(0, size - 1, num=target, dtype=int)
+        groups.append(group.iloc[indices])
+
+    downsampled = pd.concat(groups, axis=0)
+    return downsampled.sort_index().reset_index(drop=True)
 
 
 def _load_model_scores(model_path: Path) -> pd.DataFrame:
@@ -112,8 +234,15 @@ def _load_igsr(target_path: Path) -> pd.DataFrame:
     igsr_df["SampleID"] = igsr_df["Sample name"].astype(str).str.strip()
     igsr_df["Population"] = igsr_df["Population code"].astype(str).str.strip()
     igsr_df["Superpopulation"] = igsr_df["Superpopulation code"].astype(str).str.strip()
-    igsr_df["PopulationNameLong"] = igsr_df.get("Population name", igsr_df["Population"])
-    return igsr_df[["SampleID", "Population", "PopulationNameLong", "Superpopulation"]]
+
+    if "Population name" in igsr_df.columns:
+        igsr_df["PopulationNameLong"] = igsr_df["Population name"].astype(str).str.strip()
+    else:
+        igsr_df["PopulationNameLong"] = igsr_df["Population"]
+
+    subset = igsr_df[["SampleID", "Population", "PopulationNameLong", "Superpopulation"]]
+    subset = subset[subset["SampleID"].map(lambda value: isinstance(value, str) and value != "")]
+    return _consolidate_sample_annotations(subset)
 
 
 def _build_color_map(annotated: pd.DataFrame) -> dict[tuple[str, str], np.ndarray]:
@@ -198,7 +327,15 @@ def _plot_projection(
     plt.close(fig)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+    downsample_factor = max(1, args.downsample_factor)
+    if args.downsample_factor < 1:
+        print(
+            f"Downsample factor {args.downsample_factor} is less than 1; defaulting to 1.",
+            flush=True,
+        )
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pcs_df = _load_model_scores(HWE_PATH)
@@ -225,7 +362,15 @@ def main() -> None:
     ann_pca["Superpopulation"] = ann_pca["Superpopulation"].fillna("OTH")
     ann_pca["PopulationNameLong"] = ann_pca["PopulationNameLong"].fillna(ann_pca["Population"])
 
-    color_map = _build_color_map(ann_pca)
+    plot_pca = _downsample_dataframe(ann_pca, downsample_factor)
+    if downsample_factor > 1:
+        print(
+            "Downsampled annotated PCA data from "
+            f"{len(ann_pca)} to {len(plot_pca)} rows using factor {downsample_factor}.",
+            flush=True,
+        )
+
+    color_map = _build_color_map(plot_pca)
 
     score_columns = [column for column in pcs_df.columns if column.startswith("PC")]
     export_columns = [
@@ -244,8 +389,8 @@ def main() -> None:
         columns={"SampleID": "SampleName", "Population": "Subpopulation"}
     ).to_csv(projection_path, sep="\t", index=False)
 
-    _plot_projection(ann_pca, color_map, "PC1", "PC2", OUTPUT_DIR / "pc1_pc2.png")
-    _plot_projection(ann_pca, color_map, "PC3", "PC4", OUTPUT_DIR / "pc3_pc4.png")
+    _plot_projection(plot_pca, color_map, "PC1", "PC2", OUTPUT_DIR / "pc1_pc2.png")
+    _plot_projection(plot_pca, color_map, "PC3", "PC4", OUTPUT_DIR / "pc3_pc4.png")
 
 
 if __name__ == "__main__":
