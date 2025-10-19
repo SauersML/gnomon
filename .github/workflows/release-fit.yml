@@ -163,3 +163,44 @@ jobs:
             artifacts/pc3_pc4_ld.png
             artifacts/pca_projection_scores_ld.tsv
             gnomon-fit-ld.log
+
+  compare-projections:
+    name: Compare LD vs no-LD projection performance
+    runs-on: ubuntu-22.04
+    needs:
+      - release-fit-no-ld
+      - release-fit-ld
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements-release-fit.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements-release-fit.txt
+
+      - name: Download no-LD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-fit-no-ld
+          path: comparison/no_ld
+
+      - name: Download LD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: gnomon-release-fit-ld
+          path: comparison/ld
+
+      - name: Compare projection TSV files
+        run: |
+          set -euo pipefail
+          python scripts/compare_release_fit_projections.py \
+            --no-ld comparison/no_ld/artifacts/pca_projection_scores_no_ld.tsv \
+            --ld comparison/ld/artifacts/pca_projection_scores_ld.tsv
