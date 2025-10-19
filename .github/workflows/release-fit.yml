@@ -202,5 +202,5 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/compare_release_fit_projections.py \
-            --no-ld comparison/no_ld/artifacts/pca_projection_scores_no_ld.tsv \
-            --ld comparison/ld/artifacts/pca_projection_scores_ld.tsv
+            --projection no-LD=comparison/no_ld/artifacts/pca_projection_scores_no_ld.tsv \
+            --projection LD=comparison/ld/artifacts/pca_projection_scores_ld.tsv
