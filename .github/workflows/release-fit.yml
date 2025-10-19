@@ -2,6 +2,11 @@ name: Release Fit Projection
 
 on:
   workflow_dispatch:
+    inputs:
+      downsample_factor:
+        description: 'Downsampling factor applied during PCA plot generation (>=1)'
+        required: false
+        default: '1'
   push:
     paths:
       - 'map/**/*.rs'
@@ -10,6 +15,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RELEASE_FIT_DOWNSAMPLE: ${{ github.event.inputs.downsample_factor || '1' }}
 
 jobs:
   build-release:
@@ -78,7 +84,7 @@ jobs:
             2>&1 | tee gnomon-fit-no-ld.log
 
       - name: Generate PCA plots from projection output
-        run: python scripts/generate_release_fit_plots.py
+        run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
 
       - name: Prepare artifacts (no --ld)
         run: |
@@ -139,7 +145,7 @@ jobs:
             2>&1 | tee gnomon-fit-ld.log
 
       - name: Generate PCA plots from projection output
-        run: python scripts/generate_release_fit_plots.py
+        run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
 
       - name: Prepare artifacts (--ld)
         run: |
