@@ -68,10 +68,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: gnomon-release-binary
-          path: .
+          path: gnomon-artifact
 
-      - name: Make gnomon executable
-        run: chmod +x target/release/gnomon
+      - name: Install gnomon binary
+        run: |
+          set -euo pipefail
+          binary_path="$(find gnomon-artifact -type f -name gnomon -print -quit)"
+          if [ -z "${binary_path}" ]; then
+            echo "Unable to locate downloaded gnomon binary" >&2
+            exit 1
+          fi
+          install -Dm755 "${binary_path}" target/release/gnomon
 
       - name: Timed gnomon fit run (no --ld)
         run: |
@@ -128,10 +135,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: gnomon-release-binary
-          path: .
+          path: gnomon-artifact
 
-      - name: Make gnomon executable
-        run: chmod +x target/release/gnomon
+      - name: Install gnomon binary
+        run: |
+          set -euo pipefail
+          binary_path="$(find gnomon-artifact -type f -name gnomon -print -quit)"
+          if [ -z "${binary_path}" ]; then
+            echo "Unable to locate downloaded gnomon binary" >&2
+            exit 1
+          fi
+          install -Dm755 "${binary_path}" target/release/gnomon
 
       - name: Timed gnomon fit run (--ld)
         run: |
