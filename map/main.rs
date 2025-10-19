@@ -1,4 +1,4 @@
-use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig};
+use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
@@ -6,7 +6,7 @@ use super::io::{
 };
 use super::progress::{fit_progress, projection_progress};
 use super::project::ProjectionOptions;
-use super::variant_filter::{VariantFilter, VariantListError};
+use super::variant_filter::{VariantFilter, VariantKey, VariantListError};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ pub enum MapCommand {
         genotype_path: PathBuf,
         variant_list: Option<PathBuf>,
         components: usize,
-        ld: bool,
+        ld: Option<LdWindow>,
     },
     Project {
         genotype_path: PathBuf,
@@ -110,7 +110,7 @@ fn run_fit(
     genotype_path: &Path,
     variant_list: Option<&Path>,
     components: usize,
-    ld: bool,
+    ld: Option<LdWindow>,
 ) -> Result<(), MapDriverError> {
     println!("=== HWE PCA model fitting ===");
     println!("Input genotype location: {}", genotype_path.display());
@@ -132,13 +132,17 @@ fn run_fit(
     );
 
     println!("Requested principal components: {components}");
-    if ld {
-        println!("LD flattening enabled via --ld flag.");
-    } else {
-        println!("LD flattening disabled (default).");
+    match &ld {
+        Some(LdWindow::Sites(window)) => {
+            println!("LD flattening enabled via --ld flag (sites window={window}).");
+        }
+        Some(LdWindow::BasePairs(bp)) => {
+            println!("LD flattening enabled via --ld flag (bp window={bp}).");
+        }
+        None => println!("LD flattening disabled (default)."),
     }
 
-    let mut variant_keys: Option<Vec<_>> = None;
+    let mut variant_keys: Option<Arc<Vec<VariantKey>>> = None;
     let mut selection_plan = SelectionPlan::All;
 
     if let Some(list_path) = variant_list {
@@ -167,7 +171,7 @@ fn run_fit(
                     }
                 );
 
-                variant_keys = Some(selection.keys.clone());
+                variant_keys = Some(Arc::new(selection.keys.clone()));
                 selection_plan = SelectionPlan::ByIndices(selection.indices);
             }
             GenotypeDataset::Variants(_) => {
@@ -180,13 +184,28 @@ fn run_fit(
         }
     }
 
+    let mut fit_options = FitOptions::default();
+    if let Some(window_spec) = ld.clone() {
+        println!("Computing LD normalization weights (local best-diagonal).");
+        let mut ld_config = LdConfig {
+            window: Some(window_spec.clone()),
+            ridge: None,
+            variant_keys: None,
+        };
+        if matches!(window_spec, LdWindow::BasePairs(_)) {
+            let keys_arc = if let Some(existing) = &variant_keys {
+                Arc::clone(existing)
+            } else {
+                let keys = dataset.variant_keys_for_plan(&selection_plan)?;
+                Arc::new(keys)
+            };
+            ld_config.variant_keys = Some(keys_arc);
+        }
+        fit_options.ld = Some(ld_config);
+    }
+
     let mut source = dataset.block_source_with_plan(selection_plan)?;
     let progress = fit_progress();
-    let mut fit_options = FitOptions::default();
-    if ld {
-        println!("Computing LD normalization weights (local best-diagonal).");
-        fit_options.ld = Some(LdConfig::default());
-    }
     let mut model = HwePcaModel::fit_k_with_options_and_progress(
         &mut source,
         components,
@@ -213,20 +232,31 @@ fn run_fit(
                 "Variant list did not match any variants in the dataset".into(),
             ));
         }
-        variant_keys = Some(outcome.matched_keys);
+        variant_keys = Some(Arc::new(outcome.matched_keys));
     }
 
-    if let Some(keys) = variant_keys {
+    if let Some(keys_arc) = variant_keys {
+        let keys = Arc::try_unwrap(keys_arc).unwrap_or_else(|arc| (*arc).clone());
         model.set_variant_keys(Some(keys));
     }
 
     if let Some(ld) = model.ld() {
-        println!(
-            "LD weighting summary: {} variants, window={} ridge={:.3e}",
-            ld.weights.len(),
-            ld.window,
-            ld.ridge
-        );
+        if let Some(bp) = ld.bp_window {
+            println!(
+                "LD weighting summary: {} variants, sites_window={} bp_window={} ridge={:.3e}",
+                ld.weights.len(),
+                ld.window,
+                bp,
+                ld.ridge
+            );
+        } else {
+            println!(
+                "LD weighting summary: {} variants, window={} ridge={:.3e}",
+                ld.weights.len(),
+                ld.window,
+                ld.ridge
+            );
+        }
     }
 
     let retained = model.components();

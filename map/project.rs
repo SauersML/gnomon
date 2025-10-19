@@ -508,7 +508,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Arc;
 
-    use super::super::fit::{FitOptions, LdConfig};
+    use super::super::fit::{FitOptions, LdConfig, LdWindow};
     use super::super::progress::NoopFitProgress;
 
     const N_SAMPLES: usize = 3;
@@ -536,8 +536,9 @@ mod tests {
         let mut source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("source");
         let options = FitOptions {
             ld: Some(LdConfig {
-                window: Some(3),
+                window: Some(LdWindow::Sites(3)),
                 ridge: Some(1.0e-3),
+                variant_keys: None,
             }),
         };
         let progress = Arc::new(NoopFitProgress::default());

@@ -14,6 +14,7 @@ use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, TrainedModel};
 use gnomon::map::main as map_cli;
+use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
 
 #[derive(Args)]
 pub struct TrainArgs {
@@ -410,6 +411,24 @@ enum Commands {
         /// Enable LD normalization when fitting the PCA model
         #[arg(long)]
         ld: bool,
+
+        /// LD window expressed as the number of sites (must be odd)
+        #[arg(
+            long = "sites_window",
+            value_name = "SITES",
+            requires = "ld",
+            conflicts_with = "bp_window"
+        )]
+        sites_window: Option<usize>,
+
+        /// LD window expressed in base pairs
+        #[arg(
+            long = "bp_window",
+            value_name = "BP",
+            requires = "ld",
+            conflicts_with = "sites_window"
+        )]
+        bp_window: Option<u64>,
     },
 
     /// Project samples using an existing HWE PCA model
@@ -447,7 +466,9 @@ fn main() {
             list,
             components,
             ld,
-        }) => run_map_fit(genotype_path, list, components, ld),
+            sites_window,
+            bp_window,
+        }) => run_map_fit(genotype_path, list, components, ld, sites_window, bp_window),
         Some(Commands::Project { genotype_path }) => run_map_project(genotype_path),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
@@ -469,12 +490,37 @@ fn run_map_fit(
     list: Option<PathBuf>,
     components: usize,
     ld: bool,
+    sites_window: Option<usize>,
+    bp_window: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ld_window = if ld {
+        if let Some(bp) = bp_window {
+            Some(LdWindow::BasePairs(bp))
+        } else {
+            let window = sites_window.unwrap_or(DEFAULT_LD_WINDOW);
+            if window == 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--sites_window must be at least 1",
+                )));
+            }
+            if window % 2 == 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--sites_window must be an odd number",
+                )));
+            }
+            Some(LdWindow::Sites(window))
+        }
+    } else {
+        None
+    };
+
     map_cli::run(map_cli::MapCommand::Fit {
         genotype_path,
         variant_list: list,
         components,
-        ld,
+        ld: ld_window,
     })
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }

@@ -21,7 +21,7 @@ Optional arguments:
 ### `fit`
 Fit an HWE PCA model from genotype data.
 
-Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--list <PATH>] [--ld]`
+Usage: `gnomon fit <GENOTYPE_PATH> --components <N> [--list <PATH>] [--ld [--sites_window <SITES> | --bp_window <BP>]]`
 
 ### `project`
 Project samples into an existing HWE PCA space.

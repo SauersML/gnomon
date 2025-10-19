@@ -287,6 +287,53 @@ impl GenotypeDataset {
             Self::Variants(dataset) => dataset.output_path(filename),
         }
     }
+
+    pub fn variant_keys_for_plan(
+        &self,
+        plan: &SelectionPlan,
+    ) -> Result<Vec<VariantKey>, GenotypeIoError> {
+        match (self, plan) {
+            (Self::Plink(dataset), SelectionPlan::All) => Ok(dataset.variant_keys_all()?),
+            (Self::Plink(dataset), SelectionPlan::ByIndices(indices)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Plink(PlinkIoError::InvalidHeader(
+                            format!("variant index {idx} exceeds dataset bounds"),
+                        )));
+                    }
+                }
+                Ok(selected)
+            }
+            (Self::Plink(dataset), SelectionPlan::ByKeys(filter)) => {
+                let selection = dataset.select_variants(filter)?;
+                Ok(selection.keys)
+            }
+            (Self::Variants(dataset), SelectionPlan::All) => Ok(dataset.variant_keys_all()?),
+            (Self::Variants(dataset), SelectionPlan::ByIndices(indices)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Variant(VariantIoError::UnexpectedEof {
+                            expected: indices.len(),
+                            actual: selected.len(),
+                        }));
+                    }
+                }
+                Ok(selected)
+            }
+            (Self::Variants(dataset), SelectionPlan::ByKeys(filter)) => {
+                let selection = dataset.select_variants(filter)?;
+                Ok(selection.keys)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -625,6 +672,29 @@ impl PlinkDataset {
     pub fn variant_records(&self) -> Result<PlinkVariantRecordIter, PlinkIoError> {
         let source = open_text_source(&self.bim_path)?;
         Ok(PlinkVariantRecordIter::new(self.bim_path.clone(), source))
+    }
+
+    pub fn variant_keys_all(&self) -> Result<Vec<VariantKey>, PlinkIoError> {
+        let mut iter = self.variant_records()?;
+        let mut keys = Vec::with_capacity(self.n_variants);
+        while let Some(result) = iter.next() {
+            let record = result?;
+            let position =
+                record
+                    .position
+                    .parse::<u64>()
+                    .map_err(|err| PlinkIoError::MalformedRecord {
+                        path: iter.path.display().to_string(),
+                        line: iter.line,
+                        message: format!(
+                            "invalid position '{}' for variant {}: {err}",
+                            record.position, record.identifier
+                        ),
+                    })?;
+            let key = VariantKey::new(&record.chromosome, position);
+            keys.push(key);
+        }
+        Ok(keys)
     }
 
     pub fn into_block_source(self) -> PlinkVariantBlockSource {
@@ -1155,6 +1225,64 @@ impl VcfLikeDataset {
             Arc::clone(&self.variant_count),
             plan,
         )
+    }
+
+    pub fn variant_keys_all(&self) -> Result<Vec<VariantKey>, VariantIoError> {
+        let mut keys = Vec::new();
+        let mut record = RecordBuf::default();
+
+        for part in &self.parts {
+            let (mut reader, compression, format, _) = create_variant_reader_for_file(part)
+                .map_err(|err| {
+                    print_variant_diagnostics(
+                        part,
+                        None,
+                        None,
+                        "initializing variant reader for LD window",
+                        &err,
+                    );
+                    err
+                })?;
+            let header = reader.read_header().map_err(|err| {
+                print_variant_diagnostics(
+                    part,
+                    Some(compression),
+                    Some(format),
+                    "reading variant header",
+                    &err,
+                );
+                VariantIoError::Io(err)
+            })?;
+
+            loop {
+                let bytes = reader
+                    .read_record_buf(&header, &mut record)
+                    .map_err(|err| {
+                        print_variant_diagnostics(
+                            part,
+                            Some(compression),
+                            Some(format),
+                            "scanning variant records",
+                            &err,
+                        );
+                        VariantIoError::Io(err)
+                    })?;
+                if bytes == 0 {
+                    break;
+                }
+
+                let chrom = record.reference_sequence_name().to_string();
+                let Some(position) = record.variant_start() else {
+                    return Err(VariantIoError::Decode(
+                        "variant position missing from record".to_string(),
+                    ));
+                };
+                let pos = position.get() as u64;
+                keys.push(VariantKey::new(&chrom, pos));
+            }
+        }
+
+        Ok(keys)
     }
 
     pub fn output_path(&self, filename: &str) -> PathBuf {
