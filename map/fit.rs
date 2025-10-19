@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{min, Ordering};
+use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::eigen::{
-    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
-};
 use faer::matrix_free::LinOp;
+use faer::matrix_free::eigen::{
+    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+};
 use faer::prelude::ReborrowMut;
 use faer::{
-    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
-    Par, Side,
+    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
+    unzip, zip,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
@@ -44,7 +44,7 @@ const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
 const MAX_PARTIAL_COMPONENTS: usize = 512;
 const FALLBACK_GRAM_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MIN_GRAM_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_LD_WINDOW: usize = 51;
+pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
 
@@ -123,23 +123,66 @@ pub struct FitOptions {
     pub ld: Option<LdConfig>,
 }
 
+#[derive(Clone, Debug)]
+pub enum LdWindow {
+    Sites(usize),
+    BasePairs(u64),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LdConfig {
-    pub window: Option<usize>,
+    pub window: Option<LdWindow>,
     pub ridge: Option<f64>,
+    pub variant_keys: Option<Arc<Vec<VariantKey>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LdWeights {
     pub weights: Vec<f64>,
     pub window: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bp_window: Option<u64>,
     pub ridge: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct LdBpWindowRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+enum LdResolvedWindow {
+    Sites {
+        size: usize,
+    },
+    BasePairs {
+        span_bp: u64,
+        ranges: Arc<[LdBpWindowRange]>,
+        capacity: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct LdResolvedConfig {
-    window: usize,
+    window: LdResolvedWindow,
     ridge: f64,
+}
+
+impl LdResolvedConfig {
+    fn window_capacity(&self) -> usize {
+        match &self.window {
+            LdResolvedWindow::Sites { size } => *size,
+            LdResolvedWindow::BasePairs { capacity, .. } => *capacity,
+        }
+    }
+
+    fn bp_window(&self) -> Option<u64> {
+        match &self.window {
+            LdResolvedWindow::Sites { .. } => None,
+            LdResolvedWindow::BasePairs { span_bp, .. } => Some(*span_bp),
+        }
+    }
 }
 
 impl FitOptions {
@@ -147,9 +190,28 @@ impl FitOptions {
         &self,
         observed_variants: usize,
     ) -> Result<Option<LdResolvedConfig>, HwePcaError> {
-        match &self.ld {
-            Some(cfg) if observed_variants > 0 => {
-                let mut window = cfg.window.unwrap_or(DEFAULT_LD_WINDOW);
+        let Some(cfg) = &self.ld else {
+            return Ok(None);
+        };
+
+        if observed_variants == 0 {
+            return Ok(None);
+        }
+
+        let window_spec = cfg
+            .window
+            .clone()
+            .unwrap_or(LdWindow::Sites(DEFAULT_LD_WINDOW));
+
+        let ridge = cfg.ridge.unwrap_or(DEFAULT_LD_RIDGE);
+        if !(ridge.is_finite() && ridge > 0.0) {
+            return Err(HwePcaError::InvalidInput(
+                "LD weighting ridge must be positive and finite",
+            ));
+        }
+
+        let window = match window_spec {
+            LdWindow::Sites(mut window) => {
                 if window == 0 {
                     return Err(HwePcaError::InvalidInput(
                         "LD weighting window must be at least one variant",
@@ -165,19 +227,102 @@ impl FitOptions {
                         window = 1;
                     }
                 }
-
-                let ridge = cfg.ridge.unwrap_or(DEFAULT_LD_RIDGE);
-                if !(ridge.is_finite() && ridge > 0.0) {
+                LdResolvedWindow::Sites { size: window }
+            }
+            LdWindow::BasePairs(span_bp) => {
+                let keys = cfg.variant_keys.as_ref().ok_or_else(|| {
+                    HwePcaError::InvalidInput("LD base-pair window requires variant positions")
+                })?;
+                if keys.len() != observed_variants {
                     return Err(HwePcaError::InvalidInput(
-                        "LD weighting ridge must be positive and finite",
+                        "LD base-pair window requires positions for all variants",
                     ));
                 }
-
-                Ok(Some(LdResolvedConfig { window, ridge }))
+                let (ranges, capacity) = compute_ld_bp_ranges(keys, span_bp)?;
+                LdResolvedWindow::BasePairs {
+                    span_bp,
+                    ranges,
+                    capacity,
+                }
             }
-            _ => Ok(None),
-        }
+        };
+
+        Ok(Some(LdResolvedConfig { window, ridge }))
     }
+}
+
+fn compute_ld_bp_ranges(
+    keys: &[VariantKey],
+    span_bp: u64,
+) -> Result<(Arc<[LdBpWindowRange]>, usize), HwePcaError> {
+    if keys.is_empty() {
+        return Err(HwePcaError::InvalidInput(
+            "LD base-pair window requires at least one variant",
+        ));
+    }
+
+    let mut left_bounds = vec![0usize; keys.len()];
+    let mut start = 0usize;
+
+    for (idx, key) in keys.iter().enumerate() {
+        if idx == 0 {
+            left_bounds[idx] = 0;
+            continue;
+        }
+
+        if keys[idx - 1].chromosome != key.chromosome {
+            start = idx;
+        }
+
+        while start < idx {
+            let candidate = &keys[start];
+            if candidate.chromosome != key.chromosome {
+                start += 1;
+                continue;
+            }
+            let delta = key.position.saturating_sub(candidate.position);
+            if delta > span_bp {
+                start += 1;
+                continue;
+            }
+            break;
+        }
+
+        left_bounds[idx] = start.min(idx);
+    }
+
+    let mut ranges = Vec::with_capacity(keys.len());
+    let mut capacity = 1usize;
+    let mut right = 0usize;
+
+    for (idx, key) in keys.iter().enumerate() {
+        if right < idx {
+            right = idx;
+        }
+
+        while right < keys.len() {
+            let candidate = &keys[right];
+            if candidate.chromosome != key.chromosome {
+                break;
+            }
+            let delta = candidate.position.saturating_sub(key.position);
+            if delta > span_bp {
+                break;
+            }
+            right += 1;
+        }
+
+        let start_idx = left_bounds[idx].min(idx);
+        let end_idx = right.max(idx + 1);
+        let width = end_idx - start_idx;
+        capacity = capacity.max(width.max(1));
+        ranges.push(LdBpWindowRange {
+            start: start_idx,
+            end: end_idx,
+        });
+    }
+
+    Ok((ranges.into_boxed_slice().into(), capacity.max(1)))
 }
 
 #[derive(Clone, Copy)]
@@ -2194,7 +2339,8 @@ where
         stage_progress.finish();
         return Ok(LdWeights {
             weights,
-            window: config.window,
+            window: config.window_capacity().max(1),
+            bp_window: config.bp_window(),
             ridge: config.ridge,
         });
     }
@@ -2202,7 +2348,7 @@ where
     let n_samples = source.n_samples();
     let mut block_storage = vec![0.0f64; n_samples * block_capacity];
     let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
-    let window_capacity = config.window.max(1);
+    let window_capacity = config.window_capacity().max(1);
     let mut ring = LdRingBuffer::new(n_samples, window_capacity);
     let mut next_weight = 0usize;
 
@@ -2279,7 +2425,7 @@ where
                 &mut ring,
                 &mut weights,
                 &mut next_weight,
-                config,
+                &config,
                 &mut values_scratch,
                 &mut mask_scratch,
                 &mut square_scratch,
@@ -2301,7 +2447,7 @@ where
         &mut ring,
         &mut weights,
         &mut next_weight,
-        config,
+        &config,
         &mut values_scratch,
         &mut mask_scratch,
         &mut square_scratch,
@@ -2320,7 +2466,8 @@ where
 
     Ok(LdWeights {
         weights,
-        window: config.window,
+        window: config.window_capacity().max(1),
+        bp_window: config.bp_window(),
         ridge: config.ridge,
     })
 }
@@ -2329,7 +2476,7 @@ fn assign_ready_weights<P: FitProgressObserver>(
     ring: &mut LdRingBuffer,
     weights: &mut [f64],
     next_weight: &mut usize,
-    config: LdResolvedConfig,
+    config: &LdResolvedConfig,
     values_scratch: &mut Mat<f64>,
     mask_scratch: &mut Mat<f64>,
     square_scratch: &mut Mat<f64>,
@@ -2353,22 +2500,54 @@ fn assign_ready_weights<P: FitProgressObserver>(
             break;
         }
 
-        let window_size = config.window.min(available).max(1);
-        let half_window = window_size / 2;
-        let start = if available <= window_size {
-            0
-        } else if position <= half_window {
-            0
-        } else {
-            let tail_start = available.saturating_sub(window_size);
-            min(position - half_window, tail_start)
+        let window_params = match &config.window {
+            LdResolvedWindow::Sites { size } => {
+                let window_size = (*size).min(available).max(1);
+                let half_window = window_size / 2;
+                let start = if available <= window_size {
+                    0
+                } else if position <= half_window {
+                    0
+                } else {
+                    let tail_start = available.saturating_sub(window_size);
+                    min(position - half_window, tail_start)
+                };
+                let end = min(start + window_size, available);
+                let window_len = end - start;
+                if window_len == 0 {
+                    None
+                } else {
+                    let center = position - start;
+                    let keep_from = next_weight.saturating_sub(window_size / 2);
+                    Some((start, window_len, center, keep_from))
+                }
+            }
+            LdResolvedWindow::BasePairs { ranges, .. } => {
+                let range = &ranges[*next_weight];
+                if range.end <= range.start {
+                    return Err(HwePcaError::InvalidInput(
+                        "LD base-pair window produced an empty range",
+                    ));
+                }
+                let last_index = range.end - 1;
+                match (ring.position_of(range.start), ring.position_of(last_index)) {
+                    (Some(start_offset), Some(end_offset)) => {
+                        let window_len = end_offset.saturating_sub(start_offset) + 1;
+                        if window_len == 0 {
+                            None
+                        } else {
+                            let center = position.saturating_sub(start_offset);
+                            Some((start_offset, window_len, center, range.start))
+                        }
+                    }
+                    _ => None,
+                }
+            }
         };
-        let end = min(start + window_size, available);
-        let window_len = end - start;
-        if window_len == 0 {
+
+        let Some((start, window_len, center, keep_from)) = window_params else {
             break;
-        }
-        let center = position - start;
+        };
 
         let values_ref = ring.values();
         let first_slot = ring.slot_at(start);
@@ -2478,7 +2657,6 @@ fn assign_ready_weights<P: FitProgressObserver>(
         progress.advance(*next_weight + 1);
         *next_weight += 1;
 
-        let keep_from = next_weight.saturating_sub(config.window / 2);
         ring.truncate_front(keep_from);
     }
 
