@@ -547,12 +547,66 @@ jobs:
 
       - name: Install Perf Tools
         run: |
+          set -euo pipefail
+
           CURRENT_KERNEL=$(uname -r)
-          REQUIRED_PACKAGES="linux-tools-common linux-tools-${CURRENT_KERNEL}"
+          KERNEL_NO_FLAVOR=${CURRENT_KERNEL%%-*}
+          KERNEL_MAJOR_MINOR=$(echo "$CURRENT_KERNEL" | cut -d. -f1-2)
+
           if [ "${{ steps.apt_cache.outputs.cache-hit }}" != 'true' ]; then
             sudo apt-get update -y
           fi
-          sudo apt-get install -y --no-install-recommends ${REQUIRED_PACKAGES}
+
+          install_pkg_if_available() {
+            local pkg="$1"
+            if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: (none)'; then
+              echo "Skipping unavailable package: $pkg"
+            else
+              sudo apt-get install -y --no-install-recommends "$pkg"
+            fi
+          }
+
+          install_pkg_if_available linux-tools-common
+          install_pkg_if_available "linux-tools-${CURRENT_KERNEL}"
+          install_pkg_if_available "linux-cloud-tools-${CURRENT_KERNEL}"
+          install_pkg_if_available linux-tools-azure
+          install_pkg_if_available linux-cloud-tools-azure
+
+          ensure_perf_symlink() {
+            local candidate
+            for candidate in \
+              "/usr/bin/perf_${CURRENT_KERNEL}" \
+              "/usr/bin/perf_${KERNEL_NO_FLAVOR}" \
+              "/usr/bin/perf_${KERNEL_MAJOR_MINOR}" \
+              "/usr/lib/linux-tools-${CURRENT_KERNEL}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_NO_FLAVOR}/perf" \
+              "/usr/lib/linux-tools-${KERNEL_MAJOR_MINOR}/perf"; do
+              if [ -x "$candidate" ]; then
+                echo "Linking perf from $candidate"
+                sudo ln -sf "$candidate" /usr/local/bin/perf
+                return 0
+              fi
+            done
+
+            candidate=$(find /usr/lib/linux-tools -maxdepth 2 -type f -name perf -print -quit 2>/dev/null || true)
+            if [ -n "$candidate" ]; then
+              echo "Linking perf from $candidate"
+              sudo ln -sf "$candidate" /usr/local/bin/perf
+              return 0
+            fi
+
+            return 1
+          }
+
+          if ! command -v perf >/dev/null 2>&1; then
+            ensure_perf_symlink || true
+          fi
+
+          if ! command -v perf >/dev/null 2>&1; then
+            echo "::error::perf binary not found after installation attempts"
+            exit 1
+          fi
+
           perf --version
 
       - name: Configure Profiler Permissions
