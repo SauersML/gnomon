@@ -261,6 +261,8 @@ fn compute_ld_bp_ranges(
         ));
     }
 
+    let half_span = span_bp / 2;
+
     let mut left_bounds = vec![0usize; keys.len()];
     let mut start = 0usize;
 
@@ -281,7 +283,7 @@ fn compute_ld_bp_ranges(
                 continue;
             }
             let delta = key.position.saturating_sub(candidate.position);
-            if delta > span_bp {
+            if delta > half_span {
                 start += 1;
                 continue;
             }
@@ -306,7 +308,7 @@ fn compute_ld_bp_ranges(
                 break;
             }
             let delta = candidate.position.saturating_sub(key.position);
-            if delta > span_bp {
+            if delta > half_span {
                 break;
             }
             right += 1;
@@ -3114,6 +3116,37 @@ mod tests {
     use super::*;
     use crate::map::io::GenotypeDataset;
     use std::path::Path;
+
+    #[test]
+    fn bp_window_treated_as_total_span() {
+        let keys = vec![
+            VariantKey::new("1", 100),
+            VariantKey::new("1", 140),
+            VariantKey::new("1", 180),
+            VariantKey::new("1", 220),
+        ];
+
+        let (ranges, capacity) = compute_ld_bp_ranges(&keys, 100).expect("ranges");
+
+        assert_eq!(capacity, 3);
+        assert_eq!(ranges.len(), keys.len());
+
+        assert_eq!((ranges[1].start, ranges[1].end), (0, 3));
+        assert_eq!((ranges[2].start, ranges[2].end), (1, 4));
+    }
+
+    #[test]
+    fn bp_window_uses_total_span_for_odds() {
+        let keys = vec![VariantKey::new("1", 1), VariantKey::new("1", 52)];
+
+        let (ranges, capacity) = compute_ld_bp_ranges(&keys, 101).expect("ranges");
+
+        assert_eq!(capacity, 1);
+        assert_eq!(ranges.len(), keys.len());
+
+        assert_eq!((ranges[0].start, ranges[0].end), (0, 1));
+        assert_eq!((ranges[1].start, ranges[1].end), (1, 2));
+    }
 
     #[test]
     fn fast_path_matches_masked_when_no_missingness() {

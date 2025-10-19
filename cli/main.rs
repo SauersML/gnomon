@@ -421,7 +421,7 @@ enum Commands {
         )]
         sites_window: Option<usize>,
 
-        /// LD window expressed in base pairs
+        /// LD window expressed as the total span in base pairs
         #[arg(
             long = "bp_window",
             value_name = "BP",

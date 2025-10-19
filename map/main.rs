@@ -243,7 +243,7 @@ fn run_fit(
     if let Some(ld) = model.ld() {
         if let Some(bp) = ld.bp_window {
             println!(
-                "LD weighting summary: {} variants, sites_window={} bp_window={} ridge={:.3e}",
+                "LD weighting summary: {} variants, sites_window={} bp_window_total_bp={} ridge={:.3e}",
                 ld.weights.len(),
                 ld.window,
                 bp,

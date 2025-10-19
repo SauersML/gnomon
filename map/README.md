@@ -45,8 +45,8 @@ Optional arguments:
   are reported before the command exits.
 * `--ld` – Enable linkage disequilibrium flattening. When present, LD weights
   use a default window of 51 variants unless `--sites_window <SITES>` (odd
-  number of variants) or `--bp_window <BP>` (genomic span in base pairs) is
-  supplied. The resulting weights are stored inside `hwe.json` so projections
+  number of variants) or `--bp_window <BP>` (total genomic span in base pairs)
+  is supplied. The resulting weights are stored inside `hwe.json` so projections
   can apply the same normalization.
 
 ### `gnomon project`
