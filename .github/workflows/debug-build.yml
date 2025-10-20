@@ -27,7 +27,7 @@ jobs:
       - name: Build gnomon (release)
         run: |
           set -euxo pipefail
-          CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=true cargo build --release gnomon
+          CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=true cargo build --release --bin gnomon
 
       - name: Upload gnomon binary
         uses: actions/upload-artifact@v4
