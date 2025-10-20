@@ -1,6 +1,8 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
 // A custom "Sink" for the grep searcher. It collects all matching lines
@@ -39,6 +41,36 @@ struct DeadCodeCollector {
 struct IgnoredTestCollector {
     violations: Vec<String>,
     file_path: PathBuf,
+}
+
+static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn update_stage(label: &str) {
+    let tracker = CURRENT_STAGE.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut guard) = tracker.lock() {
+        guard.clear();
+        guard.push_str(label);
+    }
+
+    println!("cargo:warning=gnomon build stage: {label}");
+    let _ = io::stdout().flush();
+}
+
+fn emit_stage_detail(detail: &str) {
+    println!("cargo:warning=gnomon build detail: {detail}");
+    let _ = io::stdout().flush();
+}
+
+fn install_stage_panic_hook() {
+    let tracker: &'static Mutex<String> = CURRENT_STAGE.get_or_init(|| Mutex::new(String::new()));
+    std::panic::set_hook(Box::new(move |info| {
+        let stage_name = tracker
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| String::from("<stage lock poisoned>"));
+        eprintln!("\n⚠️ build script panic while processing stage: {stage_name}");
+        eprintln!("{info}");
+    }));
 }
 
 impl ViolationCollector {
@@ -456,33 +488,62 @@ impl Sink for IgnoredTestCollector {
 }
 
 fn main() {
+    install_stage_panic_hook();
+
     // Always rerun this script if the build script itself changes.
+    update_stage("initialization");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Manually check for unused variables in the build script
+    update_stage("manual lint self-check");
     manually_check_for_unused_variables();
 
     // Collect all violations from all checks
     let mut all_violations = Vec::new();
 
     // Scan Rust source files for underscore prefixed variables
+    update_stage("scan underscore-prefixed bindings");
     let underscore_violations = scan_for_underscore_prefixes();
+    let underscore_report = format!(
+        "underscore scan identified {} violation groups",
+        underscore_violations.len()
+    );
+    emit_stage_detail(&underscore_report);
     all_violations.extend(underscore_violations);
 
     // Scan Rust source files for forbidden comment patterns
+    update_stage("scan forbidden comment patterns");
     let comment_violations = scan_for_forbidden_comment_patterns();
+    let comment_report = format!(
+        "forbidden comment scan identified {} violation groups",
+        comment_violations.len()
+    );
+    emit_stage_detail(&comment_report);
     all_violations.extend(comment_violations);
 
     // Scan Rust source files for #[allow(dead_code)] attributes
+    update_stage("scan allow(dead_code) attributes");
     let dead_code_violations = scan_for_allow_dead_code();
+    let dead_code_report = format!(
+        "allow(dead_code) scan identified {} violation groups",
+        dead_code_violations.len()
+    );
+    emit_stage_detail(&dead_code_report);
     all_violations.extend(dead_code_violations);
 
     // Scan Rust source files for #[ignore] test attributes
+    update_stage("scan #[ignore] test annotations");
     let ignored_test_violations = scan_for_ignored_tests();
+    let ignored_report = format!(
+        "ignored test scan identified {} violation groups",
+        ignored_test_violations.len()
+    );
+    emit_stage_detail(&ignored_report);
     all_violations.extend(ignored_test_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
+        update_stage("report validation errors");
         eprintln!("\n❌ VALIDATION ERRORS");
         eprintln!("====================");
 
@@ -499,6 +560,9 @@ fn main() {
         );
         std::process::exit(1);
     }
+
+    update_stage("build script completed");
+    emit_stage_detail("Validation checks completed without errors");
 }
 
 // This function manually checks for unused variables in the current file
@@ -506,6 +570,8 @@ fn manually_check_for_unused_variables() {
     // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
     // This ensures build.rs itself follows the strict coding policy
     let build_path = Path::new("build.rs");
+    update_stage("manual lint self-check: running rustc");
+    emit_stage_detail("Executing rustc self-lint on build.rs");
     let status = std::process::Command::new("rustc")
         .args([
             "--edition",
@@ -549,10 +615,13 @@ fn manually_check_for_unused_variables() {
                     eprintln!("   Either use the imported item or remove the import completely.");
                     std::process::exit(1);
                 }
+            } else {
+                emit_stage_detail("Completed rustc self-lint for build.rs");
             }
         }
         Err(_) => {
             // If rustc command fails, fallback to warning but don't fail the build
+            emit_stage_detail("Unable to run rustc self-lint command; continuing without manual check");
             eprintln!(
                 "cargo:warning=Could not check for unused variables/functions/imports in build.rs"
             );

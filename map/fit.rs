@@ -765,10 +765,16 @@ impl VariantStatsCache {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum SimdLaneSelection {
     Lanes4,
     Lanes2,
+}
+
+#[inline(always)]
+fn record_simd_lane_diagnostic(stage: &'static str, selection: SimdLaneSelection) -> SimdLaneSelection {
+    log::debug!("SIMD lane selection stage {stage} -> {selection:?}");
+    selection
 }
 
 fn detected_simd_lane_selection() -> SimdLaneSelection {
@@ -776,11 +782,14 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
     {
         static DETECTED: OnceLock<SimdLaneSelection> = OnceLock::new();
         return *DETECTED.get_or_init(|| {
-            if cfg!(target_feature = "avx") && std::arch::is_x86_feature_detected!("avx") {
+            let selection = if cfg!(target_feature = "avx")
+                && std::arch::is_x86_feature_detected!("avx")
+            {
                 SimdLaneSelection::Lanes4
             } else {
                 SimdLaneSelection::Lanes2
-            }
+            };
+            record_simd_lane_diagnostic("x86 runtime detection", selection)
         });
     }
 
@@ -789,7 +798,7 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        return SimdLaneSelection::Lanes4;
+        return record_simd_lane_diagnostic("default lanes4 architecture", SimdLaneSelection::Lanes4);
     }
 
     #[cfg(all(not(any(
@@ -799,7 +808,7 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         target_arch = "wasm32"
     ))))]
     {
-        return SimdLaneSelection::Lanes2;
+        return record_simd_lane_diagnostic("portable fallback", SimdLaneSelection::Lanes2);
     }
 }
 
@@ -939,6 +948,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
         SimdLaneSelection::Lanes4 => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             unsafe {
+                log::debug!("Invoking AVX sum_and_count_finite implementation");
                 return sum_and_count_finite_avx(values);
             }
 
@@ -947,6 +957,9 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 any(target_arch = "aarch64", target_arch = "wasm32")
             ))]
             {
+                log::debug!(
+                    "Using generic four-lane sum_and_count_finite implementation for non-x86 architecture"
+                );
                 return sum_and_count_finite_impl::<4>(values);
             }
 
@@ -957,6 +970,9 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 target_arch = "wasm32"
             ))))]
             {
+                log::warn!(
+                    "Falling back to two-lane sum_and_count_finite implementation despite four-lane selection"
+                );
                 return sum_and_count_finite_impl::<2>(values);
             }
         }
