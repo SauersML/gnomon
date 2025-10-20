@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{Ordering, min};
+use core::cmp::{min, Ordering};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::LinOp;
 use faer::matrix_free::eigen::{
-    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
 };
+use faer::matrix_free::LinOp;
 use faer::prelude::ReborrowMut;
 use faer::{
-    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
-    unzip, zip,
+    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
+    Par, Side,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
@@ -767,7 +767,6 @@ impl VariantStatsCache {
 
 #[derive(Clone, Copy)]
 enum SimdLaneSelection {
-    Lanes8,
     Lanes4,
     Lanes2,
 }
@@ -777,9 +776,7 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
     {
         static DETECTED: OnceLock<SimdLaneSelection> = OnceLock::new();
         return *DETECTED.get_or_init(|| {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                SimdLaneSelection::Lanes8
-            } else if std::arch::is_x86_feature_detected!("avx") {
+            if cfg!(target_feature = "avx") && std::arch::is_x86_feature_detected!("avx") {
                 SimdLaneSelection::Lanes4
             } else {
                 SimdLaneSelection::Lanes2
@@ -809,23 +806,15 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
 #[inline(always)]
 fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
     match detected_simd_lane_selection() {
-        SimdLaneSelection::Lanes8 => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            unsafe {
-                standardize_column_simd_avx512(values, mean, inv);
-            }
-
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                standardize_column_simd_impl::<8>(values, mean, inv);
-            }
-        }
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
         SimdLaneSelection::Lanes4 => {
             standardize_column_simd_lanes4(values, mean, inv);
         }
-        SimdLaneSelection::Lanes2 => {
-            standardize_column_simd_impl::<2>(values, mean, inv);
-        }
+        _ => standardize_column_simd_impl::<2>(values, mean, inv),
     }
 }
 
@@ -843,12 +832,6 @@ fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     {
         standardize_column_simd_impl::<4>(values, mean, inv);
     }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-unsafe fn standardize_column_simd_avx512(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_impl::<8>(values, mean, inv);
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -889,23 +872,15 @@ where
 #[inline(always)]
 fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
     match detected_simd_lane_selection() {
-        SimdLaneSelection::Lanes8 => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            unsafe {
-                standardize_column_simd_full_avx512(values, mean, inv);
-            }
-
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                standardize_column_simd_full_impl::<8>(values, mean, inv);
-            }
-        }
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
         SimdLaneSelection::Lanes4 => {
             standardize_column_simd_full_lanes4(values, mean, inv);
         }
-        SimdLaneSelection::Lanes2 => {
-            standardize_column_simd_full_impl::<2>(values, mean, inv);
-        }
+        _ => standardize_column_simd_full_impl::<2>(values, mean, inv),
     }
 }
 
@@ -932,12 +907,6 @@ unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f
     standardize_column_simd_full_impl::<4>(values, mean, inv);
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-unsafe fn standardize_column_simd_full_avx512(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_full_impl::<8>(values, mean, inv);
-}
-
 #[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
@@ -962,21 +931,15 @@ where
 #[inline(always)]
 fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
     match detected_simd_lane_selection() {
-        SimdLaneSelection::Lanes8 => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            unsafe {
-                sum_and_count_finite_avx512(values)
-            }
-
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                sum_and_count_finite_impl::<8>(values)
-            }
-        }
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
         SimdLaneSelection::Lanes4 => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             unsafe {
-                sum_and_count_finite_avx(values)
+                return sum_and_count_finite_avx(values);
             }
 
             #[cfg(all(
@@ -984,10 +947,10 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 any(target_arch = "aarch64", target_arch = "wasm32")
             ))]
             {
-                sum_and_count_finite_impl::<4>(values)
+                return sum_and_count_finite_impl::<4>(values);
             }
         }
-        SimdLaneSelection::Lanes2 => sum_and_count_finite_impl::<2>(values),
+        _ => return sum_and_count_finite_impl::<2>(values),
     }
 }
 
@@ -1017,12 +980,6 @@ where
     }
 
     (sum, count)
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f")]
-unsafe fn sum_and_count_finite_avx512(values: &[f64]) -> (f64, usize) {
-    sum_and_count_finite_impl::<8>(values)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
