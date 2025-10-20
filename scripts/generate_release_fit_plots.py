@@ -95,12 +95,18 @@ def _load_sample_population_mapping(path: Path) -> pd.DataFrame:
             "Sample population mapping is missing required columns 'meta_subpopulation' or 'meta_superpopulation'."
         )
 
+    def _is_sample_identifier_column(column: str) -> bool:
+        normalized = "".join(char for char in column.lower() if char.isalnum())
+        if not normalized:
+            return False
+        return "sampleid" in normalized or "samplename" in normalized
+
     sample_id_columns = [
-        column for column in mapping_df.columns if column.lower().startswith("sample_id")
+        column for column in mapping_df.columns if _is_sample_identifier_column(column)
     ]
     if not sample_id_columns:
         raise ValueError(
-            "Sample population mapping did not contain any columns beginning with 'sample_id'."
+            "Sample population mapping did not contain any columns with sample identifiers."
         )
 
     records: list[dict[str, str | None]] = []
