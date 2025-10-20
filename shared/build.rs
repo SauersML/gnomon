@@ -1,5 +1,6 @@
 use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -570,28 +571,76 @@ fn manually_check_for_unused_variables() {
     // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
     // This ensures build.rs itself follows the strict coding policy
     let build_path = Path::new("build.rs");
+    let rustc_binary = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let manual_lint_args = manual_lint_arguments(build_path);
+
     update_stage("manual lint self-check: running rustc");
-    emit_stage_detail("Executing rustc self-lint on build.rs");
-    let status = std::process::Command::new("rustc")
-        .args([
-            "--edition",
-            "2021",
-            "-D",
-            "unused_variables",
-            "-D",
-            "dead_code",
-            "-D",
-            "unused_imports",
-            "--crate-type",
-            "bin",
-            "--error-format",
-            "human",
-            build_path.to_str().unwrap(),
-        ])
-        .output();
+    emit_stage_detail(&format!(
+        "manual lint self-check: selected rustc executable: {:?}",
+        rustc_binary
+    ));
+
+    if let Some(host) = std::env::var_os("HOST") {
+        emit_stage_detail(&format!(
+            "manual lint self-check: HOST environment: {:?}",
+            host
+        ));
+    }
+
+    if let Some(target) = std::env::var_os("TARGET") {
+        emit_stage_detail(&format!(
+            "manual lint self-check: TARGET environment: {:?}",
+            target
+        ));
+    }
+
+    if let Some(triple) = std::env::var_os("CARGO_CFG_TARGET_ARCH") {
+        emit_stage_detail(&format!(
+            "manual lint self-check: cfg target arch: {:?}",
+            triple
+        ));
+    }
+
+    emit_stage_detail(&format!(
+        "manual lint self-check: build context arch/os: {} / {}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    ));
+
+    update_stage("manual lint self-check: preparing rustc command");
+    emit_stage_detail(&format!(
+        "manual lint self-check: command preview: {}",
+        command_preview(&rustc_binary, &manual_lint_args)
+    ));
+
+    if let Some(cwd) = std::env::current_dir().ok() {
+        emit_stage_detail(&format!(
+            "manual lint self-check: current dir before spawn: {:?}",
+            cwd
+        ));
+    }
+
+    let mut command = std::process::Command::new(&rustc_binary);
+    command.args(&manual_lint_args);
+
+    update_stage("manual lint self-check: invoking rustc");
+    emit_stage_detail("manual lint self-check: calling Command::output() for rustc self-lint");
+    let status = command.output();
+
+    update_stage("manual lint self-check: rustc invocation returned");
 
     match status {
         Ok(output) => {
+            emit_stage_detail(&format!(
+                "manual lint self-check: rustc exit status: {:?}",
+                output.status.code()
+            ));
+            emit_stage_detail(&format!(
+                "manual lint self-check: rustc stdout bytes: {} / stderr bytes: {}",
+                output.stdout.len(),
+                output.stderr.len()
+            ));
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr.contains("unused variable") {
@@ -619,14 +668,42 @@ fn manually_check_for_unused_variables() {
                 emit_stage_detail("Completed rustc self-lint for build.rs");
             }
         }
-        Err(_) => {
-            // If rustc command fails, fallback to warning but don't fail the build
-            emit_stage_detail("Unable to run rustc self-lint command; continuing without manual check");
+        Err(err) => {
+            emit_stage_detail(&format!(
+                "manual lint self-check: failed to start rustc self-lint command: {err}"
+            ));
             eprintln!(
                 "cargo:warning=Could not check for unused variables/functions/imports in build.rs"
             );
         }
     }
+}
+
+fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--edition"),
+        OsString::from("2021"),
+        OsString::from("-D"),
+        OsString::from("unused_variables"),
+        OsString::from("-D"),
+        OsString::from("dead_code"),
+        OsString::from("-D"),
+        OsString::from("unused_imports"),
+        OsString::from("--crate-type"),
+        OsString::from("bin"),
+        OsString::from("--error-format"),
+        OsString::from("human"),
+        build_path.as_os_str().to_os_string(),
+    ]
+}
+
+fn command_preview(program: &OsStr, args: &[OsString]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(format!("{program:?}"));
+    for arg in args {
+        parts.push(format!("{arg:?}"));
+    }
+    parts.join(" ")
 }
 
 fn scan_for_underscore_prefixes() -> Vec<String> {
