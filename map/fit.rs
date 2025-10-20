@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{Ordering, min};
+use core::cmp::{min, Ordering};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::LinOp;
 use faer::matrix_free::eigen::{
-    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
 };
+use faer::matrix_free::LinOp;
 use faer::prelude::ReborrowMut;
 use faer::{
-    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
-    unzip, zip,
+    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
+    Par, Side,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
@@ -765,32 +765,88 @@ impl VariantStatsCache {
     }
 }
 
-#[cfg(target_feature = "avx512f")]
-const STANDARDIZATION_SIMD_LANES: usize = 8;
+#[derive(Clone, Copy, Debug)]
+enum SimdLaneSelection {
+    Lanes4,
+    Lanes2,
+}
 
-#[cfg(all(
-    not(target_feature = "avx512f"),
-    any(
-        target_feature = "avx",
+#[inline(always)]
+fn record_simd_lane_diagnostic(stage: &'static str, selection: SimdLaneSelection) -> SimdLaneSelection {
+    log::debug!("SIMD lane selection stage {stage} -> {selection:?}");
+    selection
+}
+
+fn detected_simd_lane_selection() -> SimdLaneSelection {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        static DETECTED: OnceLock<SimdLaneSelection> = OnceLock::new();
+        return *DETECTED.get_or_init(|| {
+            let selection = if cfg!(target_feature = "avx")
+                && std::arch::is_x86_feature_detected!("avx")
+            {
+                SimdLaneSelection::Lanes4
+            } else {
+                SimdLaneSelection::Lanes2
+            };
+            record_simd_lane_diagnostic("x86 runtime detection", selection)
+        });
+    }
+
+    #[cfg(all(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        any(target_arch = "aarch64", target_arch = "wasm32")
+    ))]
+    {
+        return record_simd_lane_diagnostic("default lanes4 architecture", SimdLaneSelection::Lanes4);
+    }
+
+    #[cfg(all(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "wasm32"
-    )
-))]
-const STANDARDIZATION_SIMD_LANES: usize = 4;
-
-#[cfg(all(
-    not(target_feature = "avx512f"),
-    not(any(
-        target_feature = "avx",
-        target_arch = "aarch64",
-        target_arch = "wasm32"
-    ))
-))]
-const STANDARDIZATION_SIMD_LANES: usize = 2;
+    ))))]
+    {
+        return record_simd_lane_diagnostic("portable fallback", SimdLaneSelection::Lanes2);
+    }
+}
 
 #[inline(always)]
 fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_impl::<STANDARDIZATION_SIMD_LANES>(values, mean, inv);
+    match detected_simd_lane_selection() {
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
+        SimdLaneSelection::Lanes4 => {
+            standardize_column_simd_lanes4(values, mean, inv);
+        }
+        _ => standardize_column_simd_impl::<2>(values, mean, inv),
+    }
+}
+
+#[inline(always)]
+fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        standardize_column_simd_avx(values, mean, inv);
+    }
+
+    #[cfg(all(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        any(target_arch = "aarch64", target_arch = "wasm32")
+    ))]
+    {
+        standardize_column_simd_impl::<4>(values, mean, inv);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn standardize_column_simd_avx(values: &mut [f64], mean: f64, inv: f64) {
+    standardize_column_simd_impl::<4>(values, mean, inv);
 }
 
 #[inline(always)]
@@ -824,7 +880,40 @@ where
 #[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
-    standardize_column_simd_full_impl::<STANDARDIZATION_SIMD_LANES>(values, mean, inv);
+    match detected_simd_lane_selection() {
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
+        SimdLaneSelection::Lanes4 => {
+            standardize_column_simd_full_lanes4(values, mean, inv);
+        }
+        _ => standardize_column_simd_full_impl::<2>(values, mean, inv),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[inline(always)]
+fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        standardize_column_simd_full_avx(values, mean, inv);
+    }
+
+    #[cfg(all(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        any(target_arch = "aarch64", target_arch = "wasm32")
+    ))]
+    {
+        standardize_column_simd_full_impl::<4>(values, mean, inv);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f64) {
+    standardize_column_simd_full_impl::<4>(values, mean, inv);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -850,7 +939,45 @@ where
 
 #[inline(always)]
 fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
-    sum_and_count_finite_impl::<STANDARDIZATION_SIMD_LANES>(values)
+    match detected_simd_lane_selection() {
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
+        SimdLaneSelection::Lanes4 => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                log::debug!("Invoking AVX sum_and_count_finite implementation");
+                return sum_and_count_finite_avx(values);
+            }
+
+            #[cfg(all(
+                not(any(target_arch = "x86", target_arch = "x86_64")),
+                any(target_arch = "aarch64", target_arch = "wasm32")
+            ))]
+            {
+                log::debug!(
+                    "Using generic four-lane sum_and_count_finite implementation for non-x86 architecture"
+                );
+                return sum_and_count_finite_impl::<4>(values);
+            }
+
+            #[cfg(all(not(any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "wasm32"
+            ))))]
+            {
+                log::warn!(
+                    "Falling back to two-lane sum_and_count_finite implementation despite four-lane selection"
+                );
+                return sum_and_count_finite_impl::<2>(values);
+            }
+        }
+        _ => return sum_and_count_finite_impl::<2>(values),
+    }
 }
 
 #[inline(always)]
@@ -879,6 +1006,12 @@ where
     }
 
     (sum, count)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn sum_and_count_finite_avx(values: &[f64]) -> (f64, usize) {
+    sum_and_count_finite_impl::<4>(values)
 }
 
 #[derive(Clone, Debug)]
