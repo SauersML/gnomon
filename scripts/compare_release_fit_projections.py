@@ -22,6 +22,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 
 
+SAMPLE_POPULATION_MAPPING_URL = (
+    "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/data/sample_population_mapping.tsv"
+)
+
+
 @dataclass
 class DatasetSummary:
     name: str
@@ -94,14 +99,124 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _read_projection(path: Path, label: str) -> pd.DataFrame:
+def _normalize_text(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return text
+
+
+def _load_sample_population_mapping() -> pd.DataFrame:
+    df = pd.read_csv(SAMPLE_POPULATION_MAPPING_URL, sep="\t", dtype=str)
+    df = df.applymap(lambda value: value.strip() if isinstance(value, str) else value)
+
+    lower_to_actual = {column.lower(): column for column in df.columns}
+    subpop_col = lower_to_actual.get("meta_subpopulation")
+    superpop_col = lower_to_actual.get("meta_superpopulation")
+    if subpop_col is None or superpop_col is None:
+        raise ValueError(
+            "Sample population mapping TSV is missing 'meta_subpopulation' or 'meta_superpopulation' columns."
+        )
+
+    sample_id_columns = [
+        column for column in df.columns if column.lower().startswith("sample_id")
+    ]
+    if not sample_id_columns:
+        raise ValueError(
+            "Sample population mapping TSV does not contain any columns beginning with 'sample_id'."
+        )
+
+    records: list[dict[str, str | None]] = []
+    for _, row in df.iterrows():
+        subpop = _normalize_text(row[subpop_col])
+        superpop = _normalize_text(row[superpop_col])
+        for sample_col in sample_id_columns:
+            sample_id = _normalize_text(row[sample_col])
+            if sample_id is None:
+                continue
+            records.append(
+                {
+                    "SampleID": sample_id,
+                    "Subpopulation": subpop,
+                    "Superpopulation": superpop,
+                }
+            )
+
+    if not records:
+        raise ValueError(
+            "Sample population mapping TSV did not yield any sample identifiers after processing."
+        )
+
+    expanded = pd.DataFrame.from_records(records)
+    expanded = expanded.drop_duplicates(subset="SampleID", keep="first")
+    expanded["SampleID"] = expanded["SampleID"].astype("string")
+    expanded["Subpopulation"] = expanded["Subpopulation"].astype("string")
+    expanded["Superpopulation"] = expanded["Superpopulation"].astype("string")
+    return expanded
+
+
+def _annotate_with_population_labels(
+    df: pd.DataFrame, label: str, mapping: pd.DataFrame
+) -> pd.DataFrame:
+    merged = df.merge(mapping, how="left", left_on="SampleName", right_on="SampleID")
+    merged = merged.drop(columns=["SampleID"])
+
+    unmatched = merged["Subpopulation"].isna() & merged["Superpopulation"].isna()
+    if unmatched.any():
+        sample_names = merged.loc[unmatched, "SampleName"].dropna().astype(str).unique()
+        preview = ", ".join(sample_names[:10])
+        print(
+            "Warning: {} samples in '{}' lacked population mapping entries.{}".format(
+                len(sample_names),
+                label,
+                f" Examples: {preview}" if preview else "",
+            ),
+            flush=True,
+        )
+
+    missing_subpop = merged["Subpopulation"].isna() & ~unmatched
+    if missing_subpop.any():
+        sample_names = merged.loc[missing_subpop, "SampleName"].dropna().astype(str).unique()
+        preview = ", ".join(sample_names[:10])
+        print(
+            "Warning: {} samples in '{}' were missing meta_subpopulation assignments.{}".format(
+                len(sample_names),
+                label,
+                f" Examples: {preview}" if preview else "",
+            ),
+            flush=True,
+        )
+
+    missing_superpop = merged["Superpopulation"].isna() & ~unmatched
+    if missing_superpop.any():
+        sample_names = (
+            merged.loc[missing_superpop, "SampleName"].dropna().astype(str).unique()
+        )
+        preview = ", ".join(sample_names[:10])
+        print(
+            "Warning: {} samples in '{}' were missing meta_superpopulation assignments.{}".format(
+                len(sample_names),
+                label,
+                f" Examples: {preview}" if preview else "",
+            ),
+            flush=True,
+        )
+
+    return merged
+
+
+def _read_projection(path: Path, label: str, mapping: pd.DataFrame) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Projection TSV for {label} not found: {path}")
 
     print(f"Loading projection data for {label} from {path}…", flush=True)
     df = pd.read_csv(path, sep="\t")
 
-    expected_cols = {"SampleName", "Subpopulation"}
+    expected_cols = {"SampleName"}
     missing = expected_cols.difference(df.columns)
     if missing:
         raise ValueError(
@@ -112,7 +227,8 @@ def _read_projection(path: Path, label: str) -> pd.DataFrame:
     if not feature_columns:
         raise ValueError(f"No principal component columns (PC*) found in {label} TSV")
 
-    df = df[["SampleName", "Subpopulation", *feature_columns]].copy()
+    df = df[["SampleName", *feature_columns]].copy()
+    df = _annotate_with_population_labels(df, label, mapping)
     return df
 
 
@@ -395,9 +511,13 @@ def _print_summary(results: list[dict[str, object]]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    mapping = _load_sample_population_mapping()
+
     datasets: dict[str, pd.DataFrame] = {}
     for label, path in args.projections:
-        datasets[label] = _filter_projection(_read_projection(path, label), label)
+        datasets[label] = _filter_projection(
+            _read_projection(path, label, mapping), label
+        )
 
     aligned = _align_datasets(datasets)
     feature_columns = _determine_feature_columns(aligned)

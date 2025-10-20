@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import urllib.request
-from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -21,8 +20,10 @@ from tqdm import tqdm
 OUTPUT_DIR = Path("artifacts")
 HWE_PATH = Path("phased_haplotypes_v2.hwe.json")
 SAMPLES_PATH = Path("phased_haplotypes_v2.samples.tsv")
-IGSR_URL = "https://github.com/SauersML/genomic_pca/raw/refs/heads/main/data/igsr_samples.tsv"
-IGSR_FILENAME = "igsr_samples.tsv"
+SAMPLE_MAPPING_URL = (
+    "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/data/sample_population_mapping.tsv"
+)
+SAMPLE_MAPPING_FILENAME = "sample_population_mapping.tsv"
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -53,60 +54,82 @@ def _normalize_value(value: object) -> str | None:
     return text
 
 
-def _resolve_consensus(values: pd.Series) -> str | None:
-    cleaned = [_normalize_value(value) for value in values]
-    cleaned = [value for value in cleaned if value is not None]
+def _download_sample_population_mapping(target_path: Path) -> None:
+    if target_path.exists():
+        return
 
-    if not cleaned:
-        return None
+    req = urllib.request.Request(
+        SAMPLE_MAPPING_URL, headers={"User-Agent": "python-urllib"}
+    )
+    with urllib.request.urlopen(req) as response, target_path.open("wb") as out:
+        total = response.getheader("Content-Length")
+        total_bytes = int(total) if total is not None else None
+        with tqdm(
+            total=total_bytes,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=f"Downloading {target_path.name}",
+            leave=False,
+            dynamic_ncols=True,
+        ) as progress:
+            while True:
+                chunk = response.read(1024 * 64)
+                if not chunk:
+                    break
+                out.write(chunk)
+                progress.update(len(chunk))
 
-    counts = Counter(cleaned)
-    most_common = counts.most_common()
-    if len(most_common) == 1 or most_common[0][1] > most_common[1][1]:
-        return most_common[0][0]
 
-    return None
-
-
-def _consolidate_sample_annotations(igsr_df: pd.DataFrame) -> pd.DataFrame:
-    records: list[dict[str, str | None]] = []
-
-    for sample_id, group in igsr_df.groupby("SampleID", sort=False):
-        population = _resolve_consensus(group["Population"])
-
-        normalized_population = group["Population"].map(_normalize_value)
-        if population is not None:
-            matching_rows = group.loc[normalized_population == population]
-            if matching_rows.empty:
-                matching_rows = group
-        else:
-            matching_rows = group
-
-        superpopulation = _resolve_consensus(matching_rows["Superpopulation"])
-        population_name = _resolve_consensus(matching_rows["PopulationNameLong"])
-        if population_name is None:
-            population_name = population
-
-        records.append(
-            {
-                "SampleID": sample_id,
-                "Population": population,
-                "PopulationNameLong": population_name,
-                "Superpopulation": superpopulation,
-            }
-        )
-
-    consolidated = pd.DataFrame.from_records(
-        records,
-        columns=["SampleID", "Population", "PopulationNameLong", "Superpopulation"],
+def _load_sample_population_mapping(path: Path) -> pd.DataFrame:
+    mapping_df = pd.read_csv(path, sep="\t", dtype=str)
+    mapping_df = mapping_df.applymap(
+        lambda value: value.strip() if isinstance(value, str) else value
     )
 
-    if not consolidated.empty:
-        consolidated["SampleID"] = consolidated["SampleID"].astype("string")
-        for column in ("Population", "PopulationNameLong", "Superpopulation"):
-            consolidated[column] = consolidated[column].astype("string")
+    lower_to_actual = {column.lower(): column for column in mapping_df.columns}
+    subpop_col = lower_to_actual.get("meta_subpopulation")
+    superpop_col = lower_to_actual.get("meta_superpopulation")
+    if subpop_col is None or superpop_col is None:
+        raise ValueError(
+            "Sample population mapping is missing required columns 'meta_subpopulation' or 'meta_superpopulation'."
+        )
 
-    return consolidated
+    sample_id_columns = [
+        column for column in mapping_df.columns if column.lower().startswith("sample_id")
+    ]
+    if not sample_id_columns:
+        raise ValueError(
+            "Sample population mapping did not contain any columns beginning with 'sample_id'."
+        )
+
+    records: list[dict[str, str | None]] = []
+    for _, row in mapping_df.iterrows():
+        subpop = _normalize_value(row[subpop_col])
+        superpop = _normalize_value(row[superpop_col])
+        for sample_col in sample_id_columns:
+            sample_id = _normalize_value(row[sample_col])
+            if sample_id is None:
+                continue
+            records.append(
+                {
+                    "SampleID": sample_id,
+                    "Population": subpop,
+                    "Superpopulation": superpop,
+                }
+            )
+
+    if not records:
+        raise ValueError(
+            "Sample population mapping did not yield any sample identifiers after processing."
+        )
+
+    expanded = pd.DataFrame.from_records(records)
+    expanded = expanded.drop_duplicates(subset="SampleID", keep="first")
+    expanded["SampleID"] = expanded["SampleID"].astype("string")
+    expanded["Population"] = expanded["Population"].astype("string")
+    expanded["Superpopulation"] = expanded["Superpopulation"].astype("string")
+    return expanded
 
 
 def _downsample_dataframe(df: pd.DataFrame, factor: int) -> pd.DataFrame:
@@ -202,47 +225,6 @@ def _load_samples(samples_path: Path) -> pd.DataFrame:
     filenames = samples_df[filename_col].astype(str)
 
     return pd.DataFrame({"Filename": filenames, "SampleID": sample_ids})
-
-
-def _download_igsr(target_path: Path) -> None:
-    if target_path.exists():
-        return
-
-    req = urllib.request.Request(IGSR_URL, headers={"User-Agent": "python-urllib"})
-    with urllib.request.urlopen(req) as response, target_path.open("wb") as out:
-        total = response.getheader("Content-Length")
-        total_bytes = int(total) if total is not None else None
-        with tqdm(
-            total=total_bytes,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            desc=f"Downloading {target_path.name}",
-            leave=False,
-            dynamic_ncols=True,
-        ) as progress:
-            while True:
-                chunk = response.read(1024 * 64)
-                if not chunk:
-                    break
-                out.write(chunk)
-                progress.update(len(chunk))
-
-
-def _load_igsr(target_path: Path) -> pd.DataFrame:
-    igsr_df = pd.read_csv(target_path, sep="\t", dtype=str)
-    igsr_df["SampleID"] = igsr_df["Sample name"].astype(str).str.strip()
-    igsr_df["Population"] = igsr_df["Population code"].astype(str).str.strip()
-    igsr_df["Superpopulation"] = igsr_df["Superpopulation code"].astype(str).str.strip()
-
-    if "Population name" in igsr_df.columns:
-        igsr_df["PopulationNameLong"] = igsr_df["Population name"].astype(str).str.strip()
-    else:
-        igsr_df["PopulationNameLong"] = igsr_df["Population"]
-
-    subset = igsr_df[["SampleID", "Population", "PopulationNameLong", "Superpopulation"]]
-    subset = subset[subset["SampleID"].map(lambda value: isinstance(value, str) and value != "")]
-    return _consolidate_sample_annotations(subset)
 
 
 def _build_color_map(annotated: pd.DataFrame) -> dict[tuple[str, str], np.ndarray]:
@@ -353,14 +335,47 @@ def main(argv: Sequence[str] | None = None) -> None:
     pcs_df.insert(1, "SampleID", pcs_df["Filename"].map(filename_to_sample))
     pcs_df["SampleID"] = pcs_df["SampleID"].fillna(pcs_df["Filename"])
 
-    igsr_path = OUTPUT_DIR / IGSR_FILENAME
-    _download_igsr(igsr_path)
-    igsr_df = _load_igsr(igsr_path)
+    mapping_path = OUTPUT_DIR / SAMPLE_MAPPING_FILENAME
+    _download_sample_population_mapping(mapping_path)
+    mapping_df = _load_sample_population_mapping(mapping_path)
 
-    ann_pca = pcs_df.merge(igsr_df, on="SampleID", how="left")
+    ann_pca = pcs_df.merge(mapping_df, on="SampleID", how="left")
+
+    unmatched = ann_pca["Population"].isna() & ann_pca["Superpopulation"].isna()
+    if unmatched.any():
+        samples = ann_pca.loc[unmatched, "SampleID"].dropna().astype(str).unique()
+        preview = ", ".join(samples[:10])
+        print(
+            "Warning: {} samples were not found in the population mapping.{}".format(
+                len(samples), f" Examples: {preview}" if preview else ""
+            ),
+            flush=True,
+        )
+
+    missing_subpop = ann_pca["Population"].isna() & ~unmatched
+    if missing_subpop.any():
+        samples = ann_pca.loc[missing_subpop, "SampleID"].dropna().astype(str).unique()
+        preview = ", ".join(samples[:10])
+        print(
+            "Warning: {} samples lacked meta_subpopulation assignments.{}".format(
+                len(samples), f" Examples: {preview}" if preview else ""
+            ),
+            flush=True,
+        )
+
+    missing_superpop = ann_pca["Superpopulation"].isna() & ~unmatched
+    if missing_superpop.any():
+        samples = ann_pca.loc[missing_superpop, "SampleID"].dropna().astype(str).unique()
+        preview = ", ".join(samples[:10])
+        print(
+            "Warning: {} samples lacked meta_superpopulation assignments.{}".format(
+                len(samples), f" Examples: {preview}" if preview else ""
+            ),
+            flush=True,
+        )
+
     ann_pca["Population"] = ann_pca["Population"].fillna("UNK")
     ann_pca["Superpopulation"] = ann_pca["Superpopulation"].fillna("OTH")
-    ann_pca["PopulationNameLong"] = ann_pca["PopulationNameLong"].fillna(ann_pca["Population"])
 
     plot_pca = _downsample_dataframe(ann_pca, downsample_factor)
     if downsample_factor > 1:
