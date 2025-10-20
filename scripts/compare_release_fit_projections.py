@@ -370,7 +370,7 @@ def _build_models() -> list[tuple[str, Callable[[], BaseEstimator]]]:
         (
             "LogisticRegression",
             lambda: LogisticRegression(
-                penalty="none",
+                penalty=None,
                 solver="lbfgs",
                 max_iter=1000,
                 multi_class="auto",
