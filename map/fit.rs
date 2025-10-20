@@ -949,6 +949,16 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
             {
                 return sum_and_count_finite_impl::<4>(values);
             }
+
+            #[cfg(all(not(any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "wasm32"
+            ))))]
+            {
+                return sum_and_count_finite_impl::<2>(values);
+            }
         }
         _ => return sum_and_count_finite_impl::<2>(values),
     }
