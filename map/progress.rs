@@ -2,6 +2,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -513,24 +514,28 @@ impl ProjectionStageBar {
                 bar,
                 processed,
             } => {
-                *current_total = total_u64;
-                bar.set_length(total_u64);
+                if *current_total != total_u64 {
+                    *current_total = total_u64;
+                    bar.set_length(total_u64);
+                }
                 let capped = (*processed).min(total_u64);
                 *processed = capped;
+                bar.set_style(determinate_style());
+                bar.set_message(ConsoleProjectionProgress::stage_message(stage));
+                bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
                 bar.set_position(capped);
             }
             ProjectionStageBar::Spinner { bar, processed } => {
                 let processed_value = (*processed).min(total_u64);
-                bar.finish_and_clear();
-                let new_bar = ProgressBar::new(total_u64);
-                new_bar.set_draw_target(progress_draw_target());
-                new_bar.set_style(determinate_style());
-                new_bar.set_message(ConsoleProjectionProgress::stage_message(stage));
-                new_bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-                new_bar.set_position(processed_value);
+                let mut bar = mem::replace(bar, ProgressBar::hidden());
+                bar.set_style(determinate_style());
+                bar.set_length(total_u64);
+                bar.set_message(ConsoleProjectionProgress::stage_message(stage));
+                bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                bar.set_position(processed_value);
                 *self = ProjectionStageBar::Determinate {
                     total: total_u64,
-                    bar: new_bar,
+                    bar,
                     processed: processed_value,
                 };
             }
