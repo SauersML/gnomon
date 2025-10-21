@@ -138,15 +138,30 @@ jobs:
         run: python scripts/generate_release_fit_plots.py --downsample-factor "${{ env.RELEASE_FIT_DOWNSAMPLE }}"
 
       - name: Prepare artifacts (--ld ${{ matrix.window.description }})
+        if: ${{ always() }}
         env:
           LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
         run: |
           set -euo pipefail
-          mv artifacts/pc1_pc2.png artifacts/pc1_pc2_${LD_SUFFIX}.png
-          mv artifacts/pc3_pc4.png artifacts/pc3_pc4_${LD_SUFFIX}.png
-          mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
+          mkdir -p artifacts
+          if [ -f artifacts/pc1_pc2.png ]; then
+            mv artifacts/pc1_pc2.png artifacts/pc1_pc2_${LD_SUFFIX}.png
+          else
+            echo "pc1_pc2 plot missing; skipping rename." >&2
+          fi
+          if [ -f artifacts/pc3_pc4.png ]; then
+            mv artifacts/pc3_pc4.png artifacts/pc3_pc4_${LD_SUFFIX}.png
+          else
+            echo "pc3_pc4 plot missing; skipping rename." >&2
+          fi
+          if [ -f artifacts/pca_projection_scores.tsv ]; then
+            mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
+          else
+            echo "Projection scores TSV missing; skipping rename." >&2
+          fi
 
       - name: Upload PCA plot artifacts (--ld ${{ matrix.window.description }})
+        if: ${{ always() }}
         env:
           LD_SUFFIX: ${{ matrix.window.artifact_suffix }}
         uses: actions/upload-artifact@v4
@@ -157,6 +172,7 @@ jobs:
             artifacts/pc3_pc4_${LD_SUFFIX}.png
             artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
             gnomon-fit-${LD_SUFFIX}.log
+          if-no-files-found: warn
 
   compare-projections:
     name: Compare LD window projection performance

@@ -114,8 +114,10 @@ jobs:
             2>&1 | tee compare-ld-window.log
 
       - name: Upload comparison outputs
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: compare-ld-window-results
           path: |
             compare-ld-window.log
+          if-no-files-found: warn
