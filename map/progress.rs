@@ -2,6 +2,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::IsTerminal;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -136,6 +137,9 @@ pub trait ProjectionProgressObserver: Send + Sync {
     }
     fn on_stage_advance(&self, stage: ProjectionProgressStage, processed_variants: usize) {
         let _ = (stage, processed_variants);
+    }
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let _ = (stage, total_variants);
     }
     fn on_stage_finish(&self, stage: ProjectionProgressStage) {
         let _ = stage;
@@ -485,6 +489,40 @@ impl ProjectionStageBar {
         }
     }
 
+    fn set_total(&mut self, stage: ProjectionProgressStage, total_variants: usize) {
+        if total_variants == 0 {
+            return;
+        }
+
+        let total = total_variants as u64;
+        match self {
+            ProjectionStageBar::Determinate {
+                total: existing,
+                bar,
+            } => {
+                if *existing != total {
+                    *existing = total;
+                    bar.set_length(total);
+                }
+                let current = bar.position().min(total);
+                bar.set_style(determinate_style());
+                bar.set_message(ConsoleProjectionProgress::stage_message(stage));
+                bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                bar.set_position(current);
+            }
+            ProjectionStageBar::Spinner { bar } => {
+                let bar = mem::replace(bar, ProgressBar::hidden());
+                let current = bar.position().min(total);
+                bar.set_style(determinate_style());
+                bar.set_length(total);
+                bar.set_message(ConsoleProjectionProgress::stage_message(stage));
+                bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                bar.set_position(current);
+                *self = ProjectionStageBar::Determinate { total, bar };
+            }
+        }
+    }
+
     fn finish(self, message: &'static str) {
         match self {
             ProjectionStageBar::Determinate { bar, .. }
@@ -564,6 +602,26 @@ impl ProjectionProgressObserver for ConsoleProjectionProgress {
         } else {
             log::warn!(
                 "received projection progress for stage '{}' with no active progress bar",
+                stage
+            );
+        }
+    }
+
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((current, bar)) = inner.as_mut() {
+            if *current == stage {
+                bar.set_total(stage, total_variants);
+            } else {
+                log::warn!(
+                    "received total update for projection stage '{}' while '{}' is active",
+                    stage,
+                    current
+                );
+            }
+        } else {
+            log::warn!(
+                "received total update for projection stage '{}' with no active progress bar",
                 stage
             );
         }
