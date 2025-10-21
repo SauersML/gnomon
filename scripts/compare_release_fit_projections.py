@@ -11,7 +11,6 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
-from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -122,7 +121,11 @@ def _load_sample_population_mapping() -> pd.DataFrame:
         "  Mapping columns: {}".format(", ".join(df.columns.tolist()[:20])),
         flush=True,
     )
-    df = df.applymap(lambda value: value.strip() if isinstance(value, str) else value)
+    string_like_columns = df.select_dtypes(include=["object", "string"])
+    if not string_like_columns.empty:
+        df[string_like_columns.columns] = string_like_columns.apply(
+            lambda col: col.str.strip()
+        )
 
     lower_to_actual = {column.lower(): column for column in df.columns}
     subpop_col = lower_to_actual.get("meta_subpopulation")
@@ -475,6 +478,48 @@ def _filter_classes_across_datasets(
     return {label: df[df["Subpopulation"].isin(allowed)].copy() for label, df in datasets.items()}
 
 
+def _compute_classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    classes: np.ndarray,
+) -> tuple[float, float, float]:
+    """Compute accuracy, macro-F1, and balanced accuracy without scikit-learn warnings."""
+
+    if y_true.size == 0:
+        return 0.0, 0.0, 0.0
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    accuracy = float(np.mean(y_true == y_pred))
+
+    truth = pd.Series(y_true, name="true")
+    preds = pd.Series(y_pred, name="pred")
+    all_classes = np.unique(np.concatenate((classes, np.unique(y_pred))))
+    confusion = pd.crosstab(truth, preds, dropna=False)
+    confusion = confusion.reindex(index=all_classes, columns=all_classes, fill_value=0)
+    confusion_values = confusion.to_numpy(dtype=float)
+
+    tp = np.diag(confusion_values)
+    support = confusion_values.sum(axis=1)
+    predicted = confusion_values.sum(axis=0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        recall = np.divide(tp, support, out=np.zeros_like(tp), where=support != 0)
+        precision = np.divide(tp, predicted, out=np.zeros_like(tp), where=predicted != 0)
+        f1 = np.divide(
+            2.0 * precision * recall,
+            precision + recall,
+            out=np.zeros_like(precision),
+            where=(precision + recall) != 0,
+        )
+
+    macro_f1 = float(f1.mean()) if f1.size else 0.0
+    balanced_accuracy = float(recall.mean()) if recall.size else 0.0
+
+    return accuracy, macro_f1, balanced_accuracy
+
+
 def _summarize_dataset(df: pd.DataFrame, name: str) -> DatasetSummary:
     feature_columns = [col for col in df.columns if col.startswith("PC")]
     counts = Counter(df["Subpopulation"].tolist())
@@ -488,13 +533,13 @@ def _summarize_dataset(df: pd.DataFrame, name: str) -> DatasetSummary:
 
 def _build_models() -> list[tuple[str, Callable[[], BaseEstimator]]]:
     return [
-        ("LogisticRegression",
-         lambda: make_pipeline(
-             StandardScaler(),
-             LogisticRegression(
-                 penalty=None, solver="lbfgs", max_iter=2000, multi_class="multinomial"
-             ),
-         )),
+        (
+            "LogisticRegression",
+            lambda: make_pipeline(
+                StandardScaler(),
+                LogisticRegression(penalty=None, solver="lbfgs", max_iter=2000),
+            ),
+        ),
         ("KNeighborsClassifier",
          lambda: make_pipeline(
              StandardScaler(),
@@ -535,6 +580,7 @@ def _evaluate_models(
 ) -> list[dict[str, object]]:
     labels = list(datasets.keys())
     y = next(iter(datasets.values()))["Subpopulation"].to_numpy()
+    classes = np.unique(y)
 
     matrices = {
         label: df[feature_columns].to_numpy(dtype=float)
@@ -586,9 +632,9 @@ def _evaluate_models(
                 model.fit(X[train_idx], y[train_idx])
                 preds = model.predict(X[test_idx])
 
-                acc = accuracy_score(y[test_idx], preds)
-                mac_f1 = f1_score(y[test_idx], preds, average="macro")
-                bal_acc = balanced_accuracy_score(y[test_idx], preds)
+                acc, mac_f1, bal_acc = _compute_classification_metrics(
+                    y[test_idx], preds, classes
+                )
 
                 score_tracker[label].append(acc)
                 print(
