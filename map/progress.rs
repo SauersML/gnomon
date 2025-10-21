@@ -492,8 +492,8 @@ impl ProjectionStageBar {
                 bar,
                 processed,
             } => {
-                *processed = processed_variants.min(*total as usize) as u64;
                 let capped = processed_variants.min(*total as usize) as u64;
+                *processed = capped;
                 bar.set_position(capped);
             }
             ProjectionStageBar::Spinner { bar, processed } => {
