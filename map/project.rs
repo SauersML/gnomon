@@ -161,7 +161,13 @@ impl<'model> HwePcaProjector<'model> {
         P: ProjectionProgressObserver,
     {
         let n_samples = source.n_samples();
-        let n_variants = source.n_variants();
+        let variant_hint = source.n_variants();
+        let model_variants = self.model.n_variants();
+        let expected_variants = if variant_hint == 0 {
+            model_variants
+        } else {
+            variant_hint
+        };
         let components = self.model.components();
 
         if opts.return_alignment && !opts.missing_axis_renormalization {
@@ -175,7 +181,7 @@ impl<'model> HwePcaProjector<'model> {
                 "Projection requires at least one sample",
             ));
         }
-        if n_variants != self.model.n_variants() {
+        if variant_hint != 0 && variant_hint != model_variants {
             return Err(HwePcaError::InvalidInput(
                 "Projection variant dimension must match fitted model",
             ));
@@ -205,7 +211,7 @@ impl<'model> HwePcaProjector<'model> {
             .map_err(|e| HwePcaError::Source(Box::new(e)))?;
 
         let block_capacity =
-            projection_block_capacity(self.model.n_samples(), n_samples, n_variants);
+            projection_block_capacity(self.model.n_samples(), n_samples, expected_variants);
         let elements = n_samples
             .checked_mul(block_capacity)
             .ok_or_else(|| HwePcaError::InvalidInput("Projection workspace size overflow"))?;
@@ -236,7 +242,10 @@ impl<'model> HwePcaProjector<'model> {
             None
         };
 
-        progress.on_stage_start(ProjectionProgressStage::Projection, n_variants);
+        progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
+        if expected_variants != variant_hint && expected_variants > 0 {
+            progress.on_stage_total(ProjectionProgressStage::Projection, expected_variants);
+        }
 
         loop {
             let filled = source
@@ -245,7 +254,7 @@ impl<'model> HwePcaProjector<'model> {
             if filled == 0 {
                 break;
             }
-            if processed + filled > n_variants {
+            if processed + filled > expected_variants {
                 return Err(HwePcaError::InvalidInput(
                     "VariantBlockSource returned more variants than reported",
                 ));
@@ -354,7 +363,7 @@ impl<'model> HwePcaProjector<'model> {
             progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
         }
 
-        if processed != n_variants {
+        if processed != expected_variants && (variant_hint != 0 || processed != model_variants) {
             return Err(HwePcaError::InvalidInput(
                 "VariantBlockSource terminated early during projection",
             ));
