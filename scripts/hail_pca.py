@@ -17,6 +17,7 @@ DEFAULT_DATA_PATH = (
 )
 GCS_CONNECTOR_URL = "https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar"
 DEFAULT_NUM_PCS = 10
+DEFAULT_OUTPUT_PREFIX = "hail_pca"
 
 
 def _normalize_vcf_path(path: str) -> str:
@@ -142,8 +143,11 @@ def parse_args(args: List[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-prefix",
-        required=True,
-        help="Prefix used for the exported eigenvalues, scores, and loadings.",
+        default=DEFAULT_OUTPUT_PREFIX,
+        help=(
+            "Prefix used for the exported eigenvalues, scores, and loadings. "
+            f"Defaults to '{DEFAULT_OUTPUT_PREFIX}'."
+        ),
     )
     parser.add_argument(
         "--num-pcs",
