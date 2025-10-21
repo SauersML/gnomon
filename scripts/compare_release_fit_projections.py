@@ -389,7 +389,7 @@ def _build_models() -> list[tuple[str, Callable[[], BaseEstimator]]]:
          lambda: make_pipeline(
              StandardScaler(),
              LogisticRegression(
-                 penalty="none", solver="lbfgs", max_iter=2000, multi_class="multinomial"
+                 penalty=None, solver="lbfgs", max_iter=2000, multi_class="multinomial"
              ),
          )),
         ("KNeighborsClassifier",
