@@ -7,9 +7,6 @@ on:
         description: 'Downsampling factor applied during PCA plot generation (>=1)'
         required: false
         default: '1'
-  push:
-    paths:
-      - 'map/**/*.rs'
 
 env:
   CARGO_TERM_COLOR: always
