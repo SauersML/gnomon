@@ -524,19 +524,39 @@ impl HweScaler {
         debug_assert_eq!(filled, presence_out.ncols());
         debug_assert_eq!(block.nrows(), presence_out.nrows());
 
-        let block_ref = block.as_ref();
+        let _ = par;
 
-        for (presence_col, column) in presence_out
-            .subcols_mut(0, filled)
+        let scales = &self.scales[start..end];
+        debug_assert_eq!(filled, scales.len());
+
+        let block = block.subcols_mut(0, filled);
+        let presence_out = presence_out.subcols_mut(0, filled);
+
+        let apply_standardization =
+            |column: ColMut<'_, f64>, presence_col: ColMut<'_, f64>, mean: f64, inv: f64| {
+                let contiguous_values = column
+                    .try_as_col_major_mut()
+                    .expect("projection block column must be contiguous");
+                let contiguous_mask = presence_col
+                    .try_as_col_major_mut()
+                    .expect("projection mask column must be contiguous");
+                let values = contiguous_values.as_slice_mut();
+                let mask = contiguous_mask.as_slice_mut();
+                standardize_column_with_mask(values, mask, mean, inv);
+            };
+
+        for (idx, (presence_col, column)) in presence_out
             .col_iter_mut()
-            .zip(block_ref.subcols(0, filled).col_iter())
+            .zip(block.col_iter_mut())
+            .enumerate()
         {
-            zip!(presence_col, column).for_each(|unzip!(presence, raw)| {
-                *presence = if raw.is_finite() { 1.0 } else { 0.0 };
-            });
+            let freq = freqs[idx];
+            let scale = scales[idx];
+            let mean = 2.0 * freq;
+            let denom = scale.max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            apply_standardization(column, presence_col, mean, inv);
         }
-
-        self.standardize_block(block, variant_range, par);
     }
 }
 
@@ -879,6 +899,111 @@ where
         } else {
             0.0
         };
+    }
+}
+
+#[inline(always)]
+fn standardize_column_with_mask(values: &mut [f64], mask: &mut [f64], mean: f64, inv: f64) {
+    debug_assert_eq!(values.len(), mask.len());
+
+    if inv == 0.0 {
+        for (value, mask_value) in values.iter_mut().zip(mask.iter_mut()) {
+            let raw = *value;
+            *mask_value = if raw.is_finite() { 1.0 } else { 0.0 };
+            *value = 0.0;
+        }
+        return;
+    }
+
+    standardize_column_with_mask_simd(values, mask, mean, inv);
+}
+
+#[inline(always)]
+fn standardize_column_with_mask_simd(values: &mut [f64], mask: &mut [f64], mean: f64, inv: f64) {
+    match detected_simd_lane_selection() {
+        #[cfg(any(
+            target_feature = "avx",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        ))]
+        SimdLaneSelection::Lanes4 => {
+            standardize_column_with_mask_simd_lanes4(values, mask, mean, inv);
+        }
+        _ => standardize_column_with_mask_simd_impl::<2>(values, mask, mean, inv),
+    }
+}
+
+#[inline(always)]
+fn standardize_column_with_mask_simd_lanes4(
+    values: &mut [f64],
+    mask: &mut [f64],
+    mean: f64,
+    inv: f64,
+) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        standardize_column_with_mask_simd_avx(values, mask, mean, inv);
+    }
+
+    #[cfg(all(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        any(target_arch = "aarch64", target_arch = "wasm32")
+    ))]
+    {
+        standardize_column_with_mask_simd_impl::<4>(values, mask, mean, inv);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn standardize_column_with_mask_simd_avx(
+    values: &mut [f64],
+    mask: &mut [f64],
+    mean: f64,
+    inv: f64,
+) {
+    standardize_column_with_mask_simd_impl::<4>(values, mask, mean, inv);
+}
+
+#[inline(always)]
+fn standardize_column_with_mask_simd_impl<const LANES: usize>(
+    values: &mut [f64],
+    mask: &mut [f64],
+    mean: f64,
+    inv: f64,
+) where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let mean_simd = Simd::<f64, LANES>::splat(mean);
+    let inv_simd = Simd::<f64, LANES>::splat(inv);
+    let zero = Simd::<f64, LANES>::splat(0.0);
+    let one = Simd::<f64, LANES>::splat(1.0);
+
+    let (value_chunks, value_remainder) = values.as_chunks_mut::<LANES>();
+    let (mask_chunks, mask_remainder) = mask.as_chunks_mut::<LANES>();
+
+    debug_assert_eq!(value_chunks.len(), mask_chunks.len());
+    debug_assert_eq!(value_remainder.len(), mask_remainder.len());
+
+    for (value_chunk, mask_chunk) in value_chunks.iter_mut().zip(mask_chunks.iter_mut()) {
+        let lane = Simd::<f64, LANES>::from_array(*value_chunk);
+        let finite_mask = lane.is_finite();
+        let standardized = (lane - mean_simd) * inv_simd;
+        let result = finite_mask.select(standardized, zero);
+        *value_chunk = result.to_array();
+        let mask_values = finite_mask.select(one, zero);
+        *mask_chunk = mask_values.to_array();
+    }
+
+    for (value, mask_value) in value_remainder.iter_mut().zip(mask_remainder.iter_mut()) {
+        let raw = *value;
+        if raw.is_finite() {
+            *mask_value = 1.0;
+            *value = (raw - mean) * inv;
+        } else {
+            *mask_value = 0.0;
+            *value = 0.0;
+        }
     }
 }
 
