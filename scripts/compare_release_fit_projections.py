@@ -61,8 +61,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--folds",
         type=int,
-        default=50,
-        help="Requested number of stratified CV folds (defaults to 50).",
+        default=20,
+        help="Requested number of stratified CV folds (defaults to 20).",
     )
     parser.add_argument(
         "--random-state",
@@ -493,6 +493,15 @@ def _evaluate_models(
             scores_b = dataset_summaries[b_label]["scores"]
             diff = scores_b - scores_a
             mean_diff = float(diff.mean())
+            wins = int(np.sum(diff > 0))
+            losses = int(np.sum(diff < 0))
+            ties = int(diff.size - wins - losses)
+
+            effect_size = mean_diff
+            if diff.size > 1:
+                diff_std = float(diff.std(ddof=1))
+                if diff_std > 0.0:
+                    effect_size = mean_diff / diff_std
 
             # Dependence-aware test
             t_corr, p_corr = corrected_resampled_t(diff, k=folds, r=1)
@@ -502,13 +511,29 @@ def _evaluate_models(
                     "a": a_label,
                     "b": b_label,
                     "mean_diff": mean_diff,
+                    "effect_size": float(effect_size),
+                    "wins": wins,
+                    "losses": losses,
+                    "ties": ties,
                     "t_stat_corrected": float(t_corr),
                     "p_value_corrected": float(p_corr),
                 }
             )
             print(
-                "  Corrected paired test ({} - {}): diff = {:.4f}, t = {:.4f}, p = {:.6f}".format(
-                    b_label, a_label, mean_diff, t_corr, p_corr
+                (
+                    "  Corrected paired test ({} - {}): diff = {:.4f}"
+                    " [wins={}, losses={}, ties={}], effect = {:.4f},"
+                    " t = {:.4f}, p = {:.6f}"
+                ).format(
+                    b_label,
+                    a_label,
+                    mean_diff,
+                    wins,
+                    losses,
+                    ties,
+                    effect_size,
+                    t_corr,
+                    p_corr,
                 ),
                 flush=True,
             )
@@ -541,8 +566,12 @@ def _print_summary(results: list[dict[str, object]]) -> None:
         print("  Pairwise comparisons (B - A), corrected t-test:", flush=True)
         for comp in entry["comparisons"]:
             print(
-                f"    {comp['b']} - {comp['a']:<16} diff = {comp['mean_diff']:.4f},"
-                f" t = {comp['t_stat_corrected']:.4f}, p = {comp['p_value_corrected']:.6f}",
+                (
+                    f"    {comp['b']} - {comp['a']:<16} diff = {comp['mean_diff']:.4f},"
+                    f" effect = {comp['effect_size']:.4f},"
+                    f" wins/losses/ties = {comp['wins']}/{comp['losses']}/{comp['ties']},"
+                    f" t = {comp['t_stat_corrected']:.4f}, p = {comp['p_value_corrected']:.6f}"
+                ),
                 flush=True,
             )
         print("", flush=True)
