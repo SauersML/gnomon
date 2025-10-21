@@ -26,7 +26,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 // ========================================================================================
@@ -79,9 +79,15 @@ pub fn run_gnomon_with_args(
 // Function removed to eliminate dead code warnings
 
 /// Core implementation that takes args as parameter
+static RAYON_INIT: Once = Once::new();
+
 fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize the Rayon global thread pool to use all available cores.
-    rayon::ThreadPoolBuilder::new().build_global().unwrap();
+    RAYON_INIT.call_once(|| {
+        rayon::ThreadPoolBuilder::new()
+            .build_global()
+            .expect("failed to initialize Rayon global thread pool");
+    });
 
     let overall_start_time = Instant::now();
     let fileset_prefixes = resolve_filesets(&args.input_path)?;
