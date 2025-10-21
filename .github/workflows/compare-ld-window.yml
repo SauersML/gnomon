@@ -54,6 +54,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          echo "GH CLI version:"
+          gh --version
+          echo "Searching for workflow '${WORKFLOW_NAME}' runs on branch '${{ github.event.inputs.branch || 'main' }}'"
           BRANCH="${{ github.event.inputs.branch || 'main' }}"
           RUN_JSON=$(gh run list \
             --workflow "${WORKFLOW_NAME}" \
@@ -61,6 +65,7 @@ jobs:
             --status success \
             --limit 1 \
             --json databaseId,headBranch,headSha,createdAt,url,displayTitle)
+          echo "Raw gh run list JSON: ${RUN_JSON}"
           RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
           HEAD_BRANCH=$(echo "${RUN_JSON}" | jq -r '.[0].headBranch')
           HEAD_SHA=$(echo "${RUN_JSON}" | jq -r '.[0].headSha')
@@ -70,6 +75,14 @@ jobs:
 
           test -n "${RUN_ID}" && test "${RUN_ID}" != "null" || { echo "No successful runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'." >&2; false; }
 
+          echo "Selected run metadata:"
+          echo "  run_id=${RUN_ID}"
+          echo "  title=${TITLE}"
+          echo "  head_branch=${HEAD_BRANCH}"
+          echo "  head_sha=${HEAD_SHA}"
+          echo "  created_at=${CREATED_AT}"
+          echo "  run_url=${RUN_URL}"
+
           echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "::notice title=Using artifacts from::${WORKFLOW_NAME} • ${TITLE} • run_id=${RUN_ID}"
           echo "::notice title=Run metadata::branch=${HEAD_BRANCH} sha=${HEAD_SHA} created=${CREATED_AT} url=${RUN_URL}"
@@ -78,35 +91,50 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir -p "${DOWNLOAD_DIR}"
-          gh run download "${{ steps.find.outputs.run_id }}" --pattern "${ARTIFACT_PATTERN}" -D "${DOWNLOAD_DIR}"
-          echo "Downloaded files:"
-          ls -R "${DOWNLOAD_DIR}" || true
+          echo "Downloading artifacts matching pattern '${ARTIFACT_PATTERN}' into '${DOWNLOAD_DIR}'"
+          gh run download "${{ steps.find.outputs.run_id }}" --pattern "${ARTIFACT_PATTERN}" -D "${DOWNLOAD_DIR}" --verbose
+          echo "Download directory structure:"
+          find "${DOWNLOAD_DIR}" -maxdepth 2 -type d -print
+          echo "All files fetched (detailed listing):"
+          ls -alR "${DOWNLOAD_DIR}" || true
 
       - name: Sanity check projection TSVs exist
         run: |
           set -euo pipefail
+          echo "Scanning '${DOWNLOAD_DIR}' for projection TSVs"
           mapfile -t tsvs < <(find "${DOWNLOAD_DIR}" -name 'pca_projection_scores_*.tsv' | sort)
           if [ "${#tsvs[@]}" -lt 2 ]; then
             echo "Expected at least two projection TSV files but found ${#tsvs[@]}."
             ls -R "${DOWNLOAD_DIR}" || true
             exit 1
           fi
+          echo "Located ${#tsvs[@]} projection TSVs:"
           printf '%s\n' "${tsvs[@]}"
 
       - name: Run comparison (Python only)
         run: |
           set -euo pipefail
+          echo "Python runtime information:"
+          python --version
+          python -m pip list
           FOLDS="${{ github.event.inputs.folds || '50' }}"
           SEED="${{ github.event.inputs.random_state || '42' }}"
           echo "::notice title=Compare settings::folds=${FOLDS} seed=${SEED}"
           args=""
+          echo "Building argument list from downloaded TSV files"
           while IFS= read -r file; do
             base=$(basename "$file")
             label=${base#pca_projection_scores_}
             label=${label%.tsv}
             args="$args --projection ${label}=$file"
+            echo "  Added projection label='${label}' path='${file}'"
           done < <(find "${DOWNLOAD_DIR}" -name 'pca_projection_scores_*.tsv' | sort)
+          echo "Final argument string: ${args}"
+          echo "Executing comparison script with verbose logging"
+          ls -al "${DOWNLOAD_DIR}" || true
+          du -sh "${DOWNLOAD_DIR}"/* 2>/dev/null || echo "No per-file size info available."
           python scripts/compare_release_fit_projections.py \
             --folds "${FOLDS}" \
             --random-state "${SEED}" \
