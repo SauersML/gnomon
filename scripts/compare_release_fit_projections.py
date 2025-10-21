@@ -17,7 +17,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 from scipy.stats import t as student_t
+from xgboost import XGBClassifier
 
 
 SAMPLE_POPULATION_MAPPING_URL = (
@@ -547,6 +549,27 @@ def _build_models() -> list[tuple[str, Callable[[], BaseEstimator]]]:
          )),
         ("RandomForestClassifier",
          lambda: RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)),
+        (
+            "XGBClassifier",
+            lambda: XGBClassifier(
+                random_state=42,
+                eval_metric="mlogloss",
+                use_label_encoder=False,
+            ),
+        ),
+        (
+            "SVC",
+            lambda: make_pipeline(
+                StandardScaler(),
+                SVC(
+                    kernel="rbf",
+                    C=1.0,
+                    gamma="scale",
+                    decision_function_shape="ovr",
+                    random_state=42,
+                ),
+            ),
+        ),
     ]
 
 
