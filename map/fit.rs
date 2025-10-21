@@ -524,8 +524,6 @@ impl HweScaler {
         debug_assert_eq!(filled, presence_out.ncols());
         debug_assert_eq!(block.nrows(), presence_out.nrows());
 
-        let _ = par;
-
         let scales = &self.scales[start..end];
         debug_assert_eq!(filled, scales.len());
 
@@ -545,17 +543,31 @@ impl HweScaler {
                 standardize_column_with_mask(values, mask, mean, inv);
             };
 
-        for (idx, (presence_col, column)) in presence_out
-            .col_iter_mut()
-            .zip(block.col_iter_mut())
-            .enumerate()
-        {
-            let freq = freqs[idx];
-            let scale = scales[idx];
-            let mean = 2.0 * freq;
-            let denom = scale.max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            apply_standardization(column, presence_col, mean, inv);
+        let use_parallel = filled >= 32 && par.degree() > 1;
+
+        if use_parallel {
+            zip!(presence_out, block)
+                .par_col_iter_mut()
+                .enumerate()
+                .for_each(|(idx, mut columns)| {
+                    let unzip!(mut presence_col, mut column) = columns;
+                    let freq = freqs[idx];
+                    let scale = scales[idx];
+                    let mean = 2.0 * freq;
+                    let denom = scale.max(HWE_SCALE_FLOOR);
+                    let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                    apply_standardization(column, presence_col, mean, inv);
+                });
+        } else {
+            for (idx, mut columns) in zip!(presence_out, block).col_iter_mut().enumerate() {
+                let unzip!(mut presence_col, mut column) = columns;
+                let freq = freqs[idx];
+                let scale = scales[idx];
+                let mean = 2.0 * freq;
+                let denom = scale.max(HWE_SCALE_FLOOR);
+                let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+                apply_standardization(column, presence_col, mean, inv);
+            }
         }
     }
 }
