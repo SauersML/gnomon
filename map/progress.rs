@@ -137,6 +137,9 @@ pub trait ProjectionProgressObserver: Send + Sync {
     fn on_stage_advance(&self, stage: ProjectionProgressStage, processed_variants: usize) {
         let _ = (stage, processed_variants);
     }
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let _ = (stage, total_variants);
+    }
     fn on_stage_finish(&self, stage: ProjectionProgressStage) {
         let _ = stage;
     }
@@ -447,8 +450,15 @@ impl Drop for ConsoleFitProgress {
 }
 
 enum ProjectionStageBar {
-    Determinate { total: u64, bar: ProgressBar },
-    Spinner { bar: ProgressBar },
+    Determinate {
+        total: u64,
+        bar: ProgressBar,
+        processed: u64,
+    },
+    Spinner {
+        bar: ProgressBar,
+        processed: u64,
+    },
 }
 
 impl ProjectionStageBar {
@@ -462,6 +472,7 @@ impl ProjectionStageBar {
             Self::Determinate {
                 total: total as u64,
                 bar,
+                processed: 0,
             }
         } else {
             let bar = ProgressBar::new_spinner();
@@ -469,18 +480,59 @@ impl ProjectionStageBar {
             bar.set_style(spinner_style());
             bar.set_message(ConsoleProjectionProgress::stage_message(stage));
             bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
-            Self::Spinner { bar }
+            Self::Spinner { bar, processed: 0 }
         }
     }
 
-    fn update(&self, processed_variants: usize) {
+    fn update(&mut self, processed_variants: usize) {
         match self {
-            ProjectionStageBar::Determinate { total, bar } => {
+            ProjectionStageBar::Determinate {
+                total,
+                bar,
+                processed,
+            } => {
+                *processed = processed_variants.min(*total as usize) as u64;
                 let capped = processed_variants.min(*total as usize) as u64;
                 bar.set_position(capped);
             }
-            ProjectionStageBar::Spinner { bar, .. } => {
+            ProjectionStageBar::Spinner { bar, processed } => {
+                *processed = processed_variants as u64;
                 bar.set_position(processed_variants as u64);
+            }
+        }
+    }
+
+    fn set_total(&mut self, stage: ProjectionProgressStage, total: usize) {
+        if total == 0 {
+            return;
+        }
+        let total_u64 = total as u64;
+        match self {
+            ProjectionStageBar::Determinate {
+                total: current_total,
+                bar,
+                processed,
+            } => {
+                *current_total = total_u64;
+                bar.set_length(total_u64);
+                let capped = (*processed).min(total_u64);
+                *processed = capped;
+                bar.set_position(capped);
+            }
+            ProjectionStageBar::Spinner { bar, processed } => {
+                let processed_value = (*processed).min(total_u64);
+                bar.finish_and_clear();
+                let new_bar = ProgressBar::new(total_u64);
+                new_bar.set_draw_target(progress_draw_target());
+                new_bar.set_style(determinate_style());
+                new_bar.set_message(ConsoleProjectionProgress::stage_message(stage));
+                new_bar.enable_steady_tick(PROGRESS_TICK_INTERVAL);
+                new_bar.set_position(processed_value);
+                *self = ProjectionStageBar::Determinate {
+                    total: total_u64,
+                    bar: new_bar,
+                    processed: processed_value,
+                };
             }
         }
     }
@@ -550,8 +602,8 @@ impl ProjectionProgressObserver for ConsoleProjectionProgress {
     }
 
     fn on_stage_advance(&self, stage: ProjectionProgressStage, processed_variants: usize) {
-        let inner = self.inner.lock().unwrap();
-        if let Some((current, bar)) = inner.as_ref() {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((current, bar)) = inner.as_mut() {
             if *current == stage {
                 bar.update(processed_variants);
             } else {
@@ -564,6 +616,26 @@ impl ProjectionProgressObserver for ConsoleProjectionProgress {
         } else {
             log::warn!(
                 "received projection progress for stage '{}' with no active progress bar",
+                stage
+            );
+        }
+    }
+
+    fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((current, bar)) = inner.as_mut() {
+            if *current == stage {
+                bar.set_total(stage, total_variants);
+            } else {
+                log::warn!(
+                    "received total update for projection stage '{}' while '{}' is active",
+                    stage,
+                    current
+                );
+            }
+        } else {
+            log::warn!(
+                "received total update for projection stage '{}' with no active progress bar",
                 stage
             );
         }
