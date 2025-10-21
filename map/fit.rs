@@ -3448,6 +3448,7 @@ mod tests {
             &mut sq_scratch,
             &mut system_scratch,
             &mut rhs_scratch,
+
         )?;
 
         Ok(weights)
