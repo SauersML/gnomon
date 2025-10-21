@@ -16,10 +16,12 @@ from urllib.request import urlopen
 
 import hail as hl
 
-try:  # Optional dependency used when Hail lacks native BCF support.
+try:
     import pysam  # type: ignore
-except Exception:  # pragma: no cover - runtime fallback
-    pysam = None
+except Exception as exc:  # pragma: no cover - runtime fallback
+    raise RuntimeError(
+        "pysam is required for handling BCF inputs but could not be imported"
+    ) from exc
 
 DEFAULT_DATA_PATH = (
     "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/*.bcf"
@@ -178,6 +180,24 @@ def _copy_variant_to_local(source: str, destination: Path) -> None:
         shutil.copyfile(source, destination)
 
 
+def _copy_variant_index_if_available(source: str, destination: Path) -> None:
+    """Copy an index sidecar file for *source* into *destination*'s directory."""
+
+    sidecar_suffixes = (".csi", ".tbi", ".idx")
+    for suffix in sidecar_suffixes:
+        index_source = f"{source}{suffix}"
+        if source.startswith("gs://"):
+            exists = hl.hadoop_exists(index_source)
+        else:
+            exists = Path(index_source).exists()
+        if not exists:
+            continue
+
+        index_destination = destination.with_name(f"{destination.name}{suffix}")
+        _copy_variant_to_local(index_source, index_destination)
+        break
+
+
 def _guess_reference_from_header(header: "pysam.libcbcf.VariantHeader") -> Optional[str]:
     """Infer the reference genome from a pysam header if possible."""
 
@@ -217,6 +237,7 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
         local_bcf = temp_dir / f"input_{index}.bcf"
         logging.info("Copying %s to %s for conversion", source, local_bcf)
         _copy_variant_to_local(source, local_bcf)
+        _copy_variant_index_if_available(source, local_bcf)
 
         dest_path = temp_dir / f"converted_{index}.vcf.bgz"
         logging.info("Converting %s to %s", local_bcf, dest_path)
@@ -243,9 +264,6 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
 def _infer_reference_genome(pattern: str) -> Optional[str]:
     """Infer a reference genome for the VCF inputs matching *pattern*."""
 
-    if pysam is None:
-        return None
-
     matches = _list_matching_variant_paths(pattern)
     if not matches:
         raise FileNotFoundError(f"No variant files matched pattern '{pattern}'.")
@@ -258,6 +276,7 @@ def _infer_reference_genome(pattern: str) -> Optional[str]:
         cleanup_dir = Path(tempfile.mkdtemp(prefix="hail-ref-"))
         local_path = cleanup_dir / Path(first).name
         _copy_variant_to_local(first, local_path)
+        _copy_variant_index_if_available(first, local_path)
 
     try:
         with pysam.VariantFile(str(local_path)) as reader:
@@ -314,20 +333,6 @@ def _read_genotypes(path: str) -> hl.MatrixTable:
 
     if variant_format == "bcf":
         logging.info("Importing BCFs from %s", variant_path)
-        importer = getattr(hl, "import_bcf", None)
-        if importer is not None:
-            return importer(variant_path)
-
-        logging.warning(
-            "Hail %s does not expose `import_bcf`; falling back to conversion via pysam",
-            hl.__version__,
-        )
-        if pysam is None:
-            raise RuntimeError(
-                "BCF input detected but pysam is unavailable to perform conversion. "
-                "Install pysam or upgrade Hail to a version that provides `import_bcf`."
-            )
-
         converted_paths, temp_dir, reference = _convert_bcf_inputs_to_vcf(variant_path)
         atexit.register(shutil.rmtree, temp_dir, True)
         import_kwargs = {
