@@ -26,15 +26,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Rebuild gnomon (release, native cpu)
-        run: |
-          set -euxo pipefail
-          cargo clean
-          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -46,6 +37,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r scripts/requirements-release-fit.txt
+
+      - name: Launch hail PCA warmup
+        run: |
+          set -euo pipefail
+          timeout 60 python scripts/hail_pca.py --loop-seconds 3600 > hail_pca_no_ld.log 2>&1 &
+          echo "HAIL_PCA_PID=$!" >> "$GITHUB_ENV"
+          echo "HAIL_PCA_LOG=hail_pca_no_ld.log" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rebuild gnomon (release, native cpu)
+        run: |
+          set -euxo pipefail
+          cargo clean
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
 
       - name: Timed gnomon fit run (no --ld)
         run: |
@@ -67,6 +74,19 @@ jobs:
           mv artifacts/pc3_pc4.png artifacts/pc3_pc4_no_ld.png
           mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_no_ld.tsv
 
+      - name: Wait for hail PCA warmup (no --ld)
+        if: env.HAIL_PCA_PID
+        run: |
+          set -euo pipefail
+          set +e
+          wait "$HAIL_PCA_PID"
+          status=$?
+          set -e
+          cat "$HAIL_PCA_LOG" || true
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            exit "$status"
+          fi
+
       - name: Upload PCA plot artifacts (no --ld)
         uses: actions/upload-artifact@v4
         with:
@@ -85,15 +105,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Rebuild gnomon (release, native cpu)
-        run: |
-          set -euxo pipefail
-          cargo clean
-          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -105,6 +116,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r scripts/requirements-release-fit.txt
+
+      - name: Launch hail PCA warmup
+        run: |
+          set -euo pipefail
+          timeout 60 python scripts/hail_pca.py --loop-seconds 3600 > hail_pca_ld.log 2>&1 &
+          echo "HAIL_PCA_PID=$!" >> "$GITHUB_ENV"
+          echo "HAIL_PCA_LOG=hail_pca_ld.log" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rebuild gnomon (release, native cpu)
+        run: |
+          set -euxo pipefail
+          cargo clean
+          RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
 
       - name: Timed gnomon fit run (--ld)
         run: |
@@ -126,6 +153,19 @@ jobs:
           mv artifacts/pc1_pc2.png artifacts/pc1_pc2_ld.png
           mv artifacts/pc3_pc4.png artifacts/pc3_pc4_ld.png
           mv artifacts/pca_projection_scores.tsv artifacts/pca_projection_scores_ld.tsv
+
+      - name: Wait for hail PCA warmup (--ld)
+        if: env.HAIL_PCA_PID
+        run: |
+          set -euo pipefail
+          set +e
+          wait "$HAIL_PCA_PID"
+          status=$?
+          set -e
+          cat "$HAIL_PCA_LOG" || true
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            exit "$status"
+          fi
 
       - name: Upload PCA plot artifacts (--ld)
         uses: actions/upload-artifact@v4
