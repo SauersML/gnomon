@@ -227,6 +227,9 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
                 for record in reader:
                     writer.write(record)
 
+        logging.info("Indexing converted VCF %s", dest_path)
+        pysam.tabix_index(str(dest_path), preset="vcf", force=True)
+
         try:
             local_bcf.unlink()
         except FileNotFoundError:  # pragma: no cover - cleanup race
