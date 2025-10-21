@@ -108,7 +108,20 @@ def _normalize_text(value: object) -> str | None:
 
 
 def _load_sample_population_mapping() -> pd.DataFrame:
+    print(
+        "Downloading sample population mapping TSV from "
+        f"{SAMPLE_POPULATION_MAPPING_URL}…",
+        flush=True,
+    )
     df = pd.read_csv(SAMPLE_POPULATION_MAPPING_URL, sep="\t", dtype=str)
+    print(
+        "  Raw mapping shape: {} rows × {} columns".format(len(df), len(df.columns)),
+        flush=True,
+    )
+    print(
+        "  Mapping columns: {}".format(", ".join(df.columns.tolist()[:20])),
+        flush=True,
+    )
     df = df.applymap(lambda value: value.strip() if isinstance(value, str) else value)
 
     lower_to_actual = {column.lower(): column for column in df.columns}
@@ -149,10 +162,26 @@ def _load_sample_population_mapping() -> pd.DataFrame:
         )
 
     expanded = pd.DataFrame.from_records(records)
+    print(
+        "  Expanded to {} sample → population assignments".format(len(expanded)),
+        flush=True,
+    )
     expanded = expanded.drop_duplicates(subset="SampleID", keep="first")
+    print(
+        "  After dropping duplicates: {} unique SampleID entries".format(
+            len(expanded)
+        ),
+        flush=True,
+    )
     expanded["SampleID"] = expanded["SampleID"].astype("string")
     expanded["Subpopulation"] = expanded["Subpopulation"].astype("string")
     expanded["Superpopulation"] = expanded["Superpopulation"].astype("string")
+    print(
+        "Finished loading population mapping: preview {}".format(
+            expanded.head(3).to_dict(orient="records")
+        ),
+        flush=True,
+    )
     return expanded
 
 
@@ -212,6 +241,16 @@ def _read_projection(path: Path, label: str, mapping: pd.DataFrame) -> pd.DataFr
 
     print(f"Loading projection data for {label} from {path}…", flush=True)
     df = pd.read_csv(path, sep="\t")
+    print(
+        "  Raw projection shape for {}: {} rows × {} columns".format(
+            label, len(df), len(df.columns)
+        ),
+        flush=True,
+    )
+    print(
+        "  Projection columns (first 15): {}".format(", ".join(df.columns[:15])),
+        flush=True,
+    )
 
     expected_cols = {"SampleName"}
     missing = expected_cols.difference(df.columns)
@@ -226,6 +265,12 @@ def _read_projection(path: Path, label: str, mapping: pd.DataFrame) -> pd.DataFr
 
     df = df[["SampleName", *feature_columns]].copy()
     df = _annotate_with_population_labels(df, label, mapping)
+    print(
+        "  Annotated projection '{}' now has columns: {}".format(
+            label, ", ".join(df.columns[:15])
+        ),
+        flush=True,
+    )
     return df
 
 
@@ -253,6 +298,11 @@ def _filter_projection(df: pd.DataFrame, label: str) -> pd.DataFrame:
             f"Removed {removed} rows with undefined or disallowed subpopulation labels from {label}.",
             flush=True,
         )
+    else:
+        print(
+            f"No rows removed for subpopulation filtering in {label}; {len(df)} rows remain.",
+            flush=True,
+        )
 
     duplicates = df.duplicated(subset="SampleName")
     if duplicates.any():
@@ -262,8 +312,17 @@ def _filter_projection(df: pd.DataFrame, label: str) -> pd.DataFrame:
             flush=True,
         )
         df = df[~duplicates]
+    else:
+        print(
+            f"No duplicate SampleName entries detected in {label}.",
+            flush=True,
+        )
 
     df = df.set_index("SampleName", drop=False)
+    print(
+        "  Filtered projection '{}' index size: {}".format(label, len(df)),
+        flush=True,
+    )
     return df
 
 
@@ -273,12 +332,31 @@ def _align_datasets(datasets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame
     if not common_samples:
         raise ValueError("No overlapping samples found across the provided projections")
 
+    print(
+        "Alignment diagnostics:",
+        flush=True,
+    )
+    for label, df in datasets.items():
+        print(
+            f"  Dataset '{label}' total samples: {len(df)} (unique index entries)",
+            flush=True,
+        )
+    print(
+        f"  Common overlapping samples across datasets: {len(common_samples)}",
+        flush=True,
+    )
+
     aligned: dict[str, pd.DataFrame] = {}
     for label, df in datasets.items():
         missing = len(df) - len(common_samples)
         if missing:
             print(
                 f"Omitted {missing} samples unique to {label} data to align datasets.",
+                flush=True,
+            )
+        else:
+            print(
+                f"  No samples omitted when aligning dataset '{label}'.",
                 flush=True,
             )
         aligned[label] = df.loc[common_samples].copy()
@@ -317,6 +395,12 @@ def _determine_feature_columns(datasets: dict[str, pd.DataFrame]) -> list[str]:
     selected = sorted(common, key=sort_key)
 
     for label, features in feature_sets.items():
+        print(
+            "  Dataset '{}' provides {} PC columns.".format(label, len(features)),
+            flush=True,
+        )
+
+    for label, features in feature_sets.items():
         removed = sorted(features - set(selected), key=sort_key)
         if removed:
             print(
@@ -328,6 +412,12 @@ def _determine_feature_columns(datasets: dict[str, pd.DataFrame]) -> list[str]:
     print(
         f"Using {len(selected)} shared principal components: {', '.join(selected[:20])}"
         + (" …" if len(selected) > 20 else ""),
+        flush=True,
+    )
+
+    print(
+        f"Final feature column selection ({len(selected)} PCs): {', '.join(selected[:25])}"
+        + (" …" if len(selected) > 25 else ""),
         flush=True,
     )
 
@@ -363,6 +453,19 @@ def _filter_classes_across_datasets(
         print(
             "Removing subpopulations with insufficient support across datasets "
             f"(< {min_size} samples in at least one dataset): {', '.join(removed)}",
+            flush=True,
+        )
+    else:
+        print(
+            "No subpopulations removed when enforcing minimum size across datasets.",
+            flush=True,
+        )
+    for label, counts in counts_per.items():
+        print(
+            "  Dataset '{}' subpopulation counts (top 10): {}".format(
+                label,
+                counts.sort_values(ascending=False).head(10).to_dict(),
+            ),
             flush=True,
         )
     if not allowed:
@@ -438,6 +541,14 @@ def _evaluate_models(
         for label, df in datasets.items()
     }
 
+    for label, matrix in matrices.items():
+        print(
+            "  Matrix '{}' shape: {} samples × {} features".format(
+                label, matrix.shape[0], matrix.shape[1]
+            ),
+            flush=True,
+        )
+
     # With across-dataset filtering, smallest class size >= folds is guaranteed.
     min_class_count = next(iter(datasets.values()))["Subpopulation"].value_counts().min()
     if min_class_count < folds:
@@ -447,6 +558,19 @@ def _evaluate_models(
 
     splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
     splits = list(splitter.split(next(iter(matrices.values())), y))
+    print(
+        "  Generated {} stratified splits with fold sizes: {}".format(
+            len(splits),
+            [
+                {
+                    "train": int(train_idx.size),
+                    "test": int(test_idx.size),
+                }
+                for (train_idx, test_idx) in splits
+            ],
+        ),
+        flush=True,
+    )
 
     results: list[dict[str, object]] = []
     for model_name, factory in models:
@@ -580,12 +704,30 @@ def _print_summary(results: list[dict[str, object]]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    print(
+        "Received {} projection arguments: {}".format(
+            len(args.projections),
+            [label for label, _ in args.projections],
+        ),
+        flush=True,
+    )
+    print(
+        f"Configured to run with folds={args.folds} and random_state={args.random_state}.",
+        flush=True,
+    )
+
     mapping = _load_sample_population_mapping()
 
     datasets: dict[str, pd.DataFrame] = {}
     for label, path in args.projections:
         datasets[label] = _filter_projection(
             _read_projection(path, label, mapping), label
+        )
+        print(
+            "Dataset '{}' ready with {} rows post-filtering.".format(
+                label, len(datasets[label])
+            ),
+            flush=True,
         )
 
     aligned = _align_datasets(datasets)
