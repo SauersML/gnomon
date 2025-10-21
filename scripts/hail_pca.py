@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import fnmatch
 import gzip
 import logging
 import shutil
+import tempfile
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from urllib.error import URLError
 from urllib.request import urlopen
 
 import hail as hl
+
+try:  # Optional dependency used when Hail lacks native BCF support.
+    import pysam  # type: ignore
+except Exception:  # pragma: no cover - runtime fallback
+    pysam = None
 
 DEFAULT_DATA_PATH = (
     "gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/*.bcf"
@@ -111,6 +119,126 @@ def _resolve_variant_path(path: str) -> tuple[str, str]:
     )
 
 
+def _list_matching_variant_paths(pattern: str) -> List[str]:
+    """Expand *pattern* into a list of matching variant file paths."""
+
+    if "*" not in pattern:
+        return [pattern]
+
+    directory, _, name_pattern = pattern.rpartition("/")
+    directory = f"{directory}/" if directory else ""
+
+    if pattern.startswith("gs://"):
+        target = directory or pattern
+        entries = hl.hadoop_ls(target)
+        return [
+            entry["path"]
+            for entry in entries
+            if not entry.get("is_dir")
+            and fnmatch.fnmatch(entry["path"].split("/")[-1], name_pattern)
+        ]
+
+    base = Path(directory) if directory else Path.cwd()
+    return [str(path) for path in base.glob(name_pattern)]
+
+
+def _copy_variant_to_local(source: str, destination: Path) -> None:
+    """Copy a variant file from *source* to *destination*."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if source.startswith("gs://"):
+        hl.hadoop_copy(source, str(destination))
+    else:
+        shutil.copyfile(source, destination)
+
+
+def _guess_reference_from_header(header: "pysam.libcbcf.VariantHeader") -> Optional[str]:
+    """Infer the reference genome from a pysam header if possible."""
+
+    try:
+        reference_line = header.get("reference")
+    except AttributeError:  # pragma: no cover - pysam interface variations
+        reference_line = None
+
+    if reference_line:
+        text = str(reference_line[0]).lower()
+        if "grch38" in text or "hg38" in text:
+            return "GRCh38"
+        if "grch37" in text or "hg19" in text:
+            return "GRCh37"
+
+    contigs = list(getattr(header, "contigs", []))
+    if not contigs:
+        return None
+
+    if any(str(name).lower().startswith("chr") for name in contigs):
+        return "GRCh38"
+    return "GRCh37"
+
+
+def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[str]]:
+    """Convert BCF inputs matching *pattern* into bgzipped VCF files."""
+
+    matches = _list_matching_variant_paths(pattern)
+    if not matches:
+        raise FileNotFoundError(f"No BCF files matched pattern '{pattern}'.")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="hail-bcf-"))
+    converted: List[str] = []
+    reference: Optional[str] = None
+
+    for index, source in enumerate(matches):
+        local_bcf = temp_dir / f"input_{index}.bcf"
+        logging.info("Copying %s to %s for conversion", source, local_bcf)
+        _copy_variant_to_local(source, local_bcf)
+
+        dest_path = temp_dir / f"converted_{index}.vcf.bgz"
+        logging.info("Converting %s to %s", local_bcf, dest_path)
+        with pysam.VariantFile(str(local_bcf)) as reader:
+            if reference is None:
+                reference = _guess_reference_from_header(reader.header)
+            with pysam.VariantFile(str(dest_path), "wz", header=reader.header) as writer:
+                for record in reader:
+                    writer.write(record)
+
+        try:
+            local_bcf.unlink()
+        except FileNotFoundError:  # pragma: no cover - cleanup race
+            pass
+
+        converted.append(str(dest_path.resolve()))
+
+    return converted, temp_dir, reference
+
+
+def _infer_reference_genome(pattern: str) -> Optional[str]:
+    """Infer a reference genome for the VCF inputs matching *pattern*."""
+
+    if pysam is None:
+        return None
+
+    matches = _list_matching_variant_paths(pattern)
+    if not matches:
+        raise FileNotFoundError(f"No variant files matched pattern '{pattern}'.")
+
+    first = matches[0]
+    cleanup_dir: Optional[Path] = None
+    local_path = Path(first)
+
+    if first.startswith("gs://"):
+        cleanup_dir = Path(tempfile.mkdtemp(prefix="hail-ref-"))
+        local_path = cleanup_dir / Path(first).name
+        _copy_variant_to_local(first, local_path)
+
+    try:
+        with pysam.VariantFile(str(local_path)) as reader:
+            return _guess_reference_from_header(reader.header)
+    finally:
+        if cleanup_dir is not None:
+            atexit.register(shutil.rmtree, cleanup_dir, True)
+
+
 def _ensure_gcs_connector() -> str:
     """Download the GCS connector jar if it is not already cached."""
 
@@ -158,10 +286,38 @@ def _read_genotypes(path: str) -> hl.MatrixTable:
 
     if variant_format == "bcf":
         logging.info("Importing BCFs from %s", variant_path)
-        return hl.import_bcf(variant_path)
+        importer = getattr(hl, "import_bcf", None)
+        if importer is not None:
+            return importer(variant_path)
+
+        logging.warning(
+            "Hail %s does not expose `import_bcf`; falling back to conversion via pysam",
+            hl.__version__,
+        )
+        if pysam is None:
+            raise RuntimeError(
+                "BCF input detected but pysam is unavailable to perform conversion. "
+                "Install pysam or upgrade Hail to a version that provides `import_bcf`."
+            )
+
+        converted_paths, temp_dir, reference = _convert_bcf_inputs_to_vcf(variant_path)
+        atexit.register(shutil.rmtree, temp_dir, True)
+        import_kwargs = {
+            "force_bgz": True,
+            "array_elements_required": False,
+        }
+        if reference is not None:
+            import_kwargs["reference_genome"] = reference
+        return hl.import_vcf(converted_paths, **import_kwargs)
 
     logging.info("Importing VCFs from %s", variant_path)
-    return hl.import_vcf(variant_path, force_bgz=True, array_elements_required=False)
+    reference = _infer_reference_genome(variant_path)
+    paths = _list_matching_variant_paths(variant_path)
+    force_bgz = all(path.endswith((".vcf.bgz", ".vcf.gz")) for path in paths)
+    import_kwargs = {"array_elements_required": False, "force_bgz": force_bgz}
+    if reference is not None:
+        import_kwargs["reference_genome"] = reference
+    return hl.import_vcf(variant_path, **import_kwargs)
 
 
 def _export_scores(scores: hl.Table, output_prefix: str) -> None:
@@ -169,6 +325,10 @@ def _export_scores(scores: hl.Table, output_prefix: str) -> None:
 
 
 def _export_loadings(loadings: hl.Table, output_prefix: str) -> None:
+    if loadings is None:
+        logging.info("No loadings were produced; skipping loadings export")
+        return
+
     loadings.export(f"{output_prefix}.loadings.tsv.bgz")
 
 
