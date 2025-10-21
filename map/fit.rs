@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{min, Ordering};
+use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::eigen::{
-    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
-};
 use faer::matrix_free::LinOp;
+use faer::matrix_free::eigen::{
+    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+};
 use faer::prelude::ReborrowMut;
 use faer::{
-    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
-    Par, Side,
+    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
+    unzip, zip,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
@@ -772,7 +772,10 @@ enum SimdLaneSelection {
 }
 
 #[inline(always)]
-fn record_simd_lane_diagnostic(stage: &'static str, selection: SimdLaneSelection) -> SimdLaneSelection {
+fn record_simd_lane_diagnostic(
+    stage: &'static str,
+    selection: SimdLaneSelection,
+) -> SimdLaneSelection {
     log::debug!("SIMD lane selection stage {stage} -> {selection:?}");
     selection
 }
@@ -782,13 +785,12 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
     {
         static DETECTED: OnceLock<SimdLaneSelection> = OnceLock::new();
         return *DETECTED.get_or_init(|| {
-            let selection = if cfg!(target_feature = "avx")
-                && std::arch::is_x86_feature_detected!("avx")
-            {
-                SimdLaneSelection::Lanes4
-            } else {
-                SimdLaneSelection::Lanes2
-            };
+            let selection =
+                if cfg!(target_feature = "avx") && std::arch::is_x86_feature_detected!("avx") {
+                    SimdLaneSelection::Lanes4
+                } else {
+                    SimdLaneSelection::Lanes2
+                };
             record_simd_lane_diagnostic("x86 runtime detection", selection)
         });
     }
@@ -798,7 +800,10 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        return record_simd_lane_diagnostic("default lanes4 architecture", SimdLaneSelection::Lanes4);
+        return record_simd_lane_diagnostic(
+            "default lanes4 architecture",
+            SimdLaneSelection::Lanes4,
+        );
     }
 
     #[cfg(all(not(any(
@@ -1024,6 +1029,7 @@ pub struct HwePcaModel {
     sample_basis: Mat<f64>,
     sample_scores: Mat<f64>,
     loadings: Mat<f64>,
+    component_weighted_norms_sq: Vec<f64>,
     variant_keys: Option<Vec<VariantKey>>,
     ld: Option<LdWeights>,
 }
@@ -1208,7 +1214,7 @@ impl HwePcaModel {
             par,
         )?;
 
-        renormalize_variant_loadings(
+        let component_weighted_norms_sq = renormalize_variant_loadings(
             loadings.as_mut(),
             &mut singular_values,
             sample_scores.as_mut(),
@@ -1224,6 +1230,7 @@ impl HwePcaModel {
             sample_basis: decomposition.vectors,
             sample_scores,
             loadings,
+            component_weighted_norms_sq,
             variant_keys: None,
             ld: ld_weights,
         })
@@ -1294,6 +1301,10 @@ impl HwePcaModel {
 
     pub fn variant_loadings(&self) -> MatRef<'_, f64> {
         self.loadings.as_ref()
+    }
+
+    pub fn component_weighted_norms_sq(&self) -> &[f64] {
+        &self.component_weighted_norms_sq
     }
 
     pub fn set_variant_keys(&mut self, keys: Option<Vec<VariantKey>>) {
@@ -2883,21 +2894,17 @@ fn solve_ld_window_from_stats(
     1.0
 }
 
-fn renormalize_variant_loadings(
-    mut loadings: MatMut<'_, f64>,
-    singular_values: &mut [f64],
-    mut sample_scores: MatMut<'_, f64>,
+fn compute_component_weighted_norms_sq(
+    loadings: MatRef<'_, f64>,
     ld_weights: Option<&[f64]>,
-) {
-    debug_assert_eq!(loadings.ncols(), singular_values.len());
-    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
-
+) -> Vec<f64> {
     let weights = ld_weights.unwrap_or(&[]);
     let n_weights = weights.len();
     let n_components = loadings.ncols();
+    let mut norms_sq = vec![0.0f64; n_components];
 
     for component in 0..n_components {
-        let column_ref = loadings.as_ref().col(component);
+        let column_ref = loadings.col(component);
         let mut sum = 0.0f64;
         let mut compensation = 0.0f64;
 
@@ -2923,8 +2930,32 @@ fn renormalize_variant_loadings(
             });
         }
 
-        let norm = sum.sqrt();
+        let sum = if sum.is_finite() && sum >= 0.0 {
+            sum
+        } else {
+            0.0
+        };
+        norms_sq[component] = sum;
+    }
+
+    norms_sq
+}
+
+fn renormalize_variant_loadings(
+    mut loadings: MatMut<'_, f64>,
+    singular_values: &mut [f64],
+    mut sample_scores: MatMut<'_, f64>,
+    ld_weights: Option<&[f64]>,
+) -> Vec<f64> {
+    debug_assert_eq!(loadings.ncols(), singular_values.len());
+    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
+
+    let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), ld_weights);
+
+    for (component, norm_sq) in norms_sq.iter_mut().enumerate() {
+        let norm = (*norm_sq).sqrt();
         if !(norm.is_finite() && norm > 0.0) {
+            *norm_sq = 0.0;
             continue;
         }
 
@@ -2940,7 +2971,11 @@ fn renormalize_variant_loadings(
         zip!(score_col).for_each(|unzip!(value)| {
             *value *= norm;
         });
+
+        *norm_sq = 1.0;
     }
+
+    norms_sq
 }
 
 fn compute_variant_loadings<S, P>(
@@ -3186,7 +3221,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 10)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 11)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -3201,6 +3236,10 @@ impl Serialize for HwePcaModel {
             &MatrixData::from_mat(self.sample_scores.as_ref()),
         )?;
         state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
+        state.serialize_field(
+            "component_weighted_norms_sq",
+            &self.component_weighted_norms_sq,
+        )?;
         state.serialize_field("variant_keys", &self.variant_keys)?;
         state.serialize_field("ld", &self.ld)?;
         state.end()
@@ -3223,23 +3262,41 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             sample_scores: MatrixData,
             loadings: MatrixData,
             #[serde(default)]
+            component_weighted_norms_sq: Vec<f64>,
+            #[serde(default)]
             variant_keys: Option<Vec<VariantKey>>,
             #[serde(default)]
             ld: Option<LdWeights>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
+        let singular_values_len = raw.singular_values.len();
+        let sample_basis = raw.sample_basis.into_mat().map_err(DeError::custom)?;
+        let sample_scores = raw.sample_scores.into_mat().map_err(DeError::custom)?;
+        let loadings = raw.loadings.into_mat().map_err(DeError::custom)?;
+        let ld = raw.ld;
+        let component_weighted_norms_sq =
+            if raw.component_weighted_norms_sq.len() == singular_values_len {
+                raw.component_weighted_norms_sq
+            } else {
+                compute_component_weighted_norms_sq(
+                    loadings.as_ref(),
+                    ld.as_ref().map(|ld| ld.weights.as_slice()),
+                )
+            };
+
         Ok(HwePcaModel {
             n_samples: raw.n_samples,
             n_variants: raw.n_variants,
             scaler: raw.scaler,
             eigenvalues: raw.eigenvalues,
             singular_values: raw.singular_values,
-            sample_basis: raw.sample_basis.into_mat().map_err(DeError::custom)?,
-            sample_scores: raw.sample_scores.into_mat().map_err(DeError::custom)?,
-            loadings: raw.loadings.into_mat().map_err(DeError::custom)?,
+            sample_basis,
+            sample_scores,
+            loadings,
+            component_weighted_norms_sq,
             variant_keys: raw.variant_keys,
-            ld: raw.ld,
+            ld,
         })
     }
 }
