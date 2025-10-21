@@ -76,14 +76,39 @@ def _resolve_variant_path(path: str) -> tuple[str, str]:
 
     trimmed = path.rstrip("/")
     inferred = _infer_variant_format(trimmed)
-    if inferred is not None:
-        return trimmed, inferred
 
     if "*" in trimmed:
+        matches = _list_matching_variant_paths(trimmed)
+        if not matches:
+            raise FileNotFoundError(f"No files matched pattern '{trimmed}'.")
+
+        try:
+            detected = _detect_variant_format_from_file(matches[0])
+        except RuntimeError:
+            detected = None
+
+        if detected is not None:
+            return trimmed, detected
+
+        inferred_match = _infer_variant_format(matches[0])
+        if inferred_match is not None:
+            return trimmed, inferred_match
+
+        if inferred is not None:
+            return trimmed, inferred
+
         raise ValueError(
-            "Unable to infer variant format from glob pattern. "
-            "Please include a file extension in the --data-path value."
+            "Unable to determine whether the input files are VCF or BCF. "
+            "Please pass a path with an explicit extension."
         )
+
+    if inferred is not None:
+        try:
+            detected = _detect_variant_format_from_file(trimmed)
+        except RuntimeError:
+            detected = None
+
+        return trimmed, detected or inferred
 
     listing_target = path if path.endswith("/") else f"{path}/"
     try:
