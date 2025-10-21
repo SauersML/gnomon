@@ -21,7 +21,7 @@ We'll assess these scores on three metrics in the test data:
 - AUROC
 - Nagelkerke's R²
 
-gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed is 10.51 TiB, so we can use gs://fc-aou-datasets-controlled/v8/microarray/plink/* instead.
+`gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed` is 10.51 TiB, so we can use `gs://fc-aou-datasets-controlled/v8/microarray/plink/` instead.
 
 Create a standard cloud analysis environment with 8 CPUs and 30 GB RAM (though using lower or higher values should also work similarly).
 
@@ -37,7 +37,7 @@ gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarr
 
 Now we can run the scores. It should be faster to run them all at once instead of one at a time.
 ```
-./gnomon/target/release/gnomon score "PGS000765,PGS004904,PGS003433,PGS003979,PGS003386,PGS003852,PGS004303" arrays
+./gnomon/target/release/gnomon score "PGS000332,PGS000015,PGS000508,PGS000344,PGS000317,PGS000007,PGS000507,PGS004869" arrays
 ```
 
 This should take 11 minutes to run, and output a file called:
