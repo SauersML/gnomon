@@ -160,7 +160,7 @@ jobs:
       - name: Run hail PCA warmup
         run: |
           set -euo pipefail
-          python scripts/hail_pca.py --loop-seconds 3600 2>&1 | tee hail_pca.log
+          python scripts/hail_pca.py 2>&1 | tee hail_pca.log
 
       - name: Upload warmup log
         uses: actions/upload-artifact@v4
