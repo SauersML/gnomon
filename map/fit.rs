@@ -2,7 +2,7 @@ use super::progress::{
     FitProgressObserver, FitProgressStage, NoopFitProgress, StageProgressHandle,
 };
 use super::variant_filter::VariantKey;
-use core::cmp::{min, Ordering};
+use core::cmp::{Ordering, min};
 use core::fmt;
 use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
@@ -12,14 +12,14 @@ use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
 use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
 use faer::mat::AsMatMut;
-use faer::matrix_free::eigen::{
-    partial_eigen_scratch, partial_self_adjoint_eigen, PartialEigenInfo, PartialEigenParams,
-};
 use faer::matrix_free::LinOp;
+use faer::matrix_free::eigen::{
+    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+};
 use faer::prelude::ReborrowMut;
 use faer::{
-    get_global_parallelism, set_global_parallelism, unzip, zip, Accum, ColMut, Mat, MatMut, MatRef,
-    Par, Side,
+    Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
+    unzip, zip,
 };
 use rayon::prelude::*;
 use serde::de::Error as DeError;
@@ -28,7 +28,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
@@ -772,7 +772,10 @@ enum SimdLaneSelection {
 }
 
 #[inline(always)]
-fn record_simd_lane_diagnostic(stage: &'static str, selection: SimdLaneSelection) -> SimdLaneSelection {
+fn record_simd_lane_diagnostic(
+    stage: &'static str,
+    selection: SimdLaneSelection,
+) -> SimdLaneSelection {
     log::debug!("SIMD lane selection stage {stage} -> {selection:?}");
     selection
 }
@@ -782,13 +785,12 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
     {
         static DETECTED: OnceLock<SimdLaneSelection> = OnceLock::new();
         return *DETECTED.get_or_init(|| {
-            let selection = if cfg!(target_feature = "avx")
-                && std::arch::is_x86_feature_detected!("avx")
-            {
-                SimdLaneSelection::Lanes4
-            } else {
-                SimdLaneSelection::Lanes2
-            };
+            let selection =
+                if cfg!(target_feature = "avx") && std::arch::is_x86_feature_detected!("avx") {
+                    SimdLaneSelection::Lanes4
+                } else {
+                    SimdLaneSelection::Lanes2
+                };
             record_simd_lane_diagnostic("x86 runtime detection", selection)
         });
     }
@@ -798,7 +800,10 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        return record_simd_lane_diagnostic("default lanes4 architecture", SimdLaneSelection::Lanes4);
+        return record_simd_lane_diagnostic(
+            "default lanes4 architecture",
+            SimdLaneSelection::Lanes4,
+        );
     }
 
     #[cfg(all(not(any(
@@ -2689,15 +2694,15 @@ fn assign_ready_weights<P: FitProgressObserver>(
         let contiguous = first_slot + window_len <= ring.capacity();
         let n_samples = values_ref.nrows();
 
+        let mut full_coverage = true;
         for col in 0..window_len {
             let slot = ring.slot_at(start + col);
             let src = ring.mask_slice(slot);
-            let dst_col = mask_scratch.as_mut().col_mut(col);
-            for (dst_value, &src_value) in dst_col.iter_mut().zip(src.iter()) {
-                *dst_value = f64::from(src_value);
+            if full_coverage && src.iter().any(|&value| value != 1) {
+                full_coverage = false;
+                break;
             }
         }
-        let mask_view = mask_scratch.as_ref().submatrix(0, 0, n_samples, window_len);
 
         let values_view = if contiguous {
             values_ref.submatrix(0, first_slot, n_samples, window_len)
@@ -2727,52 +2732,86 @@ fn assign_ready_weights<P: FitProgressObserver>(
             par,
         );
 
-        let mut squared_view = square_scratch
-            .as_mut()
-            .submatrix_mut(0, 0, n_samples, window_len);
-        for col in 0..window_len {
-            let src = values_view.col(col);
-            let dst_col = squared_view.rb_mut().col_mut(col);
-            zip!(dst_col, src).for_each(|unzip!(dst, src)| {
-                *dst = src * src;
-            });
-        }
-
         let mut count_view = count_scratch
             .as_mut()
             .submatrix_mut(0, 0, window_len, window_len);
-        matmul(
-            count_view.as_mut(),
-            Accum::Replace,
-            mask_view.transpose(),
-            mask_view,
-            1.0,
-            par,
-        );
-
         let mut sum_view = sum_scratch
             .as_mut()
             .submatrix_mut(0, 0, window_len, window_len);
-        matmul(
-            sum_view.as_mut(),
-            Accum::Replace,
-            values_view.transpose(),
-            mask_view,
-            1.0,
-            par,
-        );
-
         let mut sq_view = sq_scratch
             .as_mut()
             .submatrix_mut(0, 0, window_len, window_len);
-        matmul(
-            sq_view.as_mut(),
-            Accum::Replace,
-            squared_view.as_ref().transpose(),
-            mask_view,
-            1.0,
-            par,
-        );
+
+        if full_coverage {
+            let count_value = n_samples as f64;
+            for row in 0..window_len {
+                for col in 0..window_len {
+                    count_view[(row, col)] = count_value;
+                }
+            }
+
+            for row in 0..window_len {
+                let mut sum = 0.0f64;
+                let mut sum_sq = 0.0f64;
+                for &value in values_view.col(row).iter() {
+                    sum += value;
+                    sum_sq += value * value;
+                }
+
+                for col in 0..window_len {
+                    sum_view[(row, col)] = sum;
+                    sq_view[(row, col)] = sum_sq;
+                }
+            }
+        } else {
+            for col in 0..window_len {
+                let slot = ring.slot_at(start + col);
+                let src = ring.mask_slice(slot);
+                let dst_col = mask_scratch.as_mut().col_mut(col);
+                for (dst_value, &src_value) in dst_col.iter_mut().zip(src.iter()) {
+                    *dst_value = f64::from(src_value);
+                }
+            }
+            let mask_view = mask_scratch.as_ref().submatrix(0, 0, n_samples, window_len);
+
+            let mut squared_view = square_scratch
+                .as_mut()
+                .submatrix_mut(0, 0, n_samples, window_len);
+            for col in 0..window_len {
+                let src = values_view.col(col);
+                let dst_col = squared_view.rb_mut().col_mut(col);
+                zip!(dst_col, src).for_each(|unzip!(dst, src)| {
+                    *dst = src * src;
+                });
+            }
+
+            matmul(
+                count_view.as_mut(),
+                Accum::Replace,
+                mask_view.transpose(),
+                mask_view,
+                1.0,
+                par,
+            );
+
+            matmul(
+                sum_view.as_mut(),
+                Accum::Replace,
+                values_view.transpose(),
+                mask_view,
+                1.0,
+                par,
+            );
+
+            matmul(
+                sq_view.as_mut(),
+                Accum::Replace,
+                squared_view.as_ref().transpose(),
+                mask_view,
+                1.0,
+                par,
+            );
+        }
 
         let mut system_view = system_scratch
             .as_mut()
@@ -3249,6 +3288,209 @@ mod tests {
     use super::*;
     use crate::map::io::GenotypeDataset;
     use std::path::Path;
+    use std::sync::Arc;
+
+    fn reference_weights(
+        values: &[Vec<f64>],
+        masks: &[Vec<u8>],
+        window_size: usize,
+        ridge: f64,
+    ) -> Vec<f64> {
+        let n_samples = values.len();
+        assert!(n_samples > 0);
+        let n_variants = values[0].len();
+        assert!(masks.len() == n_samples);
+        assert!(masks.iter().all(|row| row.len() == n_variants));
+
+        let window_capacity = window_size.max(1);
+        let mut gram = Mat::zeros(window_capacity, window_capacity);
+        let mut sums = Mat::zeros(window_capacity, window_capacity);
+        let mut squared_sums = Mat::zeros(window_capacity, window_capacity);
+        let mut counts = Mat::zeros(window_capacity, window_capacity);
+        let mut system = Mat::zeros(window_capacity, window_capacity);
+        let mut rhs = Mat::zeros(window_capacity, 1);
+
+        let mut weights = vec![0.0; n_variants];
+
+        for variant_idx in 0..n_variants {
+            let available = n_variants;
+            let window_len = available.min(window_size).max(1);
+            let half_window = window_len / 2;
+            let start = if available <= window_size {
+                0
+            } else if variant_idx <= half_window {
+                0
+            } else {
+                let tail_start = available - window_len;
+                (variant_idx - half_window).min(tail_start)
+            };
+            let end = (start + window_len).min(available);
+            let window_len = end - start;
+            let center = variant_idx - start;
+
+            let mut gram_view = gram.as_mut().submatrix_mut(0, 0, window_len, window_len);
+            let mut sum_view = sums.as_mut().submatrix_mut(0, 0, window_len, window_len);
+            let mut sq_view = squared_sums
+                .as_mut()
+                .submatrix_mut(0, 0, window_len, window_len);
+            let mut count_view = counts.as_mut().submatrix_mut(0, 0, window_len, window_len);
+            let mut system_view = system.as_mut().submatrix_mut(0, 0, window_len, window_len);
+            let mut rhs_view = rhs.as_mut().submatrix_mut(0, 0, window_len, 1);
+
+            for i in 0..window_len {
+                for j in 0..window_len {
+                    let mut gram_sum = 0.0f64;
+                    let mut count_sum = 0.0f64;
+                    let mut value_sum = 0.0f64;
+                    let mut square_sum = 0.0f64;
+                    for sample in 0..n_samples {
+                        let val_i = values[sample][start + i];
+                        let val_j = values[sample][start + j];
+                        let mask_i = masks[sample][start + i];
+                        let mask_j = masks[sample][start + j];
+
+                        gram_sum += val_i * val_j;
+                        if mask_i != 0 && mask_j != 0 {
+                            count_sum += 1.0;
+                        }
+                        if mask_j != 0 {
+                            value_sum += val_i;
+                            square_sum += val_i * val_i;
+                        }
+                    }
+                    gram_view[(i, j)] = gram_sum;
+                    count_view[(i, j)] = count_sum;
+                    sum_view[(i, j)] = value_sum;
+                    sq_view[(i, j)] = square_sum;
+                }
+            }
+
+            let weight = solve_ld_window_from_stats(
+                gram_view.as_ref(),
+                sum_view.as_ref(),
+                sq_view.as_ref(),
+                count_view.as_ref(),
+                center,
+                ridge,
+                system_view.as_mut(),
+                rhs_view.as_mut(),
+            );
+            weights[variant_idx] = weight;
+        }
+
+        weights
+    }
+
+    fn compute_weights_with_assign(
+        values: &[Vec<f64>],
+        masks: &[Vec<u8>],
+        window_size: usize,
+        ridge: f64,
+    ) -> Vec<f64> {
+        let n_samples = values.len();
+        let n_variants = values[0].len();
+        let window_capacity = window_size.max(1);
+
+        let mut ring = LdRingBuffer::new(n_samples, window_capacity);
+        for variant_idx in 0..n_variants {
+            let slot = ring.push_slot();
+            {
+                let column = ring.values_mut().col_mut(slot);
+                for (row, dst) in column.iter_mut().enumerate() {
+                    *dst = values[row][variant_idx];
+                }
+            }
+            {
+                let mask_slice = ring.mask_slice_mut(slot);
+                for row in 0..n_samples {
+                    mask_slice[row] = masks[row][variant_idx];
+                }
+            }
+            ring.indices_mut()[slot] = variant_idx;
+        }
+
+        let mut weights = vec![1.0; n_variants];
+        let mut next_weight = 0usize;
+        let config = LdResolvedConfig {
+            window: LdResolvedWindow::Sites { size: window_size },
+            ridge,
+        };
+
+        let mut values_scratch = Mat::zeros(n_samples, window_capacity);
+        let mut mask_scratch = Mat::zeros(n_samples, window_capacity);
+        let mut square_scratch = Mat::zeros(n_samples, window_capacity);
+        let mut gram_scratch = Mat::zeros(window_capacity, window_capacity);
+        let mut count_scratch = Mat::zeros(window_capacity, window_capacity);
+        let mut sum_scratch = Mat::zeros(window_capacity, window_capacity);
+        let mut sq_scratch = Mat::zeros(window_capacity, window_capacity);
+        let mut system_scratch = Mat::zeros(window_capacity, window_capacity);
+        let mut rhs_scratch = Mat::zeros(window_capacity, 1);
+
+        let progress =
+            StageProgressHandle::new(Arc::new(NoopFitProgress), FitProgressStage::LdWeights);
+        let par = get_global_parallelism();
+
+        assign_ready_weights(
+            &mut ring,
+            &mut weights,
+            &mut next_weight,
+            &config,
+            &mut values_scratch,
+            &mut mask_scratch,
+            &mut square_scratch,
+            &mut gram_scratch,
+            &mut count_scratch,
+            &mut sum_scratch,
+            &mut sq_scratch,
+            &mut system_scratch,
+            &mut rhs_scratch,
+            &progress,
+            par,
+        )
+        .unwrap();
+
+        weights
+    }
+
+    #[test]
+    fn assign_ready_weights_full_coverage_matches_reference() {
+        let values = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![1.0, 2.0, 3.0],
+            vec![2.0, 3.0, 4.0],
+            vec![3.0, 4.0, 5.0],
+        ];
+        let masks = vec![vec![1, 1, 1]; 4];
+        let window_size = 3;
+        let ridge = 0.0;
+
+        let expected = reference_weights(&values, &masks, window_size, ridge);
+        let actual = compute_weights_with_assign(&values, &masks, window_size, ridge);
+
+        for (lhs, rhs) in actual.iter().zip(expected.iter()) {
+            assert!((lhs - rhs).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn assign_ready_weights_missing_data_matches_reference() {
+        let values = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![1.0, 2.0, 3.0],
+            vec![2.0, 3.0, 4.0],
+            vec![3.0, 4.0, 5.0],
+        ];
+        let masks = vec![vec![1, 1, 1], vec![1, 0, 1], vec![1, 1, 0], vec![1, 1, 1]];
+        let window_size = 3;
+        let ridge = 0.0;
+
+        let expected = reference_weights(&values, &masks, window_size, ridge);
+        let actual = compute_weights_with_assign(&values, &masks, window_size, ridge);
+
+        for (lhs, rhs) in actual.iter().zip(expected.iter()) {
+            assert!((lhs - rhs).abs() < 1.0e-12);
+        }
+    }
 
     #[test]
     fn bp_window_treated_as_total_span() {
