@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Compare release-fit projection TSVs using cross-validation classifiers."""
-
 from __future__ import annotations
 
 import argparse
@@ -13,13 +10,15 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 from sklearn.base import BaseEstimator
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import t as student_t
 
 
 SAMPLE_POPULATION_MAPPING_URL = (
@@ -46,7 +45,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare PCA projection TSV files using stratified cross-validated classifiers "
-            "and paired statistical testing across any number of projection sources."
+            "and dependence-aware paired statistical testing across projection sources."
         )
     )
     parser.add_argument(
@@ -102,11 +101,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _normalize_text(value: object) -> str | None:
     if pd.isna(value):
         return None
-
     text = str(value).strip()
     if not text:
         return None
-
     return text
 
 
@@ -235,16 +232,13 @@ def _read_projection(path: Path, label: str, mapping: pd.DataFrame) -> pd.DataFr
 def _normalize_subpop(value: object) -> str | None:
     if pd.isna(value):
         return None
-
     text = str(value).strip()
     if not text:
         return None
-
     lowered = text.lower()
     disallowed = ("nan", "unk", "unknown", "other", "others", "na", "none")
     if any(token in lowered for token in disallowed):
         return None
-
     return text
 
 
@@ -354,6 +348,30 @@ def _filter_small_classes(df: pd.DataFrame, min_size: int) -> pd.DataFrame:
     return df[df["Subpopulation"].isin(allowed)].copy()
 
 
+def _filter_classes_across_datasets(
+    datasets: dict[str, pd.DataFrame], min_size: int
+) -> dict[str, pd.DataFrame]:
+    """Keep only subpopulations that have at least `min_size` samples in *every* dataset."""
+    counts_per = {label: df["Subpopulation"].value_counts() for label, df in datasets.items()}
+    all_labels = set().union(*[c.index for c in counts_per.values()])
+    allowed = sorted(
+        lab for lab in all_labels
+        if min(c.get(lab, 0) for c in counts_per.values()) >= min_size
+    )
+    removed = sorted(all_labels - set(allowed))
+    if removed:
+        print(
+            "Removing subpopulations with insufficient support across datasets "
+            f"(< {min_size} samples in at least one dataset): {', '.join(removed)}",
+            flush=True,
+        )
+    if not allowed:
+        raise ValueError(
+            "After alignment, no subpopulation meets the required size across all datasets."
+        )
+    return {label: df[df["Subpopulation"].isin(allowed)].copy() for label, df in datasets.items()}
+
+
 def _summarize_dataset(df: pd.DataFrame, name: str) -> DatasetSummary:
     feature_columns = [col for col in df.columns if col.startswith("PC")]
     counts = Counter(df["Subpopulation"].tolist())
@@ -367,21 +385,42 @@ def _summarize_dataset(df: pd.DataFrame, name: str) -> DatasetSummary:
 
 def _build_models() -> list[tuple[str, Callable[[], BaseEstimator]]]:
     return [
-        (
-            "LogisticRegression",
-            lambda: LogisticRegression(
-                penalty=None,
-                solver="lbfgs",
-                max_iter=1000,
-                multi_class="auto",
-            ),
-        ),
-        ("KNeighborsClassifier", lambda: KNeighborsClassifier(n_neighbors=10)),
-        (
-            "RandomForestClassifier",
-            lambda: RandomForestClassifier(random_state=42),
-        ),
+        ("LogisticRegression",
+         lambda: make_pipeline(
+             StandardScaler(),
+             LogisticRegression(
+                 penalty="none", solver="lbfgs", max_iter=2000, multi_class="multinomial"
+             ),
+         )),
+        ("KNeighborsClassifier",
+         lambda: make_pipeline(
+             StandardScaler(),
+             KNeighborsClassifier(n_neighbors=10, n_jobs=-1),
+         )),
+        ("RandomForestClassifier",
+         lambda: RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)),
     ]
+
+
+def corrected_resampled_t(diff: np.ndarray, k: int, r: int = 1) -> tuple[float, float]:
+    """Nadeau–Bengio corrected resampled t-test for dependent K-fold differences.
+
+    diff: array of per-fold (and per-repeat) differences (len = r*k).
+    k: number of folds; r: number of repeats.
+    Returns (t_stat, two-sided p-value), using Student-t with df=r*k - 1.
+    """
+    diff = np.asarray(diff, dtype=float)
+    dbar = float(diff.mean())
+    s2 = float(diff.var(ddof=1)) if diff.size > 1 else 0.0
+    var_corr = (1.0 / (r * k) + 1.0 / (k - 1.0)) * s2
+    if var_corr == 0.0:
+        if dbar == 0.0:
+            return 0.0, 1.0
+        return (np.inf if dbar > 0 else -np.inf), 0.0
+    t = dbar / np.sqrt(var_corr)
+    df = max(1, r * k - 1)
+    p = 2.0 * (1.0 - student_t.cdf(abs(t), df=df))
+    return t, p
 
 
 def _evaluate_models(
@@ -399,26 +438,20 @@ def _evaluate_models(
         for label, df in datasets.items()
     }
 
+    # With across-dataset filtering, smallest class size >= folds is guaranteed.
     min_class_count = next(iter(datasets.values()))["Subpopulation"].value_counts().min()
-    if min_class_count < 2:
-        raise ValueError("Insufficient samples per class after filtering (need >= 2)")
-
-    n_splits = min(folds, min_class_count)
-    if n_splits < folds:
-        print(
-            f"Requested {folds} folds but the smallest class has only {min_class_count} samples;"
-            f" using {n_splits} folds instead.",
-            flush=True,
+    if min_class_count < folds:
+        raise ValueError(
+            f"Cannot run {folds} folds: smallest class has only {min_class_count} samples after filtering."
         )
-    if n_splits < 2:
-        raise ValueError("Unable to perform stratified CV with fewer than 2 folds")
 
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
     splits = list(splitter.split(next(iter(matrices.values())), y))
 
     results: list[dict[str, object]] = []
     for model_name, factory in models:
-        print(f"\nEvaluating {model_name} with {n_splits}-fold stratified CV…", flush=True)
+        print(f"\nEvaluating {model_name} with {folds}-fold stratified CV (seed={random_state})…", flush=True)
+        # Track per-fold accuracy (used for tests); log macroF1 & balanced acc too.
         score_tracker: dict[str, list[float]] = {label: [] for label in labels}
 
         for fold_index, (train_idx, test_idx) in enumerate(splits, start=1):
@@ -428,16 +461,20 @@ def _evaluate_models(
                 X = matrices[label]
                 model.fit(X[train_idx], y[train_idx])
                 preds = model.predict(X[test_idx])
+
                 acc = accuracy_score(y[test_idx], preds)
+                mac_f1 = f1_score(y[test_idx], preds, average="macro")
+                bal_acc = balanced_accuracy_score(y[test_idx], preds)
+
                 score_tracker[label].append(acc)
                 print(
-                    f"    {label:<20} accuracy = {acc:.4f}",
+                    f"    {label:<20} acc = {acc:.4f}  macroF1 = {mac_f1:.4f}  balAcc = {bal_acc:.4f}",
                     flush=True,
                 )
 
         dataset_summaries: dict[str, dict[str, object]] = {}
         for label, scores in score_tracker.items():
-            arr = np.array(scores)
+            arr = np.array(scores, dtype=float)
             dataset_summaries[label] = {
                 "scores": arr,
                 "mean": float(arr.mean()),
@@ -455,20 +492,23 @@ def _evaluate_models(
             scores_a = dataset_summaries[a_label]["scores"]
             scores_b = dataset_summaries[b_label]["scores"]
             diff = scores_b - scores_a
-            t_stat, p_value = stats.ttest_rel(scores_b, scores_a)
             mean_diff = float(diff.mean())
+
+            # Dependence-aware test
+            t_corr, p_corr = corrected_resampled_t(diff, k=folds, r=1)
+
             comparisons.append(
                 {
                     "a": a_label,
                     "b": b_label,
                     "mean_diff": mean_diff,
-                    "t_stat": float(t_stat),
-                    "p_value": float(p_value),
+                    "t_stat_corrected": float(t_corr),
+                    "p_value_corrected": float(p_corr),
                 }
             )
             print(
-                "  Paired t-test ({} - {}): diff = {:.4f}, t = {:.4f}, p = {:.6f}".format(
-                    b_label, a_label, mean_diff, t_stat, p_value
+                "  Corrected paired test ({} - {}): diff = {:.4f}, t = {:.4f}, p = {:.6f}".format(
+                    b_label, a_label, mean_diff, t_corr, p_corr
                 ),
                 flush=True,
             )
@@ -476,7 +516,7 @@ def _evaluate_models(
         results.append(
             {
                 "model": model_name,
-                "folds": n_splits,
+                "folds": folds,
                 "datasets": dataset_summaries,
                 "comparisons": comparisons,
             }
@@ -498,11 +538,11 @@ def _print_summary(results: list[dict[str, object]]) -> None:
                 f"    {label:<20} mean = {stats_dict['mean']:.4f}, std = {stats_dict['std']:.4f}",
                 flush=True,
             )
-        print("  Pairwise comparisons (B - A):", flush=True)
+        print("  Pairwise comparisons (B - A), corrected t-test:", flush=True)
         for comp in entry["comparisons"]:
             print(
                 f"    {comp['b']} - {comp['a']:<16} diff = {comp['mean_diff']:.4f},"
-                f" t = {comp['t_stat']:.4f}, p = {comp['p_value']:.6f}",
+                f" t = {comp['t_stat_corrected']:.4f}, p = {comp['p_value_corrected']:.6f}",
                 flush=True,
             )
         print("", flush=True)
@@ -520,16 +560,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     aligned = _align_datasets(datasets)
-    feature_columns = _determine_feature_columns(aligned)
 
-    reference_label = next(iter(aligned))
-    filtered_reference = _filter_small_classes(aligned[reference_label], min_size=2)
-    retained_samples = filtered_reference.index.tolist()
+    # Guarantee we can run the requested number of folds by filtering *across datasets*.
+    min_required = max(2, args.folds)
+    filtered_datasets = _filter_classes_across_datasets(aligned, min_size=min_required)
 
-    trimmed_datasets: dict[str, pd.DataFrame] = {}
-    for label, df in aligned.items():
-        trimmed = df.loc[retained_samples, ["SampleName", "Subpopulation", *feature_columns]].copy()
-        trimmed_datasets[label] = trimmed
+    feature_columns = _determine_feature_columns(filtered_datasets)
+
+    # Preserve identical sample order across datasets
+    retained_samples = filtered_datasets[next(iter(filtered_datasets))].index.tolist()
+    trimmed_datasets: dict[str, pd.DataFrame] = {
+        label: df.loc[retained_samples, ["SampleName", "Subpopulation", *feature_columns]].copy()
+        for label, df in filtered_datasets.items()
+    }
 
     if not trimmed_datasets or next(iter(trimmed_datasets.values())).empty:
         raise ValueError("No samples remain after filtering invalid labels and small classes")
