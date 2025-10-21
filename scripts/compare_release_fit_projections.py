@@ -604,6 +604,8 @@ def _evaluate_models(
     labels = list(datasets.keys())
     y = next(iter(datasets.values()))["Subpopulation"].to_numpy()
     classes = np.unique(y)
+    label_to_index = {label: idx for idx, label in enumerate(classes)}
+    y_encoded = np.array([label_to_index[label] for label in y], dtype=int)
 
     matrices = {
         label: df[feature_columns].to_numpy(dtype=float)
@@ -626,7 +628,7 @@ def _evaluate_models(
         )
 
     splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
-    splits = list(splitter.split(next(iter(matrices.values())), y))
+    splits = list(splitter.split(next(iter(matrices.values())), y_encoded))
     print(
         "  Generated {} stratified splits with fold sizes: {}".format(
             len(splits),
@@ -652,11 +654,16 @@ def _evaluate_models(
             for label in labels:
                 model = factory()
                 X = matrices[label]
-                model.fit(X[train_idx], y[train_idx])
-                preds = model.predict(X[test_idx])
+                model.fit(X[train_idx], y_encoded[train_idx])
+                preds = np.asarray(model.predict(X[test_idx]))
+
+                if preds.dtype.kind in {"U", "S", "O"}:
+                    predicted_labels = preds.astype(str)
+                else:
+                    predicted_labels = classes[preds.astype(int)]
 
                 acc, mac_f1, bal_acc = _compute_classification_metrics(
-                    y[test_idx], preds, classes
+                    y[test_idx], predicted_labels, classes
                 )
 
                 score_tracker[label].append(acc)
