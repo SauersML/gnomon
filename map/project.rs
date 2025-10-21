@@ -243,7 +243,7 @@ impl<'model> HwePcaProjector<'model> {
         };
 
         progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
-        if expected_variants != variant_hint && expected_variants > 0 {
+        if variant_hint == 0 && expected_variants > 0 {
             progress.on_stage_total(ProjectionProgressStage::Projection, expected_variants);
         }
 
@@ -255,9 +255,11 @@ impl<'model> HwePcaProjector<'model> {
                 break;
             }
             if processed + filled > expected_variants {
-                return Err(HwePcaError::InvalidInput(
-                    "VariantBlockSource returned more variants than reported",
-                ));
+                if variant_hint != 0 || processed + filled > model_variants {
+                    return Err(HwePcaError::InvalidInput(
+                        "VariantBlockSource returned more variants than reported",
+                    ));
+                }
             }
 
             let mut block = MatMut::from_column_major_slice_mut(
@@ -363,10 +365,17 @@ impl<'model> HwePcaProjector<'model> {
             progress.on_stage_advance(ProjectionProgressStage::Projection, processed);
         }
 
-        if processed != expected_variants && (variant_hint != 0 || processed != model_variants) {
-            return Err(HwePcaError::InvalidInput(
-                "VariantBlockSource terminated early during projection",
-            ));
+        if processed != expected_variants {
+            if variant_hint != 0 {
+                return Err(HwePcaError::InvalidInput(
+                    "VariantBlockSource terminated early during projection",
+                ));
+            }
+            if processed != model_variants {
+                return Err(HwePcaError::InvalidInput(
+                    "VariantBlockSource terminated early during projection",
+                ));
+            }
         }
 
         progress.on_stage_finish(ProjectionProgressStage::Projection);
