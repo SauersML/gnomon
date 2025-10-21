@@ -1029,6 +1029,7 @@ pub struct HwePcaModel {
     sample_basis: Mat<f64>,
     sample_scores: Mat<f64>,
     loadings: Mat<f64>,
+    component_weighted_norms_sq: Vec<f64>,
     variant_keys: Option<Vec<VariantKey>>,
     ld: Option<LdWeights>,
 }
@@ -1213,7 +1214,7 @@ impl HwePcaModel {
             par,
         )?;
 
-        renormalize_variant_loadings(
+        let component_weighted_norms_sq = renormalize_variant_loadings(
             loadings.as_mut(),
             &mut singular_values,
             sample_scores.as_mut(),
@@ -1229,6 +1230,7 @@ impl HwePcaModel {
             sample_basis: decomposition.vectors,
             sample_scores,
             loadings,
+            component_weighted_norms_sq,
             variant_keys: None,
             ld: ld_weights,
         })
@@ -1299,6 +1301,10 @@ impl HwePcaModel {
 
     pub fn variant_loadings(&self) -> MatRef<'_, f64> {
         self.loadings.as_ref()
+    }
+
+    pub fn component_weighted_norms_sq(&self) -> &[f64] {
+        &self.component_weighted_norms_sq
     }
 
     pub fn set_variant_keys(&mut self, keys: Option<Vec<VariantKey>>) {
@@ -2934,21 +2940,17 @@ fn solve_ld_window_from_stats(
     1.0
 }
 
-fn renormalize_variant_loadings(
-    mut loadings: MatMut<'_, f64>,
-    singular_values: &mut [f64],
-    mut sample_scores: MatMut<'_, f64>,
+fn compute_component_weighted_norms_sq(
+    loadings: MatRef<'_, f64>,
     ld_weights: Option<&[f64]>,
-) {
-    debug_assert_eq!(loadings.ncols(), singular_values.len());
-    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
-
+) -> Vec<f64> {
     let weights = ld_weights.unwrap_or(&[]);
     let n_weights = weights.len();
     let n_components = loadings.ncols();
+    let mut norms_sq = vec![0.0f64; n_components];
 
     for component in 0..n_components {
-        let column_ref = loadings.as_ref().col(component);
+        let column_ref = loadings.col(component);
         let mut sum = 0.0f64;
         let mut compensation = 0.0f64;
 
@@ -2974,8 +2976,32 @@ fn renormalize_variant_loadings(
             });
         }
 
-        let norm = sum.sqrt();
+        let sum = if sum.is_finite() && sum >= 0.0 {
+            sum
+        } else {
+            0.0
+        };
+        norms_sq[component] = sum;
+    }
+
+    norms_sq
+}
+
+fn renormalize_variant_loadings(
+    mut loadings: MatMut<'_, f64>,
+    singular_values: &mut [f64],
+    mut sample_scores: MatMut<'_, f64>,
+    ld_weights: Option<&[f64]>,
+) -> Vec<f64> {
+    debug_assert_eq!(loadings.ncols(), singular_values.len());
+    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
+
+    let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), ld_weights);
+
+    for (component, norm_sq) in norms_sq.iter_mut().enumerate() {
+        let norm = (*norm_sq).sqrt();
         if !(norm.is_finite() && norm > 0.0) {
+            *norm_sq = 0.0;
             continue;
         }
 
@@ -2991,7 +3017,11 @@ fn renormalize_variant_loadings(
         zip!(score_col).for_each(|unzip!(value)| {
             *value *= norm;
         });
+
+        *norm_sq = 1.0;
     }
+
+    norms_sq
 }
 
 fn compute_variant_loadings<S, P>(
@@ -3237,7 +3267,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 10)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 11)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -3252,6 +3282,10 @@ impl Serialize for HwePcaModel {
             &MatrixData::from_mat(self.sample_scores.as_ref()),
         )?;
         state.serialize_field("loadings", &MatrixData::from_mat(self.loadings.as_ref()))?;
+        state.serialize_field(
+            "component_weighted_norms_sq",
+            &self.component_weighted_norms_sq,
+        )?;
         state.serialize_field("variant_keys", &self.variant_keys)?;
         state.serialize_field("ld", &self.ld)?;
         state.end()
@@ -3274,23 +3308,41 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             sample_scores: MatrixData,
             loadings: MatrixData,
             #[serde(default)]
+            component_weighted_norms_sq: Vec<f64>,
+            #[serde(default)]
             variant_keys: Option<Vec<VariantKey>>,
             #[serde(default)]
             ld: Option<LdWeights>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
+        let singular_values_len = raw.singular_values.len();
+        let sample_basis = raw.sample_basis.into_mat().map_err(DeError::custom)?;
+        let sample_scores = raw.sample_scores.into_mat().map_err(DeError::custom)?;
+        let loadings = raw.loadings.into_mat().map_err(DeError::custom)?;
+        let ld = raw.ld;
+        let component_weighted_norms_sq =
+            if raw.component_weighted_norms_sq.len() == singular_values_len {
+                raw.component_weighted_norms_sq
+            } else {
+                compute_component_weighted_norms_sq(
+                    loadings.as_ref(),
+                    ld.as_ref().map(|ld| ld.weights.as_slice()),
+                )
+            };
+
         Ok(HwePcaModel {
             n_samples: raw.n_samples,
             n_variants: raw.n_variants,
             scaler: raw.scaler,
             eigenvalues: raw.eigenvalues,
             singular_values: raw.singular_values,
-            sample_basis: raw.sample_basis.into_mat().map_err(DeError::custom)?,
-            sample_scores: raw.sample_scores.into_mat().map_err(DeError::custom)?,
-            loadings: raw.loadings.into_mat().map_err(DeError::custom)?,
+            sample_basis,
+            sample_scores,
+            loadings,
+            component_weighted_norms_sq,
             variant_keys: raw.variant_keys,
-            ld: raw.ld,
+            ld,
         })
     }
 }

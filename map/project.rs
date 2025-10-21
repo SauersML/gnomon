@@ -228,48 +228,6 @@ impl<'model> HwePcaProjector<'model> {
         let scaler = self.model.scaler();
         let loadings = self.model.variant_loadings();
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
-        let normalization_factors = if opts.missing_axis_renormalization {
-            let mut factors = Vec::with_capacity(components);
-            match ld_weights {
-                Some(weights) => {
-                    let weight_len = weights.len();
-                    for col in 0..components {
-                        let mut sum = 0.0f64;
-                        let mut compensation = 0.0f64;
-                        for row in 0..loadings.nrows() {
-                            let weight = if row < weight_len { weights[row] } else { 1.0 };
-                            let weighted = weight * loadings[(row, col)];
-                            let square = weighted * weighted;
-                            let y = square - compensation;
-                            let t = sum + y;
-                            compensation = (t - sum) - y;
-                            sum = t;
-                        }
-                        factors.push(sum);
-                    }
-                }
-                None => {
-                    for col in 0..components {
-                        let mut sum = 0.0f64;
-                        let mut compensation = 0.0f64;
-                        for row in 0..loadings.nrows() {
-                            let square = {
-                                let value = loadings[(row, col)];
-                                value * value
-                            };
-                            let y = square - compensation;
-                            let t = sum + y;
-                            compensation = (t - sum) - y;
-                            sum = t;
-                        }
-                        factors.push(sum);
-                    }
-                }
-            }
-            factors
-        } else {
-            Vec::new()
-        };
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
         let mut alignment_r2 = if opts.missing_axis_renormalization {
@@ -405,7 +363,7 @@ impl<'model> HwePcaProjector<'model> {
         progress.on_stage_finish(ProjectionProgressStage::Projection);
 
         if let Some(r2) = alignment_r2 {
-            let normalization = &normalization_factors;
+            let normalization = self.model.component_weighted_norms_sq();
             match alignment_out.as_mut() {
                 Some(alignment_mat) => {
                     for col in 0..components {
@@ -510,6 +468,7 @@ mod tests {
 
     use super::super::fit::{FitOptions, LdConfig, LdWindow};
     use super::super::progress::NoopFitProgress;
+    use serde_json::Value;
 
     const N_SAMPLES: usize = 3;
     const N_VARIANTS: usize = 4;
@@ -549,6 +508,143 @@ mod tests {
             &progress,
         )
         .expect("model fit with ld")
+    }
+
+    fn model_with_zero_norm_component() -> HwePcaModel {
+        let model = fit_example_model();
+        let components = model.components();
+        assert!(
+            components >= 2,
+            "example model should expose multiple components"
+        );
+        let zero_idx = components - 1;
+        let mut value = serde_json::to_value(&model).expect("serialize model");
+
+        if let Some(loadings) = value.get_mut("loadings").and_then(Value::as_object_mut) {
+            let nrows = loadings
+                .get("nrows")
+                .and_then(Value::as_u64)
+                .expect("loadings nrows") as usize;
+            if let Some(data) = loadings.get_mut("data").and_then(Value::as_array_mut) {
+                for row in 0..nrows {
+                    let idx = zero_idx * nrows + row;
+                    data[idx] = Value::from(0.0);
+                }
+            }
+        }
+
+        if let Some(scores) = value
+            .get_mut("sample_scores")
+            .and_then(Value::as_object_mut)
+        {
+            let nrows = scores
+                .get("nrows")
+                .and_then(Value::as_u64)
+                .expect("scores nrows") as usize;
+            if let Some(data) = scores.get_mut("data").and_then(Value::as_array_mut) {
+                for row in 0..nrows {
+                    let idx = zero_idx * nrows + row;
+                    data[idx] = Value::from(0.0);
+                }
+            }
+        }
+
+        if let Some(singular_values) = value
+            .get_mut("singular_values")
+            .and_then(Value::as_array_mut)
+        {
+            singular_values[zero_idx] = Value::from(0.0);
+        }
+        if let Some(eigenvalues) = value.get_mut("eigenvalues").and_then(Value::as_array_mut) {
+            if zero_idx < eigenvalues.len() {
+                eigenvalues[zero_idx] = Value::from(0.0);
+            }
+        }
+        if let Some(norms) = value
+            .get_mut("component_weighted_norms_sq")
+            .and_then(Value::as_array_mut)
+        {
+            norms[zero_idx] = Value::from(0.0);
+        }
+
+        serde_json::from_value(value).expect("deserialize mutated model")
+    }
+
+    fn recompute_component_norms_sq(model: &HwePcaModel) -> Vec<f64> {
+        let loadings = model.variant_loadings();
+        let ld_weights = model.ld().map(|ld| ld.weights.as_slice());
+        let weights = ld_weights.unwrap_or(&[]);
+        let n_weights = weights.len();
+        let mut result = Vec::with_capacity(loadings.ncols());
+
+        for col in 0..loadings.ncols() {
+            let mut sum = 0.0f64;
+            let mut compensation = 0.0f64;
+            for row in 0..loadings.nrows() {
+                let weight = if row < n_weights { weights[row] } else { 1.0 };
+                let value = loadings[(row, col)];
+                let weighted = weight * value;
+                let square = weighted * weighted;
+                let y = square - compensation;
+                let t = sum + y;
+                compensation = (t - sum) - y;
+                sum = t;
+            }
+
+            if !sum.is_finite() || sum < 0.0 {
+                sum = 0.0;
+            }
+            result.push(sum);
+        }
+
+        result
+    }
+
+    #[test]
+    fn cached_component_norms_match_manual_computation() {
+        let model = fit_example_model();
+        let manual = recompute_component_norms_sq(&model);
+        let cached = model.component_weighted_norms_sq();
+        assert_eq!(manual.len(), cached.len());
+        for (idx, (expected, actual)) in manual.iter().zip(cached.iter()).enumerate() {
+            assert!(
+                (expected - actual).abs() <= 1e-12,
+                "component {idx} mismatch: expected {expected}, cached {actual}",
+            );
+        }
+    }
+
+    #[test]
+    fn cached_component_norms_match_with_ld_weights() {
+        let model = fit_example_model_with_ld();
+        let manual = recompute_component_norms_sq(&model);
+        let cached = model.component_weighted_norms_sq();
+        assert_eq!(manual.len(), cached.len());
+        for (idx, (expected, actual)) in manual.iter().zip(cached.iter()).enumerate() {
+            assert!(
+                (expected - actual).abs() <= 1e-12,
+                "component {idx} mismatch: expected {expected}, cached {actual}",
+            );
+        }
+    }
+
+    #[test]
+    fn cached_component_norms_handle_zero_norm_components() {
+        let model = model_with_zero_norm_component();
+        let manual = recompute_component_norms_sq(&model);
+        let cached = model.component_weighted_norms_sq();
+        assert_eq!(manual.len(), cached.len());
+        let mut saw_zero = false;
+        for (idx, (expected, actual)) in manual.iter().zip(cached.iter()).enumerate() {
+            if expected.abs() <= 1e-12 {
+                saw_zero = true;
+            }
+            assert!(
+                (expected - actual).abs() <= 1e-12,
+                "component {idx} mismatch: expected {expected}, cached {actual}",
+            );
+        }
+        assert!(saw_zero, "expected at least one near-zero norm component");
     }
 
     fn assert_mats_close(a: &Mat<f64>, b: &Mat<f64>, tol: f64) {
