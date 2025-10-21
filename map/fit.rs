@@ -527,8 +527,8 @@ impl HweScaler {
         let scales = &self.scales[start..end];
         debug_assert_eq!(filled, scales.len());
 
-        let block = block.subcols_mut(0, filled);
-        let presence_out = presence_out.subcols_mut(0, filled);
+        let mut block = block.subcols_mut(0, filled);
+        let mut presence_out = presence_out.subcols_mut(0, filled);
 
         let apply_standardization =
             |column: ColMut<'_, f64>, presence_col: ColMut<'_, f64>, mean: f64, inv: f64| {
@@ -546,11 +546,11 @@ impl HweScaler {
         let use_parallel = filled >= 32 && par.degree() > 1;
 
         if use_parallel {
-            zip!(presence_out, block)
+            presence_out
                 .par_col_iter_mut()
+                .zip(block.par_col_iter_mut())
                 .enumerate()
-                .for_each(|(idx, mut columns)| {
-                    let unzip!(mut presence_col, mut column) = columns;
+                .for_each(|(idx, (presence_col, column))| {
                     let freq = freqs[idx];
                     let scale = scales[idx];
                     let mean = 2.0 * freq;
@@ -559,8 +559,9 @@ impl HweScaler {
                     apply_standardization(column, presence_col, mean, inv);
                 });
         } else {
-            for (idx, mut columns) in zip!(presence_out, block).col_iter_mut().enumerate() {
-                let unzip!(mut presence_col, mut column) = columns;
+            for idx in 0..filled {
+                let presence_col = presence_out.rb_mut().col_mut(idx);
+                let column = block.rb_mut().col_mut(idx);
                 let freq = freqs[idx];
                 let scale = scales[idx];
                 let mean = 2.0 * freq;

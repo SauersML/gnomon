@@ -527,7 +527,7 @@ impl ProjectionStageBar {
             }
             ProjectionStageBar::Spinner { bar, processed } => {
                 let processed_value = (*processed).min(total_u64);
-                let mut bar = mem::replace(bar, ProgressBar::hidden());
+                let bar = mem::replace(bar, ProgressBar::hidden());
                 bar.set_style(determinate_style());
                 bar.set_length(total_u64);
                 bar.set_message(ConsoleProjectionProgress::stage_message(stage));
