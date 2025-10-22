@@ -415,8 +415,7 @@ pub fn fit_model_for_fixed_rho(
                 let accept_step = if firth_active {
                     true
                 } else {
-                    penalized_deviance_trial
-                        <= penalized_deviance_current * (1.0 + 1e-12)
+                    penalized_deviance_trial <= penalized_deviance_current * (1.0 + 1e-12)
                         || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12
                 };
 
