@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
 import fnmatch
 import gzip
 import logging
+import os
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.error import URLError
@@ -29,6 +32,18 @@ DEFAULT_DATA_PATH = (
 GCS_CONNECTOR_URL = "https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar"
 DEFAULT_NUM_PCS = 10
 DEFAULT_OUTPUT_PREFIX = "hail_pca"
+
+
+def _available_cpu_count() -> int:
+    """Return the number of CPUs available to this process."""
+
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except (AttributeError, NotImplementedError):
+        pass
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count)
 
 
 def _infer_variant_format(path: str) -> str | None:
@@ -230,10 +245,18 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
         raise FileNotFoundError(f"No BCF files matched pattern '{pattern}'.")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="hail-bcf-"))
-    converted: List[str] = []
+    converted: List[Optional[str]] = [None] * len(matches)
     reference: Optional[str] = None
 
-    for index, source in enumerate(matches):
+    worker_count = max(1, min(len(matches), _available_cpu_count()))
+    if worker_count > 1:
+        logging.info(
+            "Converting %d BCF files to VCF with %d workers", len(matches), worker_count
+        )
+
+    reference_lock = threading.Lock()
+
+    def _convert_single(index: int, source: str) -> tuple[int, str, Optional[str]]:
         local_bcf = temp_dir / f"input_{index}.bcf"
         logging.info("Copying %s to %s for conversion", source, local_bcf)
         _copy_variant_to_local(source, local_bcf)
@@ -241,9 +264,9 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
 
         dest_path = temp_dir / f"converted_{index}.vcf.bgz"
         logging.info("Converting %s to %s", local_bcf, dest_path)
+        header_reference: Optional[str] = None
         with pysam.VariantFile(str(local_bcf)) as reader:
-            if reference is None:
-                reference = _guess_reference_from_header(reader.header)
+            header_reference = _guess_reference_from_header(reader.header)
             with pysam.VariantFile(str(dest_path), "wz", header=reader.header) as writer:
                 for record in reader:
                     writer.write(record)
@@ -251,14 +274,41 @@ def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[
         logging.info("Indexing converted VCF %s", dest_path)
         pysam.tabix_index(str(dest_path), preset="vcf", force=True)
 
+        for sidecar_suffix in (".csi", ".tbi", ".idx"):
+            try:
+                (local_bcf.with_name(f"{local_bcf.name}{sidecar_suffix}")).unlink()
+            except FileNotFoundError:
+                continue
+
         try:
             local_bcf.unlink()
         except FileNotFoundError:  # pragma: no cover - cleanup race
             pass
 
-        converted.append(str(dest_path.resolve()))
+        return index, str(dest_path.resolve()), header_reference
 
-    return converted, temp_dir, reference
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(_convert_single, index, source)
+            for index, source in enumerate(matches)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            idx, path, header_reference = future.result()
+            converted[idx] = path
+            if header_reference is not None:
+                with reference_lock:
+                    if reference is None:
+                        reference = header_reference
+
+    missing_indices = [idx for idx, path in enumerate(converted) if path is None]
+    if missing_indices:
+        raise RuntimeError(
+            "BCF conversion failed to produce output for inputs at indices "
+            + ", ".join(str(idx) for idx in missing_indices)
+        )
+
+    converted_paths = [path for path in converted if path is not None]
+    return converted_paths, temp_dir, reference
 
 
 def _infer_reference_genome(pattern: str) -> Optional[str]:
@@ -374,7 +424,11 @@ def _export_eigenvalues(eigenvalues: Iterable[float], output_prefix: str) -> Non
     eigenvalue_ht.export(f"{output_prefix}.eigenvalues.tsv.bgz")
 
 
-def run_pca(data_path: str, output_prefix: str, n_pcs: int) -> None:
+def run_pca(
+    data_path: str,
+    output_prefix: str,
+    n_pcs: int,
+) -> None:
     """Run PCA on the provided data and export the results."""
 
     logging.info(
@@ -435,7 +489,11 @@ def parse_args(args: List[str] | None = None) -> argparse.Namespace:
 def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
-    run_pca(args.data_path, args.output_prefix, args.num_pcs)
+    run_pca(
+        args.data_path,
+        args.output_prefix,
+        args.num_pcs,
+    )
 
 
 if __name__ == "__main__":
