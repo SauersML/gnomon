@@ -2,7 +2,7 @@ use grep::regex::RegexMatcher;
 use grep::searcher::{Searcher, Sink, SinkMatch};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
@@ -722,7 +722,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok()) // Ignore any errors during directory traversal.
-                .filter(|e| !e.path().starts_with("./target")) // Exclude the target directory.
+                .filter(|e| !is_in_target_directory(e.path())) // Exclude any target directories.
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             // Keep only .rs files.
             {
@@ -804,7 +804,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
                 .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -838,7 +838,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
                 .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -873,7 +873,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target"))
+                .filter(|e| !is_in_target_directory(e.path()))
                 .filter(|e| e.file_name() != "build.rs")
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -906,7 +906,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target"))
+                .filter(|e| !is_in_target_directory(e.path()))
                 .filter(|e| e.file_name() != "build.rs")
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -945,7 +945,7 @@ fn scan_for_allow_dead_code() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
                 .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -998,7 +998,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| !e.path().starts_with("./target")) // Exclude target directory
+                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
                 .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1037,4 +1037,9 @@ fn scan_for_ignored_tests() -> Vec<String> {
 
     // Return all violations found
     all_violations
+}
+
+fn is_in_target_directory(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == "target"))
 }
