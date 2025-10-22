@@ -497,3 +497,11 @@ In women, PGS ensemble + PCs:
 - 1.539613 OR/SD
 - 6.2% at 2x risk
 
+Let's check ICD code heterogeneity:
+
+<img width="989" height="390" alt="image" src="https://github.com/user-attachments/assets/93b62d4d-49a0-4301-bc0b-fafd69844fba" />
+
+<img width="989" height="390" alt="image" src="https://github.com/user-attachments/assets/d5397d26-b530-4378-bf8a-7b71bb2cd577" />
+
+
+
