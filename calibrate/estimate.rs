@@ -1316,6 +1316,7 @@ pub fn train_model(
                 standardize_pred: schema.standardize_pred,
                 standardize_se: schema.standardize_se,
                 standardize_dist: schema.standardize_dist,
+                interaction_center_pred: Some(schema.interaction_center_pred),
                 se_wiggle_only_drop: schema.se_wiggle_only_drop,
                 dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
                 lambda_pred: lambdas_cal[0],

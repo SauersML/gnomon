@@ -20,10 +20,11 @@ use crate::calibrate::estimate::{
 
 /// Features used to train the calibrator GAM
 pub struct CalibratorFeatures {
-    pub pred: Array1<f64>,          // η̃ (logit) or μ̃ (identity)
-    pub se: Array1<f64>,            // SẼ on the same scale
-    pub dist: Array1<f64>,          // signed distance to peeled hull (negative inside)
-    pub pred_identity: Array1<f64>, // baseline η (or μ) to preserve with identity backbone
+    pub pred: Array1<f64>,           // η̃ (logit) or μ̃ (identity)
+    pub se: Array1<f64>,             // SẼ on the same scale
+    pub dist: Array1<f64>,           // signed distance to peeled hull (negative inside)
+    pub pred_identity: Array1<f64>,  // baseline η (or μ) to preserve with identity backbone
+    pub fisher_weights: Array1<f64>, // final PIRLS weights (prior × Fisher) for metric-aware ops
 }
 
 /// Configuration of the calibrator smooths and penalties
@@ -81,6 +82,8 @@ pub struct CalibratorModel {
     pub standardize_pred: (f64, f64), // mean, std
     pub standardize_se: (f64, f64),
     pub standardize_dist: (f64, f64),
+    #[serde(default)]
+    pub interaction_center_pred: Option<f64>,
 
     // Flag for SE wiggle-only drop when SE range is negligible
     #[serde(alias = "se_linear_fallback")]
@@ -120,6 +123,7 @@ pub struct InternalSchema {
     pub standardize_pred: (f64, f64),
     pub standardize_se: (f64, f64),
     pub standardize_dist: (f64, f64),
+    pub interaction_center_pred: f64,
     pub se_wiggle_only_drop: bool,
     pub dist_wiggle_only_drop: bool,
     pub penalty_nullspace_dims: (usize, usize, usize, usize),
@@ -515,6 +519,7 @@ pub fn compute_alo_features(
         se: se_tilde,
         dist,
         pred_identity: eta_hat,
+        fisher_weights: base.final_weights.clone(),
     })
 }
 
@@ -598,6 +603,73 @@ pub fn build_calibrator_design(
             )));
         }
     }
+    if features.fisher_weights.len() != n {
+        return Err(EstimationError::InvalidSpecification(format!(
+            "Calibrator fisher weights length {} does not match number of observations {}",
+            features.fisher_weights.len(),
+            n
+        )));
+    }
+
+    fn normalized_constraint_weights(raw: &Array1<f64>) -> Array1<f64> {
+        let mut positives: Vec<f64> = raw
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+
+        if positives.is_empty() {
+            return Array1::zeros(raw.len());
+        }
+
+        positives.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if positives.len() % 2 == 1 {
+            positives[positives.len() / 2]
+        } else {
+            let upper = positives.len() / 2;
+            0.5 * (positives[upper - 1] + positives[upper])
+        };
+
+        let scale = if median.is_finite() && median > 0.0 {
+            median
+        } else {
+            positives.iter().copied().filter(|v| *v > 0.0).sum::<f64>()
+                / (positives.len().max(1) as f64)
+        };
+
+        raw.mapv(|v| {
+            if v.is_finite() && v > 0.0 {
+                v / scale
+            } else {
+                0.0
+            }
+        })
+    }
+
+    fn weighted_projection_norm(
+        basis: &Array2<f64>,
+        weights: &Array1<f64>,
+        target: Option<&Array1<f64>>,
+    ) -> f64 {
+        if basis.is_empty() {
+            return 0.0;
+        }
+        let mut accum = 0.0;
+        for col in 0..basis.ncols() {
+            let mut dot = 0.0;
+            for row in 0..basis.nrows() {
+                let w = weights[row];
+                if w <= 0.0 {
+                    continue;
+                }
+                let basis_val = basis[[row, col]];
+                let target_val = target.map(|t| t[row]).unwrap_or(1.0);
+                dot += w * basis_val * target_val;
+            }
+            accum += dot * dot;
+        }
+        accum.sqrt()
+    }
 
     // Standardize inputs and record parameters
     fn mean_and_std_raw(v: &Array1<f64>, weights: Option<&Array1<f64>>) -> (f64, f64) {
@@ -650,6 +722,26 @@ pub fn build_calibrator_design(
     }
 
     let weight_opt = spec.prior_weights.as_ref();
+    // Orthogonality is enforced in the same metric used for fitting: base PIRLS Fisher
+    // curvature combined with any explicit training weights supplied to the calibrator.
+    let constraint_weights_raw = if let Some(w) = spec.prior_weights.as_ref() {
+        features
+            .fisher_weights
+            .iter()
+            .zip(w.iter())
+            .map(|(&f, &p)| {
+                if f.is_finite() && p.is_finite() {
+                    f * p
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Array1<f64>>()
+    } else {
+        features.fisher_weights.clone()
+    };
+    let constraint_weights = normalized_constraint_weights(&constraint_weights_raw);
+    let ones = Array1::<f64>::ones(n);
     // The spline basis must be built on the same predictor channel that will be
     // available at inference time (the baseline logits).  Use the identity
     // backbone features for both the free identity column and the penalized
@@ -677,6 +769,9 @@ pub fn build_calibrator_design(
 
     // Compute robust statistics for the distance component
     let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw, weight_opt);
+
+    let (pred_mean_fisher, _) =
+        mean_and_std_raw(&features.pred_identity, Some(&constraint_weights));
 
     // Advanced heuristic for wiggle-only drop with multiple criteria
 
@@ -772,8 +867,9 @@ pub fn build_calibrator_design(
     );
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred_identity);
-    // Center the predictor on the weighted mean so interaction terms shrink toward c.
-    let pred_centered = features.pred_identity.mapv(|x| x - pred_mean);
+    // Center the predictor on the Fisher-weighted mean so interaction terms shrink toward c
+    // in the geometry used for REML.
+    let pred_centered = features.pred_identity.mapv(|x| x - pred_mean_fisher);
     let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
     let (dist_std, dist_ms) = if use_wiggle_only_dist {
         // Center only for wiggle-only drop to avoid extreme scaling
@@ -1076,9 +1172,6 @@ pub fn build_calibrator_design(
     let pred_raw_cols = b_pred_raw.ncols();
     let se_raw_cols = b_se_raw.ncols();
 
-    // Pull training weights for use in orthogonality constraints and STZ (weighted centering)
-    let w_for_stz = spec.prior_weights.as_ref().map(|w| w.view());
-
     let offset = features.pred_identity.clone();
 
     // Detect whether the predictor has any variation after standardization.
@@ -1103,7 +1196,11 @@ pub fn build_calibrator_design(
     } else {
         pred_constraint_order = spec.penalty_order_pred.min(pred_raw_cols);
         let z_pred = polynomial_constraint_matrix(&pred_std, pred_constraint_order);
-        match apply_weighted_orthogonality_constraint(b_pred_raw.view(), z_pred.view(), w_for_stz) {
+        match apply_weighted_orthogonality_constraint(
+            b_pred_raw.view(),
+            z_pred.view(),
+            Some(constraint_weights.view()),
+        ) {
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
@@ -1124,6 +1221,19 @@ pub fn build_calibrator_design(
 
     prune_near_zero_columns(&mut b_pred_c, &mut pred_constraint, "pred");
 
+    if b_pred_c.ncols() > 0 {
+        let norm_const = weighted_projection_norm(&b_pred_c, &constraint_weights, None);
+        let norm_linear = weighted_projection_norm(
+            &b_pred_c,
+            &constraint_weights,
+            Some(&features.pred_identity),
+        );
+        eprintln!(
+            "[CAL] pred wiggle Fisher-orthogonality: ||B^T W 1||={:.3e}, ||B^T W eta||={:.3e}",
+            norm_const, norm_linear
+        );
+    }
+
     let mut b_pred_param = Array2::<f64>::zeros((n, 0));
     if !pred_is_const {
         let param_dim = pred_constraint_order.min(2);
@@ -1138,7 +1248,7 @@ pub fn build_calibrator_design(
                 match apply_weighted_orthogonality_constraint(
                     b_pred_c.view(),
                     b_pred_param.view(),
-                    w_for_stz,
+                    Some(constraint_weights.view()),
                 ) {
                     Ok((b_reparam, transform)) => {
                         b_pred_c = b_reparam;
@@ -1172,7 +1282,7 @@ pub fn build_calibrator_design(
             spec.se_basis.degree,
             knots_se.len(),
             spec.penalty_order_se,
-            w_for_stz.is_some()
+            true
         );
         (
             Array2::<f64>::zeros((n, 0)),
@@ -1181,7 +1291,11 @@ pub fn build_calibrator_design(
     } else {
         let constraint_order = spec.penalty_order_se.min(se_raw_cols);
         let z = polynomial_constraint_matrix(&se_std, constraint_order);
-        match apply_weighted_orthogonality_constraint(b_se_raw.view(), z.view(), w_for_stz) {
+        match apply_weighted_orthogonality_constraint(
+            b_se_raw.view(),
+            z.view(),
+            Some(constraint_weights.view()),
+        ) {
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
                 eprintln!(
@@ -1211,10 +1325,46 @@ pub fn build_calibrator_design(
             b_se_c = Array2::<f64>::zeros((n, 0));
             stz_se = Array2::<f64>::zeros((stz_se.nrows(), 0));
         } else {
+            let mut interacted = b_se_c.clone();
             for (row, &pc) in pred_centered.iter().enumerate() {
-                for col in 0..b_se_c.ncols() {
-                    b_se_c[[row, col]] *= pc;
+                for col in 0..interacted.ncols() {
+                    interacted[[row, col]] *= pc;
                 }
+            }
+            let mut backbone_constraints = Array2::<f64>::zeros((n, 2));
+            backbone_constraints.column_mut(0).assign(&ones);
+            backbone_constraints
+                .column_mut(1)
+                .assign(&features.pred_identity);
+            match apply_weighted_orthogonality_constraint(
+                interacted.view(),
+                backbone_constraints.view(),
+                Some(constraint_weights.view()),
+            ) {
+                Ok((basis_ortho, transform)) => {
+                    let norm_const =
+                        weighted_projection_norm(&basis_ortho, &constraint_weights, None);
+                    let norm_linear = weighted_projection_norm(
+                        &basis_ortho,
+                        &constraint_weights,
+                        Some(&features.pred_identity),
+                    );
+                    eprintln!(
+                        "[CAL] se interaction Fisher-orthogonality: ||B^T W 1||={:.3e}, ||B^T W eta||={:.3e}",
+                        norm_const, norm_linear
+                    );
+                    b_se_c = basis_ortho;
+                    stz_se = stz_se.dot(&transform);
+                }
+                Err(BasisError::ConstraintNullspaceNotFound) => {
+                    eprintln!(
+                        "[CAL][WARN] block=se reason=interaction_nullspace_consumes_basis action=drop_block raw_cols={}",
+                        interacted.ncols()
+                    );
+                    b_se_c = Array2::<f64>::zeros((n, 0));
+                    stz_se = Array2::<f64>::zeros((stz_se.nrows(), 0));
+                }
+                Err(err) => return Err(EstimationError::BasisError(err)),
             }
         }
     }
@@ -1292,7 +1442,7 @@ pub fn build_calibrator_design(
         let (b_dist_c, stz_dist) = match apply_weighted_orthogonality_constraint(
             b_dist_raw.view(),
             z.view(),
-            w_for_stz,
+            Some(constraint_weights.view()),
         ) {
             Ok(res) => res,
             Err(BasisError::ConstraintNullspaceNotFound) => {
@@ -1332,10 +1482,46 @@ pub fn build_calibrator_design(
             b_dist_c = Array2::<f64>::zeros((n, 0));
             stz_dist = Array2::<f64>::zeros((stz_dist.nrows(), 0));
         } else {
+            let mut interacted = b_dist_c.clone();
             for (row, &pc) in pred_centered.iter().enumerate() {
-                for col in 0..b_dist_c.ncols() {
-                    b_dist_c[[row, col]] *= pc;
+                for col in 0..interacted.ncols() {
+                    interacted[[row, col]] *= pc;
                 }
+            }
+            let mut backbone_constraints = Array2::<f64>::zeros((n, 2));
+            backbone_constraints.column_mut(0).assign(&ones);
+            backbone_constraints
+                .column_mut(1)
+                .assign(&features.pred_identity);
+            match apply_weighted_orthogonality_constraint(
+                interacted.view(),
+                backbone_constraints.view(),
+                Some(constraint_weights.view()),
+            ) {
+                Ok((basis_ortho, transform)) => {
+                    let norm_const =
+                        weighted_projection_norm(&basis_ortho, &constraint_weights, None);
+                    let norm_linear = weighted_projection_norm(
+                        &basis_ortho,
+                        &constraint_weights,
+                        Some(&features.pred_identity),
+                    );
+                    eprintln!(
+                        "[CAL] dist interaction Fisher-orthogonality: ||B^T W 1||={:.3e}, ||B^T W eta||={:.3e}",
+                        norm_const, norm_linear
+                    );
+                    b_dist_c = basis_ortho;
+                    stz_dist = stz_dist.dot(&transform);
+                }
+                Err(BasisError::ConstraintNullspaceNotFound) => {
+                    eprintln!(
+                        "[CAL][WARN] block=dist reason=interaction_nullspace_consumes_basis action=drop_block raw_cols={}",
+                        interacted.ncols()
+                    );
+                    b_dist_c = Array2::<f64>::zeros((n, 0));
+                    stz_dist = Array2::<f64>::zeros((stz_dist.nrows(), 0));
+                }
+                Err(err) => return Err(EstimationError::BasisError(err)),
             }
         }
     }
@@ -1353,6 +1539,8 @@ pub fn build_calibrator_design(
     };
     // s_dist_raw0 is already created in the if-else block above
 
+    // Backbone adjustments (intercept and slope tweaks) keep their own ridge penalty so
+    // REML can decide how much to shrink them relative to the wiggle block.
     let s_pred_param_raw = if b_pred_param.ncols() > 0 {
         Array2::<f64>::eye(b_pred_param.ncols())
     } else {
@@ -1396,8 +1584,9 @@ pub fn build_calibrator_design(
     }
 
     // Assemble X = [B_pred_wiggle | B_pred_param | B_se | B_dist] and keep the identity
-    // backbone as an offset.  The wiggle block has the polynomial nullspace removed;
-    // the intercept and slope adjustments live in the param block with their own ridge.
+    // backbone as an offset.  The wiggle block has the polynomial nullspace removed,
+    // while the intercept and slope adjustments live in the param block with their own
+    // ridge penalty that REML scales alongside the wiggle smoothing parameter.
     let pred_off = 0usize;
     let pred_param_off = pred_off + b_pred_c.ncols();
     let p_cols = b_pred_c.ncols() + b_pred_param.ncols() + b_se_c.ncols() + b_dist_c.ncols();
@@ -1523,6 +1712,7 @@ pub fn build_calibrator_design(
         standardize_pred: pred_ms,
         standardize_se: se_ms,
         standardize_dist: dist_ms,
+        interaction_center_pred: pred_mean_fisher,
         se_wiggle_only_drop,
         dist_wiggle_only_drop: use_wiggle_only_dist,
         penalty_nullspace_dims: (
@@ -1566,10 +1756,11 @@ pub fn predict_calibrator(
 ) -> Result<Array1<f64>, EstimationError> {
     // Standardize inputs using stored params
     let (mp, sp) = model.standardize_pred;
+    let pred_center = model.interaction_center_pred.unwrap_or(mp);
     let (ms, ss) = model.standardize_se;
     let (md, sd) = model.standardize_dist;
     let pred_std = pred.mapv(|x| (x - mp) / sp.max(1e-8_f64));
-    let pred_centered = pred.mapv(|x| x - mp);
+    let pred_centered = pred.mapv(|x| x - pred_center);
     let se_std = se.mapv(|x| (x - ms) / ss.max(1e-8_f64));
 
     // Important: Apply hinge in raw space before standardization,
@@ -3539,6 +3730,7 @@ mod tests {
             se,
             dist,
             pred_identity: constant_pred,
+            fisher_weights: Array1::ones(n),
         };
 
         let spec = CalibratorSpec {
@@ -3624,6 +3816,7 @@ mod tests {
             se,
             dist,
             pred_identity: constant_pred,
+            fisher_weights: Array1::ones(n),
         };
 
         let spec = CalibratorSpec {
@@ -3694,6 +3887,7 @@ mod tests {
             se,
             dist,
             pred_identity: constant_pred,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec with sum-to-zero constraint
@@ -3786,6 +3980,7 @@ mod tests {
             se,
             dist,
             pred_identity: pred,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create two calibrator specs with different ridge values
@@ -3968,6 +4163,7 @@ mod tests {
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: base_pred,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec
@@ -4071,6 +4267,7 @@ mod tests {
             se,
             dist,
             pred_identity: pred,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec
@@ -4211,6 +4408,7 @@ mod tests {
             se,
             dist,
             pred_identity: pred,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec
@@ -4324,6 +4522,7 @@ mod tests {
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: pred_vals,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec with very small ridge to encourage numerical issues
@@ -4532,6 +4731,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -4686,6 +4886,7 @@ mod tests {
                 standardize_pred: schema.standardize_pred,
                 standardize_se: schema.standardize_se,
                 standardize_dist: schema.standardize_dist,
+                interaction_center_pred: Some(schema.interaction_center_pred),
                 se_wiggle_only_drop: schema.se_wiggle_only_drop,
                 dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
                 lambda_pred: lambdas[0],
@@ -4745,6 +4946,9 @@ mod tests {
         let small_improvement = ece_improvement_for_amplitude(0.05);
         let large_improvement = ece_improvement_for_amplitude(2.0);
 
+        // With Fisher-metric orthogonality in place the backbone ridge stays active:
+        // REML keeps the intercept/slope block available instead of collapsing it, so
+        // the large-miscalibration case exhibits a meaningfully bigger gain.
         assert!(
             large_improvement >= small_improvement + 0.05,
             "Expected larger miscalibration to benefit more: large ΔECE = {:.4}, small ΔECE = {:.4}",
@@ -4846,6 +5050,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5004,6 +5209,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5299,6 +5505,7 @@ mod tests {
             se: se_raw.clone(),
             dist: dist.clone(),
             pred_identity: pred_standardized.clone(),
+            fisher_weights: Array1::ones(n),
         };
 
         let spec = CalibratorSpec {
@@ -5356,6 +5563,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5480,6 +5688,7 @@ mod tests {
             se: alo_features.se,
             dist: Array1::zeros(n),
             pred_identity: alo_features.pred_identity,
+            fisher_weights: alo_features.fisher_weights,
         };
 
         let spec = CalibratorSpec {
@@ -5563,6 +5772,7 @@ mod tests {
             se,
             dist,
             pred_identity: pred,
+            fisher_weights: weights.clone(),
         };
 
         // Create calibrator spec
@@ -5646,6 +5856,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5754,6 +5965,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5915,11 +6127,13 @@ mod tests {
         }
 
         // Create calibrator features directly
+        let fisher_weights = base_probs.mapv(|p| p * (1.0 - p));
         let features = CalibratorFeatures {
             pred: distorted_eta.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: distorted_eta,
+            fisher_weights,
         };
 
         // Create calibrator spec
@@ -6092,11 +6306,13 @@ mod tests {
             y[i] = if dist.sample(&mut rng) { 1.0 } else { 0.0 };
         }
 
+        let fisher_weights = base_probs.mapv(|p| p * (1.0 - p));
         let features = CalibratorFeatures {
             pred: distorted_eta.clone(),
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: distorted_eta,
+            fisher_weights,
         };
 
         let spec = CalibratorSpec {
@@ -6190,6 +6406,7 @@ mod tests {
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: mu_true,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec
@@ -6690,6 +6907,7 @@ mod tests {
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: pred_vals,
+            fisher_weights: w.clone(),
         };
 
         // Create calibrator spec with very large lambda values to force numerical challenges
@@ -6809,6 +7027,7 @@ mod tests {
             se: Array1::from_elem(n, 0.5),
             dist: Array1::zeros(n),
             pred_identity: pred_vals,
+            fisher_weights: Array1::ones(n),
         };
 
         // Create calibrator spec
@@ -6986,6 +7205,7 @@ mod tests {
             standardize_pred: schema.standardize_pred,
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
+            interaction_center_pred: Some(schema.interaction_center_pred),
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -7395,14 +7615,6 @@ mod tests {
         println!("\nSTZ Column Means vs Coefficient Sums Test:");
         println!("Mean y: {:.3}, logit(mean_y): {:.3}", mean_y, logit_mean_y);
 
-        // Create calibrator features
-        let features = CalibratorFeatures {
-            pred: varying_pred.clone(),
-            se,
-            dist,
-            pred_identity: varying_pred,
-        };
-
         // Create calibrator spec with sum-to-zero constraint and both uniform and non-uniform weights
         let spec_uniform = CalibratorSpec {
             link: LinkFunction::Logit,
@@ -7435,6 +7647,21 @@ mod tests {
             weights[i] = 0.5; // Lower weights for others
         }
 
+        let features_uniform = CalibratorFeatures {
+            pred: varying_pred.clone(),
+            se: se.clone(),
+            dist: dist.clone(),
+            pred_identity: varying_pred.clone(),
+            fisher_weights: Array1::ones(n),
+        };
+        let features_weighted = CalibratorFeatures {
+            pred: varying_pred.clone(),
+            se,
+            dist,
+            pred_identity: varying_pred,
+            fisher_weights: weights.clone(),
+        };
+
         let spec_nonuniform = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
@@ -7460,7 +7687,7 @@ mod tests {
         // Build designs and fit models for both weight cases
         println!("\nCase 1: Uniform weights");
         let (x_uniform, penalties_uniform, schema_uniform, offset_uniform) =
-            build_calibrator_design(&features, &spec_uniform).unwrap();
+            build_calibrator_design(&features_uniform, &spec_uniform).unwrap();
 
         let penalty_nullspace_dims_uniform =
             active_penalty_nullspace_dims(&schema_uniform, &penalties_uniform);
@@ -7477,7 +7704,7 @@ mod tests {
 
         println!("\nCase 2: Non-uniform weights");
         let (x_nonuniform, penalties_nonuniform, schema_nonuniform, offset_nonuniform) =
-            build_calibrator_design(&features, &spec_nonuniform).unwrap();
+            build_calibrator_design(&features_weighted, &spec_nonuniform).unwrap();
 
         let penalty_nullspace_dims_nonuniform =
             active_penalty_nullspace_dims(&schema_nonuniform, &penalties_nonuniform);
