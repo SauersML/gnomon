@@ -570,9 +570,75 @@ fn main() {
 fn manually_check_for_unused_variables() {
     // Force compilation to fail with unused_variables, dead_code, and unused_imports lint
     // This ensures build.rs itself follows the strict coding policy
-    let build_path = Path::new("build.rs");
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let build_path = manifest_dir.join("shared/build.rs");
+
+    if !build_path.exists() {
+        emit_stage_detail("manual lint self-check: build script source not found");
+        eprintln!(
+            "manual lint self-check fatal error: build script source file {:?} is missing",
+            build_path
+        );
+        std::process::exit(1);
+    }
+
+    let deps_dir = match build_dependencies_directory() {
+        Some(path) => path,
+        None => {
+            emit_stage_detail(
+                "manual lint self-check: could not determine build dependency directory",
+            );
+            eprintln!(
+                "manual lint self-check fatal error: unable to derive build dependency directory from OUT_DIR"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let mut manual_lint_args = manual_lint_arguments(&build_path);
+    let source_path = match manual_lint_args.pop() {
+        Some(path) => path,
+        None => {
+            emit_stage_detail(
+                "manual lint self-check: unable to obtain source path from manual lint arguments",
+            );
+            eprintln!(
+                "manual lint self-check fatal error: manual lint argument assembly failed to include the source path"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    manual_lint_args.push(OsString::from("-L"));
+    manual_lint_args.push(
+        OsString::from(format!("dependency={}", deps_dir.display())),
+    );
+
+    for crate_name in ["grep", "walkdir"] {
+        match locate_build_dependency(&deps_dir, crate_name) {
+            Some(artifact_path) => {
+                manual_lint_args.push(OsString::from("--extern"));
+                manual_lint_args.push(
+                    OsString::from(format!("{crate_name}={}", artifact_path.display())),
+                );
+            }
+            None => {
+                emit_stage_detail(&format!(
+                    "manual lint self-check: missing rlib for dependency '{crate_name}'"
+                ));
+                eprintln!(
+                    "manual lint self-check fatal error: required dependency '{crate_name}' rlib not found in {:?}",
+                    deps_dir
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    manual_lint_args.push(source_path);
     let rustc_binary = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-    let manual_lint_args = manual_lint_arguments(build_path);
 
     update_stage("manual lint self-check: running rustc");
     emit_stage_detail(&format!(
@@ -621,6 +687,7 @@ fn manually_check_for_unused_variables() {
     }
 
     let mut command = std::process::Command::new(&rustc_binary);
+    command.current_dir(&manifest_dir);
     command.args(&manual_lint_args);
 
     update_stage("manual lint self-check: invoking rustc");
@@ -663,6 +730,19 @@ fn manually_check_for_unused_variables() {
                     eprintln!("\n⚠️ Unused imports are STRICTLY FORBIDDEN in this project.");
                     eprintln!("   Either use the imported item or remove the import completely.");
                     std::process::exit(1);
+                } else {
+                    eprintln!(
+                        "manual lint self-check fatal error: rustc self-lint exited with status {}",
+                        output
+                            .status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| String::from("<signal>"))
+                    );
+                    if !output.stderr.is_empty() {
+                        eprintln!("rustc self-lint stderr:\n{}", stderr);
+                    }
+                    std::process::exit(1);
                 }
             } else {
                 emit_stage_detail("Completed rustc self-lint for build.rs");
@@ -673,8 +753,9 @@ fn manually_check_for_unused_variables() {
                 "manual lint self-check: failed to start rustc self-lint command: {err}"
             ));
             eprintln!(
-                "cargo:warning=Could not check for unused variables/functions/imports in build.rs"
+                "manual lint self-check fatal error: failed to spawn rustc self-lint command: {err}"
             );
+            std::process::exit(1);
         }
     }
 }
@@ -695,6 +776,38 @@ fn manual_lint_arguments(build_path: &Path) -> Vec<OsString> {
         OsString::from("human"),
         build_path.as_os_str().to_os_string(),
     ]
+}
+
+fn build_dependencies_directory() -> Option<PathBuf> {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR")?);
+    let profile_dir = out_dir.ancestors().nth(3)?;
+    Some(profile_dir.join("deps"))
+}
+
+fn locate_build_dependency(deps_dir: &Path, crate_name: &str) -> Option<PathBuf> {
+    let prefix = format!("lib{crate_name}-");
+    let mut candidate: Option<PathBuf> = None;
+
+    if let Ok(entries) = std::fs::read_dir(deps_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rlib") {
+                continue;
+            }
+
+            let file_name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if file_name.starts_with(&prefix) {
+                candidate = Some(path);
+                break;
+            }
+        }
+    }
+
+    candidate
 }
 
 fn command_preview(program: &OsStr, args: &[OsString]) -> String {
