@@ -46,7 +46,7 @@ Create a standard cloud analysis environment with 8 CPUs and 30 GB RAM (though u
 
 Install gnomon if you haven't already:
 ```
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && { for f in ~/.bashrc ~/.profile; do [ -f "$f" ] || touch "$f"; grep -qxF 'source "$HOME/.cargo/env"' "$f" || printf '\n# Rust / Cargo\nsource "$HOME/.cargo/env"\n' >> "$f"; done; } && source "$HOME/.cargo/env" && rm -rf gnomon && git clone https://github.com/SauersML/gnomon.git && cd gnomon && rustup toolchain install nightly && rustup override set nightly && cargo build --release && cd ~
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y && { for f in ~/.bashrc ~/.profile; do [ -f "$f" ] || touch "$f"; grep -qxF 'source "$HOME/.cargo/env"' "$f" || printf '\n# Rust / Cargo\nsource "$HOME/.cargo/env"\n' >> "$f"; done; } && source "$HOME/.cargo/env" && rm -rf gnomon && git clone https://github.com/SauersML/gnomon.git && cd gnomon && cargo build --release && cd ~
 ```
 
 For now, let's download the microarray data. This may impact the variant overlap of our scores.
