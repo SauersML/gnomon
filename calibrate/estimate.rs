@@ -320,12 +320,73 @@ fn run_gradient_check(
     Ok(())
 }
 
+fn check_rho_gradient_stationarity(
+    label: &str,
+    reml_state: &RemlState<'_>,
+    final_z: &Array1<f64>,
+    tol_z: f64,
+) -> Result<(f64, bool), EstimationError> {
+    let rho = to_rho_from_z(final_z);
+    let grad_rho = reml_state.compute_gradient(&rho)?;
+    let grad_norm_rho = grad_rho.dot(&grad_rho).sqrt();
+    let max_abs_grad = grad_rho
+        .iter()
+        .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+    let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+
+    let tol_rho = (tol_z / RHO_BOUND.max(1.0)).max(1e-12);
+    let mut is_stationary = grad_norm_rho <= tol_rho;
+
+    let boundary_margin = 1.0_f64;
+    let mut boundary_push = false;
+    for (&rho_i, &grad_i) in rho.iter().zip(grad_rho.iter()) {
+        let dist_to_bound = RHO_BOUND - rho_i.abs();
+        if dist_to_bound <= boundary_margin {
+            if rho_i > 0.0 && grad_i < -tol_rho {
+                boundary_push = true;
+                break;
+            }
+            if rho_i < 0.0 && grad_i > tol_rho {
+                boundary_push = true;
+                break;
+            }
+        }
+    }
+
+    if boundary_push {
+        is_stationary = false;
+        eprintln!(
+            "[Candidate {label}] Gradient pushes outside rho bound (max|rho|={:.2}, max|∇ρ|={:.3e}); marking as non-stationary",
+            max_abs_rho, max_abs_grad
+        );
+    }
+
+    if !boundary_push && grad_norm_rho > tol_rho {
+        eprintln!(
+            "[Candidate {label}] rho-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
+            grad_norm_rho, tol_rho
+        );
+        is_stationary = false;
+    }
+
+    eprintln!(
+        "[Candidate {label}] rho-space gradient norm {:.3e} (tol {:.3e}); max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
+        grad_norm_rho,
+        tol_rho,
+        max_abs_grad,
+        max_abs_rho,
+        is_stationary
+    );
+
+    Ok((grad_norm_rho, is_stationary))
+}
+
 fn run_bfgs_for_candidate(
     label: &str,
     reml_state: &RemlState<'_>,
     config: &ModelConfig,
     initial_z: Array1<f64>,
-) -> Result<BfgsSolution, EstimationError> {
+) -> Result<(BfgsSolution, f64, bool), EstimationError> {
     eprintln!("\n[Candidate {label}] Running BFGS optimization from queued seed");
     let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(config.reml_convergence_tolerance)
@@ -380,7 +441,14 @@ fn run_bfgs_for_candidate(
         )));
     }
 
-    Ok(solution)
+    let (grad_norm_rho, is_stationary) = check_rho_gradient_stationarity(
+        label,
+        reml_state,
+        &solution.final_point,
+        config.reml_convergence_tolerance,
+    )?;
+
+    Ok((solution, grad_norm_rho, is_stationary))
 }
 
 fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -837,7 +905,14 @@ pub fn train_model(
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
 
-    let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution)> = Vec::new();
+    let mut successful_runs: Vec<(
+        String,
+        Option<usize>,
+        Option<f64>,
+        BfgsSolution,
+        f64,
+        bool,
+    )> = Vec::new();
     let mut last_error: Option<EstimationError> = None;
 
     for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
@@ -860,12 +935,19 @@ pub fn train_model(
         }
 
         match run_bfgs_for_candidate(&label, &reml_state, config, initial_z) {
-            Ok(solution) => {
+            Ok((solution, grad_norm_rho, is_stationary)) => {
                 eprintln!(
                     "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
                     solution.iterations, solution.final_value
                 );
-                successful_runs.push((label, seed_index, seed_cost, solution));
+                successful_runs.push((
+                    label,
+                    seed_index,
+                    seed_cost,
+                    solution,
+                    grad_norm_rho,
+                    is_stationary,
+                ));
                 continue;
             }
             Err(err) => {
@@ -888,12 +970,19 @@ pub fn train_model(
         match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
             Ok(()) => {
                 match run_bfgs_for_candidate(&fallback_label, &reml_state, config, fallback_z) {
-                    Ok(solution) => {
+                    Ok((solution, grad_norm_rho, is_stationary)) => {
                         eprintln!(
                             "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
                             solution.iterations, solution.final_value
                         );
-                        successful_runs.push((fallback_label, None, None, solution));
+                        successful_runs.push((
+                            fallback_label,
+                            None,
+                            None,
+                            solution,
+                            grad_norm_rho,
+                            is_stationary,
+                        ));
                     }
                     Err(err) => {
                         eprintln!("[Fallback] BFGS failed: {err}");
@@ -916,13 +1005,70 @@ pub fn train_model(
         }
     }
 
-    let (best_label, best_seed_index, best_seed_cost, best_solution) = successful_runs
-        .into_iter()
-        .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
-            Some(order) => order,
-            None => std::cmp::Ordering::Equal,
-        })
-        .unwrap();
+    let (stationary_runs, non_stationary_runs): (
+        Vec<(
+            String,
+            Option<usize>,
+            Option<f64>,
+            BfgsSolution,
+            f64,
+            bool,
+        )>,
+        Vec<(
+            String,
+            Option<usize>,
+            Option<f64>,
+            BfgsSolution,
+            f64,
+            bool,
+        )>,
+    ) = successful_runs.into_iter().partition(|entry| entry.5);
+
+    let select_by_final_value = |
+        entries: Vec<(
+            String,
+            Option<usize>,
+            Option<f64>,
+            BfgsSolution,
+            f64,
+            bool,
+        )>,
+    | {
+        entries
+            .into_iter()
+            .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
+                Some(order) => order,
+                None => std::cmp::Ordering::Equal,
+            })
+    };
+
+    let (
+        best_label,
+        best_seed_index,
+        best_seed_cost,
+        best_solution,
+        best_grad_norm_rho,
+        best_stationary,
+    ) = if let Some(best) = select_by_final_value(stationary_runs) {
+        best
+    } else {
+        let fallback = non_stationary_runs
+            .into_iter()
+            .min_by(|a, b| match a.4.partial_cmp(&b.4) {
+                Some(order) => order,
+                None => std::cmp::Ordering::Equal,
+            })
+            .unwrap();
+        eprintln!(
+            "\n[Winner] WARNING: no stationary candidates found; selecting minimal rho gradient norm ({:.3e}).",
+            fallback.4
+        );
+        log::warn!(
+            "REML optimizer could not find a stationary candidate; using minimal rho gradient norm {:.3e}.",
+            fallback.4
+        );
+        fallback
+    };
 
     let BfgsSolution {
         final_point: final_z,
@@ -940,6 +1086,11 @@ pub fn train_model(
     if let Some(cost) = best_seed_cost {
         eprintln!("  -> Seed cost: {cost:.6}");
     }
+    eprintln!(
+        "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
+        best_grad_norm_rho,
+        best_stationary
+    );
     log::info!("REML optimization completed successfully");
 
     // --- Finalize the Model (same as before) ---
