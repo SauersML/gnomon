@@ -7017,16 +7017,26 @@ mod tests {
             logits.push((clamped / (1.0 - clamped)).ln());
         }
 
-        let mut intercept = 0.0f64;
-        let mut slope = 1.0f64;
+        const MAX_ITERS: usize = 50;
 
-        for _ in 0..50 {
+        // The intercept and slope are highly correlated when the logits are
+        // far from zero, which is exactly the regime that triggers the
+        // calibration failures seen in production.  Re-parameterize the IRLS
+        // solve around mean-centered logits so that the normal equations stay
+        // well conditioned without biasing the fitted slope.
+        let mean_logit = logits.iter().sum::<f64>() / n as f64;
+        let centered_logits: Vec<f64> = logits.iter().map(|&x| x - mean_logit).collect();
+
+        let mut beta0 = mean_logit; // intercept in the centered basis
+        let mut beta1 = 1.0f64; // slope
+
+        for _ in 0..MAX_ITERS {
             let mut mu = Vec::with_capacity(n);
             let mut weights = Vec::with_capacity(n);
             let mut z = Vec::with_capacity(n);
 
             for i in 0..n {
-                let linear = intercept + slope * logits[i];
+                let linear = beta0 + beta1 * centered_logits[i];
                 let mu_i = 1.0 / (1.0 + (-linear).exp());
                 let mu_clamped = mu_i.clamp(1e-8, 1.0 - 1e-8);
                 let weight = (mu_clamped * (1.0 - mu_clamped)).max(1e-12);
@@ -7041,7 +7051,7 @@ mod tests {
             let mut xtwx11 = 0.0;
             for i in 0..n {
                 let w = weights[i];
-                let x1 = logits[i];
+                let x1 = centered_logits[i];
                 xtwx00 += w;
                 xtwx01 += w * x1;
                 xtwx11 += w * x1 * x1;
@@ -7063,7 +7073,7 @@ mod tests {
 
             for i in 0..n {
                 let w = weights[i];
-                let x1 = logits[i];
+                let x1 = centered_logits[i];
                 let hat = w * (inv00 + 2.0 * inv01 * x1 + inv11 * x1 * x1);
                 let adjustment = hat * (0.5 - mu[i]);
                 z[i] += adjustment / w;
@@ -7073,25 +7083,28 @@ mod tests {
             let mut xtwz1 = 0.0;
             for i in 0..n {
                 let w = weights[i];
-                let x1 = logits[i];
+                let x1 = centered_logits[i];
                 let zi = z[i];
                 xtwz0 += w * zi;
                 xtwz1 += w * zi * x1;
             }
 
-            let new_intercept = inv00 * xtwz0 + inv01 * xtwz1;
-            let new_slope = inv01 * xtwz0 + inv11 * xtwz1;
+            let new_beta0 = inv00 * xtwz0 + inv01 * xtwz1;
+            let new_beta1 = inv01 * xtwz0 + inv11 * xtwz1;
 
-            let delta_intercept = new_intercept - intercept;
-            let delta_slope = new_slope - slope;
+            let delta_beta0 = new_beta0 - beta0;
+            let delta_beta1 = new_beta1 - beta1;
 
-            intercept = new_intercept;
-            slope = new_slope;
+            beta0 = new_beta0;
+            beta1 = new_beta1;
 
-            if delta_intercept.abs().max(delta_slope.abs()) < 1e-6 {
+            if delta_beta0.abs().max(delta_beta1.abs()) < 1e-6 {
                 break;
             }
         }
+
+        let intercept = beta0 - beta1 * mean_logit;
+        let slope = beta1;
 
         (intercept, slope)
     }
@@ -7121,7 +7134,9 @@ mod tests {
         let n_small = 10;
         let (_, calibrated_probs) = fit_sinusoidal_calibrator_fixture(n_small, 2024);
 
-        let min_prob = calibrated_probs.iter().fold(f64::INFINITY, |acc, &p| acc.min(p));
+        let min_prob = calibrated_probs
+            .iter()
+            .fold(f64::INFINITY, |acc, &p| acc.min(p));
         let max_prob = calibrated_probs
             .iter()
             .fold(f64::NEG_INFINITY, |acc, &p| acc.max(p));
