@@ -3191,9 +3191,12 @@ mod tests {
             "Saturated dataset should produce max abs error > 1e-1; observed {:.3e}",
             max_abs_pred
         );
+        // The Firth bias-reduced IRLS used in real_unpenalized_fit suppresses the
+        // most extreme working-response updates, but saturated points should still
+        // trigger very large z-η gaps.
         assert!(
-            max_working_jump > 35.0,
-            "Expected at least one working-response jump > 35; observed {:.3e}",
+            max_working_jump > 25.0,
+            "Expected at least one working-response jump > 25; observed {:.3e}",
             max_working_jump
         );
     }
