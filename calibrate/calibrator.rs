@@ -770,21 +770,8 @@ pub fn build_calibrator_design(
     // Compute robust statistics for the distance component
     let (dist_mean, dist_std_raw) = mean_and_std_raw(&dist_raw, weight_opt);
 
-    let (pred_mean_fisher, pred_std_fisher_raw) =
+    let (pred_mean_fisher, _) =
         mean_and_std_raw(&features.pred_identity, Some(&constraint_weights));
-    let (pred_std_fisher, _) = standardize_with(
-        pred_mean_fisher,
-        pred_std_fisher_raw,
-        &features.pred_identity,
-    );
-
-    let (se_mean_fisher, se_std_fisher_raw) =
-        mean_and_std_raw(&features.se, Some(&constraint_weights));
-    let (se_std_fisher, _) = standardize_with(se_mean_fisher, se_std_fisher_raw, &features.se);
-
-    let (dist_mean_fisher, dist_std_fisher_raw) =
-        mean_and_std_raw(&dist_raw, Some(&constraint_weights));
-    let (dist_std_fisher, _) = standardize_with(dist_mean_fisher, dist_std_fisher_raw, &dist_raw);
 
     // Advanced heuristic for wiggle-only drop with multiple criteria
 
