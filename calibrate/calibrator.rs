@@ -612,7 +612,6 @@ pub fn build_calibrator_design(
     }
 
     fn normalized_constraint_weights(raw: &Array1<f64>) -> Array1<f64> {
-        const EPS: f64 = 1e-6;
         let mut positives: Vec<f64> = raw
             .iter()
             .copied()
@@ -620,7 +619,7 @@ pub fn build_calibrator_design(
             .collect();
 
         if positives.is_empty() {
-            return Array1::ones(raw.len());
+            return Array1::zeros(raw.len());
         }
 
         positives.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -640,9 +639,9 @@ pub fn build_calibrator_design(
 
         raw.mapv(|v| {
             if v.is_finite() && v > 0.0 {
-                (v / scale).max(EPS)
+                v / scale
             } else {
-                EPS
+                0.0
             }
         })
     }
@@ -723,7 +722,25 @@ pub fn build_calibrator_design(
     }
 
     let weight_opt = spec.prior_weights.as_ref();
-    let constraint_weights = normalized_constraint_weights(&features.fisher_weights);
+    // Orthogonality is enforced in the same metric used for fitting: base PIRLS Fisher
+    // curvature combined with any explicit training weights supplied to the calibrator.
+    let constraint_weights_raw = if let Some(w) = spec.prior_weights.as_ref() {
+        features
+            .fisher_weights
+            .iter()
+            .zip(w.iter())
+            .map(|(&f, &p)| {
+                if f.is_finite() && p.is_finite() {
+                    f * p
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Array1<f64>>()
+    } else {
+        features.fisher_weights.clone()
+    };
+    let constraint_weights = normalized_constraint_weights(&constraint_weights_raw);
     let ones = Array1::<f64>::ones(n);
     // The spline basis must be built on the same predictor channel that will be
     // available at inference time (the baseline logits).  Use the identity
@@ -1191,7 +1208,7 @@ pub fn build_calibrator_design(
         )
     } else {
         pred_constraint_order = spec.penalty_order_pred.min(pred_raw_cols);
-        let z_pred = polynomial_constraint_matrix(&pred_std_fisher, pred_constraint_order);
+        let z_pred = polynomial_constraint_matrix(&pred_std, pred_constraint_order);
         match apply_weighted_orthogonality_constraint(
             b_pred_raw.view(),
             z_pred.view(),
@@ -1286,7 +1303,7 @@ pub fn build_calibrator_design(
         )
     } else {
         let constraint_order = spec.penalty_order_se.min(se_raw_cols);
-        let z = polynomial_constraint_matrix(&se_std_fisher, constraint_order);
+        let z = polynomial_constraint_matrix(&se_std, constraint_order);
         match apply_weighted_orthogonality_constraint(
             b_se_raw.view(),
             z.view(),
@@ -1434,7 +1451,7 @@ pub fn build_calibrator_design(
         // Replace STZ with full polynomial nullspace removal to match penalty nullspace
         eprintln!("[CAL] Applying orthogonality constraints to distance smooth");
         let constraint_order = spec.penalty_order_dist.min(dist_raw_cols);
-        let z = polynomial_constraint_matrix(&dist_std_fisher, constraint_order);
+        let z = polynomial_constraint_matrix(&dist_std, constraint_order);
         let (b_dist_c, stz_dist) = match apply_weighted_orthogonality_constraint(
             b_dist_raw.view(),
             z.view(),
