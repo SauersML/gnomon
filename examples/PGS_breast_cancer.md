@@ -140,12 +140,7 @@ pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided
 | PGS000015_AVG | 447,278 | 6,614 |  440,664 |     1.150 |  <1e-10 | 0.539 |    5.96e-28 |         0.20% |  <1e-10 |
 | PGS000332_AVG | 447,278 | 6,614 |  440,664 |     1.131 |  <1e-10 | 0.537 |    4.62e-25 |         0.15% |  <1e-10 |
 
-
-The GenoBoost method (PGS004303), which uses non-additive models, doesn't perform well relative to the others. The ICD-10 codes included in the construction of PGS004303 were similar to ours: C18,C19,C20.
-
-The best performing scores are PGS003852, PGS003979, and PGS003433. One thing common to each of these scores is that the associated study involves colorectal cancer specifically (as opposed to being general and studying many diseases at once).
-
-Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
+PGS000007 is the best so far. Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
 
 ```
 import os, numpy as np, pandas as pd
