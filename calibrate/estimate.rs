@@ -3599,7 +3599,7 @@ pub mod internal {
 
             let mut pgs_pc1_stats = Vec::new();
             for (idx, label) in labels.iter().enumerate() {
-                if label == "f(PGS,PC1)[1]" || label == "f(PGS,PC1)[2]" {
+                if label == "f(PGS,PC1)[PGS]" || label == "f(PGS,PC1)[PC]" {
                     let near_pos_bound = rho_values[idx] >= RHO_BOUND - 1.0;
                     pgs_pc1_stats.push((label.clone(), near_pos_bound, rho_values[idx]));
                 }
@@ -3608,7 +3608,7 @@ pub mod internal {
             assert_eq!(
                 pgs_pc1_stats.len(),
                 2,
-                "Expected two f(PGS,PC1) penalty components, found {}",
+                "Expected two f(PGS,PC1) penalty components (PGS & PC), found {}",
                 pgs_pc1_stats.len()
             );
 
