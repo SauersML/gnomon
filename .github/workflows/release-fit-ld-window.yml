@@ -141,6 +141,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          if [ -f gnomon-fit-${LD_SUFFIX}.log ]; then
+            mv gnomon-fit-${LD_SUFFIX}.log artifacts/gnomon-fit-${LD_SUFFIX}.log
+          else
+            echo "Timed fit log missing; skipping move." >&2
+          fi
           if [ -f artifacts/pc1_pc2.png ]; then
             mv artifacts/pc1_pc2.png artifacts/pc1_pc2_${LD_SUFFIX}.png
           else
@@ -168,7 +173,7 @@ jobs:
             artifacts/pc1_pc2_${LD_SUFFIX}.png
             artifacts/pc3_pc4_${LD_SUFFIX}.png
             artifacts/pca_projection_scores_${LD_SUFFIX}.tsv
-            gnomon-fit-${LD_SUFFIX}.log
+            artifacts/gnomon-fit-${LD_SUFFIX}.log
           if-no-files-found: warn
 
   compare-projections:

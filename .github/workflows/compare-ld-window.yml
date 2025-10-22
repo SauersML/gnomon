@@ -64,16 +64,32 @@ jobs:
             --branch "${BRANCH}" \
             --status success \
             --limit 1 \
-            --json databaseId,headBranch,headSha,createdAt,url,displayTitle)
-          echo "Raw gh run list JSON: ${RUN_JSON}"
+            --json databaseId,headBranch,headSha,createdAt,url,displayTitle,conclusion)
+          echo "Raw gh run list JSON (successful runs): ${RUN_JSON}"
           RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
+
+          if [ -z "${RUN_ID}" ] || [ "${RUN_ID}" = "null" ]; then
+            echo "No successful runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'. Falling back to most recent run regardless of conclusion." >&2
+            RUN_JSON=$(gh run list \
+              --workflow "${WORKFLOW_NAME}" \
+              --branch "${BRANCH}" \
+              --limit 1 \
+              --json databaseId,headBranch,headSha,createdAt,url,displayTitle,conclusion,status)
+            echo "Raw gh run list JSON (any conclusion): ${RUN_JSON}"
+            RUN_ID=$(echo "${RUN_JSON}" | jq -r '.[0].databaseId')
+          else
+            echo "Found successful run; skipping fallback search."
+          fi
+
           HEAD_BRANCH=$(echo "${RUN_JSON}" | jq -r '.[0].headBranch')
           HEAD_SHA=$(echo "${RUN_JSON}" | jq -r '.[0].headSha')
           CREATED_AT=$(echo "${RUN_JSON}" | jq -r '.[0].createdAt')
           RUN_URL=$(echo "${RUN_JSON}" | jq -r '.[0].url')
           TITLE=$(echo "${RUN_JSON}" | jq -r '.[0].displayTitle')
+          CONCLUSION=$(echo "${RUN_JSON}" | jq -r '.[0].conclusion')
+          STATUS=$(echo "${RUN_JSON}" | jq -r '.[0].status // "unknown"')
 
-          test -n "${RUN_ID}" && test "${RUN_ID}" != "null" || { echo "No successful runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'." >&2; false; }
+          test -n "${RUN_ID}" && test "${RUN_ID}" != "null" || { echo "No runs for '${WORKFLOW_NAME}' on branch '${BRANCH}'." >&2; false; }
 
           echo "Selected run metadata:"
           echo "  run_id=${RUN_ID}"
@@ -82,10 +98,12 @@ jobs:
           echo "  head_sha=${HEAD_SHA}"
           echo "  created_at=${CREATED_AT}"
           echo "  run_url=${RUN_URL}"
+          echo "  conclusion=${CONCLUSION}"
+          echo "  status=${STATUS}"
 
           echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "::notice title=Using artifacts from::${WORKFLOW_NAME} • ${TITLE} • run_id=${RUN_ID}"
-          echo "::notice title=Run metadata::branch=${HEAD_BRANCH} sha=${HEAD_SHA} created=${CREATED_AT} url=${RUN_URL}"
+          echo "::notice title=Run metadata::branch=${HEAD_BRANCH} sha=${HEAD_SHA} created=${CREATED_AT} url=${RUN_URL} conclusion=${CONCLUSION} status=${STATUS}"
 
       - name: Download artifacts from that run
         env:
