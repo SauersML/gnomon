@@ -76,14 +76,15 @@ plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); pl
 Let's make the case definition.
 
 **ICD-10:**
-- C18.0–C18.9 — Malignant neoplasm of colon
-- C19 — Malignant neoplasm of rectosigmoid junction. 
-- C20 — Malignant neoplasm of rectum. 
+- C50.0–C50.9 — Malignant neoplasm of breast.
+- D05.0–D05.9 — Carcinoma in situ of breast (in situ; Stage 0).
+- Z85.3 — Personal history of malignant neoplasm of breast.
 
 **ICD-9:**
-- 153.0–153.9 — Malignant neoplasm of colon.
-- 154.0 — Malignant neoplasm of rectosigmoid junction.
-- 154.1 — Malignant neoplasm of rectum.
+- 174.0–174.9 — Malignant neoplasm of female breast.
+- 175.0–175.9 — Malignant neoplasm of male breast.
+- 233.0 — Carcinoma in situ of breast (in situ; Stage 0).
+- V10.3 — Personal history of malignant neoplasm of breast.
 
 ```
 cdr_id = os.environ["WORKSPACE_CDR"]
