@@ -231,25 +231,25 @@ from sklearn.metrics import roc_auc_score
 
 d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID')
 d.index = d.index.astype(str)
-pgs = [c for c in d.columns if c.endswith('_AVG') and c != 'PGS004303_AVG']
+pgs = [c for c in d.columns if c.endswith('_AVG')]
 
-try:
-    covars
-except NameError:
-    NUM_PCS=16; pc_cols=[f"PC{i}" for i in range(1,NUM_PCS+1)]
-    so={"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
-    pcs=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv", sep="\t", storage_options=so, usecols=["research_id","pca_features"])
-    parse=lambda s,k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
-    pc_df=pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols).assign(person_id=pcs["research_id"].astype(str)).set_index("person_id")
-    sex=pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv", sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
-    sex_df=sex.assign(person_id=sex["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"].map({"XX":0,"XY":1}).to_frame("sex").dropna()
-    covars=pc_df.join(sex_df, how="inner").filter(pc_cols+["sex"]).dropna()
+NUM_PCS = 16
+pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
+so = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
 
-covars = covars.copy()
-covars.index = covars.index.astype(str)
+pcs = pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+                  sep="\t", storage_options=so, usecols=["research_id","pca_features"])
+parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
+pc_df = (pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols)
+           .assign(person_id=pcs["research_id"].astype(str)).set_index("person_id"))
 
-if 'cases' not in globals(): raise NameError("Variable 'cases' not found.")
-case_set=set(pd.Series(cases, dtype=str))
+sex_df = (pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",
+                      sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+           .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"]
+           .map({"XX":0,"XY":1}).to_frame("sex"))
+
+covars = pc_df.join(sex_df, how="inner").dropna()
+case_set = set(pd.Series(cases, dtype=str))
 
 Xy = covars.join(d[pgs], how="inner").dropna()
 y = Xy.index.to_series().isin(case_set).astype('i1').to_numpy()
@@ -257,93 +257,74 @@ X = Xy.to_numpy()
 
 cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
 mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
-p = cross_val_predict(mdl, X, y, cv=cv, method="predict_proba")[:,1]
+p = cross_val_predict(mdl, X, y, cv=cv, method="predict_proba")[:, 1]
 auc = roc_auc_score(y, p)
 
-pd.DataFrame([{"n": int(len(y)), "cases": int(y.sum()), "controls": int(len(y)-y.sum()), "predictors": X.shape[1], "AUROC": float(auc)}])
+pd.DataFrame([{
+    "n": int(len(y)),
+    "cases": int(y.sum()),
+    "controls": int(len(y) - y.sum()),
+    "predictors": int(X.shape[1]),
+    "AUROC": float(auc)
+}])
 ```
 
-This yields an AUROC of 0.617375. (Adding a ridge penalty gives a similar value of 0.617.)
+This yields an AUROC of 0.787221, much better!
 
-Let's check the colorectal cancer-related ICD codes individually.
+But do score ensembles really improve the result?
 
+Let's compare:
 ```
-import os
-from google.cloud import bigquery as bq
-import matplotlib.pyplot as plt
+import numpy as np, pandas as pd, math
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
 
-cdr_id=os.environ["WORKSPACE_CDR"]
-codes=[f"C18.{i}" for i in range(10)]+["C19","C20"]+[f"153.{i}" for i in range(10)]+["154.0","154.1"]
-codes=[c.upper() for c in (codes+[c.replace(".","") for c in codes])]
-sql=f"""
-WITH code_list AS (
-  SELECT DISTINCT UPPER(code) AS code FROM UNNEST(@codes) AS code
-),
-norm_codes AS (
-  SELECT ANY_VALUE(code) AS code, REPLACE(code,'.','') AS code_n
-  FROM code_list
-  GROUP BY code_n
-),
-cond AS (
-  SELECT CAST(person_id AS STRING) person_id,
-         REPLACE(UPPER(TRIM(condition_source_value)),'.','') AS csv_n
-  FROM `{cdr_id}.condition_occurrence`
-  WHERE condition_source_value IS NOT NULL
-),
-joined AS (
-  SELECT nc.code AS code, c.person_id
-  FROM norm_codes nc
-  JOIN cond c ON c.csv_n = nc.code_n
-)
-SELECT code, COUNT(DISTINCT person_id) AS n_persons
-FROM joined
-GROUP BY code
-ORDER BY n_persons DESC, code
-"""
-code_counts=bq.Client().query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes","STRING",codes)])).to_dataframe()
-print(code_counts.to_string(index=False))
-print(code_counts[code_counts["n_persons"]<20].sort_values(["n_persons","code"]).to_string(index=False))
-df=code_counts[code_counts["n_persons"]>=20].sort_values("n_persons",ascending=True)
-plt.figure(figsize=(8, max(2, 0.3*len(df))))
-plt.barh(df["code"], df["n_persons"])
-plt.xlabel("Distinct persons")
-plt.ylabel("ICD code")
-plt.title("CRC ICD code counts (≥20 cases)")
-plt.tight_layout(); plt.show()
-```
-<img width="790" height="679" alt="image" src="https://github.com/user-attachments/assets/2e1d2983-d9e9-4268-a378-699b2f0cfd04" />
+d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID')
+d.index = d.index.astype(str)
+pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
+idx_all = d[pgs_cols].dropna().index
+X_all = d.loc[idx_all, pgs_cols].astype(float)
+X_507 = d.loc[idx_all, ['PGS000507_AVG']].astype(float)
+y = pd.Index(idx_all).to_series().isin(pd.Series(cases, dtype=str)).astype('i1').to_numpy()
 
-We haven't assessed a few important codes.
+cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
+pipe = lambda: make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
 
-ICD-10
-- Z85.038 — Personal history of malignant neoplasm of large intestine.
-- Z85.04x — Personal history of malignant neoplasm of rectum/rectosigmoid junction/anal canal.
+p_all = np.zeros(len(y)); p_507 = np.zeros(len(y))
+auc_all_f, auc_507_f = [], []
 
-```
-cdr_id=os.environ["WORKSPACE_CDR"]
-codes_exact=["Z85.038","V10.05"]
-codes_exact=[c.upper() for c in (codes_exact+[c.replace(".","") for c in codes_exact])]
+for tr, te in cv.split(X_all, y):
+    m_all = pipe(); m_507 = pipe()
+    m_all.fit(X_all.iloc[tr], y[tr]); m_507.fit(X_507.iloc[tr], y[tr])
+    p_all[te] = m_all.predict_proba(X_all.iloc[te])[:,1]
+    p_507[te] = m_507.predict_proba(X_507.iloc[te])[:,1]
+    auc_all_f.append(roc_auc_score(y[te], p_all[te]))
+    auc_507_f.append(roc_auc_score(y[te], p_507[te]))
 
-sql=f"""
-SELECT DISTINCT CAST(person_id AS STRING) person_id
-FROM `{cdr_id}.observation`
-WHERE observation_source_value IS NOT NULL
-  AND (
-    UPPER(TRIM(observation_source_value)) IN UNNEST(@codes_exact)
-    OR REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]','') IN UNNEST(@codes_exact)
-    OR STARTS_WITH(REGEXP_REPLACE(UPPER(TRIM(observation_source_value)),'[^A-Z0-9]',''), @z8503_prefix)
-  )
-"""
-cases=bq.Client().query(
-    sql,
-    job_config=bq.QueryJobConfig(query_parameters=[
-        bq.ArrayQueryParameter("codes_exact","STRING",codes_exact),
-        bq.ScalarQueryParameter("z8503_prefix","STRING","Z8503"),
-    ])
-).to_dataframe()["person_id"].astype(str)
+auc_all = roc_auc_score(y, p_all)
+auc_507 = roc_auc_score(y, p_507)
+
+perf = pd.DataFrame([
+    {"model":"All AVG", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_all)},
+    {"model":"PGS000507 only", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_507)},
+]).sort_values("AUROC", ascending=False).reset_index(drop=True)
+
+diff =  np.array(auc_all_f) - np.array(auc_507_f)
+nz = diff[diff!=0]
+s = int((nz>0).sum()); n = int(len(nz))
+p_one_sided = sum(math.comb(n,k) for k in range(s, n+1)) / (2**n) if n>0 else np.nan
+
+print(perf.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+print(f"One-sided sign-test p (PGS000507 < All AVG): {p_one_sided:.3g} over {s}/{n} folds; ΔAUROC (OOF) = {auc_all-auc_507:+.3f}")
 ```
 
-PGS003852 has an accuracy by itself of 0.619311 for this new case definition, while the multi-PGS + covariates model has a cross-validated AUC of 0.648.
+We see that the AUC of the ensemble (0.588) is significantly better than that of the single score (0.547).
+
+
+
 
 Let's plot risk in each decline of the multivariate model.
 ```
