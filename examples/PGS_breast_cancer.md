@@ -75,26 +75,37 @@ plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); pl
 
 Let's make the case definition.
 
-**ICD-10:**
-- C50.0–C50.9 — Malignant neoplasm of breast.
-- D05.0–D05.9 — Carcinoma in situ of breast (in situ; Stage 0).
-- Z85.3 — Personal history of malignant neoplasm of breast.
 
-**ICD-9:**
-- 174.0–174.9 — Malignant neoplasm of female breast.
-- 175.0–175.9 — Malignant neoplasm of male breast.
-- 233.0 — Carcinoma in situ of breast (in situ; Stage 0).
-- V10.3 — Personal history of malignant neoplasm of breast.
+
+
 
 ```
+import os
 cdr_id = os.environ["WORKSPACE_CDR"]
 from google.cloud import bigquery as bq
-codes=[f"C18.{i}" for i in range(10)]+["C19","C20"]+[f"153.{i}" for i in range(10)]+["154.0","154.1"]; codes=[c.upper() for c in (codes+[c.replace(".","") for c in codes])]
-sql=f"""SELECT DISTINCT CAST(person_id AS STRING) person_id
-        FROM `{cdr_id}.condition_occurrence`
-        WHERE condition_source_value IS NOT NULL
-          AND UPPER(TRIM(condition_source_value)) IN UNNEST(@codes)"""
-cases=bq.Client().query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes","STRING",codes)])).to_dataframe()["person_id"].astype(str)
+
+# ICD-10: C50.0–C50.9 (malignant), D05.0–D05.9 (in situ), Z85.3 (personal history)
+icd10_breast = [f"C50.{i}" for i in range(10)] + [f"D05.{i}" for i in range(10)] + ["Z85.3"]
+
+# ICD-9: 174.0–174.9 (female), 175.0–175.9 (male), 233.0 (in situ), V10.3 (personal history)
+icd9_breast = [f"174.{i}" for i in range(10)] + [f"175.{i}" for i in range(10)] + ["233.0", "V10.3"]
+
+codes = icd10_breast + icd9_breast
+codes = [c.upper() for c in (codes + [c.replace(".", "") for c in codes])]
+
+sql = f"""
+SELECT DISTINCT CAST(person_id AS STRING) AS person_id
+FROM `{cdr_id}.condition_occurrence`
+WHERE condition_source_value IS NOT NULL
+  AND UPPER(TRIM(condition_source_value)) IN UNNEST(@codes)
+"""
+
+cases = (
+    bq.Client()
+    .query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes", "STRING", codes)]))
+    .to_dataframe()["person_id"]
+    .astype(str)
+)
 ```
 
 For simplicity, we aren't using a time-to-event model. Some of our "controls" will go on to develop colorectal cancer later in life.
