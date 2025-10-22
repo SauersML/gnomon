@@ -147,64 +147,79 @@ import os, numpy as np, pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, accuracy_score
 
 d = pd.read_csv('../../arrays.sscore', sep='\t')
 d['#IID'] = d['#IID'].astype(str)
 d = d.set_index('#IID')
 score_cols = [c for c in d.columns if c.endswith('_AVG')]
 
-try:
-    covars
-except NameError:
-    NUM_PCS = 16
-    PCS_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
-    SEX_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
-    storage_opts = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
-    pcs_raw = pd.read_csv(PCS_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","pca_features"])
-    parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
-    pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
-    pc_df = pd.DataFrame(pcs_raw["pca_features"].apply(parse).to_list(), columns=pc_cols)\
-              .assign(person_id=pcs_raw["research_id"].astype(str)).set_index("person_id")
-    sex_df = pd.read_csv(SEX_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","dragen_sex_ploidy"])\
-              .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"]\
-              .map({"XX":0,"XY":1}).to_frame("sex").dropna()
-    covars = pc_df.join(sex_df, how="inner").filter(pc_cols+["sex"]).dropna()
+NUM_PCS = 16
+PCS_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+SEX_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
+storage_opts = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
 
-if 'cases' not in globals():
-    raise NameError("Variable 'cases' not found.")
-case_set = set(pd.Series(cases, dtype=str))
+pcs_raw = pd.read_csv(PCS_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","pca_features"])
+parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
+pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
+pc_df = (pd.DataFrame(pcs_raw["pca_features"].apply(parse).to_list(), columns=pc_cols)
+         .assign(person_id=pcs_raw["research_id"].astype(str)).set_index("person_id"))
+
+sex_df = (pd.read_csv(SEX_URI, sep="\t", storage_options=storage_opts, usecols=["research_id","dragen_sex_ploidy"])
+          .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"]
+          .map({"XX":0,"XY":1}).to_frame("sex"))
+
+covars = pc_df.join(sex_df, how="inner").dropna()
+case_idx = pd.Index(pd.Series(cases, dtype=str).unique(), name="person_id")
+
+def eval_block(df):
+    if df.empty: 
+        return {"n": 0, "cases": 0, "controls": 0, "AUROC": np.nan, "ACC": np.nan}
+    y = df.index.to_series().isin(case_idx).astype('i1').to_numpy()
+    X = df.astype(float).to_numpy()
+    mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
+    mdl.fit(X, y)
+    p = mdl.predict_proba(X)[:,1]
+    return {"n": int(len(df)), "cases": int(y.sum()), "controls": int(len(y)-y.sum()),
+            "AUROC": float(roc_auc_score(y, p)), "ACC": float(accuracy_score(y, (p>=0.5).astype(int)))}
 
 rows = []
 for sc in score_cols:
-    tmp = d[[sc]].join(covars, how='inner').dropna()
-    if tmp.empty: 
-        continue
-    y = tmp.index.to_series().isin(case_set).astype('i1').to_numpy()
-    X = tmp[["sex"] + pc_cols + [sc]].astype(float).to_numpy()
-    mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
-    mdl.fit(X, y)
-    auc = roc_auc_score(y, mdl.predict_proba(X)[:,1])
-    rows.append({"score": sc.replace("_AVG",""), "n": int(len(tmp)), "cases": int(y.sum()), "controls": int(len(y)-y.sum()), "AUROC": float(auc)})
+    s = d[[sc]].dropna()
+    s_sex = d[[sc]].join(sex_df, how="inner").dropna()[[sc,"sex"]]
+    s_sex_pcs = d[[sc]].join(covars, how="inner").dropna()[["sex"]+pc_cols+[sc]]
 
-out = pd.DataFrame(rows).sort_values("AUROC", ascending=False).reset_index(drop=True)
-display(out)
+    r1 = eval_block(s[[sc]])
+    r2 = eval_block(s_sex)
+    r3 = eval_block(s_sex_pcs)
+
+    rows.append({
+        "score": sc.replace("_AVG",""),
+        "n_s": r1["n"], "cases_s": r1["cases"], "AUROC_s": r1["AUROC"], "ACC_s": r1["ACC"],
+        "n_sx": r2["n"], "cases_sx": r2["cases"], "AUROC_sx": r2["AUROC"], "ACC_sx": r2["ACC"],
+        "n_sxpc": r3["n"], "cases_sxpc": r3["cases"], "AUROC_sxpc": r3["AUROC"], "ACC_sxpc": r3["ACC"],
+    })
+
+out = pd.DataFrame(rows).sort_values("AUROC_sxpc", ascending=False).reset_index(drop=True)
+print(out.to_string(index=False, float_format=lambda x: f"{x:.3f}" if isinstance(x, float) else str(x)))
 ```
 
 
-| score     | cases | controls | AUROC    |
-| :-------- | ----: | -------: | :------- |
-| PGS003852 |  2985 |   410352 | 0.619005 |
-| PGS003979 |  2985 |   410352 | 0.617833 |
-| PGS003433 |  2985 |   410352 | 0.610325 |
-| PGS000765 |  2985 |   410352 | 0.600296 |
-| PGS004904 |  2985 |   410352 | 0.599918 |
-| PGS003386 |  2985 |   410352 | 0.596961 |
-| PGS004303 |  2985 |   410352 | 0.592681 |
+| Score     |      nₛ | casesₛ | AUROCₛ |  ACCₛ |     nₛₓ | casesₛₓ | AUROCₛₓ | ACCₛₓ |   nₛₓₚ꜀ | casesₛₓₚ꜀ | AUROCₛₓₚ꜀ | ACCₛₓₚ꜀ |
+| --------- | ------: | -----: | -----: | ----: | ------: | ------: | ------: | ----: | ------: | --------: | --------: | ------: |
+| PGS000507 | 447,278 |  6,614 |  0.547 | 0.985 | 413,337 |   6,210 |   0.721 | 0.985 | 413,337 |     6,210 |     0.785 |   0.985 |
+| PGS000508 | 447,278 |  6,614 |  0.542 | 0.985 | 413,337 |   6,210 |   0.718 | 0.985 | 413,337 |     6,210 |     0.784 |   0.985 |
+| PGS000332 | 447,278 |  6,614 |  0.537 | 0.985 | 413,337 |   6,210 |   0.715 | 0.985 | 413,337 |     6,210 |     0.783 |   0.985 |
+| PGS004869 | 447,278 |  6,614 |  0.552 | 0.985 | 413,337 |   6,210 |   0.724 | 0.985 | 413,337 |     6,210 |     0.779 |   0.985 |
+| PGS000317 | 447,278 |  6,614 |  0.567 | 0.985 | 413,337 |   6,210 |   0.733 | 0.985 | 413,337 |     6,210 |     0.778 |   0.985 |
+| PGS000007 | 447,278 |  6,614 |  0.569 | 0.985 | 413,337 |   6,210 |   0.735 | 0.985 | 413,337 |     6,210 |     0.776 |   0.985 |
+| PGS000015 | 447,278 |  6,614 |  0.539 | 0.985 | 413,337 |   6,210 |   0.715 | 0.985 | 413,337 |     6,210 |     0.776 |   0.985 |
+| PGS000344 | 447,278 |  6,614 |  0.540 | 0.985 | 413,337 |   6,210 |   0.717 | 0.985 | 413,337 |     6,210 |     0.774 |   0.985 |
 
-This improves the scores somewhat, but there's a few problems. First, we typically want one prediction per individual, but now we have seven (one per score). Further, we're training on the same dataset we're evaluating on.
+Everything is helpful: score, sex, and PCs.
 
-Now, let's test the same model, except jointly fitting all scores (except for PGS004303) using cross-validation to avoid overfitting.
+
+Now, let's test the same model, except jointly fitting all scores using cross-validation to avoid overfitting.
 
 ```
 import os, numpy as np, pandas as pd
