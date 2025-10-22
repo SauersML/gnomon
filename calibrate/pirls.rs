@@ -321,6 +321,7 @@ pub fn fit_model_for_fixed_rho(
         if firth_active {
             let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
                 x_transformed.view(),
+                x.view(),
                 weights.view(),
                 s_transformed,
                 &mut workspace,
@@ -3752,6 +3753,7 @@ mod tests {
 /// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
 fn compute_firth_hat_and_half_logdet(
     x_transformed: ArrayView2<f64>,
+    x_original: ArrayView2<f64>,
     weights: ArrayView1<f64>,
     s_transformed: &Array2<f64>,
     workspace: &mut PirlsWorkspace,
@@ -3769,8 +3771,8 @@ fn compute_firth_hat_and_half_logdet(
     workspace.wx.assign(&x_transformed);
     workspace.wx *= &sqrt_w_col;
 
-    let xtwx = workspace.wx.t().dot(&workspace.wx);
-    let mut penalized_hessian = xtwx.clone() + s_transformed;
+    let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
+    let mut penalized_hessian = xtwx_transformed.clone() + s_transformed;
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -3782,7 +3784,21 @@ fn compute_firth_hat_and_half_logdet(
     let mut stabilized = penalized_hessian.clone();
     ensure_positive_definite(&mut stabilized)?;
 
-    let mut fisher = xtwx.clone();
+    let mut fisher = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let xi = x_original.row(i);
+        for j in 0..p {
+            let xij = xi[j];
+            for k in 0..p {
+                fisher[[j, k]] += wi * xij * xi[k];
+            }
+        }
+    }
+    let mut fisher = fisher;
     ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
     let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {

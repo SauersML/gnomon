@@ -2241,13 +2241,14 @@ pub mod internal {
         fn penalised_ll_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
             let penalty = pr.stable_penalty_term;
-            let mut penalised = -0.5 * pr.deviance - 0.5 * penalty;
+            let penalised = -0.5 * pr.deviance - 0.5 * penalty;
             if self.config.firth_bias_reduction
                 && matches!(self.config.link_function, LinkFunction::Logit)
             {
-                if let Some(adj) = pr.firth_log_det {
-                    penalised += adj;
-                }
+                // The Jeffreys prior adjustment stabilizes the inner IRLS solve but
+                // should not feed into the smoothing-parameter objective.  Treat the
+                // stored log-determinant as constant with respect to ρ.
+                let _ = pr.firth_log_det;
             }
             Ok(penalised)
         }
@@ -2657,14 +2658,14 @@ pub mod internal {
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use stable penalty term calculated in P-IRLS
-                    let mut penalised_ll =
+                    let penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                     if self.config.firth_bias_reduction
                         && matches!(self.config.link_function, LinkFunction::Logit)
                     {
-                        if let Some(adj) = pirls_result.firth_log_det {
-                            penalised_ll += adj;
-                        }
+                        // Ignore the Firth log-determinant contribution when assembling
+                        // the outer objective; it only stabilizes the coefficient solve.
+                        let _ = pirls_result.firth_log_det;
                     }
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
