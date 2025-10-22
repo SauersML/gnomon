@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import concurrent.futures
 import fnmatch
 import gzip
 import logging
 import os
 import shutil
 import tempfile
-import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.error import URLError
@@ -32,18 +31,6 @@ DEFAULT_DATA_PATH = (
 GCS_CONNECTOR_URL = "https://storage.googleapis.com/hadoop-lib/gcs/gcs-connector-hadoop3-latest.jar"
 DEFAULT_NUM_PCS = 10
 DEFAULT_OUTPUT_PREFIX = "hail_pca"
-
-
-def _available_cpu_count() -> int:
-    """Return the number of CPUs available to this process."""
-
-    try:
-        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except (AttributeError, NotImplementedError):
-        pass
-
-    cpu_count = os.cpu_count() or 1
-    return max(1, cpu_count)
 
 
 def _infer_variant_format(path: str) -> str | None:
@@ -237,78 +224,207 @@ def _guess_reference_from_header(header: "pysam.libcbcf.VariantHeader") -> Optio
     return "GRCh37"
 
 
-def _convert_bcf_inputs_to_vcf(pattern: str) -> tuple[List[str], Path, Optional[str]]:
-    """Convert BCF inputs matching *pattern* into bgzipped VCF files."""
+def _convert_single_bcf(
+    source: str, destination_directory: Path, index: int
+) -> tuple[Path, Optional[str]]:
+    """Convert a single BCF *source* into a bgzipped VCF within *destination_directory*."""
+
+    local_bcf = destination_directory / f"input_{index}.bcf"
+    logging.info("Copying %s to %s for conversion", source, local_bcf)
+    _copy_variant_to_local(source, local_bcf)
+    _copy_variant_index_if_available(source, local_bcf)
+
+    dest_path = destination_directory / f"converted_{index}.vcf.bgz"
+    logging.info("Converting %s to %s", local_bcf, dest_path)
+    header_reference: Optional[str] = None
+    with pysam.VariantFile(str(local_bcf)) as reader:
+        threads = max(1, min((os.cpu_count() or 1), 8))
+        try:
+            reader.set_threads(threads)
+        except AttributeError:  # pragma: no cover - older pysam versions
+            pass
+        header_reference = _guess_reference_from_header(reader.header)
+        with pysam.VariantFile(str(dest_path), "wz", header=reader.header) as writer:
+            try:
+                writer.set_threads(threads)
+            except AttributeError:  # pragma: no cover - older pysam versions
+                pass
+            for record in reader:
+                writer.write(record)
+
+    logging.info("Indexing converted VCF %s", dest_path)
+    pysam.tabix_index(str(dest_path), preset="vcf", force=True)
+
+    for sidecar_suffix in (".csi", ".tbi", ".idx"):
+        try:
+            (local_bcf.with_name(f"{local_bcf.name}{sidecar_suffix}")).unlink()
+        except FileNotFoundError:
+            continue
+
+    try:
+        local_bcf.unlink()
+    except FileNotFoundError:  # pragma: no cover - cleanup race
+        pass
+
+    return dest_path, header_reference
+
+
+def _remove_if_exists(path: Path) -> None:
+    """Delete *path* if it exists."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _positive_int_from_env(name: str) -> Optional[int]:
+    """Return a positive integer from *name* if it is set and valid."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.warning("Ignoring %s=%r; expected a positive integer", name, raw)
+        return None
+
+    if value <= 0:
+        logging.warning("Ignoring %s=%r; value must be greater than zero", name, raw)
+        return None
+
+    return value
+
+
+def _conversion_worker_count(total_files: int) -> int:
+    """Return the number of concurrent BCF conversions to run."""
+
+    env_value = _positive_int_from_env("GNOMON_BCF_CONVERSION_WORKERS")
+    if env_value is not None:
+        return min(total_files, env_value)
+
+    cpu_count = os.cpu_count() or 1
+    return min(total_files, max(1, min(cpu_count, 8)))
+
+
+def _conversion_chunk_size(total_files: int, workers: int) -> int:
+    """Return how many converted VCFs to import per batch."""
+
+    env_value = _positive_int_from_env("GNOMON_BCF_IMPORT_CHUNK_SIZE")
+    if env_value is not None:
+        return min(total_files, max(1, env_value))
+
+    # Default to a modest multiple of the worker count to reduce import passes
+    default_chunk = max(1, min(total_files, max(workers * 2, 4)))
+    return default_chunk
+
+
+def _import_bcf_as_matrix_table(pattern: str) -> hl.MatrixTable:
+    """Import BCF inputs matching *pattern* by converting them incrementally to VCF."""
 
     matches = _list_matching_variant_paths(pattern)
     if not matches:
         raise FileNotFoundError(f"No BCF files matched pattern '{pattern}'.")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="hail-bcf-"))
-    converted: List[Optional[str]] = [None] * len(matches)
+    atexit.register(shutil.rmtree, temp_dir, True)
+
     reference: Optional[str] = None
+    current_checkpoint: Optional[str] = None
+    mt: Optional[hl.MatrixTable] = None
 
-    worker_count = max(1, min(len(matches), _available_cpu_count()))
-    if worker_count > 1:
-        logging.info(
-            "Converting %d BCF files to VCF with %d workers", len(matches), worker_count
-        )
+    workers = _conversion_worker_count(len(matches))
+    chunk_size = _conversion_chunk_size(len(matches), workers)
+    logging.info(
+        "Preparing to convert %d BCF files with %d workers in chunks of %d",
+        len(matches),
+        workers,
+        chunk_size,
+    )
 
-    reference_lock = threading.Lock()
+    def schedule_chunk(
+        executor: ThreadPoolExecutor, start_index: int
+    ) -> list[tuple[str, Future[tuple[Path, Optional[str]]]]]:
+        scheduled: list[tuple[str, Future[tuple[Path, Optional[str]]]]] = []
+        for offset in range(chunk_size):
+            index = start_index + offset
+            if index >= len(matches):
+                break
+            source = matches[index]
+            future = executor.submit(_convert_single_bcf, source, temp_dir, index)
+            scheduled.append((source, future))
+        return scheduled
 
-    def _convert_single(index: int, source: str) -> tuple[int, str, Optional[str]]:
-        local_bcf = temp_dir / f"input_{index}.bcf"
-        logging.info("Copying %s to %s for conversion", source, local_bcf)
-        _copy_variant_to_local(source, local_bcf)
-        _copy_variant_index_if_available(source, local_bcf)
+    next_index = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        scheduled = schedule_chunk(executor, next_index)
+        next_index += len(scheduled)
 
-        dest_path = temp_dir / f"converted_{index}.vcf.bgz"
-        logging.info("Converting %s to %s", local_bcf, dest_path)
-        header_reference: Optional[str] = None
-        with pysam.VariantFile(str(local_bcf)) as reader:
-            header_reference = _guess_reference_from_header(reader.header)
-            with pysam.VariantFile(str(dest_path), "wz", header=reader.header) as writer:
-                for record in reader:
-                    writer.write(record)
+        while scheduled:
+            converted_results: list[tuple[Path, Optional[str]]] = []
+            for source, future in scheduled:
+                converted_results.append(future.result())
 
-        logging.info("Indexing converted VCF %s", dest_path)
-        pysam.tabix_index(str(dest_path), preset="vcf", force=True)
+            # Begin converting the next chunk before triggering the expensive import/checkpoint
+            next_batch = schedule_chunk(executor, next_index)
+            next_index += len(next_batch)
 
-        for sidecar_suffix in (".csi", ".tbi", ".idx"):
-            try:
-                (local_bcf.with_name(f"{local_bcf.name}{sidecar_suffix}")).unlink()
-            except FileNotFoundError:
-                continue
+            chunk_reference = next(
+                (ref for _, ref in converted_results if ref is not None), None
+            )
+            if reference is None and chunk_reference is not None:
+                reference = chunk_reference
 
-        try:
-            local_bcf.unlink()
-        except FileNotFoundError:  # pragma: no cover - cleanup race
-            pass
+            converted_paths = [str(path) for path, _ in converted_results]
+            import_kwargs = {
+                "force_bgz": True,
+                "array_elements_required": False,
+            }
+            if reference is not None:
+                import_kwargs["reference_genome"] = reference
 
-        return index, str(dest_path.resolve()), header_reference
+            logging.info(
+                "Importing a chunk of %d converted VCFs", len(converted_paths)
+            )
+            piece_mt = hl.import_vcf(converted_paths, **import_kwargs)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [
-            executor.submit(_convert_single, index, source)
-            for index, source in enumerate(matches)
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            idx, path, header_reference = future.result()
-            converted[idx] = path
-            if header_reference is not None:
-                with reference_lock:
-                    if reference is None:
-                        reference = header_reference
+            if mt is None:
+                mt = piece_mt
+            else:
+                mt = mt.union_rows(piece_mt)
 
-    missing_indices = [idx for idx, path in enumerate(converted) if path is None]
-    if missing_indices:
-        raise RuntimeError(
-            "BCF conversion failed to produce output for inputs at indices "
-            + ", ".join(str(idx) for idx in missing_indices)
-        )
+            checkpoint_target = hl.utils.new_temp_file(
+                prefix="hail-bcf-checkpoint", extension="mt"
+            )
+            logging.info("Checkpointing MatrixTable to %s", checkpoint_target)
+            mt = mt.checkpoint(checkpoint_target, overwrite=True)
 
-    converted_paths = [path for path in converted if path is not None]
-    return converted_paths, temp_dir, reference
+            if current_checkpoint is not None and current_checkpoint != checkpoint_target:
+                logging.info("Removing previous checkpoint %s", current_checkpoint)
+                try:
+                    hl.hadoop_remove(current_checkpoint, recursive=True)
+                except Exception:  # pragma: no cover - best effort cleanup
+                    logging.warning(
+                        "Failed to remove previous checkpoint %s", current_checkpoint
+                    )
+
+            current_checkpoint = checkpoint_target
+
+            logging.info("Cleaning up %d converted VCFs", len(converted_paths))
+            for converted_path_str in converted_paths:
+                converted_path = Path(converted_path_str)
+                _remove_if_exists(converted_path)
+                for suffix in (".tbi", ".csi", ".idx"):
+                    _remove_if_exists(converted_path.with_name(f"{converted_path.name}{suffix}"))
+
+            scheduled = next_batch
+
+    if mt is None:
+        raise RuntimeError("BCF import produced no MatrixTable data")
+
+    return mt
 
 
 def _infer_reference_genome(pattern: str) -> Optional[str]:
@@ -383,15 +499,7 @@ def _read_genotypes(path: str) -> hl.MatrixTable:
 
     if variant_format == "bcf":
         logging.info("Importing BCFs from %s", variant_path)
-        converted_paths, temp_dir, reference = _convert_bcf_inputs_to_vcf(variant_path)
-        atexit.register(shutil.rmtree, temp_dir, True)
-        import_kwargs = {
-            "force_bgz": True,
-            "array_elements_required": False,
-        }
-        if reference is not None:
-            import_kwargs["reference_genome"] = reference
-        return hl.import_vcf(converted_paths, **import_kwargs)
+        return _import_bcf_as_matrix_table(variant_path)
 
     logging.info("Importing VCFs from %s", variant_path)
     reference = _infer_reference_genome(variant_path)
