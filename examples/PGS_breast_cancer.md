@@ -40,7 +40,7 @@ Now we can run the scores. It should be faster to run them all at once instead o
 ./gnomon/target/release/gnomon score "PGS000332,PGS000015,PGS000508,PGS000344,PGS000317,PGS000007,PGS000507,PGS004869" arrays
 ```
 
-This should take 11 minutes to run, and output a file called:
+This should take 23 minutes to run, and output a file called:
 ```
 arrays.sscore
 ```
@@ -51,7 +51,7 @@ Let's open a Jupyter analysis notebook.
 
 This shows us the columns of the score output:
 ```
-#IID	PGS000765_AVG	PGS000765_MISSING_PCT	PGS003386_AVG	PGS003386_MISSING_PCT	PGS003433_AVG	PGS003433_MISSING_PCT	PGS003852_AVG	PGS003852_MISSING_PCT	PGS003979_AVG	PGS003979_MISSING_PCT	PGS004303_AVG	PGS004303_MISSING_PCT	PGS004904_AVG	PGS004904_MISSING_PCT
+#IID	PGS000007_AVG	PGS000007_MISSING_PCT	PGS000015_AVG	PGS000015_MISSING_PCT	PGS000317_AVG	PGS000317_MISSING_PCT	PGS000332_AVG	PGS000332_MISSING_PCT	PGS000344_AVG	PGS000344_MISSING_PCT	PGS000507_AVG	PGS000507_MISSING_PCT	PGS000508_AVG	PGS000508_MISSING_PCT	PGS004869_AVG	PGS004869_MISSING_PCT
 ```
 
 Let's plot missingness for each score:
@@ -61,11 +61,7 @@ d=pd.read_csv('../../arrays.sscore', sep='\t')
 for c in d.columns[d.columns.str.endswith('_MISSING_PCT')]: d[c].hist(bins=50); plt.title(c); plt.xlabel(c); plt.ylabel('count'); plt.show()
 ```
 
-Here's one example:
-
-<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/bbe62bb4-6f93-4953-b441-c31ef1859804" />
-
-This is not too bad given that we are using microarray data.
+Most samples' missingness should be under 2%.
 
 Now let's check the correlation matrix of the scores. We expect moderate correlations.
 
@@ -75,7 +71,7 @@ c=pd.read_csv('../../arrays.sscore',sep='\t').filter(regex='_AVG$').corr()
 plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); plt.xticks(range(len(c)),c.columns,rotation=90); plt.yticks(range(len(c)),c.columns); plt.tight_layout(); plt.show()
 ```
 
-<img width="390" height="379" alt="image" src="https://github.com/user-attachments/assets/96f101be-c18f-494f-bdd6-4550364c6644" />
+<img width="780" height="758" alt="image" src="https://github.com/user-attachments/assets/ecbf0e0e-1e08-4401-8534-0e3879d2f037" />
 
 Let's make the case definition.
 
