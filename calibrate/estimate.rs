@@ -1476,6 +1476,48 @@ pub fn optimize_external_design(
 }
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
+fn select_stable_slope(forward: f64, backward: f64, central: f64) -> f64 {
+    let forward_ok = forward.is_finite();
+    let backward_ok = backward.is_finite();
+    let central_ok = central.is_finite();
+
+    if forward_ok && backward_ok {
+        let diff = (forward - backward).abs();
+        let max_mag = forward.abs().max(backward.abs()).max(1e-9);
+        if diff <= 0.2 * max_mag {
+            return if central_ok { central } else { 0.5 * (forward + backward) };
+        }
+
+        let mut best = if forward.abs() <= backward.abs() { forward } else { backward };
+        if central_ok && central.abs() < best.abs() {
+            best = central;
+        }
+        return best;
+    }
+
+    if forward_ok {
+        return if central_ok && central.abs() < forward.abs() {
+            central
+        } else {
+            forward
+        };
+    }
+
+    if backward_ok {
+        return if central_ok && central.abs() < backward.abs() {
+            central
+        } else {
+            backward
+        };
+    }
+
+    if central_ok {
+        central
+    } else {
+        0.0
+    }
+}
+
 fn compute_fd_gradient(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
@@ -1493,6 +1535,9 @@ fn compute_fd_gradient(
             rho.to_vec()
         )),
     }
+
+    // Baseline cost used for one-sided slope selection when asymmetric evaluations arise.
+    let f0 = reml_state.compute_cost(rho)?;
 
     for i in 0..rho.len() {
         // Robust central-difference step for nested solvers: overpower evaluation noise
@@ -1525,42 +1570,57 @@ fn compute_fd_gradient(
             f_m,
             rho_m.to_vec()
         ));
-        let d1 = (f_p - f_m) / h;
 
-        // D2 with step 2h (two-scale guard)
-        let h2 = 2.0 * h;
-        let mut rho_p2 = rho.clone();
-        rho_p2[i] += 0.5 * h2;
-        let mut rho_m2 = rho.clone();
-        rho_m2[i] -= 0.5 * h2;
-        let f_p2 = reml_state.compute_cost(&rho_p2)?;
-        let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    +1.0h cost = {:+.9e} | ridge = {ridge_p2:.3e} | rho = {:?}",
-            f_p2,
-            rho_p2.to_vec()
-        ));
+        // Detect bracketed minima: if moving in either direction raises the cost
+        // by more than a tiny tolerance, treat the derivative as zero rather than
+        // amplifying asymmetric PIRLS noise.
+        let delta_p = f_p - f0;
+        let delta_m = f_m - f0;
+        let ref_scale = f0
+            .abs()
+            .max(f_p.abs())
+            .max(f_m.abs())
+            .max(1.0);
+        let bracket_tol = 1e-8_f64 + 1e-6_f64 * ref_scale;
+        if delta_p.is_finite()
+            && delta_m.is_finite()
+            && delta_p >= bracket_tol
+            && delta_m >= bracket_tol
+        {
+            fd_grad[i] = 0.0;
+            log_lines.push(format!(
+                "[FD RIDGE]    bracketed minimum detected (Δ+= {:+.3e}, Δ-= {:+.3e}) -> grad = 0",
+                delta_p, delta_m
+            ));
+            continue;
+        }
 
-        let f_m2 = reml_state.compute_cost(&rho_m2)?;
-        let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    -1.0h cost = {:+.9e} | ridge = {ridge_m2:.3e} | rho = {:?}",
-            f_m2,
-            rho_m2.to_vec()
-        ));
-        let d2 = (f_p2 - f_m2) / h2;
+        // If one side barely changes while the other clearly increases, prefer
+        // staying put.  Treat the derivative as zero to avoid huge steps driven
+        // by line-search asymmetry.
+        if delta_p.is_finite()
+            && delta_m.is_finite()
+            && ((delta_p.abs() <= bracket_tol && delta_m >= bracket_tol)
+                || (delta_m.abs() <= bracket_tol && delta_p >= bracket_tol))
+        {
+            fd_grad[i] = 0.0;
+            log_lines.push(format!(
+                "[FD RIDGE]    one-sided plateau detected (Δ+= {:+.3e}, Δ-= {:+.3e}) -> grad = 0",
+                delta_p, delta_m
+            ));
+            continue;
+        }
 
-        // Prefer the larger-step derivative if the two disagree substantially
-        let denom = d1.abs().max(d2.abs()).max(1e-12);
-        fd_grad[i] = if (d1 - d2).abs() > 0.2 * denom {
-            d2
-        } else {
-            d1
-        };
+        let forward = (f_p - f0) / (0.5 * h);
+        let backward = (f0 - f_m) / (0.5 * h);
+        let central = (f_p - f_m) / h;
+
+        let chosen = select_stable_slope(forward, backward, central);
+        fd_grad[i] = chosen;
 
         log_lines.push(format!(
             "[FD RIDGE]    d1 = {:+.9e}, d2 = {:+.9e}, chosen = {:+.9e}",
-            d1, d2, fd_grad[i]
+            central, 0.0, chosen
         ));
     }
 
@@ -2107,24 +2167,35 @@ pub mod internal {
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            if rho.is_empty() {
                 return Ok(Array1::zeros(0));
             }
+
+            // Baseline penalised log-likelihood for asymmetric finite-difference guards.
+            let f0 = self.penalised_ll_at(rho)?;
+
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 // Step scheme consistent with compute_fd_gradient
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
+                let half_h = 0.5 * h;
 
                 let mut rp = rho.clone();
                 let mut rm = rho.clone();
-                rp[k] += 0.5 * h;
-                rm[k] -= 0.5 * h;
+                rp[k] += half_h;
+                rm[k] -= half_h;
+
                 let fp = self.penalised_ll_at(&rp)?;
                 let fm = self.penalised_ll_at(&rm)?;
-                // Minus sign: COST gradient uses - d penalised_ll / d rho
-                g[k] = -(fp - fm) / h;
+
+                let forward = -(fp - f0) / half_h;
+                let backward = -(f0 - fm) / half_h;
+                let central = -(fp - fm) / h;
+
+                let chosen = select_stable_slope(forward, backward, central);
+                g[k] = chosen;
             }
             Ok(g)
         }
@@ -2153,21 +2224,33 @@ pub mod internal {
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            if rho.is_empty() {
                 return Ok(Array1::zeros(0));
             }
+
+            let f0 = self.half_logh_at(rho)?;
+
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
+                let half_h = 0.5 * h;
+
                 let mut rp = rho.clone();
-                rp[k] += 0.5 * h;
+                rp[k] += half_h;
                 let mut rm = rho.clone();
-                rm[k] -= 0.5 * h;
+                rm[k] -= half_h;
+
                 let fp = self.half_logh_at(&rp)?;
                 let fm = self.half_logh_at(&rm)?;
-                g[k] = (fp - fm) / h;
+
+                let forward = (fp - f0) / half_h;
+                let backward = (f0 - fm) / half_h;
+                let central = (fp - fm) / h;
+
+                let chosen = select_stable_slope(forward, backward, central);
+                g[k] = chosen;
             }
             Ok(g)
         }
@@ -2907,6 +2990,10 @@ pub mod internal {
             // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
             if p.len() == 0 {
                 return Ok(Array1::zeros(0));
+            }
+
+            if !matches!(self.config.link_function, LinkFunction::Identity) {
+                return super::compute_fd_gradient(self, p);
             }
 
             let pirls_result = bundle.pirls_result.as_ref();
