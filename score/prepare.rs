@@ -124,6 +124,13 @@ struct FileStream<'arena> {
     malformed_lines_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineReadOutcome {
+    Pushed,
+    Skipped,
+    Eof,
+}
+
 /// An iterator that merges multiple, sorted score files on the fly.
 struct KWayMergeIterator<'arena> {
     streams: Vec<FileStream<'arena>>,
@@ -715,6 +722,46 @@ mod tests {
             assert!(dense[orig_byte] >= 0);
         }
     }
+
+    #[test]
+    fn kway_merge_continues_after_filtered_lines() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let score_path = dir.path().join("score.tsv");
+        let mut file = std::fs::File::create(&score_path).expect("create score");
+        writeln!(file, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write header");
+        writeln!(file, "1:100\tA\tG\t0.5").expect("write first line");
+        writeln!(file, "1:150\tC\tT\t0.7").expect("write second line");
+        writeln!(file, "1:180\tC\tT\t0.2").expect("write third line");
+        drop(file);
+
+        let mut score_name_to_col_index = AHashMap::new();
+        score_name_to_col_index.insert("ScoreA".to_string(), ScoreColumnIndex(0));
+
+        let region = GenomicRegion {
+            chromosome: 1,
+            start: 140,
+            end: 200,
+        };
+        let bump = Bump::new();
+        let file_paths = vec![score_path];
+        let mut iter = KWayMergeIterator::new(
+            &file_paths,
+            &score_name_to_col_index,
+            Some(vec![Some(region)]),
+            &bump,
+        )
+        .expect("iterator");
+
+        let mut keys = Vec::new();
+        while let Some(result) = iter.next() {
+            let record = result.expect("record ok");
+            keys.push(record.key);
+        }
+
+        assert_eq!(keys, vec![(1, 150), (1, 180)]);
+    }
 }
 
 fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {
@@ -947,28 +994,31 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 
     fn replenish_from_stream(&mut self, file_idx: usize) -> Result<(), PrepError> {
-        // We scope the mutable borrow of the stream to check its buffer.
-        if !self.streams[file_idx].line_buffer.is_empty() {
-            let stream = &mut self.streams[file_idx];
-            Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
-            return Ok(());
+        loop {
+            let column_map = &self.file_column_maps[file_idx];
+            let bump = self.bump;
+            let region_filters = self.region_filters.as_deref();
+
+            let outcome = {
+                let stream = &mut self.streams[file_idx];
+                if !stream.line_buffer.is_empty() {
+                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    return Ok(());
+                }
+
+                Self::read_line_into_buffer(stream, column_map, region_filters, bump)?
+            };
+
+            match outcome {
+                LineReadOutcome::Pushed => {
+                    let stream = &mut self.streams[file_idx];
+                    Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    return Ok(());
+                }
+                LineReadOutcome::Skipped => continue,
+                LineReadOutcome::Eof => return Ok(()),
+            }
         }
-
-        // The line buffer is empty, so we must read a new line from the file.
-        // Get the data we need from `self` before we mutably borrow a part of it.
-        let column_map = &self.file_column_maps[file_idx];
-        let bump = self.bump; // `&'arena Bump` is `Copy`, so this is a cheap reference copy.
-
-        // Now, get the mutable borrow of the stream.
-        let stream = &mut self.streams[file_idx];
-
-        // Call the static helper function using the correct syntax.
-        // This avoids the borrow checker conflict.
-        if Self::read_line_into_buffer(stream, column_map, self.region_filters.as_deref(), bump)? {
-            Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
-        }
-
-        Ok(())
     }
 
     fn read_line_into_buffer(
@@ -976,7 +1026,7 @@ impl<'arena> KWayMergeIterator<'arena> {
         column_map: &[ScoreColumnIndex],
         region_filters: Option<&[Option<GenomicRegion>]>,
         bump: &'arena Bump,
-    ) -> Result<bool, PrepError> {
+    ) -> Result<LineReadOutcome, PrepError> {
         stream.line_buffer.clear();
         stream.current_line_info = None;
 
@@ -988,51 +1038,59 @@ impl<'arena> KWayMergeIterator<'arena> {
                 .map_err(|e| PrepError::Io(e, PathBuf::new()))?;
 
             if bytes_read == 0 {
-                return Ok(false);
+                return Ok(LineReadOutcome::Eof);
             }
 
-            if !stream.line_string_buffer.trim().is_empty()
-                && !stream.line_string_buffer.starts_with('#')
+            if stream.line_string_buffer.trim().is_empty()
+                || stream.line_string_buffer.starts_with('#')
             {
-                break;
+                continue;
             }
-        }
-        // Use the `bump` argument, not `self.bump`.
-        let line_in_arena = bump.alloc_str(&stream.line_string_buffer);
 
-        let mut parts = line_in_arena.split('\t');
-        let (variant_id, effect_allele, other_allele) =
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some(v), Some(e), Some(o)) if !v.is_empty() && !e.is_empty() && !o.is_empty() => {
-                    (v, e, o)
-                } // Ensure other_allele is also not empty
-                _ => {
-                    stream.malformed_lines_count += 1;
-                    return Ok(false); // Line doesn't have the required three non-empty columns
-                }
-            };
+            // Use the `bump` argument, not `self.bump`.
+            let line_in_arena = bump.alloc_str(&stream.line_string_buffer);
 
-        let mut key_parts = variant_id.splitn(2, ':');
-        let chr_str = key_parts.next().unwrap_or("");
-        let pos_str = key_parts.next().unwrap_or("");
-        let key = parse_key(chr_str, pos_str)?;
-        stream.current_line_info = Some((key, effect_allele, other_allele));
+            let mut parts = line_in_arena.split('\t');
+            let (variant_id, effect_allele, other_allele) =
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(v), Some(e), Some(o))
+                        if !v.is_empty() && !e.is_empty() && !o.is_empty() =>
+                    {
+                        (v, e, o)
+                    } // Ensure other_allele is also not empty
+                    _ => {
+                        stream.malformed_lines_count += 1;
+                        continue; // Line doesn't have the required three non-empty columns
+                    }
+                };
 
-        for (i, weight_str) in parts.enumerate() {
-            if let Ok(weight) = weight_str.trim().parse::<f32>()
-                && let Some(&score_column_index) = column_map.get(i)
-            {
-                if let Some(filters) = region_filters {
-                    if let Some(Some(region)) = filters.get(score_column_index.0) {
-                        if !region.contains(key) {
-                            continue;
+            let mut key_parts = variant_id.splitn(2, ':');
+            let chr_str = key_parts.next().unwrap_or("");
+            let pos_str = key_parts.next().unwrap_or("");
+            let key = parse_key(chr_str, pos_str)?;
+            stream.current_line_info = Some((key, effect_allele, other_allele));
+
+            for (i, weight_str) in parts.enumerate() {
+                if let Ok(weight) = weight_str.trim().parse::<f32>()
+                    && let Some(&score_column_index) = column_map.get(i)
+                {
+                    if let Some(filters) = region_filters {
+                        if let Some(Some(region)) = filters.get(score_column_index.0) {
+                            if !region.contains(key) {
+                                continue;
+                            }
                         }
                     }
+                    stream.line_buffer.push_back((weight, score_column_index));
                 }
-                stream.line_buffer.push_back((weight, score_column_index));
+            }
+            if stream.line_buffer.is_empty() {
+                stream.current_line_info = None;
+                return Ok(LineReadOutcome::Skipped);
+            } else {
+                return Ok(LineReadOutcome::Pushed);
             }
         }
-        Ok(!stream.line_buffer.is_empty())
     }
 
     fn push_next_from_buffer_to_heap(
