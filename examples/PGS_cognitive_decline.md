@@ -19,6 +19,13 @@ Strong performers include:
 - PGS000007
 - PGS000507
 - PGS004869
+- PGS004146
+- PGS004863
+- PGS003957
+- PGS003334
+- PGS004589
+- PGS004898
+- PGS004227
 
 We'll assess these scores on three metrics in the test data:
 - Odds ratio (per standard deviation of score)
