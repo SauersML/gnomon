@@ -4842,18 +4842,30 @@ mod tests {
             let base_probs = distorted_eta.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
             let fake_x = Array2::from_shape_fn((n, 1), |(i, _)| distorted_eta[i]);
-            let base_fit = real_unpenalized_fit(&fake_x, &y, &w, LinkFunction::Logit);
+            let jittered_fake_x = {
+                let mut rng = StdRng::seed_from_u64(9_192_245_771_317_209_097);
+                let normal = rand_distr::Normal::new(0.0, 0.05).unwrap();
+                let mut design = fake_x.clone();
+                for val in design.iter_mut() {
+                    *val += normal.sample(&mut rng);
+                }
+                design
+            };
+
+            let base_fit = real_unpenalized_fit(&jittered_fake_x, &y, &w, LinkFunction::Logit);
 
             let mut alo_features = compute_alo_features(
                 &base_fit,
                 y.view(),
-                fake_x.view(),
+                jittered_fake_x.view(),
                 None,
                 LinkFunction::Logit,
             )
             .unwrap();
 
-            // Preserve the miscalibrated base logits as the identity backbone
+            // Preserve the miscalibrated base logits as the identity backbone and as the
+            // predictor seen by the calibrator; the jitter only regularizes the PIRLS fit.
+            alo_features.pred = distorted_eta.clone();
             alo_features.pred_identity = distorted_eta.clone();
 
             let (x_cal, penalties, schema, offset) =
