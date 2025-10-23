@@ -503,5 +503,107 @@ Let's check ICD code heterogeneity:
 
 <img width="989" height="390" alt="image" src="https://github.com/user-attachments/assets/d5397d26-b530-4378-bf8a-7b71bb2cd577" />
 
+Let's check accuracy within each inferred genetic ancestry group:
+```
+import os, numpy as np, pandas as pd, matplotlib.pyplot as plt, statsmodels.api as sm
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
 
+# data
+d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID'); d.index = d.index.astype(str)
+pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
+
+NUM_PCS = 16
+pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
+PCS_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+SEX_URI = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
+so = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
+
+pcs_raw = pd.read_csv(PCS_URI, sep="\t", storage_options=so, usecols=["research_id","pca_features","ancestry_pred"])
+parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
+pc_df = (pd.DataFrame(pcs_raw["pca_features"].apply(parse).to_list(), columns=pc_cols)
+           .assign(person_id=pcs_raw["research_id"].astype(str), ancestry_pred=pcs_raw["ancestry_pred"])
+           .set_index("person_id"))
+
+sex = (pd.read_csv(SEX_URI, sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+         .assign(person_id=lambda x: x["research_id"].astype(str))
+         .set_index("person_id")["dragen_sex_ploidy"])
+
+women_ids = d.index.intersection(sex[sex=="XX"].index)
+case_set = set(pd.Series(cases, dtype=str))
+
+X = d.loc[women_ids, pgs_cols].join(pc_df[pc_cols], how="inner").dropna()
+y = pd.Index(X.index).to_series().isin(case_set).astype('i1').to_numpy()
+anc = pc_df.loc[X.index, "ancestry_pred"]
+
+# 10-fold OOF probabilities
+cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+clf = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", C=1e6, max_iter=2000))
+p = np.zeros(len(y))
+for tr, te in cv.split(X.values, y):
+    clf.fit(X.iloc[tr], y[tr]); p[te] = clf.predict_proba(X.iloc[te])[:,1]
+
+def auc_ci_boot(y, p, B=500, rng=123):
+    rs = np.random.RandomState(rng)
+    y = np.asarray(y); p = np.asarray(p)
+    pos, neg = np.where(y==1)[0], np.where(y==0)[0]
+    aucs = []
+    for _ in range(B):
+        idx = np.concatenate([rs.choice(pos, len(pos), True), rs.choice(neg, len(neg), True)])
+        aucs.append(roc_auc_score(y[idx], p[idx]))
+    lo, hi = np.percentile(aucs, [2.5, 97.5])
+    return float(roc_auc_score(y, p)), float(lo), float(hi)
+
+def orsd_ci(y, p):
+    z = (p - p.mean()) / p.std(ddof=0)
+    m = sm.Logit(y, sm.add_constant(z)).fit(disp=False, maxiter=200)
+    beta, se = float(m.params[1]), float(m.bse[1])
+    or_sd = np.exp(beta)
+    return float(or_sd), float(np.exp(beta-1.96*se)), float(np.exp(beta+1.96*se))
+
+rows = []
+for anc_val, idx in anc.groupby(anc).groups.items():
+    idx = pd.Index(idx)
+    y_g = pd.Series(y, index=X.index).loc[idx].to_numpy()
+    p_g = pd.Series(p, index=X.index).loc[idx].to_numpy()
+    if y_g.sum()==0 or y_g.sum()==len(y_g) or p_g.std(ddof=0)==0: 
+        continue
+    auc, auc_lo, auc_hi = auc_ci_boot(y_g, p_g)
+    orsd, or_lo, or_hi = orsd_ci(y_g, p_g)
+    rows.append({"ancestry": str(anc_val), "n_women": int(len(y_g)), "cases": int(y_g.sum()),
+                 "AUROC": auc, "AUROC_lo": auc_lo, "AUROC_hi": auc_hi,
+                 "OR_per_SD": orsd, "OR_lo": or_lo, "OR_hi": or_hi})
+
+res = pd.DataFrame(rows).sort_values("AUROC", ascending=False).reset_index(drop=True)
+print(res.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+# two plots: AUROC and OR/SD with 95% CI
+anc_order = res["ancestry"].tolist()
+x = np.arange(len(anc_order)); w = 0.6
+
+plt.figure(figsize=(9,5))
+yv = res.set_index("ancestry").loc[anc_order, "AUROC"].to_numpy()
+lo = yv - res.set_index("ancestry").loc[anc_order, "AUROC_lo"].to_numpy()
+hi = res.set_index("ancestry").loc[anc_order, "AUROC_hi"].to_numpy() - yv
+plt.bar(x, yv, width=w, yerr=[lo, hi], capsize=4)
+plt.xticks(x, anc_order, rotation=25, ha="right"); plt.ylabel("AUROC")
+plt.title("Women — AUROC by ancestry (Scores + PCs, 10-fold OOF)"); plt.tight_layout()
+
+plt.figure(figsize=(9,5))
+yv = res.set_index("ancestry").loc[anc_order, "OR_per_SD"].to_numpy()
+lo = yv - res.set_index("ancestry").loc[anc_order, "OR_lo"].to_numpy()
+hi = res.set_index("ancestry").loc[anc_order, "OR_hi"].to_numpy() - yv
+plt.bar(x, yv, width=w, yerr=[lo, hi], capsize=4)
+plt.xticks(x, anc_order, rotation=25, ha="right"); plt.ylabel("OR per SD of prediction")
+plt.title("Women — OR/SD by ancestry (Scores + PCs, 10-fold OOF)"); plt.tight_layout()
+
+res
+```
+
+<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/7ddcf049-1906-47ba-bf8a-7318b0738e36" />
+
+<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/cb2253bf-59b2-4415-a3a2-70ace6713e64" />
 
