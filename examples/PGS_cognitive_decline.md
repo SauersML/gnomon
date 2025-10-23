@@ -1,9 +1,13 @@
 ## Running a polygenic score for cognitive decline on the _All of Us_ cohort
 
-First, let's see which colorectal cancer scores exist in the PGS Catalog:
+Cognitive decline has a heterogeneous etiology, and may be related to Alzheimer's disease, dementia, or other genetic and environmental causes. This is complicated by the age of individuals in the biobank.
 
-[https://www.pgscatalog.org/trait/MONDO_0005575/
-](https://www.pgscatalog.org/trait/MONDO_0007254/)
+Let's view the polygenic score catalog for dementia:
+https://www.pgscatalog.org/trait/MONDO_0001627/
+
+And Alzheimer's disease:
+https://www.pgscatalog.org/trait/MONDO_0004975/
+
 
 Strong performers include:
 - PGS000332
