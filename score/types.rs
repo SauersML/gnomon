@@ -4,7 +4,86 @@
 
 // This file is ONLY for types that are SHARED BETWEEN FILES, not types that only are used in one file.
 
+use std::fmt;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenomicRegion {
+    pub chromosome: u8,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl GenomicRegion {
+    #[inline]
+    pub fn contains(&self, key: (u8, u32)) -> bool {
+        key.0 == self.chromosome && key.1 >= self.start && key.1 <= self.end
+    }
+}
+
+impl fmt::Display for GenomicRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let chr_label = match self.chromosome {
+            23 => "X".to_string(),
+            24 => "Y".to_string(),
+            25 => "MT".to_string(),
+            n => format!("{n}"),
+        };
+        write!(f, "chr{chr_label}:{}-{}", self.start, self.end)
+    }
+}
+
+pub fn parse_chromosome_label(chr_str: &str) -> Result<u8, String> {
+    let mut trimmed = chr_str.trim();
+
+    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("chr") {
+        trimmed = &trimmed[3..];
+    }
+
+    if trimmed.eq_ignore_ascii_case("X") {
+        return Ok(23);
+    }
+    if trimmed.eq_ignore_ascii_case("Y") {
+        return Ok(24);
+    }
+    if trimmed.eq_ignore_ascii_case("MT") {
+        return Ok(25);
+    }
+
+    trimmed.parse::<u8>().map_err(|_| {
+        format!(
+            "Invalid chromosome format '{}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix.",
+            chr_str.trim()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_chromosome_label_supports_common_variants() {
+        assert_eq!(parse_chromosome_label("1").unwrap(), 1);
+        assert_eq!(parse_chromosome_label("chr2").unwrap(), 2);
+        assert_eq!(parse_chromosome_label("chrX").unwrap(), 23);
+        assert_eq!(parse_chromosome_label("MT").unwrap(), 25);
+    }
+
+    #[test]
+    fn genomic_region_contains_enforces_bounds() {
+        let region = GenomicRegion {
+            chromosome: 1,
+            start: 100,
+            end: 200,
+        };
+
+        assert!(region.contains((1, 150)));
+        assert!(!region.contains((1, 50)));
+        assert!(!region.contains((2, 150)));
+        assert!(!region.contains((1, 250)));
+    }
+}
 
 /// The payload sent from the I/O producer to the compute consumers. It contains
 /// the raw data for one variant and the necessary metadata to process it.

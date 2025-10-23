@@ -18,8 +18,9 @@ use gnomon::score::io::{gcs_billing_project_from_env, get_shared_runtime, load_a
 use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
-use gnomon::score::types::PreparationResult;
+use gnomon::score::types::{GenomicRegion, PreparationResult};
 use natord::compare;
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
@@ -94,15 +95,10 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Phase 1a: Score File Resolution ---
     // This block resolves the --score argument into a definitive list of files.
-    let resolved_score_files: Vec<PathBuf> = {
+    let (resolved_score_files, score_regions_map): (Vec<PathBuf>, HashMap<String, GenomicRegion>) = {
         let score_arg_str = args.score.to_string_lossy();
 
-        // HEURISTIC: If the path doesn't exist AND it contains "PGS",
-        // assume it's a list of IDs to download. This avoids accidentally
-        // triggering a download for a simple typo in a file path.
         if !args.score.exists() && score_arg_str.contains("PGS") {
-            // Define the permanent cache directory. Placing it relative to the
-            // output is a good strategy, keeping all generated files together.
             let scores_cache_dir = {
                 let p0 = &fileset_prefixes[0];
                 let parent_local = p0
@@ -113,20 +109,20 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 parent_local.join("gnomon_score_cache")
             };
 
-            download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?
+            let resolved =
+                download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?;
+            (resolved.paths, resolved.regions)
         } else {
-            // --- This is the original, local file handling logic ---
-            // The path exists locally, so we handle it as a file or directory.
-            if args.score.is_dir() {
+            let files = if args.score.is_dir() {
                 fs::read_dir(&args.score)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
                     .filter(|p| p.is_file())
                     .collect()
             } else {
-                // It's a single file.
                 vec![args.score.clone()]
-            }
+            };
+            (files, HashMap::new())
         }
     };
 
@@ -137,10 +133,17 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Phase 1b: Preparation ---
     // This phase is synchronous and CPU-bound. It parses all input files,
     // reconciles variants, and produces a "computation blueprint".
+    let score_regions_ref = if score_regions_map.is_empty() {
+        None
+    } else {
+        Some(&score_regions_map)
+    };
+
     let prep_result = run_preparation_phase(
         &fileset_prefixes,
         &resolved_score_files,
         args.keep.as_deref(),
+        score_regions_ref,
     )?;
 
     // --- Phase 2: Resource Allocation ---
@@ -187,6 +190,7 @@ fn run_preparation_phase(
     fileset_prefixes: &[PathBuf],
     score_files: &[PathBuf],
     keep: Option<&Path>,
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
     if fileset_prefixes.len() > 1 {
         eprintln!(
@@ -250,8 +254,13 @@ fn run_preparation_phase(
     }
 
     // --- Run the main preparation logic with the fully normalized and sorted files ---
-    let prep = prepare::prepare_for_computation(fileset_prefixes, &native_score_files, keep)
-        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    let prep = prepare::prepare_for_computation(
+        fileset_prefixes,
+        &native_score_files,
+        keep,
+        score_regions,
+    )
+    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
     eprintln!(
         "> Preparation complete in {:.2?}. Found {} individuals to score and {} overlapping variants across {} score(s).",

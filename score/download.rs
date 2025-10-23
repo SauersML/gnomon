@@ -5,11 +5,12 @@
 // ========================================================================================
 
 use crate::score::reformat;
+use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use dwldutil::indicator::{IndicateSignal, Indicator, IndicatorFactory};
 use dwldutil::{DLFile, Downloader};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -102,12 +103,12 @@ impl Indicator for DownloadIndicatorTask {
 ///   stored. This directory will be created if it does not exist.
 ///
 /// # Returns
-/// A `Result` containing a `Vec<PathBuf>` of paths to the final, native-format
-/// score files on success, or a boxed dynamic error on failure.
+/// A `Result` containing a [`ResolvedScoreFiles`] struct on success, or a boxed
+/// dynamic error on failure.
 pub fn resolve_and_download_scores(
     score_arg: &str,
     scores_dir: &Path,
-) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+) -> Result<ResolvedScoreFiles, Box<dyn Error + Send + Sync>> {
     // --- Stage 1: Setup and State Synchronization ---
     fs::create_dir_all(scores_dir)?;
     eprintln!(
@@ -115,20 +116,41 @@ pub fn resolve_and_download_scores(
         scores_dir.display()
     );
 
-    let requested_pgs_ids: BTreeSet<String> = score_arg
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if requested_pgs_ids.is_empty() {
+    let parsed_specs = parse_requested_scores(score_arg)?;
+    if parsed_specs.is_empty() {
         return Err("No valid PGS IDs provided in --score argument.".into());
     }
 
-    for id in &requested_pgs_ids {
+    let mut requested_pgs_ids = BTreeSet::new();
+    let mut region_overrides: HashMap<String, GenomicRegion> = HashMap::new();
+
+    for (id, region) in parsed_specs {
         if !id.starts_with("PGS") {
-            return Err(Box::new(DownloadError::InvalidId(id.clone())));
+            return Err(Box::new(DownloadError::InvalidId(id)));
         }
+
+        if !requested_pgs_ids.insert(id.clone()) {
+            if let Some(region) = region {
+                match region_overrides.get(&id) {
+                    Some(existing) if *existing != region => {
+                        return Err(Box::new(DownloadError::InvalidRegion(format!(
+                            "Score '{id}' specified multiple conflicting regions ({} vs {}).",
+                            existing, region
+                        ))));
+                    }
+                    Some(_) => {}
+                    None => {
+                        region_overrides.insert(id.clone(), region);
+                    }
+                }
+            }
+        } else if let Some(region) = region {
+            region_overrides.insert(id.clone(), region);
+        }
+    }
+
+    if requested_pgs_ids.is_empty() {
+        return Err("No valid PGS IDs provided in --score argument.".into());
     }
 
     let mut existing_native_paths = Vec::new();
@@ -166,7 +188,10 @@ pub fn resolve_and_download_scores(
     // --- Stage 3: Conditional Reformatting ---
     if files_to_reformat.is_empty() {
         eprintln!("> All required score files are already present and converted.");
-        return Ok(existing_native_paths);
+        return Ok(ResolvedScoreFiles {
+            paths: existing_native_paths,
+            regions: region_overrides,
+        });
     }
 
     eprintln!(
@@ -194,7 +219,10 @@ pub fn resolve_and_download_scores(
 
     // --- Stage 4: Final Aggregation ---
     existing_native_paths.extend(new_native_paths);
-    Ok(existing_native_paths)
+    Ok(ResolvedScoreFiles {
+        paths: existing_native_paths,
+        regions: region_overrides,
+    })
 }
 
 // ========================================================================================
@@ -207,6 +235,7 @@ pub enum DownloadError {
     Io(io::Error, PathBuf),
     Network(String),
     InvalidId(String),
+    InvalidRegion(String),
     Reformat(reformat::ReformatError),
     RuntimeCreation(io::Error),
 }
@@ -222,6 +251,7 @@ impl Display for DownloadError {
                 f,
                 "Invalid ID format for '{s}'. All IDs must start with 'PGS'."
             ),
+            DownloadError::InvalidRegion(s) => write!(f, "Invalid region specification: {s}"),
             DownloadError::Reformat(e) => write!(f, "{e}"),
             DownloadError::RuntimeCreation(e) => write!(f, "Failed to create async runtime: {e}"),
         }
@@ -236,6 +266,42 @@ impl Error for DownloadError {
             DownloadError::RuntimeCreation(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_requested_scores_handles_regions() {
+        let specs = parse_requested_scores(
+            "PGS000001 | chr1:100-200, PGS000002, PGS000003 | chrX:1,000-2,000",
+        )
+        .unwrap();
+
+        assert_eq!(specs.len(), 3);
+        let first_region = specs[0].1.expect("expected region");
+        assert!(first_region.contains((1, 150)));
+        assert!(specs[1].1.is_none());
+        let third_region = specs[2].1.expect("expected region");
+        assert_eq!(third_region.chromosome, 23);
+        assert_eq!(third_region.start, 1000);
+        assert_eq!(third_region.end, 2000);
+    }
+
+    #[test]
+    fn resolve_and_download_scores_errors_on_conflicting_regions() {
+        let dir = tempdir().unwrap();
+        let err = resolve_and_download_scores(
+            "PGS000010 | chr1:10-20, PGS000010 | chr1:30-40",
+            dir.path(),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("conflicting regions"));
     }
 }
 
@@ -296,4 +362,174 @@ fn download_missing_files(
 
         Ok(paths_to_reformat)
     })
+}
+#[derive(Debug)]
+pub struct ResolvedScoreFiles {
+    pub paths: Vec<PathBuf>,
+    pub regions: HashMap<String, GenomicRegion>,
+}
+
+fn parse_position_component(component: &str) -> Result<u32, String> {
+    let cleaned: String = component
+        .chars()
+        .filter(|c| !matches!(c, ',' | '_' | ' '))
+        .collect();
+    if cleaned.is_empty() {
+        return Err(format!("Coordinate '{component}' is empty."));
+    }
+    let value: u64 = cleaned
+        .parse()
+        .map_err(|_| format!("Coordinate '{component}' is not a valid integer."))?;
+    if value == 0 {
+        return Err(format!(
+            "Coordinate '{component}' must be greater than zero."
+        ));
+    }
+    if value > u32::MAX as u64 {
+        return Err(format!(
+            "Coordinate '{component}' exceeds the supported range (>{}).",
+            u32::MAX
+        ));
+    }
+    Ok(value as u32)
+}
+
+fn parse_region_spec(region_str: &str) -> Result<GenomicRegion, DownloadError> {
+    let trimmed = region_str.trim();
+    let mut parts = trimmed.splitn(2, ':');
+    let chr_part = parts.next().unwrap_or("").trim();
+    let range_part = parts
+        .next()
+        .ok_or_else(|| {
+            DownloadError::InvalidRegion(format!("Region '{trimmed}' is missing a ':' separator."))
+        })?
+        .trim();
+
+    if chr_part.is_empty() {
+        return Err(DownloadError::InvalidRegion(format!(
+            "Region '{trimmed}' is missing a chromosome label."
+        )));
+    }
+    if range_part.is_empty() {
+        return Err(DownloadError::InvalidRegion(format!(
+            "Region '{trimmed}' is missing position bounds."
+        )));
+    }
+
+    let mut bounds = range_part.splitn(2, '-');
+    let start_str = bounds.next().unwrap_or("").trim();
+    let end_str = bounds
+        .next()
+        .ok_or_else(|| {
+            DownloadError::InvalidRegion(format!(
+                "Region '{trimmed}' is missing an end coordinate."
+            ))
+        })?
+        .trim();
+
+    if start_str.is_empty() || end_str.is_empty() {
+        return Err(DownloadError::InvalidRegion(format!(
+            "Region '{trimmed}' must include both start and end coordinates."
+        )));
+    }
+
+    let chromosome = parse_chromosome_label(chr_part).map_err(|msg| {
+        DownloadError::InvalidRegion(format!("Invalid chromosome in region '{trimmed}': {msg}"))
+    })?;
+    let start = parse_position_component(start_str).map_err(|msg| {
+        DownloadError::InvalidRegion(format!(
+            "Invalid start coordinate in region '{trimmed}': {msg}"
+        ))
+    })?;
+    let end = parse_position_component(end_str).map_err(|msg| {
+        DownloadError::InvalidRegion(format!(
+            "Invalid end coordinate in region '{trimmed}': {msg}"
+        ))
+    })?;
+
+    if start > end {
+        return Err(DownloadError::InvalidRegion(format!(
+            "Region '{trimmed}' has start coordinate greater than end coordinate."
+        )));
+    }
+
+    Ok(GenomicRegion {
+        chromosome,
+        start,
+        end,
+    })
+}
+
+fn split_score_argument(score_arg: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let bytes = score_arg.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    while i < len {
+        if bytes[i] == b',' {
+            let mut lookahead = i + 1;
+            while lookahead < len && bytes[lookahead].is_ascii_whitespace() {
+                lookahead += 1;
+            }
+            if lookahead < len && score_arg[lookahead..].starts_with("PGS") {
+                let item = score_arg[start..i].trim();
+                if !item.is_empty() {
+                    parts.push(item.to_string());
+                }
+                start = i + 1;
+            }
+        }
+        i += 1;
+    }
+
+    let tail = score_arg[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+
+    parts
+}
+
+fn parse_requested_scores(
+    score_arg: &str,
+) -> Result<Vec<(String, Option<GenomicRegion>)>, DownloadError> {
+    let mut results = Vec::new();
+
+    for raw in split_score_argument(score_arg) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split('|');
+        let id_part = parts.next().unwrap_or("").trim();
+        let region_part = parts.next().map(|s| s.trim());
+
+        if parts.next().is_some() {
+            return Err(DownloadError::InvalidRegion(format!(
+                "Score specification '{trimmed}' contains multiple '|' separators."
+            )));
+        }
+
+        if id_part.is_empty() {
+            return Err(DownloadError::InvalidId(trimmed.to_string()));
+        }
+
+        let region = if let Some(region_str) = region_part {
+            if region_str.is_empty() {
+                return Err(DownloadError::InvalidRegion(format!(
+                    "Region specification for '{id_part}' is empty."
+                )));
+            }
+            Some(parse_region_spec(region_str)?)
+        } else {
+            None
+        };
+
+        results.push((id_part.to_string(), region));
+    }
+
+    Ok(results)
 }
