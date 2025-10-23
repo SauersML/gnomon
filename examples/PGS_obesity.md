@@ -16,6 +16,8 @@ Strong performers include:
 - PGS005198
 - PGS003400
 - PGS005235
+- PGS005203
+- PGS004150
 
 We can use the microarray `gs://fc-aou-datasets-controlled/v8/microarray/plink/` for scoring.
 
