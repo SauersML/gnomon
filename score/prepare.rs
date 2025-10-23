@@ -11,14 +11,14 @@
 use crate::score::io::{TextSource, open_text_source};
 use crate::score::pipeline::PipelineError;
 use crate::score::types::{
-    BimRowIndex, FilesetBoundary, GroupedComplexRule, PersonSubset, PipelineKind,
-    PreparationResult, ScoreColumnIndex, ScoreInfo,
+    BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
+    PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
 };
 use ahash::{AHashMap, AHashSet};
 use bumpalo::Bump;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
@@ -131,6 +131,7 @@ struct KWayMergeIterator<'arena> {
     file_column_maps: Vec<Vec<ScoreColumnIndex>>,
     // Holds a terminal error. If Some, iteration will stop after yielding the error.
     next_error: Option<PrepError>,
+    region_filters: Option<Vec<Option<GenomicRegion>>>,
     // A reference to the memory arena for zero-copy string allocations.
     bump: &'arena Bump,
 }
@@ -212,6 +213,7 @@ pub fn prepare_for_computation(
     fileset_prefixes: &[PathBuf],
     sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<PreparationResult, PrepError> {
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
@@ -246,8 +248,25 @@ pub fn prepare_for_computation(
 
     // Create the iterators, giving them a reference to the arena.
     let mut bim_iterator = BimIterator::new(&fileset_paths, &bump)?;
-    let mut score_iterator =
-        KWayMergeIterator::new(sorted_score_files, &score_name_to_col_index, &bump)?;
+    let region_filters = score_regions.and_then(|regions| {
+        let mut has_any = false;
+        let mut filters = Vec::with_capacity(score_names.len());
+        for name in &score_names {
+            let region = regions.get(name).copied();
+            if region.is_some() {
+                has_any = true;
+            }
+            filters.push(region);
+        }
+        has_any.then_some(filters)
+    });
+
+    let mut score_iterator = KWayMergeIterator::new(
+        sorted_score_files,
+        &score_name_to_col_index,
+        region_filters,
+        &bump,
+    )?;
 
     let mut bim_iter = bim_iterator.by_ref().peekable();
     let mut score_iter = score_iterator.by_ref().peekable();
@@ -740,41 +759,9 @@ fn extract_chr_from_parse_error(msg: &str) -> Option<&str> {
 }
 
 fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
-    // First, check for special, non-numeric chromosome names
-    if chr_str.eq_ignore_ascii_case("X") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
-        return Ok((23, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("Y") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
-        return Ok((24, pos_num));
-    }
-    if chr_str.eq_ignore_ascii_case("MT") {
-        let pos_num: u32 = pos_str
-            .parse()
-            .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
-        return Ok((25, pos_num));
-    }
-
-    // Next, handle numeric chromosomes, stripping a potential "chr" prefix case-insensitively.
-    let number_part = if chr_str.len() >= 3 && chr_str[..3].eq_ignore_ascii_case("chr") {
-        &chr_str[3..]
-    } else {
-        chr_str
-    };
-
-    // Now, parse the remaining part.
-    let chr_num: u8 = number_part.parse().map_err(|_| {
-        PrepError::Parse(format!(
-            "Invalid chromosome format '{chr_str}'. Expected a number, 'X', 'Y', 'MT', or 'chr' prefix."
-        ))
-    })?;
-
-    let pos_num: u32 = pos_str
+    let chr_num = parse_chromosome_label(chr_str).map_err(PrepError::Parse)?;
+    let pos_trimmed = pos_str.trim();
+    let pos_num: u32 = pos_trimmed
         .parse()
         .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
 
@@ -892,6 +879,7 @@ impl<'arena> KWayMergeIterator<'arena> {
     fn new(
         file_paths: &[PathBuf],
         score_name_to_col_index: &AHashMap<String, ScoreColumnIndex>,
+        region_filters: Option<Vec<Option<GenomicRegion>>>,
         bump: &'arena Bump,
     ) -> Result<Self, PrepError> {
         let mut streams = Vec::with_capacity(file_paths.len());
@@ -947,6 +935,7 @@ impl<'arena> KWayMergeIterator<'arena> {
             heap: BinaryHeap::new(),
             file_column_maps,
             next_error: None,
+            region_filters,
             bump,
         };
 
@@ -975,7 +964,7 @@ impl<'arena> KWayMergeIterator<'arena> {
 
         // Call the static helper function using the correct syntax.
         // This avoids the borrow checker conflict.
-        if Self::read_line_into_buffer(stream, column_map, bump)? {
+        if Self::read_line_into_buffer(stream, column_map, self.region_filters.as_deref(), bump)? {
             Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
         }
 
@@ -985,6 +974,7 @@ impl<'arena> KWayMergeIterator<'arena> {
     fn read_line_into_buffer(
         stream: &mut FileStream<'arena>,
         column_map: &[ScoreColumnIndex],
+        region_filters: Option<&[Option<GenomicRegion>]>,
         bump: &'arena Bump,
     ) -> Result<bool, PrepError> {
         stream.line_buffer.clear();
@@ -1032,6 +1022,13 @@ impl<'arena> KWayMergeIterator<'arena> {
             if let Ok(weight) = weight_str.trim().parse::<f32>()
                 && let Some(&score_column_index) = column_map.get(i)
             {
+                if let Some(filters) = region_filters {
+                    if let Some(Some(region)) = filters.get(score_column_index.0) {
+                        if !region.contains(key) {
+                            continue;
+                        }
+                    }
+                }
                 stream.line_buffer.push_back((weight, score_column_index));
             }
         }
