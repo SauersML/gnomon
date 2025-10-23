@@ -177,6 +177,8 @@ pub struct MergeDiagnosticInfo {
     // Store the last few raw keys we saw from each stream. Formatting is deferred.
     last_bim_keys_seen: std::collections::VecDeque<VariantKey>,
     last_score_keys_seen: std::collections::VecDeque<VariantKey>,
+    /// Track any region filters supplied by the user so we can surface them in diagnostics.
+    active_region_filters: Vec<(String, GenomicRegion)>,
 }
 
 /// The number of recent keys to store for diagnostic reporting.
@@ -197,6 +199,19 @@ impl MergeDiagnosticInfo {
             self.last_score_keys_seen.pop_front();
         }
         self.last_score_keys_seen.push_back(key);
+    }
+
+    fn record_region_filters(&mut self, filters: &HashMap<String, GenomicRegion>) {
+        if filters.is_empty() {
+            return;
+        }
+
+        self.active_region_filters = filters
+            .iter()
+            .map(|(name, region)| (name.clone(), *region))
+            .collect();
+        self.active_region_filters
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0));
     }
 }
 
@@ -250,6 +265,9 @@ pub fn prepare_for_computation(
     let bump = Bump::new();
 
     let mut diagnostics = MergeDiagnosticInfo::default();
+    if let Some(regions) = score_regions {
+        diagnostics.record_region_filters(regions);
+    }
     let mut seen_invalid_bim_chrs: AHashSet<String> = AHashSet::new();
     let mut seen_invalid_score_chrs: AHashSet<String> = AHashSet::new();
 
@@ -1396,6 +1414,30 @@ impl Display for PrepError {
                     "Total score records processed from Score files: {}",
                     diag.total_score_records_processed
                 )?;
+
+                if !diag.active_region_filters.is_empty() {
+                    writeln!(f, "\nRegion filters requested:")?;
+                    for (score, region) in &diag.active_region_filters {
+                        writeln!(f, "  - {score} -> {region}")?;
+                    }
+
+                    if diag.total_score_records_processed == 0 {
+                        writeln!(
+                            f,
+                            "\nAll score records were filtered out by the requested region restriction(s)."
+                        )?;
+                        writeln!(
+                            f,
+                            "Please verify that the specified coordinates exist in the score file(s)."
+                        )?;
+                    }
+                } else if diag.total_score_records_processed == 0 {
+                    writeln!(f, "\nNo score records were processed.")?;
+                    writeln!(
+                        f,
+                        "This can happen if the score files are empty or contain only unparsable entries."
+                    )?;
+                }
 
                 if !diag.last_bim_keys_seen.is_empty() {
                     writeln!(
