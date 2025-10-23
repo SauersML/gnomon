@@ -1152,7 +1152,8 @@ fn scan_for_ignored_tests() -> Vec<String> {
     all_violations
 }
 
-fn is_in_target_directory(path: &Path) -> bool {
-    path.components()
+fn is_in_target_directory(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .components()
         .any(|component| matches!(component, Component::Normal(name) if name == "target"))
 }
