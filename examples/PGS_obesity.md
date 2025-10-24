@@ -165,7 +165,7 @@ for s in d.filter(regex='_AVG$').columns:
 pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided_OR>1','AUROC','p_one_sided_AUC>0.5','Nagelkerke_R2','p_one_sided_R2>0']).sort_values('Nagelkerke_R2',ascending=False)
 ```
 
-The best score is PGS005198 with an OR/SD of 1.453851 and AUROC of 0.602658. PGS004378 is in second place, with an AUROC of 0.589763
+The best score is PGS005198 with an OR/SD of 1.453851 and AUROC of 0.602658. PGS004378 is in second place, with an AUROC of 0.589763. PGS005235 is in third, with an AUROC of 0.583957.
 
 ```
 import os, numpy as np, pandas as pd
