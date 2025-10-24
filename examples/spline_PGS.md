@@ -313,3 +313,59 @@ cat(sprintf("R^2: %.6f\n", summary(fit_err)$r.squared))
 ```
 R^2: 0.000360. Not great.
 
+Let's predict Alzheimer's with both scores and PCs:
+```
+# PCs + all PGS → logistic model → AUROC and OR/SD
+
+library(data.table)
+library(pROC)
+
+pc_cols  <- paste0("PC", 1:16)
+case_ids <- unique(as.character(cases))
+
+# PCs
+Z <- as.data.table(pc_df[, c("person_id", pc_cols), with = FALSE])
+Z[, person_id := as.character(person_id)]
+for (cn in pc_cols) set(Z, j = cn, value = suppressWarnings(as.numeric(Z[[cn]])))
+keep_pcs <- vapply(pc_cols, function(cn) any(is.finite(Z[[cn]])), logical(1))
+Z <- Z[, c("person_id", pc_cols[keep_pcs]), with = FALSE]
+for (cn in setdiff(names(Z), "person_id")) {
+  v <- Z[[cn]]; m <- mean(v[is.finite(v)]); v[!is.finite(v)] <- m; set(Z, j = cn, value = v)
+}
+
+# PGS
+ss <- fread("arrays.sscore", sep = "\t", showProgress = FALSE)
+setnames(ss, names(ss)[1], "person_id")
+ss[, person_id := as.character(person_id)]
+pgs_cols <- grep("_AVG$", names(ss), value = TRUE)
+Xpgs <- ss[, c("person_id", pgs_cols), with = FALSE]
+for (cn in pgs_cols) set(Xpgs, j = cn, value = suppressWarnings(as.numeric(Xpgs[[cn]])))
+keep_pgs <- vapply(pgs_cols, function(cn) any(is.finite(Xpgs[[cn]])), logical(1))
+Xpgs <- Xpgs[, c("person_id", pgs_cols[keep_pgs]), with = FALSE]
+for (cn in setdiff(names(Xpgs), "person_id")) {
+  v <- Xpgs[[cn]]; m <- mean(v[is.finite(v)]); v[!is.finite(v)] <- m; set(Xpgs, j = cn, value = v)
+}
+
+# Align & model
+M <- merge(Xpgs, Z, by = "person_id", all = FALSE)
+y <- as.integer(M$person_id %chin% case_ids)
+X <- M[, -1, with = FALSE]
+
+fit   <- glm(y ~ ., data = data.frame(y = y, X, check.names = FALSE), family = binomial())
+p_hat <- as.numeric(predict(fit, type = "response"))
+
+auc_val <- as.numeric(auc(roc(response = y, predictor = p_hat, quiet = TRUE)))
+
+mu <- mean(p_hat); sdv <- sd(p_hat)
+z  <- (p_hat - mu) / sdv
+fit_z <- glm(y ~ z, family = binomial())
+or_sd <- unname(exp(coef(fit_z)["z"]))
+
+cat(sprintf(
+  "Merged n: %s | Predictors: %d\nAUROC: %.6f\nOR per SD of prediction: %.6f\n",
+  format(length(y), big.mark = ","), ncol(X), auc_val, or_sd
+))
+```
+AUROC: 0.630836
+OR per SD of prediction: 1.439452
+
