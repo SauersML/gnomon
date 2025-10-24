@@ -683,7 +683,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
 # data
-d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID')
+d = pd.read_csv('../../arrays_cog.sscore', sep='\t').set_index('#IID')
 d.index = d.index.astype(str)
 pgs = [c for c in d.columns if c.endswith('_AVG')]
 
@@ -691,29 +691,44 @@ NUM_PCS = 16
 pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
 so = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
 
-pcs = pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
-                  sep="\t", storage_options=so, usecols=["research_id","pca_features"])
+pcs = pd.read_csv(
+    "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+    sep="\t", storage_options=so, usecols=["research_id","pca_features"]
+)
 parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
-pc_df = (pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols)
-           .assign(person_id=pcs["research_id"].astype(str)).set_index("person_id")).dropna()
+pc_df = (
+    pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols)
+      .assign(person_id=pcs["research_id"].astype(str))
+      .set_index("person_id")
+).dropna()
 
-sex = (pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",
-                   sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
-         .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"])
+sex_df = (
+    pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",
+                sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+      .assign(person_id=lambda x: x["research_id"].astype(str))
+      .set_index("person_id")["dragen_sex_ploidy"]
+      .map({"XX":0,"XY":1})
+      .to_frame("sex")
+)
 
-# women only; predictors = all scores + PCs
-X = d[pgs].join(pc_df, how="inner").dropna()
-idx_w = X.index.intersection(sex[sex=="XX"].index)
-Xw = X.loc[idx_w].astype(float)
-y = pd.Index(idx_w).to_series().isin(pd.Series(cases, dtype=str)).astype('i1').to_numpy()
+# predictors = all scores + sex + PCs
+X = (
+    d[pgs]
+      .join(sex_df, how="inner")
+      .join(pc_df, how="inner")
+      .dropna()
+      .astype(float)
+)
 
-# 10-fold CV, OOF predictions
+y = X.index.to_series().isin(pd.Series(cases, dtype=str)).astype('i1').to_numpy()
+
+# 10-fold CV, out-of-fold predictions
 cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
 mdl = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
 p = np.zeros(len(y))
-for tr, te in cv.split(Xw, y):
-    mdl.fit(Xw.iloc[tr], y[tr])
-    p[te] = mdl.predict_proba(Xw.iloc[te])[:,1]
+for tr, te in cv.split(X, y):
+    mdl.fit(X.iloc[tr], y[tr])
+    p[te] = mdl.predict_proba(X.iloc[te])[:,1]
 
 # metrics
 auc = roc_auc_score(y, p)
@@ -725,27 +740,22 @@ thr = min(2*base, 0.999)
 frac_2x = float((p >= thr).mean())
 
 pd.DataFrame([{
-    "n_women": int(len(y)),
+    "n": int(len(y)),
     "cases": int(y.sum()),
     "controls": int(len(y)-y.sum()),
+    "predictors": int(X.shape[1]),
     "AUROC": float(auc),
     "OR_per_SD_pred": or_per_sd,
-    "fraction_women_at_≥2x_risk": frac_2x,
+    "fraction_at_≥2x_risk": frac_2x,
     "baseline_risk": float(base),
     "2x_threshold": float(thr)
 }])
 ```
 
-In women, PGS ensemble + PCs:
-- 0.657404 AUROC
-- 1.539613 OR/SD
-- 6.2% at 2x risk
-
-Let's check ICD code heterogeneity:
-
-<img width="989" height="390" alt="image" src="https://github.com/user-attachments/assets/93b62d4d-49a0-4301-bc0b-fafd69844fba" />
-
-<img width="989" height="390" alt="image" src="https://github.com/user-attachments/assets/d5397d26-b530-4378-bf8a-7b71bb2cd577" />
+PGS ensemble + PCs + sex:
+- 0.625009 AUROC
+- 1.399734 OR/SD
+- 5.43% at 2x risk
 
 Let's check accuracy within each inferred genetic ancestry group:
 ```
