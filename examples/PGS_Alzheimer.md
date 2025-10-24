@@ -471,20 +471,7 @@ out = pd.DataFrame(rows).sort_values("AUROC_sxpc", ascending=False).reset_index(
 print(out.to_string(index=False, float_format=lambda x: f"{x:.3f}" if isinstance(x, float) else str(x)))
 ```
 
-
-| Score     |      nₛ | casesₛ | AUROCₛ |  ACCₛ |     nₛₓ | casesₛₓ | AUROCₛₓ | ACCₛₓ |   nₛₓₚ꜀ | casesₛₓₚ꜀ | AUROCₛₓₚ꜀ | ACCₛₓₚ꜀ |
-| --------- | ------: | -----: | -----: | ----: | ------: | ------: | ------: | ----: | ------: | --------: | --------: | ------: |
-| PGS000507 | 447,278 |  6,614 |  0.547 | 0.985 | 413,337 |   6,210 |   0.721 | 0.985 | 413,337 |     6,210 |     0.785 |   0.985 |
-| PGS000508 | 447,278 |  6,614 |  0.542 | 0.985 | 413,337 |   6,210 |   0.718 | 0.985 | 413,337 |     6,210 |     0.784 |   0.985 |
-| PGS000332 | 447,278 |  6,614 |  0.537 | 0.985 | 413,337 |   6,210 |   0.715 | 0.985 | 413,337 |     6,210 |     0.783 |   0.985 |
-| PGS004869 | 447,278 |  6,614 |  0.552 | 0.985 | 413,337 |   6,210 |   0.724 | 0.985 | 413,337 |     6,210 |     0.779 |   0.985 |
-| PGS000317 | 447,278 |  6,614 |  0.567 | 0.985 | 413,337 |   6,210 |   0.733 | 0.985 | 413,337 |     6,210 |     0.778 |   0.985 |
-| PGS000007 | 447,278 |  6,614 |  0.569 | 0.985 | 413,337 |   6,210 |   0.735 | 0.985 | 413,337 |     6,210 |     0.776 |   0.985 |
-| PGS000015 | 447,278 |  6,614 |  0.539 | 0.985 | 413,337 |   6,210 |   0.715 | 0.985 | 413,337 |     6,210 |     0.776 |   0.985 |
-| PGS000344 | 447,278 |  6,614 |  0.540 | 0.985 | 413,337 |   6,210 |   0.717 | 0.985 | 413,337 |     6,210 |     0.774 |   0.985 |
-
-Everything is helpful: score, sex, and PCs.
-
+From this, we can see that everything is helpful: score, sex, and PCs. The best AUROC is from PGS004146 + sex + PCs, at 0.630.
 
 Now, let's test the same model, except jointly fitting all scores using cross-validation to avoid overfitting.
 
@@ -536,9 +523,9 @@ pd.DataFrame([{
 }])
 ```
 
-This yields an AUROC of 0.787221, much better!
+This yields an AUROC of 0.623147, similar to before.
 
-But do score ensembles really improve the result?
+Do score ensembles really improve the result?
 
 Let's compare:
 ```
@@ -554,7 +541,7 @@ d.index = d.index.astype(str)
 pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
 idx_all = d[pgs_cols].dropna().index
 X_all = d.loc[idx_all, pgs_cols].astype(float)
-X_507 = d.loc[idx_all, ['PGS000507_AVG']].astype(float)
+X_507 = d.loc[idx_all, ['PGS004146_AVG']].astype(float)
 y = pd.Index(idx_all).to_series().isin(pd.Series(cases, dtype=str)).astype('i1').to_numpy()
 
 cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
@@ -576,7 +563,7 @@ auc_507 = roc_auc_score(y, p_507)
 
 perf = pd.DataFrame([
     {"model":"All AVG", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_all)},
-    {"model":"PGS000507 only", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_507)},
+    {"model":"PGS004146 only", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_507)},
 ]).sort_values("AUROC", ascending=False).reset_index(drop=True)
 
 diff =  np.array(auc_all_f) - np.array(auc_507_f)
@@ -585,13 +572,10 @@ s = int((nz>0).sum()); n = int(len(nz))
 p_one_sided = sum(math.comb(n,k) for k in range(s, n+1)) / (2**n) if n>0 else np.nan
 
 print(perf.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
-print(f"One-sided sign-test p (PGS000507 < All AVG): {p_one_sided:.3g} over {s}/{n} folds; ΔAUROC (OOF) = {auc_all-auc_507:+.3f}")
+print(f"One-sided sign-test p (PGS004146 < All AVG): {p_one_sided:.3g} over {s}/{n} folds; ΔAUROC (OOF) = {auc_all-auc_507:+.3f}")
 ```
 
-We see that the AUC of the ensemble (0.588) is significantly better than that of the single score (0.547).
-
-
-
+We see that the AUC of the ensemble (0.586) is significantly better than that of the single score (0.573) at p = 0.00369.
 
 Let's plot risk in each decline of the multivariate model.
 ```
@@ -604,94 +588,87 @@ from sklearn.model_selection import StratifiedKFold
 d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID')
 d.index = d.index.astype(str)
 pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
-X_all = d[pgs_cols].dropna().astype(float)
-X_507 = d[['PGS000507_AVG']].dropna().astype(float)
+single_col = "PGS004146_AVG"
 
 NUM_PCS = 16
 pc_cols = [f"PC{i}" for i in range(1, NUM_PCS+1)]
 so = {"project": os.environ.get("GOOGLE_PROJECT"), "requester_pays": True} if os.environ.get("GOOGLE_PROJECT") else {}
-pcs = pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
-                  sep="\t", storage_options=so, usecols=["research_id","pca_features"])
+
+pcs = pd.read_csv(
+    "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv",
+    sep="\t", storage_options=so, usecols=["research_id","pca_features"]
+)
 parse = lambda s, k=NUM_PCS: ([(float(x) if x!='' else np.nan) for x in str(s).strip()[1:-1].split(",")] + [np.nan]*k)[:k]
-pc_df = (pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols)
-           .assign(person_id=pcs["research_id"].astype(str)).set_index("person_id")).dropna()
-X_spc = X_all.join(pc_df, how="inner").dropna()
+pc_df = (
+    pd.DataFrame(pcs["pca_features"].apply(parse).to_list(), columns=pc_cols)
+      .assign(person_id=pcs["research_id"].astype(str))
+      .set_index("person_id")
+)
 
-sex = (pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",
-                   sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
-         .assign(person_id=lambda x: x["research_id"].astype(str)).set_index("person_id")["dragen_sex_ploidy"])
+sex_df = (
+    pd.read_csv("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv",
+                sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+      .assign(person_id=lambda x: x["research_id"].astype(str))
+      .set_index("person_id")["dragen_sex_ploidy"]
+      .map({"XX":0,"XY":1})
+      .to_frame("sex")
+)
 
-case_idx = pd.Index(pd.Series(cases, dtype=str).unique())
+case_idx = pd.Index(pd.Series(cases, dtype=str).unique(), name="person_id")
 
-def oof(X, y):
+# Build one common analysis set so all models use identical rows
+base = (
+    d[pgs_cols]
+      .join(sex_df, how="inner")
+      .join(pc_df, how="inner")
+      .dropna()
+      .astype(float)
+)
+
+y = base.index.to_series().isin(case_idx).astype('i1').to_numpy()
+X_single = base[[single_col]]
+X_all = base[pgs_cols]
+X_all_spc = base[pgs_cols + ["sex"] + pc_cols]
+
+def oof_pred(X, y):
     cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
     m = make_pipeline(StandardScaler(), LogisticRegression(solver="lbfgs", max_iter=1000))
     p = np.zeros(len(y))
     for tr, te in cv.split(X, y):
         m.fit(X.iloc[tr], y[tr])
-        p[te] = m.predict_proba(X.iloc[te])[:,1]
+        p[te] = m.predict_proba(X.iloc[te])[:, 1]
     return p
 
 def deciles_obs(p, y, q=10):
     df = pd.DataFrame({"p": p, "y": y})
     bins = pd.qcut(df["p"], q=q, labels=False, duplicates="drop")
     g = df.assign(decile=bins).groupby("decile", observed=True)
-    r = (g["y"].mean()).to_frame("rate")
+    r = g["y"].mean().to_frame("rate")
     r.index = r.index.astype(int) + 1
     return r
 
-# Women: three lines (observed only)
-w_ix = sex[sex=="XX"].index
-ix_507 = X_507.index.intersection(w_ix)
-ix_all = X_all.index.intersection(w_ix)
-ix_spc = X_spc.index.intersection(w_ix)
+p_single = oof_pred(X_single, y)
+p_all = oof_pred(X_all, y)
+p_all_spc = oof_pred(X_all_spc, y)
 
-y_507 = pd.Index(ix_507).to_series().isin(case_idx).astype('i1').to_numpy()
-y_all = pd.Index(ix_all).to_series().isin(case_idx).astype('i1').to_numpy()
-y_spc = pd.Index(ix_spc).to_series().isin(case_idx).astype('i1').to_numpy()
-
-p_507 = oof(X_507.loc[ix_507], y_507)
-p_all = oof(X_all.loc[ix_all], y_all)
-p_spc = oof(X_spc.loc[ix_spc], y_spc)
-
-d_507 = deciles_obs(p_507, y_507)
-d_all = deciles_obs(p_all, y_all)
-d_spc = deciles_obs(p_spc, y_spc)
+d_single = deciles_obs(p_single, y)
+d_all = deciles_obs(p_all, y)
+d_all_spc = deciles_obs(p_all_spc, y)
 
 plt.figure()
-plt.plot(d_507.index, d_507["rate"], marker="o", label="PGS000507 only")
+plt.plot(d_single.index, d_single["rate"], marker="o", label=f"{single_col} only")
 plt.plot(d_all.index, d_all["rate"], marker="o", label="All scores")
-plt.plot(d_spc.index, d_spc["rate"], marker="o", label="Scores + PCs")
-plt.xlabel("Predicted risk decile (women)")
+plt.plot(d_all_spc.index, d_all_spc["rate"], marker="o", label="Scores + Sex + PCs")
+plt.xlabel("Predicted risk decile")
 plt.ylabel("Observed case rate")
-plt.title(f"Deciles (observed only) — Women  |  n={len(ix_all)}")
+plt.title(f"Deciles (observed only) — n={len(y)}")
 plt.legend()
-plt.tight_layout()
-
-# Men: bar chart bottom 90% vs top 10% using Scores+PCs ensemble
-m_ix = sex[sex=="XY"].index
-ix_spc_m = X_spc.index.intersection(m_ix)
-y_m = pd.Index(ix_spc_m).to_series().isin(case_idx).astype('i1').to_numpy()
-p_spc_m = oof(X_spc.loc[ix_spc_m], y_m)
-thr = np.quantile(p_spc_m, 0.9)
-top = y_m[p_spc_m >= thr]
-bot = y_m[p_spc_m < thr]
-
-rates = [bot.mean() if len(bot) else np.nan, top.mean() if len(top) else np.nan]
-counts = [len(bot), len(top)]
-
-plt.figure()
-plt.bar(["Bottom 90%", "Top 10%"], rates)
-plt.ylabel("Observed case rate")
-plt.title(f"Scores + PCs — Men  |  n={len(y_m)}  |  n90={counts[0]}, n10={counts[1]}")
 plt.tight_layout()
 ```
 
-<img width="630" height="470" alt="image" src="https://github.com/user-attachments/assets/d8a3a4b0-63f9-472c-9cdf-c2028780e910" />
+<img width="630" height="470" alt="image" src="https://github.com/user-attachments/assets/6ee3c9d8-2009-4d05-9f81-2d1e925027bc" />
 
-<img width="630" height="470" alt="image" src="https://github.com/user-attachments/assets/5e6f0368-a946-4291-ac18-c54f044f25c2" />
-
-We can see that the ensemble helps, and also adding PCs help.
+This is much more stable than the per-score decile plots.
 
 **Note:** we do not include age at all, which adds noise to the results.
 
