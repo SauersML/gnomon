@@ -952,80 +952,57 @@ Let's inspect a few scores:
 ```
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, roc_curve
-from patsy import dmatrix
-import statsmodels.api as sm
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
-scores = ["PGS000015","PGS004589","PGS003957"]
-ids = d['#IID'].astype(str) if '#IID' in d.columns else pd.Series(d.index.astype(str), index=d.index)
-y = ids.isin(set(pd.Series(cases, dtype=str))).astype('i1')
+scores = sorted({c[:-4] for c in d.columns if isinstance(c, str) and c.endswith("_AVG")})
+y = pd.Index(d.index.astype(str)).isin(set(pd.Series(cases, dtype=str))).astype("i1")
 
-def orient(x, y):
-    a = roc_auc_score(y, x) if y.nunique()==2 else np.nan
-    return (-x) if np.isfinite(a) and a < 0.5 else x
-
-def youden(y, s):
-    fpr, tpr, thr = roc_curve(y, s)
-    return thr[np.argmax(tpr - fpr)]
-
-def glm_binom_spline(x, y, xg, df=6):
-    X = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": x}, return_type='dataframe')
-    m = sm.GLM(y, X, family=sm.families.Binomial()).fit()
-    Xg = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": xg}, return_type='dataframe')
-    sf = m.get_prediction(Xg).summary_frame()
-    return sf['mean'].to_numpy(), sf['mean_ci_lower'].to_numpy(), sf['mean_ci_upper'].to_numpy()
-
-def ols_spline_ci(x, y, xg, df=6):
-    X = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": x}, return_type='dataframe')
-    m = sm.OLS(y, X).fit().get_robustcov_results(cov_type='HC3')
-    Xg = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": xg}, return_type='dataframe')
-    sf = m.get_prediction(Xg).summary_frame()
-    return sf['mean'].to_numpy(), sf['mean_ci_lower'].to_numpy(), sf['mean_ci_upper'].to_numpy()
-
-plt.figure(figsize=(7,5))
+plt.figure(figsize=(8,6))
+plotted = False
 for s in scores:
     xcol, mcol = f"{s}_AVG", f"{s}_MISSING_PCT"
     if xcol not in d.columns or mcol not in d.columns: continue
     t = pd.DataFrame({"x": pd.to_numeric(d[xcol], errors="coerce"),
                       "m": pd.to_numeric(d[mcol], errors="coerce"),
                       "y": y}).dropna()
-    if len(t) < 50 or t["y"].nunique() < 2: continue
-    xo = orient(t["x"], t["y"])
-    thr = youden(t["y"], xo)
-    acc = ((xo >= thr).astype('i1') == t["y"]).astype(int).to_numpy()
-    logm = np.log(np.maximum(t["m"].to_numpy(), 1e-12))
-    xg = np.linspace(logm.min(), logm.max(), 200)
-    mean, lo, hi = glm_binom_spline(logm, acc, xg)
-    plt.plot(np.exp(xg), mean, label=s); plt.fill_between(np.exp(xg), lo, hi, alpha=0.15)
-plt.xscale('log'); plt.xlabel('Missingness'); plt.ylabel('Proportion correct'); plt.title('Accuracy vs missingness (95% CI)'); plt.legend(); plt.tight_layout()
+    if len(t) < 50 or t["y"].nunique() < 2 or t["m"].std(ddof=0) == 0: continue
 
-plt.figure(figsize=(7,5))
-for s in scores:
-    xcol, mcol = f"{s}_AVG", f"{s}_MISSING_PCT"
-    if xcol not in d.columns or mcol not in d.columns: continue
-    t = pd.DataFrame({"x": pd.to_numeric(d[xcol], errors="coerce"),
-                      "m": pd.to_numeric(d[mcol], errors="coerce"),
-                      "y": y}).dropna()
-    if len(t) < 50 or t["y"].nunique() < 2: continue
-    xo = orient(t["x"], t["y"])
-    df2 = pd.DataFrame({"s": xo.to_numpy()+1e-12, "y": t["y"].to_numpy(), "m": t["m"].to_numpy()})
-    g = df2.groupby("s", observed=True)["y"].agg(pos_eq=lambda z: (z==1).sum(),
-                                                 neg_eq=lambda z: (z==0).sum()).reset_index().sort_values("s")
-    g["pos_lt"] = g["pos_eq"].cumsum() - g["pos_eq"]; g["neg_lt"] = g["neg_eq"].cumsum() - g["neg_eq"]
-    npos = int((df2["y"]==1).sum()); nneg = int((df2["y"]==0).sum())
-    look = g.set_index("s"); sv = df2["s"].to_numpy()
-    pos_lt = look.loc[sv,"pos_lt"].to_numpy(); pos_eq = look.loc[sv,"pos_eq"].to_numpy()
-    neg_lt = look.loc[sv,"neg_lt"].to_numpy(); neg_eq = look.loc[sv,"neg_eq"].to_numpy()
-    contrib = np.empty(len(df2)); pm = (df2["y"].to_numpy()==1)
-    contrib[pm]  = (neg_lt[pm] + 0.5*neg_eq[pm]) / max(nneg,1)
-    contrib[~pm] = (npos - (pos_lt[~pm] + 0.5*pos_eq[~pm])) / max(npos,1)
-    logm = np.log(np.maximum(df2["m"].to_numpy(), 1e-12))
-    xg = np.linspace(logm.min(), logm.max(), 200)
-    mean, lo, hi = ols_spline_ci(logm, contrib, xg)
-    plt.plot(np.exp(xg), mean, label=s); plt.fill_between(np.exp(xg), lo, hi, alpha=0.15)
-plt.xscale('log'); plt.xlabel('Missingness'); plt.ylabel('Per-individual AUC contribution'); plt.title('AUC contribution vs missingness (95% CI)'); plt.legend(); plt.tight_layout(); plt.show()
+    auc = roc_auc_score(t["y"], t["x"])
+    xo = -t["x"] if np.isfinite(auc) and auc < 0.5 else t["x"]
+    fpr, tpr, thr = roc_curve(t["y"], xo); tstar = thr[np.argmax(tpr - fpr)]
+    acc = ((xo >= tstar).astype("i1") == t["y"]).astype(int)
+
+    p90 = t["m"].quantile(0.9)
+    keep = pd.concat([t[t["m"] >= p90],
+                      t[t["m"] < p90].sample(frac=0.1, random_state=0)], ignore_index=False)
+    ak = acc.loc[keep.index]
+    if ak.std(ddof=0) == 0: continue
+
+    zm = (keep["m"] - keep["m"].mean()) / keep["m"].std(ddof=0)
+    za = (ak - ak.mean()) / ak.std(ddof=0)
+
+    sc = plt.scatter(zm, za, s=3, alpha=0.18, label=s)
+    c = sc.get_facecolor()[0]; plotted = True
+
+    bins = pd.qcut(keep["m"], q=20, labels=False, duplicates="drop")
+    bx = pd.Series(zm.values, index=bins.index).groupby(bins, observed=True).mean()
+    by = pd.Series(za.values, index=bins.index).groupby(bins, observed=True).mean()
+    if len(bx) > 1:
+        order = np.argsort(bx.values)
+        plt.plot(bx.values[order], by.values[order], marker="o", linewidth=1.5, markersize=4, color=c)
+
+    lo = lowess(za.values, zm.values, frac=0.2, it=0, return_sorted=True)
+    plt.plot(lo[:,0], lo[:,1], linewidth=2, color=c)
+
+if plotted:
+    plt.axhline(0, linewidth=1); plt.axvline(0, linewidth=1); plt.legend()
+plt.xlabel("z-missingness"); plt.ylabel("z-accuracy (per individual)")
+plt.title("z-missingness vs accuracy — scatter, percentile-bin means, and LOESS")
+plt.tight_layout(); plt.show()
 ```
 
-
+<img width="690" height="489" alt="image" src="https://github.com/user-attachments/assets/668f0d8c-f7a9-4098-a26b-1e3debdb282a" />
+<img width="790" height="590" alt="image" src="https://github.com/user-attachments/assets/c4730611-8f2d-448e-9f64-2a400d9115ca" />
 
 Let's check accuracy within each inferred genetic ancestry group:
 ```
@@ -1037,7 +1014,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 
 # data
-d = pd.read_csv('../../arrays.sscore', sep='\t').set_index('#IID'); d.index = d.index.astype(str)
+d = pd.read_csv('../../arrays_cog.sscore', sep='\t').set_index('#IID'); d.index = d.index.astype(str)
 pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
 
 NUM_PCS = 16
@@ -1052,14 +1029,20 @@ pc_df = (pd.DataFrame(pcs_raw["pca_features"].apply(parse).to_list(), columns=pc
            .assign(person_id=pcs_raw["research_id"].astype(str), ancestry_pred=pcs_raw["ancestry_pred"])
            .set_index("person_id"))
 
-sex = (pd.read_csv(SEX_URI, sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
-         .assign(person_id=lambda x: x["research_id"].astype(str))
-         .set_index("person_id")["dragen_sex_ploidy"])
+sex_df = (pd.read_csv(SEX_URI, sep="\t", storage_options=so, usecols=["research_id","dragen_sex_ploidy"])
+            .assign(person_id=lambda x: x["research_id"].astype(str))
+            .set_index("person_id")["dragen_sex_ploidy"]
+            .map({"XX":0,"XY":1})
+            .to_frame("sex"))
 
-women_ids = d.index.intersection(sex[sex=="XX"].index)
 case_set = set(pd.Series(cases, dtype=str))
 
-X = d.loc[women_ids, pgs_cols].join(pc_df[pc_cols], how="inner").dropna()
+# predictors = all scores + SEX + PCs
+X = (d[pgs_cols]
+       .join(sex_df, how="inner")
+       .join(pc_df[pc_cols], how="inner")
+       .dropna()
+       .astype(float))
 y = pd.Index(X.index).to_series().isin(case_set).astype('i1').to_numpy()
 anc = pc_df.loc[X.index, "ancestry_pred"]
 
@@ -1097,7 +1080,7 @@ for anc_val, idx in anc.groupby(anc).groups.items():
         continue
     auc, auc_lo, auc_hi = auc_ci_boot(y_g, p_g)
     orsd, or_lo, or_hi = orsd_ci(y_g, p_g)
-    rows.append({"ancestry": str(anc_val), "n_women": int(len(y_g)), "cases": int(y_g.sum()),
+    rows.append({"ancestry": str(anc_val), "n": int(len(y_g)), "cases": int(y_g.sum()),
                  "AUROC": auc, "AUROC_lo": auc_lo, "AUROC_hi": auc_hi,
                  "OR_per_SD": orsd, "OR_lo": or_lo, "OR_hi": or_hi})
 
@@ -1114,7 +1097,7 @@ lo = yv - res.set_index("ancestry").loc[anc_order, "AUROC_lo"].to_numpy()
 hi = res.set_index("ancestry").loc[anc_order, "AUROC_hi"].to_numpy() - yv
 plt.bar(x, yv, width=w, yerr=[lo, hi], capsize=4)
 plt.xticks(x, anc_order, rotation=25, ha="right"); plt.ylabel("AUROC")
-plt.title("Women — AUROC by ancestry (Scores + PCs, 10-fold OOF)"); plt.tight_layout()
+plt.title("AUROC by ancestry (All scores + Sex + PCs, 10-fold OOF)"); plt.tight_layout()
 
 plt.figure(figsize=(9,5))
 yv = res.set_index("ancestry").loc[anc_order, "OR_per_SD"].to_numpy()
@@ -1122,12 +1105,10 @@ lo = yv - res.set_index("ancestry").loc[anc_order, "OR_lo"].to_numpy()
 hi = res.set_index("ancestry").loc[anc_order, "OR_hi"].to_numpy() - yv
 plt.bar(x, yv, width=w, yerr=[lo, hi], capsize=4)
 plt.xticks(x, anc_order, rotation=25, ha="right"); plt.ylabel("OR per SD of prediction")
-plt.title("Women — OR/SD by ancestry (Scores + PCs, 10-fold OOF)"); plt.tight_layout()
+plt.title("OR/SD by ancestry (All scores + Sex + PCs, 10-fold OOF)"); plt.tight_layout()
 
 res
 ```
 
-<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/7ddcf049-1906-47ba-bf8a-7318b0738e36" />
-
-<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/cb2253bf-59b2-4415-a3a2-70ace6713e64" />
-
+<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/b5872265-60d1-4e7d-9b25-91f115ea91f1" />
+<img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/6b5dc483-00e1-49a9-9b7f-30d88532218e" />
