@@ -65,15 +65,12 @@ d=pd.read_csv('../../arrays.sscore', sep='\t')
 for c in d.columns[d.columns.str.endswith('_MISSING_PCT')]: d[c].hist(bins=50); plt.title(c); plt.xlabel(c); plt.ylabel('count'); plt.show()
 ```
 
-Most samples' missingness should be under 2%. But there are a few scores that have high missingness for some samples.
+Most samples' missingness should be under 2%. But there are a few scores that have high missingness for some samples:
 
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/493766a6-870c-4ed4-8481-9eaa1ead61af" />
-<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/dd433dbc-3bb3-414e-a5d9-7053cc3a0e8f" />
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/f345c05b-7025-4b96-924b-f7dbd422b401" />
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/66b15e0c-9ef3-4adb-98ea-da892886c71d" />
 <img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/5d9139cd-d6e9-4aaf-a466-46c7c25eec15" />
-
-
 
 Now let's check the correlation matrix of the scores. We expect moderate correlations.
 
@@ -83,7 +80,7 @@ c=pd.read_csv('../../arrays.sscore',sep='\t').filter(regex='_AVG$').corr()
 plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); plt.xticks(range(len(c)),c.columns,rotation=90); plt.yticks(range(len(c)),c.columns); plt.tight_layout(); plt.show()
 ```
 
-<img width="780" height="758" alt="image" src="https://github.com/user-attachments/assets/ecbf0e0e-1e08-4401-8534-0e3879d2f037" />
+<img width="780" height="758" alt="image" src="https://github.com/user-attachments/assets/54cb4a28-f73c-4b5b-8795-d99d45c0ed57" />
 
 Let's make the case definition.
 
