@@ -116,16 +116,6 @@ fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
     })
 }
 
-/// Jacobian of ρ(z) = RHO_BOUND·tanh(z / RHO_BOUND).
-#[inline]
-fn drho_dz_from_z(z: &Array1<f64>) -> Array1<f64> {
-    z.mapv(|v| {
-        let scaled = v / RHO_BOUND;
-        let tanh_scaled = scaled.tanh();
-        1.0 - tanh_scaled * tanh_scaled
-    })
-}
-
 #[inline]
 fn jacobian_drho_dz_from_rho(rho: &Array1<f64>) -> Array1<f64> {
     rho.mapv(|r| {
@@ -3535,7 +3525,8 @@ pub mod internal {
         fn drho_dz_matches_unity_at_origin() {
             let eps = 1e-6;
             let center = Array1::from_vec(vec![0.0]);
-            let jac = drho_dz_from_z(&center);
+            let rho_center = to_rho_from_z(&center);
+            let jac = jacobian_drho_dz_from_rho(&rho_center);
             assert!((jac[0] - 1.0).abs() < 1e-12);
 
             let forward = to_rho_from_z(&Array1::from_vec(vec![eps]));
