@@ -757,6 +757,69 @@ PGS ensemble + PCs + sex:
 - 1.399734 OR/SD
 - 5.43% at 2x risk
 
+Before, we saw that high missingness affected some samples. Let's check if missingness affects accuracy per score:
+```
+import numpy as np, pandas as pd
+from scipy.stats import pearsonr
+from sklearn.metrics import roc_auc_score
+
+if '#IID' in d.columns:
+    ids = d['#IID'].astype(str)
+    y_series = ids.isin(set(pd.Series(cases, dtype=str))).astype('i1')
+    y_series.index = d.index
+else:
+    idx = pd.Index(d.index.astype(str))
+    y_series = pd.Series(idx.isin(set(pd.Series(cases, dtype=str))).astype('i1'), index=d.index)
+
+rows = []
+for s in [c for c in d.columns if c.endswith('_AVG')]:
+    mcol = s.replace('_AVG', '_MISSING_PCT')
+    if mcol not in d.columns:
+        continue
+    x = pd.to_numeric(d[s], errors='coerce')
+    miss = pd.to_numeric(d[mcol], errors='coerce')
+    t = pd.DataFrame({'x': x, 'miss': miss, 'y': y_series}).dropna()
+    if len(t) < 3 or t['y'].nunique() < 2 or t['x'].std(ddof=0) == 0 or t['miss'].std(ddof=0) == 0:
+        rows.append([s.replace('_AVG',''), int(len(t)), np.nan, np.nan])
+        continue
+
+    auc = roc_auc_score(t['y'], t['x'])
+    xo = (-t['x']) if auc < 0.5 else t['x']
+    pred = (xo > xo.median()).astype('i1')
+    acc = (pred == t['y']).astype('i1')
+    if acc.nunique() < 2:
+        r, p = np.nan, np.nan
+    else:
+        r, p = pearsonr(t['miss'].to_numpy(), acc.to_numpy())
+
+    rows.append([s.replace('_AVG',''), int(len(t)), float(r), float(p)])
+
+out = pd.DataFrame(rows, columns=['score','n','pearson_r_missing_vs_accuracy','p_value_raw']) \
+        .sort_values('p_value_raw', na_position='last') \
+        .reset_index(drop=True)
+out['p_value'] = out['p_value_raw'].map(lambda v: '' if pd.isna(v) else np.format_float_positional(v, trim='-'))
+out[['score','n','pearson_r_missing_vs_accuracy','p_value']]
+```
+| Score     | N      | Pearson r (missing vs accuracy) | p-value                           |
+| --------- | ------ | ------------------------------- | --------------------------------- |
+| PGS003334 | 447278 | -0.068224                       | ≈ 0                                 |
+| PGS004146 | 447278 | -0.043374                       | ≈ 0  |
+| PGS000015 | 447278 | 0.017543                        | 8.60183791610128e-35              |
+| PGS004589 | 447278 | 0.013929                        | 1.2085366582732694e-20            |
+| PGS003957 | 447278 | 0.009972                        | 2.5712636769050822e-11            |
+| PGS000317 | 447278 | -0.006459                       | 1.5614608261813486e-05            |
+| PGS000508 | 447278 | 0.005580                        | 0.0001899198792989028             |
+| PGS000335 | 447278 | 0.004918                        | 0.0010049042456912638             |
+| PGS000507 | 447278 | 0.004231                        | 0.004663657541919483              |
+| PGS000344 | 447278 | 0.004183                        | 0.005152200021396543              |
+| PGS004869 | 447278 | 0.003794                        | 0.011165516697301309              |
+| PGS004898 | 447278 | 0.003043                        | 0.041806129699096355              |
+| PGS000332 | 447278 | 0.002060                        | 0.16834350526542918               |
+| PGS004863 | 447278 | 0.001538                        | 0.3037079706476949                |
+| PGS004227 | 447278 | -0.001128                       | 0.4505731903914835                |
+| PGS000007 | 447278 | 0.000455                        | 0.7607642498413164                |
+
+
 Let's check accuracy within each inferred genetic ancestry group:
 ```
 import os, numpy as np, pandas as pd, matplotlib.pyplot as plt, statsmodels.api as sm
