@@ -156,4 +156,160 @@ dt <- dt[, ..cols_keep]
 fwrite(dt, "arrays.sscore", sep = "\t", quote = FALSE)
 ```
 
+Let's load the PCs:
+```
+library(data.table)
+
+NUM_PCS <- 16
+PCS_URI <- "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/ancestry/ancestry_preds.tsv"
+project <- Sys.getenv("GOOGLE_PROJECT")
+
+pcs_raw <- fread(
+  cmd = sprintf("gsutil -u %s cat %s", shQuote(project), shQuote(PCS_URI)),
+  sep = "\t",
+  select = c("research_id", "pca_features"),
+  showProgress = FALSE
+)
+
+parse_vec <- function(s, k = NUM_PCS) {
+  v <- as.numeric(trimws(strsplit(sub("^\\[|\\]$", "", s), ",", fixed = TRUE)[[1]]))
+  len <- length(v)
+  if (len < k) v <- c(v, rep(NA_real_, k - len))
+  v[1:k]
+}
+
+pcs_mat <- t(vapply(pcs_raw$pca_features, parse_vec, numeric(NUM_PCS)))
+pc_cols <- paste0("PC", seq_len(NUM_PCS))
+
+pc_df <- as.data.table(pcs_mat)
+setnames(pc_df, pc_cols)
+pc_df[, person_id := as.character(pcs_raw$research_id)]
+setcolorder(pc_df, c("person_id", pc_cols))
+```
+
+Let's use them to predict Alzheimer's disease:
+```
+# Logistic model: Alzheimer's ~ 16 ancestry PCs
+
+library(data.table)
+
+pc_cols <- paste0("PC", 1:16)
+case_ids <- unique(as.character(cases))
+
+# build modeling frame
+dt <- as.data.table(pc_df[, c("person_id", pc_cols), with = FALSE])
+for (cn in pc_cols) set(dt, j = cn, value = as.numeric(dt[[cn]]))
+dt[, y := as.integer(person_id %chin% case_ids)]
+
+# drop rows with no PC information at all
+nz <- rowSums(is.finite(as.matrix(dt[, ..pc_cols]))) > 0
+dt <- dt[nz]
+
+# mean-impute PCs (keeps all 16 PCs; drops any column that is entirely NA/Inf)
+keep_cols <- pc_cols
+for (cn in pc_cols) {
+  v <- dt[[cn]]
+  if (!any(is.finite(v))) { keep_cols <- setdiff(keep_cols, cn); next }
+  m <- mean(v[is.finite(v)])
+  v[!is.finite(v)] <- m
+  set(dt, j = cn, value = v)
+}
+dt <- dt[, c("y", keep_cols), with = FALSE]
+
+stopifnot(length(unique(dt$y)) == 2L, nrow(dt) > 0L, length(keep_cols) > 0L)
+
+fit <- glm(y ~ ., data = as.data.frame(dt), family = binomial())
+summary(fit)
+```
+
+PCs 2 and 4 are significantly associated with Alzheimer's disease.
+
+Let's check the AUROC:
+```
+library(pROC)
+
+p <- predict(fit, type = "response")
+r <- roc(response = dt$y, predictor = p, quiet = TRUE)
+cat(sprintf("AUROC: %.6f\n", as.numeric(auc(r))))
+```
+AUROC: 0.59518.
+
+Let's try with each score:
+```
+# Logistic model: Alzheimer's (cases) ~ all PGS scores
+library(data.table)
+library(pROC)
+
+# cases: character vector of case person_ids already loaded from BigQuery
+case_ids <- unique(as.character(cases))
+
+ss  <- fread("arrays.sscore", sep = "\t", showProgress = FALSE)
+ids <- as.character(ss[[1]])
+y   <- as.integer(ids %chin% case_ids)
+
+pgs_cols <- grep("_AVG$", names(ss), value = TRUE)
+
+X <- ss[, ..pgs_cols]
+# coerce to numeric
+for (j in seq_along(pgs_cols)) set(X, j = j, value = as.numeric(X[[j]]))
+
+# drop columns that are entirely non-finite
+keep <- vapply(X, function(v) any(is.finite(v)), logical(1))
+X    <- X[, which(keep), with = FALSE]
+
+# mean impute per column
+for (j in seq_len(ncol(X))) {
+  v <- X[[j]]
+  m <- mean(v[is.finite(v)])
+  v[!is.finite(v)] <- m
+  set(X, j = j, value = v)
+}
+
+stopifnot(length(unique(y)) == 2L, nrow(X) == length(y), ncol(X) > 0L)
+
+df       <- data.frame(y = y, X, check.names = FALSE)
+fit_pgs  <- glm(y ~ ., data = df, family = binomial())
+p_hat    <- as.numeric(predict(fit_pgs, type = "response"))
+roc_obj  <- roc(response = y, predictor = p_hat, quiet = TRUE)
+auc_val  <- as.numeric(auc(roc_obj))
+
+cat(sprintf("Predictors: %d\nAUROC (PGS-only): %.6f\n", ncol(X), auc_val))
+```
+
+AUROC: 0.589798.
+
+Let's check how well we can predict individual-level accuracy with PCs:
+```
+library(data.table)
+
+pc_cols <- paste0("PC", 1:16)
+
+pred_dt <- data.table(
+  person_id = as.character(ids),
+  err_abs   = abs(as.integer(y) - as.numeric(predict(fit_pgs, type = "response")))
+)
+
+Z <- as.data.table(pc_df[, c("person_id", pc_cols), with = FALSE])
+Z[, person_id := as.character(person_id)]
+for (cn in pc_cols) set(Z, j = cn, value = as.numeric(Z[[cn]]))
+
+dt <- merge(pred_dt, Z, by = "person_id", all = FALSE)
+
+keep <- vapply(pc_cols, function(cn) any(is.finite(dt[[cn]])), logical(1))
+pcs_use <- pc_cols[keep]
+
+for (cn in pcs_use) {
+  v <- dt[[cn]]
+  m <- mean(v[is.finite(v)])
+  v[!is.finite(v)] <- m
+  set(dt, j = cn, value = v)
+}
+
+dt <- dt[is.finite(err_abs)]
+stopifnot(nrow(dt) > 0L, length(pcs_use) > 0L)
+
+fit_err <- lm(err_abs ~ ., data = dt[, c("err_abs", pcs_use), with = FALSE])
+cat(sprintf("R^2: %.6f\n", summary(fit_err)$r.squared))
+```
+R^2: 0.000360. Not great.
 
