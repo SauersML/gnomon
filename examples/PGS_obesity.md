@@ -109,16 +109,22 @@ ICD-9:
 
 ```
 import os
-cdr_id = os.environ["WORKSPACE_CDR"]
 from google.cloud import bigquery as bq
 
-# ICD-10: C50.0–C50.9 (malignant), D05.0–D05.9 (in situ), Z85.3 (personal history)
-icd10_breast = [f"C50.{i}" for i in range(10)] + [f"D05.{i}" for i in range(10)] + ["Z85.3"]
+cdr_id = os.environ["WORKSPACE_CDR"]
 
-# ICD-9: 174.0–174.9 (female), 175.0–175.9 (male), 233.0 (in situ), V10.3 (personal history)
-icd9_breast = [f"174.{i}" for i in range(10)] + [f"175.{i}" for i in range(10)] + ["233.0", "V10.3"]
+icd10_obesity = [
+    "E66.811", "E66.812", "E66.813",
+    "E66.01", "E66.09",
+    "E66.1", "E66.2",
+    "E66.89", "E66.9",
+    "E88.82",
+]
+icd9_obesity = [
+    "278.00", "278.01", "278.03",
+]
 
-codes = icd10_breast + icd9_breast
+codes = icd10_obesity + icd9_obesity
 codes = [c.upper() for c in (codes + [c.replace(".", "") for c in codes])]
 
 sql = f"""
@@ -130,7 +136,9 @@ WHERE condition_source_value IS NOT NULL
 
 cases = (
     bq.Client()
-    .query(sql, job_config=bq.QueryJobConfig(query_parameters=[bq.ArrayQueryParameter("codes", "STRING", codes)]))
+    .query(sql, job_config=bq.QueryJobConfig(
+        query_parameters=[bq.ArrayQueryParameter("codes", "STRING", codes)]
+    ))
     .to_dataframe()["person_id"]
     .astype(str)
 )
