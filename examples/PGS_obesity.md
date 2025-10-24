@@ -49,7 +49,7 @@ Let's open a Jupyter analysis notebook.
 
 This shows us the columns of the score output:
 ```
-#IID	PGS000007_AVG	PGS000007_MISSING_PCT	PGS000015_AVG	PGS000015_MISSING_PCT	PGS000317_AVG	PGS000317_MISSING_PCT	PGS000332_AVG	PGS000332_MISSING_PCT	PGS000344_AVG	PGS000344_MISSING_PCT	PGS000507_AVG	PGS000507_MISSING_PCT	PGS000508_AVG	PGS000508_MISSING_PCT	PGS004869_AVG	PGS004869_MISSING_PCT
+#IID	PGS003400_AVG	PGS003400_MISSING_PCT	PGS003897_AVG	PGS003897_MISSING_PCT	PGS004150_AVG	PGS004150_MISSING_PCT	PGS004378_AVG	PGS004378_MISSING_PCT	PGS005198_AVG	PGS005198_MISSING_PCT	PGS005199_AVG	PGS005199_MISSING_PCT	PGS005203_AVG	PGS005203_MISSING_PCT	PGS005235_AVG	PGS005235_MISSING_PCT
 ```
 
 Let's plot missingness for each score:
@@ -69,7 +69,11 @@ c=pd.read_csv('../../arrays.sscore',sep='\t').filter(regex='_AVG$').corr()
 plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); plt.xticks(range(len(c)),c.columns,rotation=90); plt.yticks(range(len(c)),c.columns); plt.tight_layout(); plt.show()
 ```
 
-<img width="780" height="758" alt="image" src="https://github.com/user-attachments/assets/ecbf0e0e-1e08-4401-8534-0e3879d2f037" />
+<img width="780" height="758" alt="image" src="https://github.com/user-attachments/assets/8598d356-92bd-4ff1-8f7e-f77672f72e37" />
+
+
+This lets us know that we should drop PGS005199 or PGS005203 since they are highly correlated. Looking at the PGS catalog, PGS005199 is multi-ancestry and better performing.
+
 
 Let's make the case definition.
 
