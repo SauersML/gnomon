@@ -87,8 +87,23 @@ const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
 const DESIGN_MATRIX_CONDITION_THRESHOLD: f64 = 1e12;
 
 #[inline]
-fn atanh_clamped(x: f64) -> f64 {
-    0.5 * ((1.0 + x) / (1.0 - x)).ln()
+fn stable_atanh(x: f64) -> f64 {
+    // Use a formulation that remains accurate for |x| close to 1 while
+    // avoiding spurious infinities from catastrophic cancellation.
+    //
+    // atanh(x) = 0.5 * [ln(1 + x) - ln(1 - x)]
+    0.5 * ((1.0 + x).ln() - (1.0 - x).ln())
+}
+
+#[inline]
+fn next_toward_zero(x: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else if x > 0.0 {
+        f64::from_bits(x.to_bits() - 1)
+    } else {
+        f64::from_bits(x.to_bits() + 1)
+    }
 }
 
 #[inline]
@@ -96,14 +111,14 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
     rho.mapv(|r| {
         // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
         let ratio = r / RHO_BOUND;
-        let xr = if ratio < -0.999_999 {
-            -0.999_999
-        } else if ratio > 0.999_999 {
-            0.999_999
+        let xr = if ratio <= -1.0 {
+            next_toward_zero(-1.0)
+        } else if ratio >= 1.0 {
+            next_toward_zero(1.0)
         } else {
             ratio
         };
-        let z = RHO_BOUND * atanh_clamped(xr);
+        let z = RHO_BOUND * stable_atanh(xr);
         z.clamp(-1e6, 1e6)
     })
 }
