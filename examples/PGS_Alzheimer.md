@@ -819,6 +819,138 @@ out[['score','n','pearson_r_missing_vs_accuracy','p_value']]
 | PGS004227 | 447278 | -0.001128                       | 0.4505731903914835                |
 | PGS000007 | 447278 | 0.000455                        | 0.7607642498413164                |
 
+This makes sense for the negative correlations. But why do many have positive correlations, in which more missingness results in higher accuracy? That is odd.
+
+Let's test in a different way.
+```
+import numpy as np, pandas as pd
+from scipy.stats import pearsonr
+from sklearn.metrics import roc_auc_score, roc_curve
+
+case_set = set(pd.Series(cases, dtype=str))
+ids = d['#IID'].astype(str) if '#IID' in d.columns else pd.Series(d.index.astype(str), index=d.index)
+y_series = ids.isin(case_set).astype('i1')
+
+rows = []
+for s in [c for c in d.columns if c.endswith('_AVG')]:
+    mcol = s.replace('_AVG','_MISSING_PCT')
+    if mcol not in d.columns:
+        continue
+    x = pd.to_numeric(d[s], errors='coerce')
+    miss = pd.to_numeric(d[mcol], errors='coerce')
+    ok = x.notna() & miss.notna()
+    if ok.sum() < 3 or y_series[ok].nunique() < 2:
+        rows.append([s.replace('_AVG',''), int(ok.sum()), np.nan, ''])
+        continue
+
+    yv = y_series[ok]
+    auc = roc_auc_score(yv, x[ok])
+    xo = (-x) if auc < 0.5 else x
+
+    fpr, tpr, thr = roc_curve(yv, xo[ok])
+    tstar = thr[np.argmax(tpr - fpr)]
+    pred = (xo[ok] >= tstar).astype('i1')
+    correct = (pred == yv).astype('i1')
+
+    if correct.nunique() < 2 or miss[ok].std(ddof=0) == 0:
+        r, p = np.nan, ''
+    else:
+        r, p_raw = pearsonr(miss[ok].to_numpy(), correct.to_numpy())
+        r = float(r)
+        p = np.format_float_positional(float(p_raw), trim='-')
+
+    rows.append([s.replace('_AVG',''), int(ok.sum()), r, p])
+
+out = pd.DataFrame(rows, columns=['score','n','pearson_r_missing_vs_correct','p_value']).sort_values(
+    'p_value', key=lambda s: pd.to_numeric(s, errors='coerce'), na_position='last'
+)
+out
+```
+
+Hmmm, we still see positive correlations between missingness and accuracy. PGS000015 and PGS004589 have r=0.02 for accuracy vs. missingness.
+
+Perhaps genetic ancestry is causing a bias?
+
+```
+# Correlate per-individual missingness with ancestry PCs for PGS000015 and PGS004589
+scores = ["PGS000015", "PGS004589"]
+ids = d["#IID"].astype(str) if "#IID" in d.columns else pd.Series(d.index.astype(str), index=d.index)
+pcs = [c for c in pc_cols if c in pc_df.columns]
+
+rows = []
+for s in scores:
+    mcol = f"{s}_MISSING_PCT"
+    if mcol not in d.columns or not pcs:
+        continue
+    miss = pd.to_numeric(d[mcol], errors="coerce")
+    miss_df = pd.DataFrame({"miss": miss.values}, index=ids)
+    X = pc_df[pcs].join(miss_df, how="inner").dropna()
+    if X.empty or X["miss"].std(ddof=0) == 0:
+        continue
+    for pc in pcs:
+        r, p = pearsonr(X["miss"].to_numpy(), X[pc].to_numpy())
+        rows.append([s, pc, int(len(X)), float(r), np.format_float_positional(float(p), trim='-')])
+
+out = pd.DataFrame(rows, columns=["score","PC","n","pearson_r","p_value"]) \
+       .sort_values(["score", "PC"]).reset_index(drop=True)
+out
+```
+
+Indeed, there are many correlations between PCs and missingness.
+
+Does the correlation between accuracy and missingness hold up after controlling for PCs?
+```
+case_set = set(pd.Series(cases, dtype=str))
+ids = d['#IID'].astype(str) if '#IID' in d.columns else pd.Series(d.index.astype(str), index=d.index)
+y_series = ids.isin(case_set).astype('i1')
+pcs_use = [c for c in pc_cols if c in pc_df.columns]
+
+rows = []
+for s in [c for c in d.columns if c.endswith('_AVG')]:
+    mcol = s.replace('_AVG','_MISSING_PCT')
+    if mcol not in d.columns or not pcs_use:
+        continue
+
+    x = pd.to_numeric(d[s], errors='coerce')
+    miss = pd.to_numeric(d[mcol], errors='coerce')
+    base = pd.DataFrame({'x': x, 'miss': miss, 'y': y_series, 'person_id': ids}).dropna(subset=['x','miss','y'])
+    if base.empty:
+        continue
+
+    T = (base.set_index('person_id')
+               .join(pc_df[pcs_use], how='inner')
+               .dropna())
+    if len(T) < 50 or T['y'].nunique() < 2 or T['miss'].std(ddof=0) == 0:
+        rows.append([s.replace('_AVG',''), int(len(T)), np.nan, np.nan, np.nan, ''])
+        continue
+
+    auc = roc_auc_score(T['y'], T['x'])
+    xo = (-T['x']) if auc < 0.5 else T['x']
+    fpr, tpr, thr = roc_curve(T['y'], xo)
+    tstar = thr[np.argmax(tpr - fpr)]
+    correct = (xo >= tstar).astype('i1') == T['y']
+
+    X = sm.add_constant(pd.concat([T[pcs_use].astype(float), T['miss'].astype(float)], axis=1))
+    m = sm.Logit(correct.astype('i1'), X).fit(disp=False, maxiter=200)
+
+    beta = float(m.params['miss'])
+    se = float(m.bse['miss'])
+    OR = float(np.exp(beta))
+    p = float(m.pvalues['miss'])
+
+    rows.append([s.replace('_AVG',''), int(len(T)), beta, se, OR, np.format_float_positional(p, trim='-')])
+
+out = pd.DataFrame(rows, columns=['score','n','beta_missing','se','OR_missing','p_two_sided']) \
+       .sort_values('p_two_sided', key=lambda s: pd.to_numeric(s, errors='coerce'), na_position='last') \
+       .reset_index(drop=True)
+out
+```
+
+This doesn't account for all of it. PGS003957 still has a positive correlation between missingness and accuracy after accounting for PCs.
+
+
+
+
 
 Let's check accuracy within each inferred genetic ancestry group:
 ```
