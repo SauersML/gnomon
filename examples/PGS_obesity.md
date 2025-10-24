@@ -165,18 +165,7 @@ for s in d.filter(regex='_AVG$').columns:
 pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided_OR>1','AUROC','p_one_sided_AUC>0.5','Nagelkerke_R2','p_one_sided_R2>0']).sort_values('Nagelkerke_R2',ascending=False)
 ```
 
-| Score         |       N | Cases | Controls | OR per SD | P (OR>1) | AUROC | P (AUC>0.5) | Nagelkerke R² | P (R²>0) |
-| ------------- | ------: | ----: | -------: | --------: | -------: | ----: | ----------: | ------------: | -------: |
-| PGS000007_AVG | 447,278 | 6,614 |  440,664 |     1.275 |  <1e-10 | 0.569 |    3.49e-82 |         0.61% |  <1e-10 |
-| PGS000317_AVG | 447,278 | 6,614 |  440,664 |     1.269 |  <1e-10 | 0.567 |    1.30e-79 |         0.57% |  <1e-10 |
-| PGS004869_AVG | 447,278 | 6,614 |  440,664 |     1.201 |  <1e-10 | 0.552 |    1.57e-47 |         0.34% |  <1e-10 |
-| PGS000507_AVG | 447,278 | 6,614 |  440,664 |     1.179 |  <1e-10 | 0.547 |    1.68e-40 |         0.28% |  <1e-10 |
-| PGS000344_AVG | 447,278 | 6,614 |  440,664 |     1.152 |  <1e-10 | 0.540 |    1.29e-29 |         0.20% |  <1e-10 |
-| PGS000508_AVG | 447,278 | 6,614 |  440,664 |     1.151 |  <1e-10 | 0.542 |    2.69e-32 |         0.20% |  <1e-10 |
-| PGS000015_AVG | 447,278 | 6,614 |  440,664 |     1.150 |  <1e-10 | 0.539 |    5.96e-28 |         0.20% |  <1e-10 |
-| PGS000332_AVG | 447,278 | 6,614 |  440,664 |     1.131 |  <1e-10 | 0.537 |    4.62e-25 |         0.15% |  <1e-10 |
-
-PGS000007 is the best so far. Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
+The best score is PGS005198 with an OR/SD of 1.453851 and AUROC of 0.602658. PGS004378 is in second place, with an AUROC of 0.589763
 
 ```
 import os, numpy as np, pandas as pd
