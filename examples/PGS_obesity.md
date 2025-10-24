@@ -310,7 +310,7 @@ d.index = d.index.astype(str)
 pgs_cols = [c for c in d.columns if c.endswith('_AVG')]
 idx_all = d[pgs_cols].dropna().index
 X_all = d.loc[idx_all, pgs_cols].astype(float)
-X_507 = d.loc[idx_all, ['PGS000507_AVG']].astype(float)
+X_507 = d.loc[idx_all, ['PGS005198_AVG']].astype(float)
 y = pd.Index(idx_all).to_series().isin(pd.Series(cases, dtype=str)).astype('i1').to_numpy()
 
 cv = StratifiedKFold(n_splits=15, shuffle=True, random_state=42)
@@ -332,7 +332,7 @@ auc_507 = roc_auc_score(y, p_507)
 
 perf = pd.DataFrame([
     {"model":"All AVG", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_all)},
-    {"model":"PGS000507 only", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_507)},
+    {"model":"PGS005198 only", "n":len(y), "cases":int(y.sum()), "controls":int(len(y)-y.sum()), "AUROC":float(auc_507)},
 ]).sort_values("AUROC", ascending=False).reset_index(drop=True)
 
 diff =  np.array(auc_all_f) - np.array(auc_507_f)
@@ -341,12 +341,10 @@ s = int((nz>0).sum()); n = int(len(nz))
 p_one_sided = sum(math.comb(n,k) for k in range(s, n+1)) / (2**n) if n>0 else np.nan
 
 print(perf.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
-print(f"One-sided sign-test p (PGS000507 < All AVG): {p_one_sided:.3g} over {s}/{n} folds; ΔAUROC (OOF) = {auc_all-auc_507:+.3f}")
+print(f"One-sided sign-test p (PGS005198 < All AVG): {p_one_sided:.3g} over {s}/{n} folds; ΔAUROC (OOF) = {auc_all-auc_507:+.3f}")
 ```
 
-We see that the AUC of the ensemble (0.588) is significantly better than that of the single score (0.547).
-
-
+We see that the AUC of the ensemble (0.622) is significantly better than that of the single score (0.603).
 
 
 Let's plot risk in each decline of the multivariate model.
