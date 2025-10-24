@@ -30,3 +30,78 @@ We want to compare a few models.
 - 4.a  Predicting with linear scores and linear PCs
 - 4.b  Predicting with spline scores and spline PCs
 
+Let's define the cases and controls:
+```
+# Alzheimer's case definition in BigQuery + cohort counts (cases/controls)
+
+library(bigrquery)
+
+cdr_id  <- Sys.getenv("WORKSPACE_CDR")
+project <- Sys.getenv("GOOGLE_PROJECT")
+
+icd10_alz <- c("G30.0", "G30.1", "G30.8", "G30.9")
+icd9_alz  <- "331.0"
+codes_raw <- c(icd10_alz, icd9_alz)
+codes     <- toupper(unique(c(codes_raw, gsub("\\.", "", codes_raw))))
+
+# Case IDs (distinct person_id with AD codes in condition_source_value)
+sql_cases <- sprintf(
+  "SELECT DISTINCT CAST(person_id AS STRING) AS person_id
+   FROM `%s.condition_occurrence`
+   WHERE condition_source_value IS NOT NULL
+     AND UPPER(TRIM(condition_source_value)) IN UNNEST(@codes)",
+  cdr_id
+)
+
+h_cases <- bq_project_query(
+  x = project,
+  query = sql_cases,
+  use_legacy_sql = FALSE,
+  parameters = list(codes = codes),
+  location = "US"
+)
+
+cases <- unique(as.character(bq_table_download(h_cases, bigint = "character")$person_id))
+
+# Counts from BigQuery: total persons, cases, controls (= total - cases)
+sql_counts <- sprintf(
+  "WITH cases AS (
+     SELECT DISTINCT CAST(person_id AS STRING) AS person_id
+     FROM `%s.condition_occurrence`
+     WHERE condition_source_value IS NOT NULL
+       AND UPPER(TRIM(condition_source_value)) IN UNNEST(@codes)
+   ),
+   tot AS (
+     SELECT COUNT(DISTINCT CAST(person_id AS STRING)) AS n_total
+     FROM `%s.person`
+   )
+   SELECT
+     (SELECT COUNT(*) FROM cases)                   AS n_cases,
+     (SELECT n_total FROM tot)                      AS n_total,
+     (SELECT n_total FROM tot) - (SELECT COUNT(*) FROM cases) AS n_controls",
+  cdr_id, cdr_id
+)
+
+h_counts <- bq_project_query(
+  x = project,
+  query = sql_counts,
+  use_legacy_sql = FALSE,
+  parameters = list(codes = codes),
+  location = "US"
+)
+
+cnt <- bq_table_download(h_counts, bigint = "integer")
+n_cases    <- as.integer(cnt$n_cases[1])
+n_total    <- as.integer(cnt$n_total[1])
+n_controls <- as.integer(cnt$n_controls[1])
+prev       <- 100 * n_cases / n_total
+
+cat(sprintf(
+  "Total: %s\nCases: %s\nControls: %s\nPrevalence: %.3f%%\n",
+  format(n_total, big.mark = ","),
+  format(n_cases, big.mark = ","),
+  format(n_controls, big.mark = ","),
+  prev
+))
+```
+The prevalence is 0.201%.
