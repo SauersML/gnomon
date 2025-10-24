@@ -92,7 +92,7 @@ fn atanh_clamped(x: f64) -> f64 {
 
 fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
     rho.mapv(|r| {
-        // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
+        // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
         let ratio = r / RHO_BOUND;
         let xr = if ratio < -0.999_999 {
             -0.999_999
@@ -101,12 +101,23 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
         } else {
             ratio
         };
-        atanh_clamped(xr)
+        RHO_BOUND * atanh_clamped(xr)
     })
 }
 
 fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
-    z.mapv(|v| RHO_BOUND * v.tanh())
+    z.mapv(|v| {
+        let scaled = v / RHO_BOUND;
+        RHO_BOUND * scaled.tanh()
+    })
+}
+
+fn jacobian_drho_dz(z: &Array1<f64>) -> Array1<f64> {
+    z.mapv(|v| {
+        let scaled = v / RHO_BOUND;
+        let tanh_scaled = scaled.tanh();
+        1.0 - tanh_scaled * tanh_scaled
+    })
 }
 
 fn build_asymmetric_fallback(len: usize) -> Array1<f64> {
@@ -334,7 +345,7 @@ fn check_rho_gradient_stationarity(
         .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
     let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
 
-    let tol_rho = (tol_z / RHO_BOUND.max(1.0)).max(1e-12);
+    let tol_rho = tol_z.max(1e-12);
     let mut is_stationary = grad_norm_rho <= tol_rho;
 
     let boundary_margin = 1.0_f64;
@@ -371,11 +382,7 @@ fn check_rho_gradient_stationarity(
 
     eprintln!(
         "[Candidate {label}] rho-space gradient norm {:.3e} (tol {:.3e}); max|∇ρ| {:.3e}; max|ρ| {:.2}; stationary = {}",
-        grad_norm_rho,
-        tol_rho,
-        max_abs_grad,
-        max_abs_rho,
-        is_stationary
+        grad_norm_rho, tol_rho, max_abs_grad, max_abs_rho, is_stationary
     );
 
     Ok((grad_norm_rho, is_stationary))
@@ -905,14 +912,8 @@ pub fn train_model(
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
 
-    let mut successful_runs: Vec<(
-        String,
-        Option<usize>,
-        Option<f64>,
-        BfgsSolution,
-        f64,
-        bool,
-    )> = Vec::new();
+    let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)> =
+        Vec::new();
     let mut last_error: Option<EstimationError> = None;
 
     for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
@@ -1006,41 +1007,19 @@ pub fn train_model(
     }
 
     let (stationary_runs, non_stationary_runs): (
-        Vec<(
-            String,
-            Option<usize>,
-            Option<f64>,
-            BfgsSolution,
-            f64,
-            bool,
-        )>,
-        Vec<(
-            String,
-            Option<usize>,
-            Option<f64>,
-            BfgsSolution,
-            f64,
-            bool,
-        )>,
+        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
+        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
     ) = successful_runs.into_iter().partition(|entry| entry.5);
 
-    let select_by_final_value = |
-        entries: Vec<(
-            String,
-            Option<usize>,
-            Option<f64>,
-            BfgsSolution,
-            f64,
-            bool,
-        )>,
-    | {
-        entries
-            .into_iter()
-            .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
-                Some(order) => order,
-                None => std::cmp::Ordering::Equal,
-            })
-    };
+    let select_by_final_value =
+        |entries: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>| {
+            entries
+                .into_iter()
+                .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
+                    Some(order) => order,
+                    None => std::cmp::Ordering::Equal,
+                })
+        };
 
     let (
         best_label,
@@ -1088,8 +1067,7 @@ pub fn train_model(
     }
     eprintln!(
         "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
-        best_grad_norm_rho,
-        best_stationary
+        best_grad_norm_rho, best_stationary
     );
     log::info!("REML optimization completed successfully");
 
@@ -1480,7 +1458,7 @@ pub fn optimize_external_design(
         Some(opts.nullspace_dims.clone()),
     )?;
     let initial_rho = Array1::<f64>::zeros(k);
-    // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via atanh(r/RHO_BOUND)
+    // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
     let initial_z = to_z_from_rho(&initial_rho);
     let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(opts.tol)
@@ -1610,7 +1588,12 @@ pub fn optimize_external_design(
     let final_grad = reml_state
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
-    let final_grad_norm = final_grad.dot(&final_grad).sqrt();
+    let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
+    let final_grad_norm = if final_grad_norm_rho.is_finite() {
+        final_grad_norm_rho
+    } else {
+        grad_norm_reported
+    };
 
     Ok(ExternalOptimResult {
         beta: beta_orig,
@@ -1619,11 +1602,7 @@ pub fn optimize_external_design(
         edf_by_block,
         edf_total,
         iterations: iters,
-        final_grad_norm: if grad_norm_reported.is_finite() {
-            grad_norm_reported
-        } else {
-            final_grad_norm
-        },
+        final_grad_norm,
     })
 }
 
@@ -2778,7 +2757,7 @@ pub mod internal {
         }
 
         /// The state-aware closure method for the BFGS optimizer.
-        /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND*tanh(z)`.
+        /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND * tanh(z / RHO_BOUND)`.
         pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
             let eval_num = {
                 let mut count = self.eval_count.borrow_mut();
@@ -2786,10 +2765,11 @@ pub mod internal {
                 *count
             };
 
-            // Map from unbounded z to bounded rho via tanh
+            // Map from unbounded z to bounded rho via rho = RHO_BOUND * tanh(z / RHO_BOUND)
             let rho = z.mapv(|v| {
                 if v.is_finite() {
-                    RHO_BOUND * v.tanh()
+                    let scaled = v / RHO_BOUND;
+                    RHO_BOUND * scaled.tanh()
                 } else {
                     0.0
                 }
@@ -2814,8 +2794,8 @@ pub mod internal {
                                     grad[i] = 0.0;
                                 }
                             }
-                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = RHO_BOUND*(1 - tanh(z)^2)
-                            let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
+                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = 1 - tanh^2(z / RHO_BOUND)
+                            let jac = jacobian_drho_dz(z);
                             let grad_z = &grad * &jac;
                             let grad_norm = grad_z.dot(&grad_z).sqrt();
 
@@ -2852,7 +2832,7 @@ pub mod internal {
                             );
                             // Generate retreat gradient toward heavier smoothing in rho-space
                             let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                            let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
+                            let jac = jacobian_drho_dz(z);
                             let retreat_gradient = &retreat_rho_grad * &jac;
                             (f64::INFINITY, retreat_gradient)
                         }
@@ -2896,7 +2876,7 @@ pub mod internal {
                             }
                         }),
                     };
-                    let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
+                    let jac = jacobian_drho_dz(z);
                     let gradient = &gradient * &jac;
                     let grad_norm = gradient.dot(&gradient).sqrt();
                     println!("  -> Retreat gradient norm: {grad_norm:.6e}");
@@ -2920,7 +2900,7 @@ pub mod internal {
                     );
                     // Generate retreat gradient toward heavier smoothing in rho-space
                     let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
+                    let jac = jacobian_drho_dz(z);
                     let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
@@ -2933,7 +2913,7 @@ pub mod internal {
                     // For infinite costs, compute a more informed gradient instead of zeros
                     // Generate retreat gradient toward heavier smoothing in rho-space
                     let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = z.mapv(|v| RHO_BOUND * (1.0 - v.tanh().powi(2)));
+                    let jac = jacobian_drho_dz(z);
                     let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
