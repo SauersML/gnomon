@@ -105,3 +105,55 @@ cat(sprintf(
 ))
 ```
 The prevalence is 0.201%.
+
+Let's check per-score accuracies:
+```
+install.packages("pROC")
+# AUROC of each score column in arrays.sscore vs. case/control
+library(data.table)
+library(pROC)
+
+ss <- fread("arrays.sscore", sep = "\t", showProgress = FALSE)
+ids <- as.character(ss[[1]])
+y <- as.integer(ids %chin% unique(as.character(cases)))  # 1 = case, 0 = control
+
+score_cols <- grep("_AVG$", names(ss), value = TRUE)
+
+res <- rbindlist(lapply(score_cols, function(cn) {
+  x <- suppressWarnings(as.numeric(ss[[cn]]))
+  ok <- is.finite(x)
+  n1 <- sum(y[ok] == 1L); n0 <- sum(y[ok] == 0L)
+  if (n1 == 0L || n0 == 0L) return(data.table())
+  r <- roc(response = y[ok], predictor = x[ok], quiet = TRUE)
+  data.table(
+    score    = sub("_AVG$", "", cn),
+    n        = sum(ok),
+    cases    = n1,
+    controls = n0,
+    AUROC    = as.numeric(auc(r))
+  )
+}))
+
+setorder(res, -AUROC)
+print(res)
+```
+
+Let's remove all but the top 5 scores:
+```
+# Keep only the top-5 PGS columns (plus ID) in arrays.sscore
+
+library(data.table)
+
+keep <- c("PGS004146","PGS000015","PGS004898","PGS004869","PGS000332")
+
+dt <- fread("arrays.sscore", sep = "\t", showProgress = FALSE)
+idcol <- names(dt)[1]
+
+pat <- paste0("^(", paste(keep, collapse = "|"), ")_")
+cols_keep <- c(idcol, grep(pat, names(dt), value = TRUE, perl = TRUE))
+
+dt <- dt[, ..cols_keep]
+fwrite(dt, "arrays.sscore", sep = "\t", quote = FALSE)
+```
+
+
