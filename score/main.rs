@@ -170,6 +170,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         &prep_result,
         &final_scores,
         &final_counts,
+        score_regions_ref,
     )?;
 
     eprintln!(
@@ -281,6 +282,7 @@ fn finalize_and_write_output(
     prep_result: &Arc<PreparationResult>,
     final_scores: &[f64],
     final_counts: &[u32],
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (output_dir, out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
         let stem = output_prefix
@@ -316,6 +318,7 @@ fn finalize_and_write_output(
         &prep_result.score_variant_counts,
         final_scores,
         final_counts,
+        score_regions,
     )?;
 
     eprintln!("> Final output written in {:.2?}", output_start.elapsed());
@@ -598,10 +601,24 @@ fn write_scores_to_file(
     score_variant_counts: &[u32],
     sum_scores: &[f64],
     missing_counts: &[u32],
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     let num_scores = score_names.len();
+
+    if let Some(regions) = score_regions {
+        let mut wrote_metadata_header = false;
+        for name in score_names {
+            if let Some(region) = regions.get(name) {
+                if !wrote_metadata_header {
+                    writeln!(writer, "#REGION\tSCORE\tINTERVAL")?;
+                    wrote_metadata_header = true;
+                }
+                writeln!(writer, "#REGION\t{name}\t{region}")?;
+            }
+        }
+    }
 
     // Write the new, more descriptive, and correctly tab-separated header.
     write!(writer, "#IID")?;
