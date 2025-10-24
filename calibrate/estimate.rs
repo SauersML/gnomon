@@ -96,13 +96,8 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
     rho.mapv(|r| {
         // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
         let ratio = r / RHO_BOUND;
-        let xr = if ratio < -0.999_999 {
-            -0.999_999
-        } else if ratio > 0.999_999 {
-            0.999_999
-        } else {
-            ratio
-        };
+        let upper = 1.0 - f64::EPSILON;
+        let xr = ratio.clamp(-upper, upper);
         let z = RHO_BOUND * atanh_clamped(xr);
         z.clamp(-1e6, 1e6)
     })
