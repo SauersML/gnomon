@@ -88,6 +88,24 @@ df.to_csv('../../arrays.sscore', sep='\t', index=False)
 
 Let's make the case definition.
 
+ICD-10:
+
+* E66.811
+* E66.812
+* E66.813
+* E66.01
+* E66.09
+* E66.1
+* E66.2
+* E66.89
+* E66.9
+* E88.82
+
+ICD-9:
+
+* 278.00
+* 278.01
+* 278.03
 
 ```
 import os
