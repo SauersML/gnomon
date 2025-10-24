@@ -27,14 +27,7 @@ Strong performers include:
 - PGS004898
 - PGS004227
 
-We'll assess these scores on three metrics in the test data:
-- Odds ratio (per standard deviation of score)
-- AUROC
-- Nagelkerke's R²
-
-`gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed` is 10.51 TiB, so we can use `gs://fc-aou-datasets-controlled/v8/microarray/plink/` instead.
-
-Create a standard cloud analysis environment with 8 CPUs and 30 GB RAM (though using lower or higher values should also work similarly).
+We will use `gs://fc-aou-datasets-controlled/v8/microarray/plink/`, though it may have higher missingness compared to WGS.
 
 Install gnomon if you haven't already:
 ```
@@ -62,7 +55,7 @@ Let's open a Jupyter analysis notebook.
 
 This shows us the columns of the score output:
 ```
-#IID	PGS000007_AVG	PGS000007_MISSING_PCT	PGS000015_AVG	PGS000015_MISSING_PCT	PGS000317_AVG	PGS000317_MISSING_PCT	PGS000332_AVG	PGS000332_MISSING_PCT	PGS000344_AVG	PGS000344_MISSING_PCT	PGS000507_AVG	PGS000507_MISSING_PCT	PGS000508_AVG	PGS000508_MISSING_PCT	PGS004869_AVG	PGS004869_MISSING_PCT
+#IID	PGS000007_AVG	PGS000007_MISSING_PCT	PGS000015_AVG	PGS000015_MISSING_PCT	PGS000317_AVG	PGS000317_MISSING_PCT	PGS000332_AVG	PGS000332_MISSING_PCT	PGS000335_AVG	PGS000335_MISSING_PCT	PGS000344_AVG	PGS000344_MISSING_PCT	PGS000507_AVG	PGS000507_MISSING_PCT	PGS000508_AVG	PGS000508_MISSING_PCT	PGS003334_AVG	PGS003334_MISSING_PCT	PGS003957_AVG	PGS003957_MISSING_PCT	PGS004146_AVG	PGS004146_MISSING_PCT	PGS004227_AVG	PGS004227_MISSING_PCT	PGS004589_AVG	PGS004589_MISSING_PCT	PGS004863_AVG	PGS004863_MISSING_PCT	PGS004869_AVG	PGS004869_MISSING_PCT	PGS004898_AVG	PGS004898_MISSING_PCT
 ```
 
 Let's plot missingness for each score:
@@ -72,7 +65,15 @@ d=pd.read_csv('../../arrays.sscore', sep='\t')
 for c in d.columns[d.columns.str.endswith('_MISSING_PCT')]: d[c].hist(bins=50); plt.title(c); plt.xlabel(c); plt.ylabel('count'); plt.show()
 ```
 
-Most samples' missingness should be under 2%.
+Most samples' missingness should be under 2%. But there are a few scores that have high missingness for some samples.
+
+<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/493766a6-870c-4ed4-8481-9eaa1ead61af" />
+<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/dd433dbc-3bb3-414e-a5d9-7053cc3a0e8f" />
+<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/f345c05b-7025-4b96-924b-f7dbd422b401" />
+<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/66b15e0c-9ef3-4adb-98ea-da892886c71d" />
+<img width="597" height="454" alt="image" src="https://github.com/user-attachments/assets/5d9139cd-d6e9-4aaf-a466-46c7c25eec15" />
+
+
 
 Now let's check the correlation matrix of the scores. We expect moderate correlations.
 
