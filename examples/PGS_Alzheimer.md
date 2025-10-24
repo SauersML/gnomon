@@ -948,7 +948,82 @@ out
 
 This doesn't account for all of it. PGS003957 still has a positive correlation between missingness and accuracy after accounting for PCs.
 
+Let's inspect a few scores:
+```
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, roc_curve
+from patsy import dmatrix
+import statsmodels.api as sm
 
+scores = ["PGS000015","PGS004589","PGS003957"]
+ids = d['#IID'].astype(str) if '#IID' in d.columns else pd.Series(d.index.astype(str), index=d.index)
+y = ids.isin(set(pd.Series(cases, dtype=str))).astype('i1')
+
+def orient(x, y):
+    a = roc_auc_score(y, x) if y.nunique()==2 else np.nan
+    return (-x) if np.isfinite(a) and a < 0.5 else x
+
+def youden(y, s):
+    fpr, tpr, thr = roc_curve(y, s)
+    return thr[np.argmax(tpr - fpr)]
+
+def glm_binom_spline(x, y, xg, df=6):
+    X = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": x}, return_type='dataframe')
+    m = sm.GLM(y, X, family=sm.families.Binomial()).fit()
+    Xg = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": xg}, return_type='dataframe')
+    sf = m.get_prediction(Xg).summary_frame()
+    return sf['mean'].to_numpy(), sf['mean_ci_lower'].to_numpy(), sf['mean_ci_upper'].to_numpy()
+
+def ols_spline_ci(x, y, xg, df=6):
+    X = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": x}, return_type='dataframe')
+    m = sm.OLS(y, X).fit().get_robustcov_results(cov_type='HC3')
+    Xg = dmatrix(f"bs(x, df={df}, degree=3, include_intercept=False)", {"x": xg}, return_type='dataframe')
+    sf = m.get_prediction(Xg).summary_frame()
+    return sf['mean'].to_numpy(), sf['mean_ci_lower'].to_numpy(), sf['mean_ci_upper'].to_numpy()
+
+plt.figure(figsize=(7,5))
+for s in scores:
+    xcol, mcol = f"{s}_AVG", f"{s}_MISSING_PCT"
+    if xcol not in d.columns or mcol not in d.columns: continue
+    t = pd.DataFrame({"x": pd.to_numeric(d[xcol], errors="coerce"),
+                      "m": pd.to_numeric(d[mcol], errors="coerce"),
+                      "y": y}).dropna()
+    if len(t) < 50 or t["y"].nunique() < 2: continue
+    xo = orient(t["x"], t["y"])
+    thr = youden(t["y"], xo)
+    acc = ((xo >= thr).astype('i1') == t["y"]).astype(int).to_numpy()
+    logm = np.log(np.maximum(t["m"].to_numpy(), 1e-12))
+    xg = np.linspace(logm.min(), logm.max(), 200)
+    mean, lo, hi = glm_binom_spline(logm, acc, xg)
+    plt.plot(np.exp(xg), mean, label=s); plt.fill_between(np.exp(xg), lo, hi, alpha=0.15)
+plt.xscale('log'); plt.xlabel('Missingness'); plt.ylabel('Proportion correct'); plt.title('Accuracy vs missingness (95% CI)'); plt.legend(); plt.tight_layout()
+
+plt.figure(figsize=(7,5))
+for s in scores:
+    xcol, mcol = f"{s}_AVG", f"{s}_MISSING_PCT"
+    if xcol not in d.columns or mcol not in d.columns: continue
+    t = pd.DataFrame({"x": pd.to_numeric(d[xcol], errors="coerce"),
+                      "m": pd.to_numeric(d[mcol], errors="coerce"),
+                      "y": y}).dropna()
+    if len(t) < 50 or t["y"].nunique() < 2: continue
+    xo = orient(t["x"], t["y"])
+    df2 = pd.DataFrame({"s": xo.to_numpy()+1e-12, "y": t["y"].to_numpy(), "m": t["m"].to_numpy()})
+    g = df2.groupby("s", observed=True)["y"].agg(pos_eq=lambda z: (z==1).sum(),
+                                                 neg_eq=lambda z: (z==0).sum()).reset_index().sort_values("s")
+    g["pos_lt"] = g["pos_eq"].cumsum() - g["pos_eq"]; g["neg_lt"] = g["neg_eq"].cumsum() - g["neg_eq"]
+    npos = int((df2["y"]==1).sum()); nneg = int((df2["y"]==0).sum())
+    look = g.set_index("s"); sv = df2["s"].to_numpy()
+    pos_lt = look.loc[sv,"pos_lt"].to_numpy(); pos_eq = look.loc[sv,"pos_eq"].to_numpy()
+    neg_lt = look.loc[sv,"neg_lt"].to_numpy(); neg_eq = look.loc[sv,"neg_eq"].to_numpy()
+    contrib = np.empty(len(df2)); pm = (df2["y"].to_numpy()==1)
+    contrib[pm]  = (neg_lt[pm] + 0.5*neg_eq[pm]) / max(nneg,1)
+    contrib[~pm] = (npos - (pos_lt[~pm] + 0.5*pos_eq[~pm])) / max(npos,1)
+    logm = np.log(np.maximum(df2["m"].to_numpy(), 1e-12))
+    xg = np.linspace(logm.min(), logm.max(), 200)
+    mean, lo, hi = ols_spline_ci(logm, contrib, xg)
+    plt.plot(np.exp(xg), mean, label=s); plt.fill_between(np.exp(xg), lo, hi, alpha=0.15)
+plt.xscale('log'); plt.xlabel('Missingness'); plt.ylabel('Per-individual AUC contribution'); plt.title('AUC contribution vs missingness (95% CI)'); plt.legend(); plt.tight_layout(); plt.show()
+```
 
 
 
