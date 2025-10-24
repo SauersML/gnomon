@@ -86,10 +86,12 @@ const MAX_CONSECUTIVE_INNER_ERRORS: usize = 3;
 const SYM_VS_ASYM_MARGIN: f64 = 1.001; // 0.1% preference
 const DESIGN_MATRIX_CONDITION_THRESHOLD: f64 = 1e12;
 
+#[inline]
 fn atanh_clamped(x: f64) -> f64 {
     0.5 * ((1.0 + x) / (1.0 - x)).ln()
 }
 
+#[inline]
 fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
     rho.mapv(|r| {
         // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
@@ -101,10 +103,12 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
         } else {
             ratio
         };
-        RHO_BOUND * atanh_clamped(xr)
+        let z = RHO_BOUND * atanh_clamped(xr);
+        z.clamp(-1e6, 1e6)
     })
 }
 
+#[inline]
 fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
     z.mapv(|v| {
         let scaled = v / RHO_BOUND;
@@ -112,12 +116,35 @@ fn to_rho_from_z(z: &Array1<f64>) -> Array1<f64> {
     })
 }
 
-fn jacobian_drho_dz(z: &Array1<f64>) -> Array1<f64> {
+/// Jacobian of ρ(z) = RHO_BOUND·tanh(z / RHO_BOUND).
+#[inline]
+fn drho_dz_from_z(z: &Array1<f64>) -> Array1<f64> {
     z.mapv(|v| {
         let scaled = v / RHO_BOUND;
         let tanh_scaled = scaled.tanh();
         1.0 - tanh_scaled * tanh_scaled
     })
+}
+
+#[inline]
+fn jacobian_drho_dz_from_rho(rho: &Array1<f64>) -> Array1<f64> {
+    rho.mapv(|r| {
+        // Numerical guard: can be slightly negative near the walls; clamp to [0, 1].
+        (1.0 - (r / RHO_BOUND).powi(2)).max(0.0)
+    })
+}
+
+#[inline]
+fn project_rho_gradient(rho: &Array1<f64>, grad: &mut Array1<f64>) {
+    let tol = 1e-8;
+    for i in 0..rho.len() {
+        if rho[i] <= -RHO_BOUND + tol && grad[i] > 0.0 {
+            grad[i] = 0.0;
+        }
+        if rho[i] >= RHO_BOUND - tol && grad[i] < 0.0 {
+            grad[i] = 0.0;
+        }
+    }
 }
 
 fn build_asymmetric_fallback(len: usize) -> Array1<f64> {
@@ -338,9 +365,11 @@ fn check_rho_gradient_stationarity(
     tol_z: f64,
 ) -> Result<(f64, bool), EstimationError> {
     let rho = to_rho_from_z(final_z);
-    let grad_rho = reml_state.compute_gradient(&rho)?;
+    let mut grad_rho = reml_state.compute_gradient(&rho)?;
+    let grad_rho_raw = grad_rho.clone();
+    project_rho_gradient(&rho, &mut grad_rho);
     let grad_norm_rho = grad_rho.dot(&grad_rho).sqrt();
-    let max_abs_grad = grad_rho
+    let max_abs_grad = grad_rho_raw
         .iter()
         .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
     let max_abs_rho = rho.iter().fold(0.0_f64, |acc, &val| acc.max(val.abs()));
@@ -350,7 +379,7 @@ fn check_rho_gradient_stationarity(
 
     let boundary_margin = 1.0_f64;
     let mut boundary_push = false;
-    for (&rho_i, &grad_i) in rho.iter().zip(grad_rho.iter()) {
+    for (&rho_i, &grad_i) in rho.iter().zip(grad_rho_raw.iter()) {
         let dist_to_bound = RHO_BOUND - rho_i.abs();
         if dist_to_bound <= boundary_margin {
             if rho_i > 0.0 && grad_i < -tol_rho {
@@ -374,7 +403,7 @@ fn check_rho_gradient_stationarity(
 
     if !boundary_push && grad_norm_rho > tol_rho {
         eprintln!(
-            "[Candidate {label}] rho-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
+            "[Candidate {label}] projected rho-space gradient norm {:.3e} exceeds tolerance {:.3e}; marking as non-stationary",
             grad_norm_rho, tol_rho
         );
         is_stationary = false;
@@ -2785,17 +2814,9 @@ pub mod internal {
                     match self.compute_gradient(&rho) {
                         Ok(mut grad) => {
                             // Projected/KKT handling at active bounds in rho-space
-                            let tol = 1e-8;
-                            for i in 0..rho.len() {
-                                if rho[i] <= -RHO_BOUND + tol && grad[i] > 0.0 {
-                                    grad[i] = 0.0;
-                                }
-                                if rho[i] >= RHO_BOUND - tol && grad[i] < 0.0 {
-                                    grad[i] = 0.0;
-                                }
-                            }
-                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz = 1 - tanh^2(z / RHO_BOUND)
-                            let jac = jacobian_drho_dz(z);
+                            project_rho_gradient(&rho, &mut grad);
+                            // Chain rule: dCost/dz = dCost/drho * drho/dz, where drho/dz|_{z=0} = 1
+                            let jac = jacobian_drho_dz_from_rho(&rho);
                             let grad_z = &grad * &jac;
                             let grad_norm = grad_z.dot(&grad_z).sqrt();
 
@@ -2832,7 +2853,7 @@ pub mod internal {
                             );
                             // Generate retreat gradient toward heavier smoothing in rho-space
                             let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                            let jac = jacobian_drho_dz(z);
+                            let jac = jacobian_drho_dz_from_rho(&rho);
                             let retreat_gradient = &retreat_rho_grad * &jac;
                             (f64::INFINITY, retreat_gradient)
                         }
@@ -2876,7 +2897,7 @@ pub mod internal {
                             }
                         }),
                     };
-                    let jac = jacobian_drho_dz(z);
+                    let jac = jacobian_drho_dz_from_rho(&rho);
                     let gradient = &gradient * &jac;
                     let grad_norm = gradient.dot(&gradient).sqrt();
                     println!("  -> Retreat gradient norm: {grad_norm:.6e}");
@@ -2900,7 +2921,7 @@ pub mod internal {
                     );
                     // Generate retreat gradient toward heavier smoothing in rho-space
                     let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = jacobian_drho_dz(z);
+                    let jac = jacobian_drho_dz_from_rho(&rho);
                     let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
@@ -2913,7 +2934,7 @@ pub mod internal {
                     // For infinite costs, compute a more informed gradient instead of zeros
                     // Generate retreat gradient toward heavier smoothing in rho-space
                     let retreat_rho_grad = Array1::from_elem(rho.len(), -1.0);
-                    let jac = jacobian_drho_dz(z);
+                    let jac = jacobian_drho_dz_from_rho(&rho);
                     let retreat_gradient = &retreat_rho_grad * &jac;
                     (f64::INFINITY, retreat_gradient)
                 }
@@ -3485,6 +3506,56 @@ pub mod internal {
         use rand::{Rng, SeedableRng, rngs::StdRng};
         use rand_distr::{Distribution, Normal};
         use std::f64::consts::PI;
+
+        #[test]
+        fn rho_z_round_trip_precision() {
+            let mut rng = StdRng::seed_from_u64(2024);
+            let mut values = vec![
+                -RHO_BOUND + 1e-9,
+                -3.0,
+                -0.5,
+                0.0,
+                0.75,
+                4.5,
+                RHO_BOUND - 1e-9,
+            ];
+            values.extend((0..249).map(|_| rng.gen_range((-RHO_BOUND + 1e-6)..(RHO_BOUND - 1e-6))));
+            let rho = Array1::from_vec(values);
+            let z = to_z_from_rho(&rho);
+            let rho_rt = to_rho_from_z(&z);
+            for (expected, actual) in rho.iter().zip(rho_rt.iter()) {
+                assert!(
+                    (expected - actual).abs() < 5e-10,
+                    "round-trip mismatch: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        #[test]
+        fn drho_dz_matches_unity_at_origin() {
+            let eps = 1e-6;
+            let center = Array1::from_vec(vec![0.0]);
+            let jac = drho_dz_from_z(&center);
+            assert!((jac[0] - 1.0).abs() < 1e-12);
+
+            let forward = to_rho_from_z(&Array1::from_vec(vec![eps]));
+            let backward = to_rho_from_z(&Array1::from_vec(vec![-eps]));
+            let fd = (forward[0] - backward[0]) / (2.0 * eps);
+            assert!(
+                (fd - 1.0).abs() < 1e-9,
+                "finite-difference derivative deviates: {fd}"
+            );
+        }
+
+        #[test]
+        fn projected_gradient_zeroes_outward_components() {
+            let rho = Array1::from_vec(vec![RHO_BOUND - 1e-10, -RHO_BOUND + 1e-10, 0.0]);
+            let mut grad = Array1::from_vec(vec![-0.5, 0.25, 0.75]);
+            project_rho_gradient(&rho, &mut grad);
+            assert_eq!(grad[0], 0.0);
+            assert_eq!(grad[1], 0.0);
+            assert!((grad[2] - 0.75).abs() < 1e-12);
+        }
 
         struct RealWorldTestFixture {
             n_samples: usize,
