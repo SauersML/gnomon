@@ -187,6 +187,7 @@ ICD-9:
 290.42
 290.43
 
+This is too many ICD codes, which makes both modeling and interpretation more difficult. Let's use Alzheimer's codes only:
 
 ```
 import os
@@ -194,111 +195,18 @@ from google.cloud import bigquery as bq
 
 cdr_id = os.environ["WORKSPACE_CDR"]
 
-icd10_cog_dem_alz = [
-    "R41.81",
-    "G31.84",
-    "F06.70",
-    "F06.71",
-    "F03.90",
-    "F03.911",
-    "F03.918",
-    "F03.92",
-    "F03.93",
-    "F03.94",
-    "F03.A0",
-    "F03.A11",
-    "F03.A18",
-    "F03.A2",
-    "F03.A3",
-    "F03.A4",
-    "F03.B0",
-    "F03.B11",
-    "F03.B18",
-    "F03.B2",
-    "F03.B3",
-    "F03.B4",
-    "F03.C0",
-    "F03.C11",
-    "F03.C18",
-    "F03.C2",
-    "F03.C3",
-    "F03.C4",
-    "F02.80",
-    "F02.811",
-    "F02.818",
-    "F02.82",
-    "F02.83",
-    "F02.84",
-    "F02.A0",
-    "F02.A11",
-    "F02.A18",
-    "F02.A2",
-    "F02.A3",
-    "F02.A4",
-    "F02.B0",
-    "F02.B11",
-    "F02.B18",
-    "F02.B2",
-    "F02.B3",
-    "F02.B4",
-    "F02.C0",
-    "F02.C11",
-    "F02.C18",
-    "F02.C2",
-    "F02.C3",
-    "F02.C4",
-    "F01.50",
-    "F01.511",
-    "F01.518",
-    "F01.52",
-    "F01.53",
-    "F01.54",
-    "F01.A0",
-    "F01.A11",
-    "F01.A18",
-    "F01.A2",
-    "F01.A3",
-    "F01.A4",
-    "F01.B0",
-    "F01.B11",
-    "F01.B18",
-    "F01.B2",
-    "F01.B3",
-    "F01.B4",
-    "F01.C0",
-    "F01.C11",
-    "F01.C18",
-    "F01.C2",
-    "F01.C3",
-    "F01.C4",
+icd10_alz = [
     "G30.0",
     "G30.1",
     "G30.8",
     "G30.9",
 ]
 
-icd9_cog_dem_alz = [
-    "331.83",
-    "294.20",
-    "294.21",
-    "294.10",
-    "294.11",
+icd9_alz = [
     "331.0",
-    "290.0",
-    "290.10",
-    "290.11",
-    "290.12",
-    "290.13",
-    "290.20",
-    "290.21",
-    "290.3",
-    "290.40",
-    "290.41",
-    "290.42",
-    "290.43",
 ]
 
-codes = icd10_cog_dem_alz + icd9_cog_dem_alz
+codes = icd10_alz + icd9_alz
 codes = [c.upper() for c in (codes + [c.replace(".", "") for c in codes])]
 
 sql = f"""
