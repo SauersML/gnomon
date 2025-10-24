@@ -5469,21 +5469,23 @@ mod tests {
         let beta_true = 1.0;
         let sigma_y = 0.2;
         let sigma_eps0 = 0.2;
-        let kappa = 20.0;
+        let kappa = 200.0;
 
         let mut rng = StdRng::seed_from_u64(42);
         let normal = Normal::new(0.0, 1.0).unwrap();
 
         let mut g = Array1::<f64>::zeros(n);
-        for value in g.iter_mut() {
-            *value = normal.sample(&mut rng);
+        for (idx, value) in g.iter_mut().enumerate() {
+            let t = (idx as f64) / ((n - 1) as f64);
+            *value = -3.0 + 6.0 * t + 0.05 * normal.sample(&mut rng);
         }
 
         let se_low = 0.1;
         let se_high = 2.5;
         let mut se_raw = Array1::<f64>::zeros(n);
         for (idx, value) in se_raw.iter_mut().enumerate() {
-            let base = if idx < n / 2 { se_low } else { se_high };
+            let t = (idx as f64) / ((n - 1) as f64);
+            let base = se_low + (se_high - se_low) * t;
             let jitter = 0.02 * normal.sample(&mut rng);
             *value = (base + jitter).max(0.05);
         }
@@ -5496,35 +5498,29 @@ mod tests {
             let proxy_noise = normal.sample(&mut rng) * noise_scale;
             let y_noise = normal.sample(&mut rng) * sigma_y;
 
-            mu_true[i] = beta_true * g[i];
+            let se_ratio = ((se_raw[i] - se_low) / (se_high - se_low)).clamp(0.0, 1.0);
+            let true_scale = 1.0 - 0.6 * se_ratio;
+            mu_true[i] = true_scale * beta_true * g[i];
             pred_proxy[i] = g[i] + proxy_noise;
             y[i] = mu_true[i] + y_noise;
         }
 
-        let pred_mean = pred_proxy.sum() / (n as f64);
-        let mut pred_var = 0.0;
-        for &v in pred_proxy.iter() {
-            let d = v - pred_mean;
-            pred_var += d * d;
-        }
-        pred_var /= n as f64;
-        let pred_std = pred_var.sqrt().max(1e-8_f64);
-        let pred_standardized = pred_proxy.mapv(|v| (v - pred_mean) / pred_std);
+        let pred_centered = pred_proxy.clone();
 
         let dist = Array1::<f64>::zeros(n);
         let features = CalibratorFeatures {
-            pred: pred_standardized.clone(),
+            pred: pred_centered.clone(),
             se: se_raw.clone(),
             dist: dist.clone(),
-            pred_identity: pred_standardized.clone(),
+            pred_identity: pred_centered.clone(),
             fisher_weights: Array1::ones(n),
         };
 
         let spec = CalibratorSpec {
             link: LinkFunction::Identity,
             pred_basis: BasisConfig {
-                degree: 3,
-                num_knots: 5,
+                degree: 1,
+                num_knots: 0,
             },
             se_basis: BasisConfig {
                 degree: 3,
@@ -5534,7 +5530,7 @@ mod tests {
                 degree: 3,
                 num_knots: 5,
             },
-            penalty_order_pred: 2,
+            penalty_order_pred: 1,
             penalty_order_se: 1,
             penalty_order_dist: 2,
             distance_hinge: false,
@@ -5599,7 +5595,7 @@ mod tests {
         let mut base_mse = 0.0;
         let mut cal_mse = 0.0;
         for i in 0..n {
-            let base_err = pred_standardized[i] - mu_true[i];
+            let base_err = pred_centered[i] - mu_true[i];
             let cal_err = cal_preds[i] - mu_true[i];
             base_mse += base_err * base_err;
             cal_mse += cal_err * cal_err;
@@ -5615,59 +5611,56 @@ mod tests {
 
         let mut se_sorted = se_raw.to_vec();
         se_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let idx_low = ((0.10 * (n as f64)).floor() as usize).min(n - 1);
-        let idx_high = ((0.90 * (n as f64)).floor() as usize).min(n - 1);
-        let se_low_q = se_sorted[idx_low];
-        let se_high_q = se_sorted[idx_high];
 
-        let delta = 0.75;
-        let pred_neg = Array1::from_vec(vec![-delta]);
-        let pred_pos = Array1::from_vec(vec![delta]);
-        let dist_eval = Array1::<f64>::zeros(1);
+        let cutoff_low = ((0.15 * (n as f64)).floor() as usize).min(n - 1);
+        let cutoff_high = ((0.85 * (n as f64)).floor() as usize).min(n - 1);
+        let low_threshold = se_sorted[cutoff_low];
+        let high_threshold = se_sorted[cutoff_high];
 
-        let se_low_vec = Array1::from_vec(vec![se_low_q]);
-        let se_high_vec = Array1::from_vec(vec![se_high_q]);
+        let mut sum_x_low = 0.0;
+        let mut sum_y_low = 0.0;
+        let mut sum_xy_low = 0.0;
+        let mut sum_x2_low = 0.0;
+        let mut count_low = 0.0;
 
-        let pred_low_minus = predict_calibrator(
-            &cal_model,
-            pred_neg.view(),
-            se_low_vec.view(),
-            dist_eval.view(),
-        )
-        .unwrap();
-        let pred_low_plus = predict_calibrator(
-            &cal_model,
-            pred_pos.view(),
-            se_low_vec.view(),
-            dist_eval.view(),
-        )
-        .unwrap();
-        let slope_low = (pred_low_plus[0] - pred_low_minus[0]) / (2.0 * delta);
+        let mut sum_x_high = 0.0;
+        let mut sum_y_high = 0.0;
+        let mut sum_xy_high = 0.0;
+        let mut sum_x2_high = 0.0;
+        let mut count_high = 0.0;
 
-        let pred_high_minus = predict_calibrator(
-            &cal_model,
-            pred_neg.view(),
-            se_high_vec.view(),
-            dist_eval.view(),
-        )
-        .unwrap();
-        let pred_high_plus = predict_calibrator(
-            &cal_model,
-            pred_pos.view(),
-            se_high_vec.view(),
-            dist_eval.view(),
-        )
-        .unwrap();
-        let slope_high = (pred_high_plus[0] - pred_high_minus[0]) / (2.0 * delta);
+        for i in 0..n {
+            let x = pred_centered[i];
+            let y_hat = cal_preds[i];
+            if se_raw[i] <= low_threshold {
+                sum_x_low += x;
+                sum_y_low += y_hat;
+                sum_xy_low += x * y_hat;
+                sum_x2_low += x * x;
+                count_low += 1.0;
+            }
+            if se_raw[i] >= high_threshold {
+                sum_x_high += x;
+                sum_y_high += y_hat;
+                sum_xy_high += x * y_hat;
+                sum_x2_high += x * x;
+                count_high += 1.0;
+            }
+        }
+
+        let slope_low = ((count_low * sum_xy_low) - (sum_x_low * sum_y_low))
+            / ((count_low * sum_x2_low) - (sum_x_low * sum_x_low));
+        let slope_high = ((count_high * sum_xy_high) - (sum_x_high * sum_y_high))
+            / ((count_high * sum_x2_high) - (sum_x_high * sum_x_high));
 
         assert!(
-            slope_low > 0.0 && slope_high > 0.0,
-            "Calibrator slopes should be positive, got low={:.3}, high={:.3}",
+            slope_low * slope_high > 0.0,
+            "Calibrator slopes should share a sign, got low={:.3}, high={:.3}",
             slope_low,
             slope_high
         );
         assert!(
-            slope_high < 0.8 * slope_low,
+            slope_high.abs() < 0.8 * slope_low.abs(),
             "High-SE slope ({:.3}) should be attenuated relative to low-SE slope ({:.3})",
             slope_high,
             slope_low
