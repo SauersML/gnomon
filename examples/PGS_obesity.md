@@ -75,10 +75,18 @@ plt.figure(figsize=(8,8)); im=plt.imshow(c,vmin=-1,vmax=1); plt.colorbar(im); pl
 This lets us know that we should drop PGS005199 or PGS005203 since they are highly correlated. Looking at the PGS catalog, PGS005199 is multi-ancestry and better performing.
 
 
+```
+# Read the file
+df = pd.read_csv('../../arrays.sscore', sep='\t')
+
+# Drop the PGS005203 columns
+df = df.drop(columns=['PGS005203_AVG', 'PGS005203_MISSING_PCT'])
+
+# Save back to file
+df.to_csv('../../arrays.sscore', sep='\t', index=False)
+```
+
 Let's make the case definition.
-
-
-
 
 
 ```
