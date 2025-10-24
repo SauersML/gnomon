@@ -1,4 +1,4 @@
-## Running a polygenic score for cognitive decline on the _All of Us_ cohort
+## Running a polygenic score for Alzheimer's disease on the _All of Us_ cohort
 
 Cognitive decline has a heterogeneous etiology, and may be related to Alzheimer's disease, dementia, or other genetic and environmental causes. This is complicated by the age of individuals in the biobank.
 
@@ -187,7 +187,7 @@ ICD-9:
 290.42
 290.43
 
-This is too many ICD codes, which makes both modeling and interpretation more difficult. Let's use Alzheimer's codes only:
+This is too many ICD codes, which makes both modeling and interpretation more difficult. Let's use Alzheimer's codes only instead:
 
 ```
 import os
@@ -250,18 +250,164 @@ for s in d.filter(regex='_AVG$').columns:
 pd.DataFrame(res,columns=['score','n','cases','controls','OR_perSD','p_one_sided_OR>1','AUROC','p_one_sided_AUC>0.5','Nagelkerke_R2','p_one_sided_R2>0']).sort_values('Nagelkerke_R2',ascending=False)
 ```
 
-| Score         |       N | Cases | Controls | OR per SD | P (OR>1) | AUROC | P (AUC>0.5) | Nagelkerke R² | P (R²>0) |
-| ------------- | ------: | ----: | -------: | --------: | -------: | ----: | ----------: | ------------: | -------: |
-| PGS000007_AVG | 447,278 | 6,614 |  440,664 |     1.275 |  <1e-10 | 0.569 |    3.49e-82 |         0.61% |  <1e-10 |
-| PGS000317_AVG | 447,278 | 6,614 |  440,664 |     1.269 |  <1e-10 | 0.567 |    1.30e-79 |         0.57% |  <1e-10 |
-| PGS004869_AVG | 447,278 | 6,614 |  440,664 |     1.201 |  <1e-10 | 0.552 |    1.57e-47 |         0.34% |  <1e-10 |
-| PGS000507_AVG | 447,278 | 6,614 |  440,664 |     1.179 |  <1e-10 | 0.547 |    1.68e-40 |         0.28% |  <1e-10 |
-| PGS000344_AVG | 447,278 | 6,614 |  440,664 |     1.152 |  <1e-10 | 0.540 |    1.29e-29 |         0.20% |  <1e-10 |
-| PGS000508_AVG | 447,278 | 6,614 |  440,664 |     1.151 |  <1e-10 | 0.542 |    2.69e-32 |         0.20% |  <1e-10 |
-| PGS000015_AVG | 447,278 | 6,614 |  440,664 |     1.150 |  <1e-10 | 0.539 |    5.96e-28 |         0.20% |  <1e-10 |
-| PGS000332_AVG | 447,278 | 6,614 |  440,664 |     1.131 |  <1e-10 | 0.537 |    4.62e-25 |         0.15% |  <1e-10 |
+Done.
 
-PGS000007 is the best so far. Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
+| Score ID      | N (Total) | Cases | Controls | OR per SD | One-sided p (OR>1) | AUROC | One-sided p (AUC>0.5) |
+| ------------- | --------- | ----- | -------- | --------- | ------------------ | ----- | --------------------- |
+| PGS004146_AVG | 447278    | 1083  | 446195   | 1.318     | 0                  | 0.574 | 2.28e-17              |
+| PGS004898_AVG | 447278    | 1083  | 446195   | 1.158     | 7.82e-07           | 0.540 | 2.60e-06              |
+| PGS000015_AVG | 447278    | 1083  | 446195   | 0.875     | 1.000              | 0.460 | 1.000                 |
+| PGS000332_AVG | 447278    | 1083  | 446195   | 0.886     | 1.000              | 0.469 | 1.000                 |
+| PGS000508_AVG | 447278    | 1083  | 446195   | 0.887     | 1.000              | 0.471 | 0.999                 |
+| PGS004869_AVG | 447278    | 1083  | 446195   | 0.892     | 1.000              | 0.465 | 1.000                 |
+| PGS000507_AVG | 447278    | 1083  | 446195   | 0.894     | 1.000              | 0.472 | 0.999                 |
+| PGS000344_AVG | 447278    | 1083  | 446195   | 0.904     | 1.000              | 0.471 | 0.999                 |
+| PGS003334_AVG | 447278    | 1083  | 446195   | 1.084     | 0.004              | 0.519 | 0.018                 |
+| PGS000335_AVG | 447278    | 1083  | 446195   | 0.924     | 0.995              | 0.483 | 0.970                 |
+| PGS000007_AVG | 447278    | 1083  | 446195   | 0.930     | 0.991              | 0.480 | 0.988                 |
+| PGS000317_AVG | 447278    | 1083  | 446195   | 0.944     | 0.972              | 0.482 | 0.980                 |
+| PGS004589_AVG | 447278    | 1083  | 446195   | 1.048     | 0.064              | 0.512 | 0.083                 |
+| PGS003957_AVG | 447278    | 1083  | 446195   | 0.960     | 0.908              | 0.505 | 0.286                 |
+| PGS004863_AVG | 447278    | 1083  | 446195   | 1.038     | 0.110              | 0.509 | 0.151                 |
+| PGS004227_AVG | 447278    | 1083  | 446195   | 0.992     | 0.600              | 0.499 | 0.553                 |
+
+PGS004146 is the best. The p-values are one-sided, but it's likely that the effect direction is reversed in some of these scores. Take PGS000015_AVG, for example. OR per SD shows substantially decreased risk per SD of the score, with an AUROC under 0.5. If we set a simple +/- 0.1 OR change per SD, we are left with: PGS004146_AVG, PGS004898_AVG, PGS000015_AVG, PGS000332_AVG, PGS000508_AVG, PGS004869_AVG, and PGS000507_AVG.
+
+Let's do decile plots for each score:
+
+```
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, statsmodels.api as sm
+
+# Only these scores
+keep = [
+    "PGS004146_AVG", "PGS004898_AVG", "PGS000015_AVG",
+    "PGS000332_AVG", "PGS000508_AVG", "PGS004869_AVG", "PGS000507_AVG",
+]
+
+d = pd.read_csv('../../arrays.sscore', sep='\t')
+d['#IID'] = d['#IID'].astype(str)
+d = d.set_index('#IID')
+cols = [c for c in keep if c in d.columns]
+
+y = d.index.to_series().isin(pd.Series(cases, dtype=str)).astype('i1')
+
+def or_per_sd_within_deciles(x, y, q=10):
+    t = pd.DataFrame({'x': pd.to_numeric(x, errors='coerce'), 'y': y}).dropna()
+    if t.empty:
+        return pd.Series(dtype=float)
+    bins = pd.qcut(t['x'], q=q, labels=False, duplicates='drop')
+    out = []
+    for dec in range(int(bins.min()), int(bins.max()) + 1):
+        idx = bins.index[bins == dec]
+        xi = t.loc[idx, 'x']; yi = t.loc[idx, 'y']
+        if yi.nunique() < 2:
+            out.append(np.nan); continue
+        sd = xi.std(ddof=0)
+        if not np.isfinite(sd) or sd == 0:
+            out.append(np.nan); continue
+        z = (xi - xi.mean()) / sd
+        m = sm.Logit(yi.to_numpy(), sm.add_constant(z.to_numpy())).fit(disp=False, maxiter=200)
+        out.append(float(np.exp(m.params[1])))
+    # 1-based decile indexing
+    return pd.Series(out, index=np.arange(int(bins.min()) + 1, int(bins.max()) + 2))
+
+plt.figure(figsize=(9, 6))
+for c in cols:
+    seq = or_per_sd_within_deciles(d[c], y)
+    if not seq.empty:
+        plt.plot(seq.index, seq.values, marker='o', label=c.replace('_AVG',''))
+plt.axhline(1.0, linewidth=1)
+plt.xlabel('Decile of raw score (per-score quantiles)')
+plt.ylabel('OR per SD within decile')
+plt.title('OR/SD by decile — raw PGS only')
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+<img width="889" height="590" alt="image" src="https://github.com/user-attachments/assets/4e4243b8-ab66-41b2-97a1-4d876d0985f5" />
+
+This is not great. We should check if these scores are useful using a two-sided test. Let's compare the top 10% to the bottom 90% for each score. To avoid making assumptions about score construction, we might as well also test the top 90% and bottom 10%.
+
+```
+from statsmodels.stats.proportion import proportions_ztest
+from statsmodels.stats.contingency_tables import Table2x2
+import numpy as np, pandas as pd
+
+S = cols if 'cols' in globals() else [c for c in d.columns if c.endswith('_AVG')]
+fmt = lambda v: np.format_float_positional(float(v), trim='-')
+
+def do_test(mask, other_mask, label):
+    n1, n0 = int(mask.sum()), int(other_mask.sum())
+    if n1 == 0 or n0 == 0:
+        return None
+    a = int(y[mask].sum()); b = n1 - a; c = int(y[other_mask].sum()); d0 = n0 - c
+    z, p = proportions_ztest([a, c], [n1, n0], alternative='two-sided')
+    A, B, C, D = (a, b, c, d0)
+    if min(A, B, C, D) == 0:
+        A += 0.5; B += 0.5; C += 0.5; D += 0.5
+    t = Table2x2([[A, B], [C, D]])
+    OR = float(t.oddsratio); lo, hi = map(float, t.oddsratio_confint())
+    r1, r0 = a / n1, c / n0
+    return [label, n1, a, r1, n0, c, r0, r1 - r0, float(z), fmt(p), OR, lo, hi,
+            'higher' if r1 > r0 else ('lower' if r1 < r0 else 'no diff')]
+
+rows = []
+for s in S:
+    x = pd.to_numeric(d[s], errors='coerce'); m = x.notna()
+    q90, q10 = np.nanquantile(x[m], 0.90), np.nanquantile(x[m], 0.10)
+    top = (x >= q90) & m; rest_for_top = (~top) & m
+    bot = (x <= q10) & m; rest_for_bot = (~bot) & m
+    r1 = do_test(top, rest_for_top, f"{s.replace('_AVG','')} | top10_vs_rest")
+    r0 = do_test(bot, rest_for_bot, f"{s.replace('_AVG','')} | bottom10_vs_rest")
+    if r1: rows.append(r1)
+    if r0: rows.append(r0)
+
+out = pd.DataFrame(rows, columns=[
+    'score|comparison','n_group','cases_group','rate_group',
+    'n_other','cases_other','rate_other','rate_diff',
+    'z','p_two_sided','odds_ratio','or_95ci_low','or_95ci_high','direction'
+]).sort_values('p_two_sided', key=lambda s: s.astype(float))
+
+out
+```
+
+### Top 10% vs rest
+
+| Score ID  | Two-sided p | Odds ratio | Direction |
+| --------- | ----------- | ---------- | --------- |
+| PGS004146 | 1.34e-11    | 1.737      | higher    |
+| PGS004898 | 7.40e-05    | 1.418      | higher    |
+| PGS000332 | 0.002       | 0.688      | lower     |
+| PGS000507 | 0.002       | 0.688      | lower     |
+| PGS000508 | 0.002       | 0.698      | lower     |
+| PGS004869 | 0.040       | 0.796      | lower     |
+| PGS000015 | 0.177       | 0.865      | lower     |
+
+### Bottom 10% vs rest
+
+| Score ID  | Two-sided p | Odds ratio | Direction |
+| --------- | ----------- | ---------- | --------- |
+| PGS004146 | 1.13e-07    | 0.490      | lower     |
+| PGS000015 | 1.98e-04    | 1.393      | higher    |
+| PGS000507 | 4.33e-04    | 1.370      | higher    |
+| PGS000508 | 0.001       | 1.337      | higher    |
+| PGS000332 | 0.007       | 1.282      | higher    |
+| PGS004869 | 0.007       | 1.282      | higher    |
+| PGS004898 | 0.010       | 0.746      | lower     |
+
+It was a good idea to do both the top 10% and bottom 10%: PGS000015, for example, is only significant if we consider the bottom 10% vs. the rest.
+
+Let's add 16 principal components and sex to the model as predictors (not controls) and look at the resulting AUC.
+
+Let's drop the remaining scores not used in the above.
+
+```
+bad = ["PGS000007","PGS000317","PGS000335","PGS000344","PGS003334","PGS003957","PGS004227","PGS004589","PGS004863"]
+t = pd.read_csv('../../arrays_cog.sscore', sep='\t')
+t = t[[c for c in t.columns if not any(c.startswith(b + '_') for b in bad)]]
+t.to_csv('../../arrays_cog.filtered.sscore', sep='\t', index=False)  # writes cleaned file
+```
 
 ```
 import os, numpy as np, pandas as pd
