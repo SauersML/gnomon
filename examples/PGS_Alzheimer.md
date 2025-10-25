@@ -1114,3 +1114,5 @@ res
 
 <img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/b5872265-60d1-4e7d-9b25-91f115ea91f1" />
 <img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/6b5dc483-00e1-49a9-9b7f-30d88532218e" />
+
+Overall, the best score for Alzheimer's disease is PGS004146, with PGS004898 in second place.
