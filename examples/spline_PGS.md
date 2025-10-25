@@ -404,3 +404,49 @@ plot(p4$bin, 100 * p4$prev, type = "o", xlab = "PC4 quantile (1 = low)",
 <img width="810" height="519" alt="image" src="https://github.com/user-attachments/assets/9a30edc4-7b20-4f55-beae-00172105575a" />
 
 
+Now let's check with splines:
+```
+# Spline prevalence curves (mgcv): PC2 and PC4 → AD probability
+
+library(data.table)
+library(mgcv)
+
+dt <- as.data.table(pc_df[, .(person_id, PC2, PC4)])
+dt[, person_id := as.character(person_id)]
+dt[, y := as.integer(person_id %chin% unique(as.character(cases)))]
+dt <- dt[is.finite(PC2) & is.finite(PC4)]
+
+m2 <- gam(y ~ s(PC2, k = 9), data = dt, family = binomial())
+m4 <- gam(y ~ s(PC4, k = 9), data = dt, family = binomial())
+
+ilogit <- function(x) 1/(1 + exp(-x))
+
+g2 <- data.table(PC2 = seq(min(dt$PC2), max(dt$PC2), length.out = 200))
+p2 <- predict(m2, newdata = g2, type = "link", se.fit = TRUE)
+g2[, `:=`(prev = 100 * ilogit(p2$fit),
+          lo   = 100 * ilogit(p2$fit - 1.96 * p2$se.fit),
+          hi   = 100 * ilogit(p2$fit + 1.96 * p2$se.fit))]
+
+g4 <- data.table(PC4 = seq(min(dt$PC4), max(dt$PC4), length.out = 200))
+p4 <- predict(m4, newdata = g4, type = "link", se.fit = TRUE)
+g4[, `:=`(prev = 100 * ilogit(p4$fit),
+          lo   = 100 * ilogit(p4$fit - 1.96 * p4$se.fit),
+          hi   = 100 * ilogit(p4$fit + 1.96 * p4$se.fit))]
+
+plot(g2$PC2, g2$prev, type = "l", xlab = "PC2", ylab = "Alzheimer's prevalence (%)",
+     main = "Spline: PC2 vs prevalence")
+lines(g2$PC2, g2$lo, lty = 2); lines(g2$PC2, g2$hi, lty = 2)
+
+plot(g4$PC4, g4$prev, type = "l", xlab = "PC4", ylab = "Alzheimer's prevalence (%)",
+     main = "Spline: PC4 vs prevalence")
+lines(g4$PC4, g4$lo, lty = 2); lines(g4$PC4, g4$hi, lty = 2)
+```
+
+<img width="876" height="519" alt="image" src="https://github.com/user-attachments/assets/ee38a540-0bf8-4733-8636-284069adf64e" />
+
+<img width="876" height="519" alt="image" src="https://github.com/user-attachments/assets/0098ee1c-c815-4bfb-82aa-3dc79c1f32ec" />
+
+The non-linearity makes sense given the complex landscape of population structure proxied by PCs.
+
+
+
