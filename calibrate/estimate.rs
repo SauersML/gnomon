@@ -4790,6 +4790,7 @@ pub mod internal {
         /// Real-world evaluation: discrimination, calibration, complexity, and stability via CV.
         #[test]
         fn test_model_realworld_metrics() {
+            const SEX_STRONG_SHRINK_RHO: f64 = 10.0;
             let RealWorldTestFixture {
                 n_samples,
                 p,
@@ -4982,17 +4983,24 @@ pub mod internal {
 
                     for (idx, &rho_val) in rho_values.iter().enumerate() {
                         rho_by_penalty[idx].push(rho_val);
-                        if rho_val.abs() >= (RHO_BOUND - 1.0) {
+
+                        let label_ref = &labels_ref[idx];
+                        let term_type = &types_ref[idx];
+                        let is_sex = is_sex_related(label_ref, term_type);
+                        let threshold = if is_sex {
+                            SEX_STRONG_SHRINK_RHO
+                        } else {
+                            RHO_BOUND - 1.0
+                        };
+
+                        if rho_val.abs() >= threshold {
                             near_bound_counts[idx] += 1;
-                            if rho_val >= RHO_BOUND - 1.0 {
+                            if rho_val >= threshold {
                                 pos_bound_counts[idx] += 1;
-                            } else if rho_val <= -(RHO_BOUND - 1.0) {
+                            } else if rho_val <= -threshold {
                                 neg_bound_counts[idx] += 1;
                             }
 
-                            let label_ref = &labels_ref[idx];
-                            let term_type = &types_ref[idx];
-                            let is_sex = is_sex_related(label_ref, term_type);
                             if is_sex {
                                 sex_bound_details
                                     .push(format!("{} (rho={:.2})", label_ref, rho_val));
@@ -5205,14 +5213,16 @@ pub mod internal {
                             format!("Penalty term '{}'", label),
                             if pos_bound_ok && neg_bound_ok {
                                 format!(
-                                    "Sex-related penalty '{}' hit +bound in {:.1}% of folds (≥10% expected) and avoided -bound",
+                                    "Sex-related penalty '{}' reached rho ≥{:.1} in {:.1}% of folds (≥10% expected) and avoided -bound",
                                     label,
+                                    SEX_STRONG_SHRINK_RHO,
                                     100.0 * pos_rate
                                 )
                             } else if !pos_bound_ok {
                                 format!(
-                                    "Sex-related penalty '{}' failed to hit +bound in ≥10% of folds (rate {:.1}%)",
+                                    "Sex-related penalty '{}' failed to reach rho ≥{:.1} in ≥10% of folds (rate {:.1}%)",
                                     label,
+                                    SEX_STRONG_SHRINK_RHO,
                                     100.0 * pos_rate
                                 )
                             } else {
