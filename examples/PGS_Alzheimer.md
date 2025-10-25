@@ -27,6 +27,8 @@ Strong performers include:
 - PGS004898
 - PGS004227
 
+These also contain some scores for breast cancer, which I forgot to remove from a list from a previous analysis.
+
 We will use `gs://fc-aou-datasets-controlled/v8/microarray/plink/`, though it may have higher missingness compared to WGS.
 
 Install gnomon if you haven't already:
