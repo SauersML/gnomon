@@ -524,9 +524,6 @@ The AUROC is 0.64612, with an OR/SD of 1.647. The fraction at 2x+ risk is only 0
 
 
 Let's check accuracy within each inferred genetic ancestry group:
-```
-
-```
 
 <img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/4d29d084-db43-44c5-bdf0-bb3ca589b53d" />
 
