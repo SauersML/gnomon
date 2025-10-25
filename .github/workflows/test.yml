@@ -9,6 +9,8 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'shared/**'
+      - 'shared/**/*.rs'
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
@@ -21,6 +23,8 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'shared/**'
+      - 'shared/**/*.rs'
       - 'score/**'
       - 'score/tests/**'
       - 'calibrate/**'
@@ -53,9 +57,23 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '**/*.rs'
+            core:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'shared/**'
+              - 'shared/**/*.rs'
+            score:
+              - 'score/**'
+              - 'score/**/*.rs'
+              - 'score/tests/**'
             map:
+              - 'map/**'
               - 'map/**/*.rs'
               - 'map/*.rs'
+            calibrate:
+              - 'calibrate/**'
+              - 'calibrate/**/*.rs'
+              - 'calibrate/*.rs'
       # -----------------------------------------------------------------------
 
       - name: Install Rust nightly
@@ -104,9 +122,21 @@ jobs:
 
       - name: Run Rust unit tests
         id: test_step
-        if: steps.rust_changes.outputs.rust == 'true' && steps.rust_changes.outputs.map != 'true'
-        run: cargo +nightly test --release -- --show-output
+        if: steps.rust_changes.outputs.core == 'true'
+        run: >-
+          cargo +nightly test --release --
+          --show-output
+          --skip calibrate::
+          --skip map::
         continue-on-error: true
+
+      - name: Run score-specific tests
+        if: steps.rust_changes.outputs.score == 'true'
+        run: 'cargo +nightly test --release score:: -- --nocapture'
+
+      - name: Run calibrate-specific tests
+        if: steps.rust_changes.outputs.calibrate == 'true'
+        run: 'cargo +nightly test --release calibrate:: -- --nocapture'
 
       - name: Run map-specific tests
         if: steps.rust_changes.outputs.map == 'true'
