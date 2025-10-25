@@ -7751,14 +7751,29 @@ mod tests {
             max_abs_col_mean_uniform = max_abs_col_mean_uniform.max(mean.abs());
         }
 
-        // Calculate weighted column means for non-uniform case
-        let w_sum = weights.sum();
+        // Calculate weighted column means for non-uniform case using the same
+        // metric that the constraint enforces (Fisher weights × prior weights).
+        let constraint_weights = Array1::from_vec(
+            features_weighted
+                .fisher_weights
+                .iter()
+                .zip(
+                    spec_nonuniform
+                        .prior_weights
+                        .as_ref()
+                        .expect("non-uniform case must supply prior weights")
+                        .iter(),
+                )
+                .map(|(&fisher, &prior)| fisher * prior)
+                .collect(),
+        );
+        let w_sum = constraint_weights.sum();
         let mut max_abs_col_mean_nonuniform: f64 = 0.0;
         for j in 0..b_pred_nonuniform.ncols() {
             let col = b_pred_nonuniform.column(j);
             let weighted_mean = col
                 .iter()
-                .zip(weights.iter())
+                .zip(constraint_weights.iter())
                 .map(|(&x, &w)| x * w)
                 .sum::<f64>()
                 / w_sum;
@@ -7774,17 +7789,19 @@ mod tests {
             "STZ failed to zero weighted column means: max |mean| = {max_abs_col_mean_nonuniform:e}"
         );
 
-        // Highlight that the sum of coefficients is generally NOT zero (the test's incorrect assertion)
+        // Highlight that enforcing sum-to-zero on the design columns does not
+        // collapse the fitted spline coefficients onto the all-ones nullspace.
         let pred_coef_sum_uniform: f64 = beta_uniform.slice(s![pred_range_uniform]).sum();
         let pred_coef_sum_nonuniform: f64 = beta_nonuniform.slice(s![pred_range_nonuniform]).sum();
 
+        let coef_sum_tol = 1e-6;
         assert!(
-            pred_coef_sum_uniform.abs() > 1e-6,
-            "Sum-to-zero constraint should not force coefficients to sum to zero (uniform case)"
+            pred_coef_sum_uniform.abs() > coef_sum_tol,
+            "Sum-to-zero constraint should not force coefficients to sum to zero (uniform case); |sum| = {pred_coef_sum_uniform:e}"
         );
         assert!(
-            pred_coef_sum_nonuniform.abs() > 1e-6,
-            "Sum-to-zero constraint should not force coefficients to sum to zero (non-uniform case)"
+            pred_coef_sum_nonuniform.abs() > coef_sum_tol,
+            "Sum-to-zero constraint should not force coefficients to sum to zero (non-uniform case); |sum| = {pred_coef_sum_nonuniform:e}"
         );
     }
 }
