@@ -369,3 +369,38 @@ cat(sprintf(
 AUROC: 0.630836
 OR per SD of prediction: 1.439452
 
+Let's view Alzheimer's risk along PCs 2 and 4:
+```
+# PC2 / PC4 quantile bins (20 each) vs Alzheimer's prevalence
+
+library(data.table)
+
+dt <- as.data.table(pc_df[, .(person_id, PC2, PC4)])
+dt[, person_id := as.character(person_id)]
+dt[, y := as.integer(person_id %chin% unique(as.character(cases)))]
+
+qprev <- function(v, y, q = 20L) {
+  n <- sum(is.finite(v))
+  r <- frank(v, ties.method = "average", na.last = "keep")
+  b <- ceiling(r / (n / q))
+  b[b < 1L | b > q] <- NA_integer_
+  out <- data.table(bin = b, y = y)[!is.na(bin), .(prev = mean(y)), by = bin][order(bin)]
+  out[]
+}
+
+p2 <- qprev(dt$PC2, dt$y, q = 20L)
+p4 <- qprev(dt$PC4, dt$y, q = 20L)
+
+ylim <- c(0, 100 * max(c(p2$prev, p4$prev), na.rm = TRUE))
+
+plot(p2$bin, 100 * p2$prev, type = "o", xlab = "PC2 quantile (1 = low)",
+     ylab = "Alzheimer's prevalence (%)", main = "PC2 vs AD prevalence", ylim = ylim)
+plot(p4$bin, 100 * p4$prev, type = "o", xlab = "PC4 quantile (1 = low)",
+     ylab = "Alzheimer's prevalence (%)", main = "PC4 vs AD prevalence", ylim = ylim)
+```
+
+<img width="810" height="519" alt="image" src="https://github.com/user-attachments/assets/2b9d6dc6-40d9-4173-b0a7-38c50ba194d6" />
+
+<img width="810" height="519" alt="image" src="https://github.com/user-attachments/assets/9a30edc4-7b20-4f55-beae-00172105575a" />
+
+
