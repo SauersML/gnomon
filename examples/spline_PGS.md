@@ -489,3 +489,4 @@ lines(g4$PC4, g4$lo, lty = 2); lines(g4$PC4, g4$hi, lty = 2)
 <img width="876" height="519" alt="image" src="https://github.com/user-attachments/assets/61fcbfe4-9ecf-4403-8a6b-3832ad3cd516" />
 
 
+REML is similar but not exactly the same as the default, GCV.
