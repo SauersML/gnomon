@@ -724,22 +724,13 @@ pub fn build_calibrator_design(
     let weight_opt = spec.prior_weights.as_ref();
     // Orthogonality is enforced in the same metric used for fitting: base PIRLS Fisher
     // curvature combined with any explicit training weights supplied to the calibrator.
-    let constraint_weights_raw = if let Some(w) = spec.prior_weights.as_ref() {
-        features
-            .fisher_weights
-            .iter()
-            .zip(w.iter())
-            .map(|(&f, &p)| {
-                if f.is_finite() && p.is_finite() {
-                    f * p
-                } else {
-                    0.0
-                }
-            })
-            .collect::<Array1<f64>>()
-    } else {
-        features.fisher_weights.clone()
-    };
+    // The PIRLS loop already multiplies the Fisher curvature by any prior weights
+    // supplied to the calibrator when it assembles `features.fisher_weights`.
+    // Re-multiplying by `prior_weights` here would double-count that scaling, so
+    // we use the final weights directly (after zeroing any non-finite entries).
+    let constraint_weights_raw = features
+        .fisher_weights
+        .mapv(|f| if f.is_finite() && f > 0.0 { f } else { 0.0 });
     let constraint_weights = normalized_constraint_weights(&constraint_weights_raw);
     let ones = Array1::<f64>::ones(n);
     // The spline basis must be built on the same predictor channel that will be
@@ -7751,22 +7742,9 @@ mod tests {
             max_abs_col_mean_uniform = max_abs_col_mean_uniform.max(mean.abs());
         }
 
-        // Calculate weighted column means for non-uniform case using the same
-        // metric that the constraint enforces (Fisher weights × prior weights).
-        let constraint_weights = Array1::from_vec(
-            features_weighted
-                .fisher_weights
-                .iter()
-                .zip(
-                    spec_nonuniform
-                        .prior_weights
-                        .as_ref()
-                        .expect("non-uniform case must supply prior weights")
-                        .iter(),
-                )
-                .map(|(&fisher, &prior)| fisher * prior)
-                .collect(),
-        );
+        // Calculate weighted column means for the non-uniform case using the
+        // same metric that the constraint enforces (the final PIRLS weights).
+        let constraint_weights = features_weighted.fisher_weights.clone();
         let w_sum = constraint_weights.sum();
         let mut max_abs_col_mean_nonuniform: f64 = 0.0;
         for j in 0..b_pred_nonuniform.ncols() {
