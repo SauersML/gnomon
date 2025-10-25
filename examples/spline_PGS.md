@@ -449,4 +449,43 @@ lines(g4$PC4, g4$lo, lty = 2); lines(g4$PC4, g4$hi, lty = 2)
 The non-linearity makes sense given the complex landscape of population structure proxied by PCs.
 
 
+Let's check if using REML makes any difference:
+```
+# Spline prevalence curves with REML: PC2 and PC4 → AD probability
+
+library(data.table)
+library(mgcv)
+
+dt <- as.data.table(pc_df[, .(person_id, PC2, PC4)])
+dt[, person_id := as.character(person_id)]
+dt[, y := as.integer(person_id %chin% unique(as.character(cases)))]
+dt <- dt[is.finite(PC2) & is.finite(PC4)]
+
+m2 <- gam(y ~ s(PC2, k = 9), data = dt, family = binomial(), method = "REML")
+m4 <- gam(y ~ s(PC4, k = 9), data = dt, family = binomial(), method = "REML")
+
+g2 <- data.table(PC2 = seq(min(dt$PC2), max(dt$PC2), length.out = 200))
+p2 <- predict(m2, newdata = g2, type = "link", se.fit = TRUE)
+g2[, `:=`(prev = 100 * plogis(p2$fit),
+          lo   = 100 * plogis(p2$fit - 1.96 * p2$se.fit),
+          hi   = 100 * plogis(p2$fit + 1.96 * p2$se.fit))]
+
+g4 <- data.table(PC4 = seq(min(dt$PC4), max(dt$PC4), length.out = 200))
+p4 <- predict(m4, newdata = g4, type = "link", se.fit = TRUE)
+g4[, `:=`(prev = 100 * plogis(p4$fit),
+          lo   = 100 * plogis(p4$fit - 1.96 * p4$se.fit),
+          hi   = 100 * plogis(p4$fit + 1.96 * p4$se.fit))]
+
+plot(g2$PC2, g2$prev, type = "l", xlab = "PC2", ylab = "Alzheimer's prevalence (%)",
+     main = "Spline (REML): PC2 vs prevalence")
+lines(g2$PC2, g2$lo, lty = 2); lines(g2$PC2, g2$hi, lty = 2)
+
+plot(g4$PC4, g4$prev, type = "l", xlab = "PC4", ylab = "Alzheimer's prevalence (%)",
+     main = "Spline (REML): PC4 vs prevalence")
+lines(g4$PC4, g4$lo, lty = 2); lines(g4$PC4, g4$hi, lty = 2)
+```
+
+<img width="876" height="519" alt="image" src="https://github.com/user-attachments/assets/62cb1ee0-8c9b-48cb-be3e-196898767d03" />
+<img width="876" height="519" alt="image" src="https://github.com/user-attachments/assets/61fcbfe4-9ecf-4403-8a6b-3832ad3cd516" />
+
 
