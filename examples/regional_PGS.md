@@ -128,3 +128,11 @@ These extra scores should complete in under 10 seconds:
 ```
 ./gnomon/target/release/gnomon score "PGS004146 | chr17:45535159-46342045, PGS004898 | chr17:45535159-46342045, PGS000007 | chr17:45535159-46342045, PGS000317 | chr17:45535159-46342045, PGS005198 | chr17:45535159-46342045, PGS004378 | chr17:45535159-46342045, PGS003957 | chr17:45535159-46342045, PGS003334 | chr17:45535159-46342045, PGS004589 | chr17:45535159-46342045, PGS004229 | chr17:45535159-46342045, PGS000335 | chr17:45535159-46342045, PGS000015 | chr17:45535159-46342045, PGS000508 | chr17:45535159-46342045, PGS000344 | chr17:45535159-46342045, PGS000507 | chr17:45535159-46342045, PGS004869 | chr17:45535159-46342045" arrays
 ```
+
+<img width="1011" height="2731" alt="image" src="https://github.com/user-attachments/assets/e418ce20-45e2-424c-9e11-9da3d54b5df3" />
+
+Low missingness.
+
+Let's check which have variance:
+
+<img width="1011" height="2571" alt="image" src="https://github.com/user-attachments/assets/529d3046-fef4-4920-90e8-c583942ee75d" />
