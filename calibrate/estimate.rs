@@ -1944,6 +1944,12 @@ pub mod internal {
                 } else {
                     log::debug!("{grad_msg}");
                 }
+            } else if !diag.iterations.is_empty() {
+                log::debug!(
+                    "P-IRLS final gradient norm unavailable; status={:?} iter_count={}",
+                    pr.status,
+                    diag.iterations.len()
+                );
             }
 
             if !diag.notes.is_empty() {
