@@ -103,4 +103,4 @@ plt.show()
 
 <img width="1011" height="971" alt="image" src="https://github.com/user-attachments/assets/8dff839d-a9c1-4494-9e14-b8644b810c57" />
 
-We can see the scores with no overlap in the region are simply all zero.
+We can see the scores with no overlap in the region are simply all zero. We need one extra score for Alzheimer's disease and two extra scores for breast cancer.
