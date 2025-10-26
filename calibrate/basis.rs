@@ -687,13 +687,20 @@ mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{array, Array1};
 
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This implements the Cox-de Boor algorithm using recursion, following the
     /// canonical definition from De Boor's "A Practical Guide to Splines" (2001).
     /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
+        let last_knot = *knots.last().expect("knot vector should be non-empty");
+        let last_basis_index = knots.len() - degree - 2;
+
+        if (x - last_knot).abs() < 1e-12 {
+            return if i == last_basis_index { 1.0 } else { 0.0 };
+        }
+
         // Base case for degree 0
         if degree == 0 {
             // A degree-0 B-spline B_{i,0}(x) is an indicator function for the knot interval [knots[i], knots[i+1]).
@@ -1013,155 +1020,67 @@ mod tests {
 
     #[test]
     fn test_degree_0_boundary_behavior() {
-        let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        let knots: Array1<f64> = array![0.0, 0.0, 1.0, 2.0, 2.0];
         let x = 2.0;
 
-        println!("Testing degree-0 basis functions at x=2:");
-        println!("Knots: {:?}", knots);
-        println!();
+        const EPS: f64 = 1e-12;
 
-        // Test each possible degree-0 basis function
         for i in 0..(knots.len() - 1) {
-            let value = evaluate_bspline(x, &knots, i, 0);
-            println!(
-                "B_{},0 at x=2: {} (interval [{}, {}))",
-                i,
-                value,
-                knots[i],
-                knots[i + 1]
-            );
-
-            // Manual check
-            let x_clamped = x.clamp(knots[0], knots[knots.len() - 1]);
-            let in_interval = x_clamped >= knots[i] && x_clamped < knots[i + 1];
-            let is_last_interval = i == knots.len() - 2;
-            let at_upper_boundary = x_clamped == knots[i + 1];
-
-            println!(
-                "  x_clamped={}, in_interval={}, is_last_interval={}, at_upper_boundary={}",
-                x_clamped, in_interval, is_last_interval, at_upper_boundary
-            );
-
-            if (knots[i + 1] - knots[i]).abs() < 1e-12 {
-                println!("  Zero-length interval, should return 0");
-            } else if in_interval {
-                println!("  In interval, should return 1");
-            } else if is_last_interval && at_upper_boundary {
-                println!("  Last interval + upper boundary, should return 1");
+            let interval_width = knots[i + 1] - knots[i];
+            let expected = if interval_width.abs() < EPS {
+                if i == knots.len() - 2 && (x - knots[i + 1]).abs() < EPS {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else if x >= knots[i] && x < knots[i + 1] {
+                1.0
+            } else if i == knots.len() - 2 && (x - knots[i + 1]).abs() < EPS {
+                1.0
             } else {
-                println!("  Outside, should return 0");
-            }
-            println!();
+                0.0
+            };
+
+            let value = evaluate_bspline(x, &knots, i, 0);
+            assert_abs_diff_eq!(value, expected, epsilon = 1e-12);
         }
     }
 
     #[test]
     fn test_boundary_analysis() {
         // Test case from the failing test: knots [0, 0, 1, 2, 2], degree 1, x=2
-        let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
+        let knots: Array1<f64> = array![0.0, 0.0, 1.0, 2.0, 2.0];
         let degree = 1;
         let x = 2.0;
 
-        println!("Testing knots: {:?}", knots);
-        println!("Degree: {}", degree);
-        println!("Point: x = {}", x);
-        println!();
-
-        // The number of basis functions for this case
         let num_basis = knots.len() - degree - 1;
-        println!("Number of basis functions: {}", num_basis);
-
-        // Test each basis function individually with recursive implementation
-        for i in 0..num_basis {
-            let value = evaluate_bspline(x, &knots, i, degree);
-            println!("Recursive B_{},{} at x={}: {}", i, degree, x, value);
-
-            // Also test degree 0 components to understand boundary handling
-            if degree == 1 {
-                let b_i_0 = evaluate_bspline(x, &knots, i, 0);
-                let b_i1_0 = if i + 1 < knots.len() - 1 {
-                    evaluate_bspline(x, &knots, i + 1, 0)
-                } else {
-                    0.0
-                };
-                println!(
-                    "  Components: B_{},0={}, B_{},0={}",
-                    i,
-                    b_i_0,
-                    i + 1,
-                    b_i1_0
-                );
-            }
-        }
-
-        // Test with iterative implementation
         let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
-        println!();
-        println!("Iterative implementation:");
-        for i in 0..num_basis {
-            println!(
-                "Iterative B_{},{} at x={}: {}",
-                i, degree, x, iterative_basis[i]
-            );
+
+        let recursive_values: Vec<f64> = (0..num_basis)
+            .map(|i| evaluate_bspline(x, &knots, i, degree))
+            .collect();
+        let expected = vec![0.0, 0.0, 1.0];
+
+        assert_eq!(
+            recursive_values.len(),
+            expected.len(),
+            "Recursive evaluation length mismatch"
+        );
+
+        for (i, (&recursive, &expected_value)) in recursive_values
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert_abs_diff_eq!(recursive, expected_value, epsilon = 1e-12);
+            assert_abs_diff_eq!(iterative_basis[i], expected_value, epsilon = 1e-12);
         }
 
-        // Check sum
-        let recursive_sum: f64 = (0..num_basis)
-            .map(|i| evaluate_bspline(x, &knots, i, degree))
-            .sum();
+        let recursive_sum: f64 = recursive_values.iter().sum();
         let iterative_sum = iterative_basis.sum();
-        println!();
-        println!("Recursive sum: {}", recursive_sum);
-        println!("Iterative sum: {}", iterative_sum);
 
-        // Test the specific failing case: basis function 2 at x=2
-        println!();
-        println!("Specific failing case:");
-        println!(
-            "Recursive B_{},{} at x={}: {}",
-            2,
-            degree,
-            x,
-            evaluate_bspline(x, &knots, 2, degree)
-        );
-        println!(
-            "Iterative B_{},{} at x={}: {}",
-            2, degree, x, iterative_basis[2]
-        );
-
-        // Let's manually trace the recursion for B_2,1(x=2)
-        println!();
-        println!("Manual trace of B_2,1(x=2):");
-        println!("B_2,1(x) = (x - t_2)/(t_3 - t_2) * B_2,0(x) + (t_4 - x)/(t_4 - t_3) * B_3,0(x)");
-        println!("t_2 = {}, t_3 = {}, t_4 = {}", knots[2], knots[3], knots[4]);
-
-        let b20 = evaluate_bspline(x, &knots, 2, 0);
-        let b30 = evaluate_bspline(x, &knots, 3, 0);
-
-        println!("B_2,0(x=2) = {}", b20);
-        println!("B_3,0(x=2) = {}", b30);
-
-        let term1 = if (knots[3] - knots[2]).abs() > 1e-10 {
-            (x - knots[2]) / (knots[3] - knots[2]) * b20
-        } else {
-            0.0
-        };
-
-        let term2 = if (knots[4] - knots[3]).abs() > 1e-10 {
-            (knots[4] - x) / (knots[4] - knots[3]) * b30
-        } else {
-            0.0
-        };
-
-        println!(
-            "Term 1: ({} - {}) / ({} - {}) * {} = {}",
-            x, knots[2], knots[3], knots[2], b20, term1
-        );
-        println!(
-            "Term 2: ({} - {}) / ({} - {}) * {} = {}",
-            knots[4], x, knots[4], knots[3], b30, term2
-        );
-        println!("Total: {} + {} = {}", term1, term2, term1 + term2);
+        assert_abs_diff_eq!(recursive_sum, 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(iterative_sum, 1.0, epsilon = 1e-12);
     }
 
     /// Validates the basis functions against Example 1 in Starkey's "Cox-deBoor" notes.
