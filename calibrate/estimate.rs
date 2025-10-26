@@ -734,7 +734,9 @@ pub fn train_model(
         pc_null_transforms,
         interaction_centering_means,
         interaction_orth_alpha,
+        penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
+    drop(penalty_structs);
     log_layout_info(&layout);
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -4831,7 +4833,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -4941,7 +4943,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -5131,9 +5133,10 @@ pub mod internal {
                     );
 
                     // Complexity: edf and Hessian min-eig by refitting at chosen lambdas on training X
-                    let (x_tr, s_list, layout, _, _, _, _, _, _) =
+                    let (x_tr, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                         build_design_and_penalty_matrices(&data_train, &trained.config)
                             .expect("layout");
+                    drop(penalty_structs);
 
                     if penalty_labels.is_none() {
                         let (labels, types) = assign_penalty_labels(&layout);
@@ -6196,8 +6199,9 @@ pub mod internal {
             };
 
             // --- Build model structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             assert!(
                 layout.num_penalties > 0,
@@ -6210,9 +6214,9 @@ pub mod internal {
             // a massive factor to ensure they have an actual smoothing effect that's
             // measurable in the final cost function.
             // Reduced from 1e9 to avoid numerical brittleness, while still ensuring the penalty is dominant.
-            let penalty_scale_factor = 10_000.0;
+            let penalty_scale_factor: f64 = 10_000.0;
             for s in s_list.iter_mut() {
-                s.mapv_inplace(|x| x * penalty_scale_factor);
+                s.mapv_inplace(|x: f64| x * penalty_scale_factor);
             }
 
             // --- Identify the penalty indices corresponding to the main effects of PC1 and PC2 ---
@@ -6538,8 +6542,9 @@ pub mod internal {
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             // Try with very large lambda values (exp(10) ~ 22000)
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
@@ -6673,8 +6678,9 @@ pub mod internal {
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             let reml_state = internal::RemlState::new(
                 data.y.view(),
@@ -7093,9 +7099,10 @@ pub mod internal {
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, constraints, _, _, _, _, _, penalty_structs) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
+            drop(penalty_structs);
 
             // In the pure pre-centering approach, the PC basis is constrained first.
             // Let's examine if the columns approximately sum to zero, but don't enforce it
@@ -7126,7 +7133,7 @@ pub mod internal {
             for (key, constraint) in constraints.iter() {
                 if key.starts_with("INT_P") {
                     // Check that the constraint is an identity matrix
-                    let z = constraint;
+                    let z: &Array2<f64> = constraint;
                     assert_eq!(
                         z.nrows(),
                         z.ncols(),
@@ -7174,7 +7181,7 @@ pub mod internal {
                         penalty_matrix.slice(s![block.col_range.clone(), block.col_range.clone()]);
 
                     // The block diagonal should have some non-zero elements (penalty structure)
-                    let block_sum = block_submatrix.iter().map(|&x| x.abs()).sum::<f64>();
+                    let block_sum: f64 = block_submatrix.iter().map(|&x: &f64| x.abs()).sum();
                     assert!(
                         block_sum > 1e-10,
                         "Interaction penalty block should have non-zero penalty structure"
@@ -7240,7 +7247,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // Stage: Build guaranteed-consistent structures for this simple model
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -7383,7 +7390,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // Stage: Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -7582,7 +7589,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -7749,7 +7756,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -7871,7 +7878,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -8067,7 +8074,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -8275,8 +8282,9 @@ mod optimizer_progress_tests {
         };
 
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config)?;
+        drop(penalty_structs);
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -8546,7 +8554,7 @@ mod gradient_validation_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
-        let (x, s_list, layout, _, _, _, _, _, _) =
+        let (x, s_list, layout, _, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).expect("matrix build");
         assert!(
             layout.num_penalties > 0,

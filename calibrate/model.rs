@@ -1504,6 +1504,7 @@ mod tests {
             pc_null_transforms,
             interaction_centering_means,
             interaction_orth_alpha,
+            _,
         ) = crate::calibrate::construction::build_design_and_penalty_matrices(
             &dummy_data,
             &model_config,

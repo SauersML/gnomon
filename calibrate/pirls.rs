@@ -2785,8 +2785,9 @@ mod tests {
         data: &TrainingData,
         config: &ModelConfig,
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(data, config)?;
+        drop(penalty_structs);
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
     }
