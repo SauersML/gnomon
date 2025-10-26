@@ -8,6 +8,7 @@ use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 fn max_abs_element(matrix: &Array2<f64>) -> f64 {
     matrix
@@ -276,6 +277,30 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
             }
         });
     result
+}
+
+struct DifferencePenaltyCache {
+    cache: HashMap<(usize, usize), Arc<Array2<f64>>>,
+}
+
+impl DifferencePenaltyCache {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, ncols: usize, order: usize) -> Result<Arc<Array2<f64>>, EstimationError> {
+        if !self.cache.contains_key(&(ncols, order)) {
+            let penalty = create_difference_penalty_matrix(ncols, order)?;
+            self.cache.insert((ncols, order), Arc::new(penalty));
+        }
+        Ok(self
+            .cache
+            .get(&(ncols, order))
+            .expect("penalty cache missing freshly inserted key")
+            .clone())
+    }
 }
 
 /// Holds the layout of the design matrix `X` and penalty matrices `S_i`.
@@ -666,6 +691,7 @@ pub fn build_design_and_penalty_matrices(
     let mut pc_null_projectors: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut interaction_centering_means = HashMap::new();
     let mut interaction_orth_alpha: HashMap<String, Array2<f64>> = HashMap::new();
+    let mut diff_penalty_cache = DifferencePenaltyCache::new();
 
     // Reserve capacities to avoid rehashing/reallocation
     // +1 for PGS entries where applicable
@@ -694,13 +720,21 @@ pub fn build_design_and_penalty_matrices(
         basis::apply_sum_to_zero_constraint(pgs_main_basis_unc.view(), Some(data.weights.view()))?;
 
     // Create whitened range transform for PGS (used if switching to whitened interactions)
-    let s_pgs_main =
-        create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
+    let s_pgs_main = diff_penalty_cache.get(pgs_main_basis_unc.ncols(), config.penalty_order)?;
+    let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(s_pgs_main.as_ref())?;
     let pgs_null_projector = z_null_pgs.dot(&z_null_pgs.t());
 
+    let pgs_isotropic_interaction_basis = if matches!(
+        config.interaction_penalty,
+        InteractionPenaltyKind::Isotropic
+    ) {
+        Some(pgs_main_basis_unc.dot(&z_range_pgs))
+    } else {
+        None
+    };
+
     // Store PGS range transformation for interactions and potential future penalized PGS
-    range_transforms.insert("pgs".to_string(), z_range_pgs);
+    range_transforms.insert("pgs".to_string(), z_range_pgs.clone());
 
     // Save the PGS sum-to-zero constraint transformation
     sum_to_zero_constraints.insert("pgs_main".to_string(), pgs_z_transform.clone());
@@ -734,9 +768,8 @@ pub fn build_design_and_penalty_matrices(
         pc_unconstrained_bases_main.push(pc_main_basis_unc.to_owned());
 
         // Create whitened range transform for PC main effects
-        let s_pc_main =
-            create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_main)?;
+        let s_pc_main = diff_penalty_cache.get(pc_main_basis_unc.ncols(), config.penalty_order)?;
+        let (z_null_pc, z_range_pc) = basis::null_range_whiten(s_pc_main.as_ref())?;
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
@@ -826,7 +859,9 @@ pub fn build_design_and_penalty_matrices(
     }
 
     // Precompute the wiggle penalty component for the sex×PGS interaction
-    let s_sex_pgs_wiggle = pgs_z_transform.t().dot(&s_pgs_main.dot(&pgs_z_transform));
+    let s_sex_pgs_wiggle = pgs_z_transform
+        .t()
+        .dot(&s_pgs_main.as_ref().dot(&pgs_z_transform));
 
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
@@ -860,10 +895,7 @@ pub fn build_design_and_penalty_matrices(
         InteractionPenaltyKind::Anisotropic
     ) && pgs_int_ncols > 0
     {
-        Some(create_difference_penalty_matrix(
-            pgs_int_ncols,
-            config.penalty_order,
-        )?)
+        Some(diff_penalty_cache.get(pgs_int_ncols, config.penalty_order)?)
     } else {
         None
     };
@@ -918,11 +950,12 @@ pub fn build_design_and_penalty_matrices(
 
                 let s_pgs = s_pgs_interaction
                     .as_ref()
-                    .expect("PGS penalty matrix missing in anisotropic mode");
+                    .expect("PGS penalty matrix missing in anisotropic mode")
+                    .as_ref();
                 let i_pgs = i_pgs_interaction
                     .as_ref()
                     .expect("PGS identity matrix missing in anisotropic mode");
-                let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)?;
+                let s_pc = diff_penalty_cache.get(pc_cols, config.penalty_order)?;
                 let i_pc = Array2::<f64>::eye(pc_cols);
 
                 let pc_null_projector = pc_null_projectors[pc_idx]
@@ -935,7 +968,7 @@ pub fn build_design_and_penalty_matrices(
                     })?;
 
                 let nf1 = (frobenius_norm(s_pgs) * (pc_cols as f64).sqrt()).max(1e-12);
-                let nf2 = (frobenius_norm(&s_pc) * (pgs_cols as f64).sqrt()).max(1e-12);
+                let nf2 = (frobenius_norm(s_pc.as_ref()) * (pgs_cols as f64).sqrt()).max(1e-12);
                 let nf3_raw =
                     frobenius_norm(&pgs_null_projector) * frobenius_norm(pc_null_projector);
                 if nf3_raw <= 1e-12 {
@@ -959,7 +992,7 @@ pub fn build_design_and_penalty_matrices(
                 write_scaled_kronecker(
                     s_list[penalty_idx_pc].slice_mut(s![col_range.clone(), col_range.clone()]),
                     i_pgs,
-                    &s_pc,
+                    s_pc.as_ref(),
                     1.0 / nf2,
                 );
                 write_scaled_kronecker(
@@ -1152,18 +1185,6 @@ pub fn build_design_and_penalty_matrices(
 
     // Stage: Populate tensor product interaction effects.
     if !layout.interaction_block_idx.is_empty() {
-        let pgs_int_basis_iso = if matches!(
-            config.interaction_penalty,
-            InteractionPenaltyKind::Isotropic
-        ) {
-            let z_range_pgs = range_transforms.get("pgs").ok_or_else(|| {
-                EstimationError::LayoutError("Missing 'pgs' in range_transforms".to_string())
-            })?;
-            Some(pgs_main_basis_unc.dot(z_range_pgs))
-        } else {
-            None
-        };
-
         for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
             if pc_idx >= layout.interaction_block_idx.len() {
                 break;
@@ -1174,19 +1195,14 @@ pub fn build_design_and_penalty_matrices(
 
             let tensor_interaction = match config.interaction_penalty {
                 InteractionPenaltyKind::Isotropic => {
-                    let pgs_int_basis = pgs_int_basis_iso.as_ref().ok_or_else(|| {
-                        EstimationError::LayoutError(
-                            "PGS interaction basis missing in isotropic mode".to_string(),
-                        )
-                    })?;
-                    let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
-                        EstimationError::LayoutError(format!(
-                            "Missing '{}' in range_transforms",
-                            pc_name
-                        ))
-                    })?;
-                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
-                    row_wise_tensor_product(pgs_int_basis, &pc_int_basis)
+                    let pgs_int_basis =
+                        pgs_isotropic_interaction_basis.as_ref().ok_or_else(|| {
+                            EstimationError::LayoutError(
+                                "PGS interaction basis missing in isotropic mode".to_string(),
+                            )
+                        })?;
+                    let pc_int_basis = &pc_range_bases[pc_idx];
+                    row_wise_tensor_product(pgs_int_basis, pc_int_basis)
                 }
                 InteractionPenaltyKind::Anisotropic => {
                     let pgs_int_basis = &pgs_main_basis_unc;
