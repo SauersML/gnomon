@@ -245,7 +245,7 @@ pub fn compute_alo_features(
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
-    let z = base.solve_working_response.clone();
+    let z = &base.solve_working_response;
 
     let mut diag_counter = 0;
     let max_diag_samples = 5;
@@ -3089,7 +3089,7 @@ mod tests {
         let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
         let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
-        let z = full_fit.solve_working_response.clone();
+        let z = &full_fit.solve_working_response;
         let phi = 1.0_f64;
 
         let mut loo_pred = Array1::<f64>::zeros(n);
@@ -3241,7 +3241,7 @@ mod tests {
 
         let beta_full = beta_in_original_basis(&full_fit);
         let eta_full = x.dot(&beta_full);
-        let z_full = full_fit.solve_working_response.clone();
+        let z_full = &full_fit.solve_working_response;
         let max_working_jump = z_full
             .iter()
             .zip(eta_full.iter())
