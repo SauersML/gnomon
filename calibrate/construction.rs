@@ -1,7 +1,7 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
 use ndarray::parallel::prelude::*;
@@ -1608,7 +1608,7 @@ pub fn stable_reparameterization(
     let mut s_balanced = Array2::zeros((p, p));
     let mut has_nonzero = false;
     for s_k in &s_original_list {
-        let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        let frob_norm = FaerArrayView::new(s_k).as_ref().norm_l2();
         if frob_norm > 1e-12 {
             s_balanced.scaled_add(1.0 / frob_norm, s_k);
             has_nonzero = true;
