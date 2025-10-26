@@ -1,7 +1,5 @@
 ## Running a polygenic score for obesity on the _All of Us_ cohort
 
-Cognitive decline has a heterogeneous etiology, and may be related to Alzheimer's disease, dementia, or other genetic and environmental causes. This is complicated by the age of individuals in the biobank.
-
 Let's view the polygenic score catalog for obesity:
 [https://www.pgscatalog.org/trait/MONDO_0001627/
 ](https://www.pgscatalog.org/trait/EFO_0001073/)
