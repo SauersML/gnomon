@@ -1705,13 +1705,16 @@ where
         let block_len = self.n_samples * self.block_capacity;
         let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
         // SAFETY: `buf0_uninit` was allocated with capacity `block_len` and lives
-        // for the entire scope of `apply`. We immediately treat it as
-        // initialized because the buffer is filled before being read.
+        // for the entire scope of `apply`. We immediately coerce it to
+        // `&mut [f64]` so it can be passed to `VariantBlockSource::next_block_into`,
+        // which writes the first `n_samples * filled` entries before we read
+        // them. Any remaining slots stay uninitialized but are never observed.
         let buf0 = unsafe {
             std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len)
         };
         let (buf1_uninit, stack) = stack.make_uninit::<f64>(block_len);
-        // SAFETY: Same reasoning as above for `buf0`.
+        // SAFETY: Same reasoning as above for `buf0`; the buffer lives long
+        // enough and only the initialized prefix is observed.
         let buf1 = unsafe {
             std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len)
         };
@@ -1723,8 +1726,12 @@ where
         ];
 
         let (mut proj_uninit, _) =
-            // SAFETY: The scratch matrix is fully initialized before any reads
-            // via `as_mat_mut` occur, and it is bounded by the provided stack.
+            // SAFETY: `temp_mat_uninit` returns an uninitialized matrix view that
+            // must not be read before being written. We only use it as the
+            // destination of GEMM calls with `Accum::Replace`, which overwrite
+            // every element touched. The stack capacity was sized by
+            // `apply_scratch`, so the backing storage stays live for the entire
+            // duration of `apply`.
             unsafe { temp_mat_uninit::<f64, _, _>(self.block_capacity, rhs.ncols(), stack) };
         let mut proj_storage = proj_uninit.as_mat_mut();
 
@@ -1772,8 +1779,10 @@ where
                 while let Ok(id) = free_receiver.recv() {
                     // SAFETY: The raw pointer originated from a mutable slice
                     // in `buffer_slices` and remains valid until the scoped
-                    // thread exits. Each `id` is unique, so no aliasing
-                    // occurs when reconstructing the slice.
+                    // thread exits. Channel ownership ensures each `id`
+                    // corresponds to a single borrower, so the reconstructed
+                    // slice is never aliased. Only the prefix written by
+                    // `next_block_into` is observed after this call.
                     let buffer_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                     };
@@ -1821,9 +1830,10 @@ where
 
                         // SAFETY: `buffer_ptrs_compute[id]` points to the same
                         // uniquely-owned buffer handed to the prefetch thread.
-                        // The scoped threads guarantee the memory outlives this
-                        // use and channel coordination prevents concurrent
-                        // access.
+                        // Scoped threads guarantee the memory outlives this use,
+                        // channel coordination prevents concurrent access, and we
+                        // restrict all reads to the portion initialized by the
+                        // source.
                         let block_slice = unsafe {
                             std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                         };
@@ -2149,13 +2159,15 @@ where
     let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
     let buf0 =
         // SAFETY: `buf0_uninit` owns `block_len` contiguous `f64`s that live for
-        // the duration of this function. We only treat it as initialized once we
-        // populate it with data from the source.
+        // the duration of this function. We immediately coerce it to
+        // `&mut [f64]` so `VariantBlockSource::next_block_into` can stream data
+        // into the prefix `n_samples * filled`. That prefix is fully written
+        // before being read; any trailing capacity remains untouched.
         unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
     let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
     let buf1 =
         // SAFETY: Mirroring the reasoning for `buf0`, the allocation stays alive
-        // and is initialized before any reads.
+        // for the entire call and only the written prefix is ever read.
         unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
     let mut buffer_slices = [buf0, buf1];
     let [first_slice, second_slice] = &mut buffer_slices;
@@ -2210,7 +2222,9 @@ where
             while let Ok(id) = free_receiver.recv() {
                 // SAFETY: The pointer was derived from a uniquely-owned slice
                 // stored in `buffer_slices` and the scoped threads ensure the
-                // backing storage outlives this reconstruction.
+                // backing storage outlives this reconstruction. Channel
+                // ownership gives each `id` a single borrower, and we only
+                // consume the prefix populated by `next_block_into`.
                 let buffer_slice = unsafe {
                     std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                 };
@@ -2287,9 +2301,10 @@ where
                     }
 
                     // SAFETY: Each `id` corresponds to a single buffer whose
-                    // ownership is passed through the channel. The pointer remains
-                    // valid and uniquely borrowed until we send `id` back on the
-                    // free list.
+                    // ownership is passed through the channel. The pointer
+                    // remains valid and uniquely borrowed until we send `id`
+                    // back on the free list, and all reads stay within the
+                    // initialized prefix.
                     let block_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                     };
@@ -3392,12 +3407,14 @@ where
     let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
     let buf0 =
         // SAFETY: `buf0_uninit` was allocated with exactly `block_len` elements
-        // and lives until the end of this function. We initialize it before any
-        // reads take place.
+        // and lives until the end of this function. We convert it to `&mut [f64]`
+        // solely to let `VariantBlockSource::next_block_into` fill the
+        // `n_samples * filled` prefix before it is observed.
         unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
     let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
     let buf1 =
-        // SAFETY: Identical justification as for `buf0`.
+        // SAFETY: Identical justification as for `buf0`; only the filled prefix
+        // is ever accessed after writing.
         unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
     let mut buffer_slices = [buf0, buf1];
     let [first_slice, second_slice] = &mut buffer_slices;
@@ -3442,7 +3459,9 @@ where
             while let Ok(id) = free_receiver.recv() {
                 // SAFETY: Each pointer came from a mutable slice backed by the
                 // stack allocation above and remains valid throughout the
-                // scoped thread. Distinct `id`s ensure no concurrent aliasing.
+                // scoped thread. Distinct `id`s ensure no concurrent aliasing,
+                // and we only consume the portion that `next_block_into`
+                // initialized.
                 let buffer_slice = unsafe {
                     std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                 };
@@ -3496,7 +3515,8 @@ where
                     // SAFETY: The pointer corresponds to a unique buffer owned
                     // by this worker. It stays valid until the `id` is returned
                     // via `free_sender`, preventing simultaneous mutable
-                    // borrows.
+                    // borrows, and we only touch the prefix filled with new
+                    // samples.
                     let block_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                     };
