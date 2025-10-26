@@ -241,22 +241,7 @@ pub fn compute_alo_features(
     };
 
     // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
-    let ut_f = FaerMat::<f64>::from_fn(p, n, |i, j| ut[[i, j]]);
-    let s_all = factor.solve(ut_f.as_ref());
     let xtwx_f = FaerMat::<f64>::from_fn(p, p, |i, j| xtwx[[i, j]]);
-    let mut t_all = FaerMat::<f64>::zeros(p, n);
-    matmul(
-        t_all.as_mut(),
-        Accum::Replace,
-        xtwx_f.as_ref(),
-        s_all.as_ref(),
-        1.0,
-        Par::Seq,
-    );
-
-    let s_array = Array2::from_shape_fn((p, n), |(i, j)| s_all[(i, j)]);
-    let t_array = Array2::from_shape_fn((p, n), |(i, j)| t_all[(i, j)]);
-
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
@@ -274,101 +259,133 @@ pub fn compute_alo_features(
     let mut a_hi_95 = 0usize;
     let mut a_hi_99 = 0usize;
 
-    for i in 0..n {
-        let u_row = u.row(i);
-        let s_col = s_array.column(i);
-        let t_col = t_array.column(i);
+    let mut s_buf = vec![0.0f64; p];
+    let mut t_buf = vec![0.0f64; p];
+    let block_cols = 8192usize;
 
-        let ai = u_row.dot(&s_col);
-        aii[i] = ai;
-        percentiles_data.push(ai);
+    for chunk_start in (0..n).step_by(block_cols) {
+        let chunk_end = (chunk_start + block_cols).min(n);
+        let width = chunk_end - chunk_start;
 
-        if ai.is_finite() {
-            sum_aii += ai;
-        } else {
-            sum_aii = f64::NAN;
-        }
+        let rhs_chunk = FaerMat::<f64>::from_fn(p, width, |row, col| ut[[row, chunk_start + col]]);
+        let s_chunk = factor.solve(rhs_chunk.as_ref());
+        let mut t_chunk = FaerMat::<f64>::zeros(p, width);
+        matmul(
+            t_chunk.as_mut(),
+            Accum::Replace,
+            xtwx_f.as_ref(),
+            s_chunk.as_ref(),
+            1.0,
+            Par::Seq,
+        );
 
-        if ai.is_finite() {
-            max_aii = max_aii.max(ai);
-        }
-
-        if ai < 0.0 || ai > 1.0 || !ai.is_finite() {
-            invalid_count += 1;
-            eprintln!(
-                "[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}",
-                i, ai
-            );
-        } else if ai > 0.99 {
-            high_leverage_count += 1;
-            if ai > 0.999 {
-                eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", i, ai);
+        for local_col in 0..width {
+            let obs = chunk_start + local_col;
+            for r in 0..p {
+                s_buf[r] = s_chunk[(r, local_col)];
+                t_buf[r] = t_chunk[(r, local_col)];
             }
-        }
 
-        if ai > 0.90 {
-            a_hi_90 += 1;
-        }
-        if ai > 0.95 {
-            a_hi_95 += 1;
-        }
-        if ai > 0.99 {
-            a_hi_99 += 1;
-        }
+            let u_row = u.row(obs);
+            let ai = s_buf
+                .iter()
+                .zip(u_row.iter())
+                .map(|(s, &u_val)| s * u_val)
+                .sum::<f64>();
+            aii[obs] = ai;
+            percentiles_data.push(ai);
 
-        let wi = base.final_weights[i].max(1e-12);
+            if ai.is_finite() {
+                sum_aii += ai;
+            } else {
+                sum_aii = f64::NAN;
+            }
 
-        let quad = s_col.dot(&t_col);
-        let var_full = phi * (quad / wi);
+            if ai.is_finite() {
+                max_aii = max_aii.max(ai);
+            }
 
-        let denom_raw = 1.0 - ai;
-        if denom_raw <= 0.0 {
-            eprintln!(
-                "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
-                i, ai
-            );
-        }
-        let denom = denom_raw.max(1e-12);
-
-        let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
-        let denom_sq = denom * denom;
-        let var_loo = var_without_i / denom_sq;
-        let se_full = var_full.max(0.0).sqrt();
-        let se_loo = var_loo.max(0.0).sqrt();
-        se_tilde[i] = se_loo;
-
-        if diag_counter < max_diag_samples {
-            let c_i = ai / wi;
-            let se_unw = c_i.max(0.0).sqrt();
-            println!("[GNOMON DIAG] ALO SE formula (obs {}):", i);
-            println!("  - w_i: {:.6e}", wi);
-            println!("  - a_ii: {:.6e}", ai);
-            println!("  - 1 - a_ii: {:.6e}", denom_raw);
-            println!("  - var_full (full sample): {:.6e}", var_full);
-            println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
-            println!("  - var_loo (inflated): {:.6e}", var_loo);
-            println!("  - SE_full (full sample): {:.6e}", se_full);
-            println!("  - SE_tilde (LOO): {:.6e}", se_loo);
-            println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
-            println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
-            let expected_ratio = {
-                let infl = var_without_i / var_full.max(1e-24);
-                if infl >= 0.0 {
-                    (infl.sqrt() / denom.max(1e-12)).abs()
-                } else {
-                    f64::NAN
+            if ai < 0.0 || ai > 1.0 || !ai.is_finite() {
+                invalid_count += 1;
+                eprintln!(
+                    "[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}",
+                    obs, ai
+                );
+            } else if ai > 0.99 {
+                high_leverage_count += 1;
+                if ai > 0.999 {
+                    eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", obs, ai);
                 }
-            };
-            println!(
-                "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
-                if se_full > 0.0 {
-                    se_loo / se_full
-                } else {
-                    f64::NAN
-                },
-                expected_ratio
-            );
-            diag_counter += 1;
+            }
+
+            if ai > 0.90 {
+                a_hi_90 += 1;
+            }
+            if ai > 0.95 {
+                a_hi_95 += 1;
+            }
+            if ai > 0.99 {
+                a_hi_99 += 1;
+            }
+
+            let wi = base.final_weights[obs].max(1e-12);
+
+            let quad = s_buf
+                .iter()
+                .zip(t_buf.iter())
+                .map(|(s, t)| s * t)
+                .sum::<f64>();
+            let var_full = phi * (quad / wi);
+
+            let denom_raw = 1.0 - ai;
+            if denom_raw <= 0.0 {
+                eprintln!(
+                    "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
+                    obs, ai
+                );
+            }
+            let denom = denom_raw.max(1e-12);
+
+            let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
+            let denom_sq = denom * denom;
+            let var_loo = var_without_i / denom_sq;
+            let se_full = var_full.max(0.0).sqrt();
+            let se_loo = var_loo.max(0.0).sqrt();
+            se_tilde[obs] = se_loo;
+
+            if diag_counter < max_diag_samples {
+                let c_i = ai / wi;
+                let se_unw = c_i.max(0.0).sqrt();
+                println!("[GNOMON DIAG] ALO SE formula (obs {}):", obs);
+                println!("  - w_i: {:.6e}", wi);
+                println!("  - a_ii: {:.6e}", ai);
+                println!("  - 1 - a_ii: {:.6e}", denom_raw);
+                println!("  - var_full (full sample): {:.6e}", var_full);
+                println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
+                println!("  - var_loo (inflated): {:.6e}", var_loo);
+                println!("  - SE_full (full sample): {:.6e}", se_full);
+                println!("  - SE_tilde (LOO): {:.6e}", se_loo);
+                println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
+                println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
+                let expected_ratio = {
+                    let infl = var_without_i / var_full.max(1e-24);
+                    if infl >= 0.0 {
+                        (infl.sqrt() / denom.max(1e-12)).abs()
+                    } else {
+                        f64::NAN
+                    }
+                };
+                println!(
+                    "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
+                    if se_full > 0.0 {
+                        se_loo / se_full
+                    } else {
+                        f64::NAN
+                    },
+                    expected_ratio
+                );
+                diag_counter += 1;
+            }
         }
     }
 

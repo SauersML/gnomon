@@ -5050,13 +5050,13 @@ pub mod internal {
                         if raw.ncols() > 1 {
                             raw.slice_mut(ndarray::s![.., 1..]).assign(&data_val_pcs);
                         }
-                        let (corrected, num_proj) = hull.project_if_needed(raw.view());
-                        let rate = num_proj as f64 / corrected.nrows() as f64;
+                        let num_proj = hull.project_in_place(raw.view_mut());
+                        let rate = num_proj as f64 / raw.nrows() as f64;
                         proj_rates.push(rate);
                         println!(
                             "[CV]   PHC: projected {}/{} ({:.1}%)",
                             num_proj,
-                            corrected.nrows(),
+                            raw.nrows(),
                             100.0 * rate
                         );
                         rate
