@@ -47,6 +47,11 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
+
 // Helper: Frobenius inner product for faer matrices using compensated summation
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
     let (m, n) = (a.nrows(), a.ncols());
@@ -170,10 +175,6 @@ impl RidgePlanner {
 }
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
-use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;
 /// Smallest penalized deviance value we allow when profiling the Gaussian scale.
@@ -1990,13 +1991,12 @@ pub mod internal {
     /// Holds the state for the outer REML optimization and supplies cost and
     /// gradient evaluations to the `wolfe_bfgs` optimizer.
     ///
-    /// The `cache` field uses `RefCell` to enable interior mutability. This is a crucial
-    /// performance optimization. The `cost_and_grad` closure required by the BFGS
-    /// optimizer takes an immutable reference `&self`. However, we want to cache the
-    /// results of the expensive P-IRLS computation to avoid re-calculating the fit
-    /// for the same `rho` vector, which can happen during the line search.
-    /// `RefCell` allows us to mutate the cache through a `&self` reference,
-    /// making this optimization possible while adhering to the optimizer's API.
+    /// Several fields rely on interior mutability behind synchronization primitives.
+    /// The `cost_and_grad` closure required by the BFGS optimizer takes an immutable
+    /// reference `&self`, yet we need to cache the results of expensive P-IRLS
+    /// computations and track diagnostics across evaluations.  Using `Mutex` provides
+    /// thread-safe interior mutability, which also enables parallel gradient
+    /// evaluations without sacrificing correctness.
 
     #[derive(Clone)]
     struct EvalShared {
@@ -2028,24 +2028,24 @@ pub mod internal {
         config: &'a ModelConfig,
         nullspace_dims: Vec<usize>,
 
-        cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
-        faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
-        eval_count: RefCell<u64>,
-        last_cost: RefCell<f64>,
-        last_grad_norm: RefCell<f64>,
-        consecutive_cost_errors: RefCell<usize>,
-        last_cost_error_msg: RefCell<Option<String>>,
-        current_eval_bundle: RefCell<Option<EvalShared>>,
+        cache: Mutex<HashMap<Vec<u64>, Arc<PirlsResult>>>,
+        faer_factor_cache: Mutex<HashMap<Vec<u64>, Arc<FaerFactor>>>,
+        eval_count: Mutex<u64>,
+        last_cost: Mutex<f64>,
+        last_grad_norm: Mutex<f64>,
+        consecutive_cost_errors: Mutex<usize>,
+        last_cost_error_msg: Mutex<Option<String>>,
+        current_eval_bundle: Mutex<Option<EvalShared>>,
     }
 
     impl<'a> RemlState<'a> {
         pub fn reset_optimizer_tracking(&self) {
-            *self.eval_count.borrow_mut() = 0;
-            *self.last_cost.borrow_mut() = f64::INFINITY;
-            *self.last_grad_norm.borrow_mut() = f64::INFINITY;
-            *self.consecutive_cost_errors.borrow_mut() = 0;
-            *self.last_cost_error_msg.borrow_mut() = None;
-            self.current_eval_bundle.borrow_mut().take();
+            *self.eval_count.lock().unwrap() = 0;
+            *self.last_cost.lock().unwrap() = f64::INFINITY;
+            *self.last_grad_norm.lock().unwrap() = f64::INFINITY;
+            *self.consecutive_cost_errors.lock().unwrap() = 0;
+            *self.last_cost_error_msg.lock().unwrap() = None;
+            self.current_eval_bundle.lock().unwrap().take();
         }
 
         /// Returns the effective Hessian and the ridge value used (if any).
@@ -2212,14 +2212,14 @@ pub mod internal {
                 layout,
                 config,
                 nullspace_dims,
-                cache: RefCell::new(HashMap::new()),
-                faer_factor_cache: RefCell::new(HashMap::new()),
-                eval_count: RefCell::new(0),
-                last_cost: RefCell::new(f64::INFINITY),
-                last_grad_norm: RefCell::new(f64::INFINITY),
-                consecutive_cost_errors: RefCell::new(0),
-                last_cost_error_msg: RefCell::new(None),
-                current_eval_bundle: RefCell::new(None),
+                cache: Mutex::new(HashMap::new()),
+                faer_factor_cache: Mutex::new(HashMap::new()),
+                eval_count: Mutex::new(0),
+                last_cost: Mutex::new(f64::INFINITY),
+                last_grad_norm: Mutex::new(f64::INFINITY),
+                consecutive_cost_errors: Mutex::new(0),
+                last_cost_error_msg: Mutex::new(None),
+                current_eval_bundle: Mutex::new(None),
             })
         }
 
@@ -2259,19 +2259,20 @@ pub mod internal {
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
             let key = self.rho_key_sanitized(rho);
-            if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
+            if let Some(existing) = self.current_eval_bundle.lock().unwrap().as_ref().cloned() {
                 if existing.matches(&key) {
-                    return Ok(existing.clone());
+                    return Ok(existing);
                 }
             }
             let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
-            *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
+            *self.current_eval_bundle.lock().unwrap() = Some(bundle.clone());
             Ok(bundle)
         }
 
         pub(super) fn last_ridge_used(&self) -> Option<f64> {
             self.current_eval_bundle
-                .borrow()
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|bundle| bundle.ridge_used)
         }
@@ -2405,14 +2406,14 @@ pub mod internal {
             // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
-                if let Some(f) = self.faer_factor_cache.borrow().get(key) {
-                    return Arc::clone(f);
+                if let Some(f) = self.faer_factor_cache.lock().unwrap().get(key).cloned() {
+                    return f;
                 }
             }
             let fact = Arc::new(self.factorize_faer(h));
 
             if let Some(key) = key_opt {
-                let mut cache = self.faer_factor_cache.borrow_mut();
+                let mut cache = self.faer_factor_cache.lock().unwrap();
                 if cache.len() > 64 {
                     cache.clear();
                 }
@@ -2447,21 +2448,28 @@ pub mod internal {
             if rho.len() == 0 {
                 return Ok(Array1::zeros(0));
             }
-            let mut g = Array1::zeros(rho.len());
-            for k in 0..rho.len() {
-                // Step scheme consistent with compute_fd_gradient
-                let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
-                let h_abs = 1e-5_f64;
-                let h = h_rel.max(h_abs);
+            let gradients = (0..rho.len())
+                .into_par_iter()
+                .map(|k| -> Result<(usize, f64), EstimationError> {
+                    // Step scheme consistent with compute_fd_gradient
+                    let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
+                    let h_abs = 1e-5_f64;
+                    let h = h_rel.max(h_abs);
 
-                let mut rp = rho.clone();
-                let mut rm = rho.clone();
-                rp[k] += 0.5 * h;
-                rm[k] -= 0.5 * h;
-                let fp = self.penalised_ll_at(&rp)?;
-                let fm = self.penalised_ll_at(&rm)?;
-                // Minus sign: COST gradient uses - d penalised_ll / d rho
-                g[k] = -(fp - fm) / h;
+                    let mut rp = rho.to_owned();
+                    let mut rm = rp.clone();
+                    rp[k] += 0.5 * h;
+                    rm[k] -= 0.5 * h;
+                    let fp = self.penalised_ll_at(&rp)?;
+                    let fm = self.penalised_ll_at(&rm)?;
+                    // Minus sign: COST gradient uses - d penalised_ll / d rho
+                    Ok((k, -(fp - fm) / h))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut g = Array1::zeros(rho.len());
+            for (k, value) in gradients {
+                g[k] = value;
             }
             Ok(g)
         }
@@ -2532,11 +2540,11 @@ pub mod internal {
 
         // Expose error tracking state to parent module
         pub(super) fn consecutive_cost_error_count(&self) -> usize {
-            *self.consecutive_cost_errors.borrow()
+            *self.consecutive_cost_errors.lock().unwrap()
         }
 
         pub(super) fn last_cost_error_string(&self) -> Option<String> {
-            self.last_cost_error_msg.borrow().clone()
+            self.last_cost_error_msg.lock().unwrap().clone()
         }
 
         /// Runs the inner P-IRLS loop, caching the result.
@@ -2547,8 +2555,8 @@ pub mod internal {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
-                if let Some(cached_result) = self.cache.borrow().get(key) {
-                    return Ok(Arc::clone(cached_result));
+                if let Some(cached_result) = self.cache.lock().unwrap().get(key).cloned() {
+                    return Ok(cached_result);
                 }
             }
 
@@ -2587,7 +2595,8 @@ pub mod internal {
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
                         self.cache
-                            .borrow_mut()
+                            .lock()
+                            .unwrap()
                             .insert(key, Arc::clone(&pirls_result));
                     }
                     Ok(pirls_result)
@@ -2624,7 +2633,7 @@ pub mod internal {
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
-                    self.current_eval_bundle.borrow_mut().take();
+                    self.current_eval_bundle.lock().unwrap().take();
                     // Inner linear algebra says "too singular" — treat as barrier.
                     log::warn!(
                         "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
@@ -2653,7 +2662,7 @@ pub mod internal {
                     return Ok(f64::INFINITY);
                 }
                 Err(e) => {
-                    self.current_eval_bundle.borrow_mut().take();
+                    self.current_eval_bundle.lock().unwrap().take();
                     // Other errors still bubble up
                     // Provide bounds diagnostics here too
                     let at_lower: Vec<usize> = p
@@ -2965,7 +2974,7 @@ pub mod internal {
         /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND * tanh(z / RHO_BOUND)`.
         pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
             let eval_num = {
-                let mut count = self.eval_count.borrow_mut();
+                let mut count = self.eval_count.lock().unwrap();
                 *count += 1;
                 *count
             };
@@ -2986,7 +2995,7 @@ pub mod internal {
             match cost_result {
                 Ok(cost) if cost.is_finite() => {
                     // Reset consecutive error counter on successful finite cost
-                    *self.consecutive_cost_errors.borrow_mut() = 0;
+                    *self.consecutive_cost_errors.lock().unwrap() = 0;
                     match self.compute_gradient(&rho) {
                         Ok(mut grad) => {
                             // Projected/KKT handling at active bounds in rho-space
@@ -3001,24 +3010,28 @@ pub mod internal {
                                 println!("\n[BFGS Initial Point]");
                                 println!("  -> Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}");
                                 // Update on the first step
-                                *self.last_cost.borrow_mut() = cost;
-                                *self.last_grad_norm.borrow_mut() = grad_norm;
-                            } else if cost < *self.last_cost.borrow() {
-                                println!("\n[BFGS Progress Step #{eval_num}]");
-                                println!(
-                                    "  -> Old Cost: {:.7} | New Cost: {:.7} (IMPROVEMENT)",
-                                    *self.last_cost.borrow(),
-                                    cost
-                                );
-                                println!("  -> Grad Norm: {grad_norm:.6e}");
-                                // ONLY update the state if it's a true improvement
-                                *self.last_cost.borrow_mut() = cost;
-                                *self.last_grad_norm.borrow_mut() = grad_norm;
+                                *self.last_cost.lock().unwrap() = cost;
+                                *self.last_grad_norm.lock().unwrap() = grad_norm;
                             } else {
-                                println!("\n[BFGS Trial Step #{eval_num}]");
-                                println!("  -> Last Good Cost: {:.7}", *self.last_cost.borrow());
-                                println!("  -> Trial Cost:     {cost:.7} (NO IMPROVEMENT)");
-                                // DO NOT update last_cost here - this is the key fix
+                                let mut last_cost_guard = self.last_cost.lock().unwrap();
+                                let last_good = *last_cost_guard;
+                                if cost < last_good {
+                                    println!("\n[BFGS Progress Step #{eval_num}]");
+                                    println!(
+                                        "  -> Old Cost: {:.7} | New Cost: {:.7} (IMPROVEMENT)",
+                                        last_good, cost
+                                    );
+                                    println!("  -> Grad Norm: {grad_norm:.6e}");
+                                    // ONLY update the state if it's a true improvement
+                                    *last_cost_guard = cost;
+                                    drop(last_cost_guard);
+                                    *self.last_grad_norm.lock().unwrap() = grad_norm;
+                                } else {
+                                    println!("\n[BFGS Trial Step #{eval_num}]");
+                                    println!("  -> Last Good Cost: {:.7}", last_good);
+                                    println!("  -> Trial Cost:     {cost:.7} (NO IMPROVEMENT)");
+                                    // DO NOT update last_cost here - this is the key fix
+                                }
                             }
 
                             (cost, grad_z)
@@ -3088,10 +3101,10 @@ pub mod internal {
                     );
                     // Track consecutive errors so we can abort after repeated failures
                     {
-                        let mut cnt = self.consecutive_cost_errors.borrow_mut();
+                        let mut cnt = self.consecutive_cost_errors.lock().unwrap();
                         *cnt += 1;
                     }
-                    *self.last_cost_error_msg.borrow_mut() = Some(format!("{:?}", e));
+                    *self.last_cost_error_msg.lock().unwrap() = Some(format!("{:?}", e));
                     println!(
                         "\n[BFGS FAILED Step #{eval_num}] -> Cost computation failed. Optimizer will backtrack."
                     );
@@ -3213,14 +3226,14 @@ pub mod internal {
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
-                    self.current_eval_bundle.borrow_mut().take();
+                    self.current_eval_bundle.lock().unwrap().take();
                     // Push toward heavier smoothing: larger rho
                     // Minimizer steps along -grad, so use negative values
                     let grad = p.mapv(|rho| -(rho.abs() + 1.0));
                     return Ok(grad);
                 }
                 Err(e) => {
-                    self.current_eval_bundle.borrow_mut().take();
+                    self.current_eval_bundle.lock().unwrap().take();
                     return Err(e);
                 }
             };
