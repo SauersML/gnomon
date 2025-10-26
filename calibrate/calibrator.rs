@@ -2,7 +2,9 @@ use crate::calibrate::basis::{
     BasisError, apply_weighted_orthogonality_constraint, create_difference_penalty_matrix,
 };
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView};
+use crate::calibrate::faer_ndarray::FaerArrayView;
+#[cfg(test)]
+use crate::calibrate::faer_ndarray::FaerColView;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls; // for PirlsResult
