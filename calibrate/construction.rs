@@ -1627,6 +1627,7 @@ pub fn stable_reparameterization(
         bal_eigenvalues[j]
             .partial_cmp(&bal_eigenvalues[i])
             .unwrap_or(Ordering::Equal)
+            .then(i.cmp(&j))
     });
 
     let mut qs = Array2::zeros((p, p));
@@ -1643,11 +1644,15 @@ pub fn stable_reparameterization(
     let max_bal = bal_eigenvalues_ordered
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let rank_tol = if max_bal > 0.0 { max_bal * 1e-8 } else { 1e-12 };
-    let penalized_rank = bal_eigenvalues_ordered
-        .iter()
-        .take_while(|&&val| val > rank_tol)
-        .count();
+    let rank_tol = if max_bal > 0.0 { max_bal * 1e-10 } else { 1e-12 };
+    let penalized_rank = if has_nonzero {
+        bal_eigenvalues_ordered
+            .iter()
+            .take_while(|&&val| val > rank_tol)
+            .count()
+    } else {
+        0
+    };
 
     let mut rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|rs| rs.dot(&qs)).collect();
 
@@ -1669,6 +1674,7 @@ pub fn stable_reparameterization(
             range_eigenvalues[j]
                 .partial_cmp(&range_eigenvalues[i])
                 .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
         });
 
         let mut range_rotation = Array2::zeros((penalized_rank, penalized_rank));
@@ -1694,11 +1700,6 @@ pub fn stable_reparameterization(
             }
         }
 
-        s_lambda.fill(0.0);
-        for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-            let s_k = penalty_from_root(rs_k);
-            s_lambda.scaled_add(*lambda, &s_k);
-        }
     }
 
     let mut s_transformed = Array2::zeros((p, p));
@@ -1715,7 +1716,11 @@ pub fn stable_reparameterization(
     let max_eigenval = s_eigenvalues_raw
         .iter()
         .fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tolerance = max_eigenval * 1e-12;
+    let tolerance = if max_eigenval > 0.0 {
+        max_eigenval * 1e-10
+    } else {
+        1e-12
+    };
     let penalty_rank = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
