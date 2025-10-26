@@ -77,9 +77,8 @@ debug = 1
 strip = false
 
 [features]
-default = ["basis-cache"]
+default = []
 no-inline-profiling = []
-basis-cache = []
 
 [lints.rust]
 unused_variables = "deny"
