@@ -178,29 +178,32 @@ pub fn fit_model_for_fixed_rho(
 
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
     let p = x.ncols();
-    let mut balanced_storage: Option<Array2<f64>> = None;
-    let eb_view = if let Some(precomputed) = balanced_penalty_root {
-        println!(
-            "[Balanced Penalty] Reusing cached lambda-independent root with shape: {:?}",
-            precomputed.dim()
-        );
-        precomputed.view()
-    } else {
-        // Reconstruct full penalty matrices from square roots for balanced penalty creation
-        // STANDARDIZED: With rank x p roots, use S = R^T * R
-        let mut s_list_full = Vec::with_capacity(rs_original.len());
-        for rs in rs_original {
-            let s_full = rs.t().dot(rs);
-            s_list_full.push(s_full);
+    let mut balanced_owned: Option<Array2<f64>> = None;
+    let eb_view = match balanced_penalty_root {
+        Some(precomputed) => {
+            println!(
+                "[Balanced Penalty] Reusing cached lambda-independent root with shape: {:?}",
+                precomputed.dim()
+            );
+            precomputed.view()
         }
+        None => {
+            // Reconstruct full penalty matrices from square roots for balanced penalty creation
+            // STANDARDIZED: With rank x p roots, use S = R^T * R
+            let mut s_list_full = Vec::with_capacity(rs_original.len());
+            for rs in rs_original {
+                let s_full = rs.t().dot(rs);
+                s_list_full.push(s_full);
+            }
 
-        let computed = create_balanced_penalty_root(&s_list_full, p)?;
-        println!(
-            "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
-            computed.dim()
-        );
-        balanced_storage = Some(computed);
-        balanced_storage.as_ref().unwrap().view()
+            let owned = create_balanced_penalty_root(&s_list_full, p)?;
+            println!(
+                "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
+                owned.dim()
+            );
+            balanced_owned = Some(owned);
+            balanced_owned.as_ref().unwrap().view()
+        }
     };
 
     // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop

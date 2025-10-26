@@ -1862,6 +1862,8 @@ pub mod internal {
         pirls_result: Arc<PirlsResult>,
         h_eff: Arc<Array2<f64>>,
         ridge_used: f64,
+        rho: Array1<f64>,
+        lambdas: Array1<f64>,
     }
 
     impl EvalShared {
@@ -2110,11 +2112,14 @@ pub mod internal {
         ) -> Result<EvalShared, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(rho)?;
             let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
+            let lambdas = rho.mapv(f64::exp);
             Ok(EvalShared {
                 key,
                 pirls_result,
                 h_eff: Arc::new(h_eff),
                 ridge_used,
+                rho: rho.to_owned(),
+                lambdas,
             })
         }
 
@@ -2150,7 +2155,7 @@ pub mod internal {
         fn edf_from_h_and_rk(
             &self,
             pr: &PirlsResult,
-            lambdas: &Array1<f64>,
+            rho: &Array1<f64>,
             h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
@@ -2169,8 +2174,7 @@ pub mod internal {
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
 
             // Factor the effective Hessian once
-            let rho_like = lambdas.mapv(|lam| lam.ln());
-            let factor = self.get_faer_factor(&rho_like, h_eff);
+            let factor = self.get_faer_factor(rho, h_eff);
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
@@ -2573,7 +2577,7 @@ pub mod internal {
                     }
                 }
             }
-            let lambdas = p.mapv(f64::exp);
+            let lambdas = &bundle.lambdas;
 
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
@@ -2631,7 +2635,7 @@ pub mod internal {
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &bundle.rho, h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
 
                     if n - edf < 1.0 {
@@ -2727,7 +2731,7 @@ pub mod internal {
                     // Diagnostics: effective degrees of freedom via trace identity
                     // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, &bundle.rho, h_eff)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
@@ -3133,7 +3137,7 @@ pub mod internal {
             }
 
             // --- Extract common components ---
-            let lambdas = p.mapv(f64::exp); // This is λ
+            let lambdas = &bundle.lambdas; // This is λ
 
             // --- Create the gradient vector ---
             // This variable holds the gradient of the COST function (-V_REML or -V_LAML),
