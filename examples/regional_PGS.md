@@ -138,3 +138,9 @@ Let's check which have variance:
 <img width="1011" height="2571" alt="image" src="https://github.com/user-attachments/assets/529d3046-fef4-4920-90e8-c583942ee75d" />
 
 Our options are: PGS000015, PGS000335, PGS000507, PGS000508, PGS004146, PGS004229, PGS004378, PGS004869, and PGS005198.
+
+Obesity: PGS004378, PGS005198
+
+Alzheimer’s: PGS004146, PGS004229
+
+Breast Cancer: PGS000015, PGS000335, PGS000507, PGS000508, PGS004869
