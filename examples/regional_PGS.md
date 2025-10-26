@@ -104,3 +104,20 @@ plt.show()
 <img width="1011" height="971" alt="image" src="https://github.com/user-attachments/assets/8dff839d-a9c1-4494-9e14-b8644b810c57" />
 
 We can see the scores with no overlap in the region are simply all zero. We need one extra score for Alzheimer's disease and two extra scores for breast cancer.
+
+For breast cancer, we can try:
+- PGS000335
+- PGS000015
+- PGS000508
+- PGS000344
+- PGS000007
+- PGS000507
+- PGS004869
+
+For Alzheimer's disease, we can try:
+- PGS004146
+- PGS003957
+- PGS003334
+- PGS004589
+- PGS004898
+- PGS004229
