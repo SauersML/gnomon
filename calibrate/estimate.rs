@@ -38,7 +38,8 @@ use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::s;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
@@ -3378,6 +3379,63 @@ pub mod internal {
                         None
                     };
 
+                    // Pre-compute H⁻¹ R_kᵀ for all penalties using a single batched solve when
+                    // the analytic log|H| derivative is enabled.  This keeps the arithmetic
+                    // identical to the previous per-penalty solves while avoiding repeated calls
+                    // into the faer factorization.
+                    let analytic_trace_terms: Option<Vec<f64>> = if numeric_logh_grad.is_none() {
+                        let rs_transposed = &reparam_result.rs_transposed;
+                        if rs_transposed.is_empty() {
+                            Some(Vec::new())
+                        } else {
+                            let p_dim = h_eff.nrows();
+                            let total_cols: usize = rs_transposed.iter().map(|rt| rt.ncols()).sum();
+                            if total_cols == 0 {
+                                Some(vec![0.0; rs_transposed.len()])
+                            } else {
+                                let mut rhs_concat = Array2::<f64>::zeros((p_dim, total_cols));
+                                let mut block_ranges: Vec<(usize, usize)> =
+                                    Vec::with_capacity(rs_transposed.len());
+                                let mut cursor = 0usize;
+                                for rt in rs_transposed {
+                                    let cols = rt.ncols();
+                                    let end = cursor + cols;
+                                    rhs_concat.slice_mut(s![.., cursor..end]).assign(rt);
+                                    block_ranges.push((cursor, end));
+                                    cursor = end;
+                                }
+
+                                let rhs_view = FaerArrayView::new(&rhs_concat);
+                                let solved = factor_g.solve(rhs_view.as_ref());
+                                let solved_ref = solved.as_ref();
+                                let mut solved_concat = Array2::<f64>::zeros((p_dim, total_cols));
+                                for j in 0..total_cols {
+                                    for i in 0..p_dim {
+                                        solved_concat[(i, j)] = solved_ref[(i, j)];
+                                    }
+                                }
+
+                                let mut traces = Vec::with_capacity(rs_transposed.len());
+                                for (idx, rt) in rs_transposed.iter().enumerate() {
+                                    let (start, end) = block_ranges[idx];
+                                    if start == end {
+                                        traces.push(0.0);
+                                        continue;
+                                    }
+                                    let solved_block = solved_concat.slice(s![.., start..end]);
+                                    let mut acc = KahanSum::default();
+                                    Zip::from(solved_block)
+                                        .and(rt.view())
+                                        .for_each(|&x, &r| acc.add(x * r));
+                                    traces.push(acc.sum());
+                                }
+                                Some(traces)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     // Three-term gradient computation following mgcv gdi1
                     for k in 0..lambdas.len() {
                         let r_k = &rs_transformed[k];
@@ -3399,14 +3457,12 @@ pub mod internal {
                         // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
                         let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
                             g[k]
-                        } else {
-                            let rt_arr = r_k.t().to_owned();
-                            let rt_view = FaerArrayView::new(&rt_arr);
-                            let x = factor_g.solve(rt_view.as_ref());
-                            // Frobenius inner product ⟨X, Rt⟩
-                            let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt_view.as_ref());
+                        } else if let Some(ref traces) = analytic_trace_terms {
+                            let trace_h_inv_s_k = traces.get(k).copied().unwrap_or(0.0);
                             let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                             tra1 / 2.0
+                        } else {
+                            0.0
                         };
 
                         // Component 3: derivative of the penalty pseudo-determinant.
