@@ -330,6 +330,12 @@ fn compute_ld_bp_ranges(
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f64);
 
+// SAFETY: `SendPtr` is only ever constructed from buffers that are owned by the
+// current thread and remain alive for the entire duration of the scoped thread
+// in which the pointer is sent. We only move the raw pointer between threads to
+// avoid borrow checker restrictions; the pointed-to memory is still uniquely
+// owned, and channel coordination guarantees that at most one thread accesses a
+// given buffer at a time.
 unsafe impl Send for SendPtr {}
 
 struct ParallelismGuard {
@@ -868,6 +874,9 @@ fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
 #[inline(always)]
 fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // SAFETY: The AVX-specific implementation is only compiled on x86 targets
+    // and this branch is taken after `detected_simd_lane_selection` confirmed
+    // that the CPU supports the required feature set.
     unsafe {
         standardize_column_simd_avx(values, mean, inv);
     }
@@ -883,6 +892,10 @@ fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
+/// # Safety
+/// The caller must ensure the current CPU supports AVX instructions. All call
+/// sites guard this by checking `std::arch::is_x86_feature_detected!("avx")` or
+/// by only invoking it in configurations where AVX is guaranteed to be present.
 unsafe fn standardize_column_simd_avx(values: &mut [f64], mean: f64, inv: f64) {
     standardize_column_simd_impl::<4>(values, mean, inv);
 }
@@ -954,6 +967,8 @@ fn standardize_column_with_mask_simd_lanes4(
     inv: f64,
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // SAFETY: On x86 we only reach this branch when runtime detection selects
+    // the four-lane configuration, which implies AVX availability.
     unsafe {
         standardize_column_with_mask_simd_avx(values, mask, mean, inv);
     }
@@ -969,6 +984,10 @@ fn standardize_column_with_mask_simd_lanes4(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
+/// # Safety
+/// The caller must ensure the CPU supports AVX instructions. All invocations
+/// are conditioned on runtime feature detection or target configurations that
+/// guarantee AVX availability.
 unsafe fn standardize_column_with_mask_simd_avx(
     values: &mut [f64],
     mask: &mut [f64],
@@ -1040,6 +1059,8 @@ fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
 #[inline(always)]
 fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // SAFETY: The AVX path is only taken on x86 targets when the runtime lane
+    // selection confirmed AVX support.
     unsafe {
         standardize_column_simd_full_avx(values, mean, inv);
     }
@@ -1055,6 +1076,9 @@ fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) 
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
+/// # Safety
+/// Callers must guarantee AVX availability; runtime dispatch ensures that the
+/// function is only invoked when the CPU advertises the capability.
 unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f64) {
     standardize_column_simd_full_impl::<4>(values, mean, inv);
 }
@@ -1090,6 +1114,8 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
         ))]
         SimdLaneSelection::Lanes4 => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Runtime detection guaranteed AVX is present before
+            // dispatching to the specialized implementation.
             unsafe {
                 log::debug!("Invoking AVX sum_and_count_finite implementation");
                 return sum_and_count_finite_avx(values);
@@ -1153,6 +1179,9 @@ where
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
+/// # Safety
+/// Callers must ensure AVX is supported by the running CPU. Runtime feature
+/// checks protect all invocations of this function.
 unsafe fn sum_and_count_finite_avx(values: &[f64]) -> (f64, usize) {
     sum_and_count_finite_impl::<4>(values)
 }
@@ -1675,10 +1704,14 @@ where
 
         let block_len = self.n_samples * self.block_capacity;
         let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        // SAFETY: `buf0_uninit` was allocated with capacity `block_len` and lives
+        // for the entire scope of `apply`. We immediately treat it as
+        // initialized because the buffer is filled before being read.
         let buf0 = unsafe {
             std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len)
         };
         let (buf1_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        // SAFETY: Same reasoning as above for `buf0`.
         let buf1 = unsafe {
             std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len)
         };
@@ -1690,6 +1723,8 @@ where
         ];
 
         let (mut proj_uninit, _) =
+            // SAFETY: The scratch matrix is fully initialized before any reads
+            // via `as_mat_mut` occur, and it is bounded by the provided stack.
             unsafe { temp_mat_uninit::<f64, _, _>(self.block_capacity, rhs.ncols(), stack) };
         let mut proj_storage = proj_uninit.as_mat_mut();
 
@@ -1735,6 +1770,10 @@ where
 
                 let mut start = 0usize;
                 while let Ok(id) = free_receiver.recv() {
+                    // SAFETY: The raw pointer originated from a mutable slice
+                    // in `buffer_slices` and remains valid until the scoped
+                    // thread exits. Each `id` is unique, so no aliasing
+                    // occurs when reconstructing the slice.
                     let buffer_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                     };
@@ -1780,6 +1819,11 @@ where
                             );
                         }
 
+                        // SAFETY: `buffer_ptrs_compute[id]` points to the same
+                        // uniquely-owned buffer handed to the prefetch thread.
+                        // The scoped threads guarantee the memory outlives this
+                        // use and channel coordination prevents concurrent
+                        // access.
                         let block_slice = unsafe {
                             std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                         };
@@ -2104,9 +2148,14 @@ where
     let stack = MemStack::new(&mut mem);
     let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
     let buf0 =
+        // SAFETY: `buf0_uninit` owns `block_len` contiguous `f64`s that live for
+        // the duration of this function. We only treat it as initialized once we
+        // populate it with data from the source.
         unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
     let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
     let buf1 =
+        // SAFETY: Mirroring the reasoning for `buf0`, the allocation stays alive
+        // and is initialized before any reads.
         unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
     let mut buffer_slices = [buf0, buf1];
     let [first_slice, second_slice] = &mut buffer_slices;
@@ -2159,6 +2208,9 @@ where
             let mut start = 0usize;
             let mut used_source_progress = false;
             while let Ok(id) = free_receiver.recv() {
+                // SAFETY: The pointer was derived from a uniquely-owned slice
+                // stored in `buffer_slices` and the scoped threads ensure the
+                // backing storage outlives this reconstruction.
                 let buffer_slice = unsafe {
                     std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                 };
@@ -2234,6 +2286,10 @@ where
                         ));
                     }
 
+                    // SAFETY: Each `id` corresponds to a single buffer whose
+                    // ownership is passed through the channel. The pointer remains
+                    // valid and uniquely borrowed until we send `id` back on the
+                    // free list.
                     let block_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                     };
@@ -3335,9 +3391,13 @@ where
     let stack = MemStack::new(&mut mem);
     let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
     let buf0 =
+        // SAFETY: `buf0_uninit` was allocated with exactly `block_len` elements
+        // and lives until the end of this function. We initialize it before any
+        // reads take place.
         unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
     let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
     let buf1 =
+        // SAFETY: Identical justification as for `buf0`.
         unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
     let mut buffer_slices = [buf0, buf1];
     let [first_slice, second_slice] = &mut buffer_slices;
@@ -3380,6 +3440,9 @@ where
 
             let mut start = 0usize;
             while let Ok(id) = free_receiver.recv() {
+                // SAFETY: Each pointer came from a mutable slice backed by the
+                // stack allocation above and remains valid throughout the
+                // scoped thread. Distinct `id`s ensure no concurrent aliasing.
                 let buffer_slice = unsafe {
                     std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
                 };
@@ -3430,6 +3493,10 @@ where
                         ));
                     }
 
+                    // SAFETY: The pointer corresponds to a unique buffer owned
+                    // by this worker. It stays valid until the `id` is returned
+                    // via `free_sender`, preventing simultaneous mutable
+                    // borrows.
                     let block_slice = unsafe {
                         std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
                     };
