@@ -1559,16 +1559,13 @@ pub fn construct_s_lambda(
 /// diagnostics or alternative workflows. This function does not take `eb` as a
 /// parameter; it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
+    rs_list: &[Array2<f64>],
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
-    // println!("DEBUG: lambdas: {:?}", lambdas);
-    // println!("DEBUG: rs_list: {:?}", rs_list);
     let p = layout.total_coeffs;
-    let m = rs_list.len(); // Number of penalty square roots
+    let m = rs_list.len();
 
-    // CRITICAL VALIDATION: lambdas length must match number of penalties
     if lambdas.len() != m {
         return Err(EstimationError::ParameterConstraintViolation(format!(
             "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
@@ -1586,478 +1583,145 @@ pub fn stable_reparameterization(
             qs: Array2::eye(p),
             rs_transformed: vec![],
             rs_transposed: vec![],
-            e_transformed: Array2::zeros((0, p)), // rank x p matrix
+            e_transformed: Array2::zeros((0, p)),
         });
     }
 
-    // Wood (2011) Appendix B: get_stableS algorithm
-    // Use a tighter tolerance for α/γ partitioning to better match mgcv
-    let eps = 1e-7; // robust partitioning tolerance (was 1e-4)
-    // println!("DEBUG: eps = {}", eps);
-    let r_tol = f64::EPSILON.powf(0.75); // rank tolerance
-
-    // Initialize global transformation matrix and working matrices
-    let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
-
-    // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
-    // These will NEVER be modified and are used for building the sb matrix
     let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
+        rs_list.iter().map(|root| penalty_from_root(root)).collect();
 
-    // Create the WORKING copy that will be transformed
-    let mut s_current_list = s_original_list.clone();
+    let total_rows: usize = rs_list.iter().map(|rs| rs.nrows()).sum();
 
-    // Clone penalty square roots - we'll transform these in-place
-    let mut rs_current = rs_list.to_vec();
-
-    // Initialize iteration variables following get_stableS
-    let mut k_offset = 0_usize; // K: number of parameters already processed  
-    let mut q_current = p; // Q: size of current sub-problem
-    let mut gamma: Vec<usize> = (0..m).collect(); // Active penalty indices
-    let mut iteration = 0; // Track iterations for the termination logic
-
-    // Main similarity transform loop - mirrors get_stableS structure
-    loop {
-        // Increment iteration counter
-        iteration += 1;
-
-        if gamma.is_empty() || q_current == 0 {
-            break;
+    if total_rows == 0 {
+        let mut s_transformed = Array2::zeros((p, p));
+        for (lambda, s_k) in lambdas.iter().zip(&s_original_list) {
+            s_transformed.scaled_add(*lambda, s_k);
         }
 
-        // Step: Find Frobenius norms of penalties in current sub-problem
-        // For penalty square roots, we need to form the full penalty matrix S_i = rS_i^T * rS_i
-        let mut frob_norms = Vec::new();
-        let mut max_omega: f64 = 0.0;
+        let rs_transformed: Vec<Array2<f64>> = rs_list.iter().cloned().collect();
+        let rs_transposed: Vec<Array2<f64>> =
+            rs_transformed.iter().map(|m| m.t().to_owned()).collect();
 
-        for &i in &gamma {
-            // Extract active columns from penalty square root (rank x p convention)
-            let rs_active_cols = rs_current[i].slice(s![.., k_offset..k_offset + q_current]);
+        return Ok(ReparamResult {
+            s_transformed,
+            log_det: 0.0,
+            det1: Array1::zeros(m),
+            qs: Array2::eye(p),
+            rs_transformed,
+            rs_transposed,
+            e_transformed: Array2::zeros((0, p)),
+        });
+    }
 
-            // Skip if penalty has no rows (zero rank penalty)
-            if rs_current[i].nrows() == 0 || q_current == 0 {
-                frob_norms.push((i, 0.0));
-                continue;
-            }
-
-            // Form the active sub-block of full penalty matrix S_i = rS_i^T * rS_i
-            let s_active_block = rs_active_cols.t().dot(&rs_active_cols);
-
-            // The Frobenius norm is the sqrt of sum of squares of matrix elements
-            let frob_norm = s_active_block.iter().map(|&x| x * x).sum::<f64>().sqrt();
-            // Weight by lambda so the transform reflects current smoothing regime
-            let omega_i = frob_norm * lambdas[i];
-
-            // No artificial perturbation - mgcv handles zero penalties exactly
-            frob_norms.push((i, omega_i));
-            max_omega = max_omega.max(omega_i);
-            // println!("DEBUG: Penalty {} has omega_i = {}", i, omega_i);
-        }
-
-        if max_omega < 1e-15 {
-            break; // All remaining penalties are numerically zero
-        }
-
-        // Stage: Partition into dominant α and subdominant γ' sets
-        // This is the most critical part of the algorithm
-        // We must ensure this logic exactly matches mgcv's get_stableS function
-        let threshold = eps * max_omega;
-        // println!("DEBUG: max_omega = {}, threshold = {}", max_omega, threshold);
-
-        // Initialize alpha and gamma_prime sets as empty
-        let mut alpha = Vec::new();
-        let mut gamma_prime = Vec::new();
-
-        // For each term in gamma, decide whether it goes in alpha or gamma_prime
-        // based on its weighted Frobenius norm (omega)
-        for &i in &gamma {
-            // Find the omega value for this index
-            if let Some(&(_, omega)) = frob_norms.iter().find(|&&(idx, _)| idx == i) {
-                if omega >= threshold {
-                    // This penalty has significant influence - put in alpha (dominant)
-                    alpha.push(i);
-                } else {
-                    // This penalty has minor influence - put in gamma_prime (subdominant)
-                    gamma_prime.push(i);
-                }
-            }
-        }
-
-        // Now alpha contains indices of penalties with ω_i ≥ threshold
-        // gamma_prime contains indices of penalties with ω_i < threshold
-
-        // Alpha and gamma_prime are already index lists
-        // No need for conversion - they contain the actual indices from gamma
-
-        if alpha.is_empty() {
-            println!("No terms in alpha set. Terminating.");
-            break;
-        }
-
-        println!(
-            "Partitioned: alpha set = {:?}, gamma_prime set = {:?}",
-            alpha, gamma_prime
-        );
-
-        // println!("DEBUG: Partitioned: alpha set = {:?}, gamma_prime set = {:?}", alpha, gamma_prime);
-
-        // Stage: Form a scaled sum for stable rank detection (lambda-independent)
-        // This creates a lambda-independent, balanced matrix for reliable rank detection
-        let mut sb_for_rank = Array2::zeros((q_current, q_current));
-        for &i in &alpha {
-            let s_current_sub_block = s_current_list[i].slice(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]);
-
-            // Calculate Frobenius norm (sqrt of sum of squared elements)
-            let frob_norm = s_current_sub_block
-                .iter()
-                .map(|&x| x * x)
-                .sum::<f64>()
-                .sqrt();
-
-            // Scale by inverse norm to create a balanced matrix for rank detection
-            if frob_norm > 1e-12 {
-                // Avoid division by zero for zero-matrices
-                sb_for_rank.scaled_add(1.0 / frob_norm, &s_current_sub_block);
-            }
-        }
-
-        // Eigendecompose the balanced matrix to get stable eigenvalues for rank detection
-        let (eigenvalues_for_rank, _) =
-            robust_eigh(&sb_for_rank, Side::Lower, "stable rank detection matrix")?;
-
-        // Determine rank 'r' using these stable eigenvalues
-        let max_eigenval = eigenvalues_for_rank
-            .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let rank_tolerance = max_eigenval * r_tol;
-        let mut r = eigenvalues_for_rank
-            .iter()
-            .filter(|&&ev| ev > rank_tolerance)
-            .count();
-
-        println!(
-            "Stable rank detection: found rank {} from {} eigenvalues (max_eig: {}, tol: {})",
-            r,
-            eigenvalues_for_rank.len(),
-            max_eigenval,
-            rank_tolerance
-        );
-
-        // Correct energy capture check using eigenvalues of sb_for_rank (basis-invariant)
-        if r > 1 {
-            let positive_eigenvalues: Vec<f64> = eigenvalues_for_rank
-                .iter()
-                .filter(|&&e| e > rank_tolerance)
-                .copied()
-                .collect();
-
-            if !positive_eigenvalues.is_empty() {
-                let total_energy: f64 = positive_eigenvalues.iter().sum();
-                let top_r_eigenvalues: Vec<f64> = positive_eigenvalues
-                    .iter()
-                    .rev() // Largest first (eigenvalues are in ascending order)
-                    .take(r)
-                    .copied()
-                    .collect();
-                let captured_energy: f64 = top_r_eigenvalues.iter().sum();
-
-                let captured_energy_ratio = if total_energy > 1e-12 {
-                    captured_energy / total_energy
-                } else {
-                    1.0
-                };
-
-                // Guardrail: if capture falls suspiciously low, log a warning and proceed conservatively
-                if captured_energy_ratio < 0.95 {
-                    log::warn!(
-                        "Energy capture ratio low: {:.3}. Proceeding with conservative rank {}.",
-                        captured_energy_ratio,
-                        r
-                    );
-                }
-            }
-        }
-
-        // Stage: Form a weighted sum for the transformation (lambda-weighted for eigenvectors)
-        // This matrix provides the eigenvectors for the similarity transform
-        let mut sb_for_transform = Array2::zeros((q_current, q_current));
-        for &i in &alpha {
-            // Use the CURRENTLY transformed matrix, not the original
-            let s_current_sub_block = s_current_list[i].slice(s![
-                k_offset..k_offset + q_current,
-                k_offset..k_offset + q_current
-            ]);
-
-            // Use lambda weighting for transformation eigenvectors
-            sb_for_transform.scaled_add(lambdas[i], &s_current_sub_block);
-        }
-
-        // Eigendecomposition to get eigenvectors 'u' for the similarity transform
-        // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
-        let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = robust_eigh(
-            &sb_for_transform,
-            Side::Lower,
-            "lambda-weighted penalty matrix",
-        )?;
-
-        // SAFETY CHECK: Validate that the two decompositions agree on the rank
-        // If the lambda-weighted matrix has significantly different rank structure,
-        // the reparameterization may be unreliable
-        let max_eigenval_transform = eigenvalues_for_transform
-            .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let rank_tolerance_transform = max_eigenval_transform * r_tol;
-        let r_transform = eigenvalues_for_transform
-            .iter()
-            .filter(|&&ev| ev > rank_tolerance_transform)
-            .count();
-
-        // Check for significant disagreement between the two rank estimates
-        if (r as i32 - r_transform as i32).abs() > 1 {
-            log::warn!(
-                "Rank disagreement detected: balanced matrix rank={}, weighted matrix rank={}. Proceeding with caution.",
-                r,
-                r_transform
-            );
-
-            // Fall back to more conservative rank estimate to avoid corruption
-            let r_conservative = r.min(r_transform);
-            if r_conservative == 0 {
-                gamma = gamma_prime;
-                continue;
-            }
-            // Use the conservative rank for the remainder of this iteration
-            r = r_conservative;
-        }
-
-        // Note: The stable rank detection debug message is already logged above
-
-        println!(
-            "Rank detection: r={}, q_current={}, iteration={}",
-            r, q_current, iteration
-        );
-
-        // Step 5A: reorder the eigenvector matrix `u` to match mgcv’s logic.
-        // `Eigh` returns eigenvalues in ascending order, so the eigenvectors for the range
-        // space (largest eigenvalues) are at the end of `u`. We reorder them to be first.
-        // The new basis is `U_reordered = [U_range | U_null]`.
-
-        // Guard against r == 0 to avoid empty slicing
-        if r == 0 {
-            // No range directions identified this iteration; switch to gamma' and continue
-            gamma = gamma_prime;
+    let mut balanced_stack = Array2::zeros((total_rows, p));
+    let mut row_offset = 0;
+    for (rs, s_k) in rs_list.iter().zip(&s_original_list) {
+        let rows = rs.nrows();
+        if rows == 0 {
             continue;
         }
 
-        let u_range = u.slice(s![.., q_current - r..]); // Last r columns
-        let u_null = u.slice(s![.., ..q_current - r]); // First q_current - r columns
-        let u_reordered = ndarray::concatenate(Axis(1), &[u_range, u_null])
-            .expect("Failed to reorder eigenvectors");
+        let frob = frobenius_norm(s_k);
+        let scale = if frob > 0.0 { 1.0 / frob.sqrt() } else { 0.0 };
 
-        // Stage: Update the global transformation matrix Qf using the reordered basis
-        let qf_block = qf.slice(s![.., k_offset..k_offset + q_current]).to_owned();
-        let qf_new = qf_block.dot(&u_reordered);
-        qf.slice_mut(s![.., k_offset..k_offset + q_current])
-            .assign(&qf_new);
-
-        // Now, apply the similarity transform to all active S_k matrices for the next iteration.
-        // This is the core of the recursive update.
-        for &i in &gamma {
-            // Extract the current sub-problem block
-            let s_sub_block = s_current_list[i]
-                .slice(s![
-                    k_offset..k_offset + q_current,
-                    k_offset..k_offset + q_current
-                ])
-                .to_owned();
-
-            // Apply the similarity transform using the REORDERED basis: U_reordered^T * S_sub * U_reordered
-            let transformed_sub_block = u_reordered.t().dot(&s_sub_block).dot(&u_reordered);
-
-            // Place it back into the full-size matrix
-            s_current_list[i]
-                .slice_mut(s![
-                    k_offset..k_offset + q_current,
-                    k_offset..k_offset + q_current
-                ])
-                .assign(&transformed_sub_block);
+        let mut block = balanced_stack.slice_mut(s![row_offset..row_offset + rows, ..]);
+        if scale > 0.0 {
+            block.assign(&(&rs.view() * scale));
+        } else {
+            block.fill(0.0);
         }
-
-        // Stage: Transform all active penalty roots by the reordered eigenvector matrix U.
-        // This projects them onto the new basis defined by the eigenvectors of the dominant penalties.
-        for &i in &gamma {
-            if rs_current[i].nrows() == 0 || q_current == 0 {
-                continue;
-            }
-
-            // For rank×p penalty roots, transform as R_new = R * U (not U^T * R)
-            let c_matrix = rs_current[i]
-                .slice(s![.., k_offset..k_offset + q_current])
-                .to_owned();
-            let b_matrix = c_matrix.dot(&u_reordered); // rS_sub * U_reordered
-
-            // Assign the fully transformed block back into the main rs_current matrix.
-            rs_current[i]
-                .slice_mut(s![.., k_offset..k_offset + q_current])
-                .assign(&b_matrix);
-        }
-
-        // Stage: partitioning logic.
-        // After transforming with `u_reordered`, the first `r` rows correspond to the range
-        // space, and the last `q_current - r` rows correspond to the null space.
-        for &i in &gamma {
-            if rs_current[i].nrows() == 0 || q_current == 0 {
-                continue;
-            }
-
-            if alpha.contains(&i) {
-                // DOMINANT penalty: Its effect is now entirely within the range space.
-                // For rank×p roots, zero out the null space COLUMNS (not rows)
-                // The null space is now the LAST `q_current - r` columns of the sub-block.
-                if r < q_current {
-                    // Use explicit end index to avoid zeroing beyond current subblock
-                    rs_current[i]
-                        .slice_mut(s![.., k_offset + r..k_offset + q_current])
-                        .fill(0.0);
-                }
-            } else {
-                // SUB-DOMINANT penalty (in gamma_prime).
-                // Its effect is carried forward in the null space.
-                // For rank×p roots, zero out the range space COLUMNS (not rows)
-                // The range space is now the FIRST `r` columns of the sub-block.
-                rs_current[i]
-                    .slice_mut(s![.., k_offset..k_offset + r])
-                    .fill(0.0);
-            }
-        }
-
-        // Apply the same zeroing to the full S matrices.
-        // This prevents dominant penalty information from contaminating the next iteration's
-        // basis calculation (the cause of the numerical instability).
-        // Apply the same zeroing to the full S matrices to enforce exact projector structure
-        for &i in &gamma {
-            if alpha.contains(&i) {
-                // DOMINANT penalty: Zero out its null-space block.
-                if r < q_current {
-                    // Zero out the null-space rows and columns (bottom-right block)
-                    s_current_list[i]
-                        .slice_mut(s![
-                            k_offset + r..k_offset + q_current,
-                            k_offset + r..k_offset + q_current
-                        ])
-                        .fill(0.0);
-                    // Zero out the off-diagonal blocks connecting range and null spaces
-                    s_current_list[i]
-                        .slice_mut(s![
-                            k_offset..k_offset + r,
-                            k_offset + r..k_offset + q_current
-                        ])
-                        .fill(0.0);
-                    s_current_list[i]
-                        .slice_mut(s![
-                            k_offset + r..k_offset + q_current,
-                            k_offset..k_offset + r
-                        ])
-                        .fill(0.0);
-                }
-            } else {
-                // SUB-DOMINANT penalty: Zero out its range-space block.
-                // Zero out the range-space rows and columns (top-left block)
-                s_current_list[i]
-                    .slice_mut(s![k_offset..k_offset + r, k_offset..k_offset + r])
-                    .fill(0.0);
-                // Zero out the off-diagonal blocks connecting range and null spaces
-                s_current_list[i]
-                    .slice_mut(s![
-                        k_offset..k_offset + r,
-                        k_offset + r..k_offset + q_current
-                    ])
-                    .fill(0.0);
-                s_current_list[i]
-                    .slice_mut(s![
-                        k_offset + r..k_offset + q_current,
-                        k_offset..k_offset + r
-                    ])
-                    .fill(0.0);
-            }
-        }
-
-        // Update for next iteration
-        // Update iteration variables for next loop according to mgcv
-        k_offset += r; // Increase offset by the rank we processed
-        q_current -= r; // Reduce problem size by the rank we processed
-        gamma = gamma_prime; // Continue with the subdominant penalties
+        row_offset += rows;
     }
 
-    println!(
-        "[Reparam] Loop finished after {} iterations. Proceeding to generate final outputs.",
-        iteration
-    );
+    let balanced_stack = if row_offset == total_rows {
+        balanced_stack
+    } else {
+        balanced_stack.slice(s![0..row_offset, ..]).to_owned()
+    };
 
-    // AFTER LOOP: Generate final outputs from the transformed penalty roots
+    use crate::calibrate::faer_ndarray::FaerSvd;
+    let (_, singular_values, vt_opt) = balanced_stack
+        .svd(false, true)
+        .map_err(EstimationError::EigendecompositionFailed)?;
 
-    // Stage: The loop has finished - rs_current now contains the fully transformed penalty roots
-    let final_rs_transformed = rs_current;
+    let vt = vt_opt.ok_or_else(|| {
+        EstimationError::EigendecompositionFailed(FaerLinalgError::SvdNoConvergence)
+    })?;
+    let mut qs = vt.t().to_owned();
 
-    // Stage: Construct the final transformed total penalty matrix
+    let sigma_max = singular_values
+        .iter()
+        .fold(0.0_f64, |acc, &val| acc.max(val));
+    let rank_tol = if sigma_max > 0.0 {
+        sigma_max * 1e-10
+    } else {
+        1e-12
+    };
+    let penalty_rank = singular_values.iter().filter(|&&s| s > rank_tol).count();
+
+    if penalty_rank == 0 {
+        qs = Array2::eye(p);
+    }
+
+    let mut rs_transformed: Vec<Array2<f64>> = Vec::with_capacity(m);
+    for rs in rs_list {
+        let mut transformed = rs.dot(&qs);
+        if penalty_rank < p {
+            transformed.slice_mut(s![.., penalty_rank..]).fill(0.0);
+        }
+        rs_transformed.push(transformed);
+    }
+
+    let rs_transposed: Vec<Array2<f64>> = rs_transformed.iter().map(|m| m.t().to_owned()).collect();
+
     let mut s_transformed = Array2::zeros((p, p));
-    for i in 0..m {
-        // Form full penalty from transformed root: S_k = rS_k^T * rS_k
-        let s_k_transformed = penalty_from_root(&final_rs_transformed[i]);
-        s_transformed.scaled_add(lambdas[i], &s_k_transformed);
+    let mut s_transformed_components = Vec::with_capacity(m);
+    for (lambda, rs_t) in lambdas.iter().zip(&rs_transformed) {
+        let s_k_transformed = penalty_from_root(rs_t);
+        s_transformed.scaled_add(*lambda, &s_k_transformed);
+        s_transformed_components.push(s_k_transformed);
     }
 
-    // Stage: Compute the eigendecomposition of S_lambda
-    let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) =
+    let (s_eigenvalues_raw, s_eigenvectors) =
         robust_eigh(&s_transformed, Side::Lower, "combined penalty matrix")?;
-    // Use a small constant ridge epsilon for smoothed logdet/inverse; keep it lambda-independent
-    // keep for possible future smoothing: not used when using pseudo-determinant
-    // let _ridge_eps: f64 = 1e-8;
 
-    // Determine effective rank (for e_transformed shape) using raw spectrum and relative tolerance
     let max_eigenval = s_eigenvalues_raw
         .iter()
-        .fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tolerance = max_eigenval * 1e-12;
-    let penalty_rank = s_eigenvalues_raw
+        .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+    let tolerance = if max_eigenval > 0.0 {
+        max_eigenval * 1e-12
+    } else {
+        1e-12
+    };
+    let penalty_rank_effective = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
-        .count()
-        .max(0);
+        .count();
 
-    // Construct the lambda-DEPENDENT penalty square root matrix from the RAW spectrum
-    let mut e_matrix = Array2::zeros((p, penalty_rank));
+    let mut e_matrix = Array2::zeros((p, penalty_rank_effective));
     let mut col_idx = 0;
     for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
             let eigenvec = s_eigenvectors.column(i);
-            // Each column of the matrix is sqrt(eigenvalue) * eigenvector
             e_matrix
                 .column_mut(col_idx)
                 .assign(&(&eigenvec * sqrt_eigenval));
             col_idx += 1;
         }
     }
+    let e_transformed = if penalty_rank_effective == 0 {
+        Array2::zeros((0, p))
+    } else {
+        e_matrix.t().to_owned()
+    };
 
-    // e_transformed: Lambda-DEPENDENT penalty root for actual penalty application
-    // This represents the true penalty strength and changes with lambda values
-    let e_transformed = e_matrix.t().to_owned();
-
-    // Stage: Calculate the log-pseudo-determinant from the positive eigenvalues
     let log_det: f64 = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
         .map(|&ev| ev.ln())
         .sum();
 
-    // Stage: Calculate derivatives using the correct transformed matrices
-    let mut det1 = Array1::zeros(lambdas.len());
-
-    // Compute pseudo-inverse S_lambda^+ using only eigenvalues above tolerance
     let mut s_plus = Array2::zeros((p, p));
     for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
         if eigenval > tolerance {
@@ -2070,24 +1734,24 @@ pub fn stable_reparameterization(
         }
     }
 
-    // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
-    for k in 0..lambdas.len() {
-        let s_k_transformed = penalty_from_root(&final_rs_transformed[k]);
-        let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
-        let trace: f64 = s_plus_times_s_k.diag().sum();
-        det1[k] = lambdas[k] * trace;
+    let mut det1 = Array1::zeros(m);
+    for (idx, lambda) in lambdas.iter().enumerate() {
+        if *lambda == 0.0 {
+            det1[idx] = 0.0;
+            continue;
+        }
+        let s_k_transformed = &s_transformed_components[idx];
+        let trace = s_plus.dot(s_k_transformed).diag().sum();
+        det1[idx] = lambda * trace;
     }
 
     Ok(ReparamResult {
         s_transformed,
         log_det,
         det1,
-        qs: qf,
-        rs_transformed: final_rs_transformed.clone(),
-        rs_transposed: final_rs_transformed
-            .iter()
-            .map(|m| m.t().to_owned())
-            .collect(),
+        qs,
+        rs_transformed,
+        rs_transposed,
         e_transformed,
     })
 }
