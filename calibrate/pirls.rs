@@ -2617,7 +2617,7 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
-            penalty_supports: vec![0..0; 2],
+            penalty_supports: vec![0..2; 2],
             penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
 
@@ -2814,7 +2814,7 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
-            penalty_supports: vec![0..0; 2],
+            penalty_supports: vec![0..2; 2],
             penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
 
@@ -3667,7 +3667,7 @@ mod tests {
     #[test]
     fn test_penalty_root_consistency() {
         use crate::calibrate::construction::{
-            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+            ModelLayout, PenaltyStructure, compute_penalty_square_roots, stable_reparameterization,
         };
         use ndarray::arr2;
 
@@ -3691,7 +3691,7 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
-            penalty_supports: vec![0..0; 2],
+            penalty_supports: vec![0..2; 2],
             penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
         let lambdas = vec![0.7, 3.0];

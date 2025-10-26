@@ -177,7 +177,7 @@ impl ModelLayout {
             interaction_factor_widths: vec![],
             total_coeffs,
             num_penalties,
-            penalty_supports: vec![0..0; num_penalties],
+            penalty_supports: vec![0..total_coeffs; num_penalties],
             penalty_structures: vec![PenaltyStructure::Dense; num_penalties],
         }
     }
@@ -1398,10 +1398,17 @@ pub fn construct_s_lambda(
             continue;
         }
 
-        let support = layout.penalty_supports.get(i).cloned().unwrap_or(0..0);
-        if support.start >= support.end {
-            continue;
-        }
+        let support = layout
+            .penalty_supports
+            .get(i)
+            .cloned()
+            .map(|range| {
+                let end = range.end.min(p);
+                let start = range.start.min(end);
+                start..end
+            })
+            .filter(|range| range.start < range.end)
+            .unwrap_or(0..p);
 
         match layout
             .penalty_structures
