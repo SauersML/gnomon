@@ -1,9 +1,11 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use ahash::{AHashMap, AHasher};
 use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::sync::OnceLock;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -78,6 +80,216 @@ pub enum BasisError {
     InvalidKnotVector(String),
 }
 
+/// Runtime statistics for the optional B-spline basis cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BasisCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+const DEFAULT_BASIS_CACHE_CAPACITY: usize = 1_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BasisCacheKey {
+    knot_hash: u64,
+    degree: usize,
+    data_hash: u64,
+    derivative: usize,
+}
+
+#[derive(Clone, Debug)]
+struct BasisCacheEntry {
+    basis: Array2<f64>,
+}
+
+#[derive(Debug)]
+struct BasisCacheInner {
+    map: AHashMap<BasisCacheKey, BasisCacheEntry>,
+    order: Vec<BasisCacheKey>,
+    max_size: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl BasisCacheInner {
+    fn new(max_size: usize) -> Self {
+        Self {
+            map: AHashMap::with_capacity(max_size.max(1)),
+            order: Vec::with_capacity(max_size.max(1)),
+            max_size,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn touch(&mut self, key: &BasisCacheKey) {
+        if let Some(position) = self.order.iter().position(|existing| existing == key) {
+            let moved = self.order.remove(position);
+            self.order.push(moved);
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(oldest) = self.order.first().cloned() {
+            self.order.remove(0);
+            self.map.remove(&oldest);
+        }
+    }
+
+    fn insert(&mut self, key: BasisCacheKey, basis: Array2<f64>) {
+        if self.max_size == 0 {
+            return;
+        }
+
+        if self.map.contains_key(&key) {
+            self.order.retain(|existing| existing != &key);
+        }
+
+        if self.map.len() >= self.max_size {
+            self.evict_oldest();
+        }
+
+        self.order.push(key.clone());
+        self.map.insert(key, BasisCacheEntry { basis });
+    }
+
+    fn set_max_size(&mut self, new_max: usize) {
+        self.max_size = new_max;
+        if self.max_size == 0 {
+            self.map.clear();
+            self.order.clear();
+            return;
+        }
+
+        while self.map.len() > self.max_size {
+            self.evict_oldest();
+        }
+
+        if self.order.capacity() < self.max_size {
+            self.order.reserve(self.max_size - self.order.capacity());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BasisCache {
+    inner: Mutex<BasisCacheInner>,
+}
+
+impl BasisCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            inner: Mutex::new(BasisCacheInner::new(max_size)),
+        }
+    }
+
+    fn get(&self, key: &BasisCacheKey) -> Option<Array2<f64>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("basis cache mutex should not be poisoned");
+        if let Some(entry) = guard.map.get(key) {
+            guard.hits = guard.hits.saturating_add(1);
+            guard.touch(key);
+            Some(entry.basis.clone())
+        } else {
+            guard.misses = guard.misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn insert(&self, key: BasisCacheKey, basis: Array2<f64>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("basis cache mutex should not be poisoned");
+        guard.insert(key, basis);
+    }
+
+    fn clear(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("basis cache mutex should not be poisoned");
+        guard.map.clear();
+        guard.order.clear();
+        guard.hits = 0;
+        guard.misses = 0;
+    }
+
+    fn stats(&self) -> BasisCacheStats {
+        let guard = self
+            .inner
+            .lock()
+            .expect("basis cache mutex should not be poisoned");
+        BasisCacheStats {
+            hits: guard.hits,
+            misses: guard.misses,
+        }
+    }
+
+    fn set_max_size(&self, new_max: usize) {
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("basis cache mutex should not be poisoned");
+        guard.set_max_size(new_max);
+    }
+}
+
+fn global_basis_cache() -> &'static BasisCache {
+    static CACHE: OnceLock<BasisCache> = OnceLock::new();
+    CACHE.get_or_init(|| BasisCache::new(DEFAULT_BASIS_CACHE_CAPACITY))
+}
+
+fn quantize_value(value: f64) -> i64 {
+    if value.is_nan() {
+        i64::MIN
+    } else {
+        let scaled = (value * 1e12).round();
+        if !scaled.is_finite() {
+            i64::MAX
+        } else {
+            let clamped = scaled.max(i64::MIN as f64).min(i64::MAX as f64);
+            clamped as i64
+        }
+    }
+}
+
+fn hash_array_view(view: ArrayView1<'_, f64>) -> u64 {
+    let mut hasher = AHasher::default();
+    for &value in view.iter() {
+        quantize_value(value).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn make_cache_key(
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    data: ArrayView1<'_, f64>,
+    derivative: usize,
+) -> BasisCacheKey {
+    BasisCacheKey {
+        knot_hash: hash_array_view(knots),
+        degree,
+        data_hash: hash_array_view(data),
+        derivative,
+    }
+}
+
+pub fn clear_basis_cache() {
+    global_basis_cache().clear();
+}
+
+pub fn set_basis_cache_max_size(max_size: usize) {
+    global_basis_cache().set_max_size(max_size);
+}
+
+pub fn basis_cache_stats() -> BasisCacheStats {
+    global_basis_cache().stats()
+}
+
 /// Creates a B-spline basis matrix using a pre-computed knot vector.
 /// This function is used during prediction to ensure exact reproduction of training basis.
 ///
@@ -136,6 +348,13 @@ pub fn create_bspline_basis_with_knots(
 
     let knot_vec = knot_vector.to_owned();
     let knot_view = knot_vec.view();
+
+    let cache_key = make_cache_key(knot_view, degree, data, 0);
+
+    if let Some(cached) = global_basis_cache().get(&cache_key) {
+        return Ok((cached, knot_vec));
+    }
+
     let num_basis_functions = knot_view.len() - degree - 1;
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
@@ -176,6 +395,8 @@ pub fn create_bspline_basis_with_knots(
         let mut scratch = internal::BsplineScratch::new(degree);
         fill_rows(&mut scratch);
     }
+
+    global_basis_cache().insert(cache_key, basis_matrix.clone());
 
     Ok((basis_matrix, knot_vec))
 }
@@ -232,6 +453,12 @@ pub fn create_bspline_basis(
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
     let knot_view = knot_vector.view();
 
+    let cache_key = make_cache_key(knot_view, degree, data, 0);
+
+    if let Some(cached) = global_basis_cache().get(&cache_key) {
+        return Ok((cached, knot_vector));
+    }
+
     // The number of B-spline basis functions for a given knot vector and degree `d` is
     // n = k - d - 1, where k is the number of knots.
     // Our knot vector has k = num_internal_knots + 2 * (degree + 1) knots.
@@ -277,6 +504,8 @@ pub fn create_bspline_basis(
         let mut scratch = internal::BsplineScratch::new(degree);
         fill_rows(&mut scratch);
     }
+
+    global_basis_cache().insert(cache_key, basis_matrix.clone());
 
     Ok((basis_matrix, knot_vector))
 }
@@ -879,6 +1108,28 @@ mod tests {
                 sum
             );
         }
+    }
+
+    #[test]
+    fn test_basis_cache_returns_identical_results() {
+        clear_basis_cache();
+
+        let data = Array::linspace(0.0, 1.0, 25);
+        let (fresh_basis, knots) =
+            create_bspline_basis(data.view(), (0.0, 1.0), 5, 3).expect("fresh basis");
+
+        let (cached_basis, _) =
+            create_bspline_basis_with_knots(data.view(), knots.view(), 3).expect("cached basis");
+
+        assert_abs_diff_eq!(
+            fresh_basis.as_slice().unwrap(),
+            cached_basis.as_slice().unwrap(),
+            epsilon = 1e-14
+        );
+
+        let stats = basis_cache_stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[test]
