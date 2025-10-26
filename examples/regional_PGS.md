@@ -217,3 +217,9 @@ plt.show()
 <img width="563" height="383" alt="image" src="https://github.com/user-attachments/assets/68f8d0e4-e263-457b-adfc-ed207cbdc4ac" />
 
 Most individuals overlap between srWGS and microarray. There is a small subset of the microarray cohort which is absent from srWGS.
+
+Let's run our final set of six scores in the terminal:
+
+```
+./gnomon/target/release/gnomon score "PGS004378 | chr17:45535159-46342045, PGS005198 | chr17:45535159-46342045, PGS004146 | chr17:45535159-46342045, PGS004229 | chr17:45535159-46342045, PGS004869 | chr17:45535159-46342045, PGS000507 | chr17:45535159-46342045" arrays
+```
