@@ -806,9 +806,10 @@ pub fn train_model(
 
         let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
         // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
-        let h_trans = final_fit.penalized_hessian_transformed.clone();
         let qs = &final_fit.reparam_result.qs;
-        let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+        let penalized_hessian_orig = qs
+            .dot(&final_fit.penalized_hessian_transformed)
+            .dot(&qs.t());
         // Compute scale for Identity; 1.0 for Logit
         let scale_val = match config.link_function {
             LinkFunction::Logit => 1.0,
@@ -1249,9 +1250,10 @@ pub fn train_model(
     // back to the original, interpretable basis.
     let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
     // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
-    let h_trans = final_fit.penalized_hessian_transformed.clone();
     let qs = &final_fit.reparam_result.qs;
-    let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+    let penalized_hessian_orig = qs
+        .dot(&final_fit.penalized_hessian_transformed)
+        .dot(&qs.t());
     // Compute scale for Identity; 1.0 for Logit
     let scale_val = match config.link_function {
         LinkFunction::Logit => 1.0,
@@ -1635,14 +1637,13 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
         y_o.view(),
         w_o.view(),
-        &rs_list_ref,
+        &rs_list,
         &layout,
         &cfg,
     )?;
