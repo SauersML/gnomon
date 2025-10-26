@@ -698,6 +698,7 @@ pub fn build_design_and_penalty_matrices(
         create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)?;
     let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(&s_pgs_main)?;
     let pgs_null_projector = z_null_pgs.dot(&z_null_pgs.t());
+    let pgs_null_projector_norm = frobenius_norm(&pgs_null_projector);
 
     // Store PGS range transformation for interactions and potential future penalized PGS
     range_transforms.insert("pgs".to_string(), z_range_pgs);
@@ -709,6 +710,9 @@ pub fn build_design_and_penalty_matrices(
     let mut pc_range_bases: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
     let mut pc_null_bases: Vec<Option<Array2<f64>>> = Vec::with_capacity(n_pcs);
     let mut pc_unconstrained_bases_main: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
+    let mut pc_diff_penalties: Vec<Array2<f64>> = Vec::with_capacity(n_pcs);
+    let mut pc_penalty_norms: Vec<f64> = Vec::with_capacity(n_pcs);
+    let mut pc_null_projector_norms: Vec<Option<f64>> = Vec::with_capacity(n_pcs);
 
     // Check if we have any PCs to process
     if config.pc_configs.is_empty() {
@@ -736,6 +740,7 @@ pub fn build_design_and_penalty_matrices(
         // Create whitened range transform for PC main effects
         let s_pc_main =
             create_difference_penalty_matrix(pc_main_basis_unc.ncols(), config.penalty_order)?;
+        let penalty_norm = frobenius_norm(&s_pc_main);
         let (z_null_pc, z_range_pc) = basis::null_range_whiten(&s_pc_main)?;
 
         // PC main effect uses ONLY the range (penalized) part
@@ -747,14 +752,19 @@ pub fn build_design_and_penalty_matrices(
             let pc_null_basis = pc_main_basis_unc.dot(&z_null_pc);
             pc_null_bases.push(Some(pc_null_basis));
             pc_null_transforms.insert(pc_name.clone(), z_null_pc.clone());
-            pc_null_projectors.push(Some(z_null_pc.dot(&z_null_pc.t())));
+            let projector = z_null_pc.dot(&z_null_pc.t());
+            pc_null_projector_norms.push(Some(frobenius_norm(&projector)));
+            pc_null_projectors.push(Some(projector));
         } else {
             pc_null_bases.push(None);
+            pc_null_projector_norms.push(None);
             pc_null_projectors.push(None);
         }
 
         // Store PC range transformation for interactions and main effects
         range_transforms.insert(pc_name.clone(), z_range_pc);
+        pc_penalty_norms.push(penalty_norm);
+        pc_diff_penalties.push(s_pc_main);
     }
 
     // Stage: Calculate the layout first to determine matrix dimensions
@@ -819,6 +829,7 @@ pub fn build_design_and_penalty_matrices(
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
     let mut s_list = Vec::with_capacity(layout.num_penalties);
+    let mut identity_cache: HashMap<usize, Array2<f64>> = HashMap::new();
 
     // Initialize all penalty matrices as zeros
     for _ in 0..layout.num_penalties {
@@ -876,6 +887,9 @@ pub fn build_design_and_penalty_matrices(
     } else {
         None
     };
+    let pgs_penalty_norm_opt = s_pgs_interaction
+        .as_ref()
+        .map(|penalty| frobenius_norm(penalty));
 
     for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
         if pc_idx >= layout.interaction_block_idx.len() {
@@ -922,8 +936,11 @@ pub fn build_design_and_penalty_matrices(
                 let i_pgs = i_pgs_interaction
                     .as_ref()
                     .expect("PGS identity matrix missing in anisotropic mode");
-                let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)?;
-                let i_pc = Array2::<f64>::eye(pc_cols);
+                let s_pc = &pc_diff_penalties[pc_idx];
+                let pc_penalty_norm = pc_penalty_norms[pc_idx];
+                let i_pc = identity_cache
+                    .entry(pc_cols)
+                    .or_insert_with(|| Array2::<f64>::eye(pc_cols));
 
                 let pc_null_projector = pc_null_projectors[pc_idx]
                     .as_ref()
@@ -933,11 +950,21 @@ pub fn build_design_and_penalty_matrices(
                             pc_config.name
                         ))
                     })?;
+                let pc_null_norm = pc_null_projector_norms[pc_idx]
+                    .ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "PC {} is missing a null-space projector required for anisotropic interaction penalties",
+                            pc_config.name
+                        ))
+                    })?;
 
-                let nf1 = (frobenius_norm(s_pgs) * (pc_cols as f64).sqrt()).max(1e-12);
-                let nf2 = (frobenius_norm(&s_pc) * (pgs_cols as f64).sqrt()).max(1e-12);
-                let nf3_raw =
-                    frobenius_norm(&pgs_null_projector) * frobenius_norm(pc_null_projector);
+                let pgs_penalty_norm = *pgs_penalty_norm_opt
+                    .as_ref()
+                    .expect("PGS penalty norm missing in anisotropic mode");
+
+                let nf1 = (pgs_penalty_norm * (pc_cols as f64).sqrt()).max(1e-12);
+                let nf2 = (pc_penalty_norm * (pgs_cols as f64).sqrt()).max(1e-12);
+                let nf3_raw = pgs_null_projector_norm * pc_null_norm;
                 if nf3_raw <= 1e-12 {
                     return Err(EstimationError::LayoutError(format!(
                         "Null interaction penalty for f(PGS,{}) is numerically zero; purity projection should leave a non-trivial null⊗null span",
@@ -953,13 +980,13 @@ pub fn build_design_and_penalty_matrices(
                 write_scaled_kronecker(
                     s_list[penalty_idx_pgs].slice_mut(s![col_range.clone(), col_range.clone()]),
                     s_pgs,
-                    &i_pc,
+                    i_pc,
                     1.0 / nf1,
                 );
                 write_scaled_kronecker(
                     s_list[penalty_idx_pc].slice_mut(s![col_range.clone(), col_range.clone()]),
                     i_pgs,
-                    &s_pc,
+                    s_pc,
                     1.0 / nf2,
                 );
                 write_scaled_kronecker(
@@ -979,10 +1006,13 @@ pub fn build_design_and_penalty_matrices(
     let mut x_matrix = Array2::zeros((n_samples, layout.total_coeffs));
 
     // Stage: Populate the intercept column first
-    x_matrix.column_mut(layout.intercept_col).fill(1.0);
+    let intercept_basis = Array1::from_elem(n_samples, 1.0);
+    x_matrix
+        .column_mut(layout.intercept_col)
+        .assign(&intercept_basis);
 
     // Stage: Add sex main effect (single column, unpenalized)
-    if let Some(sex_col) = layout.sex_col {
+    let sex_main_matrix = if let Some(sex_col) = layout.sex_col {
         if data.sex.len() != n_samples {
             return Err(EstimationError::LayoutError(format!(
                 "Sex vector length {} does not match number of samples {}",
@@ -991,7 +1021,10 @@ pub fn build_design_and_penalty_matrices(
             )));
         }
         x_matrix.column_mut(sex_col).assign(&data.sex);
-    }
+        Some(data.sex.to_owned().insert_axis(Axis(1)))
+    } else {
+        None
+    };
 
     // Stage: Fill main PC effects (null-space first, then penalized range)
     for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
@@ -1022,31 +1055,28 @@ pub fn build_design_and_penalty_matrices(
             }
         }
         // Fill penalized range-space columns
-        for block in &layout.penalty_map {
-            if block.term_name == format!("f({pc_name})") {
-                let col_range = block.col_range.clone();
-                let pc_basis = &pc_range_bases[pc_idx];
+        let block_idx = layout.pc_main_block_idx[pc_idx];
+        let block = &layout.penalty_map[block_idx];
+        let col_range = block.col_range.clone();
+        let pc_basis = &pc_range_bases[pc_idx];
 
-                if pc_basis.nrows() != n_samples {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC range basis {} has {} rows but expected {} samples",
-                        pc_name,
-                        pc_basis.nrows(),
-                        n_samples
-                    )));
-                }
-                if pc_basis.ncols() != col_range.len() {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC range basis {} has {} columns but layout expects {} columns",
-                        pc_name,
-                        pc_basis.ncols(),
-                        col_range.len()
-                    )));
-                }
-                x_matrix.slice_mut(s![.., col_range]).assign(pc_basis);
-                break;
-            }
+        if pc_basis.nrows() != n_samples {
+            return Err(EstimationError::LayoutError(format!(
+                "PC range basis {} has {} rows but expected {} samples",
+                pc_name,
+                pc_basis.nrows(),
+                n_samples
+            )));
         }
+        if pc_basis.ncols() != col_range.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "PC range basis {} has {} columns but layout expects {} columns",
+                pc_name,
+                pc_basis.ncols(),
+                col_range.len()
+            )));
+        }
+        x_matrix.slice_mut(s![.., col_range]).assign(pc_basis);
     }
 
     // Stage: Populate the main PGS effect directly from the layout range
@@ -1093,28 +1123,25 @@ pub fn build_design_and_penalty_matrices(
             row *= sex_value;
         }
 
-        let intercept = x_matrix.column(layout.intercept_col).to_owned();
-        let sex_main = layout.sex_col.ok_or_else(|| {
+        let sex_main_cols = sex_main_matrix.as_ref().ok_or_else(|| {
             EstimationError::LayoutError(
                 "Layout is missing the sex main-effect column required for the sex×PGS interaction"
                     .to_string(),
             )
         })?;
-        let sex_main_cols = x_matrix.slice(s![.., sex_main..sex_main + 1]).to_owned();
-        let pgs_main = pgs_main_basis.to_owned();
 
-        let m_cols = 1 + sex_main_cols.ncols() + pgs_main.ncols();
+        let m_cols = 1 + sex_main_cols.ncols() + pgs_main_basis.ncols();
         let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
         let mut offset = 0;
-        m_matrix.column_mut(offset).assign(&intercept);
+        m_matrix.column_mut(offset).assign(&intercept_basis);
         offset += 1;
         m_matrix
             .slice_mut(s![.., offset..offset + sex_main_cols.ncols()])
-            .assign(&sex_main_cols);
+            .assign(sex_main_cols);
         offset += sex_main_cols.ncols();
         m_matrix
-            .slice_mut(s![.., offset..offset + pgs_main.ncols()])
-            .assign(&pgs_main);
+            .slice_mut(s![.., offset..offset + pgs_main_basis.ncols()])
+            .assign(&pgs_main_basis);
 
         let mw = &m_matrix * &w_col;
         let tw = &sex_pgs_basis * &w_col;
@@ -1179,14 +1206,8 @@ pub fn build_design_and_penalty_matrices(
                             "PGS interaction basis missing in isotropic mode".to_string(),
                         )
                     })?;
-                    let z_range_pc = range_transforms.get(pc_name).ok_or_else(|| {
-                        EstimationError::LayoutError(format!(
-                            "Missing '{}' in range_transforms",
-                            pc_name
-                        ))
-                    })?;
-                    let pc_int_basis = pc_unconstrained_bases_main[pc_idx].dot(z_range_pc);
-                    row_wise_tensor_product(pgs_int_basis, &pc_int_basis)
+                    let pc_int_basis = &pc_range_bases[pc_idx];
+                    row_wise_tensor_product(pgs_int_basis, pc_int_basis)
                 }
                 InteractionPenaltyKind::Anisotropic => {
                     let pgs_int_basis = &pgs_main_basis_unc;
@@ -1215,39 +1236,23 @@ pub fn build_design_and_penalty_matrices(
             }
 
             // Build main-effect matrix M = [Intercept | Sex | PGS_main | PC_main_for_this_pc (null + range)]
-            // Extract intercept, sex, and PGS main
-            let intercept = x_matrix.column(layout.intercept_col).to_owned();
-            let sex_main = layout
-                .sex_col
-                .map(|col| x_matrix.slice(s![.., col..col + 1]).to_owned());
-            let pgs_main = x_matrix
-                .slice(s![.., layout.pgs_main_cols.clone()])
-                .to_owned();
-            // Extract this PC's main effect columns: null then range
-            let pc_block = &layout.penalty_map[layout.pc_main_block_idx[pc_idx]];
-            let pc_null_cols = &layout.pc_null_cols[pc_idx];
-            let pc_null = if pc_null_cols.len() > 0 {
-                Some(x_matrix.slice(s![.., pc_null_cols.clone()]).to_owned())
-            } else {
-                None
-            };
-            let pc_range = x_matrix
-                .slice(s![.., pc_block.col_range.clone()])
-                .to_owned();
+            let sex_main = sex_main_matrix.as_ref();
+            let pc_null = pc_null_bases[pc_idx].as_ref();
+            let pc_range = &pc_range_bases[pc_idx];
 
             // Preallocate M = [Intercept | Sex (opt) | PGS_main | PC_null (opt) | PC_range]
             let m_cols = 1
-                + sex_main.as_ref().map_or(0, |z| z.ncols())
-                + pgs_main.ncols()
-                + pc_null.as_ref().map_or(0, |z| z.ncols())
+                + sex_main.map_or(0, |z| z.ncols())
+                + pgs_main_basis.ncols()
+                + pc_null.map_or(0, |z| z.ncols())
                 + pc_range.ncols();
             let mut m_matrix = Array2::<f64>::zeros((n_samples, m_cols));
             let mut offset = 0;
             // Intercept
-            m_matrix.column_mut(offset).assign(&intercept);
+            m_matrix.column_mut(offset).assign(&intercept_basis);
             offset += 1;
             // Sex main effect (if present)
-            if let Some(sex_col) = sex_main.as_ref() {
+            if let Some(sex_col) = sex_main {
                 m_matrix
                     .slice_mut(s![.., offset..offset + sex_col.ncols()])
                     .assign(sex_col);
@@ -1255,11 +1260,11 @@ pub fn build_design_and_penalty_matrices(
             }
             // PGS_main
             m_matrix
-                .slice_mut(s![.., offset..offset + pgs_main.ncols()])
-                .assign(&pgs_main);
-            offset += pgs_main.ncols();
+                .slice_mut(s![.., offset..offset + pgs_main_basis.ncols()])
+                .assign(&pgs_main_basis);
+            offset += pgs_main_basis.ncols();
             // PC_null
-            if let Some(pc_n) = pc_null.as_ref() {
+            if let Some(pc_n) = pc_null {
                 m_matrix
                     .slice_mut(s![.., offset..offset + pc_n.ncols()])
                     .assign(pc_n);
