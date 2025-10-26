@@ -9,6 +9,143 @@ use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
 use std::ops::Range;
 
+fn max_abs_element(matrix: &Array2<f64>) -> f64 {
+    matrix
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, |acc, &val| acc.max(val.abs()))
+}
+
+fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
+    let (rows, cols) = matrix.dim();
+    debug_assert_eq!(rows, cols, "Matrix must be square for sanitization");
+
+    let mut sanitized = matrix.clone();
+
+    for i in 0..rows {
+        let diag = sanitized[[i, i]];
+        if !diag.is_finite() {
+            sanitized[[i, i]] = 0.0;
+        }
+        for j in (i + 1)..cols {
+            let mut upper = sanitized[[i, j]];
+            let mut lower = sanitized[[j, i]];
+            if !upper.is_finite() {
+                upper = 0.0;
+            }
+            if !lower.is_finite() {
+                lower = 0.0;
+            }
+            let avg = 0.5 * (upper + lower);
+            sanitized[[i, j]] = avg;
+            sanitized[[j, i]] = avg;
+        }
+    }
+
+    let scale = max_abs_element(&sanitized);
+    let tiny = (scale * 1e-14).max(1e-30);
+    for val in sanitized.iter_mut() {
+        if !val.is_finite() {
+            *val = 0.0;
+        } else if val.abs() < tiny {
+            *val = 0.0;
+        }
+    }
+
+    sanitized
+}
+
+fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
+    let full = root.t().dot(root);
+    sanitize_symmetric(&full)
+}
+
+fn robust_eigh(
+    matrix: &Array2<f64>,
+    side: Side,
+    context: &str,
+) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+    if matrix.iter().any(|v| !v.is_finite()) {
+        let max_abs = max_abs_element(matrix);
+        return Err(EstimationError::InvalidInput(format!(
+            "{} contains non-finite entries (max finite magnitude {:.3e})",
+            context, max_abs
+        )));
+    }
+
+    let mut candidate = sanitize_symmetric(matrix);
+    let mut ridge = 0.0_f64;
+
+    for attempt in 0..4 {
+        match candidate.eigh(side) {
+            Ok((mut eigenvalues, eigenvectors)) => {
+                let scale = eigenvalues
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+                let tolerance = if scale.is_finite() {
+                    (scale * 1e-12).max(1e-12)
+                } else {
+                    1e-12
+                };
+
+                for val in eigenvalues.iter_mut() {
+                    if !val.is_finite() {
+                        *val = 0.0;
+                        continue;
+                    }
+                    if val.abs() < tolerance {
+                        *val = 0.0;
+                    } else if *val < 0.0 {
+                        if val.abs() <= tolerance * 10.0 {
+                            *val = 0.0;
+                        } else {
+                            log::warn!(
+                                "{} produced large negative eigenvalue {:.3e}; clamping for stability",
+                                context,
+                                *val
+                            );
+                            *val = 0.0;
+                        }
+                    }
+                }
+
+                return Ok((eigenvalues, eigenvectors));
+            }
+            Err(err) => {
+                if attempt == 3 {
+                    return Err(EstimationError::EigendecompositionFailed(err));
+                }
+
+                let diag_scale = candidate
+                    .diag()
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .fold(0.0_f64, |acc, &val| acc.max(val.abs()));
+                let base = if diag_scale.is_finite() {
+                    (diag_scale * 1e-8).max(1e-10)
+                } else {
+                    1e-8
+                };
+
+                ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
+                for i in 0..candidate.nrows() {
+                    candidate[[i, i]] += ridge;
+                }
+
+                log::warn!(
+                    "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
+                    context,
+                    attempt + 1,
+                    ridge
+                );
+            }
+        }
+    }
+
+    unreachable!("robust_eigh should return or error within 4 attempts")
+}
+
 /// Computes weighted column means for functional ANOVA decomposition.
 /// Returns the weighted means that would be subtracted by center_columns_in_place.
 fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
@@ -1280,9 +1417,8 @@ pub fn create_balanced_penalty_root(
     }
 
     // Take the matrix square root of the balanced penalty
-    let (eigenvalues, eigenvectors) = s_balanced
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
+    let (eigenvalues, eigenvectors) =
+        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
 
     // Find the maximum eigenvalue to create a relative tolerance
     let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
@@ -1328,9 +1464,7 @@ pub fn compute_penalty_square_roots(
         let p = s.nrows();
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
-        let (eigenvalues, eigenvectors) = s
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
+        let (eigenvalues, eigenvectors) = robust_eigh(s, Side::Lower, "penalty matrix")?;
 
         // Count positive eigenvalues to determine rank
         // Find the maximum eigenvalue to create a relative tolerance
@@ -1467,7 +1601,8 @@ pub fn stable_reparameterization(
 
     // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
     // These will NEVER be modified and are used for building the sb matrix
-    let s_original_list: Vec<Array2<f64>> = rs_list.iter().map(|rs_k| rs_k.t().dot(rs_k)).collect();
+    let s_original_list: Vec<Array2<f64>> =
+        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
 
     // Create the WORKING copy that will be transformed
     let mut s_current_list = s_original_list.clone();
@@ -1590,9 +1725,8 @@ pub fn stable_reparameterization(
         }
 
         // Eigendecompose the balanced matrix to get stable eigenvalues for rank detection
-        let (eigenvalues_for_rank, _) = sb_for_rank
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
+        let (eigenvalues_for_rank, _) =
+            robust_eigh(&sb_for_rank, Side::Lower, "stable rank detection matrix")?;
 
         // Determine rank 'r' using these stable eigenvalues
         let max_eigenval = eigenvalues_for_rank
@@ -1663,9 +1797,11 @@ pub fn stable_reparameterization(
 
         // Eigendecomposition to get eigenvectors 'u' for the similarity transform
         // We DISCARD the eigenvalues from this decomposition - only use eigenvectors
-        let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = sb_for_transform
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
+        let (eigenvalues_for_transform, u): (Array1<f64>, Array2<f64>) = robust_eigh(
+            &sb_for_transform,
+            Side::Lower,
+            "lambda-weighted penalty matrix",
+        )?;
 
         // SAFETY CHECK: Validate that the two decompositions agree on the rank
         // If the lambda-weighted matrix has significantly different rank structure,
@@ -1870,14 +2006,13 @@ pub fn stable_reparameterization(
     let mut s_transformed = Array2::zeros((p, p));
     for i in 0..m {
         // Form full penalty from transformed root: S_k = rS_k^T * rS_k
-        let s_k_transformed = final_rs_transformed[i].t().dot(&final_rs_transformed[i]);
+        let s_k_transformed = penalty_from_root(&final_rs_transformed[i]);
         s_transformed.scaled_add(lambdas[i], &s_k_transformed);
     }
 
     // Stage: Compute the eigendecomposition of S_lambda
-    let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) = s_transformed
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
+    let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) =
+        robust_eigh(&s_transformed, Side::Lower, "combined penalty matrix")?;
     // Use a small constant ridge epsilon for smoothed logdet/inverse; keep it lambda-independent
     // keep for possible future smoothing: not used when using pseudo-determinant
     // let _ridge_eps: f64 = 1e-8;
@@ -1937,7 +2072,7 @@ pub fn stable_reparameterization(
 
     // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
     for k in 0..lambdas.len() {
-        let s_k_transformed = final_rs_transformed[k].t().dot(&final_rs_transformed[k]);
+        let s_k_transformed = penalty_from_root(&final_rs_transformed[k]);
         let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
         let trace: f64 = s_plus_times_s_k.diag().sum();
         det1[k] = lambdas[k] * trace;
@@ -2006,7 +2141,7 @@ mod tests {
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
     use approx::assert_abs_diff_eq;
-    use ndarray::{Array1, Array2};
+    use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -2340,6 +2475,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn penalty_square_roots_clean_near_singular_penalty() {
+        let root = array![[1.0, 0.0, 0.0], [0.0, 1e-6, 1e-6],];
+        let mut penalty = root.t().dot(&root);
+        penalty[[0, 1]] += 5e-13;
+        penalty[[1, 0]] -= 5e-13;
+
+        let roots = compute_penalty_square_roots(&[penalty.clone()]).expect("square roots");
+        assert_eq!(roots.len(), 1);
+
+        let rebuilt = roots[0].t().dot(&roots[0]);
+        let sanitized = sanitize_symmetric(&penalty);
+        for i in 0..sanitized.nrows() {
+            for j in 0..sanitized.ncols() {
+                assert_abs_diff_eq!(rebuilt[[i, j]], sanitized[[i, j]], epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn robust_eigh_clamps_small_negative_modes() {
+        let mat = array![[1.0, 0.0], [0.0, -1e-13]];
+        let (eigs, vectors) =
+            robust_eigh(&mat, Side::Lower, "test matrix").expect("robust eigen decomposition");
+        let positive_count = eigs.iter().filter(|&&val| val > 0.0).count();
+        assert!(positive_count >= 1);
+        assert!(eigs.iter().all(|val| *val >= 0.0));
+        assert!(eigs.iter().any(|val| *val == 0.0));
+        assert_eq!(vectors.nrows(), 2);
     }
 
     #[test]
