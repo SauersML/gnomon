@@ -1,5 +1,6 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
+use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use thiserror::Error;
 
@@ -122,16 +123,34 @@ pub fn create_bspline_basis_with_knots(
         ));
     }
 
-    let num_basis_functions = knot_vector.len() - degree - 1;
+    let knot_vec = knot_vector.to_owned();
+    let knot_view = knot_vec.view();
+    let num_basis_functions = knot_view.len() - degree - 1;
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
-    // Evaluate the splines for each data point
-    for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector);
-        basis_matrix.row_mut(i).assign(&basis_row);
+    const PAR_THRESHOLD: usize = 256;
+    if data.len() >= PAR_THRESHOLD {
+        let data_vec: Vec<f64> = data.to_vec();
+        basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data_vec.into_par_iter())
+            .for_each(|(mut row, x)| {
+                let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+                row.assign(&basis_row);
+            });
+    } else {
+        for (mut row, &x) in basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_iter()
+            .zip(data.iter())
+        {
+            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+            row.assign(&basis_row);
+        }
     }
 
-    Ok((basis_matrix, knot_vector.to_owned()))
+    Ok((basis_matrix, knot_vec))
 }
 
 /// Creates a B-spline basis expansion matrix with uniformly spaced knots.
@@ -184,21 +203,36 @@ pub fn create_bspline_basis(
     }
 
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
+    let knot_view = knot_vector.view();
 
     // The number of B-spline basis functions for a given knot vector and degree `d` is
     // n = k - d - 1, where k is the number of knots.
     // Our knot vector has k = num_internal_knots + 2 * (degree + 1) knots.
     // So, n = (num_internal_knots + 2*d + 2) - d - 1 = num_internal_knots + d + 1.
-    let num_basis_functions = knot_vector.len() - degree - 1;
+    let num_basis_functions = knot_view.len() - degree - 1;
 
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
-    // Evaluate the splines for each data point.
-    // This structure allows the inner loop (de Boor's) to be highly optimized
-    // and cache-friendly for a single point `x`.
-    for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
-        basis_matrix.row_mut(i).assign(&basis_row);
+    const PAR_THRESHOLD: usize = 256;
+    if data.len() >= PAR_THRESHOLD {
+        let data_vec: Vec<f64> = data.to_vec();
+        basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data_vec.into_par_iter())
+            .for_each(|(mut row, x)| {
+                let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+                row.assign(&basis_row);
+            });
+    } else {
+        for (mut row, &x) in basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_iter()
+            .zip(data.iter())
+        {
+            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+            row.assign(&basis_row);
+        }
     }
 
     Ok((basis_matrix, knot_vector))
