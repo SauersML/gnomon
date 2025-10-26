@@ -170,8 +170,10 @@ impl RidgePlanner {
 }
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
+use ahash::AHasher;
+use hashbrown::{HashMap, hash_map::RawEntryMut};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -1998,23 +2000,73 @@ pub mod internal {
     /// `RefCell` allows us to mutate the cache through a `&self` reference,
     /// making this optimization possible while adhering to the optimizer's API.
 
+    #[inline]
+    fn sanitized_rho_component(value: f64) -> Option<u64> {
+        if value.is_nan() {
+            return None;
+        }
+        if value == 0.0 {
+            Some(0.0f64.to_bits())
+        } else {
+            Some(value.to_bits())
+        }
+    }
+
+    fn rho_hash(rho: &Array1<f64>) -> Option<u64> {
+        let mut hasher = AHasher::default();
+        hasher.write_usize(rho.len());
+        for &value in rho.iter() {
+            let bits = sanitized_rho_component(value)?;
+            hasher.write_u64(bits);
+        }
+        Some(hasher.finish())
+    }
+
+    fn rho_matches_bits(rho: &Array1<f64>, bits: &[u64]) -> bool {
+        if rho.len() != bits.len() {
+            return false;
+        }
+        for (&value, &stored_bits) in rho.iter().zip(bits.iter()) {
+            let Some(bits) = sanitized_rho_component(value) else {
+                return false;
+            };
+            if bits != stored_bits {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn rho_key_arc(rho: &Array1<f64>) -> Option<Arc<[u64]>> {
+        let mut bits = Vec::with_capacity(rho.len());
+        for &value in rho.iter() {
+            bits.push(sanitized_rho_component(value)?);
+        }
+        Some(Arc::<[u64]>::from(bits))
+    }
+
+    fn rho_has_nan(rho: &Array1<f64>) -> bool {
+        rho.iter().any(|v| v.is_nan())
+    }
+
     #[derive(Clone)]
     struct EvalShared {
-        key: Option<Vec<u64>>,
+        key: Option<Arc<[u64]>>,
         pirls_result: Arc<PirlsResult>,
         h_eff: Arc<Array2<f64>>,
         ridge_used: f64,
     }
 
     impl EvalShared {
-        fn matches(&self, key: &Option<Vec<u64>>) -> bool {
-            match (&self.key, key) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a == b,
-                _ => false,
+        fn matches_rho(&self, rho: &Array1<f64>) -> bool {
+            match &self.key {
+                Some(bits) => rho_matches_bits(rho, bits.as_ref()),
+                None => rho_has_nan(rho),
             }
         }
     }
+
+    type RhoCache<T> = HashMap<Arc<[u64]>, Arc<T>, BuildHasherDefault<AHasher>>;
 
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
@@ -2028,8 +2080,8 @@ pub mod internal {
         config: &'a ModelConfig,
         nullspace_dims: Vec<usize>,
 
-        cache: RefCell<HashMap<Vec<u64>, Arc<PirlsResult>>>,
-        faer_factor_cache: RefCell<HashMap<Vec<u64>, Arc<FaerFactor>>>,
+        cache: RefCell<RhoCache<PirlsResult>>,
+        faer_factor_cache: RefCell<RhoCache<FaerFactor>>,
         eval_count: RefCell<u64>,
         last_cost: RefCell<f64>,
         last_grad_norm: RefCell<f64>,
@@ -2212,8 +2264,8 @@ pub mod internal {
                 layout,
                 config,
                 nullspace_dims,
-                cache: RefCell::new(HashMap::new()),
-                faer_factor_cache: RefCell::new(HashMap::new()),
+                cache: RefCell::new(HashMap::default()),
+                faer_factor_cache: RefCell::new(HashMap::default()),
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
@@ -2223,31 +2275,8 @@ pub mod internal {
             })
         }
 
-        /// Creates a sanitized cache key from rho values.
-        /// Returns None if any component is NaN, which indicates that caching should be skipped.
-        /// Maps -0.0 to 0.0 to ensure consistency in caching.
-        fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
-            let mut key = Vec::with_capacity(rho.len());
-            for &v in rho.iter() {
-                if v.is_nan() {
-                    return None; // Don't cache NaN values
-                }
-                if v == 0.0 {
-                    // This handles both +0.0 and -0.0
-                    key.push(0.0f64.to_bits());
-                } else {
-                    key.push(v.to_bits());
-                }
-            }
-            Some(key)
-        }
-
-        fn prepare_eval_bundle_with_key(
-            &self,
-            rho: &Array1<f64>,
-            key: Option<Vec<u64>>,
-        ) -> Result<EvalShared, EstimationError> {
-            let pirls_result = self.execute_pirls_if_needed(rho)?;
+        fn prepare_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
+            let (pirls_result, key) = self.execute_pirls_if_needed(rho)?;
             let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
             Ok(EvalShared {
                 key,
@@ -2258,13 +2287,12 @@ pub mod internal {
         }
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
-            let key = self.rho_key_sanitized(rho);
             if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
-                if existing.matches(&key) {
+                if existing.matches_rho(rho) {
                     return Ok(existing.clone());
                 }
             }
-            let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
+            let bundle = self.prepare_eval_bundle(rho)?;
             *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
             Ok(bundle)
         }
@@ -2403,20 +2431,30 @@ pub mod internal {
             // path ever appears, extend the key (for example by tagging the Hessian variant) or
             // split the cache.  Until then we prefer the cheaper key because it maximizes cache
             // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
-            let key_opt = self.rho_key_sanitized(rho);
-            if let Some(key) = &key_opt {
-                if let Some(f) = self.faer_factor_cache.borrow().get(key) {
-                    return Arc::clone(f);
+            if let Some(hash) = rho_hash(rho) {
+                if let Some(fact) = {
+                    let mut cache = self.faer_factor_cache.borrow_mut();
+                    match cache
+                        .raw_entry_mut()
+                        .from_hash(hash, |existing_key: &Arc<[u64]>| {
+                            rho_matches_bits(rho, existing_key.as_ref())
+                        }) {
+                        RawEntryMut::Occupied(entry) => Some(Arc::clone(entry.get())),
+                        RawEntryMut::Vacant(_) => None,
+                    }
+                } {
+                    return fact;
                 }
             }
+
             let fact = Arc::new(self.factorize_faer(h));
 
-            if let Some(key) = key_opt {
+            if let Some(key) = rho_key_arc(rho) {
                 let mut cache = self.faer_factor_cache.borrow_mut();
                 if cache.len() > 64 {
                     cache.clear();
                 }
-                cache.insert(key, Arc::clone(&fact));
+                cache.insert(Arc::clone(&key), Arc::clone(&fact));
             }
             fact
         }
@@ -2424,7 +2462,7 @@ pub mod internal {
         /// Evaluate the penalized log-likelihood part at rho using the converged PIRLS state.
         /// Matches compute_cost’s definition: penalised_ll = -0.5*deviance - 0.5*beta'S_lambda beta.
         fn penalised_ll_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-            let pr = self.execute_pirls_if_needed(rho)?;
+            let (pr, _) = self.execute_pirls_if_needed(rho)?;
             let penalty = pr.stable_penalty_term;
             let penalised = -0.5 * pr.deviance - 0.5 * penalty;
             if self.config.firth_bias_reduction
@@ -2468,7 +2506,7 @@ pub mod internal {
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
         fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-            let pr = self.execute_pirls_if_needed(rho)?;
+            let (pr, _) = self.execute_pirls_if_needed(rho)?;
             let (h_eff, _) = self.effective_hessian(&pr)?;
             let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
                 let min_eig = h_eff
@@ -2543,12 +2581,22 @@ pub mod internal {
         fn execute_pirls_if_needed(
             &self,
             rho: &Array1<f64>,
-        ) -> Result<Arc<PirlsResult>, EstimationError> {
-            // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
-            let key_opt = self.rho_key_sanitized(rho);
-            if let Some(key) = &key_opt {
-                if let Some(cached_result) = self.cache.borrow().get(key) {
-                    return Ok(Arc::clone(cached_result));
+        ) -> Result<(Arc<PirlsResult>, Option<Arc<[u64]>>), EstimationError> {
+            if let Some(hash) = rho_hash(rho) {
+                if let Some((result, key)) = {
+                    let mut cache = self.cache.borrow_mut();
+                    match cache
+                        .raw_entry_mut()
+                        .from_hash(hash, |existing_key: &Arc<[u64]>| {
+                            rho_matches_bits(rho, existing_key.as_ref())
+                        }) {
+                        RawEntryMut::Occupied(entry) => {
+                            Some((Arc::clone(entry.get()), Arc::clone(entry.key())))
+                        }
+                        RawEntryMut::Vacant(_) => None,
+                    }
+                } {
+                    return Ok((result, Some(key)));
                 }
             }
 
@@ -2584,13 +2632,13 @@ pub mod internal {
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                    // This is a successful fit. Cache only if key is valid (not NaN).
-                    if let Some(key) = key_opt {
+                    let key = rho_key_arc(rho);
+                    if let Some(ref key_arc) = key {
                         self.cache
                             .borrow_mut()
-                            .insert(key, Arc::clone(&pirls_result));
+                            .insert(Arc::clone(key_arc), Arc::clone(&pirls_result));
                     }
-                    Ok(pirls_result)
+                    Ok((pirls_result, key))
                 }
                 pirls::PirlsStatus::Unstable => {
                     // The fit was unstable. This is where we throw our specific, user-friendly error.
@@ -4606,7 +4654,7 @@ pub mod internal {
         // Direct computation of 0.5·log|H_eff| at rho using the SAME stabilized
         // effective Hessian and logdet path as compute_cost.
         fn half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> f64 {
-            let pr = state.execute_pirls_if_needed(rho).expect("pirls");
+            let (pr, _) = state.execute_pirls_if_needed(rho).expect("pirls");
             let (h_eff, _) = state.effective_hessian(&pr).expect("effective Hessian");
             let chol = h_eff
                 .clone()
@@ -4633,7 +4681,7 @@ pub mod internal {
 
         fn half_logh_s_part(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             // ½·λk tr(H_eff⁻¹ S_k)
-            let pr = state.execute_pirls_if_needed(rho).expect("pirls");
+            let (pr, _) = state.execute_pirls_if_needed(rho).expect("pirls");
             let (h_eff, _) = state.effective_hessian(&pr).expect("effective Hessian");
             let factor = state.get_faer_factor(rho, &h_eff);
             let lambdas = rho.mapv(f64::exp);
@@ -4649,7 +4697,7 @@ pub mod internal {
         }
 
         fn dlog_s(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
-            let pr = state.execute_pirls_if_needed(rho).expect("pirls");
+            let (pr, _) = state.execute_pirls_if_needed(rho).expect("pirls");
             Array1::from(pr.reparam_result.det1.to_vec())
         }
 
