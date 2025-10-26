@@ -1,4 +1,7 @@
-use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
+use crate::calibrate::construction::{
+    ModelLayout, PenaltyWorkspace, PenaltyWorkspaceOwned, ReparamResult,
+    calculate_condition_number, stable_reparameterization_with_matrices,
+};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
@@ -208,7 +211,7 @@ pub fn fit_model_for_fixed_rho(
     offset: ArrayView1<f64>,
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
-    rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
+    penalties: PenaltyWorkspace<'_>,
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
@@ -221,40 +224,55 @@ pub fn fit_model_for_fixed_rho(
         lambdas.len()
     );
     println!(
-        "P-IRLS input dimensions: x: {:?}, y: {}, rs_original: {}",
+        "P-IRLS input dimensions: x: {:?}, y: {}, penalties: {}",
         x.shape(),
         y.len(),
-        rs_original.len()
+        penalties.rs_list.len()
     );
     if !lambdas.is_empty() {
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Stage: Create the lambda-independent balanced penalty root for stable rank detection
-    // This is computed ONCE from the unweighted penalty structure and never changes
-    log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
-
-    // Reconstruct full penalty matrices from square roots for balanced penalty creation
-    // STANDARDIZED: With rank x p roots, use S = R^T * R
-    let mut s_list_full = Vec::with_capacity(rs_original.len());
-    for rs in rs_original {
-        let s_full = rs.t().dot(rs);
-        s_list_full.push(s_full);
-    }
-
-    use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
-    let p = x.ncols();
-    let eb = create_balanced_penalty_root(&s_list_full, p)?;
-    println!(
-        "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
-        eb.shape()
-    );
+    let lambdas_vec = lambdas.to_vec();
+    let rho_vec_owned = rho_vec.to_vec();
 
     // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
     println!("[Reparam] ==> Entering stable_reparameterization...");
-    let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+    let mut cache_hit = false;
+    let reparam_result = match penalties.reparam_cache {
+        Some(cell) => {
+            let mut cache = cell.borrow_mut();
+            if let Some(cached) = cache.try_get(&rho_vec_owned, &lambdas_vec) {
+                cache_hit = true;
+                cached
+            } else {
+                let computed = stable_reparameterization_with_matrices(
+                    penalties.rs_list,
+                    penalties.s_full_list,
+                    &lambdas_vec,
+                    layout,
+                )?;
+                cache.insert(rho_vec_owned.clone(), lambdas_vec.clone(), &computed);
+                computed
+            }
+        }
+        None => stable_reparameterization_with_matrices(
+            penalties.rs_list,
+            penalties.s_full_list,
+            &lambdas_vec,
+            layout,
+        )?,
+    };
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
+    if cache_hit {
+        log::debug!("Reparameterization cache hit for rho {:?}", rho_vec_owned);
+    } else {
+        log::debug!(
+            "Computed fresh reparameterization for rho {:?}",
+            rho_vec_owned
+        );
+    }
 
     println!(
         "[Reparam Result Check] qs_sum: {:.4e}, s_transformed_sum: {:.4e}, log_det_s: {:.4e}",
@@ -275,6 +293,12 @@ pub fn fit_model_for_fixed_rho(
     println!(
         "[Matrix Multiply] <== x.dot(qs) complete. x_transformed_sum: {:.4e}",
         x_transformed.sum()
+    );
+
+    let eb = penalties.balanced_root;
+    println!(
+        "[Balanced Penalty] Using lambda-independent eb with shape: {:?}",
+        eb.shape()
     );
 
     // Transform eb to the same stable basis
@@ -2491,8 +2515,8 @@ mod tests {
         };
 
         // --- Run the fit ---
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
+        let (x_matrix, penalty_ws, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let rho_vec = Array1::<f64>::zeros(penalty_ws.rs_list().len());
 
         let offset = Array1::<f64>::zeros(data.y.len());
         let pirls_result = fit_model_for_fixed_rho(
@@ -2501,7 +2525,7 @@ mod tests {
             offset.view(),
             data.y.view(),
             data.weights.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &config,
         )?;
@@ -2784,11 +2808,11 @@ mod tests {
     fn setup_pirls_test_inputs(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
+    ) -> Result<(Array2<f64>, PenaltyWorkspaceOwned, ModelLayout), Box<dyn std::error::Error>> {
         let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(data, config)?;
-        let rs_original = compute_penalty_square_roots(&s_list)?;
-        Ok((x_matrix, rs_original, layout))
+        let penalty_ws = PenaltyWorkspaceOwned::from_penalty_matrices(s_list, &layout)?;
+        Ok((x_matrix, penalty_ws, layout))
     }
 
     /// Test that the unpivot_columns function correctly reverses a column pivot
@@ -2900,13 +2924,15 @@ mod tests {
 
         // Call the function with first rho vector
         let offset = Array1::<f64>::zeros(n_samples);
+        let penalty_ws =
+            PenaltyWorkspaceOwned::from_penalty_roots(rs_original.clone(), &layout).unwrap();
         let result1 = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
             x.view(),
             offset.view(),
             y.view(),
             weights.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &config,
         )
@@ -2919,7 +2945,7 @@ mod tests {
             offset.view(),
             y.view(),
             weights.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &config,
         )
@@ -3017,10 +3043,10 @@ mod tests {
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let (x_matrix, penalty_ws, layout) = setup_pirls_test_inputs(&data, &config)?;
 
         // Size rho vector to match actual number of penalties
-        let rho_vec = Array1::<f64>::zeros(rs_original.len());
+        let rho_vec = Array1::<f64>::zeros(penalty_ws.rs_list().len());
 
         // === PHASE 5: Execute the target function ===
         let offset = Array1::<f64>::zeros(data.y.len());
@@ -3030,7 +3056,7 @@ mod tests {
             offset.view(),
             data.y.view(),
             data.weights.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &config,
         )
@@ -3148,8 +3174,8 @@ mod tests {
         };
 
         // === Set up inputs using helper ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
-        let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
+        let (x_matrix, penalty_ws, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let rho_vec = Array1::<f64>::zeros(penalty_ws.rs_list().len());
 
         // === Execute P-IRLS ===
         let offset = Array1::<f64>::zeros(data.y.len());
@@ -3159,7 +3185,7 @@ mod tests {
             offset.view(),
             data.y.view(),
             data.weights.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &config,
         )

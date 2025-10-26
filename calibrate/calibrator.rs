@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 // Use the shared optimizer facade from estimate.rs
+use crate::calibrate::construction::PenaltyWorkspaceOwned;
 use crate::calibrate::estimate::{
     ExternalOptimOptions, ExternalOptimResult, optimize_external_design,
 };
@@ -2242,6 +2243,8 @@ mod tests {
             .map_or(false, |spec| spec.enabled);
         let cfg = ModelConfig::external(LinkFunction::Logit, 1e-3, 75, firth_active);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
+        let penalty_ws =
+            PenaltyWorkspaceOwned::from_penalty_roots(rs_list, &layout).expect("penalty workspace");
 
         let pirls = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
@@ -2249,7 +2252,7 @@ mod tests {
             offset,
             y,
             w_prior,
-            &rs_list,
+            penalty_ws.view_without_cache(),
             &layout,
             &cfg,
         )
@@ -2303,6 +2306,8 @@ mod tests {
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
+        let penalty_ws =
+            PenaltyWorkspaceOwned::from_penalty_roots(rs_list, &layout).expect("penalty workspace");
 
         let pirls = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
@@ -2310,7 +2315,7 @@ mod tests {
             offset,
             y,
             w_prior,
-            &rs_list,
+            penalty_ws.view_without_cache(),
             &layout,
             &cfg,
         )
@@ -2754,6 +2759,8 @@ mod tests {
         let p = x.ncols();
 
         let rs_original: Vec<Array2<f64>> = Vec::new();
+        let penalty_ws = PenaltyWorkspaceOwned::from_penalty_roots(rs_original, &layout)
+            .expect("penalty workspace");
         let rho = Array1::<f64>::zeros(0);
         let offset = Array1::<f64>::zeros(n);
 
@@ -2766,7 +2773,7 @@ mod tests {
             offset.view(),
             y.view(),
             w_prior.view(),
-            &rs_original,
+            penalty_ws.view_without_cache(),
             &layout,
             &cfg,
         )
@@ -3961,8 +3968,9 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let layout = ModelLayout::external(x_with_ridge.ncols(), penalties_with_ridge.len());
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
-        let penalty_roots =
-            compute_penalty_square_roots(&penalties_with_ridge).expect("penalty roots");
+        let penalty_ws =
+            PenaltyWorkspaceOwned::from_penalty_matrices(penalties_with_ridge.clone(), &layout)
+                .expect("penalty workspace");
 
         let rho_low = Array1::from_elem(penalties_with_ridge.len(), -15.0);
         let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
@@ -3973,7 +3981,7 @@ mod tests {
             offset_with_ridge.view(),
             y.view(),
             w.view(),
-            &penalty_roots,
+            penalty_ws.view_without_cache(),
             &layout,
             &cfg,
         )
@@ -3984,7 +3992,7 @@ mod tests {
             offset_with_ridge.view(),
             y.view(),
             w.view(),
-            &penalty_roots,
+            penalty_ws.view_without_cache(),
             &layout,
             &cfg,
         )

@@ -6,7 +6,9 @@ use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
 fn max_abs_element(matrix: &Array2<f64>) -> f64 {
@@ -1383,6 +1385,217 @@ pub struct ReparamResult {
     pub e_transformed: Array2<f64>,
 }
 
+#[derive(Clone)]
+struct CachedReparam {
+    rho: Vec<f64>,
+    lambdas: Vec<f64>,
+    result: ReparamResult,
+}
+
+impl CachedReparam {
+    fn matches(&self, rho: &[f64], lambdas: &[f64], abs_tol: f64, rel_tol: f64) -> bool {
+        fn approx_equal(a: &[f64], b: &[f64], abs_tol: f64, rel_tol: f64) -> bool {
+            if a.len() != b.len() {
+                return false;
+            }
+            a.iter().zip(b.iter()).all(|(&x, &y)| {
+                let diff = (x - y).abs();
+                let scale = x.abs().max(y.abs()).max(1.0);
+                diff <= abs_tol.max(rel_tol * scale)
+            })
+        }
+
+        approx_equal(&self.rho, rho, abs_tol, rel_tol)
+            && approx_equal(&self.lambdas, lambdas, abs_tol, rel_tol)
+    }
+}
+
+/// Cache of reparameterization results keyed by smoothing parameters.
+/// Stores a small LRU list of recent results to avoid repeating the expensive
+/// similarity transforms when the optimizer probes nearby points.
+pub struct ReparamCache {
+    entries: VecDeque<CachedReparam>,
+    abs_tol: f64,
+    rel_tol: f64,
+    max_entries: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl ReparamCache {
+    pub fn new(abs_tol: f64, rel_tol: f64, max_entries: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            abs_tol,
+            rel_tol,
+            max_entries,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    pub fn try_get(&mut self, rho: &[f64], lambdas: &[f64]) -> Option<ReparamResult> {
+        if rho.len() != lambdas.len() {
+            self.misses += 1;
+            return None;
+        }
+
+        let mut hit_entry: Option<CachedReparam> = None;
+        let mut new_entries = VecDeque::with_capacity(self.entries.len());
+
+        while let Some(entry) = self.entries.pop_front() {
+            if hit_entry.is_none() && entry.matches(rho, lambdas, self.abs_tol, self.rel_tol) {
+                self.hits += 1;
+                hit_entry = Some(entry.clone());
+                new_entries.push_back(entry);
+            } else {
+                new_entries.push_back(entry);
+            }
+        }
+
+        self.entries = new_entries;
+
+        if let Some(entry) = hit_entry {
+            Some(entry.result.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    pub fn insert(&mut self, rho: Vec<f64>, lambdas: Vec<f64>, result: &ReparamResult) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        let cached = CachedReparam {
+            rho,
+            lambdas,
+            result: result.clone(),
+        };
+
+        self.entries.push_front(cached);
+        while self.entries.len() > self.max_entries {
+            self.entries.pop_back();
+        }
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
+
+impl Default for ReparamCache {
+    fn default() -> Self {
+        // Conservative tolerances: reuse only when log-smoothing parameters and
+        // their exponentials differ negligibly, but keep a few entries to cover
+        // line-search backtracking.
+        Self::new(5e-5, 1e-3, 8)
+    }
+}
+
+impl Clone for ReparamCache {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            abs_tol: self.abs_tol,
+            rel_tol: self.rel_tol,
+            max_entries: self.max_entries,
+            hits: 0,
+            misses: 0,
+        }
+    }
+}
+
+/// Owned penalty workspace holding immutable penalty matrices and cache state.
+pub struct PenaltyWorkspaceOwned {
+    s_full_list: Vec<Array2<f64>>,
+    rs_list: Vec<Array2<f64>>,
+    balanced_root: Array2<f64>,
+    reparam_cache: RefCell<ReparamCache>,
+}
+
+impl PenaltyWorkspaceOwned {
+    /// Builds the workspace from full penalty matrices. The matrices are
+    /// sanitized and the associated square roots and balanced penalty root are
+    /// computed once.
+    pub fn from_penalty_matrices(
+        mut s_list: Vec<Array2<f64>>,
+        layout: &ModelLayout,
+    ) -> Result<Self, EstimationError> {
+        for s in &mut s_list {
+            *s = sanitize_symmetric(s);
+        }
+        let rs_list = compute_penalty_square_roots(&s_list)?;
+        let balanced_root = create_balanced_penalty_root(&s_list, layout.total_coeffs)?;
+        Ok(Self {
+            s_full_list: s_list,
+            rs_list,
+            balanced_root,
+            reparam_cache: RefCell::new(ReparamCache::default()),
+        })
+    }
+
+    /// Builds the workspace from pre-computed penalty roots.
+    pub fn from_penalty_roots(
+        rs_list: Vec<Array2<f64>>,
+        layout: &ModelLayout,
+    ) -> Result<Self, EstimationError> {
+        let s_full_list: Vec<Array2<f64>> =
+            rs_list.iter().map(|rs| penalty_from_root(rs)).collect();
+        let balanced_root = create_balanced_penalty_root(&s_full_list, layout.total_coeffs)?;
+        Ok(Self {
+            s_full_list,
+            rs_list,
+            balanced_root,
+            reparam_cache: RefCell::new(ReparamCache::default()),
+        })
+    }
+
+    pub fn view(&self) -> PenaltyWorkspace<'_> {
+        PenaltyWorkspace {
+            s_full_list: &self.s_full_list,
+            rs_list: &self.rs_list,
+            balanced_root: &self.balanced_root,
+            reparam_cache: Some(&self.reparam_cache),
+        }
+    }
+
+    pub fn view_without_cache(&self) -> PenaltyWorkspace<'_> {
+        PenaltyWorkspace {
+            s_full_list: &self.s_full_list,
+            rs_list: &self.rs_list,
+            balanced_root: &self.balanced_root,
+            reparam_cache: None,
+        }
+    }
+
+    pub fn s_full_list(&self) -> &[Array2<f64>] {
+        &self.s_full_list
+    }
+
+    pub fn rs_list(&self) -> &[Array2<f64>] {
+        &self.rs_list
+    }
+
+    pub fn balanced_root(&self) -> &Array2<f64> {
+        &self.balanced_root
+    }
+
+    pub fn reparam_cache(&self) -> &RefCell<ReparamCache> {
+        &self.reparam_cache
+    }
+}
+
+/// Borrowed view of the penalty workspace data.
+#[derive(Clone, Copy)]
+pub struct PenaltyWorkspace<'a> {
+    pub s_full_list: &'a [Array2<f64>],
+    pub rs_list: &'a [Array2<f64>],
+    pub balanced_root: &'a Array2<f64>,
+    pub reparam_cache: Option<&'a RefCell<ReparamCache>>,
+}
+
 /// Creates a lambda-independent balanced penalty root for stable rank detection
 /// This follows mgcv's approach: scale each penalty to unit Frobenius norm, sum them,
 /// and take the matrix square root. This balanced penalty is used ONLY for rank detection.
@@ -1559,7 +1772,25 @@ pub fn construct_s_lambda(
 /// diagnostics or alternative workflows. This function does not take `eb` as a
 /// parameter; it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
+    rs_list: &[Array2<f64>],
+    lambdas: &[f64],
+    layout: &ModelLayout,
+) -> Result<ReparamResult, EstimationError> {
+    stable_reparameterization_internal(rs_list, None, lambdas, layout)
+}
+
+pub fn stable_reparameterization_with_matrices(
+    rs_list: &[Array2<f64>],
+    s_full_list: &[Array2<f64>],
+    lambdas: &[f64],
+    layout: &ModelLayout,
+) -> Result<ReparamResult, EstimationError> {
+    stable_reparameterization_internal(rs_list, Some(s_full_list), lambdas, layout)
+}
+
+fn stable_reparameterization_internal(
+    rs_list: &[Array2<f64>],
+    s_full_list: Option<&[Array2<f64>]>,
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
@@ -1601,11 +1832,13 @@ pub fn stable_reparameterization(
 
     // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
     // These will NEVER be modified and are used for building the sb matrix
-    let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
+    let s_original_storage: Cow<'_, [Array2<f64>]> = match s_full_list {
+        Some(precomputed) => Cow::Borrowed(precomputed),
+        None => Cow::Owned(rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect()),
+    };
 
     // Create the WORKING copy that will be transformed
-    let mut s_current_list = s_original_list.clone();
+    let mut s_current_list: Vec<Array2<f64>> = s_original_storage.iter().cloned().collect();
 
     // Clone penalty square roots - we'll transform these in-place
     let mut rs_current = rs_list.to_vec();

@@ -29,8 +29,8 @@ use self::internal::RemlState;
 // Crate-level imports
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
-    ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
-    compute_penalty_square_roots,
+    ModelLayout, PenaltyWorkspace, PenaltyWorkspaceOwned, build_design_and_penalty_matrices,
+    calculate_condition_number, compute_penalty_square_roots,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
@@ -781,7 +781,7 @@ pub fn train_model(
             reml_state.offset(),
             reml_state.y(),
             reml_state.weights(),
-            reml_state.rs_list_ref(),
+            reml_state.penalty_workspace(),
             &layout,
             config,
         )?;
@@ -1236,8 +1236,8 @@ pub fn train_model(
         reml_state.x(), // Use original X
         reml_state.offset(),
         reml_state.y(),
-        reml_state.weights(),     // Pass weights
-        reml_state.rs_list_ref(), // Pass original penalty matrices
+        reml_state.weights(), // Pass weights
+        reml_state.penalty_workspace(),
         &layout,
         config,
     )?;
@@ -1586,7 +1586,6 @@ pub fn optimize_external_design(
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
-    let rs_list = compute_penalty_square_roots(&s_vec)?;
 
     // Clone inputs to own their storage and unify lifetimes inside this function
     let y_o = y.to_owned();
@@ -1635,14 +1634,13 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
         y_o.view(),
         w_o.view(),
-        &rs_list_ref,
+        reml_state.penalty_workspace(),
         &layout,
         &cfg,
     )?;
@@ -2021,9 +2019,7 @@ pub mod internal {
         x: ArrayView2<'a, f64>,
         weights: ArrayView1<'a, f64>,
         offset: Array1<f64>,
-        // Original penalty matrices S_k (p × p), ρ-independent basis
-        s_full_list: Vec<Array2<f64>>,
-        pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
+        penalty_workspace: PenaltyWorkspaceOwned,
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
         nullspace_dims: Vec<usize>,
@@ -2184,10 +2180,8 @@ pub mod internal {
             config: &'a ModelConfig,
             nullspace_dims: Option<Vec<usize>>,
         ) -> Result<Self, EstimationError> {
-            // Pre-compute penalty square roots once
-            let rs_list = compute_penalty_square_roots(&s_list)?;
-
             let expected_len = s_list.len();
+            let penalty_workspace = PenaltyWorkspaceOwned::from_penalty_matrices(s_list, layout)?;
             let nullspace_dims = match nullspace_dims {
                 Some(dims) => {
                     if dims.len() != expected_len {
@@ -2207,8 +2201,7 @@ pub mod internal {
                 x,
                 weights,
                 offset: offset.to_owned(),
-                s_full_list: s_list,
-                rs_list,
+                penalty_workspace,
                 layout,
                 config,
                 nullspace_dims,
@@ -2518,8 +2511,12 @@ pub mod internal {
             self.y
         }
 
-        pub(super) fn rs_list_ref(&self) -> &Vec<Array2<f64>> {
-            &self.rs_list
+        pub(super) fn rs_list_ref(&self) -> &[Array2<f64>] {
+            self.penalty_workspace.rs_list()
+        }
+
+        pub(super) fn penalty_workspace(&self) -> PenaltyWorkspace<'_> {
+            self.penalty_workspace.view()
         }
 
         pub(super) fn weights(&self) -> ArrayView1<'a, f64> {
@@ -2570,7 +2567,7 @@ pub mod internal {
                 self.offset.view(),
                 self.y,
                 self.weights,
-                &self.rs_list,
+                self.penalty_workspace.view(),
                 self.layout,
                 self.config,
             );
@@ -2908,7 +2905,7 @@ pub mod internal {
 
                     let mut h_raw = xtwx.clone();
                     for (k, &lambda) in lambdas.iter().enumerate() {
-                        let s_k = &self.s_full_list[k];
+                        let s_k = &self.penalty_workspace.s_full_list()[k];
                         if lambda != 0.0 {
                             h_raw.scaled_add(lambda, s_k);
                         }
@@ -4812,7 +4809,7 @@ pub mod internal {
                 reml_state.offset(),
                 data.y.view(),
                 data.weights.view(),
-                reml_state.rs_list_ref(),
+                reml_state.penalty_workspace(),
                 &layout,
                 &config,
             )
@@ -4922,7 +4919,7 @@ pub mod internal {
                 reml_state.offset(),
                 data.y.view(),
                 data.weights.view(),
-                reml_state.rs_list_ref(),
+                reml_state.penalty_workspace(),
                 &layout,
                 &config,
             )
@@ -5189,7 +5186,9 @@ pub mod internal {
                     }
                     total_folds_evaluated += 1;
 
-                    let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
+                    let penalty_ws =
+                        PenaltyWorkspaceOwned::from_penalty_matrices(s_list.clone(), &layout)
+                            .expect("penalty workspace");
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
                     let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -5198,7 +5197,7 @@ pub mod internal {
                         offset.view(),
                         data_train.y.view(),
                         data_train.weights.view(),
-                        &rs_list,
+                        penalty_ws.view_without_cache(),
                         &layout,
                         &trained.config,
                     )
@@ -6508,7 +6507,7 @@ pub mod internal {
             // Directly compute the original rs_list for the new function
 
             // Here we need to create the original rs_list to pass to the new function
-            let rs_original = compute_penalty_square_roots(&s_list)?;
+            let penalty_ws = PenaltyWorkspaceOwned::from_penalty_matrices(s_list, &layout)?;
 
             let offset = Array1::<f64>::zeros(data.y.len());
             let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -6517,7 +6516,7 @@ pub mod internal {
                 offset.view(),
                 data.y.view(),
                 data.weights.view(),
-                &rs_original,
+                penalty_ws.view_without_cache(),
                 &layout,
                 &config,
             );
