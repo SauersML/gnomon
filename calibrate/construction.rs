@@ -1,9 +1,11 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
-use faer::Side;
+use faer::linalg::matmul::{Accum, matmul};
+use faer::mat::MatMut;
+use faer::{Mat, Par, Side};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
@@ -57,8 +59,66 @@ fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
 }
 
 fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
-    let full = root.t().dot(root);
-    sanitize_symmetric(&full)
+    let (_, cols) = root.dim();
+    if cols == 0 {
+        return Array2::zeros((0, 0));
+    }
+
+    let root_view = FaerArrayView::new(root);
+    let mut gram = Mat::<f64>::zeros(cols, cols);
+    matmul(
+        gram.as_mut(),
+        Accum::Replace,
+        root_view.as_ref().transpose(),
+        root_view.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let gram_array = Array2::from_shape_fn((cols, cols), |(i, j)| gram[(i, j)]);
+    sanitize_symmetric(&gram_array)
+}
+
+fn faer_matmul(lhs: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+    let (rows, k_lhs) = lhs.dim();
+    let (k_rhs, cols) = rhs.dim();
+    let mut product = Array2::<f64>::zeros((rows, cols));
+    if rows == 0 || cols == 0 {
+        return product;
+    }
+
+    assert_eq!(
+        k_lhs, k_rhs,
+        "Inner dimensions must match for matrix multiplication"
+    );
+    if k_lhs == 0 {
+        return product;
+    }
+
+    let lhs_view = FaerArrayView::new(lhs);
+    let rhs_view = FaerArrayView::new(rhs);
+    {
+        let slice = product
+            .as_slice_memory_order_mut()
+            .expect("Matrix product output must be contiguous");
+        let product_view = MatMut::from_row_major_slice_mut(slice, rows, cols);
+        matmul(
+            product_view,
+            Accum::Replace,
+            lhs_view.as_ref(),
+            rhs_view.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+    }
+
+    product
+}
+
+fn transpose_owned(matrix: &Array2<f64>) -> Array2<f64> {
+    let mut transposed = Array2::zeros((matrix.ncols(), matrix.nrows()));
+    transposed.assign(&matrix.t());
+    transposed
 }
 
 fn robust_eigh(
@@ -1622,7 +1682,7 @@ pub fn stable_reparameterization(
             det1: Array1::zeros(m),
             qs: Array2::eye(p),
             rs_transformed: rs_list.iter().cloned().collect(),
-            rs_transposed: rs_list.iter().map(|rs| rs.t().to_owned()).collect(),
+            rs_transposed: rs_list.iter().map(|rs| transpose_owned(rs)).collect(),
             e_transformed: Array2::zeros((0, p)),
         });
     }
@@ -1662,7 +1722,8 @@ pub fn stable_reparameterization(
         .take_while(|&&val| val > rank_tol)
         .count();
 
-    let mut rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|rs| rs.dot(&qs)).collect();
+    let mut rs_transformed: Vec<Array2<f64>> =
+        rs_list.iter().map(|rs| faer_matmul(rs, &qs)).collect();
 
     let mut s_lambda = Array2::zeros((p, p));
     for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
@@ -1781,7 +1842,7 @@ pub fn stable_reparameterization(
         det1,
         qs,
         rs_transformed: rs_transformed.clone(),
-        rs_transposed: rs_transformed.iter().map(|m| m.t().to_owned()).collect(),
+        rs_transposed: rs_transformed.iter().map(|m| transpose_owned(m)).collect(),
         e_transformed,
     })
 }
