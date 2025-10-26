@@ -1462,7 +1462,6 @@ pub fn optimize_external_design(
         )));
     }
 
-    use crate::calibrate::construction::compute_penalty_square_roots;
     use crate::calibrate::model::ModelConfig;
 
     let p = x.ncols();
@@ -1474,7 +1473,6 @@ pub fn optimize_external_design(
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
-    let rs_list = compute_penalty_square_roots(&s_vec)?;
 
     // Clone inputs to own their storage and unify lifetimes inside this function
     let y_o = y.to_owned();
@@ -1523,14 +1521,13 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
         y_o.view(),
         w_o.view(),
-        &rs_list_ref,
+        reml_state.rs_list_ref(),
         &layout,
         &cfg,
     )?;

@@ -194,7 +194,10 @@ pub fn fit_model_for_fixed_rho(
     // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
     println!("[Reparam] ==> Entering stable_reparameterization...");
-    let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+    let lambda_slice = lambdas
+        .as_slice()
+        .expect("Lambda vector should be contiguous for reparameterization");
+    let reparam_result = stable_reparameterization(rs_original, lambda_slice, layout)?;
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
 
     println!(
