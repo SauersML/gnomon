@@ -150,6 +150,7 @@ pub fn fit_model_for_fixed_rho(
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
+    balanced_penalty_root: Option<&Array2<f64>>,
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
@@ -175,21 +176,32 @@ pub fn fit_model_for_fixed_rho(
     // This is computed ONCE from the unweighted penalty structure and never changes
     log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
 
-    // Reconstruct full penalty matrices from square roots for balanced penalty creation
-    // STANDARDIZED: With rank x p roots, use S = R^T * R
-    let mut s_list_full = Vec::with_capacity(rs_original.len());
-    for rs in rs_original {
-        let s_full = rs.t().dot(rs);
-        s_list_full.push(s_full);
-    }
-
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
     let p = x.ncols();
-    let eb = create_balanced_penalty_root(&s_list_full, p)?;
-    println!(
-        "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
-        eb.shape()
-    );
+    let mut balanced_storage: Option<Array2<f64>> = None;
+    let eb_view = if let Some(precomputed) = balanced_penalty_root {
+        println!(
+            "[Balanced Penalty] Reusing cached lambda-independent root with shape: {:?}",
+            precomputed.dim()
+        );
+        precomputed.view()
+    } else {
+        // Reconstruct full penalty matrices from square roots for balanced penalty creation
+        // STANDARDIZED: With rank x p roots, use S = R^T * R
+        let mut s_list_full = Vec::with_capacity(rs_original.len());
+        for rs in rs_original {
+            let s_full = rs.t().dot(rs);
+            s_list_full.push(s_full);
+        }
+
+        let computed = create_balanced_penalty_root(&s_list_full, p)?;
+        println!(
+            "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
+            computed.dim()
+        );
+        balanced_storage = Some(computed);
+        balanced_storage.as_ref().unwrap().view()
+    };
 
     // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
@@ -222,7 +234,7 @@ pub fn fit_model_for_fixed_rho(
     // As per mgcv (Eb <- Eb%*%T), transform eb into the same stable basis as x_transformed.
     // The transformation for a penalty root R (shape k x p) is R_new = R * Q.
     // Here, eb is `rank x p` and qs is `p x p`, so the result is `rank x p`.
-    let eb_transformed = eb.dot(&reparam_result.qs);
+    let eb_transformed = eb_view.dot(&reparam_result.qs);
     println!(
         "[Basis Fix] Transformed eb from original to stable basis. eb_transformed_sum: {:.4e}",
         eb_transformed.sum()
@@ -2450,6 +2462,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )?;
@@ -2855,6 +2868,7 @@ mod tests {
             y.view(),
             weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -2868,6 +2882,7 @@ mod tests {
             y.view(),
             weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -2979,6 +2994,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -3108,6 +3124,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )

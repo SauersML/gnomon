@@ -2233,6 +2233,7 @@ mod tests {
             y,
             w_prior,
             &rs_list,
+            None,
             &layout,
             &cfg,
         )
@@ -2294,6 +2295,7 @@ mod tests {
             y,
             w_prior,
             &rs_list,
+            None,
             &layout,
             &cfg,
         )
@@ -2750,6 +2752,7 @@ mod tests {
             y.view(),
             w_prior.view(),
             &rs_original,
+            None,
             &layout,
             &cfg,
         )
@@ -3957,6 +3960,7 @@ mod tests {
             y.view(),
             w.view(),
             &penalty_roots,
+            None,
             &layout,
             &cfg,
         )
@@ -3968,6 +3972,7 @@ mod tests {
             y.view(),
             w.view(),
             &penalty_roots,
+            None,
             &layout,
             &cfg,
         )
