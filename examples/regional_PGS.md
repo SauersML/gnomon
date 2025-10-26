@@ -18,3 +18,6 @@ Let's use the array data (though we could also stream the srWGS):
 ```
 ./gnomon/target/release/gnomon score "PGS004146 | chr17:45535159-46342045, PGS004898 | chr17:45535159-46342045, PGS000007 | chr17:45535159-46342045, PGS000317 | chr17:45535159-46342045, PGS005198 | chr17:45535159-46342045, PGS004378 | chr17:45535159-46342045" arrays
 ```
+
+This should complete in a few seconds.
+
