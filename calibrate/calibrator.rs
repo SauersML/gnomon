@@ -182,8 +182,9 @@ pub fn compute_alo_features(
     // K = X' W X + S_λ from PIRLS; add tiny ridge for numerical consistency with stabilized usage elsewhere
     let mut k = base.penalized_hessian_transformed.clone();
     // Tiny ridge for numerical consistency with stabilized Hessian usage elsewhere.
+    let ridge = 1e-12_f64;
     for d in 0..k.nrows() {
-        k[[d, d]] += 1e-12;
+        k[[d, d]] += ridge;
     }
     let p = k.nrows();
     let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
@@ -214,9 +215,6 @@ pub fn compute_alo_features(
     };
 
     let ut = u.t(); // p x n
-    // Precompute Xᵀ W X = Uᵀ U (U = sqrt(W) X). This is required for the
-    // Fisher prediction variance in penalized models.
-    let xtwx = ut.dot(&u);
 
     // Gaussian dispersion φ (use PIRLS final weights)
     let phi = match link {
@@ -241,7 +239,6 @@ pub fn compute_alo_features(
     };
 
     // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
-    let xtwx_f = FaerMat::<f64>::from_fn(p, p, |i, j| xtwx[[i, j]]);
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
@@ -259,9 +256,25 @@ pub fn compute_alo_features(
     let mut a_hi_95 = 0usize;
     let mut a_hi_99 = 0usize;
 
-    let mut s_buf = vec![0.0f64; p];
-    let mut t_buf = vec![0.0f64; p];
-    let block_cols = 8192usize;
+    let penalty_root = base.reparam_result.e_transformed.view();
+    let penalty_rank = penalty_root.nrows();
+    let penalty_root_f = if penalty_rank > 0 {
+        Some(FaerMat::<f64>::from_fn(penalty_rank, p, |row, col| {
+            penalty_root[[row, col]]
+        }))
+    } else {
+        None
+    };
+
+    let target_chunk_bytes = 512 * 1024; // 512 KiB of solver output per chunk by default.
+    let bytes_per_col = p.saturating_mul(std::mem::size_of::<f64>());
+    let mut block_cols = if bytes_per_col == 0 {
+        n
+    } else {
+        let approx = target_chunk_bytes / bytes_per_col;
+        if approx == 0 { 1 } else { approx }
+    };
+    block_cols = block_cols.min(n).min(8192).max(1);
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
@@ -269,29 +282,47 @@ pub fn compute_alo_features(
 
         let rhs_chunk = FaerMat::<f64>::from_fn(p, width, |row, col| ut[[row, chunk_start + col]]);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
-        let mut t_chunk = FaerMat::<f64>::zeros(p, width);
-        matmul(
-            t_chunk.as_mut(),
-            Accum::Replace,
-            xtwx_f.as_ref(),
-            s_chunk.as_ref(),
-            1.0,
-            Par::Seq,
-        );
+
+        let penalty_chunk = penalty_root_f.as_ref().map(|root| {
+            let mut chunk = FaerMat::<f64>::zeros(root.nrows(), width);
+            if root.nrows() > 0 && width > 0 {
+                matmul(
+                    chunk.as_mut(),
+                    Accum::Replace,
+                    root.as_ref(),
+                    s_chunk.as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
+            }
+            chunk
+        });
+
+        let mut aii_chunk = vec![0.0f64; width];
+        let mut norm_s_sq_chunk = vec![0.0f64; width];
+        let mut penalty_quad_chunk = vec![0.0f64; width];
+
+        if let Some(chunk) = penalty_chunk.as_ref() {
+            for row in 0..chunk.nrows() {
+                for col in 0..width {
+                    let val = chunk[(row, col)];
+                    penalty_quad_chunk[col] += val * val;
+                }
+            }
+        }
+
+        for r in 0..p {
+            let u_col = u.slice(s![chunk_start..chunk_end, r]);
+            for (local_col, &u_val) in u_col.iter().enumerate() {
+                let s_val = s_chunk[(r, local_col)];
+                aii_chunk[local_col] += s_val * u_val;
+                norm_s_sq_chunk[local_col] += s_val * s_val;
+            }
+        }
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            for r in 0..p {
-                s_buf[r] = s_chunk[(r, local_col)];
-                t_buf[r] = t_chunk[(r, local_col)];
-            }
-
-            let u_row = u.row(obs);
-            let ai = s_buf
-                .iter()
-                .zip(u_row.iter())
-                .map(|(s, &u_val)| s * u_val)
-                .sum::<f64>();
+            let ai = aii_chunk[local_col];
             aii[obs] = ai;
             percentiles_data.push(ai);
 
@@ -329,12 +360,9 @@ pub fn compute_alo_features(
             }
 
             let wi = base.final_weights[obs].max(1e-12);
-
-            let quad = s_buf
-                .iter()
-                .zip(t_buf.iter())
-                .map(|(s, t)| s * t)
-                .sum::<f64>();
+            let penalty_term = penalty_quad_chunk[local_col];
+            let ridge_term = ridge * norm_s_sq_chunk[local_col];
+            let quad = (ai - penalty_term - ridge_term).max(0.0);
             let var_full = phi * (quad / wi);
 
             let denom_raw = 1.0 - ai;
