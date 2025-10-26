@@ -141,24 +141,41 @@ pub fn create_bspline_basis_with_knots(
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
     const PAR_THRESHOLD: usize = 256;
-    if data.len() >= PAR_THRESHOLD {
+
+    let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
+        for (mut row, &x) in basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_iter()
+            .zip(data.iter())
+        {
+            let row_slice = row
+                .as_slice_mut()
+                .expect("basis matrix rows should be contiguous");
+            internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
+        }
+    };
+
+    if let (true, Some(data_slice)) = (data.len() >= PAR_THRESHOLD, data.as_slice()) {
         bspline_thread_pool().install(|| {
             basis_matrix
                 .axis_iter_mut(Axis(0))
                 .into_par_iter()
-                .enumerate()
-                .for_each(|(i, mut row)| {
-                    let x = data[i];
-                    let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-                    row.assign(&basis_row);
-                });
+                .zip(data_slice.par_iter().copied())
+                .for_each_init(
+                    || internal::BsplineScratch::new(degree),
+                    |scratch, (mut row, x)| {
+                        let row_slice = row
+                            .as_slice_mut()
+                            .expect("basis matrix rows should be contiguous");
+                        internal::evaluate_splines_at_point_into(
+                            x, degree, knot_view, row_slice, scratch,
+                        );
+                    },
+                );
         });
     } else {
-        for (i, mut row) in basis_matrix.axis_iter_mut(Axis(0)).into_iter().enumerate() {
-            let x = data[i];
-            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-            row.assign(&basis_row);
-        }
+        let mut scratch = internal::BsplineScratch::new(degree);
+        fill_rows(&mut scratch);
     }
 
     Ok((basis_matrix, knot_vec))
@@ -225,24 +242,41 @@ pub fn create_bspline_basis(
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
 
     const PAR_THRESHOLD: usize = 256;
-    if data.len() >= PAR_THRESHOLD {
+
+    let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
+        for (mut row, &x) in basis_matrix
+            .axis_iter_mut(Axis(0))
+            .into_iter()
+            .zip(data.iter())
+        {
+            let row_slice = row
+                .as_slice_mut()
+                .expect("basis matrix rows should be contiguous");
+            internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
+        }
+    };
+
+    if let (true, Some(data_slice)) = (data.len() >= PAR_THRESHOLD, data.as_slice()) {
         bspline_thread_pool().install(|| {
             basis_matrix
                 .axis_iter_mut(Axis(0))
                 .into_par_iter()
-                .enumerate()
-                .for_each(|(i, mut row)| {
-                    let x = data[i];
-                    let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-                    row.assign(&basis_row);
-                });
+                .zip(data_slice.par_iter().copied())
+                .for_each_init(
+                    || internal::BsplineScratch::new(degree),
+                    |scratch, (mut row, x)| {
+                        let row_slice = row
+                            .as_slice_mut()
+                            .expect("basis matrix rows should be contiguous");
+                        internal::evaluate_splines_at_point_into(
+                            x, degree, knot_view, row_slice, scratch,
+                        );
+                    },
+                );
         });
     } else {
-        for (i, mut row) in basis_matrix.axis_iter_mut(Axis(0)).into_iter().enumerate() {
-            let x = data[i];
-            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-            row.assign(&basis_row);
-        }
+        let mut scratch = internal::BsplineScratch::new(degree);
+        fill_rows(&mut scratch);
     }
 
     Ok((basis_matrix, knot_vector))
@@ -488,41 +522,34 @@ fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
 mod internal {
     use super::*;
 
-    thread_local! {
-        static BSPLINE_SCRATCH: RefCell<BsplineScratch> = RefCell::new(BsplineScratch::new());
-    }
-
-    struct BsplineScratch {
-        n: Vec<f64>,
+    /// Thread-local scratch buffers for spline evaluation. These are reused across
+    /// points to reduce allocation and improve cache locality.
+    #[derive(Clone, Debug)]
+    pub(super) struct BsplineScratch {
         left: Vec<f64>,
         right: Vec<f64>,
+        n: Vec<f64>,
     }
 
     impl BsplineScratch {
-        fn new() -> Self {
+        #[inline]
+        pub fn new(degree: usize) -> Self {
+            let len = degree + 1;
             Self {
-                n: Vec::new(),
-                left: Vec::new(),
-                right: Vec::new(),
+                left: vec![0.0; len],
+                right: vec![0.0; len],
+                n: vec![0.0; len],
             }
         }
 
-        fn prepare(&mut self, degree: usize) -> (&mut [f64], &mut [f64], &mut [f64]) {
-            let needed = degree + 1;
-            if self.n.len() < needed {
-                self.n.resize(needed, 0.0);
-                self.left.resize(needed, 0.0);
-                self.right.resize(needed, 0.0);
-            } else {
-                self.n[..needed].fill(0.0);
-                self.left[..needed].fill(0.0);
-                self.right[..needed].fill(0.0);
+        #[inline]
+        fn ensure_degree(&mut self, degree: usize) {
+            let len = degree + 1;
+            if self.left.len() != len {
+                self.left.resize(len, 0.0);
+                self.right.resize(len, 0.0);
+                self.n.resize(len, 0.0);
             }
-            (
-                &mut self.n[..needed],
-                &mut self.left[..needed],
-                &mut self.right[..needed],
-            )
         }
     }
 
@@ -569,36 +596,31 @@ mod internal {
     /// provided `x` value. For out-of-domain `x`, we select the boundary span so the
     /// basis evaluates consistently (yielding zeros except at boundaries), without
     /// altering `x` itself.
-    pub(super) fn evaluate_splines_at_point(
+    #[inline]
+    pub(super) fn evaluate_splines_at_point_into(
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
-    ) -> Array1<f64> {
+        basis_values: &mut [f64],
+        scratch: &mut BsplineScratch,
+    ) {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
+        debug_assert_eq!(basis_values.len(), num_basis);
 
-        // Select the knot span `mu` as if x were in-domain, but without changing x.
-        // For x above the upper boundary, use the last valid span. For x below the
-        // lower boundary, use the first valid span. Otherwise, find the span normally.
+        scratch.ensure_degree(degree);
+        scratch.n.fill(0.0);
+        scratch.left.fill(0.0);
+        scratch.right.fill(0.0);
+
         let x_eval = x;
 
-        // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
-        // This search is robust and correctly handles the half-open interval convention
-        // and the special case for the upper boundary.
         let mu = {
-            // Special case for the upper boundary, where the interval is closed.
             if x_eval >= knots[num_basis] {
-                // If x is at or beyond the last knot of the spline's support,
-                // it belongs to the last valid span. num_basis = (num_knots - degree - 1)
                 num_basis - 1
             } else if x_eval < knots[degree] {
-                // Below the lower boundary: choose the first valid span
                 degree
             } else {
-                // Search for the span in the relevant part of the knot vector.
-                // Can be optimized with binary search, but linear is fine and robust.
-                // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
-                // The `>=` is crucial for correctly handling the half-open interval definition when x falls exactly on a knot.
                 let mut span = degree;
                 while span < num_basis && x_eval >= knots[span + 1] {
                     span += 1;
@@ -607,47 +629,58 @@ mod internal {
             }
         };
 
-        BSPLINE_SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            let (n, left, right) = scratch.prepare(degree);
+        let left = &mut scratch.left;
+        let right = &mut scratch.right;
+        let n = &mut scratch.n;
 
-            // Base case (d=0)
-            n[0] = 1.0;
+        n[0] = 1.0;
 
-            // Iteratively compute values for higher degrees (d=1 to degree)
-            for d in 1..=degree {
-                left[d] = x_eval - knots[mu + 1 - d];
-                right[d] = knots[mu + d] - x_eval;
+        for d in 1..=degree {
+            left[d] = x_eval - knots[mu + 1 - d];
+            right[d] = knots[mu + d] - x_eval;
 
-                let mut saved = 0.0;
+            let mut saved = 0.0;
 
-                for r in 0..d {
-                    // This is an in-place update. n[r] on input is a value for degree d-1.
-                    let den = right[r + 1] + left[d - r];
-                    let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+            for r in 0..d {
+                let den = right[r + 1] + left[d - r];
+                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
 
-                    // On output, n[r] will be a value for degree d.
-                    n[r] = saved + right[r + 1] * temp;
-                    saved = left[d - r] * temp;
-                }
-                n[d] = saved;
+                n[r] = saved + right[r + 1] * temp;
+                saved = left[d - r] * temp;
             }
+            n[d] = saved;
+        }
 
-            // `n` now contains the values of the `degree + 1` non-zero basis functions.
-            // n[j] corresponds to B_{mu-degree+j, degree}.
-            // Place them in the correct locations in the final full basis vector.
-            let mut basis_values = Array1::zeros(num_basis);
-            let start_index = mu.saturating_sub(degree);
-
-            for i in 0..=degree {
-                let global_idx = start_index + i;
-                if global_idx < num_basis {
-                    basis_values[global_idx] = n[i];
-                }
+        basis_values.fill(0.0);
+        let start_index = mu.saturating_sub(degree);
+        for i in 0..=degree {
+            let global_idx = start_index + i;
+            if global_idx < num_basis {
+                basis_values[global_idx] = n[i];
             }
+        }
+    }
 
+    #[cfg(test)]
+    pub(super) fn evaluate_splines_at_point(
+        x: f64,
+        degree: usize,
+        knots: ArrayView1<f64>,
+    ) -> Array1<f64> {
+        let num_knots = knots.len();
+        let num_basis = num_knots - degree - 1;
+        let mut basis_values = Array1::zeros(num_basis);
+        let mut scratch = BsplineScratch::new(degree);
+        evaluate_splines_at_point_into(
+            x,
+            degree,
+            knots,
             basis_values
-        })
+                .as_slice_mut()
+                .expect("basis row should be contiguous"),
+            &mut scratch,
+        );
+        basis_values
     }
 }
 
