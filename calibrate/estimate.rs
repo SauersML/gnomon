@@ -39,6 +39,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use rayon::prelude::*;
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
@@ -3296,6 +3297,10 @@ pub mod internal {
 
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
+            let should_parallelize = {
+                let threshold = self.config.reml_parallel_threshold;
+                threshold > 0 && lambdas.len() >= threshold
+            };
 
             // --- Create the gradient vector ---
             // This variable holds the gradient of the COST function (-V_REML or -V_LAML),
@@ -3409,29 +3414,28 @@ pub mod internal {
                         (None, None)
                     };
 
-                    for k in 0..lambdas.len() {
+                    let rt_concat_ref = rt_concat_opt.as_ref();
+                    let h_inv_concat_ref = h_inv_concat_opt.as_ref();
+                    let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
+                    let det1_values = &pirls_result.reparam_result.det1;
+                    let beta_ref = beta_transformed;
+                    let compute_gaussian_grad = |k: usize| -> f64 {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
-                        let r_beta = r_k.dot(beta_transformed);
+                        let r_beta = r_k.dot(beta_ref);
                         let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
                         // Component 1: derivative of the penalized deviance.
                         // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
-                        // φ is treated as fixed at φ̂ when taking the derivative, so there is no hidden
-                        // dφ/dρ contribution.  This matches Wood (2011) and mgcv’s
-                        // `REML1 <- oo$D1/(2*scale*gamma)` expression.
-
-                        let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
+                        let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
                         let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
                         // Component 2: derivative of the penalized Hessian determinant.
-                        // R/C counterpart: `oo$trA1/2`.
-                        // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
-                        let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
+                        let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
                             g[k]
                         } else {
                             let trace_h_inv_s_k = if let (Some(rt_concat), Some(h_inv_concat)) =
-                                (rt_concat_opt.as_ref(), h_inv_concat_opt.as_ref())
+                                (rt_concat_ref, h_inv_concat_ref)
                             {
                                 let (start, end) = block_ranges[k];
                                 if end > start {
@@ -3446,24 +3450,27 @@ pub mod internal {
                             } else {
                                 0.0
                             };
-                            let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
+                            let tra1 = lambdas[k] * trace_h_inv_s_k;
                             tra1 / 2.0
                         };
 
                         // Component 3: derivative of the penalty pseudo-determinant.
-                        // Use the stable derivative from the P-IRLS reparameterization.
-                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
+                        let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                        // Final gradient assembly for the minimizer.
-                        // This calculation now matches the formula for `REML1` in `gam.fit3.R`,
-                        // which is the gradient of the cost function that `newton` minimizes.
-                        // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`.
-                        // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
-                        // the gradient already accounts for the changing scale; adding dφ/dρ here would
-                        // double-count the effect and contradict the envelope theorem.
-                        cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
-                                         + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
-                                         - log_det_s_grad_term; // Corresponds to `- rp$det1/2`
+                        deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
+                    };
+
+                    let grad_slice = cost_gradient
+                        .as_slice_mut()
+                        .expect("gradient storage is contiguous");
+                    if should_parallelize {
+                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
+                            *slot = compute_gaussian_grad(k);
+                        });
+                    } else {
+                        for (k, slot) in grad_slice.iter_mut().enumerate() {
+                            *slot = compute_gaussian_grad(k);
+                        }
                     }
                 }
                 _ => {
@@ -3481,7 +3488,7 @@ pub mod internal {
 
                     // Use stabilized derivatives of log|Sλ|_+ directly from the reparameterization:
                     // det1[k] = λ_k tr(S_λ^+ S_k) in the stabilized basis.
-                    let det1_full = pirls_result.reparam_result.det1.to_vec();
+                    let det1_full = pirls_result.reparam_result.det1.clone();
                     eprintln!("[Sλ] Using stabilized det1 from reparam: {:?}", det1_full);
 
                     // Report current ½·log|H_eff| using the same stabilized path as cost
@@ -3521,29 +3528,36 @@ pub mod internal {
                     );
 
                     // --- Loop through penalties to assemble gradient components ---
-                    for k in 0..lambdas.len() {
-                        // (1) ½ d log|H| / dρ_k using FULL numeric derivative (consistent with cost)
-                        let log_det_h_grad_term = g_half_logh[k];
-
-                        // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
-                        let log_det_s_grad_term = 0.5 * det1_full[k];
-
-                        // (3) Numerical derivative of penalized log-likelihood part
-                        let pll_grad_term = g_pll[k];
-
-                        // Final assembly for COST gradient:
-                        // dC/dρ_k = (- d penalised_ll / dρ_k) + ½ d log|H|/dρ_k − ½ d log|S_λ|_+/dρ_k
-                        cost_gradient[k] =
+                    let det1_full_ref = &det1_full;
+                    let g_pll_ref = &g_pll;
+                    let g_half_logh_ref = &g_half_logh;
+                    let assemble_laml_grad = |k: usize| -> f64 {
+                        let log_det_h_grad_term = g_half_logh_ref[k];
+                        let log_det_s_grad_term = 0.5 * det1_full_ref[k];
+                        let pll_grad_term = g_pll_ref[k];
+                        let gradient_value =
                             pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
-
-                        // Per-component gradient breakdown for observability
                         eprintln!(
                             "[LAML g] k={k} d(-ℓ_p)={:+.6e}  +½ dlog|H|(full)={:+.6e}  -½ dlog|S|={:+.6e}  => g={:+.6e}",
                             pll_grad_term,
                             log_det_h_grad_term,
-                            -0.5 * det1_full[k],
-                            cost_gradient[k]
+                            -0.5 * det1_full_ref[k],
+                            gradient_value
                         );
+                        gradient_value
+                    };
+
+                    let grad_slice = cost_gradient
+                        .as_slice_mut()
+                        .expect("gradient storage is contiguous");
+                    if should_parallelize {
+                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
+                            *slot = assemble_laml_grad(k);
+                        });
+                    } else {
+                        for (k, slot) in grad_slice.iter_mut().enumerate() {
+                            *slot = assemble_laml_grad(k);
+                        }
                     }
                     // mgcv-style assembly
                     println!("LAML gradient computation finished.");
@@ -3845,6 +3859,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 30,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 5,
                     degree: 3,
@@ -4151,6 +4166,66 @@ pub mod internal {
             assert!(rel_l2 < 1e-3, "relative L2 too high: {rel_l2:.3e}");
             assert!(rel_dir < 1e-3, "directional secant mismatch: {rel_dir:.3e}");
         }
+
+        #[test]
+        fn reml_gradient_parallel_matches_sequential() {
+            let (y, w, x, offset, s_list) = make_identity_gradient_fixture();
+            let p = x.ncols();
+            let k = s_list.len();
+
+            let layout = ModelLayout::external(p, k);
+
+            let mut config_sequential =
+                ModelConfig::external(LinkFunction::Identity, 1e-10, 200, false);
+            config_sequential.reml_parallel_threshold = usize::MAX;
+
+            let mut config_parallel = config_sequential.clone();
+            config_parallel.reml_parallel_threshold = 1;
+
+            let state_sequential = internal::RemlState::new_with_offset(
+                y.view(),
+                x.view(),
+                w.view(),
+                offset.view(),
+                s_list.clone(),
+                &layout,
+                &config_sequential,
+                None,
+            )
+            .expect("sequential RemlState should be constructed");
+
+            let state_parallel = internal::RemlState::new_with_offset(
+                y.view(),
+                x.view(),
+                w.view(),
+                offset.view(),
+                s_list,
+                &layout,
+                &config_parallel,
+                None,
+            )
+            .expect("parallel RemlState should be constructed");
+
+            let rho = Array1::from(vec![0.30_f64, -0.45_f64]);
+
+            let grad_seq = state_sequential
+                .compute_gradient(&rho)
+                .expect("sequential gradient should evaluate");
+            let grad_par = state_parallel
+                .compute_gradient(&rho)
+                .expect("parallel gradient should evaluate");
+
+            let max_abs_diff = grad_seq
+                .iter()
+                .zip(grad_par.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+
+            assert!(
+                max_abs_diff < 1e-10,
+                "parallel and sequential gradients diverged: max |Δ| = {max_abs_diff:.3e}"
+            );
+        }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
@@ -4241,6 +4316,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 6,
                     degree: 3,
@@ -4438,6 +4514,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4532,6 +4609,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 4,
                     degree: 3,
@@ -4799,6 +4877,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4909,6 +4988,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6038,6 +6118,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6163,6 +6244,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-2,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2, // Fewer knots for stability
                     degree: 2,    // Lower degree for stability
@@ -6391,6 +6473,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6515,6 +6598,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -6650,6 +6734,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3, // Smaller than original 5
                     degree: 3,
@@ -6776,6 +6861,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 15, // Too many knots for small data
                     degree: 3,
@@ -6955,6 +7041,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 6, // Reduced to avoid ModelOverparameterized
                     degree: 3,
@@ -7070,6 +7157,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7222,6 +7310,8 @@ pub mod internal {
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
                     firth_bias_reduction: false,
+                    reml_parallel_threshold:
+                        crate::calibrate::model::default_reml_parallel_threshold(),
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -7364,6 +7454,8 @@ pub mod internal {
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
                     firth_bias_reduction: false,
+                    reml_parallel_threshold:
+                        crate::calibrate::model::default_reml_parallel_threshold(),
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -7535,6 +7627,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -7733,6 +7826,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7855,6 +7949,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7968,6 +8063,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
         firth_bias_reduction: false,
+        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 5,
             degree: 3,
@@ -8043,6 +8139,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         reml_convergence_tolerance: 1e-6,
         reml_max_iterations: 20,
         firth_bias_reduction: false,
+        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 3,
             degree: 3,
@@ -8252,6 +8349,7 @@ mod optimizer_progress_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -8366,6 +8464,7 @@ mod reparam_consistency_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -8524,6 +8623,7 @@ mod gradient_validation_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,

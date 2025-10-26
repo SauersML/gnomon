@@ -149,6 +149,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         reml_convergence_tolerance: args.reml_convergence_tolerance,
         reml_max_iterations: args.reml_max_iterations,
         firth_bias_reduction: false,
+        reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config,
         pc_configs,
         pgs_range,

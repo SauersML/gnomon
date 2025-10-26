@@ -2475,6 +2475,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: matches!(link_function, LinkFunction::Logit),
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -2873,6 +2874,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -3001,6 +3003,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: true,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,
@@ -3132,6 +3135,7 @@ mod tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: true,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 5,
                 degree: 3,

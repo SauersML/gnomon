@@ -1,6 +1,7 @@
 target/
 Cargo.lock
 model.toml
+build
 *.rds
 *.csv
 *.tsv
