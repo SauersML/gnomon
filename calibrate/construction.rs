@@ -1,7 +1,7 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, partial_positive_eigh};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
 use ndarray::parallel::prelude::*;
@@ -59,6 +59,40 @@ fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
 fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
     let full = root.t().dot(root);
     sanitize_symmetric(&full)
+}
+
+fn extend_with_orthonormal_complement(qs: &mut Array2<f64>, filled: usize) -> bool {
+    let p = qs.nrows();
+    if filled >= p {
+        return true;
+    }
+
+    let mut filled_cols = filled;
+    let mut candidate = 0usize;
+    let mut attempts = 0usize;
+    while filled_cols < p && attempts < p * 4 {
+        let idx = candidate % p;
+        candidate += 1;
+        attempts += 1;
+
+        let mut v = Array1::<f64>::zeros(p);
+        v[idx] = 1.0;
+
+        for col_idx in 0..filled_cols {
+            let col = qs.column(col_idx);
+            let coeff = col.dot(&v);
+            v -= &(&col * coeff);
+        }
+
+        let norm_sq = v.dot(&v);
+        if norm_sq > 1e-14 {
+            let norm = norm_sq.sqrt();
+            qs.column_mut(filled_cols).assign(&(&v / norm));
+            filled_cols += 1;
+        }
+    }
+
+    filled_cols == p
 }
 
 fn robust_eigh(
@@ -1433,35 +1467,21 @@ pub fn create_balanced_penalty_root(
     }
 
     // Take the matrix square root of the balanced penalty
-    let (eigenvalues, eigenvectors) =
-        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+    let (eigenvalues, eigenvectors) = partial_positive_eigh(&s_balanced, 1e-12)?;
 
-    // Find the maximum eigenvalue to create a relative tolerance
-    let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-    // Define a relative tolerance. Use an absolute fallback for zero matrices.
-    let tolerance = if max_eig > 0.0 {
-        max_eig * 1e-12
-    } else {
-        1e-12
-    };
-
-    let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-    if penalty_rank == 0 {
+    if eigenvalues.is_empty() {
         return Ok(Array2::zeros((0, p)));
     }
 
     // Construct the balanced penalty square root
-    let mut eb = Array2::zeros((p, penalty_rank));
-    let mut col_idx = 0;
-    for (i, &eigenval) in eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = eigenvectors.column(i);
-            eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
-            col_idx += 1;
-        }
+    let mut eb = Array2::zeros((p, eigenvalues.len()));
+    for (col_idx, (&eigenval, eigenvec)) in eigenvalues
+        .iter()
+        .zip(eigenvectors.axis_iter(Axis(1)))
+        .enumerate()
+    {
+        let sqrt_eigenval = eigenval.sqrt();
+        eb.column_mut(col_idx).assign(&(&eigenvec * sqrt_eigenval));
     }
 
     // Return as rank x p matrix (matching mgcv's convention)
@@ -1480,22 +1500,9 @@ pub fn compute_penalty_square_roots(
         let p = s.nrows();
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
-        let (eigenvalues, eigenvectors) = robust_eigh(s, Side::Lower, "penalty matrix")?;
+        let (eigenvalues, eigenvectors) = partial_positive_eigh(s, 1e-12)?;
 
-        // Count positive eigenvalues to determine rank
-        // Find the maximum eigenvalue to create a relative tolerance
-        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-
-        // Define a relative tolerance. Use an absolute fallback for zero matrices.
-        let tolerance = if max_eig > 0.0 {
-            max_eig * 1e-12
-        } else {
-            1e-12
-        };
-
-        let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-        if rank_k == 0 {
+        if eigenvalues.is_empty() {
             // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)
             rs_list.push(Array2::zeros((0, p)));
             continue;
@@ -1503,17 +1510,15 @@ pub fn compute_penalty_square_roots(
 
         // STANDARDIZED: Create rank x p square root matrix where S = rs^T * rs
         // Each row is sqrt(eigenvalue) * eigenvector^T
-        let mut rs = Array2::zeros((rank_k, p));
-        let mut row_idx = 0;
+        let mut rs = Array2::zeros((eigenvalues.len(), p));
 
-        for (i, &eigenval) in eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_eigenval = eigenval.sqrt();
-                let eigenvec = eigenvectors.column(i);
-                // Each row of rs is sqrt(eigenvalue) * eigenvector^T
-                rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
-                row_idx += 1;
-            }
+        for (row_idx, (&eigenval, eigenvec)) in eigenvalues
+            .iter()
+            .zip(eigenvectors.axis_iter(Axis(1)))
+            .enumerate()
+        {
+            let sqrt_eigenval = eigenval.sqrt();
+            rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
         }
 
         rs_list.push(rs);
@@ -1627,40 +1632,53 @@ pub fn stable_reparameterization(
         });
     }
 
-    let (bal_eigenvalues, bal_eigenvectors): (Array1<f64>, Array2<f64>) =
-        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&i, &j| {
-        bal_eigenvalues[j]
-            .partial_cmp(&bal_eigenvalues[i])
-            .unwrap_or(Ordering::Equal)
-            .then(i.cmp(&j))
-    });
-
+    let (bal_pos_vals, bal_pos_vecs) = partial_positive_eigh(&s_balanced, 1e-12)?;
     let mut qs = Array2::zeros((p, p));
-    for (col_idx, &idx) in order.iter().enumerate() {
-        qs.column_mut(col_idx).assign(&bal_eigenvectors.column(idx));
+    let mut penalized_rank = bal_pos_vals.len();
+    let mut used_partial_basis = true;
+
+    if penalized_rank > 0 {
+        for (col_idx, eigenvec) in bal_pos_vecs.axis_iter(Axis(1)).enumerate() {
+            qs.column_mut(col_idx).assign(&eigenvec);
+        }
+        if !extend_with_orthonormal_complement(&mut qs, penalized_rank) {
+            used_partial_basis = false;
+        }
+    } else {
+        qs.fill(0.0);
+        for i in 0..p {
+            qs[(i, i)] = 1.0;
+        }
     }
 
-    let bal_eigenvalues_ordered = Array1::from(
-        order
+    if !used_partial_basis {
+        let (bal_eigenvalues, bal_eigenvectors) =
+            robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+        let mut order: Vec<usize> = (0..p).collect();
+        order.sort_by(|&i, &j| {
+            bal_eigenvalues[j]
+                .partial_cmp(&bal_eigenvalues[i])
+                .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
+        });
+
+        for (col_idx, &idx) in order.iter().enumerate() {
+            qs.column_mut(col_idx).assign(&bal_eigenvectors.column(idx));
+        }
+        let max_bal = order
             .iter()
-            .map(|&idx| bal_eigenvalues[idx])
-            .collect::<Vec<_>>(),
-    );
-    let max_bal = bal_eigenvalues_ordered
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let rank_tol = if max_bal > 0.0 {
-        max_bal * 1e-12
-    } else {
-        1e-12
-    };
-    let penalized_rank = bal_eigenvalues_ordered
-        .iter()
-        .take_while(|&&val| val > rank_tol)
-        .count();
+            .map(|&idx| bal_eigenvalues[idx].abs())
+            .fold(0.0_f64, f64::max);
+        let rank_tol = if max_bal > 0.0 {
+            max_bal * 1e-12
+        } else {
+            1e-12
+        };
+        penalized_rank = order
+            .iter()
+            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
+            .count();
+    }
 
     let mut rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|rs| rs.dot(&qs)).collect();
 
@@ -1717,56 +1735,38 @@ pub fn stable_reparameterization(
         s_k_transformed_cache.push(s_k);
     }
 
-    let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) =
-        robust_eigh(&s_transformed, Side::Lower, "combined penalty matrix")?;
-
-    let max_eigenval = s_eigenvalues_raw
-        .iter()
-        .fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tolerance = if max_eigenval > 0.0 {
-        max_eigenval * 1e-12
-    } else {
-        1e-12
-    };
-    let penalty_rank = s_eigenvalues_raw
-        .iter()
-        .filter(|&&ev| ev > tolerance)
-        .count()
-        .max(0);
+    let (s_pos_eigenvalues, s_pos_eigenvectors) = partial_positive_eigh(&s_transformed, 1e-12)?;
+    let penalty_rank = s_pos_eigenvalues.len();
 
     let mut e_matrix = Array2::zeros((p, penalty_rank));
-    let mut col_idx = 0;
-    for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = s_eigenvectors.column(i);
-            e_matrix
-                .column_mut(col_idx)
-                .assign(&(&eigenvec * sqrt_eigenval));
-            col_idx += 1;
-        }
+    for (col_idx, (&eigenval, eigenvec)) in s_pos_eigenvalues
+        .iter()
+        .zip(s_pos_eigenvectors.axis_iter(Axis(1)))
+        .enumerate()
+    {
+        let sqrt_eigenval = eigenval.sqrt();
+        e_matrix
+            .column_mut(col_idx)
+            .assign(&(&eigenvec * sqrt_eigenval));
     }
 
     let e_transformed = e_matrix.t().to_owned();
 
-    let log_det: f64 = s_eigenvalues_raw
-        .iter()
-        .filter(|&&ev| ev > tolerance)
-        .map(|&ev| ev.ln())
-        .sum();
+    let log_det: f64 = s_pos_eigenvalues.iter().map(|&ev| ev.ln()).sum();
 
     let mut det1 = Array1::zeros(lambdas.len());
 
     let mut s_plus = Array2::zeros((p, p));
-    for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
-        if eigenval > tolerance {
-            let v_i = s_eigenvectors.column(i);
-            let outer_product = v_i
-                .to_owned()
-                .insert_axis(Axis(1))
-                .dot(&v_i.to_owned().insert_axis(Axis(0)));
-            s_plus.scaled_add(1.0 / eigenval, &outer_product);
-        }
+    for (&eigenval, eigenvec) in s_pos_eigenvalues
+        .iter()
+        .zip(s_pos_eigenvectors.axis_iter(Axis(1)))
+    {
+        let v_i = eigenvec.to_owned();
+        let outer_product = v_i
+            .view()
+            .insert_axis(Axis(1))
+            .dot(&v_i.view().insert_axis(Axis(0)));
+        s_plus.scaled_add(1.0 / eigenval, &outer_product);
     }
 
     for k in 0..lambdas.len() {
