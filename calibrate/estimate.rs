@@ -38,7 +38,7 @@ use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
@@ -3266,6 +3266,7 @@ pub mod internal {
             let reparam_result = &pirls_result.reparam_result;
             // Use cached X·Qs from PIRLS
             let rs_transformed = &reparam_result.rs_transformed;
+            let rs_transposed = &reparam_result.rs_transposed;
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
@@ -3379,6 +3380,35 @@ pub mod internal {
                     };
 
                     // Three-term gradient computation following mgcv gdi1
+                    let mut block_ranges = Vec::with_capacity(rs_transposed.len());
+                    let mut total_rank = 0;
+                    for rt in rs_transposed {
+                        let cols = rt.ncols();
+                        block_ranges.push((total_rank, total_rank + cols));
+                        total_rank += cols;
+                    }
+
+                    let (rt_concat_opt, h_inv_concat_opt) = if numeric_logh_grad.is_none()
+                        && total_rank > 0
+                    {
+                        let mut concat = Array2::zeros((h_eff.nrows(), total_rank));
+                        for ((start, end), rt) in block_ranges.iter().zip(rs_transposed.iter()) {
+                            if *end > *start {
+                                concat.slice_mut(s![.., *start..*end]).assign(rt);
+                            }
+                        }
+                        let concat_view = FaerArrayView::new(&concat);
+                        let solved = factor_g.solve(concat_view.as_ref());
+                        let solved_ref = solved.as_ref();
+                        let solved_arr = Array2::from_shape_fn(
+                            (solved_ref.nrows(), solved_ref.ncols()),
+                            |(i, j)| solved_ref[(i, j)],
+                        );
+                        (Some(concat), Some(solved_arr))
+                    } else {
+                        (None, None)
+                    };
+
                     for k in 0..lambdas.len() {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
@@ -3400,11 +3430,22 @@ pub mod internal {
                         let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
                             g[k]
                         } else {
-                            let rt_arr = r_k.t().to_owned();
-                            let rt_view = FaerArrayView::new(&rt_arr);
-                            let x = factor_g.solve(rt_view.as_ref());
-                            // Frobenius inner product ⟨X, Rt⟩
-                            let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt_view.as_ref());
+                            let trace_h_inv_s_k = if let (Some(rt_concat), Some(h_inv_concat)) =
+                                (rt_concat_opt.as_ref(), h_inv_concat_opt.as_ref())
+                            {
+                                let (start, end) = block_ranges[k];
+                                if end > start {
+                                    let h_block = h_inv_concat.slice(s![.., start..end]);
+                                    let rt_block = rt_concat.slice(s![.., start..end]);
+                                    kahan_sum(
+                                        h_block.iter().zip(rt_block.iter()).map(|(&x, &y)| x * y),
+                                    )
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
                             let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                             tra1 / 2.0
                         };
