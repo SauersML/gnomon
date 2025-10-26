@@ -612,17 +612,16 @@ fn manually_check_for_unused_variables() {
     };
 
     manual_lint_args.push(OsString::from("-L"));
-    manual_lint_args.push(
-        OsString::from(format!("dependency={}", deps_dir.display())),
-    );
+    manual_lint_args.push(OsString::from(format!("dependency={}", deps_dir.display())));
 
     for crate_name in ["grep", "walkdir"] {
         match locate_build_dependency(&deps_dir, crate_name) {
             Some(artifact_path) => {
                 manual_lint_args.push(OsString::from("--extern"));
-                manual_lint_args.push(
-                    OsString::from(format!("{crate_name}={}", artifact_path.display())),
-                );
+                manual_lint_args.push(OsString::from(format!(
+                    "{crate_name}={}",
+                    artifact_path.display()
+                )));
             }
             None => {
                 emit_stage_detail(&format!(
