@@ -1,6 +1,6 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
-use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -124,11 +124,12 @@ pub fn create_bspline_basis_with_knots(
 
     let num_basis_functions = knot_vector.len() - degree - 1;
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+    let mut workspace = internal::BsplineWorkspace::new(degree);
 
     // Evaluate the splines for each data point
     for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector);
-        basis_matrix.row_mut(i).assign(&basis_row);
+        let row = basis_matrix.row_mut(i);
+        internal::fill_bspline_basis_row(x, degree, knot_vector, row, &mut workspace);
     }
 
     Ok((basis_matrix, knot_vector.to_owned()))
@@ -192,13 +193,14 @@ pub fn create_bspline_basis(
     let num_basis_functions = knot_vector.len() - degree - 1;
 
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+    let mut workspace = internal::BsplineWorkspace::new(degree);
 
     // Evaluate the splines for each data point.
     // This structure allows the inner loop (de Boor's) to be highly optimized
     // and cache-friendly for a single point `x`.
     for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
-        basis_matrix.row_mut(i).assign(&basis_row);
+        let row = basis_matrix.row_mut(i);
+        internal::fill_bspline_basis_row(x, degree, knot_vector.view(), row, &mut workspace);
     }
 
     Ok((basis_matrix, knot_vector))
@@ -478,94 +480,115 @@ mod internal {
         .expect("Knot vector concatenation should never fail with correct inputs"))
     }
 
-    /// Evaluates all B-spline basis functions at a single point `x`.
-    /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
-    /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.
-    ///
-    /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Peeled Hull
-    /// Clamping (PHC) provides geometric projection. This function must honor the
-    /// provided `x` value. For out-of-domain `x`, we select the boundary span so the
-    /// basis evaluates consistently (yielding zeros except at boundaries), without
-    /// altering `x` itself.
-    pub(super) fn evaluate_splines_at_point(
+    /// Workspace reused while evaluating spline values. Reusing the allocation
+    /// avoids repeated heap traffic in the hot loops that build basis matrices.
+    pub(super) struct BsplineWorkspace {
+        n: Vec<f64>,
+        left: Vec<f64>,
+        right: Vec<f64>,
+    }
+
+    impl BsplineWorkspace {
+        pub(super) fn new(degree: usize) -> Self {
+            let size = degree + 1;
+            Self {
+                n: vec![0.0; size],
+                left: vec![0.0; size],
+                right: vec![0.0; size],
+            }
+        }
+
+        fn ensure_degree(&mut self, degree: usize) {
+            let size = degree + 1;
+            if self.n.len() < size {
+                self.n.resize(size, 0.0);
+            }
+            if self.left.len() < size {
+                self.left.resize(size, 0.0);
+            }
+            if self.right.len() < size {
+                self.right.resize(size, 0.0);
+            }
+        }
+    }
+
+    #[inline]
+    fn find_knot_span(x: f64, degree: usize, knots: ArrayView1<f64>) -> usize {
+        let num_basis = knots.len() - degree - 1;
+        if x >= knots[num_basis] {
+            return num_basis - 1;
+        }
+        if x < knots[degree] {
+            return degree;
+        }
+
+        let mut low = degree;
+        let mut high = num_basis;
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if x < knots[mid] {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        low
+    }
+
+    /// Fills a dense basis row with the non-zero spline values for a single x.
+    pub(super) fn fill_bspline_basis_row(
         x: f64,
         degree: usize,
         knots: ArrayView1<f64>,
-    ) -> Array1<f64> {
+        mut row: ArrayViewMut1<'_, f64>,
+        workspace: &mut BsplineWorkspace,
+    ) {
         let num_knots = knots.len();
         let num_basis = num_knots - degree - 1;
+        debug_assert_eq!(row.len(), num_basis);
 
-        // Select the knot span `mu` as if x were in-domain, but without changing x.
-        // For x above the upper boundary, use the last valid span. For x below the
-        // lower boundary, use the first valid span. Otherwise, find the span normally.
-        let x_eval = x;
+        workspace.ensure_degree(degree);
+        let BsplineWorkspace { n, left, right } = workspace;
 
-        // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
-        // This search is robust and correctly handles the half-open interval convention
-        // and the special case for the upper boundary.
-        let mu = {
-            // Special case for the upper boundary, where the interval is closed.
-            if x_eval >= knots[num_basis] {
-                // If x is at or beyond the last knot of the spline's support,
-                // it belongs to the last valid span. num_basis = (num_knots - degree - 1)
-                num_basis - 1
-            } else if x_eval < knots[degree] {
-                // Below the lower boundary: choose the first valid span
-                degree
-            } else {
-                // Search for the span in the relevant part of the knot vector.
-                // Can be optimized with binary search, but linear is fine and robust.
-                // Find the knot span `mu` such that knots[mu] <= x < knots[mu+1].
-                // The `>=` is crucial for correctly handling the half-open interval definition when x falls exactly on a knot.
-                let mut span = degree;
-                while span < num_basis && x_eval >= knots[span + 1] {
-                    span += 1;
-                }
-                span
-            }
-        };
+        let mu = find_knot_span(x, degree, knots);
 
-        // `n` will store the non-zero basis function values.
-        // At any point x, at most `degree + 1` basis functions are non-zero.
-        let mut n = Array1::zeros(degree + 1);
-        let mut left = Array1::zeros(degree + 1);
-        let mut right = Array1::zeros(degree + 1);
-
-        // Base case (d=0)
+        row.fill(0.0);
         n[0] = 1.0;
-
-        // Iteratively compute values for higher degrees (d=1 to degree)
         for d in 1..=degree {
-            left[d] = x_eval - knots[mu + 1 - d];
-            right[d] = knots[mu + d] - x_eval;
+            left[d] = x - knots[mu + 1 - d];
+            right[d] = knots[mu + d] - x;
 
             let mut saved = 0.0;
-
             for r in 0..d {
-                // This is an in-place update. n[r] on input is a value for degree d-1.
                 let den = right[r + 1] + left[d - r];
                 let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
 
-                // On output, n[r] will be a value for degree d.
                 n[r] = saved + right[r + 1] * temp;
                 saved = left[d - r] * temp;
             }
             n[d] = saved;
         }
 
-        // `n` now contains the values of the `degree + 1` non-zero basis functions.
-        // n[j] corresponds to B_{mu-degree+j, degree}.
-        // Place them in the correct locations in the final full basis vector.
-        let mut basis_values = Array1::zeros(num_basis);
         let start_index = mu.saturating_sub(degree);
-
         for i in 0..=degree {
             let global_idx = start_index + i;
             if global_idx < num_basis {
-                basis_values[global_idx] = n[i];
+                row[global_idx] = n[i];
             }
         }
+    }
 
+    /// Evaluates all B-spline basis functions at a single point `x`.
+    #[cfg(test)]
+    pub(super) fn evaluate_splines_at_point(
+        x: f64,
+        degree: usize,
+        knots: ArrayView1<f64>,
+    ) -> Array1<f64> {
+        let num_basis = knots.len() - degree - 1;
+        let mut workspace = BsplineWorkspace::new(degree);
+        let mut basis_values = Array1::zeros(num_basis);
+        fill_bspline_basis_row(x, degree, knots, basis_values.view_mut(), &mut workspace);
         basis_values
     }
 }
