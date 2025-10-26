@@ -2252,6 +2252,7 @@ mod tests {
             &rs_list,
             &layout,
             &cfg,
+            pirls::PirlsOptions::default(),
         )
         .expect("pirls");
 
@@ -2313,6 +2314,7 @@ mod tests {
             &rs_list,
             &layout,
             &cfg,
+            pirls::PirlsOptions::default(),
         )
         .expect("pirls");
 
@@ -2769,6 +2771,7 @@ mod tests {
             &rs_original,
             &layout,
             &cfg,
+            pirls::PirlsOptions::default(),
         )
         .expect("real PIRLS fit failed")
     }
@@ -3976,6 +3979,7 @@ mod tests {
             &penalty_roots,
             &layout,
             &cfg,
+            pirls::PirlsOptions::default(),
         )
         .expect("fixed-rho PIRLS (low)");
         let fit_high = pirls::fit_model_for_fixed_rho(
@@ -3987,6 +3991,7 @@ mod tests {
             &penalty_roots,
             &layout,
             &cfg,
+            pirls::PirlsOptions::default(),
         )
         .expect("fixed-rho PIRLS (high)");
 

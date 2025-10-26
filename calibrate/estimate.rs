@@ -784,6 +784,7 @@ pub fn train_model(
             reml_state.rs_list_ref(),
             &layout,
             config,
+            pirls::PirlsOptions::default(),
         )?;
 
         // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
@@ -1240,6 +1241,7 @@ pub fn train_model(
         reml_state.rs_list_ref(), // Pass original penalty matrices
         &layout,
         config,
+        pirls::PirlsOptions::default(),
     )?;
 
     // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
@@ -1645,6 +1647,7 @@ pub fn optimize_external_design(
         &rs_list_ref,
         &layout,
         &cfg,
+        pirls::PirlsOptions::default(),
     )?;
 
     // Map beta back to original basis
@@ -2036,6 +2039,7 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
+        last_successful_pirls: RefCell<Option<Arc<PirlsResult>>>,
     }
 
     impl<'a> RemlState<'a> {
@@ -2046,6 +2050,31 @@ pub mod internal {
             *self.consecutive_cost_errors.borrow_mut() = 0;
             *self.last_cost_error_msg.borrow_mut() = None;
             self.current_eval_bundle.borrow_mut().take();
+            self.last_successful_pirls.borrow_mut().take();
+        }
+
+        fn dynamic_pirls_tolerance_multiplier(&self) -> f64 {
+            let evals = *self.eval_count.borrow();
+            if evals <= 2 {
+                return 5.0;
+            }
+
+            let grad_norm = *self.last_grad_norm.borrow();
+            if !grad_norm.is_finite() {
+                return 1.0;
+            }
+
+            if grad_norm > 10.0 {
+                5.0
+            } else if grad_norm > 1.0 {
+                2.0
+            } else if grad_norm < 0.05 {
+                0.5
+            } else if grad_norm < 0.2 {
+                0.75
+            } else {
+                1.0
+            }
         }
 
         /// Returns the effective Hessian and the ridge value used (if any).
@@ -2220,6 +2249,7 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
+                last_successful_pirls: RefCell::new(None),
             })
         }
 
@@ -2548,7 +2578,11 @@ pub mod internal {
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
                 if let Some(cached_result) = self.cache.borrow().get(key) {
-                    return Ok(Arc::clone(cached_result));
+                    let cached = Arc::clone(cached_result);
+                    self.last_successful_pirls
+                        .borrow_mut()
+                        .replace(Arc::clone(&cached));
+                    return Ok(cached);
                 }
             }
 
@@ -2564,6 +2598,13 @@ pub mod internal {
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
+            let warm_start_arc = self.last_successful_pirls.borrow().as_ref().map(Arc::clone);
+            let tolerance_multiplier = self.dynamic_pirls_tolerance_multiplier();
+            let pirls_options = pirls::PirlsOptions {
+                warm_start: warm_start_arc.as_deref(),
+                tolerance_multiplier,
+            };
+
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x.view(),
@@ -2573,6 +2614,7 @@ pub mod internal {
                 &self.rs_list,
                 self.layout,
                 self.config,
+                pirls_options,
             );
 
             if let Err(e) = &pirls_result {
@@ -2590,6 +2632,9 @@ pub mod internal {
                             .borrow_mut()
                             .insert(key, Arc::clone(&pirls_result));
                     }
+                    self.last_successful_pirls
+                        .borrow_mut()
+                        .replace(Arc::clone(&pirls_result));
                     Ok(pirls_result)
                 }
                 pirls::PirlsStatus::Unstable => {
@@ -4815,6 +4860,7 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
+                crate::calibrate::pirls::PirlsOptions::default(),
             )
             .unwrap();
 
@@ -4925,6 +4971,7 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
+                crate::calibrate::pirls::PirlsOptions::default(),
             )
             .unwrap();
 
@@ -5201,6 +5248,7 @@ pub mod internal {
                         &rs_list,
                         &layout,
                         &trained.config,
+                        crate::calibrate::pirls::PirlsOptions::default(),
                     )
                     .expect("pirls refit");
 
@@ -6520,6 +6568,7 @@ pub mod internal {
                 &rs_original,
                 &layout,
                 &config,
+                crate::calibrate::pirls::PirlsOptions::default(),
             );
 
             match result {

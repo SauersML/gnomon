@@ -189,6 +189,24 @@ pub struct PirlsResult {
     pub x_transformed: Array2<f64>,
 }
 
+/// Optional knobs for controlling a P-IRLS solve.
+#[derive(Clone, Copy)]
+pub struct PirlsOptions<'a> {
+    /// Previous P-IRLS solution that can be used for warm-starting.
+    pub warm_start: Option<&'a PirlsResult>,
+    /// Multiplier applied to the nominal convergence tolerance.
+    pub tolerance_multiplier: f64,
+}
+
+impl Default for PirlsOptions<'_> {
+    fn default() -> Self {
+        Self {
+            warm_start: None,
+            tolerance_multiplier: 1.0,
+        }
+    }
+}
+
 /// P-IRLS solver that follows mgcv's architecture exactly
 ///
 /// This function implements the complete algorithm from mgcv's gam.fit3 function
@@ -211,6 +229,7 @@ pub fn fit_model_for_fixed_rho(
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
+    options: PirlsOptions<'_>,
 ) -> Result<PirlsResult, EstimationError> {
     // No test-specific hacks - the properly implemented algorithm should handle all cases
     // Stage: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
@@ -298,7 +317,30 @@ pub fn fit_model_for_fixed_rho(
     let x_transformed_t = x_transformed.t().to_owned();
 
     // Stage: Initialize P-IRLS state variables in the transformed basis
-    let mut beta_transformed = Array1::zeros(layout.total_coeffs);
+    let tolerance_multiplier = options.tolerance_multiplier.clamp(0.1, 20.0);
+    let convergence_tolerance = config.convergence_tolerance * tolerance_multiplier;
+
+    let warm_start_beta = options.warm_start.and_then(|previous| {
+        if previous.beta_transformed.len() != layout.total_coeffs {
+            return None;
+        }
+
+        let beta_original = previous.reparam_result.qs.dot(&previous.beta_transformed);
+        let candidate = reparam_result.qs.t().dot(&beta_original);
+        if candidate.iter().all(|v| v.is_finite()) {
+            Some(candidate)
+        } else {
+            None
+        }
+    });
+
+    let mut beta_transformed = match warm_start_beta {
+        Some(beta) => {
+            log::debug!("P-IRLS warm start: reusing previous solution in transformed basis");
+            beta
+        }
+        None => Array1::zeros(layout.total_coeffs),
+    };
     let mut eta = offset.to_owned();
     eta += &x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) =
@@ -749,7 +791,7 @@ pub fn fit_model_for_fixed_rho(
         last_step_halving = step_halving_count;
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
-        if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
+        if deviance_change_scaled < convergence_tolerance * (0.1 + convergence_scale) {
             // Check gradient with the SAME (W, z) used in the last WLS solve
             // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
             // So we must check stationarity with respect to those same W_solve, z_solve
@@ -776,7 +818,7 @@ pub fn fit_model_for_fixed_rho(
 
             // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
             // and uses the user's epsilon, not machine epsilon.
-            let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
+            let gradient_tol = convergence_tolerance * (0.1 + convergence_scale);
 
             last_gradient_norm = gradient_norm;
             last_gradient_tol = gradient_tol;
@@ -951,7 +993,7 @@ pub fn fit_model_for_fixed_rho(
         }
     };
     let convergence_scale = scale_term.abs() + penalized_deviance_new.abs();
-    let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
+    let gradient_tol = convergence_tolerance * (0.1 + convergence_scale);
 
     // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
@@ -2504,6 +2546,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            PirlsOptions::default(),
         )?;
 
         // --- Return all necessary components for assertion ---
@@ -2909,6 +2952,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            super::PirlsOptions::default(),
         )
         .expect("First fit should converge for this stable test case");
 
@@ -2922,6 +2966,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            super::PirlsOptions::default(),
         )
         .expect("Second fit should converge for this stable test case");
 
@@ -3033,6 +3078,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            PirlsOptions::default(),
         )
         .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
 
@@ -3162,6 +3208,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            PirlsOptions::default(),
         )
         .expect("P-IRLS should converge on realistic data with clear signal");
 
