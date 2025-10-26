@@ -139,6 +139,7 @@ struct KWayMergeIterator<'arena> {
     // Holds a terminal error. If Some, iteration will stop after yielding the error.
     next_error: Option<PrepError>,
     region_filters: Option<Vec<Option<GenomicRegion>>>,
+    region_filter_hits: Option<Vec<bool>>,
     // A reference to the memory arena for zero-copy string allocations.
     bump: &'arena Bump,
 }
@@ -179,6 +180,7 @@ pub struct MergeDiagnosticInfo {
     last_score_keys_seen: std::collections::VecDeque<VariantKey>,
     /// Track any region filters supplied by the user so we can surface them in diagnostics.
     active_region_filters: Vec<(String, GenomicRegion)>,
+    region_filters_without_hits: Vec<String>,
 }
 
 /// The number of recent keys to store for diagnostic reporting.
@@ -212,6 +214,11 @@ impl MergeDiagnosticInfo {
             .collect();
         self.active_region_filters
             .sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    fn record_region_without_hits(&mut self, score_name: &str) {
+        self.region_filters_without_hits
+            .push(score_name.to_string());
     }
 }
 
@@ -474,6 +481,22 @@ pub fn prepare_for_computation(
 
     drop(bim_iter);
     drop(score_iter);
+
+    let region_filter_hits = score_iterator.take_region_filter_hits();
+    if let (Some(filters), Some(hit_flags)) = (region_filters.as_ref(), region_filter_hits.as_ref())
+    {
+        for (idx, region_opt) in filters.iter().enumerate() {
+            if let Some(region) = region_opt {
+                if !hit_flags.get(idx).copied().unwrap_or(false) {
+                    let score_name = &score_names[idx];
+                    eprintln!(
+                        "Warning: Score '{score_name}' has no variants within the requested region {region}."
+                    );
+                    diagnostics.record_region_without_hits(score_name);
+                }
+            }
+        }
+    }
 
     let total_variants_in_bim = bim_iterator.total_variants();
     eprintln!(
@@ -995,12 +1018,17 @@ impl<'arena> KWayMergeIterator<'arena> {
             });
         }
 
+        let region_filter_hits = region_filters
+            .as_ref()
+            .map(|_| vec![false; score_name_to_col_index.len()]);
+
         let mut iter = Self {
             streams,
             heap: BinaryHeap::new(),
             file_column_maps,
             next_error: None,
             region_filters,
+            region_filter_hits,
             bump,
         };
 
@@ -1012,29 +1040,68 @@ impl<'arena> KWayMergeIterator<'arena> {
     }
 
     fn replenish_from_stream(&mut self, file_idx: usize) -> Result<(), PrepError> {
-        loop {
-            let column_map = &self.file_column_maps[file_idx];
-            let bump = self.bump;
-            let region_filters = self.region_filters.as_deref();
+        let column_map = &self.file_column_maps[file_idx];
+        let bump = self.bump;
 
+        if self.region_filters.is_none() {
+            loop {
+                let outcome = {
+                    let stream = &mut self.streams[file_idx];
+                    if !stream.line_buffer.is_empty() {
+                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                        return Ok(());
+                    }
+
+                    Self::read_line_into_buffer(stream, column_map, None, None, bump)?
+                };
+
+                match outcome {
+                    LineReadOutcome::Pushed => {
+                        let stream = &mut self.streams[file_idx];
+                        Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                        return Ok(());
+                    }
+                    LineReadOutcome::Skipped => continue,
+                    LineReadOutcome::Eof => return Ok(()),
+                }
+            }
+        }
+
+        let region_filters = self.region_filters.as_deref();
+        let mut region_hits = self.region_filter_hits.take();
+
+        loop {
             let outcome = {
                 let stream = &mut self.streams[file_idx];
                 if !stream.line_buffer.is_empty() {
                     Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    self.region_filter_hits = region_hits;
                     return Ok(());
                 }
 
-                Self::read_line_into_buffer(stream, column_map, region_filters, bump)?
+                let region_hits_slice = region_hits.as_mut().map(|vec| vec.as_mut_slice());
+
+                Self::read_line_into_buffer(
+                    stream,
+                    column_map,
+                    region_filters,
+                    region_hits_slice,
+                    bump,
+                )?
             };
 
             match outcome {
                 LineReadOutcome::Pushed => {
                     let stream = &mut self.streams[file_idx];
                     Self::push_next_from_buffer_to_heap(stream, file_idx, &mut self.heap);
+                    self.region_filter_hits = region_hits;
                     return Ok(());
                 }
                 LineReadOutcome::Skipped => continue,
-                LineReadOutcome::Eof => return Ok(()),
+                LineReadOutcome::Eof => {
+                    self.region_filter_hits = region_hits;
+                    return Ok(());
+                }
             }
         }
     }
@@ -1043,6 +1110,7 @@ impl<'arena> KWayMergeIterator<'arena> {
         stream: &mut FileStream<'arena>,
         column_map: &[ScoreColumnIndex],
         region_filters: Option<&[Option<GenomicRegion>]>,
+        mut region_hits: Option<&mut [bool]>,
         bump: &'arena Bump,
     ) -> Result<LineReadOutcome, PrepError> {
         stream.line_buffer.clear();
@@ -1098,6 +1166,11 @@ impl<'arena> KWayMergeIterator<'arena> {
                                 continue;
                             }
                         }
+                        if let Some(hit_flags) = region_hits.as_deref_mut() {
+                            hit_flags[score_column_index.0] = true;
+                        }
+                    } else if let Some(hit_flags) = region_hits.as_deref_mut() {
+                        hit_flags[score_column_index.0] = true;
                     }
                     stream.line_buffer.push_back((weight, score_column_index));
                 }
@@ -1127,6 +1200,10 @@ impl<'arena> KWayMergeIterator<'arena> {
             };
             heap.push(HeapItem { record, file_idx });
         }
+    }
+
+    fn take_region_filter_hits(&mut self) -> Option<Vec<bool>> {
+        self.region_filter_hits.take()
     }
 }
 
@@ -1419,6 +1496,16 @@ impl Display for PrepError {
                     writeln!(f, "\nRegion filters requested:")?;
                     for (score, region) in &diag.active_region_filters {
                         writeln!(f, "  - {score} -> {region}")?;
+                    }
+
+                    if !diag.region_filters_without_hits.is_empty() {
+                        writeln!(
+                            f,
+                            "\nNo score records were observed within the requested region for:"
+                        )?;
+                        for score in &diag.region_filters_without_hits {
+                            writeln!(f, "  - {score}")?;
+                        }
                     }
 
                     if diag.total_score_records_processed == 0 {
