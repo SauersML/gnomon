@@ -1,9 +1,11 @@
 use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Mat as FaerMat, MatMut, Par};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
@@ -57,8 +59,43 @@ fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
 }
 
 fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
-    let full = root.t().dot(root);
-    sanitize_symmetric(&full)
+    let (rows, cols) = root.dim();
+    let mut gram = Array2::<f64>::zeros((cols, cols));
+
+    if rows == 0 || cols == 0 {
+        return gram;
+    }
+
+    let root_view = FaerArrayView::new(root);
+    if let Some(slice) = gram.as_slice_mut() {
+        let mut gram_view = MatMut::from_row_major_slice_mut(slice, cols, cols);
+        matmul(
+            gram_view.as_mut(),
+            Accum::Replace,
+            root_view.as_ref().transpose(),
+            root_view.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+    } else {
+        let mut fallback = FaerMat::<f64>::zeros(cols, cols);
+        matmul(
+            fallback.as_mut(),
+            Accum::Replace,
+            root_view.as_ref().transpose(),
+            root_view.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+
+        for i in 0..cols {
+            for j in 0..cols {
+                gram[[i, j]] = fallback[(i, j)];
+            }
+        }
+    }
+
+    sanitize_symmetric(&gram)
 }
 
 fn robust_eigh(
@@ -1602,15 +1639,14 @@ pub fn stable_reparameterization(
         });
     }
 
-    let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
-
     let mut s_balanced = Array2::zeros((p, p));
     let mut has_nonzero = false;
-    for s_k in &s_original_list {
-        let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if frob_norm > 1e-12 {
-            s_balanced.scaled_add(1.0 / frob_norm, s_k);
+    for rs_k in rs_list {
+        let s_k = penalty_from_root(rs_k);
+        let frob_norm_sq = s_k.iter().map(|&x| x * x).sum::<f64>();
+        if frob_norm_sq > 1e-24 {
+            let frob_norm = frob_norm_sq.sqrt();
+            s_balanced.scaled_add(1.0 / frob_norm, &s_k);
             has_nonzero = true;
         }
     }
