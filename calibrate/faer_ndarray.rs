@@ -47,11 +47,23 @@ pub struct FaerArrayView<'a> {
 impl<'a> FaerArrayView<'a> {
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
         let storage = if let Some(slice) = array.as_slice_memory_order() {
-            FaerStorage::Borrowed(MatRef::from_row_major_slice(
-                slice,
-                array.nrows(),
-                array.ncols(),
-            ))
+            if array.is_standard_layout() {
+                FaerStorage::Borrowed(MatRef::from_row_major_slice(
+                    slice,
+                    array.nrows(),
+                    array.ncols(),
+                ))
+            } else if array.t().is_standard_layout() {
+                FaerStorage::Borrowed(MatRef::from_column_major_slice(
+                    slice,
+                    array.nrows(),
+                    array.ncols(),
+                ))
+            } else {
+                let (rows, cols) = array.dim();
+                let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
+                FaerStorage::Owned(owned)
+            }
         } else {
             let (rows, cols) = array.dim();
             let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
