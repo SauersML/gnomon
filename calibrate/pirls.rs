@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::calibrate::construction::create_balanced_penalty_root;
 use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
@@ -209,6 +211,8 @@ pub fn fit_model_for_fixed_rho(
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
+    s_full_list: &[Array2<f64>],    // Full penalty matrices matching rs_original
+    balanced_penalty_root: &Array2<f64>,
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
@@ -230,30 +234,13 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Stage: Create the lambda-independent balanced penalty root for stable rank detection
-    // This is computed ONCE from the unweighted penalty structure and never changes
-    log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
-
-    // Reconstruct full penalty matrices from square roots for balanced penalty creation
-    // STANDARDIZED: With rank x p roots, use S = R^T * R
-    let mut s_list_full = Vec::with_capacity(rs_original.len());
-    for rs in rs_original {
-        let s_full = rs.t().dot(rs);
-        s_list_full.push(s_full);
-    }
-
-    use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
-    let p = x.ncols();
-    let eb = create_balanced_penalty_root(&s_list_full, p)?;
-    println!(
-        "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
-        eb.shape()
-    );
+    use crate::calibrate::construction::stable_reparameterization;
 
     // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
     log::info!("Computing stable reparameterization for numerical stability");
     println!("[Reparam] ==> Entering stable_reparameterization...");
-    let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+    let reparam_result =
+        stable_reparameterization(rs_original, s_full_list, &lambdas.to_vec(), layout)?;
     println!("[Reparam] <== Exited stable_reparameterization successfully.");
 
     println!(
@@ -281,7 +268,7 @@ pub fn fit_model_for_fixed_rho(
     // As per mgcv (Eb <- Eb%*%T), transform eb into the same stable basis as x_transformed.
     // The transformation for a penalty root R (shape k x p) is R_new = R * Q.
     // Here, eb is `rank x p` and qs is `p x p`, so the result is `rank x p`.
-    let eb_transformed = eb.dot(&reparam_result.qs);
+    let eb_transformed = balanced_penalty_root.dot(&reparam_result.qs);
     println!(
         "[Basis Fix] Transformed eb from original to stable basis. eb_transformed_sum: {:.4e}",
         eb_transformed.sum()
@@ -2491,10 +2478,11 @@ mod tests {
         };
 
         // --- Run the fit ---
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let (x_matrix, rs_original, s_full_list, layout) = setup_pirls_test_inputs(&data, &config)?;
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         let offset = Array1::<f64>::zeros(data.y.len());
+        let balanced_root = create_balanced_penalty_root(&s_full_list, layout.total_coeffs)?;
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
@@ -2502,6 +2490,8 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            &s_full_list,
+            &balanced_root,
             &layout,
             &config,
         )?;
@@ -2679,12 +2669,14 @@ mod tests {
 
         // Call stable_reparameterization directly to test the core functionality
         println!("Testing with lambdas1: {:?}", lambdas1);
-        let reparam1 = stable_reparameterization(&rs_original, &lambdas1, &layout).unwrap();
+        let reparam1 =
+            stable_reparameterization(&rs_original, &s_list, &lambdas1, &layout).unwrap();
         println!("Result 1 - qs matrix: {:?}", reparam1.qs);
         println!("Result 1 - s_transformed: {:?}", reparam1.s_transformed);
 
         println!("Testing with lambdas2: {:?}", lambdas2);
-        let reparam2 = stable_reparameterization(&rs_original, &lambdas2, &layout).unwrap();
+        let reparam2 =
+            stable_reparameterization(&rs_original, &s_list, &lambdas2, &layout).unwrap();
         println!("Result 2 - qs matrix: {:?}", reparam2.qs);
         println!("Result 2 - s_transformed: {:?}", reparam2.s_transformed);
 
@@ -2741,7 +2733,8 @@ mod tests {
         // Run stable reparameterization and confirm the null space dimension is preserved.
         let layout = ModelLayout::external(num_basis_functions, 1);
         let lambdas = vec![1.0];
-        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout)
+        let s_full_list = vec![penalty.clone()];
+        let reparam = stable_reparameterization(&rs_list, &s_full_list, &lambdas, &layout)
             .expect("stable reparameterization");
 
         assert_eq!(
@@ -2784,11 +2777,14 @@ mod tests {
     fn setup_pirls_test_inputs(
         data: &TrainingData,
         config: &ModelConfig,
-    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (Array2<f64>, Vec<Array2<f64>>, Vec<Array2<f64>>, ModelLayout),
+        Box<dyn std::error::Error>,
+    > {
         let (x_matrix, s_list, layout, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(data, config)?;
         let rs_original = compute_penalty_square_roots(&s_list)?;
-        Ok((x_matrix, rs_original, layout))
+        Ok((x_matrix, rs_original, s_list, layout))
     }
 
     /// Test that the unpivot_columns function correctly reverses a column pivot
@@ -3017,13 +3013,14 @@ mod tests {
         };
 
         // === PHASE 4: Prepare inputs for the target function ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let (x_matrix, rs_original, s_full_list, layout) = setup_pirls_test_inputs(&data, &config)?;
 
         // Size rho vector to match actual number of penalties
         let rho_vec = Array1::<f64>::zeros(rs_original.len());
 
         // === PHASE 5: Execute the target function ===
         let offset = Array1::<f64>::zeros(data.y.len());
+        let balanced_root = create_balanced_penalty_root(&s_full_list, layout.total_coeffs)?;
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
@@ -3031,6 +3028,8 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            &s_full_list,
+            &balanced_root,
             &layout,
             &config,
         )
@@ -3148,11 +3147,12 @@ mod tests {
         };
 
         // === Set up inputs using helper ===
-        let (x_matrix, rs_original, layout) = setup_pirls_test_inputs(&data, &config)?;
+        let (x_matrix, rs_original, s_full_list, layout) = setup_pirls_test_inputs(&data, &config)?;
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         // === Execute P-IRLS ===
         let offset = Array1::<f64>::zeros(data.y.len());
+        let balanced_root = create_balanced_penalty_root(&s_full_list, layout.total_coeffs)?;
         let pirls_result = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
@@ -3160,6 +3160,8 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            &s_full_list,
+            &balanced_root,
             &layout,
             &config,
         )
@@ -3740,7 +3742,7 @@ mod tests {
         };
         let lambdas = vec![0.7, 3.0];
 
-        let rp = stable_reparameterization(&rs, &lambdas, &layout).expect("reparam");
+        let rp = stable_reparameterization(&rs, &s_list, &lambdas, &layout).expect("reparam");
         let lhs = rp.s_transformed;
         let rhs = rp.e_transformed.t().dot(&rp.e_transformed);
 

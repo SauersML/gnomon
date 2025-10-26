@@ -30,7 +30,7 @@ use self::internal::RemlState;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
-    compute_penalty_square_roots,
+    compute_penalty_square_roots, create_balanced_penalty_root,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
@@ -782,6 +782,8 @@ pub fn train_model(
             reml_state.y(),
             reml_state.weights(),
             reml_state.rs_list_ref(),
+            reml_state.s_full_list(),
+            reml_state.balanced_penalty_root(),
             &layout,
             config,
         )?;
@@ -1238,6 +1240,8 @@ pub fn train_model(
         reml_state.y(),
         reml_state.weights(),     // Pass weights
         reml_state.rs_list_ref(), // Pass original penalty matrices
+        reml_state.s_full_list(),
+        reml_state.balanced_penalty_root(),
         &layout,
         config,
     )?;
@@ -1643,6 +1647,8 @@ pub fn optimize_external_design(
         y_o.view(),
         w_o.view(),
         &rs_list_ref,
+        reml_state.s_full_list(),
+        reml_state.balanced_penalty_root(),
         &layout,
         &cfg,
     )?;
@@ -2024,6 +2030,7 @@ pub mod internal {
         // Original penalty matrices S_k (p × p), ρ-independent basis
         s_full_list: Vec<Array2<f64>>,
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
+        balanced_penalty_root: Array2<f64>,
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
         nullspace_dims: Vec<usize>,
@@ -2187,6 +2194,9 @@ pub mod internal {
             // Pre-compute penalty square roots once
             let rs_list = compute_penalty_square_roots(&s_list)?;
 
+            // Pre-compute the lambda-independent balanced penalty root once per RemlState
+            let balanced_penalty_root = create_balanced_penalty_root(&s_list, layout.total_coeffs)?;
+
             let expected_len = s_list.len();
             let nullspace_dims = match nullspace_dims {
                 Some(dims) => {
@@ -2209,6 +2219,7 @@ pub mod internal {
                 offset: offset.to_owned(),
                 s_full_list: s_list,
                 rs_list,
+                balanced_penalty_root,
                 layout,
                 config,
                 nullspace_dims,
@@ -2522,6 +2533,14 @@ pub mod internal {
             &self.rs_list
         }
 
+        pub(super) fn s_full_list(&self) -> &Vec<Array2<f64>> {
+            &self.s_full_list
+        }
+
+        pub(super) fn balanced_penalty_root(&self) -> &Array2<f64> {
+            &self.balanced_penalty_root
+        }
+
         pub(super) fn weights(&self) -> ArrayView1<'a, f64> {
             self.weights
         }
@@ -2571,6 +2590,8 @@ pub mod internal {
                 self.y,
                 self.weights,
                 &self.rs_list,
+                &self.s_full_list,
+                &self.balanced_penalty_root,
                 self.layout,
                 self.config,
             );
@@ -4813,6 +4834,8 @@ pub mod internal {
                 data.y.view(),
                 data.weights.view(),
                 reml_state.rs_list_ref(),
+                reml_state.s_full_list(),
+                reml_state.balanced_penalty_root(),
                 &layout,
                 &config,
             )
@@ -4923,6 +4946,8 @@ pub mod internal {
                 data.y.view(),
                 data.weights.view(),
                 reml_state.rs_list_ref(),
+                reml_state.s_full_list(),
+                reml_state.balanced_penalty_root(),
                 &layout,
                 &config,
             )
@@ -5190,6 +5215,8 @@ pub mod internal {
                     total_folds_evaluated += 1;
 
                     let rs_list = compute_penalty_square_roots(&s_list).expect("rs roots");
+                    let balanced_root =
+                        create_balanced_penalty_root(&s_list, layout.total_coeffs).expect("eb");
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
                     let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -5199,6 +5226,8 @@ pub mod internal {
                         data_train.y.view(),
                         data_train.weights.view(),
                         &rs_list,
+                        &s_list,
+                        &balanced_root,
                         &layout,
                         &trained.config,
                     )
@@ -6509,6 +6538,7 @@ pub mod internal {
 
             // Here we need to create the original rs_list to pass to the new function
             let rs_original = compute_penalty_square_roots(&s_list)?;
+            let balanced_root = create_balanced_penalty_root(&s_list, layout.total_coeffs)?;
 
             let offset = Array1::<f64>::zeros(data.y.len());
             let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
@@ -6518,6 +6548,8 @@ pub mod internal {
                 data.y.view(),
                 data.weights.view(),
                 &rs_original,
+                &s_list,
+                &balanced_root,
                 &layout,
                 &config,
             );

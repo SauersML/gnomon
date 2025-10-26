@@ -2198,7 +2198,9 @@ pub fn fit_calibrator(
 mod tests {
     use super::*;
     use crate::calibrate::basis::null_range_whiten;
-    use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+    use crate::calibrate::construction::{
+        ModelLayout, compute_penalty_square_roots, create_balanced_penalty_root,
+    };
     use crate::calibrate::estimate::evaluate_external_gradients;
     use crate::calibrate::faer_ndarray::FaerCholesky;
     use crate::calibrate::model::ModelConfig;
@@ -2233,7 +2235,9 @@ mod tests {
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
     ) -> LamlBreakdown {
-        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, create_balanced_penalty_root,
+        };
         use crate::calibrate::model::ModelConfig;
 
         let rho_arr = Array1::from_vec(rho.to_vec());
@@ -2242,6 +2246,8 @@ mod tests {
             .map_or(false, |spec| spec.enabled);
         let cfg = ModelConfig::external(LinkFunction::Logit, 1e-3, 75, firth_active);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
+        let eb = create_balanced_penalty_root(rs_blocks, layout.total_coeffs)
+            .expect("balanced penalty root");
 
         let pirls = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
@@ -2250,6 +2256,8 @@ mod tests {
             y,
             w_prior,
             &rs_list,
+            rs_blocks,
+            &eb,
             &layout,
             &cfg,
         )
@@ -2296,13 +2304,17 @@ mod tests {
         rho: &[f64],
         scale: f64, // Gaussian dispersion parameter
     ) -> f64 {
-        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+        use crate::calibrate::construction::{
+            ModelLayout, compute_penalty_square_roots, create_balanced_penalty_root,
+        };
         use crate::calibrate::model::ModelConfig;
 
         let rho_arr = Array1::from_vec(rho.to_vec());
         let layout = ModelLayout::external(x.ncols(), rs_blocks.len());
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
+        let eb = create_balanced_penalty_root(rs_blocks, layout.total_coeffs)
+            .expect("balanced penalty root");
 
         let pirls = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
@@ -2311,6 +2323,8 @@ mod tests {
             y,
             w_prior,
             &rs_list,
+            rs_blocks,
+            &eb,
             &layout,
             &cfg,
         )
@@ -2754,6 +2768,8 @@ mod tests {
         let p = x.ncols();
 
         let rs_original: Vec<Array2<f64>> = Vec::new();
+        let s_full_list: Vec<Array2<f64>> = Vec::new();
+        let balanced_root = Array2::<f64>::zeros((0, p));
         let rho = Array1::<f64>::zeros(0);
         let offset = Array1::<f64>::zeros(n);
 
@@ -2767,6 +2783,8 @@ mod tests {
             y.view(),
             w_prior.view(),
             &rs_original,
+            &s_full_list,
+            &balanced_root,
             &layout,
             &cfg,
         )
@@ -3963,6 +3981,9 @@ mod tests {
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let penalty_roots =
             compute_penalty_square_roots(&penalties_with_ridge).expect("penalty roots");
+        let balanced_root =
+            create_balanced_penalty_root(&penalties_with_ridge, layout.total_coeffs)
+                .expect("balanced penalty root");
 
         let rho_low = Array1::from_elem(penalties_with_ridge.len(), -15.0);
         let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
@@ -3974,6 +3995,8 @@ mod tests {
             y.view(),
             w.view(),
             &penalty_roots,
+            &penalties_with_ridge,
+            &balanced_root,
             &layout,
             &cfg,
         )
@@ -3985,6 +4008,8 @@ mod tests {
             y.view(),
             w.view(),
             &penalty_roots,
+            &penalties_with_ridge,
+            &balanced_root,
             &layout,
             &cfg,
         )

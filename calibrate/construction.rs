@@ -60,6 +60,13 @@ fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
     sanitize_symmetric(&full)
 }
 
+/// Reconstructs full penalty matrices from their square roots. This helper is useful when
+/// cached roots are already available but the full matrices are required for downstream
+/// operations such as diagnostics or balanced penalty construction.
+pub fn full_penalty_matrices_from_roots(rs_list: &[Array2<f64>]) -> Vec<Array2<f64>> {
+    rs_list.iter().map(penalty_from_root).collect()
+}
+
 fn robust_eigh(
     matrix: &Array2<f64>,
     side: Side,
@@ -1560,6 +1567,7 @@ pub fn construct_s_lambda(
 /// parameter; it operates solely on `rs_list`, `lambdas`, and `layout`.
 pub fn stable_reparameterization(
     rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
+    s_full_list: &[Array2<f64>], // matching full penalty matrices (p x p)
     lambdas: &[f64],
     layout: &ModelLayout,
 ) -> Result<ReparamResult, EstimationError> {
@@ -1599,13 +1607,18 @@ pub fn stable_reparameterization(
     // Initialize global transformation matrix and working matrices
     let mut qf = Array2::eye(p); // Final accumulated orthogonal transform Qf
 
-    // Create pristine copy of original full penalty matrices S_k = rS_k * rS_k^T
-    // These will NEVER be modified and are used for building the sb matrix
-    let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
+    // Create pristine copy of original full penalty matrices. These must match rs_list in order
+    // and are expected to be provided by the caller to avoid repeated reconstruction.
+    if s_full_list.len() != m {
+        return Err(EstimationError::LayoutError(format!(
+            "Penalty matrix count mismatch: received {} roots but {} full matrices",
+            m,
+            s_full_list.len()
+        )));
+    }
 
     // Create the WORKING copy that will be transformed
-    let mut s_current_list = s_original_list.clone();
+    let mut s_current_list = s_full_list.to_owned();
 
     // Clone penalty square roots - we'll transform these in-place
     let mut rs_current = rs_list.to_vec();
@@ -2002,12 +2015,14 @@ pub fn stable_reparameterization(
     // Stage: The loop has finished - rs_current now contains the fully transformed penalty roots
     let final_rs_transformed = rs_current;
 
-    // Stage: Construct the final transformed total penalty matrix
+    // Stage: Construct the final transformed total penalty matrix and cache components for reuse
     let mut s_transformed = Array2::zeros((p, p));
+    let mut s_components = Vec::with_capacity(m);
     for i in 0..m {
         // Form full penalty from transformed root: S_k = rS_k^T * rS_k
         let s_k_transformed = penalty_from_root(&final_rs_transformed[i]);
         s_transformed.scaled_add(lambdas[i], &s_k_transformed);
+        s_components.push(s_k_transformed);
     }
 
     // Stage: Compute the eigendecomposition of S_lambda
@@ -2071,9 +2086,8 @@ pub fn stable_reparameterization(
     }
 
     // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
-    for k in 0..lambdas.len() {
-        let s_k_transformed = penalty_from_root(&final_rs_transformed[k]);
-        let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
+    for (k, s_k_transformed) in s_components.iter().enumerate() {
+        let s_plus_times_s_k = s_plus.dot(s_k_transformed);
         let trace: f64 = s_plus_times_s_k.diag().sum();
         det1[k] = lambdas[k] * trace;
     }
