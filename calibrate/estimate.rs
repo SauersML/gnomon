@@ -1894,6 +1894,69 @@ pub mod internal {
     }
 
     impl<'a> RemlState<'a> {
+        fn log_pirls_summary(&self, pr: &PirlsResult) {
+            let diag = &pr.diagnostics;
+            let summary_level = if pr.status != pirls::PirlsStatus::Converged {
+                "warn"
+            } else if diag.max_step_halving > 0 || !diag.notes.is_empty() {
+                "info"
+            } else {
+                "debug"
+            };
+
+            if let Some(last) = diag.iterations.last() {
+                let summary = format!(
+                    "P-IRLS status={:?} iter={} D={:.6e} Dp={:.6e} max|eta|={:.2e} halvings(total={}, max={}) runtime={:?}",
+                    pr.status,
+                    last.iteration,
+                    last.deviance,
+                    last.penalized_deviance,
+                    last.max_abs_eta,
+                    diag.total_step_halvings,
+                    diag.max_step_halving,
+                    diag.runtime,
+                );
+                match summary_level {
+                    "warn" => log::warn!("{summary}"),
+                    "info" => log::info!("{summary}"),
+                    _ => log::debug!("{summary}"),
+                }
+            } else {
+                log::debug!(
+                    "P-IRLS completed with no recorded iterations; status={:?}",
+                    pr.status
+                );
+            }
+
+            if let Some(grad) = diag.final_gradient_norm {
+                let grad_tol = diag.final_gradient_tolerance.unwrap_or(f64::NAN);
+                let grad_msg = format!(
+                    "P-IRLS final gradient norm {:.3e} (tol {:.3e})",
+                    grad, grad_tol
+                );
+                if pr.status != pirls::PirlsStatus::Converged && grad.is_finite() && grad > grad_tol
+                {
+                    log::warn!("{grad_msg}");
+                } else if summary_level == "warn" {
+                    log::warn!("{grad_msg}");
+                } else if summary_level == "info" {
+                    log::info!("{grad_msg}");
+                } else {
+                    log::debug!("{grad_msg}");
+                }
+            }
+
+            if !diag.notes.is_empty() {
+                for note in &diag.notes {
+                    if pr.status != pirls::PirlsStatus::Converged {
+                        log::info!("P-IRLS note: {note}");
+                    } else {
+                        log::debug!("P-IRLS note: {note}");
+                    }
+                }
+            }
+        }
+
         pub fn reset_optimizer_tracking(&self) {
             *self.eval_count.borrow_mut() = 0;
             *self.last_cost.borrow_mut() = f64::INFINITY;
@@ -2508,6 +2571,7 @@ pub mod internal {
                 }
             };
             let pirls_result = bundle.pirls_result.as_ref();
+            self.log_pirls_summary(pirls_result);
             let h_eff = bundle.h_eff.as_ref();
             let ridge_used = bundle.ridge_used;
 

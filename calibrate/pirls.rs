@@ -54,6 +54,93 @@ impl PirlsWorkspace {
     }
 }
 
+/// Snapshot of a single P-IRLS iteration recorded for diagnostics.
+#[derive(Clone, Debug)]
+pub struct PirlsIterationRecord {
+    /// 1-indexed iteration count.
+    pub iteration: usize,
+    /// Unpenalized deviance after the accepted update.
+    pub deviance: f64,
+    /// Quadratic penalty term βᵀSβ in the transformed basis.
+    pub penalty: f64,
+    /// Penalized deviance D_p = deviance + penalty after the update.
+    pub penalized_deviance: f64,
+    /// Absolute maximum of the linear predictor, useful for separation checks.
+    pub max_abs_eta: f64,
+    /// Number of step-halving attempts required before the step was accepted.
+    pub step_halving: usize,
+    /// Change in penalized deviance relative to the previous iterate.
+    pub deviance_change: Option<f64>,
+    /// Infinity norm of the gradient evaluated with the linear-system weights, when available.
+    pub gradient_norm: Option<f64>,
+}
+
+/// Aggregate diagnostics summarizing the P-IRLS inner loop.
+#[derive(Clone, Debug)]
+pub struct PirlsDiagnostics {
+    /// Per-iteration snapshots in the order they were evaluated.
+    pub iterations: Vec<PirlsIterationRecord>,
+    /// Total number of step-halving attempts across the fit.
+    pub total_step_halvings: usize,
+    /// Maximum number of halvings required for any accepted step.
+    pub max_step_halving: usize,
+    /// Final gradient norm (∞-norm) if evaluated.
+    pub final_gradient_norm: Option<f64>,
+    /// Gradient tolerance that was compared against the final norm, if known.
+    pub final_gradient_tolerance: Option<f64>,
+    /// Total wall-clock time spent inside the inner loop.
+    pub runtime: Duration,
+    /// Final status that caused the loop to terminate.
+    pub status: PirlsStatus,
+    /// Free-form notes to surface potentially problematic behaviour to callers.
+    pub notes: Vec<String>,
+}
+
+impl Default for PirlsDiagnostics {
+    fn default() -> Self {
+        Self {
+            iterations: Vec::new(),
+            total_step_halvings: 0,
+            max_step_halving: 0,
+            final_gradient_norm: None,
+            final_gradient_tolerance: None,
+            runtime: Duration::default(),
+            status: PirlsStatus::MaxIterationsReached,
+            notes: Vec::new(),
+        }
+    }
+}
+
+impl PirlsDiagnostics {
+    pub fn record_iteration(&mut self, record: PirlsIterationRecord) {
+        self.total_step_halvings += record.step_halving;
+        self.max_step_halving = self.max_step_halving.max(record.step_halving);
+        self.iterations.push(record);
+    }
+
+    pub fn attach_gradient(&mut self, iteration: usize, gradient_norm: f64, gradient_tol: f64) {
+        if let Some(entry) = self
+            .iterations
+            .iter_mut()
+            .rev()
+            .find(|rec| rec.iteration == iteration)
+        {
+            entry.gradient_norm = Some(gradient_norm);
+        }
+        self.final_gradient_norm = Some(gradient_norm);
+        self.final_gradient_tolerance = Some(gradient_tol);
+    }
+
+    pub fn push_note<S: Into<String>>(&mut self, note: S) {
+        self.notes.push(note.into());
+    }
+
+    pub fn finish(&mut self, status: PirlsStatus, runtime: Duration) {
+        self.status = status;
+        self.runtime = runtime;
+    }
+}
+
 /// The status of the P-IRLS convergence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PirlsStatus {
@@ -95,6 +182,8 @@ pub struct PirlsResult {
     pub penalized_hessian_transformed: Array2<f64>,
     // CRITICAL: Single stabilized Hessian for consistent cost/gradient computation
     pub stabilized_hessian_transformed: Array2<f64>,
+    /// Iteration-level diagnostics captured during the inner optimization loop.
+    pub diagnostics: PirlsDiagnostics,
 
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
@@ -170,6 +259,9 @@ pub fn fit_model_for_fixed_rho(
     if !lambdas.is_empty() {
         println!("Lambdas: {:?}", lambdas);
     }
+
+    let inner_start = Instant::now();
+    let mut diagnostics = PirlsDiagnostics::default();
 
     // Stage: Create the lambda-independent balanced penalty root for stable rank detection
     // This is computed ONCE from the unweighted penalty structure and never changes
@@ -463,9 +555,59 @@ pub fn fit_model_for_fixed_rho(
             .map(|v| v.abs())
             .fold(f64::NEG_INFINITY, f64::max);
 
+        // Calculate the penalized deviance using the transformed penalty matrix
+        let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+        let penalized_deviance_new = last_deviance + penalty_new;
+
+        // Set scale parameter based on link function
+        let scale = match config.link_function {
+            LinkFunction::Logit => 1.0,
+            LinkFunction::Identity => {
+                // For Gaussian, use WEIGHTED residual variance consistent with objective
+                let residuals = &y.view() - &mu;
+                let weighted_rss: f64 = prior_weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum();
+                // Use the EDF from the solver: df = n - edf
+                let df = (x_transformed.nrows() as f64 - edf_from_solver).max(1.0);
+                weighted_rss / df
+            }
+        };
+
+        // This scaling factor is the key to mgcv's numerical stability.
+        // It prevents the tolerance from collapsing when the deviance is small.
+        let convergence_scale = scale.abs() + penalized_deviance_new.abs();
+        let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
+
+        last_deviance_change = deviance_change_scaled;
+        last_penalized_deviance = penalized_deviance_new;
+        last_step_halving = step_halving_count;
+
+        diagnostics.record_iteration(PirlsIterationRecord {
+            iteration: iter,
+            deviance: last_deviance,
+            penalty: penalty_new,
+            penalized_deviance: penalized_deviance_new,
+            max_abs_eta,
+            step_halving: step_halving_count,
+            deviance_change: Some(deviance_change_scaled),
+            gradient_norm: None,
+        });
+
+        if step_halving_count > 0 {
+            diagnostics.push_note(format!(
+                "Iteration {iter} accepted after {step_halving_count} step-halving adjustments."
+            ));
+        }
+
         // Check for separation - this is a modern feature we'll keep
         const ETA_STABILITY_THRESHOLD: f64 = 100.0;
         if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function == LinkFunction::Logit {
+            diagnostics.push_note(format!(
+                "Iteration {iter} exceeded stability threshold with max|eta|={max_abs_eta:.2e}."
+            ));
             log::warn!(
                 "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
             );
@@ -505,10 +647,12 @@ pub fn fit_model_for_fixed_rho(
                 "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
                 iter, max_abs_eta
             );
+            diagnostics.finish(PirlsStatus::Unstable, inner_start.elapsed());
             return Ok(PirlsResult {
                 beta_transformed: beta_transformed.clone(),
                 penalized_hessian_transformed,
                 stabilized_hessian_transformed,
+                diagnostics,
                 deviance: last_deviance,
                 edf: if let Some((ref result, _)) = last_stable_result {
                     result.edf
@@ -586,6 +730,9 @@ pub fn fit_model_for_fixed_rho(
                 || order_separated
                 || (iter >= 3 && (beta_grew_fast || beta_too_large))
             {
+                diagnostics.push_note(format!(
+                    "Iteration {iter} flagged unpenalized separation symptoms: max|eta|={max_abs_eta:.2e}, sat_frac={sat_frac:.3}, dev/n={dev_per_sample:.3e}."
+                ));
                 log::warn!(
                     "P-IRLS instability (unpenalized Logit) at iter {}: max|eta|={:.2e}, sat_frac={:.3}, dev/n={:.3e}, order_sep={}, ||beta||={:.2e} (prev {:.2e})",
                     iter,
@@ -625,10 +772,12 @@ pub fn fit_model_for_fixed_rho(
                     "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
                     iter, max_abs_eta
                 );
+                diagnostics.finish(PirlsStatus::Unstable, inner_start.elapsed());
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
                     stabilized_hessian_transformed,
+                    diagnostics,
                     deviance: last_deviance,
                     edf: if let Some((ref result, _)) = last_stable_result {
                         result.edf
@@ -653,41 +802,12 @@ pub fn fit_model_for_fixed_rho(
             prev_beta_norm = beta_norm;
         }
 
-        // Calculate the penalized deviance using the transformed penalty matrix
-        let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-        let penalized_deviance_new = last_deviance + penalty_new;
-
-        // Set scale parameter based on link function
-        let scale = match config.link_function {
-            LinkFunction::Logit => 1.0,
-            LinkFunction::Identity => {
-                // For Gaussian, use WEIGHTED residual variance consistent with objective
-                let residuals = &y.view() - &mu;
-                let weighted_rss: f64 = prior_weights
-                    .iter()
-                    .zip(residuals.iter())
-                    .map(|(&w, &r)| w * r * r)
-                    .sum();
-                // Use the EDF from the solver: df = n - edf
-                let df = (x_transformed.nrows() as f64 - edf_from_solver).max(1.0);
-                weighted_rss / df
-            }
-        };
-
-        // This scaling factor is the key to mgcv's numerical stability.
-        // It prevents the tolerance from collapsing when the deviance is small.
-        let convergence_scale = scale.abs() + penalized_deviance_new.abs();
-        let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
-
         // Log iteration info
         let step_halving_info = if step_halving_count > 0 {
             format!(" | Step Halving: {} attempts", step_halving_count)
         } else {
             String::new()
         };
-        last_deviance_change = deviance_change_scaled;
-        last_penalized_deviance = penalized_deviance_new;
-        last_step_halving = step_halving_count;
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
         if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
@@ -721,6 +841,7 @@ pub fn fit_model_for_fixed_rho(
 
             last_gradient_norm = gradient_norm;
             last_gradient_tol = gradient_tol;
+            diagnostics.attach_gradient(iter, gradient_norm, gradient_tol);
 
             if gradient_norm < gradient_tol && iter >= min_iterations {
                 // SUCCESS: Both deviance and gradient have converged.
@@ -770,10 +891,12 @@ pub fn fit_model_for_fixed_rho(
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
                 // Populate the new PirlsResult struct with stable, transformed quantities
+                diagnostics.finish(PirlsStatus::Converged, inner_start.elapsed());
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
                     stabilized_hessian_transformed,
+                    diagnostics,
                     deviance: last_deviance,
                     edf: edf_from_solver,
                     stable_penalty_term,
@@ -795,6 +918,10 @@ pub fn fit_model_for_fixed_rho(
 
     // If we reach here, we've hit max iterations without converging
     log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
+    diagnostics.push_note(format!(
+        "Reached maximum iterations ({}) without achieving convergence tolerance.",
+        config.max_iterations
+    ));
 
     let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
     let grad_display = if last_gradient_norm.is_finite() {
@@ -893,6 +1020,7 @@ pub fn fit_model_for_fixed_rho(
     };
     let convergence_scale = scale_term.abs() + penalized_deviance_new.abs();
     let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
+    diagnostics.attach_gradient(last_iter, gradient_norm, gradient_tol);
 
     // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
@@ -904,11 +1032,14 @@ pub fn fit_model_for_fixed_rho(
     } else {
         PirlsStatus::MaxIterationsReached
     };
+    let status_for_result = final_status.clone();
+    diagnostics.finish(final_status, inner_start.elapsed());
 
     Ok(PirlsResult {
         beta_transformed,
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
+        diagnostics,
         deviance: last_deviance,
         edf: if let Some((ref result, _)) = last_stable_result {
             result.edf
@@ -922,7 +1053,7 @@ pub fn fit_model_for_fixed_rho(
         solve_weights: last_weights_solve.clone(),
         solve_working_response: last_z_solve.clone(),
         solve_mu: last_mu_solve.clone(),
-        status: final_status,
+        status: status_for_result,
         iteration: last_iter,
         max_abs_eta,
         reparam_result,
