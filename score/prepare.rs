@@ -296,7 +296,7 @@ pub fn prepare_for_computation(
     let mut score_iterator = KWayMergeIterator::new(
         sorted_score_files,
         &score_name_to_col_index,
-        region_filters,
+        region_filters.clone(),
         &bump,
     )?;
 

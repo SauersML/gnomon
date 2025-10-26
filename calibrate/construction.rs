@@ -24,11 +24,14 @@ fn weighted_column_means(x: &Array2<f64>, w: &Array1<f64>) -> Array1<f64> {
 /// This enforces intercept orthogonality (sum-to-zero) for the columns it is applied to.
 pub fn center_columns_in_place(x: &mut Array2<f64>, w: &Array1<f64>) {
     let means = weighted_column_means(x, w);
-    // Subtract means from each column
-    for j in 0..x.ncols() {
-        let m = means[j];
-        x.column_mut(j).mapv_inplace(|v| v - m);
-    }
+    let means_vec = means.to_vec();
+    x.axis_iter_mut(Axis(1))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(j, mut col)| {
+            let mean = means_vec[j];
+            col.mapv_inplace(|v| v - mean);
+        });
 }
 
 /// Computes the Kronecker product A ⊗ B for penalty matrix construction.

@@ -1,5 +1,6 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
+use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use thiserror::Error;
 
@@ -124,12 +125,17 @@ pub fn create_bspline_basis_with_knots(
 
     let num_basis_functions = knot_vector.len() - degree - 1;
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+    let data_vec = data.to_vec();
 
-    // Evaluate the splines for each data point
-    for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector);
-        basis_matrix.row_mut(i).assign(&basis_row);
-    }
+    basis_matrix
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let x = data_vec[i];
+            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector);
+            row.assign(&basis_row);
+        });
 
     Ok((basis_matrix, knot_vector.to_owned()))
 }
@@ -192,14 +198,17 @@ pub fn create_bspline_basis(
     let num_basis_functions = knot_vector.len() - degree - 1;
 
     let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+    let data_vec = data.to_vec();
 
-    // Evaluate the splines for each data point.
-    // This structure allows the inner loop (de Boor's) to be highly optimized
-    // and cache-friendly for a single point `x`.
-    for (i, &x) in data.iter().enumerate() {
-        let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
-        basis_matrix.row_mut(i).assign(&basis_row);
-    }
+    basis_matrix
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let x = data_vec[i];
+            let basis_row = internal::evaluate_splines_at_point(x, degree, knot_vector.view());
+            row.assign(&basis_row);
+        });
 
     Ok((basis_matrix, knot_vector))
 }

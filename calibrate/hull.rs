@@ -1,4 +1,5 @@
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::parallel::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 
 /// Error type for hull building and projection.
@@ -32,17 +33,28 @@ impl PeeledHull {
         );
 
         let mut out = Array2::zeros((n, d));
+        let hull = self;
+
+        let rows: Vec<(Array1<f64>, bool)> = points
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(|row| {
+                if hull.is_inside(row) {
+                    (row.to_owned(), false)
+                } else {
+                    (hull.project_point(row), true)
+                }
+            })
+            .collect();
+
         let mut num_projected = 0usize;
-        for i in 0..n {
-            let y = points.row(i);
-            if self.is_inside(y) {
-                out.row_mut(i).assign(&y);
-            } else {
-                let proj = self.project_point(y);
+        for (i, (vec_row, was_projected)) in rows.into_iter().enumerate() {
+            if was_projected {
                 num_projected += 1;
-                out.row_mut(i).assign(&proj.view());
             }
+            out.row_mut(i).assign(&vec_row);
         }
+
         (out, num_projected)
     }
 
@@ -87,11 +99,13 @@ impl PeeledHull {
 
     /// Vectorized signed distance for a batch of points (row-wise).
     pub fn signed_distance_many(&self, points: ArrayView2<f64>) -> Array1<f64> {
-        let mut out = Array1::zeros(points.nrows());
-        for i in 0..points.nrows() {
-            out[i] = self.signed_distance(points.row(i));
-        }
-        out
+        let hull = self;
+        let distances: Vec<f64> = points
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(|row| hull.signed_distance(row))
+            .collect();
+        Array1::from_vec(distances)
     }
 
     /// Compute signed distances and corresponding projections in a single pass.
@@ -104,28 +118,36 @@ impl PeeledHull {
         let d = points.ncols();
         let mut dist = Array1::zeros(n);
         let mut proj = Array2::zeros((n, d));
+        let hull = self;
 
-        for i in 0..n {
-            let xi = points.row(i);
-            if self.is_inside(xi) {
-                // Inside: negative min slack; projection is itself
-                let mut min_slack = f64::INFINITY;
-                for (a, b) in &self.facets {
-                    let slack = *b - a.dot(&xi);
-                    if slack < min_slack {
-                        min_slack = slack;
+        let rows: Vec<(Array1<f64>, f64)> = points
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(|row| {
+                let row_owned = row.to_owned();
+                if hull.is_inside(row) {
+                    let mut min_slack = f64::INFINITY;
+                    for (a, b) in &hull.facets {
+                        let slack = *b - a.dot(&row_owned.view());
+                        if slack < min_slack {
+                            min_slack = slack;
+                        }
                     }
+                    (row_owned, -min_slack.max(0.0))
+                } else {
+                    let proj_row = hull.project_point(row);
+                    let diff = &row_owned - &proj_row;
+                    let dist_val = diff.mapv(|v| v * v).sum().sqrt();
+                    (proj_row, dist_val)
                 }
-                dist[i] = -min_slack.max(0.0);
-                proj.row_mut(i).assign(&xi);
-            } else {
-                // Outside: project once; distance is Euclidean norm to projection
-                let zi = self.project_point(xi);
-                let di = (&xi.to_owned() - &zi).mapv(|v| v * v).sum().sqrt();
-                dist[i] = di;
-                proj.row_mut(i).assign(&zi.view());
-            }
+            })
+            .collect();
+
+        for (i, (proj_row, dist_val)) in rows.into_iter().enumerate() {
+            dist[i] = dist_val;
+            proj.row_mut(i).assign(&proj_row);
         }
+
         (dist, proj)
     }
 

@@ -7,6 +7,7 @@ use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
 
+use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
@@ -533,9 +534,14 @@ pub fn build_calibrator_design(
     fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
         let rows = matrix.nrows();
         let mut result = Array2::<f64>::zeros((rows, indices.len()));
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            result.column_mut(new_idx).assign(&matrix.column(old_idx));
-        }
+        result
+            .axis_iter_mut(Axis(1))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(new_idx, mut col)| {
+                let old_idx = indices[new_idx];
+                col.assign(&matrix.column(old_idx));
+            });
         result
     }
 
@@ -545,13 +551,16 @@ pub fn build_calibrator_design(
         }
 
         let tol = 1e-9_f64;
-        let mut keep: Vec<usize> = Vec::with_capacity(basis.ncols());
-        for j in 0..basis.ncols() {
-            let norm_sq: f64 = basis.column(j).iter().map(|&v| v * v).sum();
-            if norm_sq.sqrt() > tol {
-                keep.push(j);
-            }
-        }
+        let norms: Vec<f64> = basis
+            .axis_iter(Axis(1))
+            .into_par_iter()
+            .map(|col| col.iter().map(|&v| v * v).sum::<f64>().sqrt())
+            .collect();
+        let keep: Vec<usize> = norms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &norm)| (norm > tol).then_some(idx))
+            .collect();
 
         if keep.len() == basis.ncols() {
             return;
@@ -654,20 +663,34 @@ pub fn build_calibrator_design(
         if basis.is_empty() {
             return 0.0;
         }
-        let mut accum = 0.0;
-        for col in 0..basis.ncols() {
-            let mut dot = 0.0;
-            for row in 0..basis.nrows() {
-                let w = weights[row];
-                if w <= 0.0 {
-                    continue;
+        let weights_view = weights.view();
+        let target_view = target.map(|t| t.view());
+
+        let accum = basis
+            .axis_iter(Axis(1))
+            .into_par_iter()
+            .map(|col| {
+                let mut dot = 0.0;
+                if let Some(ref target_vec) = target_view {
+                    for (row_idx, &basis_val) in col.iter().enumerate() {
+                        let w = weights_view[row_idx];
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        dot += w * basis_val * target_vec[row_idx];
+                    }
+                } else {
+                    for (row_idx, &basis_val) in col.iter().enumerate() {
+                        let w = weights_view[row_idx];
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        dot += w * basis_val;
+                    }
                 }
-                let basis_val = basis[[row, col]];
-                let target_val = target.map(|t| t[row]).unwrap_or(1.0);
-                dot += w * basis_val * target_val;
-            }
-            accum += dot * dot;
-        }
+                dot * dot
+            })
+            .sum::<f64>();
         accum.sqrt()
     }
 
