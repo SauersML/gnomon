@@ -33,10 +33,7 @@ impl PeeledHull {
             .axis_iter_mut(Axis(0))
             .into_par_iter()
             .map(|mut row| {
-                let slice = row
-                    .as_slice_mut()
-                    .expect("rows must be contiguous for in-place projection");
-                let view = ArrayView1::from(&*slice);
+                let view = row.view();
                 if self.is_inside(view) {
                     0usize
                 } else {
@@ -50,7 +47,6 @@ impl PeeledHull {
 
     /// Projects points onto the hull if needed. Returns corrected points and count projected.
     pub fn project_if_needed(&self, points: ArrayView2<f64>) -> (Array2<f64>, usize) {
-        let n = points.nrows();
         let d = points.ncols();
         assert_eq!(
             d, self.dim,
