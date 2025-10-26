@@ -11,8 +11,12 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
+use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
+use faer::{Accum, Par};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::HashSet;
 // Use the shared optimizer facade from estimate.rs
 use crate::calibrate::estimate::{
     ExternalOptimOptions, ExternalOptimResult, optimize_external_design,
@@ -236,140 +240,138 @@ pub fn compute_alo_features(
         }
     };
 
-    // Blocked solves: K S = Uᵀ; compute a_ii and var_full within the same block
-    let block = 8192usize.min(n.max(1));
+    // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
+    let ut_f = FaerMat::<f64>::from_fn(p, n, |i, j| ut[[i, j]]);
+    let s_all = factor.solve(ut_f.as_ref());
+    let xtwx_f = FaerMat::<f64>::from_fn(p, p, |i, j| xtwx[[i, j]]);
+    let mut t_all = FaerMat::<f64>::zeros(p, n);
+    matmul(
+        t_all.as_mut(),
+        Accum::Replace,
+        xtwx_f.as_ref(),
+        s_all.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let s_array = Array2::from_shape_fn((p, n), |(i, j)| s_all[(i, j)]);
+    let t_array = Array2::from_shape_fn((p, n), |(i, j)| t_all[(i, j)]);
+
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
     let z = base.solve_working_response.clone();
 
-    // Add counter for diagnostic output (to print only first few observations)
     let mut diag_counter = 0;
-    let max_diag_samples = 5; // Print only the first 5 observations for readability
+    let max_diag_samples = 5;
 
-    let mut col_start = 0usize;
-    while col_start < n {
-        let col_end = (col_start + block).min(n);
-        let cols = col_end - col_start;
-        // RHS block: p x cols
-        let rhs_block = ut.slice(s![.., col_start..col_end]).to_owned();
-        let rhs_f = FaerMat::<f64>::from_fn(p, cols, |i, j| rhs_block[[i, j]]);
-        let s_block = factor.solve(rhs_f.as_ref()); // p x cols
-        let s_block_nd = Array2::from_shape_fn((p, cols), |(i, j)| s_block[(i, j)]);
-        let t_block_nd = xtwx.dot(&s_block_nd);
+    let mut percentiles_data = Vec::with_capacity(n);
+    let mut sum_aii = 0.0_f64;
+    let mut max_aii = f64::NEG_INFINITY;
+    let mut invalid_count = 0usize;
+    let mut high_leverage_count = 0usize;
+    let mut a_hi_90 = 0usize;
+    let mut a_hi_95 = 0usize;
+    let mut a_hi_99 = 0usize;
 
-        for j in 0..cols {
-            let irow = col_start + j;
+    for i in 0..n {
+        let u_row = u.row(i);
+        let s_col = s_array.column(i);
+        let t_col = t_array.column(i);
 
-            // a_ii = u_i · s_i
-            let mut dot = 0.0;
-            for r in 0..p {
-                dot += u[[irow, r]] * s_block_nd[(r, j)];
-            }
-            aii[irow] = dot;
+        let ai = u_row.dot(&s_col);
+        aii[i] = ai;
+        percentiles_data.push(ai);
 
-            let wi = base.final_weights[irow].max(1e-12);
-
-            // Fisher prediction variance on the η-scale:
-            //   Var_full(η̂_i) = φ / w_i · s_iᵀ (Xᵀ W X) s_i,
-            // where s_i = K^{-1} u_i and u_i = √w_i x_i.
-            let quad = {
-                let mut acc = 0.0;
-                for r in 0..p {
-                    acc += s_block_nd[(r, j)] * t_block_nd[(r, j)];
-                }
-                acc
-            };
-            let var_full = phi * (quad / wi);
-
-            // Proper leave-one-out (LOO) prediction variance must remove the
-            // contribution of the i-th working response before inflating by the
-            // Sherman-Morrison denominator.  For an arbitrary penalized smoother the
-            // smoothing matrix is no longer idempotent, so the simple
-            // var_full/(1 - a_ii) formula (which assumes a projection matrix) is
-            // WRONG.  The correct expression is
-            //
-            //   Var_LOO(η_i) = (Var_full(η_i) - Var(z_i) * a_ii^2) / (1 - a_ii)^2
-            //
-            // where Var(z_i) = φ / w_i.  The previous code skipped the subtraction
-            // term, implicitly assuming the hat matrix squared equals itself.  That
-            // only holds for unpenalized least squares; with smoothing penalties the
-            // matrix contracts and the omitted term is O(a_ii^2), dramatically
-            // underestimating LOO uncertainty for high leverage points.
-            let denom_raw = 1.0 - aii[irow];
-            if denom_raw <= 0.0 {
-                eprintln!(
-                    "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
-                    irow, aii[irow]
-                );
-            }
-            let denom = denom_raw.max(1e-12);
-
-            let var_without_i = (var_full - phi * (aii[irow] * aii[irow]) / wi).max(0.0);
-            let denom_sq = denom * denom;
-            let var_loo = var_without_i / denom_sq;
-            let se_full = var_full.max(0.0).sqrt();
-            se_tilde[irow] = var_loo.max(0.0).sqrt();
-
-            // Diagnostics: compare LOO SE against full-sample and unweighted proxies
-            if diag_counter < max_diag_samples {
-                let c_i = aii[irow] / wi;
-                let se_unw = c_i.max(0.0).sqrt();
-                println!("[GNOMON DIAG] ALO SE formula (obs {}):", irow);
-                println!("  - w_i: {:.6e}", wi);
-                println!("  - a_ii: {:.6e}", aii[irow]);
-                println!("  - 1 - a_ii: {:.6e}", denom_raw);
-                println!("  - var_full (full sample): {:.6e}", var_full);
-                println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
-                println!("  - var_loo (inflated): {:.6e}", var_loo);
-                println!("  - SE_full (full sample): {:.6e}", se_full);
-                println!("  - SE_tilde (LOO): {:.6e}", se_tilde[irow]);
-                println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
-                println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
-                let expected_ratio = {
-                    let infl = var_without_i / var_full.max(1e-24);
-                    if infl >= 0.0 {
-                        (infl.sqrt() / denom.max(1e-12)).abs()
-                    } else {
-                        f64::NAN
-                    }
-                };
-                println!(
-                    "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
-                    if se_full > 0.0 {
-                        se_tilde[irow] / se_full
-                    } else {
-                        f64::NAN
-                    },
-                    expected_ratio
-                );
-                diag_counter += 1;
-            }
+        if ai.is_finite() {
+            sum_aii += ai;
+        } else {
+            sum_aii = f64::NAN;
         }
 
-        col_start = col_end;
-    }
+        if ai.is_finite() {
+            max_aii = max_aii.max(ai);
+        }
 
-    // Validate leverage values (hat diagonals)
-    // Mathematically: 0 ≤ a_ii < 1.0 (projection matrix has eigenvalues in [0,1))
-    // We check for invalid values but DO NOT clip them - clipping would distort the math
-    // Instead, we just log warnings about potentially problematic values
-    let mut invalid_count = 0;
-    let mut high_leverage_count = 0;
-    for (i, &v) in aii.iter().enumerate() {
-        if v < 0.0 || v > 1.0 || !v.is_finite() {
+        if ai < 0.0 || ai > 1.0 || !ai.is_finite() {
             invalid_count += 1;
-            eprintln!("[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}", i, v);
-        } else if v > 0.99 {
+            eprintln!(
+                "[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}",
+                i, ai
+            );
+        } else if ai > 0.99 {
             high_leverage_count += 1;
-            // Only log details for extremely high values to avoid spam
-            if v > 0.999 {
-                eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", i, v);
+            if ai > 0.999 {
+                eprintln!("[CAL] Very high leverage at i={}, a_ii={:.6e}", i, ai);
             }
+        }
+
+        if ai > 0.90 {
+            a_hi_90 += 1;
+        }
+        if ai > 0.95 {
+            a_hi_95 += 1;
+        }
+        if ai > 0.99 {
+            a_hi_99 += 1;
+        }
+
+        let wi = base.final_weights[i].max(1e-12);
+
+        let quad = s_col.dot(&t_col);
+        let var_full = phi * (quad / wi);
+
+        let denom_raw = 1.0 - ai;
+        if denom_raw <= 0.0 {
+            eprintln!(
+                "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
+                i, ai
+            );
+        }
+        let denom = denom_raw.max(1e-12);
+
+        let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
+        let denom_sq = denom * denom;
+        let var_loo = var_without_i / denom_sq;
+        let se_full = var_full.max(0.0).sqrt();
+        let se_loo = var_loo.max(0.0).sqrt();
+        se_tilde[i] = se_loo;
+
+        if diag_counter < max_diag_samples {
+            let c_i = ai / wi;
+            let se_unw = c_i.max(0.0).sqrt();
+            println!("[GNOMON DIAG] ALO SE formula (obs {}):", i);
+            println!("  - w_i: {:.6e}", wi);
+            println!("  - a_ii: {:.6e}", ai);
+            println!("  - 1 - a_ii: {:.6e}", denom_raw);
+            println!("  - var_full (full sample): {:.6e}", var_full);
+            println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
+            println!("  - var_loo (inflated): {:.6e}", var_loo);
+            println!("  - SE_full (full sample): {:.6e}", se_full);
+            println!("  - SE_tilde (LOO): {:.6e}", se_loo);
+            println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
+            println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
+            let expected_ratio = {
+                let infl = var_without_i / var_full.max(1e-24);
+                if infl >= 0.0 {
+                    (infl.sqrt() / denom.max(1e-12)).abs()
+                } else {
+                    f64::NAN
+                }
+            };
+            println!(
+                "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
+                if se_full > 0.0 {
+                    se_loo / se_full
+                } else {
+                    f64::NAN
+                },
+                expected_ratio
+            );
+            diag_counter += 1;
         }
     }
 
-    // Report summary of problematic leverage values
     if invalid_count > 0 || high_leverage_count > 0 {
         eprintln!(
             "[CAL] Leverage diagnostics: {} invalid values, {} high values (>0.99)",
@@ -429,8 +431,7 @@ pub fn compute_alo_features(
 
     // Comprehensive leverage and dispersion diagnostics
     // These metrics help identify potential numerical issues or ill-conditioned fits
-    let mut a = aii.to_vec();
-    a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let mut percentiles = percentiles_data;
 
     // Calculate percentiles safely even with small n
     let p50_idx = if n > 1 {
@@ -449,21 +450,23 @@ pub fn compute_alo_features(
         0
     };
 
-    // Calculate key statistics
-    let a_mean: f64 = aii.iter().sum::<f64>() / (n as f64).max(1.0);
-    let a_median = a[p50_idx];
-    let a_p95 = a[p95_idx];
-    let a_p99 = a[p99_idx];
-    let a_max = if !a.is_empty() {
-        *a.last().unwrap()
-    } else {
-        0.0
+    let mut percentile_value = |idx: usize| -> f64 {
+        if percentiles.is_empty() {
+            0.0
+        } else {
+            let target = idx.min(percentiles.len() - 1);
+            let (_, nth, _) = percentiles
+                .select_nth_unstable_by(target, |a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+            *nth
+        }
     };
 
-    // Count observations in different leverage ranges
-    let a_hi_90 = aii.iter().filter(|v| **v > 0.9).count();
-    let a_hi_95 = aii.iter().filter(|v| **v > 0.95).count();
-    let a_hi_99 = aii.iter().filter(|v| **v > 0.99).count();
+    // Calculate key statistics
+    let a_mean: f64 = if n == 0 { 0.0 } else { sum_aii / (n as f64) };
+    let a_median = percentile_value(p50_idx);
+    let a_p95 = percentile_value(p95_idx);
+    let a_p99 = percentile_value(p99_idx);
+    let a_max = if max_aii.is_finite() { max_aii } else { 0.0 };
 
     eprintln!(
         "[CAL] ALO leverage: n={}, mean={:.3e}, median={:.3e}, p95={:.3e}, p99={:.3e}, max={:.3e}",
@@ -770,7 +773,7 @@ pub fn build_calibrator_design(
     let mut zeros_count = 0;
     let mut pos_count = 0;
     // Using a map to handle f64 keys since BTreeSet requires Ord trait
-    let mut unique_values = std::collections::BTreeMap::<u64, ()>::new();
+    let mut unique_values: HashSet<u64> = HashSet::new();
     let epsilon = 1e-10_f64;
 
     // Process all values
@@ -793,7 +796,7 @@ pub fn build_calibrator_design(
             // This helps detect when there are too few distinct values for a good spline
             let quantized = (val * 1e6_f64).round() / 1e6_f64;
             // Use f64 bits representation as key to avoid Ord trait requirement
-            unique_values.insert(quantized.to_bits(), ());
+            unique_values.insert(quantized.to_bits());
         }
     }
 
