@@ -144,3 +144,7 @@ Obesity: PGS004378, PGS005198
 Alzheimer’s: PGS004146, PGS004229
 
 Breast Cancer: PGS000015, PGS000335, PGS000507, PGS000508, PGS004869
+
+For breast cancer, we'll choose these two (best AUROC of the full score):
+- PGS004869
+- PGS000507
