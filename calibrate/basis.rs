@@ -687,7 +687,7 @@ mod internal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     /// Independent recursive implementation of B-spline basis function evaluation.
     /// This implements the Cox-de Boor algorithm using recursion, following the
@@ -1067,10 +1067,8 @@ mod tests {
             "Recursive evaluation length mismatch"
         );
 
-        for (i, (&recursive, &expected_value)) in recursive_values
-            .iter()
-            .zip(expected.iter())
-            .enumerate()
+        for (i, (&recursive, &expected_value)) in
+            recursive_values.iter().zip(expected.iter()).enumerate()
         {
             assert_abs_diff_eq!(recursive, expected_value, epsilon = 1e-12);
             assert_abs_diff_eq!(iterative_basis[i], expected_value, epsilon = 1e-12);
