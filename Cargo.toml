@@ -101,3 +101,4 @@ grep = "0.3.2"
 [[bench]]
 name = "path_benchmark"
 harness = false
+
