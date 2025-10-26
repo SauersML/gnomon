@@ -1616,7 +1616,18 @@ pub fn stable_reparameterization(
     }
 
     if !has_nonzero {
-        s_balanced = Array2::eye(p);
+        let qs = Array2::eye(p);
+        let rs_transformed: Vec<Array2<f64>> = rs_list.to_vec();
+        let rs_transposed = rs_transformed.iter().map(|m| m.t().to_owned()).collect();
+        return Ok(ReparamResult {
+            s_transformed: Array2::zeros((p, p)),
+            log_det: 0.0,
+            det1: Array1::zeros(m),
+            qs,
+            rs_transposed,
+            rs_transformed,
+            e_transformed: Array2::zeros((0, p)),
+        });
     }
 
     let (bal_eigenvalues, bal_eigenvectors): (Array1<f64>, Array2<f64>) =
@@ -1643,7 +1654,12 @@ pub fn stable_reparameterization(
     let max_bal = bal_eigenvalues_ordered
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let rank_tol = if max_bal > 0.0 { max_bal * 1e-8 } else { 1e-12 };
+    let rel_tolerance = 1e-12;
+    let rank_tol = if max_bal > 0.0 {
+        max_bal * rel_tolerance
+    } else {
+        rel_tolerance
+    };
     let penalized_rank = bal_eigenvalues_ordered
         .iter()
         .take_while(|&&val| val > rank_tol)
@@ -1693,12 +1709,6 @@ pub fn stable_reparameterization(
                 rs.slice_mut(s![.., ..penalized_rank]).assign(&updated);
             }
         }
-
-        s_lambda.fill(0.0);
-        for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-            let s_k = penalty_from_root(rs_k);
-            s_lambda.scaled_add(*lambda, &s_k);
-        }
     }
 
     let mut s_transformed = Array2::zeros((p, p));
@@ -1715,7 +1725,11 @@ pub fn stable_reparameterization(
     let max_eigenval = s_eigenvalues_raw
         .iter()
         .fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tolerance = max_eigenval * 1e-12;
+    let tolerance = if max_eigenval > 0.0 {
+        max_eigenval * rel_tolerance
+    } else {
+        rel_tolerance
+    };
     let penalty_rank = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
