@@ -2,12 +2,13 @@
 
 Cognitive decline has a heterogeneous etiology, and may be related to Alzheimer's disease, dementia, or other genetic and environmental causes. This is complicated by the age of individuals in the biobank.
 
-Let's view the polygenic score catalog for dementia:
-https://www.pgscatalog.org/trait/MONDO_0001627/
+Let's view the polygenic score catalog for obesity:
+[https://www.pgscatalog.org/trait/MONDO_0001627/
+](https://www.pgscatalog.org/trait/EFO_0001073/)
 
-And Alzheimer's disease:
-https://www.pgscatalog.org/trait/MONDO_0004975/
-
+And BMI:
+[https://www.pgscatalog.org/trait/MONDO_0004975/
+](https://www.pgscatalog.org/trait/EFO_0004340/)
 
 Strong performers include:
 - PGS004378
