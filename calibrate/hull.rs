@@ -1,7 +1,6 @@
 use ndarray::parallel::prelude::*;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Error type for hull building and projection.
 #[derive(thiserror::Error, Debug)]
@@ -24,36 +23,39 @@ pub struct PeeledHull {
 }
 
 impl PeeledHull {
+    /// Projects points in place onto the hull if needed. Returns the count of projected points.
+    pub fn project_in_place(&self, mut points: ArrayViewMut2<'_, f64>) -> usize {
+        if points.nrows() == 0 {
+            return 0;
+        }
+
+        points
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .map(|mut row| {
+                let view = row.view();
+                if self.is_inside(view) {
+                    0usize
+                } else {
+                    let proj = self.project_point(view);
+                    row.assign(&proj);
+                    1usize
+                }
+            })
+            .sum()
+    }
+
     /// Projects points onto the hull if needed. Returns corrected points and count projected.
     pub fn project_if_needed(&self, points: ArrayView2<f64>) -> (Array2<f64>, usize) {
-        let n = points.nrows();
         let d = points.ncols();
         assert_eq!(
             d, self.dim,
             "Dimension mismatch in PeeledHull::project_if_needed"
         );
 
-        let mut out = Array2::zeros((n, d));
-        if n == 0 {
-            return (out, 0);
-        }
-
-        let projected = AtomicUsize::new(0);
-        out.axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(i, mut out_row)| {
-                let point_row = points.row(i);
-                if self.is_inside(point_row) {
-                    out_row.assign(&point_row);
-                } else {
-                    let proj = self.project_point(point_row);
-                    projected.fetch_add(1, Ordering::Relaxed);
-                    out_row.assign(&proj.view());
-                }
-            });
-
-        (out, projected.load(Ordering::Relaxed))
+        let mut out = points.to_owned();
+        let projected = self.project_in_place(out.view_mut());
+        (out, projected)
     }
 
     /// Fast in-domain test: a_i^T x <= b_i for all facets.

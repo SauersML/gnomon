@@ -416,22 +416,22 @@ impl TrainedModel {
         }
 
         // Assemble raw predictors, optionally project via PHC, and split back
-        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-        let (x_corr, num_projected) = if let Some(hull) = &self.hull {
-            hull.project_if_needed(raw.view())
+        let mut raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+        let num_projected = if let Some(hull) = &self.hull {
+            hull.project_in_place(raw.view_mut())
         } else {
-            (raw, 0)
+            0
         };
-        if x_corr.nrows() > 0 && num_projected > 0 {
-            let rate = 100.0 * (num_projected as f64) / (x_corr.nrows() as f64);
+        if raw.nrows() > 0 && num_projected > 0 {
+            let rate = 100.0 * (num_projected as f64) / (raw.nrows() as f64);
             println!(
                 "[PHC] Projected {} of {} points ({:.1}%).",
                 num_projected,
-                x_corr.nrows(),
+                raw.nrows(),
                 rate
             );
         }
-        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(raw.view());
 
         let x_new = internal::construct_design_matrix(
             p_corr.view(),

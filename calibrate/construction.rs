@@ -5,7 +5,7 @@ use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
 use ndarray::parallel::prelude::*;
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -61,6 +61,47 @@ pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
         });
 
     result
+}
+
+fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+    matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
+}
+
+fn write_scaled_kronecker(
+    mut dest: ArrayViewMut2<'_, f64>,
+    a: &Array2<f64>,
+    b: &Array2<f64>,
+    scale: f64,
+) {
+    let (a_rows, a_cols) = a.dim();
+    let (b_rows, b_cols) = b.dim();
+    if a_rows == 0 || a_cols == 0 || b_rows == 0 || b_cols == 0 {
+        dest.fill(0.0);
+        return;
+    }
+
+    assert_eq!(dest.dim(), (a_rows * b_rows, a_cols * b_cols));
+    dest.fill(0.0);
+
+    dest.axis_chunks_iter_mut(Axis(0), b_rows)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row_block)| {
+            let a_row = a.row(i);
+            row_block
+                .axis_chunks_iter_mut(Axis(1), b_cols)
+                .into_iter()
+                .enumerate()
+                .for_each(|(j, mut block)| {
+                    let scaled = a_row[j] * scale;
+                    if scaled == 0.0 {
+                        return;
+                    }
+                    for (dest, &src) in block.iter_mut().zip(b.iter()) {
+                        *dest = scaled * src;
+                    }
+                });
+        });
 }
 
 /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
@@ -747,8 +788,6 @@ pub fn build_design_and_penalty_matrices(
                 let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)?;
                 let i_pc = Array2::<f64>::eye(pc_cols);
 
-                let s_kron_pgs = kronecker_product(s_pgs, &i_pc);
-                let s_kron_pc = kronecker_product(i_pgs, &s_pc);
                 let pc_null_projector = pc_null_projectors[pc_idx]
                     .as_ref()
                     .ok_or_else(|| {
@@ -757,34 +796,41 @@ pub fn build_design_and_penalty_matrices(
                             pc_config.name
                         ))
                     })?;
-                let s_kron_null = kronecker_product(&pgs_null_projector, pc_null_projector);
 
-                let frob =
-                    |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
-                let nf1 = frob(&s_kron_pgs);
-                let nf2 = frob(&s_kron_pc);
-                let nf3 = frob(&s_kron_null);
-
-                if nf3 <= 1e-12 {
+                let nf1 = (frobenius_norm(s_pgs) * (pc_cols as f64).sqrt()).max(1e-12);
+                let nf2 = (frobenius_norm(&s_pc) * (pgs_cols as f64).sqrt()).max(1e-12);
+                let nf3_raw =
+                    frobenius_norm(&pgs_null_projector) * frobenius_norm(pc_null_projector);
+                if nf3_raw <= 1e-12 {
                     return Err(EstimationError::LayoutError(format!(
                         "Null interaction penalty for f(PGS,{}) is numerically zero; purity projection should leave a non-trivial null⊗null span",
                         pc_config.name
                     )));
                 }
+                let nf3 = nf3_raw.max(1e-12);
 
                 let penalty_idx_pgs = block.penalty_indices[0];
                 let penalty_idx_pc = block.penalty_indices[1];
                 let penalty_idx_null = block.penalty_indices[2];
 
-                s_list[penalty_idx_pgs]
-                    .slice_mut(s![col_range.clone(), col_range.clone()])
-                    .assign(&(&s_kron_pgs / nf1));
-                s_list[penalty_idx_pc]
-                    .slice_mut(s![col_range.clone(), col_range.clone()])
-                    .assign(&(&s_kron_pc / nf2));
-                s_list[penalty_idx_null]
-                    .slice_mut(s![col_range.clone(), col_range.clone()])
-                    .assign(&(&s_kron_null / nf3));
+                write_scaled_kronecker(
+                    s_list[penalty_idx_pgs].slice_mut(s![col_range.clone(), col_range.clone()]),
+                    s_pgs,
+                    &i_pc,
+                    1.0 / nf1,
+                );
+                write_scaled_kronecker(
+                    s_list[penalty_idx_pc].slice_mut(s![col_range.clone(), col_range.clone()]),
+                    i_pgs,
+                    &s_pc,
+                    1.0 / nf2,
+                );
+                write_scaled_kronecker(
+                    s_list[penalty_idx_null].slice_mut(s![col_range.clone(), col_range.clone()]),
+                    &pgs_null_projector,
+                    pc_null_projector,
+                    1.0 / nf3,
+                );
             }
         }
     }

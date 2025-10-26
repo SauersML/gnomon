@@ -2,10 +2,22 @@ use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::cell::RefCell;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
+
+fn bspline_thread_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .build()
+            .expect("bspline thread pool initialization should succeed")
+    })
+}
 
 /// A comprehensive error type for all operations within the basis module.
 #[derive(Error, Debug)]
@@ -130,21 +142,20 @@ pub fn create_bspline_basis_with_knots(
 
     const PAR_THRESHOLD: usize = 256;
     if data.len() >= PAR_THRESHOLD {
-        let data_vec: Vec<f64> = data.to_vec();
-        basis_matrix
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(data_vec.into_par_iter())
-            .for_each(|(mut row, x)| {
-                let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-                row.assign(&basis_row);
-            });
+        bspline_thread_pool().install(|| {
+            basis_matrix
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(i, mut row)| {
+                    let x = data[i];
+                    let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+                    row.assign(&basis_row);
+                });
+        });
     } else {
-        for (mut row, &x) in basis_matrix
-            .axis_iter_mut(Axis(0))
-            .into_iter()
-            .zip(data.iter())
-        {
+        for (i, mut row) in basis_matrix.axis_iter_mut(Axis(0)).into_iter().enumerate() {
+            let x = data[i];
             let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
             row.assign(&basis_row);
         }
@@ -215,21 +226,20 @@ pub fn create_bspline_basis(
 
     const PAR_THRESHOLD: usize = 256;
     if data.len() >= PAR_THRESHOLD {
-        let data_vec: Vec<f64> = data.to_vec();
-        basis_matrix
-            .axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(data_vec.into_par_iter())
-            .for_each(|(mut row, x)| {
-                let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
-                row.assign(&basis_row);
-            });
+        bspline_thread_pool().install(|| {
+            basis_matrix
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(i, mut row)| {
+                    let x = data[i];
+                    let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
+                    row.assign(&basis_row);
+                });
+        });
     } else {
-        for (mut row, &x) in basis_matrix
-            .axis_iter_mut(Axis(0))
-            .into_iter()
-            .zip(data.iter())
-        {
+        for (i, mut row) in basis_matrix.axis_iter_mut(Axis(0)).into_iter().enumerate() {
+            let x = data[i];
             let basis_row = internal::evaluate_splines_at_point(x, degree, knot_view);
             row.assign(&basis_row);
         }
@@ -478,6 +488,44 @@ fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
 mod internal {
     use super::*;
 
+    thread_local! {
+        static BSPLINE_SCRATCH: RefCell<BsplineScratch> = RefCell::new(BsplineScratch::new());
+    }
+
+    struct BsplineScratch {
+        n: Vec<f64>,
+        left: Vec<f64>,
+        right: Vec<f64>,
+    }
+
+    impl BsplineScratch {
+        fn new() -> Self {
+            Self {
+                n: Vec::new(),
+                left: Vec::new(),
+                right: Vec::new(),
+            }
+        }
+
+        fn prepare(&mut self, degree: usize) -> (&mut [f64], &mut [f64], &mut [f64]) {
+            let needed = degree + 1;
+            if self.n.len() < needed {
+                self.n.resize(needed, 0.0);
+                self.left.resize(needed, 0.0);
+                self.right.resize(needed, 0.0);
+            } else {
+                self.n[..needed].fill(0.0);
+                self.left[..needed].fill(0.0);
+                self.right[..needed].fill(0.0);
+            }
+            (
+                &mut self.n[..needed],
+                &mut self.left[..needed],
+                &mut self.right[..needed],
+            )
+        }
+    }
+
     /// Generates the full knot vector, including repeated boundary knots.
     pub(super) fn generate_full_knot_vector(
         data_range: (f64, f64),
@@ -559,48 +607,47 @@ mod internal {
             }
         };
 
-        // `n` will store the non-zero basis function values.
-        // At any point x, at most `degree + 1` basis functions are non-zero.
-        let mut n = Array1::zeros(degree + 1);
-        let mut left = Array1::zeros(degree + 1);
-        let mut right = Array1::zeros(degree + 1);
+        BSPLINE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (n, left, right) = scratch.prepare(degree);
 
-        // Base case (d=0)
-        n[0] = 1.0;
+            // Base case (d=0)
+            n[0] = 1.0;
 
-        // Iteratively compute values for higher degrees (d=1 to degree)
-        for d in 1..=degree {
-            left[d] = x_eval - knots[mu + 1 - d];
-            right[d] = knots[mu + d] - x_eval;
+            // Iteratively compute values for higher degrees (d=1 to degree)
+            for d in 1..=degree {
+                left[d] = x_eval - knots[mu + 1 - d];
+                right[d] = knots[mu + d] - x_eval;
 
-            let mut saved = 0.0;
+                let mut saved = 0.0;
 
-            for r in 0..d {
-                // This is an in-place update. n[r] on input is a value for degree d-1.
-                let den = right[r + 1] + left[d - r];
-                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+                for r in 0..d {
+                    // This is an in-place update. n[r] on input is a value for degree d-1.
+                    let den = right[r + 1] + left[d - r];
+                    let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
 
-                // On output, n[r] will be a value for degree d.
-                n[r] = saved + right[r + 1] * temp;
-                saved = left[d - r] * temp;
+                    // On output, n[r] will be a value for degree d.
+                    n[r] = saved + right[r + 1] * temp;
+                    saved = left[d - r] * temp;
+                }
+                n[d] = saved;
             }
-            n[d] = saved;
-        }
 
-        // `n` now contains the values of the `degree + 1` non-zero basis functions.
-        // n[j] corresponds to B_{mu-degree+j, degree}.
-        // Place them in the correct locations in the final full basis vector.
-        let mut basis_values = Array1::zeros(num_basis);
-        let start_index = mu.saturating_sub(degree);
+            // `n` now contains the values of the `degree + 1` non-zero basis functions.
+            // n[j] corresponds to B_{mu-degree+j, degree}.
+            // Place them in the correct locations in the final full basis vector.
+            let mut basis_values = Array1::zeros(num_basis);
+            let start_index = mu.saturating_sub(degree);
 
-        for i in 0..=degree {
-            let global_idx = start_index + i;
-            if global_idx < num_basis {
-                basis_values[global_idx] = n[i];
+            for i in 0..=degree {
+                let global_idx = start_index + i;
+                if global_idx < num_basis {
+                    basis_values[global_idx] = n[i];
+                }
             }
-        }
 
-        basis_values
+            basis_values
+        })
     }
 }
 
