@@ -1116,3 +1116,16 @@ res
 <img width="889" height="490" alt="image" src="https://github.com/user-attachments/assets/6b5dc483-00e1-49a9-9b7f-30d88532218e" />
 
 Overall, the best score for Alzheimer's disease is PGS004146, with PGS004898 in second place.
+
+This is because the rest were actually scores for breast cancer.
+
+Let's try with other Alzheimer's scores:
+- PGS004146
+- PGS003957
+- PGS003334
+- PGS004589
+- PGS004898
+- PGS004229
+```
+./gnomon/target/release/gnomon score "PGS004146, PGS003957, PGS003334, PGS004589, PGS004898, PGS004229" arrays
+```
