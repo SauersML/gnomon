@@ -122,6 +122,19 @@ pub struct ModelLayout {
     pub interaction_factor_widths: Vec<(usize, usize)>,
     pub total_coeffs: usize,
     pub num_penalties: usize,
+    /// Support range for each penalty matrix in penalty index order.
+    pub penalty_supports: Vec<Range<usize>>,
+    /// Structural information that indicates how to assemble each penalty efficiently.
+    pub penalty_structures: Vec<PenaltyStructure>,
+}
+
+/// Structural classification of a penalty matrix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PenaltyStructure {
+    /// Penalty contributes only diagonal entries within its support range.
+    Diagonal,
+    /// Penalty occupies a dense block on its support.
+    Dense,
 }
 
 /// The semantic type of a penalized term in the model.
@@ -164,6 +177,8 @@ impl ModelLayout {
             interaction_factor_widths: vec![],
             total_coeffs,
             num_penalties,
+            penalty_supports: vec![0..0; num_penalties],
+            penalty_structures: vec![PenaltyStructure::Dense; num_penalties],
         }
     }
     /// Creates a new layout based on the model configuration and basis dimensions.
@@ -377,6 +392,30 @@ impl ModelLayout {
             )));
         }
 
+        let num_penalties = penalty_idx_counter;
+        let mut penalty_supports = vec![0..0; num_penalties];
+        let mut penalty_structures = vec![PenaltyStructure::Dense; num_penalties];
+        for block in &penalty_map {
+            let structure = match block.term_type {
+                TermType::PcMainEffect => PenaltyStructure::Diagonal,
+                TermType::SexPgsInteraction => PenaltyStructure::Dense,
+                TermType::Interaction => match config.interaction_penalty {
+                    InteractionPenaltyKind::Isotropic => PenaltyStructure::Diagonal,
+                    InteractionPenaltyKind::Anisotropic => PenaltyStructure::Dense,
+                },
+            };
+            for &pen_idx in &block.penalty_indices {
+                if pen_idx >= penalty_supports.len() {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Penalty index {pen_idx} out of bounds for layout with {} penalties",
+                        penalty_supports.len()
+                    )));
+                }
+                penalty_supports[pen_idx] = block.col_range.clone();
+                penalty_structures[pen_idx] = structure.clone();
+            }
+        }
+
         Ok(ModelLayout {
             intercept_col,
             sex_col,
@@ -390,7 +429,9 @@ impl ModelLayout {
             sex_pgs_block_idx,
             interaction_factor_widths,
             total_coeffs: current_col,
-            num_penalties: penalty_idx_counter,
+            num_penalties,
+            penalty_supports,
+            penalty_structures,
         })
     }
 }
@@ -1352,8 +1393,35 @@ pub fn construct_s_lambda(
 
     // Simple weighted sum since all matrices are now p × p
     for (i, s_k) in s_list.iter().enumerate() {
-        // Add weighted penalty matrix
-        s_lambda.scaled_add(lambdas[i], s_k);
+        let lambda = lambdas[i];
+        if lambda == 0.0 {
+            continue;
+        }
+
+        let support = layout.penalty_supports.get(i).cloned().unwrap_or(0..0);
+        if support.start >= support.end {
+            continue;
+        }
+
+        match layout
+            .penalty_structures
+            .get(i)
+            .unwrap_or(&PenaltyStructure::Dense)
+        {
+            PenaltyStructure::Diagonal => {
+                for idx in support.start..support.end {
+                    let value = s_k[[idx, idx]];
+                    if value != 0.0 {
+                        s_lambda[[idx, idx]] += lambda * value;
+                    }
+                }
+            }
+            PenaltyStructure::Dense => {
+                let mut dest = s_lambda.slice_mut(s![support.clone(), support.clone()]);
+                let block = s_k.slice(s![support.clone(), support.clone()]);
+                dest.scaled_add(lambda, &block);
+            }
+        }
     }
 
     s_lambda

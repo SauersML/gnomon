@@ -2587,7 +2587,7 @@ mod tests {
     #[test]
     fn test_reparameterization_matrix_depends_on_rho() {
         use crate::calibrate::construction::{
-            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+            ModelLayout, PenaltyStructure, compute_penalty_square_roots, stable_reparameterization,
         };
 
         // Create penalty matrices that require rotation to diagonalize
@@ -2617,6 +2617,8 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
+            penalty_supports: vec![0..0; 2],
+            penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
 
         // Test with two different lambda values which will change the dominant penalty
@@ -2655,7 +2657,7 @@ mod tests {
     #[test]
     fn test_stable_reparameterization_preserves_nullspace_rank() {
         use crate::calibrate::construction::{
-            ModelLayout, compute_penalty_square_roots, stable_reparameterization,
+            ModelLayout, PenaltyStructure, compute_penalty_square_roots, stable_reparameterization,
         };
 
         // Create a canonical cubic spline penalty (second-order differences)
@@ -2767,7 +2769,9 @@ mod tests {
     /// correctly converges with the P-IRLS algorithm.
     #[test]
     fn test_reparameterization_per_rho() {
-        use crate::calibrate::construction::{ModelLayout, compute_penalty_square_roots};
+        use crate::calibrate::construction::{
+            ModelLayout, PenaltyStructure, compute_penalty_square_roots,
+        };
 
         // Create a simple test case with more samples - using simple model known to converge
         let n_samples = 100;
@@ -2810,6 +2814,8 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
+            penalty_supports: vec![0..0; 2],
+            penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
 
         // Create a simple config with values known to lead to convergence
@@ -3685,6 +3691,8 @@ mod tests {
             interaction_factor_widths: vec![],
             total_coeffs: 2,
             num_penalties: 2,
+            penalty_supports: vec![0..0; 2],
+            penalty_structures: vec![PenaltyStructure::Dense; 2],
         };
         let lambdas = vec![0.7, 3.0];
 
