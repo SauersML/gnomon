@@ -1635,6 +1635,7 @@ pub fn stable_reparameterization(
         bal_eigenvalues[j]
             .partial_cmp(&bal_eigenvalues[i])
             .unwrap_or(Ordering::Equal)
+            .then(i.cmp(&j))
     });
 
     let mut qs = Array2::zeros((p, p));
@@ -1681,6 +1682,7 @@ pub fn stable_reparameterization(
             range_eigenvalues[j]
                 .partial_cmp(&range_eigenvalues[i])
                 .unwrap_or(Ordering::Equal)
+                .then(i.cmp(&j))
         });
 
         let mut range_rotation = Array2::zeros((penalized_rank, penalized_rank));
