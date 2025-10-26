@@ -40,7 +40,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 // faer: high-performance dense solvers
-use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -1559,7 +1559,7 @@ pub fn optimize_external_design(
     let lambdas = final_rho.mapv(f64::exp);
     let h = &pirls_res.stabilized_hessian_transformed;
     let p_dim = h.nrows();
-    let h_f = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
+    let h_view = FaerArrayView::new(h);
     enum Fact {
         Llt(FaerLlt<f64>),
         Ldlt(FaerLdlt<f64>),
@@ -1572,10 +1572,10 @@ pub fn optimize_external_design(
             }
         }
     }
-    let fact = match FaerLlt::new(h_f.as_ref(), Side::Lower) {
+    let fact = match FaerLlt::new(h_view.as_ref(), Side::Lower) {
         Ok(ch) => Fact::Llt(ch),
         Err(_) => {
-            let ld = FaerLdlt::new(h_f.as_ref(), Side::Lower).map_err(|_| {
+            let ld = FaerLdlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
                 EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 }
@@ -1586,12 +1586,13 @@ pub fn optimize_external_design(
     let mut traces = vec![0.0f64; k];
     for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
         let rank_k = rs.nrows();
-        let ekt = FaerMat::<f64>::from_fn(p_dim, rank_k, |i, j| rs[[j, i]]);
-        let x_sol = fact.solve(ekt.as_ref());
+        let rs_t = rs.t().to_owned();
+        let ekt_view = FaerArrayView::new(&rs_t);
+        let x_sol = fact.solve(ekt_view.as_ref());
         let mut frob = 0.0;
         for j in 0..rank_k {
             for i in 0..p_dim {
-                frob += x_sol[(i, j)] * ekt[(i, j)];
+                frob += x_sol[(i, j)] * rs[[j, i]];
             }
         }
         traces[kk] = lambdas[kk] * frob;
@@ -2168,9 +2169,8 @@ pub mod internal {
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
             let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
-            let x = factor.solve(
-                FaerMat::<f64>::from_fn(e_t.nrows(), e_t.ncols(), |i, j| e_t[[i, j]]).as_ref(),
-            );
+            let e_t_view = FaerArrayView::new(&e_t);
+            let x = factor.solve(e_t_view.as_ref());
             let trace_h_inv_s_lambda = {
                 // Frobenius inner product between H⁻¹ Eᵀ and Eᵀ
                 let mut acc = 0.0;
@@ -2200,20 +2200,19 @@ pub mod internal {
         ///
         /// # Returns
         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
-            let p = h.nrows();
-            let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| h[[i, j]]);
-            if let Ok(f) = FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+            let h_view = FaerArrayView::new(h);
+            if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
                 println!("Using faer LLᵀ for Hessian solves");
                 return FaerFactor::Llt(f);
             }
             // Next, try semidefinite LDLᵀ (can fail)
-            if let Ok(f) = FaerLdlt::new(h_faer.as_ref(), Side::Lower) {
+            if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
                 log::warn!("LLᵀ failed; using faer LDLᵀ for (semi-definite) Hessian solves");
                 return FaerFactor::Ldlt(f);
             }
             // Finally, use symmetric indefinite LBLᵀ (Bunch–Kaufman). This does not return Result.
             log::warn!("LLᵀ/LDLᵀ failed; using faer LBLᵀ (Bunch–Kaufman) for Hessian solves");
-            let f = FaerLblt::new(h_faer.as_ref(), Side::Lower);
+            let f = FaerLblt::new(h_view.as_ref(), Side::Lower);
             FaerFactor::Lblt(f)
         }
 
@@ -3229,11 +3228,11 @@ pub mod internal {
                         let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
                             g[k]
                         } else {
-                            let (rk_rows, rk_cols) = (r_k.nrows(), r_k.ncols());
-                            let rt = FaerMat::<f64>::from_fn(rk_cols, rk_rows, |i, j| r_k[[j, i]]);
-                            let x = factor_g.solve(rt.as_ref());
+                            let r_k_t = r_k.t().to_owned();
+                            let rt_view = FaerArrayView::new(&r_k_t);
+                            let x = factor_g.solve(rt_view.as_ref());
                             // Frobenius inner product ⟨X, Rt⟩
-                            let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt.as_ref());
+                            let trace_h_inv_s_k = faer_frob_inner(x.as_ref(), rt_view.as_ref());
                             let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
                             tra1 / 2.0
                         };
@@ -4428,10 +4427,9 @@ pub mod internal {
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
                 let rt_arr = &pr.reparam_result.rs_transposed[k];
-                let rt =
-                    FaerMat::<f64>::from_fn(rt_arr.nrows(), rt_arr.ncols(), |i, j| rt_arr[[i, j]]);
-                let x = factor.solve(rt.as_ref());
-                let trace = faer_frob_inner(x.as_ref(), rt.as_ref());
+                let rt_view = FaerArrayView::new(rt_arr);
+                let x = factor.solve(rt_view.as_ref());
+                let trace = faer_frob_inner(x.as_ref(), rt_view.as_ref());
                 g[k] = 0.5 * (lambdas[k] * trace);
             }
             g

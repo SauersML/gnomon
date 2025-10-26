@@ -1,13 +1,15 @@
 use crate::calibrate::construction::{ModelLayout, ReparamResult};
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh};
+use crate::calibrate::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerEigh, FaerVectorView, array1_to_col_matmut, array2_to_matmut,
+};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
-use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use log;
+use ndarray::s;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,8 @@ pub struct PirlsWorkspace {
     pub scaled_matrix: Array2<f64>,    // (<= p + eb_rows) x p
     pub final_aug_matrix: Array2<f64>, // (<= p + e_rows) x p
     // Stage 5 RHS buffers
-    pub rhs_full: Array1<f64>, // length <= p + e_rows
+    pub rhs_full: Array1<f64>,  // length <= p + e_rows
+    pub multi_rhs: Array2<f64>, // p x (1 + e_rows)
     // Gradient check helpers
     pub working_residual: Array1<f64>,
     pub weighted_residual: Array1<f64>,
@@ -46,6 +49,7 @@ impl PirlsWorkspace {
             scaled_matrix: Array2::zeros((scaled_rows_max, p)),
             final_aug_matrix: Array2::zeros((final_aug_rows_max, p)),
             rhs_full: Array1::zeros(final_aug_rows_max),
+            multi_rhs: Array2::zeros((p, 1 + e_rows)),
             working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
@@ -1461,21 +1465,34 @@ pub fn solve_penalized_least_squares(
             beta_transformed[j_orig] = beta_kept[j_new];
         }
 
-        // Stage: Build the Hessian H = Xᵀ W X (since S=0) using the preallocated buffer
-        use ndarray::linalg::{general_mat_mul, general_mat_vec_mul};
         let p_wx = wx.ncols();
         if workspace.xtwx_buf.dim() != (p_wx, p_wx) {
-            // resize if needed (shouldn't happen in steady state)
             workspace.xtwx_buf = Array2::zeros((p_wx, p_wx));
         }
-        workspace.xtwx_buf.fill(0.0);
-        general_mat_mul(1.0, &wx.t(), &wx, 0.0, &mut workspace.xtwx_buf);
-        // Compute wx.t() * wz into a preallocated buffer via GEMV
         if workspace.vec_buf_p.len() != p_wx {
             workspace.vec_buf_p = Array1::zeros(p_wx);
         }
-        workspace.vec_buf_p.fill(0.0);
-        general_mat_vec_mul(1.0, &wx.t(), &wz, 0.0, &mut workspace.vec_buf_p);
+
+        let par = faer::get_global_parallelism();
+        let wx_view = FaerArrayView::new(&wx);
+        faer::linalg::matmul::matmul(
+            array2_to_matmut(&mut workspace.xtwx_buf),
+            faer::Accum::Replace,
+            wx_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            par,
+        );
+
+        faer::linalg::matmul::matmul(
+            array1_to_col_matmut(&mut workspace.vec_buf_p),
+            faer::Accum::Replace,
+            wx_view.as_ref().transpose(),
+            FaerVectorView::new(&wz).as_col_ref(),
+            1.0,
+            par,
+        );
+
         let grad = workspace.xtwx_buf.view().dot(&beta_transformed) - &workspace.vec_buf_p;
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         if inf_norm > 1e-10 {
@@ -1518,15 +1535,32 @@ pub fn solve_penalized_least_squares(
         workspace.wz -= &offset;
         workspace.wz *= &workspace.sqrt_w; // wz = z .* sqrt_w
 
-        let xtwx = {
-            let r = &workspace.wx; // sqrt(W) X
-            r.t().dot(r)
-        };
-        let xtwz = workspace.wx.t().dot(&workspace.wz);
-
-        // H = XtWX + S_lambda (symmetrize to avoid false SPD failures)
-        let mut penalized_hessian = xtwx + s_transformed;
         let p_dim = x_transformed.ncols();
+        if workspace.vec_buf_p.len() != p_dim {
+            workspace.vec_buf_p = Array1::zeros(p_dim);
+        }
+
+        let par = faer::get_global_parallelism();
+        let wx_view = FaerArrayView::new(&workspace.wx);
+        faer::linalg::matmul::matmul(
+            array2_to_matmut(&mut workspace.xtwx_buf),
+            faer::Accum::Replace,
+            wx_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            par,
+        );
+        faer::linalg::matmul::matmul(
+            array1_to_col_matmut(&mut workspace.vec_buf_p),
+            faer::Accum::Replace,
+            wx_view.as_ref().transpose(),
+            FaerVectorView::new(&workspace.wz).as_col_ref(),
+            1.0,
+            par,
+        );
+
+        let mut penalized_hessian = workspace.xtwx_buf.view_mut();
+        penalized_hessian += s_transformed;
         for i in 0..p_dim {
             for j in 0..i {
                 let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -1535,11 +1569,11 @@ pub fn solve_penalized_least_squares(
             }
         }
         // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
-        let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
+        let h_faer = FaerArrayView::new(&workspace.xtwx_buf);
         match FaerLlt::new(h_faer.as_ref(), Side::Lower) {
             Ok(chol) => {
                 // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
-                let cond_bad = match penalized_hessian.eigh(Side::Lower) {
+                let cond_bad = match workspace.xtwx_buf.eigh(Side::Lower) {
                     Ok((eigs, _)) => {
                         let mut min_ev = f64::INFINITY;
                         let mut max_ev = 0.0f64;
@@ -1572,19 +1606,31 @@ pub fn solve_penalized_least_squares(
                     // Single multi-RHS solve: [ XtWz | Eᵀ ]
                     let rk_rows = e_transformed.nrows();
                     let nrhs = 1 + rk_rows;
-                    let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
-                        if j == 0 {
-                            xtwz[i]
-                        } else {
-                            e_transformed[(j - 1, i)]
+                    if workspace.multi_rhs.dim().1 < nrhs {
+                        workspace.multi_rhs = Array2::zeros((p_dim, nrhs));
+                    }
+                    {
+                        let mut rhs_slice = workspace.multi_rhs.slice_mut(s![..p_dim, ..nrhs]);
+                        rhs_slice.fill(0.0);
+                        rhs_slice
+                            .column_mut(0)
+                            .assign(&workspace.vec_buf_p.slice(s![..p_dim]));
+                        if rk_rows > 0 {
+                            let et = e_transformed.slice(s![..rk_rows, ..p_dim]).reversed_axes();
+                            rhs_slice.slice_mut(s![..p_dim, 1..nrhs]).assign(&et);
                         }
-                    });
-                    let sol = chol.solve(rhs.as_ref());
+                    }
 
-                    // β̂ from first column
+                    {
+                        let rhs_mat =
+                            array2_to_matmut(&mut workspace.multi_rhs).get_mut(..p_dim, ..nrhs);
+                        chol.solve_in_place(rhs_mat);
+                    }
+
+                    // β̂ from first column (stored in-place)
                     let mut beta_transformed = Array1::zeros(p_dim);
                     for i in 0..p_dim {
-                        beta_transformed[i] = sol[(i, 0)];
+                        beta_transformed[i] = workspace.multi_rhs[(i, 0)];
                     }
                     if !beta_transformed.iter().all(|v| v.is_finite()) {
                         return Err(EstimationError::ModelIsIllConditioned {
@@ -1596,7 +1642,7 @@ pub fn solve_penalized_least_squares(
                     let mut frob = 0.0f64;
                     for j in 0..rk_rows {
                         for i in 0..p_dim {
-                            frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                            frob += workspace.multi_rhs[(i, 1 + j)] * e_transformed[(j, i)];
                         }
                     }
                     let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
@@ -1630,7 +1676,7 @@ pub fn solve_penalized_least_squares(
                     return Ok((
                         StablePLSResult {
                             beta: beta_transformed,
-                            penalized_hessian,
+                            penalized_hessian: workspace.xtwx_buf.clone(),
                             edf,
                             scale,
                         },
@@ -1644,8 +1690,6 @@ pub fn solve_penalized_least_squares(
     }
 
     let function_timer = Instant::now();
-
-    use ndarray::s;
 
     // Define rank tolerance, matching mgcv's default
     const RANK_TOL: f64 = 1e-7;
@@ -2050,24 +2094,17 @@ where
 fn pivoted_qr_faer(
     matrix: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
-    use faer::Mat;
     use faer::linalg::solvers::ColPivQr;
 
     let m = matrix.nrows();
     let n = matrix.ncols();
     let k = m.min(n);
 
-    // Stage: Convert ndarray to a faer matrix
-    let mut a_faer = Mat::zeros(m, n);
-    for i in 0..m {
-        for j in 0..n {
-            a_faer[(i, j)] = matrix[[i, j]];
-        }
-    }
+    let matrix_view = FaerArrayView::new(matrix);
 
     // Stage: Perform the column-pivoted QR decomposition using the high-level API
     // This guarantees that Q, R, and P are all from the same consistent decomposition
-    let qr = ColPivQr::new(a_faer.as_ref());
+    let qr = ColPivQr::new(matrix_view.as_ref());
 
     // Stage: Extract the consistent Q factor (thin version)
     let q_faer = qr.compute_thin_Q();
@@ -2145,12 +2182,13 @@ fn calculate_edf(
     if r == 0 {
         return Ok(p as f64);
     }
-    let h_f = FaerMat::<f64>::from_fn(p, p, |i, j| penalized_hessian[[i, j]]);
-    let rhs = FaerMat::<f64>::from_fn(p, r, |i, j| e_transformed[(j, i)]);
+    let h_f = FaerArrayView::new(penalized_hessian);
+    let rhs = FaerArrayView::new(e_transformed);
+    let rhs_t = rhs.as_ref().transpose();
 
     // Try LLᵀ first
     if let Ok(ch) = FaerLlt::new(h_f.as_ref(), Side::Lower) {
-        let sol = ch.solve(rhs.as_ref());
+        let sol = ch.solve(rhs_t);
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -2162,7 +2200,7 @@ fn calculate_edf(
 
     // Try LDLᵀ (semi-definite)
     if let Ok(ld) = FaerLdlt::new(h_f.as_ref(), Side::Lower) {
-        let sol = ld.solve(rhs.as_ref());
+        let sol = ld.solve(rhs_t);
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -2174,7 +2212,7 @@ fn calculate_edf(
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
     let lb = FaerLblt::new(h_f.as_ref(), Side::Lower);
-    let sol = lb.solve(rhs.as_ref());
+    let sol = lb.solve(rhs_t);
     if sol.nrows() == p && sol.ncols() == r {
         let mut tr = 0.0;
         for j in 0..r {
@@ -2234,7 +2272,6 @@ pub fn compute_final_penalized_hessian(
     s_lambda: &Array2<f64>, // This is S_lambda = Σλ_k * S_k
 ) -> Result<Array2<f64>, EstimationError> {
     use crate::calibrate::faer_ndarray::{FaerEigh, FaerQr};
-    use ndarray::s;
 
     let p = x.ncols();
 
@@ -3771,17 +3808,27 @@ fn compute_firth_hat_and_half_logdet(
     workspace.wx.assign(&x_transformed);
     workspace.wx *= &sqrt_w_col;
 
-    let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
-    let mut penalized_hessian = xtwx_transformed.clone() + s_transformed;
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-            penalized_hessian[[i, j]] = v;
-            penalized_hessian[[j, i]] = v;
+    faer::linalg::matmul::matmul(
+        array2_to_matmut(&mut workspace.xtwx_buf),
+        faer::Accum::Replace,
+        FaerArrayView::new(&workspace.wx).as_ref().transpose(),
+        FaerArrayView::new(&workspace.wx).as_ref(),
+        1.0,
+        faer::get_global_parallelism(),
+    );
+    {
+        let mut penalized_hessian = workspace.xtwx_buf.view_mut();
+        penalized_hessian += s_transformed;
+        for i in 0..p {
+            for j in 0..i {
+                let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+                penalized_hessian[[i, j]] = v;
+                penalized_hessian[[j, i]] = v;
+            }
         }
     }
 
-    let mut stabilized = penalized_hessian.clone();
+    let mut stabilized = workspace.xtwx_buf.clone();
     ensure_positive_definite(&mut stabilized)?;
 
     let mut fisher = Array2::<f64>::zeros((p, p));
@@ -3807,14 +3854,14 @@ fn compute_firth_hat_and_half_logdet(
     })?;
     let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
 
-    let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| stabilized[[i, j]]);
+    let h_faer = FaerArrayView::new(&stabilized);
     let chol_faer = FaerLlt::new(h_faer.as_ref(), Side::Lower).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
-    let rhs = FaerMat::<f64>::from_fn(p, n, |i, j| workspace.wx[[j, i]]);
-    let sol = chol_faer.solve(rhs.as_ref());
+    let rhs = FaerArrayView::new(&workspace.wx);
+    let sol = chol_faer.solve(rhs.as_ref().transpose());
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     for i in 0..n {

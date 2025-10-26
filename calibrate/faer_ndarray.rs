@@ -2,8 +2,8 @@ use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagRef};
 use faer::linalg::solvers::{self, Solve};
 use faer::linalg::svd::{self, ComputeSvdVectors};
-use faer::{Mat, MatRef, Side, get_global_parallelism};
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix2};
+use faer::{Mat, MatMut, MatRef, Side, get_global_parallelism};
+use ndarray::{Array1, Array2, ArrayBase, CowArray, Data, Ix1, Ix2};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -16,9 +16,75 @@ pub enum FaerLinalgError {
     Cholesky(solvers::LltError),
 }
 
-fn array_to_faer<S: Data<Elem = f64>>(array: &ArrayBase<S, Ix2>) -> Mat<f64> {
+pub struct FaerArrayView<'a> {
+    rows: usize,
+    cols: usize,
+    data: CowArray<'a, f64, Ix2>,
+}
+
+pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
-    Mat::from_fn(rows, cols, |i, j| array[(i, j)])
+    let slice = array
+        .as_slice_mut()
+        .expect("standard layout guarantees contiguous slice");
+    MatMut::from_row_major_slice_mut(slice, rows, cols)
+}
+
+pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
+    let len = array.len();
+    let slice = array
+        .as_slice_mut()
+        .expect("standard layout guarantees contiguous slice");
+    MatMut::from_row_major_slice_mut(slice, len, 1)
+}
+
+impl<'a> FaerArrayView<'a> {
+    pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
+        let (rows, cols) = array.dim();
+        let data = array.as_standard_layout();
+        Self { rows, cols, data }
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> MatRef<'_, f64> {
+        let slice = self
+            .data
+            .as_slice()
+            .expect("standard layout guarantees contiguous slice");
+        MatRef::from_row_major_slice(slice, self.rows, self.cols)
+    }
+
+    #[inline]
+    pub fn dims(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+}
+
+pub struct FaerVectorView<'a> {
+    len: usize,
+    data: CowArray<'a, f64, Ix1>,
+}
+
+impl<'a> FaerVectorView<'a> {
+    pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix1>) -> Self {
+        let len = array.len();
+        let data = array.as_standard_layout();
+        Self { len, data }
+    }
+
+    #[inline]
+    pub fn as_col_ref(&self) -> MatRef<'_, f64> {
+        let slice = self
+            .data
+            .as_slice()
+            .expect("standard layout guarantees contiguous slice");
+        MatRef::from_column_major_slice(slice, self.len, 1)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
 }
 
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
@@ -44,15 +110,8 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         compute_u: bool,
         compute_vt: bool,
     ) -> Result<(Option<Array2<f64>>, Array1<f64>, Option<Array2<f64>>), FaerLinalgError> {
-        let faer_mat = array_to_faer(self);
-        if !compute_u && !compute_vt {
-            let singular_values = faer_mat
-                .singular_values()
-                .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
-            return Ok((None, Array1::from_vec(singular_values), None));
-        }
-
-        let (rows, cols) = faer_mat.shape();
+        let faer_view = FaerArrayView::new(self);
+        let (rows, cols) = faer_view.dims();
         let compute_u_flag = if compute_u {
             ComputeSvdVectors::Full
         } else {
@@ -80,7 +139,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
         let mut stack = MemStack::new(&mut mem);
 
         svd::svd(
-            faer_mat.as_ref(),
+            faer_view.as_ref(),
             singular.as_mut(),
             u_storage.as_mut().map(|mat| mat.as_mut()),
             v_storage.as_mut().map(|mat| mat.as_mut()),
@@ -107,9 +166,8 @@ pub trait FaerEigh {
 
 impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
     fn eigh(&self, side: Side) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
-        let faer_mat = array_to_faer(self);
-        let eigen = faer_mat
-            .self_adjoint_eigen(side)
+        let faer_view = FaerArrayView::new(self);
+        let eigen = faer::linalg::solvers::SelfAdjointEigen::new(faer_view.as_ref(), side)
             .map_err(FaerLinalgError::SelfAdjointEigen)?;
         let values = diag_to_array(eigen.S());
         let vectors = mat_to_array(eigen.U());
@@ -123,15 +181,14 @@ pub struct FaerCholeskyFactor {
 
 impl FaerCholeskyFactor {
     pub fn solve_vec(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        let rhs_mat = Mat::from_fn(rhs.len(), 1, |i, _| rhs[i]);
-        let sol = self.factor.solve(rhs_mat.as_ref());
-        Array1::from_shape_fn(rhs.len(), |i| sol[(i, 0)])
+        let rhs_view = FaerVectorView::new(rhs);
+        let sol = self.factor.solve(rhs_view.as_col_ref());
+        Array1::from_shape_fn(rhs_view.len(), |i| sol[(i, 0)])
     }
 
     pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let (rows, cols) = rhs.dim();
-        let rhs_mat = Mat::from_fn(rows, cols, |i, j| rhs[(i, j)]);
-        let sol = self.factor.solve(rhs_mat.as_ref());
+        let rhs_view = FaerArrayView::new(rhs);
+        let sol = self.factor.solve(rhs_view.as_ref());
         mat_to_array(sol.as_ref())
     }
 
@@ -146,8 +203,9 @@ pub trait FaerCholesky {
 
 impl<S: Data<Elem = f64>> FaerCholesky for ArrayBase<S, Ix2> {
     fn cholesky(&self, side: Side) -> Result<FaerCholeskyFactor, FaerLinalgError> {
-        let faer_mat = array_to_faer(self);
-        let factor = faer_mat.llt(side).map_err(FaerLinalgError::Cholesky)?;
+        let faer_view = FaerArrayView::new(self);
+        let factor = faer::linalg::solvers::Llt::new(faer_view.as_ref(), side)
+            .map_err(FaerLinalgError::Cholesky)?;
         Ok(FaerCholeskyFactor { factor })
     }
 }
@@ -158,8 +216,8 @@ pub trait FaerQr {
 
 impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
     fn qr(&self) -> Result<(Array2<f64>, Array2<f64>), FaerLinalgError> {
-        let faer_mat = array_to_faer(self);
-        let qr = faer_mat.qr();
+        let faer_view = FaerArrayView::new(self);
+        let qr = faer::linalg::solvers::Qr::new(faer_view.as_ref());
         let q = qr.compute_Q();
         let r = qr.R();
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
