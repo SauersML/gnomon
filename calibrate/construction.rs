@@ -2026,7 +2026,7 @@ pub fn stable_reparameterization(
 
     // Calculate derivatives: det1[k] = λ_k * tr(S_λ^+ S_k_transformed)
     for k in 0..lambdas.len() {
-        let s_k_transformed = final_rs_transformed[k].t().dot(&final_rs_transformed[k]);
+        let s_k_transformed = penalty_from_root(&final_rs_transformed[k]);
         let s_plus_times_s_k = s_plus.dot(&s_k_transformed);
         let trace: f64 = s_plus_times_s_k.diag().sum();
         det1[k] = lambdas[k] * trace;
