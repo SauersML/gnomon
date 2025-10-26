@@ -223,3 +223,7 @@ Let's run our final set of six scores in the terminal:
 ```
 ./gnomon/target/release/gnomon score "PGS004378 | chr17:45535159-46342045, PGS005198 | chr17:45535159-46342045, PGS004146 | chr17:45535159-46342045, PGS004229 | chr17:45535159-46342045, PGS004869 | chr17:45535159-46342045, PGS000507 | chr17:45535159-46342045" arrays
 ```
+
+As expected, they have non-zero variance:
+
+<img width="1011" height="971" alt="image" src="https://github.com/user-attachments/assets/c5d2500a-9017-4bb5-aa5a-6432c2fb71b7" />
