@@ -148,3 +148,58 @@ Breast Cancer: PGS000015, PGS000335, PGS000507, PGS000508, PGS004869
 For breast cancer, we'll choose these two (best AUROC of the full score):
 - PGS004869
 - PGS000507
+
+I wonder how large the overlap between the microarray cohort and the srWGS cohort is.
+
+```
+import subprocess
+import time
+import sys
+import fsspec
+from itertools import cycle
+
+project = subprocess.check_output(
+    ["gcloud", "config", "get-value", "project", "--quiet"],
+    text=True
+).strip()
+print("project:", project)
+
+fam_glob = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed/*.fam"
+print("glob:", fam_glob)
+
+fs = fsspec.filesystem("gcs", requester_pays=True, project=project)
+fam_paths = fs.glob(fam_glob)
+print("fam files found:", len(fam_paths))
+
+spinner = cycle("|/-\\")
+iids = set()
+total_lines = 0
+duplicates = 0
+t0 = time.time()
+
+for path in fam_paths:
+    print("\nreading:", path)
+    with fs.open(path, "rb") as f:
+        for line in f:
+            before = len(iids)
+            parts = line.split()
+            iids.add(parts[1].decode("utf-8"))
+            after = len(iids)
+            total_lines += 1
+            duplicates += 1 - (after - before)
+            elapsed = time.time() - t0 + 1e-9
+            rate = total_lines / elapsed
+            sys.stdout.write(
+                "\r%s lines:%d unique:%d dup:%d elapsed_s:%.1f rate:%.1f/s"
+                % (next(spinner), total_lines, after, duplicates, elapsed, rate)
+            )
+            sys.stdout.flush()
+
+print("\n\ndone.")
+print("files:", len(fam_paths))
+print("unique samples:", len(iids))
+print("lines read:", total_lines)
+```
+
+There are 414830 unique samples.
+
