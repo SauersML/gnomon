@@ -1126,6 +1126,8 @@ Let's try with other Alzheimer's scores:
 - PGS004589
 - PGS004898
 - PGS004229
+
+This should complete in 35 minutes:
 ```
 ./gnomon/target/release/gnomon score "PGS004146, PGS003957, PGS003334, PGS004589, PGS004898, PGS004229" arrays
 ```
