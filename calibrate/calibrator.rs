@@ -2812,8 +2812,8 @@ mod tests {
             let ui = u.row(irow).to_owned();
 
             // Solve K s_i = u_i
-            let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
-            let si = factor.solve(rhs_f.as_ref());
+            let rhs = FaerMat::<f64>::from_fn(p, 1, |j, _| ui[j]);
+            let si = factor.solve(rhs.as_ref());
 
             // Calculate quad = s_i' XtWX s_i
             let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
@@ -2897,13 +2897,13 @@ mod tests {
         } // tiny ridge for stability
 
         // Factor K using faer LLT
-        let kf = FaerMat::from_fn(p, p, |i, j| k[[i, j]]);
-        let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
+        let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
+        let llt = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
 
         // Compute a_ii = u_i^\top K^{-1} u_i for each observation
         for i in 0..n {
             let ui = u.row(i).to_owned();
-            let rhs = FaerMat::from_fn(p, 1, |r, _| ui[r]);
+            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let s = llt.solve(rhs.as_ref());
             let mut dot = 0.0;
             for r in 0..p {
@@ -3037,7 +3037,7 @@ mod tests {
             h[[d, d]] += 1e-12;
         }
         let p_dim = h.nrows();
-        let h_f = FaerMat::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
+        let h_f = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
 
         enum SolverFactor {
             Llt(FaerLlt<f64>),
@@ -3063,8 +3063,9 @@ mod tests {
         let xtwx = ut.dot(&u);
 
         // Solve H S = Uᵀ once; column i of S corresponds to s_i = H^{-1} u_i
-        let rhs = FaerMat::from_fn(p_dim, n, |i, j| ut[[i, j]]);
-        let s_all = factor.solve(rhs.as_ref());
+        let rhs = ut.to_owned();
+        let rhs_f = FaerMat::<f64>::from_fn(p_dim, n, |i, j| rhs[[i, j]]);
+        let s_all = factor.solve(rhs_f.as_ref());
         let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
         let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
@@ -3199,9 +3200,10 @@ mod tests {
                 xtwx[[d, d]] += 1e-10;
             }
 
-            let kf = FaerMat::from_fn(p, p, |r, c| xtwx[[r, c]]);
-            let llt = FaerLlt::new(kf.as_ref(), Side::Lower).unwrap();
-            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
+            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| xtwx[[r, c]]);
+            let llt = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+            let ui = x_i.to_owned();
+            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let sol = llt.solve(rhs.as_ref());
             let mut quad = 0.0;
             for r in 0..p {
@@ -3309,10 +3311,11 @@ mod tests {
                 k[[d, d]] += 1e-12;
             }
 
-            let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
+            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
             let llt =
-                FaerLlt::new(kf.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
-            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
+                FaerLlt::new(k_f.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
+            let ui = x_i.to_owned();
+            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
             for r in 0..p {
@@ -3411,10 +3414,11 @@ mod tests {
                 k[[d, d]] += 1e-12;
             }
 
-            let kf = FaerMat::from_fn(p, p, |r, c| k[[r, c]]);
+            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
             let llt =
-                FaerLlt::new(kf.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
-            let rhs = FaerMat::from_fn(p, 1, |r, _| x_i[r]);
+                FaerLlt::new(k_f.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
+            let ui = x_i.to_owned();
+            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
             for r in 0..p {
@@ -3924,7 +3928,7 @@ mod tests {
         let s_f = FaerMat::<f64>::from_fn(
             s_with_tiny_ridge.nrows(),
             s_with_tiny_ridge.ncols(),
-            |i, j| s_with_tiny_ridge[[i, j]],
+            |r, c| s_with_tiny_ridge[[r, c]],
         );
         let llt_result = FaerLlt::new(s_f.as_ref(), Side::Lower);
 
@@ -7365,7 +7369,7 @@ mod tests {
         for d in 0..p {
             k[[d, d]] += 1e-12;
         }
-        let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
+        let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
 
         enum Factor {
             Llt(FaerLlt<f64>),
@@ -7407,8 +7411,8 @@ mod tests {
 
         for i in 0..n {
             let ui = u.row(i).to_owned();
-            let rhs_f = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
-            let si = factor.solve(rhs_f.as_ref());
+            let rhs_view = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let si = factor.solve(rhs_view.as_ref());
             let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
 
             let mut aii = 0.0;

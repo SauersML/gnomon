@@ -1,8 +1,7 @@
 use crate::calibrate::construction::{ModelLayout, ReparamResult};
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
-use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
@@ -1535,8 +1534,8 @@ pub fn solve_penalized_least_squares(
             }
         }
         // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
-        let h_faer = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| penalized_hessian[[i, j]]);
-        match FaerLlt::new(h_faer.as_ref(), Side::Lower) {
+        let h_view = FaerArrayView::new(&penalized_hessian);
+        match FaerLlt::new(h_view.as_ref(), Side::Lower) {
             Ok(chol) => {
                 // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
                 let cond_bad = match penalized_hessian.eigh(Side::Lower) {
@@ -1572,14 +1571,17 @@ pub fn solve_penalized_least_squares(
                     // Single multi-RHS solve: [ XtWz | Eᵀ ]
                     let rk_rows = e_transformed.nrows();
                     let nrhs = 1 + rk_rows;
-                    let rhs = FaerMat::<f64>::from_fn(p_dim, nrhs, |i, j| {
-                        if j == 0 {
-                            xtwz[i]
-                        } else {
-                            e_transformed[(j - 1, i)]
+                    let mut rhs = Array2::<f64>::zeros((p_dim, nrhs));
+                    for i in 0..p_dim {
+                        rhs[(i, 0)] = xtwz[i];
+                    }
+                    for j in 0..rk_rows {
+                        for i in 0..p_dim {
+                            rhs[(i, 1 + j)] = e_transformed[(j, i)];
                         }
-                    });
-                    let sol = chol.solve(rhs.as_ref());
+                    }
+                    let rhs_view = FaerArrayView::new(&rhs);
+                    let sol = chol.solve(rhs_view.as_ref());
 
                     // β̂ from first column
                     let mut beta_transformed = Array1::zeros(p_dim);
@@ -2145,12 +2147,13 @@ fn calculate_edf(
     if r == 0 {
         return Ok(p as f64);
     }
-    let h_f = FaerMat::<f64>::from_fn(p, p, |i, j| penalized_hessian[[i, j]]);
-    let rhs = FaerMat::<f64>::from_fn(p, r, |i, j| e_transformed[(j, i)]);
+    let h_view = FaerArrayView::new(penalized_hessian);
+    let rhs_arr = e_transformed.t().to_owned();
+    let rhs_view = FaerArrayView::new(&rhs_arr);
 
     // Try LLᵀ first
-    if let Ok(ch) = FaerLlt::new(h_f.as_ref(), Side::Lower) {
-        let sol = ch.solve(rhs.as_ref());
+    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+        let sol = ch.solve(rhs_view.as_ref());
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -2161,8 +2164,8 @@ fn calculate_edf(
     }
 
     // Try LDLᵀ (semi-definite)
-    if let Ok(ld) = FaerLdlt::new(h_f.as_ref(), Side::Lower) {
-        let sol = ld.solve(rhs.as_ref());
+    if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+        let sol = ld.solve(rhs_view.as_ref());
         let mut tr = 0.0;
         for j in 0..r {
             for i in 0..p {
@@ -2173,8 +2176,8 @@ fn calculate_edf(
     }
 
     // Last resort: symmetric indefinite LBLᵀ (Bunch–Kaufman)
-    let lb = FaerLblt::new(h_f.as_ref(), Side::Lower);
-    let sol = lb.solve(rhs.as_ref());
+    let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
+    let sol = lb.solve(rhs_view.as_ref());
     if sol.nrows() == p && sol.ncols() == r {
         let mut tr = 0.0;
         for j in 0..r {
@@ -3807,14 +3810,15 @@ fn compute_firth_hat_and_half_logdet(
     })?;
     let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
 
-    let h_faer = FaerMat::<f64>::from_fn(p, p, |i, j| stabilized[[i, j]]);
-    let chol_faer = FaerLlt::new(h_faer.as_ref(), Side::Lower).map_err(|_| {
+    let h_view = FaerArrayView::new(&stabilized);
+    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
-    let rhs = FaerMat::<f64>::from_fn(p, n, |i, j| workspace.wx[[j, i]]);
-    let sol = chol_faer.solve(rhs.as_ref());
+    let rhs = workspace.wx.t().to_owned();
+    let rhs_view = FaerArrayView::new(&rhs);
+    let sol = chol_faer.solve(rhs_view.as_ref());
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     for i in 0..n {
