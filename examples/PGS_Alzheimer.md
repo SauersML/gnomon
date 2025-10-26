@@ -1131,3 +1131,12 @@ This should complete in 35 minutes:
 ```
 ./gnomon/target/release/gnomon score "PGS004146, PGS003957, PGS003334, PGS004589, PGS004898, PGS004229" arrays
 ```
+
+Decent missingness:
+<img width="1011" height="1031" alt="image" src="https://github.com/user-attachments/assets/34e7ade4-e7c4-4b5a-a8ee-aecc5e4153af" />
+
+A mix of normal and non-normal distributions:
+<img width="1011" height="971" alt="image" src="https://github.com/user-attachments/assets/ae696dc4-ddbe-415f-8838-5b54124913eb" />
+
+The top three scores are PGS004146_AVG, with an OR per SD of 1.32 and an AUROC of 0.57, PGS004898_AVG with an AUROC of 0.54, and PGS003334_AVG, with an AUROC of 0.52.
+
