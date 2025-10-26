@@ -35,7 +35,7 @@ use crate::calibrate::construction::{
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
-use crate::calibrate::pirls::{self, PirlsResult};
+use crate::calibrate::pirls::{self, PirlsControl, PirlsResult, PirlsWarmStart};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -784,6 +784,7 @@ pub fn train_model(
             reml_state.rs_list_ref(),
             &layout,
             config,
+            None,
         )?;
 
         // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
@@ -1240,6 +1241,7 @@ pub fn train_model(
         reml_state.rs_list_ref(), // Pass original penalty matrices
         &layout,
         config,
+        None,
     )?;
 
     // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
@@ -1645,6 +1647,7 @@ pub fn optimize_external_design(
         &rs_list_ref,
         &layout,
         &cfg,
+        None,
     )?;
 
     // Map beta back to original basis
@@ -2036,6 +2039,7 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
+        last_warm_start: RefCell<Option<PirlsWarmStart>>,
     }
 
     impl<'a> RemlState<'a> {
@@ -2220,6 +2224,7 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
+                last_warm_start: RefCell::new(None),
             })
         }
 
@@ -2255,6 +2260,36 @@ pub mod internal {
                 h_eff: Arc::new(h_eff),
                 ridge_used,
             })
+        }
+
+        fn dynamic_pirls_control(&self) -> PirlsControl {
+            let warm_start = self.last_warm_start.borrow().clone();
+            let evals_completed = *self.eval_count.borrow();
+            let last_grad = *self.last_grad_norm.borrow();
+
+            let tolerance_scale = if evals_completed < 5 {
+                5.0
+            } else if !last_grad.is_finite() {
+                3.0
+            } else if last_grad > 1e-2 {
+                3.0
+            } else if last_grad > 1e-4 {
+                1.5
+            } else {
+                1.0
+            };
+
+            let step_halving_limit = if last_grad.is_finite() && last_grad < 5e-4 {
+                12
+            } else {
+                30
+            };
+
+            PirlsControl {
+                warm_start,
+                tolerance_scale,
+                step_halving_limit,
+            }
         }
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
@@ -2564,6 +2599,8 @@ pub mod internal {
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
+            let control = self.dynamic_pirls_control();
+
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x.view(),
@@ -2573,6 +2610,7 @@ pub mod internal {
                 &self.rs_list,
                 self.layout,
                 self.config,
+                Some(control),
             );
 
             if let Err(e) = &pirls_result {
@@ -2580,6 +2618,17 @@ pub mod internal {
             }
 
             let pirls_result = Arc::new(pirls_result?); // Propagate error if it occurred
+
+            if matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            ) {
+                let beta_original = pirls_result
+                    .reparam_result
+                    .qs
+                    .dot(&pirls_result.beta_transformed);
+                *self.last_warm_start.borrow_mut() = Some(PirlsWarmStart { beta_original });
+            }
 
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
@@ -4815,6 +4864,7 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -4925,6 +4975,7 @@ pub mod internal {
                 reml_state.rs_list_ref(),
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -5201,6 +5252,7 @@ pub mod internal {
                         &rs_list,
                         &layout,
                         &trained.config,
+                        None,
                     )
                     .expect("pirls refit");
 
@@ -6520,6 +6572,7 @@ pub mod internal {
                 &rs_original,
                 &layout,
                 &config,
+                None,
             );
 
             match result {

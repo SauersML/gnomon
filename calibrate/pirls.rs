@@ -10,6 +10,52 @@ use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
 
+/// Control options passed from the outer optimization to P-IRLS.
+///
+/// These allow the outer loop to provide a warm start and to relax/tighten
+/// convergence behaviour depending on the current optimization progress.
+#[derive(Clone, Default)]
+pub struct PirlsControl {
+    /// Optional warm start expressed in the original coefficient basis.  The
+    /// solver transforms this into the current stable basis before beginning
+    /// the iterations.
+    pub warm_start: Option<PirlsWarmStart>,
+    /// Multiplicative factor applied to the convergence tolerance.  Values
+    /// greater than 1.0 relax convergence, while values below 1.0 tighten it.
+    pub tolerance_scale: f64,
+    /// Upper bound on the number of step-halving attempts before aborting a
+    /// search direction.  This lets the outer loop clamp expensive backtracking
+    /// when it is already close to a solution.
+    pub step_halving_limit: usize,
+}
+
+impl PirlsControl {
+    /// Ensures sane defaults even if callers provide pathological values.
+    fn sanitized(self) -> Self {
+        let tolerance_scale = if self.tolerance_scale.is_finite() && self.tolerance_scale > 0.0 {
+            self.tolerance_scale
+        } else {
+            1.0
+        };
+        let step_halving_limit = self.step_halving_limit.max(1);
+        PirlsControl {
+            warm_start: self.warm_start,
+            tolerance_scale,
+            step_halving_limit,
+        }
+    }
+}
+
+/// Lightweight warm-start information supplied by the outer loop.
+///
+/// The vector is kept in the original coefficient basis so it can be re-used
+/// across different reparameterizations.  This avoids the need to carry large
+/// working arrays between calls.
+#[derive(Clone)]
+pub struct PirlsWarmStart {
+    pub beta_original: Array1<f64>,
+}
+
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
@@ -211,10 +257,13 @@ pub fn fit_model_for_fixed_rho(
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
     layout: &ModelLayout,
     config: &ModelConfig,
+    control: Option<PirlsControl>,
 ) -> Result<PirlsResult, EstimationError> {
     // No test-specific hacks - the properly implemented algorithm should handle all cases
     // Stage: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
     let lambdas = rho_vec.mapv(f64::exp);
+
+    let control = control.unwrap_or_default().sanitized();
 
     log::info!(
         "Starting P-IRLS fitting with {} smoothing parameters",
@@ -300,7 +349,40 @@ pub fn fit_model_for_fixed_rho(
     // Stage: Initialize P-IRLS state variables in the transformed basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
     let mut eta = offset.to_owned();
-    eta += &x_transformed.dot(&beta_transformed);
+    let mut warm_start_applied = false;
+    if let Some(ref warm) = control.warm_start {
+        if warm.beta_original.len() == layout.total_coeffs {
+            let beta_guess = reparam_result.qs.t().dot(&warm.beta_original);
+            if beta_guess.iter().all(|v| v.is_finite()) {
+                beta_transformed.assign(&beta_guess);
+                let mut eta_warm = offset.to_owned();
+                eta_warm += &x.dot(&warm.beta_original);
+                if eta_warm.iter().all(|v| v.is_finite()) {
+                    eta = eta_warm;
+                    warm_start_applied = true;
+                } else {
+                    log::warn!(
+                        "Warm-start eta contained non-finite entries; reverting to cold start"
+                    );
+                    beta_transformed.fill(0.0);
+                }
+            } else {
+                log::warn!(
+                    "Warm-start coefficients were non-finite in transformed basis; reverting to cold start"
+                );
+            }
+        } else {
+            log::warn!(
+                "Warm-start beta length {} does not match expected {}; ignoring warm start",
+                warm.beta_original.len(),
+                layout.total_coeffs
+            );
+        }
+    }
+    if !warm_start_applied {
+        eta = offset.to_owned();
+        eta += &x_transformed.dot(&beta_transformed);
+    }
     let (mut mu, mut weights, mut z) =
         update_glm_vectors(y, &eta, config.link_function, prior_weights);
     let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights);
@@ -434,7 +516,7 @@ pub fn fit_model_for_fixed_rho(
         let beta_trial_initial = stable_result.0.beta.clone();
         let mut step_halving_count = 0;
         let mut last_halving_change: f64 = f64::NAN;
-        const MAX_STEP_HALVING: usize = 30;
+        let max_step_halving = control.step_halving_limit;
 
         // Use a robust loop for step-halving that prioritizes numerical stability.
         // Reuse XΔβ step direction in step-halving
@@ -498,10 +580,10 @@ pub fn fit_model_for_fixed_rho(
             }
             // If we reach here, it's because the step was either invalid or increased the deviance.
             step_halving_count += 1;
-            if step_halving_count >= MAX_STEP_HALVING {
+            if step_halving_count >= max_step_halving {
                 log::warn!(
                     "P-IRLS failed to find a valid step after {} halvings. This often indicates model instability.",
-                    MAX_STEP_HALVING
+                    max_step_halving
                 );
                 return Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: config.max_iterations,
@@ -749,7 +831,8 @@ pub fn fit_model_for_fixed_rho(
         last_step_halving = step_halving_count;
 
         // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
-        if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
+        let convergence_tolerance = config.convergence_tolerance * control.tolerance_scale;
+        if deviance_change_scaled < convergence_tolerance * (0.1 + convergence_scale) {
             // Check gradient with the SAME (W, z) used in the last WLS solve
             // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
             // So we must check stationarity with respect to those same W_solve, z_solve
@@ -776,7 +859,7 @@ pub fn fit_model_for_fixed_rho(
 
             // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
             // and uses the user's epsilon, not machine epsilon.
-            let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
+            let gradient_tol = convergence_tolerance * (0.1 + convergence_scale);
 
             last_gradient_norm = gradient_norm;
             last_gradient_tol = gradient_tol;
@@ -951,7 +1034,8 @@ pub fn fit_model_for_fixed_rho(
         }
     };
     let convergence_scale = scale_term.abs() + penalized_deviance_new.abs();
-    let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
+    let gradient_tol =
+        config.convergence_tolerance * control.tolerance_scale * (0.1 + convergence_scale);
 
     // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
@@ -2504,6 +2588,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            None,
         )?;
 
         // --- Return all necessary components for assertion ---
@@ -2909,6 +2994,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            None,
         )
         .expect("First fit should converge for this stable test case");
 
@@ -2922,6 +3008,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            None,
         )
         .expect("Second fit should converge for this stable test case");
 
@@ -3033,6 +3120,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            None,
         )
         .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
 
@@ -3162,6 +3250,7 @@ mod tests {
             &rs_original,
             &layout,
             &config,
+            None,
         )
         .expect("P-IRLS should converge on realistic data with clear signal");
 
