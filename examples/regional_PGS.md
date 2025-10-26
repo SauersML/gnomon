@@ -153,53 +153,67 @@ I wonder how large the overlap between the microarray cohort and the srWGS cohor
 
 ```
 import subprocess
-import time
-import sys
 import fsspec
-from itertools import cycle
+from matplotlib import pyplot as plt
+from matplotlib.patches import Circle
 
+print("resolving billing project")
 project = subprocess.check_output(
     ["gcloud", "config", "get-value", "project", "--quiet"],
     text=True
 ).strip()
 print("project:", project)
 
-fam_glob = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed/*.fam"
-print("glob:", fam_glob)
-
+print("listing chr22 .fam files")
+fam_glob = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/acaf_threshold/plink_bed/*chr22*.fam"
 fs = fsspec.filesystem("gcs", requester_pays=True, project=project)
 fam_paths = fs.glob(fam_glob)
-print("fam files found:", len(fam_paths))
 
-spinner = cycle("|/-\\")
-iids = set()
-total_lines = 0
-duplicates = 0
-t0 = time.time()
-
+print("reading srWGS FAM")
+srwgs_ids = set()
 for path in fam_paths:
-    print("\nreading:", path)
-    with fs.open(path, "rb") as f:
+    with fs.open(path, "rt") as f:
         for line in f:
-            before = len(iids)
-            parts = line.split()
-            iids.add(parts[1].decode("utf-8"))
-            after = len(iids)
-            total_lines += 1
-            duplicates += 1 - (after - before)
-            elapsed = time.time() - t0 + 1e-9
-            rate = total_lines / elapsed
-            sys.stdout.write(
-                "\r%s lines:%d unique:%d dup:%d elapsed_s:%.1f rate:%.1f/s"
-                % (next(spinner), total_lines, after, duplicates, elapsed, rate)
-            )
-            sys.stdout.flush()
+            srwgs_ids.add(line.split()[1])
 
-print("\n\ndone.")
-print("files:", len(fam_paths))
-print("unique samples:", len(iids))
-print("lines read:", total_lines)
+print("reading ../../arrays.sscore")
+array_ids = set()
+with open("../../arrays.sscore", "r") as f:
+    for line in f:
+        array_ids.add(line.split(maxsplit=1)[0])
+
+print("computing overlap and plotting")
+srwgs_ids = set(filter(str.isdigit, srwgs_ids))
+array_ids = set(filter(str.isdigit, array_ids))
+overlap = srwgs_ids & array_ids
+
+print("srWGS (chr22) IDs:", len(srwgs_ids))
+print("Microarray IDs:", len(array_ids))
+print("Overlap:", len(overlap))
+
+fig = plt.figure()
+ax = fig.add_subplot(111)
+
+left = Circle((-1.0, 0.0), 1.6, alpha=0.35)
+right = Circle((1.0, 0.0), 1.6, alpha=0.35)
+ax.add_patch(left)
+ax.add_patch(right)
+
+ax.set_xlim(-3.2, 3.2)
+ax.set_ylim(-2.2, 2.2)
+ax.set_aspect("equal")
+ax.axis("off")
+
+ax.text(-1.7, 0.0, str(len(srwgs_ids - array_ids)), fontsize=14, ha="center", va="center")
+ax.text(0.0, 0.0, str(len(overlap)), fontsize=14, ha="center", va="center")
+ax.text(1.7, 0.0, str(len(array_ids - srwgs_ids)), fontsize=14, ha="center", va="center")
+
+ax.text(-1.0, 1.55, "srWGS chr22", fontsize=12, ha="center")
+ax.text(1.0, 1.55, "Microarray", fontsize=12, ha="center")
+plt.title("Overlap of srWGS (chr22 FAM) and Microarray (arrays.sscore) IDs")
+plt.show()
 ```
 
-There are 414830 unique samples.
+<img width="563" height="383" alt="image" src="https://github.com/user-attachments/assets/68f8d0e4-e263-457b-adfc-ed207cbdc4ac" />
 
+Most individuals overlap between srWGS and microarray. There is a small subset of the microarray cohort which is absent from srWGS.
