@@ -1398,36 +1398,39 @@ pub fn construct_s_lambda(
             continue;
         }
 
-        let support = layout
-            .penalty_supports
-            .get(i)
-            .cloned()
-            .map(|range| {
-                let end = range.end.min(p);
-                let start = range.start.min(end);
-                start..end
-            })
-            .filter(|range| range.start < range.end)
-            .unwrap_or(0..p);
+        let support = layout.penalty_supports.get(i).and_then(|range| {
+            let end = range.end.min(p);
+            let start = range.start.min(end);
+            if start < end { Some(start..end) } else { None }
+        });
 
-        match layout
-            .penalty_structures
-            .get(i)
-            .unwrap_or(&PenaltyStructure::Dense)
-        {
-            PenaltyStructure::Diagonal => {
-                for idx in support.start..support.end {
-                    let value = s_k[[idx, idx]];
-                    if value != 0.0 {
-                        s_lambda[[idx, idx]] += lambda * value;
+        if let Some(support) = support {
+            let start = support.start;
+            let end = support.end;
+            match layout
+                .penalty_structures
+                .get(i)
+                .unwrap_or(&PenaltyStructure::Dense)
+            {
+                PenaltyStructure::Diagonal => {
+                    for idx in start..end {
+                        let value = s_k[[idx, idx]];
+                        if value != 0.0 {
+                            s_lambda[[idx, idx]] += lambda * value;
+                        }
                     }
                 }
+                PenaltyStructure::Dense => {
+                    let mut dest = s_lambda.slice_mut(s![start..end, start..end]);
+                    let block = s_k.slice(s![start..end, start..end]);
+                    dest.scaled_add(lambda, &block);
+                }
             }
-            PenaltyStructure::Dense => {
-                let mut dest = s_lambda.slice_mut(s![support.clone(), support.clone()]);
-                let block = s_k.slice(s![support.clone(), support.clone()]);
-                dest.scaled_add(lambda, &block);
-            }
+        } else {
+            // Fallback: if the layout lacks support metadata for this penalty, sum the
+            // full matrix just like the pre-metadata implementation. This preserves
+            // correctness for callers constructing layouts externally.
+            s_lambda.scaled_add(lambda, s_k);
         }
     }
 
