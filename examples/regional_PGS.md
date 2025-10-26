@@ -1,3 +1,5 @@
+### Local polygenic scores
+
 The 17q21 inversion is on chr17 from 45585159 to 46292045 on hg38. Let's add 50 kb to each side so the region becomes 45535159 to 46342045.
 
 We'll calculate the following scores.
