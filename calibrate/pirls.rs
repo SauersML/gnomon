@@ -1,4 +1,4 @@
-use crate::calibrate::construction::{ModelLayout, ReparamResult};
+use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
@@ -52,6 +52,65 @@ impl PirlsWorkspace {
             vec_buf_p: Array1::zeros(p),
         }
     }
+}
+
+const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
+const HESSIAN_CONDITION_TARGET: f64 = 1e10;
+
+fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
+    matrix
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0, f64::max)
+        .max(1.0)
+}
+
+fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64, Option<f64>) {
+    let diag_scale = max_abs_diag(matrix);
+    let cond_est = calculate_condition_number(matrix).ok();
+    let mut ridge = 0.0;
+    if let Some(cond) = cond_est {
+        if !cond.is_finite() {
+            ridge = diag_scale * 1e-8;
+        } else if cond > HESSIAN_CONDITION_TARGET {
+            ridge = diag_scale * 1e-10 * (cond / HESSIAN_CONDITION_TARGET);
+        }
+    } else {
+        ridge = diag_scale * 1e-8;
+    }
+    let mut total_added = 0.0;
+
+    for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
+        if ridge > total_added {
+            let delta = ridge - total_added;
+            for i in 0..matrix.nrows() {
+                matrix[[i, i]] += delta;
+            }
+            total_added = ridge;
+        }
+
+        let view = FaerArrayView::new(&*matrix);
+        match FaerLlt::new(view.as_ref(), Side::Lower) {
+            Ok(chol) => return (Some(chol), total_added, cond_est),
+            Err(_) => {
+                if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {
+                    return (None, total_added, cond_est);
+                }
+                if ridge <= 0.0 {
+                    ridge = diag_scale * 1e-10;
+                } else {
+                    ridge = (ridge * 10.0).max(diag_scale * 1e-10);
+                }
+                if !ridge.is_finite() || ridge <= 0.0 {
+                    ridge = diag_scale;
+                }
+            }
+        }
+    }
+
+    (None, total_added, cond_est)
 }
 
 /// The status of the P-IRLS convergence.
@@ -1534,36 +1593,24 @@ pub fn solve_penalized_least_squares(
             }
         }
         // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
-        let h_view = FaerArrayView::new(&penalized_hessian);
-        match FaerLlt::new(h_view.as_ref(), Side::Lower) {
-            Ok(chol) => {
+        let (chol_opt, ridge_used, cond_est) = attempt_spd_cholesky(&mut penalized_hessian);
+        match chol_opt {
+            Some(chol) => {
+                if ridge_used > 0.0 {
+                    let cond_display = cond_est
+                        .map(|c| format!("{c:.2e}"))
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    log::warn!(
+                        "Added ridge {:.3e} before SPD solve (cond ≈ {})",
+                        ridge_used,
+                        cond_display
+                    );
+                }
+
                 // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
-                let cond_bad = match penalized_hessian.eigh(Side::Lower) {
-                    Ok((eigs, _)) => {
-                        let mut min_ev = f64::INFINITY;
-                        let mut max_ev = 0.0f64;
-                        for &ev in eigs.iter() {
-                            if ev.is_finite() {
-                                if ev > max_ev {
-                                    max_ev = ev;
-                                }
-                                if ev < min_ev {
-                                    min_ev = ev;
-                                }
-                            }
-                        }
-                        // Treat non-positive or extremely small min eigenvalues as bad conditioning
-                        if !(min_ev.is_finite()) || min_ev <= 0.0 {
-                            true
-                        } else {
-                            let cond = max_ev / min_ev.max(std::f64::MIN_POSITIVE);
-                            cond > 1e8
-                        }
-                    }
-                    Err(_) => {
-                        // If we can't estimate, be conservative and proceed with SPD path
-                        false
-                    }
+                let cond_bad = match calculate_condition_number(&penalized_hessian) {
+                    Ok(cond) => !cond.is_finite() || cond > 1e8,
+                    Err(_) => false,
                 };
                 if cond_bad {
                     diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
@@ -1594,11 +1641,16 @@ pub fn solve_penalized_least_squares(
                         });
                     }
 
-                    // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns
+                    // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns (compensated summation)
                     let mut frob = 0.0f64;
+                    let mut comp = 0.0f64;
                     for j in 0..rk_rows {
                         for i in 0..p_dim {
-                            frob += sol[(i, 1 + j)] * e_transformed[(j, i)];
+                            let prod = sol[(i, 1 + j)] * e_transformed[(j, i)];
+                            let y_k = prod - comp;
+                            let t = frob + y_k;
+                            comp = (t - frob) - y_k;
+                            frob = t;
                         }
                     }
                     let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
@@ -1640,7 +1692,7 @@ pub fn solve_penalized_least_squares(
                     ));
                 }
             }
-            Err(_) => diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed),
+            None => diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed),
         }
         // If LLᵀ fails, continue into the robust QR path below.
     }
@@ -3846,23 +3898,59 @@ fn ensure_positive_definite_with_label(
         return Ok(());
     }
 
-    // Add a small constant ridge and retry, escalating a few times if necessary
-    let n = hess.nrows();
-    let mut delta = 1e-8_f64;
-    for attempt in 0..5 {
-        for i in 0..n {
-            hess[[i, i]] += delta;
+    let cond_est = calculate_condition_number(hess).ok();
+    let diag_scale = max_abs_diag(hess);
+    let mut ridge = match cond_est {
+        Some(cond) if cond.is_finite() && cond > HESSIAN_CONDITION_TARGET => {
+            diag_scale * 1e-10 * (cond / HESSIAN_CONDITION_TARGET)
         }
+        Some(cond) if cond.is_finite() => {
+            if diag_scale > 0.0 {
+                diag_scale * 1e-12
+            } else {
+                0.0
+            }
+        }
+        _ => diag_scale * 1e-8,
+    };
+    let mut total_added = 0.0;
+
+    for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
+        if ridge > total_added {
+            let delta = ridge - total_added;
+            for i in 0..hess.nrows() {
+                hess[[i, i]] += delta;
+            }
+            total_added = ridge;
+        }
+
         if hess.cholesky(Side::Lower).is_ok() {
-            log::warn!(
-                "{} not PD; added ridge {:.1e} on attempt {} to ensure stability.",
-                label,
-                delta,
-                attempt + 1
-            );
+            if total_added > 0.0 {
+                let cond_display = cond_est
+                    .map(|c| format!("{c:.2e}"))
+                    .unwrap_or_else(|| "unavailable".to_string());
+                log::warn!(
+                    "{} not PD; added ridge {:.1e} (cond ≈ {}) to ensure stability.",
+                    label,
+                    total_added,
+                    cond_display
+                );
+            }
             return Ok(());
         }
-        delta *= 10.0;
+
+        if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {
+            break;
+        }
+
+        if ridge <= 0.0 {
+            ridge = diag_scale * 1e-10;
+        } else {
+            ridge = (ridge * 10.0).max(diag_scale * 1e-10);
+        }
+        if !ridge.is_finite() || ridge <= 0.0 {
+            ridge = diag_scale;
+        }
     }
 
     // As a last resort, report indefiniteness with min eigenvalue for diagnostics

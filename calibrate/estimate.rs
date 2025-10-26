@@ -47,17 +47,129 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 
-// Helper: Frobenius inner product for faer matrices
+// Helper: Frobenius inner product for faer matrices using compensated summation
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
     let (m, n) = (a.nrows(), a.ncols());
-    let mut acc = 0.0;
+    let mut sum = KahanSum::default();
     for j in 0..n {
         for i in 0..m {
-            acc += a[(i, j)] * b[(i, j)];
+            sum.add(a[(i, j)] * b[(i, j)]);
         }
     }
-    acc
+    sum.sum()
 }
+
+#[derive(Default, Clone, Copy)]
+struct KahanSum {
+    sum: f64,
+    c: f64,
+}
+
+impl KahanSum {
+    fn add(&mut self, value: f64) {
+        let y = value - self.c;
+        let t = self.sum + y;
+        self.c = (t - self.sum) - y;
+        self.sum = t;
+    }
+
+    fn sum(self) -> f64 {
+        self.sum
+    }
+}
+
+fn kahan_sum<I>(iter: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut acc = KahanSum::default();
+    for value in iter {
+        acc.add(value);
+    }
+    acc.sum()
+}
+
+const HESSIAN_CONDITION_TARGET: f64 = 1e10;
+
+fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
+    matrix
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0, f64::max)
+        .max(1.0)
+}
+
+fn add_ridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
+    if ridge <= 0.0 {
+        return matrix.clone();
+    }
+    let mut regularized = matrix.clone();
+    let n = regularized.nrows();
+    for i in 0..n {
+        regularized[[i, i]] += ridge;
+    }
+    regularized
+}
+
+#[derive(Clone)]
+struct RidgePlanner {
+    cond_estimate: Option<f64>,
+    ridge: f64,
+    attempts: usize,
+    scale: f64,
+}
+
+impl RidgePlanner {
+    fn new(matrix: &Array2<f64>) -> Self {
+        let scale = max_abs_diag(matrix);
+        let cond_estimate = calculate_condition_number(matrix).ok();
+        let mut ridge = 0.0;
+        if let Some(cond) = cond_estimate {
+            if !cond.is_finite() {
+                ridge = scale * 1e-8;
+            } else if cond > HESSIAN_CONDITION_TARGET {
+                ridge = scale * 1e-10 * (cond / HESSIAN_CONDITION_TARGET);
+            }
+        } else {
+            ridge = scale * 1e-8;
+        }
+        Self {
+            cond_estimate,
+            ridge,
+            attempts: 0,
+            scale,
+        }
+    }
+
+    fn ridge(&self) -> f64 {
+        self.ridge
+    }
+
+    fn cond_estimate(&self) -> Option<f64> {
+        self.cond_estimate
+    }
+
+    fn bump(&mut self) {
+        self.attempts += 1;
+        let min_step = self.scale * 1e-10;
+        if self.ridge <= 0.0 {
+            self.ridge = min_step;
+        } else {
+            self.ridge = (self.ridge * 10.0).max(min_step);
+        }
+        if !self.ridge.is_finite() || self.ridge <= 0.0 {
+            self.ridge = self.scale;
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts
+    }
+}
+
+const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1558,49 +1670,82 @@ pub fn optimize_external_design(
     // EDF by block using stabilized H and penalty roots in transformed basis
     let lambdas = final_rho.mapv(f64::exp);
     let h = &pirls_res.stabilized_hessian_transformed;
-    let p_dim = h.nrows();
     let h_view = FaerArrayView::new(h);
     enum Fact {
         Llt(FaerLlt<f64>),
         Ldlt(FaerLdlt<f64>),
+        Lblt(FaerLblt<f64>),
     }
     impl Fact {
         fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
             match self {
                 Fact::Llt(f) => f.solve(rhs),
                 Fact::Ldlt(f) => f.solve(rhs),
+                Fact::Lblt(f) => f.solve(rhs),
             }
         }
     }
-    let fact = match FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        Ok(ch) => Fact::Llt(ch),
-        Err(_) => {
-            let ld = FaerLdlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-                EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                }
-            })?;
-            Fact::Ldlt(ld)
+    let mut planner = RidgePlanner::new(h);
+    let cond_display = planner
+        .cond_estimate()
+        .map(|c| format!("{c:.2e}"))
+        .unwrap_or_else(|| "unavailable".to_string());
+    let fact = loop {
+        let ridge = planner.ridge();
+        if ridge > 0.0 {
+            let regularized = add_ridge(h, ridge);
+            let view = FaerArrayView::new(&regularized);
+            if let Ok(ch) = FaerLlt::new(view.as_ref(), Side::Lower) {
+                log::warn!(
+                    "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
+                    ridge,
+                    cond_display
+                );
+                break Fact::Llt(ch);
+            }
+            if let Ok(ld) = FaerLdlt::new(view.as_ref(), Side::Lower) {
+                log::warn!(
+                    "LLᵀ failed; LDLᵀ succeeded with ridge {:.3e} (cond ≈ {})",
+                    ridge,
+                    cond_display
+                );
+                break Fact::Ldlt(ld);
+            }
+            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
+                log::warn!(
+                    "LLᵀ/LDLᵀ failed even after ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
+                    ridge,
+                    cond_display
+                );
+                let f = FaerLblt::new(view.as_ref(), Side::Lower);
+                break Fact::Lblt(f);
+            }
+        } else {
+            if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                break Fact::Llt(ch);
+            }
+            if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                log::warn!(
+                    "LLᵀ failed for Hessian (cond ≈ {}); using LDLᵀ without ridge",
+                    cond_display
+                );
+                break Fact::Ldlt(ld);
+            }
         }
+        planner.bump();
     };
     let mut traces = vec![0.0f64; k];
     for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-        let rank_k = rs.nrows();
         let ekt_arr = rs.t().to_owned();
         let ekt_view = FaerArrayView::new(&ekt_arr);
         let x_sol = fact.solve(ekt_view.as_ref());
-        let mut frob = 0.0;
-        for j in 0..rank_k {
-            for i in 0..p_dim {
-                frob += x_sol[(i, j)] * ekt_arr[(i, j)];
-            }
-        }
+        let frob = faer_frob_inner(x_sol.as_ref(), ekt_view.as_ref());
         traces[kk] = lambdas[kk] * frob;
     }
     let p_dim = pirls_res.beta_transformed.len();
     let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
     let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
-    let edf_total = (p_dim as f64 - traces.iter().sum::<f64>()).clamp(mp, p_dim as f64);
+    let edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
     // Per-block EDF: use block range dimension (rank of R_k) minus λ tr(H^{-1} S_k)
     // This better reflects penalized coefficients in the transformed basis
     let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
@@ -2171,17 +2316,7 @@ pub mod internal {
             let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
             let e_view = FaerArrayView::new(&e_t);
             let x = factor.solve(e_view.as_ref());
-            let trace_h_inv_s_lambda = {
-                // Frobenius inner product between H⁻¹ Eᵀ and Eᵀ
-                let mut acc = 0.0;
-                let (m, n) = (e_t.nrows(), e_t.ncols());
-                for j in 0..n {
-                    for i in 0..m {
-                        acc += x[(i, j)] * e_t[[i, j]];
-                    }
-                }
-                acc
-            };
+            let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), e_view.as_ref());
 
             // Calculate EDF as p - trace, clamped to the penalty nullspace dimension
             let p = pr.beta_transformed.len() as f64;
@@ -2200,20 +2335,57 @@ pub mod internal {
         ///
         /// # Returns
         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
-            let h_view = FaerArrayView::new(h);
-            if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                println!("Using faer LLᵀ for Hessian solves");
-                return FaerFactor::Llt(f);
+            let mut planner = RidgePlanner::new(h);
+            let cond_display = planner
+                .cond_estimate()
+                .map(|c| format!("{c:.2e}"))
+                .unwrap_or_else(|| "unavailable".to_string());
+            loop {
+                let ridge = planner.ridge();
+                if ridge > 0.0 {
+                    let regularized = add_ridge(h, ridge);
+                    let view = FaerArrayView::new(&regularized);
+                    if let Ok(f) = FaerLlt::new(view.as_ref(), Side::Lower) {
+                        log::warn!(
+                            "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
+                            ridge,
+                            cond_display
+                        );
+                        return FaerFactor::Llt(f);
+                    }
+                    if let Ok(f) = FaerLdlt::new(view.as_ref(), Side::Lower) {
+                        log::warn!(
+                            "LLᵀ failed; using faer LDLᵀ with ridge {:.3e} (cond ≈ {})",
+                            ridge,
+                            cond_display
+                        );
+                        return FaerFactor::Ldlt(f);
+                    }
+                    if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
+                        log::warn!(
+                            "LLᵀ/LDLᵀ failed even with ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
+                            ridge,
+                            cond_display
+                        );
+                        let f = FaerLblt::new(view.as_ref(), Side::Lower);
+                        return FaerFactor::Lblt(f);
+                    }
+                } else {
+                    let h_view = FaerArrayView::new(h);
+                    if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                        println!("Using faer LLᵀ for Hessian solves");
+                        return FaerFactor::Llt(f);
+                    }
+                    if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                        log::warn!(
+                            "LLᵀ failed; using faer LDLᵀ for Hessian solves (cond ≈ {})",
+                            cond_display
+                        );
+                        return FaerFactor::Ldlt(f);
+                    }
+                }
+                planner.bump();
             }
-            // Next, try semidefinite LDLᵀ (can fail)
-            if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                log::warn!("LLᵀ failed; using faer LDLᵀ for (semi-definite) Hessian solves");
-                return FaerFactor::Ldlt(f);
-            }
-            // Finally, use symmetric indefinite LBLᵀ (Bunch–Kaufman). This does not return Result.
-            log::warn!("LLᵀ/LDLᵀ failed; using faer LBLᵀ (Bunch–Kaufman) for Hessian solves");
-            let f = FaerLblt::new(h_view.as_ref(), Side::Lower);
-            FaerFactor::Lblt(f)
         }
 
         fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
