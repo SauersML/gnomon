@@ -42,16 +42,23 @@ pub fn kronecker_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     }
     let mut result = Array2::zeros((a_rows * b_rows, a_cols * b_cols));
 
-    for i in 0..a_rows {
-        for j in 0..a_cols {
-            let a_val = a[[i, j]];
-            for p in 0..b_rows {
-                for q in 0..b_cols {
-                    result[[i * b_rows + p, j * b_cols + q]] = a_val * b[[p, q]];
+    result
+        .axis_chunks_iter_mut(Axis(0), b_rows)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row_block)| {
+            let a_row = a.row(i);
+            let col_chunks = row_block.axis_chunks_iter_mut(Axis(1), b_cols);
+            for (j, mut block) in col_chunks.into_iter().enumerate() {
+                let a_val = a_row[j];
+                if a_val == 0.0 {
+                    continue;
+                }
+                for (dest, &src) in block.iter_mut().zip(b.iter()) {
+                    *dest = a_val * src;
                 }
             }
-        }
-    }
+        });
 
     result
 }

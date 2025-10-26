@@ -1,5 +1,7 @@
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::parallel::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Error type for hull building and projection.
 #[derive(thiserror::Error, Debug)]
@@ -32,18 +34,26 @@ impl PeeledHull {
         );
 
         let mut out = Array2::zeros((n, d));
-        let mut num_projected = 0usize;
-        for i in 0..n {
-            let y = points.row(i);
-            if self.is_inside(y) {
-                out.row_mut(i).assign(&y);
-            } else {
-                let proj = self.project_point(y);
-                num_projected += 1;
-                out.row_mut(i).assign(&proj.view());
-            }
+        if n == 0 {
+            return (out, 0);
         }
-        (out, num_projected)
+
+        let projected = AtomicUsize::new(0);
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(i, mut out_row)| {
+                let point_row = points.row(i);
+                if self.is_inside(point_row) {
+                    out_row.assign(&point_row);
+                } else {
+                    let proj = self.project_point(point_row);
+                    projected.fetch_add(1, Ordering::Relaxed);
+                    out_row.assign(&proj.view());
+                }
+            });
+
+        (out, projected.load(Ordering::Relaxed))
     }
 
     /// Fast in-domain test: a_i^T x <= b_i for all facets.
@@ -87,10 +97,19 @@ impl PeeledHull {
 
     /// Vectorized signed distance for a batch of points (row-wise).
     pub fn signed_distance_many(&self, points: ArrayView2<f64>) -> Array1<f64> {
-        let mut out = Array1::zeros(points.nrows());
-        for i in 0..points.nrows() {
-            out[i] = self.signed_distance(points.row(i));
+        let n = points.nrows();
+        let mut out = Array1::zeros(n);
+        if n == 0 {
+            return out;
         }
+
+        out.as_slice_mut()
+            .expect("contiguous slice")
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, slot)| {
+                *slot = self.signed_distance(points.row(i));
+            });
         out
     }
 
@@ -104,28 +123,40 @@ impl PeeledHull {
         let d = points.ncols();
         let mut dist = Array1::zeros(n);
         let mut proj = Array2::zeros((n, d));
-
-        for i in 0..n {
-            let xi = points.row(i);
-            if self.is_inside(xi) {
-                // Inside: negative min slack; projection is itself
-                let mut min_slack = f64::INFINITY;
-                for (a, b) in &self.facets {
-                    let slack = *b - a.dot(&xi);
-                    if slack < min_slack {
-                        min_slack = slack;
-                    }
-                }
-                dist[i] = -min_slack.max(0.0);
-                proj.row_mut(i).assign(&xi);
-            } else {
-                // Outside: project once; distance is Euclidean norm to projection
-                let zi = self.project_point(xi);
-                let di = (&xi.to_owned() - &zi).mapv(|v| v * v).sum().sqrt();
-                dist[i] = di;
-                proj.row_mut(i).assign(&zi.view());
-            }
+        if n == 0 {
+            return (dist, proj);
         }
+
+        let results: Vec<(f64, Vec<f64>)> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let point_row = points.row(i);
+                if self.is_inside(point_row) {
+                    let mut min_slack = f64::INFINITY;
+                    for (a, b) in &self.facets {
+                        let slack = *b - a.dot(&point_row);
+                        if slack < min_slack {
+                            min_slack = slack;
+                        }
+                    }
+                    let dist_val = -min_slack.max(0.0);
+                    let proj_vec = point_row.to_vec();
+                    (dist_val, proj_vec)
+                } else {
+                    let zi = self.project_point(point_row);
+                    let diff = point_row.to_owned() - &zi;
+                    let dist_val = diff.mapv(|v| v * v).sum().sqrt();
+                    let proj_vec = zi.to_vec();
+                    (dist_val, proj_vec)
+                }
+            })
+            .collect();
+
+        for (i, (dist_val, proj_vec)) in results.into_iter().enumerate() {
+            dist[i] = dist_val;
+            proj.row_mut(i).assign(&ArrayView1::from(&proj_vec));
+        }
+
         (dist, proj)
     }
 
