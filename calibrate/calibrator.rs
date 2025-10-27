@@ -264,51 +264,61 @@ pub fn compute_alo_features(
     let mut a_hi_95 = 0usize;
     let mut a_hi_99 = 0usize;
 
-    let mut s_buf = vec![0.0f64; p];
-    let mut t_buf = vec![0.0f64; p];
     let block_cols = 8192usize;
 
     let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
+    let mut t_chunk_storage = FaerMat::<f64>::zeros(p, block_cols);
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
         let width = chunk_end - chunk_start;
 
-        {
-            let mut rhs_slice = rhs_chunk_buf.slice_mut(s![.., ..width]);
-            for row in 0..p {
-                for col in 0..width {
-                    rhs_slice[[row, col]] = ut[[row, chunk_start + col]];
-                }
-            }
-        }
+        rhs_chunk_buf
+            .slice_mut(s![.., ..width])
+            .assign(&ut.slice(s![.., chunk_start..chunk_end]));
 
         let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
         let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
-        let mut t_chunk = FaerMat::<f64>::zeros(p, width);
+        // SAFETY: `t_chunk_storage` was allocated with `block_cols` columns. Each
+        // chunk width is bounded by `block_cols`, so resizing the view cannot
+        // exceed the underlying capacity.
+        unsafe {
+            t_chunk_storage.set_dims(p, width);
+        }
         matmul(
-            t_chunk.as_mut(),
+            t_chunk_storage.as_mut(),
             Accum::Replace,
             xtwx_view.as_ref(),
             s_chunk.as_ref(),
             1.0,
             Par::Seq,
         );
+        let t_chunk = t_chunk_storage.as_ref();
+        let s_col_stride = s_chunk.col_stride();
+        let t_col_stride = t_chunk.col_stride();
+        debug_assert!(s_col_stride >= 0 && t_col_stride >= 0);
+        let s_col_stride = s_col_stride as usize;
+        let t_col_stride = t_col_stride as usize;
+        let s_ptr = s_chunk.as_ptr();
+        let t_ptr = t_chunk.as_ptr();
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            for r in 0..p {
-                s_buf[r] = s_chunk[(r, local_col)];
-                t_buf[r] = t_chunk[(r, local_col)];
-            }
-
             let u_row = u.row(obs);
-            let ai = s_buf
-                .iter()
-                .zip(u_row.iter())
-                .map(|(s, &u_val)| s * u_val)
-                .sum::<f64>();
+            // SAFETY: `FaerMat` stores each column contiguously with stride
+            // `col_stride`, so slicing `p` elements from the column offset stays
+            // inside initialized data for both `s_chunk` and `t_chunk`.
+            let s_col =
+                unsafe { std::slice::from_raw_parts(s_ptr.add(local_col * s_col_stride), p) };
+            let t_col =
+                unsafe { std::slice::from_raw_parts(t_ptr.add(local_col * t_col_stride), p) };
+            let mut ai = 0.0f64;
+            let mut quad = 0.0f64;
+            for ((&s_val, &t_val), &u_val) in s_col.iter().zip(t_col.iter()).zip(u_row.iter()) {
+                ai = s_val.mul_add(u_val, ai);
+                quad = s_val.mul_add(t_val, quad);
+            }
             aii[obs] = ai;
             percentiles_data.push(ai);
 
@@ -347,11 +357,6 @@ pub fn compute_alo_features(
 
             let wi = base.final_weights[obs].max(1e-12);
 
-            let quad = s_buf
-                .iter()
-                .zip(t_buf.iter())
-                .map(|(s, t)| s * t)
-                .sum::<f64>();
             let var_full = phi * (quad / wi);
 
             let denom_raw = 1.0 - ai;
