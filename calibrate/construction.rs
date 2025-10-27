@@ -2178,11 +2178,335 @@ mod tests {
     use super::*;
     use crate::calibrate::basis::create_difference_penalty_matrix;
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
+    use crate::calibrate::estimate::train_model;
+    use crate::calibrate::model::{
+        internal_construct_design_matrix, internal_flatten_coefficients, BasisConfig,
+        InteractionPenaltyKind, LinkFunction, ModelConfig, PrincipalComponentConfig,
+    };
     use approx::assert_abs_diff_eq;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{array, Array1, Array2};
+    use ndarray::s;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::HashMap;
+
+    /// Maximum absolute difference helper for matrix comparisons.
+    fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max)
+    }
+
+    /// Assemble the pseudoinverse from an eigen-decomposition.
+    fn pseudoinverse_from_eigh(
+        eigenvalues: &Array1<f64>,
+        eigenvectors: &Array2<f64>,
+        tolerance: f64,
+    ) -> Array2<f64> {
+        let p = eigenvectors.nrows();
+        let mut inv_diag = Array2::zeros((p, p));
+        for (idx, &ev) in eigenvalues.iter().enumerate() {
+            if ev > tolerance {
+                inv_diag[[idx, idx]] = 1.0 / ev;
+            }
+        }
+        let vt = eigenvectors.t();
+        eigenvectors.dot(&inv_diag.dot(&vt))
+    }
+
+    /// Helper asserting that the reparameterization preserves critical invariants.
+    fn assert_reparam_invariants(
+        result: &ReparamResult,
+        rs_list: &[Array2<f64>],
+        lambdas: &[f64],
+    ) {
+        // --- Orthonormality ---
+        let qs = &result.qs;
+        let qtq = qs.t().dot(qs);
+        let identity = Array2::eye(qs.ncols());
+        let orth_diff = max_abs_diff(&qtq, &identity);
+        assert!(
+            orth_diff < 1e-10,
+            "// VIOLATION: Qs must be orthonormal; max |QtQ - I| = {:.3e}",
+            orth_diff
+        );
+
+        // --- Penalty reconstruction ---
+        let mut expected_s = Array2::zeros((qs.ncols(), qs.ncols()));
+        for (lambda_k, rs_k) in lambdas.iter().copied().zip(rs_list.iter()) {
+            let rs_qs = rs_k.dot(qs);
+            let transformed = rs_qs.t().dot(&rs_qs);
+            expected_s.scaled_add(lambda_k, &transformed);
+        }
+        let s_diff = max_abs_diff(&expected_s, &result.s_transformed);
+        assert!(
+            s_diff < 1e-8,
+            "// VIOLATION: Transformed penalty mismatch; max |Sλ - Σ λ_k QᵀS_kQ| = {:.3e}",
+            s_diff
+        );
+
+        // --- Eigenvalue-based log-determinant ---
+        let (eigenvalues, eigenvectors) =
+            result
+                .s_transformed
+                .clone()
+                .eigh(Side::Upper)
+                .expect("eigh for invariants");
+        let tol = eigenvalues
+            .iter()
+            .fold(0.0f64, |acc, &v| acc.max(v))
+            .max(1e-12)
+            * 1e-12;
+        let log_det_from_eigs: f64 = eigenvalues
+            .iter()
+            .filter(|&&ev| ev > tol)
+            .map(|&ev| ev.ln())
+            .sum();
+        assert!(
+            (result.log_det - log_det_from_eigs).abs() < 1e-8,
+            "// VIOLATION: log|Sλ| mismatch; expected {:.6e}, got {:.6e}",
+            log_det_from_eigs,
+            result.log_det
+        );
+
+        // --- det1 trace condition ---
+        assert_eq!(
+            result.det1.len(),
+            lambdas.len(),
+            "// VIOLATION: det1 length must match lambda count"
+        );
+        let s_lambda_plus = pseudoinverse_from_eigh(&eigenvalues, &eigenvectors, tol);
+        for (idx, (lambda_k, rs_k)) in lambdas.iter().zip(rs_list.iter()).enumerate() {
+            let rs_qs = rs_k.dot(qs);
+            let s_k_transformed = rs_qs.t().dot(&rs_qs);
+            let trace_term: f64 = s_lambda_plus
+                .dot(&s_k_transformed)
+                .diag()
+                .iter()
+                .sum();
+            let expected_det1 = lambda_k * trace_term;
+            assert!(
+                (result.det1[idx] - expected_det1).abs() < 1e-8,
+                "// VIOLATION: det1 trace invariant failed for penalty {idx}; expected {:.6e}, got {:.6e}",
+                expected_det1,
+                result.det1[idx]
+            );
+        }
+    }
+
+    /// Construct canonical penalty square roots and smoothing parameters for stress scenarios.
+    fn create_synthetic_penalty_scenario(
+        scenario_name: &str,
+    ) -> (Vec<Array2<f64>>, Vec<f64>, ModelLayout) {
+        match scenario_name {
+            "balanced" => {
+                let p = 10;
+                let mut rng = StdRng::seed_from_u64(0xA5A5);
+                let mut make_root = |scale: f64| {
+                    let mut root = Array2::zeros((4, p));
+                    for i in 0..root.nrows() {
+                        for j in 0..root.ncols() {
+                            root[[i, j]] = scale * rng.gen_range(-1.0..1.0);
+                        }
+                    }
+                    root
+                };
+                let rs1 = make_root(0.8);
+                let rs2 = make_root(0.9);
+                let rs3 = make_root(1.1);
+                let lambdas = vec![1.0, 1.0, 1.0];
+                let layout = ModelLayout::external(p, lambdas.len());
+                (vec![rs1, rs2, rs3], lambdas, layout)
+            }
+            "imbalanced" => {
+                let p = 12;
+                let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+                let mut make_root = |rank: usize| {
+                    let mut root = Array2::zeros((rank, p));
+                    for i in 0..rank {
+                        for j in 0..p {
+                            root[[i, j]] = rng.gen_range(-0.5..0.5);
+                        }
+                    }
+                    root
+                };
+                let rs1 = make_root(5);
+                let rs2 = make_root(3);
+                let rs3 = make_root(2);
+                let lambdas = vec![1000.0, 1.0, 1.0];
+                let layout = ModelLayout::external(p, lambdas.len());
+                (vec![rs1, rs2, rs3], lambdas, layout)
+            }
+            "near_zero" => {
+                let p = 6;
+                let rs1 = Array2::zeros((0, p));
+                let rs2 = Array2::zeros((0, p));
+                let lambdas = vec![1e-8, 2e-8];
+                let layout = ModelLayout::external(p, lambdas.len());
+                (vec![rs1, rs2], lambdas, layout)
+            }
+            "high_rank" => {
+                let p = 64;
+                let mut rng = StdRng::seed_from_u64(0xBADDCAFE);
+                let mut make_root = |rank: usize| {
+                    let mut root = Array2::zeros((rank, p));
+                    for i in 0..rank {
+                        for j in 0..p {
+                            root[[i, j]] = rng.gen_range(-1.0..1.0);
+                        }
+                    }
+                    root
+                };
+                let rs1 = make_root(52);
+                let rs2 = make_root(55);
+                let rs3 = make_root(50);
+                let lambdas = vec![2.0, 1.5, 0.75];
+                let layout = ModelLayout::external(p, lambdas.len());
+                (vec![rs1, rs2, rs3], lambdas, layout)
+            }
+            "degenerate" => {
+                let p = 8;
+                let eigenvalues: [f64; 8] = [4.0, 4.0, 1.0, 1.0, 0.25, 0.25, 0.0, 0.0];
+                let mut rs: Vec<Array2<f64>> = Vec::new();
+                for &scale in &eigenvalues {
+                    if scale > 0.0 {
+                        let mut row = Array2::zeros((1, p));
+                        let idx = rs.len();
+                        row[[0, idx]] = scale.sqrt();
+                        rs.push(row);
+                    }
+                }
+                let rs_stack = {
+                    let total_rows: usize = rs.iter().map(|m| m.nrows()).sum();
+                    let mut stack = Array2::zeros((total_rows, p));
+                    let mut offset = 0;
+                    for block in rs {
+                        let rows = block.nrows();
+                        stack
+                            .slice_mut(s![offset..offset + rows, ..])
+                            .assign(&block);
+                        offset += rows;
+                    }
+                    stack
+                };
+                let lambdas = vec![3.0, 0.5];
+                let layout = ModelLayout::external(p, lambdas.len());
+                (vec![rs_stack.clone(), rs_stack], lambdas, layout)
+            }
+            other => panic!("Unknown synthetic penalty scenario: {other}"),
+        }
+    }
+
+    /// Generate logistic training data with controllable seeds.
+    fn create_logistic_training_data(
+        n_samples: usize,
+        num_pcs: usize,
+        seed: u64,
+    ) -> TrainingData {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut p = Array1::zeros(n_samples);
+        for val in p.iter_mut() {
+            *val = rng.gen_range(-2.5..2.5);
+        }
+
+        let mut pcs = Array2::zeros((n_samples, num_pcs));
+        for i in 0..n_samples {
+            for j in 0..num_pcs {
+                pcs[[i, j]] = rng.gen_range(-2.0..2.0);
+            }
+        }
+
+        let mut eta = Array1::zeros(n_samples);
+        for i in 0..n_samples {
+            let mut val = 0.6 * p[i] + rng.gen_range(-0.3..0.3);
+            for j in 0..num_pcs {
+                let weight = 0.2 + 0.1 * (j as f64);
+                val += weight * pcs[[i, j]];
+            }
+            eta[i] = val;
+        }
+
+        let mut y = Array1::zeros(n_samples);
+        for i in 0..n_samples {
+            let prob = 1.0 / (1.0 + (-eta[i]).exp());
+            y[i] = if rng.gen_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+        }
+
+        let sex = Array1::from_iter((0..n_samples).map(|_| if rng.gen_range(0.0..1.0) < 0.5 { 1.0 } else { 0.0 }));
+        let weights = Array1::ones(n_samples);
+
+        TrainingData { y, p, sex, pcs, weights }
+    }
+
+    fn range_from_column(col: &Array1<f64>) -> (f64, f64) {
+        (
+            col.iter().fold(f64::INFINITY, |acc, &v| acc.min(v)),
+            col.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v)),
+        )
+    }
+
+    fn logistic_model_config(
+        include_pc_mains: bool,
+        include_interactions: bool,
+        data: &TrainingData,
+    ) -> ModelConfig {
+        let (pgs_knots, pc_knots) = if include_interactions {
+            (1, 1)
+        } else if include_pc_mains {
+            (1, 0)
+        } else {
+            (1, 0)
+        };
+
+        let pgs_basis_config = BasisConfig {
+            num_knots: pgs_knots,
+            degree: 3,
+        };
+        let pc_basis_template = BasisConfig {
+            num_knots: pc_knots.max(1),
+            degree: 3,
+        };
+
+        let pc_configs: Vec<PrincipalComponentConfig> = if include_pc_mains {
+            (0..data.pcs.ncols())
+                .map(|idx| {
+                    let col = data.pcs.column(idx).to_owned();
+                    PrincipalComponentConfig {
+                        name: format!("PC{}", idx + 1),
+                        basis_config: pc_basis_template.clone(),
+                        range: range_from_column(&col),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        ModelConfig {
+            link_function: LinkFunction::Logit,
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 15,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 0,
+            firth_bias_reduction: false,
+            pgs_basis_config,
+            pc_configs,
+            pgs_range: range_from_column(&data.p),
+            interaction_penalty: if include_pc_mains && include_interactions {
+                InteractionPenaltyKind::Anisotropic
+            } else {
+                InteractionPenaltyKind::Isotropic
+            },
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
+        }
+    }
 
     /// Helper function to create test data for construction tests
     fn create_test_data_for_construction(
@@ -2887,5 +3211,162 @@ mod tests {
             fnorm
         );
         assert_eq!(s_list.len(), penalty_structs.len());
+    }
+
+    #[test]
+    fn test_reparam_invariants_balanced_penalties() {
+        let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("balanced");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("balanced reparam");
+        assert_reparam_invariants(&reparam, &rs_list, &lambdas);
+    }
+
+    #[test]
+    fn test_reparam_invariants_imbalanced_penalties() {
+        let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("imbalanced");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("imbalanced");
+        assert_reparam_invariants(&reparam, &rs_list, &lambdas);
+    }
+
+    #[test]
+    fn test_reparam_invariants_near_zero_penalties() {
+        let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("near_zero");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("near_zero");
+        assert_reparam_invariants(&reparam, &rs_list, &lambdas);
+    }
+
+    #[test]
+    fn test_reparam_invariants_high_rank_penalties() {
+        let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("high_rank");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("high_rank");
+        assert_reparam_invariants(&reparam, &rs_list, &lambdas);
+    }
+
+    #[test]
+    fn test_reparam_invariants_degenerate_penalties() {
+        let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("degenerate");
+        let reparam =
+            stable_reparameterization(&rs_list, &lambdas, &layout).expect("degenerate");
+        assert_reparam_invariants(&reparam, &rs_list, &lambdas);
+    }
+
+    fn integration_assertions(
+        data_train: &TrainingData,
+        data_test: &TrainingData,
+        config: &ModelConfig,
+    ) {
+        let trained = train_model(data_train, config).expect("training succeeds");
+        let (
+            _,
+            s_list,
+            layout,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = build_design_and_penalty_matrices(data_train, config).expect("build matrices");
+        let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
+        let reparam = stable_reparameterization(&rs_list, &trained.lambdas, &layout)
+            .expect("reparam");
+        assert_reparam_invariants(&reparam, &rs_list, &trained.lambdas);
+
+        // --- Null space dimension check ---
+        let mut s_lambda_original = Array2::zeros((layout.total_coeffs, layout.total_coeffs));
+        for (lambda, s_k) in trained.lambdas.iter().zip(s_list.iter()) {
+            s_lambda_original.scaled_add(*lambda, s_k);
+        }
+        let (eigs_original, _) =
+            s_lambda_original.clone().eigh(Side::Upper).expect("eigh original");
+        let (eigs_transformed, _) = reparam
+            .s_transformed
+            .clone()
+            .eigh(Side::Upper)
+            .expect("eigh transformed");
+        let eig_tol = 1e-8;
+        let null_orig = eigs_original.iter().filter(|&&v| v < eig_tol).count();
+        let null_trans = eigs_transformed.iter().filter(|&&v| v < eig_tol).count();
+        assert_eq!(
+            null_orig, null_trans,
+            "// VIOLATION: Null space dimension changed after reparameterization"
+        );
+
+        let log_det_direct: f64 = eigs_original
+            .iter()
+            .filter(|&&v| v > eig_tol)
+            .map(|&v| v.ln())
+            .sum();
+        assert!(
+            reparam.log_det.is_finite(),
+            "// VIOLATION: log|Sλ| must be finite"
+        );
+        assert!(
+            (reparam.log_det - log_det_direct).abs() < 1e-8,
+            "// VIOLATION: log|Sλ| differs from eigenvalue computation"
+        );
+
+        // --- Prediction equivalence ---
+        let coeffs = &trained.coefficients;
+        let beta_original = internal_flatten_coefficients(coeffs, &trained.config)
+            .expect("flatten coefficients");
+        let pcs_test = if trained.config.pc_configs.is_empty() {
+            Array2::zeros((data_test.p.len(), 0))
+        } else {
+            data_test
+                .pcs
+                .slice(s![.., 0..trained.config.pc_configs.len()])
+                .to_owned()
+        };
+        let x_test = internal_construct_design_matrix(
+            data_test.p.view(),
+            data_test.sex.view(),
+            pcs_test.view(),
+            &trained.config,
+            coeffs,
+        )
+        .expect("construct design");
+        let eta_original = x_test.dot(&beta_original);
+        let qs = &reparam.qs;
+        let beta_transformed = qs.t().dot(&beta_original);
+        let x_transformed = x_test.dot(qs);
+        let eta_transformed = x_transformed.dot(&beta_transformed);
+        let max_pred_diff = eta_original
+            .iter()
+            .zip(eta_transformed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_pred_diff < 1e-6,
+            "// VIOLATION: Predictions changed after reparameterization; max |Δη| = {:.3e}",
+            max_pred_diff
+        );
+    }
+
+    #[test]
+    fn test_reparam_integration_pgs_only() {
+        let train = create_logistic_training_data(100, 3, 11);
+        let test = create_logistic_training_data(40, 3, 21);
+        let config = logistic_model_config(false, false, &train);
+        integration_assertions(&train, &test, &config);
+    }
+
+    #[test]
+    fn test_reparam_integration_pgs_and_pc_mains() {
+        let train = create_logistic_training_data(100, 3, 31);
+        let test = create_logistic_training_data(40, 3, 41);
+        let config = logistic_model_config(true, false, &train);
+        integration_assertions(&train, &test, &config);
+    }
+
+    #[test]
+    fn test_reparam_integration_full_model_with_interactions() {
+        let train = create_logistic_training_data(100, 3, 51);
+        let test = create_logistic_training_data(40, 3, 61);
+        let config = logistic_model_config(true, true, &train);
+        integration_assertions(&train, &test, &config);
     }
 }
