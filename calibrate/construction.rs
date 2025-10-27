@@ -1,14 +1,183 @@
-use crate::calibrate::basis::{self, create_bspline_basis, create_difference_penalty_matrix};
+use crate::calibrate::basis::{self, create_bspline_basis};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::Side;
+use ndarray::Zip;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+#[derive(Clone)]
+pub enum PenaltyRepresentation {
+    Dense(Array2<f64>),
+    Banded {
+        bands: Vec<Array1<f64>>,
+        offsets: Vec<i32>,
+    },
+    Kronecker {
+        left: Array2<f64>,
+        right: Array2<f64>,
+    },
+}
+
+impl PenaltyRepresentation {
+    fn frobenius_norm(&self) -> f64 {
+        match self {
+            PenaltyRepresentation::Dense(matrix) => {
+                matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
+            }
+            PenaltyRepresentation::Banded { bands, offsets } => {
+                let mut sum = 0.0;
+                for (band, &offset) in bands.iter().zip(offsets.iter()) {
+                    if offset < 0 {
+                        continue;
+                    }
+                    let weight = if offset == 0 { 1.0 } else { 2.0 };
+                    sum += weight * band.iter().map(|&x| x * x).sum::<f64>();
+                }
+                sum.sqrt()
+            }
+            PenaltyRepresentation::Kronecker { left, right } => {
+                let left_norm = left.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                let right_norm = right.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                left_norm * right_norm
+            }
+        }
+    }
+
+    fn block_dimension(&self) -> usize {
+        match self {
+            PenaltyRepresentation::Dense(matrix) => matrix.nrows(),
+            PenaltyRepresentation::Banded { bands, offsets } => {
+                let mut dim = 0usize;
+                for (band, &offset) in bands.iter().zip(offsets.iter()) {
+                    let len = band.len();
+                    let extent = if offset >= 0 {
+                        len + offset as usize
+                    } else {
+                        len + (-offset) as usize
+                    };
+                    dim = dim.max(extent);
+                }
+                dim
+            }
+            PenaltyRepresentation::Kronecker { left, right } => left.nrows() * right.nrows(),
+        }
+    }
+
+    fn to_block_dense(&self) -> Array2<f64> {
+        match self {
+            PenaltyRepresentation::Dense(matrix) => matrix.clone(),
+            PenaltyRepresentation::Banded { bands, offsets } => {
+                let dim = self.block_dimension();
+                let mut dense = Array2::zeros((dim, dim));
+                for (band, &offset) in bands.iter().zip(offsets.iter()) {
+                    if offset >= 0 {
+                        let off = offset as usize;
+                        for (idx, &value) in band.iter().enumerate() {
+                            dense[[idx, idx + off]] = value;
+                        }
+                    } else {
+                        let off = (-offset) as usize;
+                        for (idx, &value) in band.iter().enumerate() {
+                            dense[[idx + off, idx]] = value;
+                        }
+                    }
+                }
+                dense
+            }
+            PenaltyRepresentation::Kronecker { left, right } => {
+                let (l_rows, l_cols) = left.dim();
+                let (r_rows, r_cols) = right.dim();
+                let mut result = Array2::zeros((l_rows * r_rows, l_cols * r_cols));
+                for i in 0..l_rows {
+                    for j in 0..l_cols {
+                        let scale = left[(i, j)];
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        let mut block = result.slice_mut(s![
+                            i * r_rows..(i + 1) * r_rows,
+                            j * r_cols..(j + 1) * r_cols
+                        ]);
+                        block.assign(&(right * scale));
+                    }
+                }
+                result
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PenaltyMatrix {
+    pub col_range: Range<usize>,
+    pub representation: PenaltyRepresentation,
+}
+
+impl PenaltyMatrix {
+    fn accumulate_into(&self, mut dest: ArrayViewMut2<'_, f64>, weight: f64) {
+        if weight == 0.0 {
+            return;
+        }
+        match &self.representation {
+            PenaltyRepresentation::Dense(block) => {
+                dest.scaled_add(weight, block);
+            }
+            PenaltyRepresentation::Banded { bands, offsets } => {
+                for (band, &offset) in bands.iter().zip(offsets.iter()) {
+                    if offset >= 0 {
+                        let off = offset as usize;
+                        for (idx, &value) in band.iter().enumerate() {
+                            let entry = dest.get_mut((idx, idx + off)).expect("banded index");
+                            *entry += weight * value;
+                        }
+                    } else {
+                        let off = (-offset) as usize;
+                        for (idx, &value) in band.iter().enumerate() {
+                            let entry = dest.get_mut((idx + off, idx)).expect("banded index");
+                            *entry += weight * value;
+                        }
+                    }
+                }
+            }
+            PenaltyRepresentation::Kronecker { left, right } => {
+                let (l_rows, l_cols) = left.dim();
+                let (r_rows, r_cols) = right.dim();
+                for i in 0..l_rows {
+                    for j in 0..l_cols {
+                        let scale = left[(i, j)] * weight;
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        let mut block = dest.slice_mut(s![
+                            i * r_rows..(i + 1) * r_rows,
+                            j * r_cols..(j + 1) * r_cols
+                        ]);
+                        block.scaled_add(scale, right);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn to_dense(&self, total_dim: usize) -> Array2<f64> {
+        let mut dense = Array2::<f64>::zeros((total_dim, total_dim));
+        self.accumulate_into(
+            dense.slice_mut(s![self.col_range.clone(), self.col_range.clone()]),
+            1.0,
+        );
+        dense
+    }
+
+    pub fn block_dense(&self) -> Array2<f64> {
+        self.representation.to_block_dense()
+    }
+}
 
 fn max_abs_element(matrix: &Array2<f64>) -> f64 {
     matrix
@@ -205,43 +374,6 @@ fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
     matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
 }
 
-fn write_scaled_kronecker(
-    mut dest: ArrayViewMut2<'_, f64>,
-    a: &Array2<f64>,
-    b: &Array2<f64>,
-    scale: f64,
-) {
-    let (a_rows, a_cols) = a.dim();
-    let (b_rows, b_cols) = b.dim();
-    if a_rows == 0 || a_cols == 0 || b_rows == 0 || b_cols == 0 {
-        dest.fill(0.0);
-        return;
-    }
-
-    assert_eq!(dest.dim(), (a_rows * b_rows, a_cols * b_cols));
-    dest.fill(0.0);
-
-    dest.axis_chunks_iter_mut(Axis(0), b_rows)
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut row_block)| {
-            let a_row = a.row(i);
-            row_block
-                .axis_chunks_iter_mut(Axis(1), b_cols)
-                .into_iter()
-                .enumerate()
-                .for_each(|(j, mut block)| {
-                    let scaled = a_row[j] * scale;
-                    if scaled == 0.0 {
-                        return;
-                    }
-                    for (dest, &src) in block.iter_mut().zip(b.iter()) {
-                        *dest = scaled * src;
-                    }
-                });
-        });
-}
-
 /// Computes the row-wise tensor product (Khatri-Rao product) of two matrices.
 /// This creates the design matrix columns for tensor product interactions.
 /// Each row of the result is the outer product of the corresponding rows from A and B.
@@ -279,8 +411,109 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     result
 }
 
+fn binomial(n: usize, k: usize) -> usize {
+    if k == 0 || k == n {
+        return 1;
+    }
+    let k = k.min(n - k);
+    let mut numerator = 1usize;
+    let mut denominator = 1usize;
+    for i in 0..k {
+        numerator *= n - i;
+        denominator *= i + 1;
+    }
+    numerator / denominator
+}
+
+fn build_banded_difference_penalty(
+    num_basis_functions: usize,
+    order: usize,
+) -> Result<PenaltyRepresentation, EstimationError> {
+    if order == 0 || order >= num_basis_functions {
+        return Err(EstimationError::InvalidInput(format!(
+            "Invalid difference penalty order {} for {} basis functions",
+            order, num_basis_functions
+        )));
+    }
+
+    let coeffs: Array1<f64> = Array1::from_iter((0..=order).map(|j| {
+        let sign = if (order - j) % 2 == 0 { 1.0 } else { -1.0 };
+        sign * binomial(order, j) as f64
+    }));
+    let num_rows = num_basis_functions - order;
+    let band_contribs: Vec<Array1<f64>> = (0..=order)
+        .map(|shift| {
+            let len = order + 1 - shift;
+            let mut contrib = Array1::<f64>::zeros(len);
+            let left = coeffs.slice(s![..len]);
+            let right = coeffs.slice(s![shift..shift + len]);
+            Zip::from(&mut contrib)
+                .and(&left)
+                .and(&right)
+                .for_each(|c, &l, &r| {
+                    *c = l * r;
+                });
+            contrib
+        })
+        .collect();
+
+    let mut positive_bands: Vec<Array1<f64>> = (0..=order)
+        .map(|shift| Array1::<f64>::zeros(num_basis_functions - shift))
+        .collect();
+
+    for row in 0..num_rows {
+        for shift in 0..=order {
+            let contrib = &band_contribs[shift];
+            let len = contrib.len();
+            let mut slice = positive_bands[shift].slice_mut(s![row..row + len]);
+            Zip::from(&mut slice).and(contrib).for_each(|dest, &val| {
+                *dest += val;
+            });
+        }
+    }
+
+    let mut bands = Vec::with_capacity(order * 2 + 1);
+    let mut offsets = Vec::with_capacity(order * 2 + 1);
+
+    for shift in (1..=order).rev() {
+        offsets.push(-(shift as i32));
+        bands.push(positive_bands[shift].clone());
+    }
+    offsets.push(0);
+    bands.push(positive_bands[0].clone());
+    for shift in 1..=order {
+        offsets.push(shift as i32);
+        bands.push(positive_bands[shift].clone());
+    }
+
+    Ok(PenaltyRepresentation::Banded { bands, offsets })
+}
+
+struct DifferencePenalty {
+    representation: PenaltyRepresentation,
+    dense: OnceLock<Array2<f64>>,
+}
+
+impl DifferencePenalty {
+    fn new(representation: PenaltyRepresentation) -> Self {
+        Self {
+            representation,
+            dense: OnceLock::new(),
+        }
+    }
+
+    fn as_dense(&self) -> &Array2<f64> {
+        self.dense
+            .get_or_init(|| self.representation.to_block_dense())
+    }
+
+    fn frobenius_norm(&self) -> f64 {
+        self.representation.frobenius_norm()
+    }
+}
+
 struct DifferencePenaltyCache {
-    cache: HashMap<(usize, usize), Arc<Array2<f64>>>,
+    cache: HashMap<(usize, usize), Arc<DifferencePenalty>>,
 }
 
 impl DifferencePenaltyCache {
@@ -290,10 +523,17 @@ impl DifferencePenaltyCache {
         }
     }
 
-    fn get(&mut self, ncols: usize, order: usize) -> Result<Arc<Array2<f64>>, EstimationError> {
+    fn get(
+        &mut self,
+        ncols: usize,
+        order: usize,
+    ) -> Result<Arc<DifferencePenalty>, EstimationError> {
         if !self.cache.contains_key(&(ncols, order)) {
-            let penalty = create_difference_penalty_matrix(ncols, order)?;
-            self.cache.insert((ncols, order), Arc::new(penalty));
+            let representation = build_banded_difference_penalty(ncols, order)?;
+            self.cache.insert(
+                (ncols, order),
+                Arc::new(DifferencePenalty::new(representation)),
+            );
         }
         Ok(self
             .cache
@@ -608,7 +848,7 @@ pub fn build_design_and_penalty_matrices(
 ) -> Result<
     (
         Array2<f64>,                  // design matrix
-        Vec<Array2<f64>>,             // penalty matrices
+        Vec<Array2<f64>>,             // penalty matrices (dense)
         ModelLayout,                  // model layout
         HashMap<String, Array2<f64>>, // sum_to_zero_constraints
         HashMap<String, Array1<f64>>, // knot_vectors
@@ -616,6 +856,7 @@ pub fn build_design_and_penalty_matrices(
         HashMap<String, Array2<f64>>, // pc_null_transforms
         HashMap<String, Array1<f64>>, // interaction_centering_means
         HashMap<String, Array2<f64>>, // interaction_orth_alpha (per interaction block)
+        Vec<PenaltyMatrix>,           // structured penalty representations
     ),
     EstimationError,
 > {
@@ -721,7 +962,7 @@ pub fn build_design_and_penalty_matrices(
 
     // Create whitened range transform for PGS (used if switching to whitened interactions)
     let s_pgs_main = diff_penalty_cache.get(pgs_main_basis_unc.ncols(), config.penalty_order)?;
-    let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(s_pgs_main.as_ref())?;
+    let (z_null_pgs, z_range_pgs) = basis::null_range_whiten(s_pgs_main.as_dense())?;
     let pgs_null_projector = z_null_pgs.dot(&z_null_pgs.t());
 
     let pgs_isotropic_interaction_basis = if matches!(
@@ -769,7 +1010,7 @@ pub fn build_design_and_penalty_matrices(
 
         // Create whitened range transform for PC main effects
         let s_pc_main = diff_penalty_cache.get(pc_main_basis_unc.ncols(), config.penalty_order)?;
-        let (z_null_pc, z_range_pc) = basis::null_range_whiten(s_pc_main.as_ref())?;
+        let (z_null_pc, z_range_pc) = basis::null_range_whiten(s_pc_main.as_dense())?;
 
         // PC main effect uses ONLY the range (penalized) part
         let pc_range_basis = pc_main_basis_unc.dot(&z_range_pc);
@@ -851,17 +1092,12 @@ pub fn build_design_and_penalty_matrices(
     // Stage: Create individual penalty matrices—one per PC main and (for anisotropic) three per interaction
     // Each penalty gets its own lambda parameter for optimal smoothing control
     let p = layout.total_coeffs;
-    let mut s_list = Vec::with_capacity(layout.num_penalties);
-
-    // Initialize all penalty matrices as zeros
-    for _ in 0..layout.num_penalties {
-        s_list.push(Array2::zeros((p, p)));
-    }
+    let mut s_list: Vec<Option<PenaltyMatrix>> = vec![None; layout.num_penalties];
 
     // Precompute the wiggle penalty component for the sex×PGS interaction
     let s_sex_pgs_wiggle = pgs_z_transform
         .t()
-        .dot(&s_pgs_main.as_ref().dot(&pgs_z_transform));
+        .dot(&(s_pgs_main.as_dense().dot(&pgs_z_transform)));
 
     // Fill in identity penalties for each penalized block individually
     for block in &layout.penalty_map {
@@ -874,9 +1110,14 @@ pub fn build_design_and_penalty_matrices(
         let penalty_idx = block.penalty_indices[0];
         let m = col_range.len() as f64;
         let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
-        for j in col_range.clone() {
-            s_list[penalty_idx][[j, j]] = alpha;
-        }
+        let band = Array1::from_elem(col_range.len(), alpha);
+        s_list[penalty_idx] = Some(PenaltyMatrix {
+            col_range: col_range.clone(),
+            representation: PenaltyRepresentation::Banded {
+                bands: vec![band],
+                offsets: vec![0],
+            },
+        });
     }
 
     if let Some(block_idx) = layout.sex_pgs_block_idx {
@@ -884,10 +1125,11 @@ pub fn build_design_and_penalty_matrices(
         let col_range = block.col_range.clone();
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
         let penalty_idx_wiggle = block.penalty_indices[0];
-
-        s_list[penalty_idx_wiggle]
-            .slice_mut(s![col_range.clone(), col_range.clone()])
-            .assign(&(&s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle)));
+        let normalized = &s_sex_pgs_wiggle / frob(&s_sex_pgs_wiggle);
+        s_list[penalty_idx_wiggle] = Some(PenaltyMatrix {
+            col_range: col_range.clone(),
+            representation: PenaltyRepresentation::Dense(normalized),
+        });
     }
 
     let s_pgs_interaction = if matches!(
@@ -922,9 +1164,14 @@ pub fn build_design_and_penalty_matrices(
                 let penalty_idx = block.penalty_indices[0];
                 let m = col_range.len() as f64;
                 let alpha = if m > 0.0 { 1.0 / m.sqrt() } else { 1.0 };
-                for j in col_range.clone() {
-                    s_list[penalty_idx][[j, j]] = alpha;
-                }
+                let band = Array1::from_elem(col_range.len(), alpha);
+                s_list[penalty_idx] = Some(PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Banded {
+                        bands: vec![band],
+                        offsets: vec![0],
+                    },
+                });
             }
             InteractionPenaltyKind::Anisotropic => {
                 if block.penalty_indices.len() != 3 {
@@ -948,14 +1195,13 @@ pub fn build_design_and_penalty_matrices(
                     )));
                 }
 
-                let s_pgs = s_pgs_interaction
+                let s_pgs_penalty = s_pgs_interaction
                     .as_ref()
-                    .expect("PGS penalty matrix missing in anisotropic mode")
-                    .as_ref();
+                    .expect("PGS penalty matrix missing in anisotropic mode");
                 let i_pgs = i_pgs_interaction
                     .as_ref()
                     .expect("PGS identity matrix missing in anisotropic mode");
-                let s_pc = diff_penalty_cache.get(pc_cols, config.penalty_order)?;
+                let s_pc_penalty = diff_penalty_cache.get(pc_cols, config.penalty_order)?;
                 let i_pc = Array2::<f64>::eye(pc_cols);
 
                 let pc_null_projector = pc_null_projectors[pc_idx]
@@ -967,8 +1213,8 @@ pub fn build_design_and_penalty_matrices(
                         ))
                     })?;
 
-                let nf1 = (frobenius_norm(s_pgs) * (pc_cols as f64).sqrt()).max(1e-12);
-                let nf2 = (frobenius_norm(s_pc.as_ref()) * (pgs_cols as f64).sqrt()).max(1e-12);
+                let nf1 = (s_pgs_penalty.frobenius_norm() * (pc_cols as f64).sqrt()).max(1e-12);
+                let nf2 = (s_pc_penalty.frobenius_norm() * (pgs_cols as f64).sqrt()).max(1e-12);
                 let nf3_raw =
                     frobenius_norm(&pgs_null_projector) * frobenius_norm(pc_null_projector);
                 if nf3_raw <= 1e-12 {
@@ -983,24 +1229,32 @@ pub fn build_design_and_penalty_matrices(
                 let penalty_idx_pc = block.penalty_indices[1];
                 let penalty_idx_null = block.penalty_indices[2];
 
-                write_scaled_kronecker(
-                    s_list[penalty_idx_pgs].slice_mut(s![col_range.clone(), col_range.clone()]),
-                    s_pgs,
-                    &i_pc,
-                    1.0 / nf1,
-                );
-                write_scaled_kronecker(
-                    s_list[penalty_idx_pc].slice_mut(s![col_range.clone(), col_range.clone()]),
-                    i_pgs,
-                    s_pc.as_ref(),
-                    1.0 / nf2,
-                );
-                write_scaled_kronecker(
-                    s_list[penalty_idx_null].slice_mut(s![col_range.clone(), col_range.clone()]),
-                    &pgs_null_projector,
-                    pc_null_projector,
-                    1.0 / nf3,
-                );
+                let s_pgs_left = s_pgs_penalty.as_dense().clone();
+                let s_pc_right = s_pc_penalty.as_dense().clone();
+                let kron_pgs = PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Kronecker {
+                        left: s_pgs_left * (1.0 / nf1),
+                        right: i_pc.clone(),
+                    },
+                };
+                let kron_pc = PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Kronecker {
+                        left: i_pgs.clone(),
+                        right: s_pc_right * (1.0 / nf2),
+                    },
+                };
+                let kron_null = PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Kronecker {
+                        left: pgs_null_projector.clone() * (1.0 / nf3),
+                        right: pc_null_projector.clone(),
+                    },
+                };
+                s_list[penalty_idx_pgs] = Some(kron_pgs);
+                s_list[penalty_idx_pc] = Some(kron_pc);
+                s_list[penalty_idx_null] = Some(kron_null);
             }
         }
     }
@@ -1366,9 +1620,24 @@ pub fn build_design_and_penalty_matrices(
         }
     }
 
+    let penalty_structs: Vec<PenaltyMatrix> = s_list
+        .into_iter()
+        .enumerate()
+        .map(|(idx, opt)| {
+            opt.ok_or_else(|| {
+                EstimationError::LayoutError(format!("Penalty matrix {idx} was not constructed"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let dense_penalties: Vec<Array2<f64>> = penalty_structs
+        .iter()
+        .map(|penalty| penalty.to_dense(p))
+        .collect();
+
     Ok((
         x_matrix,
-        s_list,
+        dense_penalties,
         layout,
         sum_to_zero_constraints,
         knot_vectors,
@@ -1376,6 +1645,7 @@ pub fn build_design_and_penalty_matrices(
         pc_null_transforms,
         interaction_centering_means,
         interaction_orth_alpha,
+        penalty_structs,
     ))
 }
 
@@ -1845,6 +2115,7 @@ pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::basis::create_difference_penalty_matrix;
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::model::{BasisConfig, LinkFunction, ModelConfig};
     use approx::assert_abs_diff_eq;
@@ -1985,11 +2256,12 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // With null-space penalization and the sex×PGS varying coefficient:
         // PC null + PC range + three anisotropic interaction penalties + one sex×PGS penalty
+        assert_eq!(s_list.len(), penalty_structs.len());
         assert_eq!(
             s_list.len(),
             6,
@@ -2220,7 +2492,7 @@ mod tests {
     fn test_construction_with_no_pcs() {
         let (data, config) = create_test_data_for_construction(100, 0); // 0 PCs
 
-        let (_, _, layout, _, _, _, _, _, _) =
+        let (_, _, layout, _, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).unwrap();
 
         let pgs_main_coeffs =
@@ -2255,7 +2527,9 @@ mod tests {
             pc_null_transforms,
             interaction_centering_means,
             interaction_orth_alpha,
+            penalty_structs,
         ) = build_design_and_penalty_matrices(&data, &config).unwrap();
+        drop(penalty_structs);
 
         // Prepare a config carrying all saved transforms
         config.sum_to_zero_constraints = sum_to_zero_constraints.clone();
@@ -2456,7 +2730,7 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Anisotropic);
 
-        let (x, s_list, layout, _, _, _, _, _, _) =
+        let (x, s_list, layout, _, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("anisotropic interaction construction should not panic");
 
@@ -2512,7 +2786,7 @@ mod tests {
         let data = make_toy_data(n);
         let config = cfg_with_interaction(InteractionPenaltyKind::Isotropic);
 
-        let (_, s_list, layout, _, _, _, _, _, _) =
+        let (_, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config)
                 .expect("isotropic interaction construction should not panic");
 
@@ -2551,5 +2825,6 @@ mod tests {
             "isotropic penalty sub-block not unit-normalized; got {:.6e}",
             fnorm
         );
+        assert_eq!(s_list.len(), penalty_structs.len());
     }
 }
