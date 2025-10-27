@@ -171,7 +171,7 @@ impl RidgePlanner {
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use ahash::AHasher;
-use hashbrown::{HashMap, hash_map::RawEntryMut};
+use hashbrown::{hash_map::RawEntryMut, HashMap as BrownHashMap};
 use std::cell::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -2066,7 +2066,7 @@ pub mod internal {
         }
     }
 
-    type RhoCache<T> = HashMap<Arc<[u64]>, Arc<T>, BuildHasherDefault<AHasher>>;
+    type RhoCache<T> = BrownHashMap<Arc<[u64]>, Arc<T>, BuildHasherDefault<AHasher>>;
 
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
@@ -2264,8 +2264,8 @@ pub mod internal {
                 layout,
                 config,
                 nullspace_dims,
-                cache: RefCell::new(HashMap::default()),
-                faer_factor_cache: RefCell::new(HashMap::default()),
+                cache: RefCell::new(RhoCache::default()),
+                faer_factor_cache: RefCell::new(RhoCache::default()),
                 eval_count: RefCell::new(0),
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
@@ -6577,12 +6577,12 @@ pub mod internal {
                 }],
                 pgs_range: (-6.0, 6.0),
                 interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
             // Test with extreme lambda values that might cause issues
@@ -6712,12 +6712,12 @@ pub mod internal {
                 }],
                 pgs_range: (-3.0, 3.0),
                 interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -8023,12 +8023,12 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pc_configs: vec![],
         pgs_range: (-1.0, 1.0),
         interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: HashMap::new(),
-        knot_vectors: HashMap::new(),
-        range_transforms: HashMap::new(),
-        pc_null_transforms: HashMap::new(),
-        interaction_centering_means: HashMap::new(),
-        interaction_orth_alpha: HashMap::new(),
+        sum_to_zero_constraints: std::collections::HashMap::new(),
+        knot_vectors: std::collections::HashMap::new(),
+        range_transforms: std::collections::HashMap::new(),
+        pc_null_transforms: std::collections::HashMap::new(),
+        interaction_centering_means: std::collections::HashMap::new(),
+        interaction_orth_alpha: std::collections::HashMap::new(),
     };
 
     // Stage: Train the model and expect an error
