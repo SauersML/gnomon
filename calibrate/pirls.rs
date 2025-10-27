@@ -1,11 +1,15 @@
 use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh};
+use crate::calibrate::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, array1_to_col_mat_mut, array2_to_mat_mut,
+    hash_array2,
+};
 use crate::calibrate::model::{LinkFunction, ModelConfig};
-use faer::Side;
+use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
+use faer::{Accum, Side, get_global_parallelism};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
@@ -30,6 +34,7 @@ pub struct PirlsWorkspace {
     pub xtwx_buf: Array2<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
+    pub(crate) chol_cache: Option<CholeskyCacheEntry>,
 }
 
 impl PirlsWorkspace {
@@ -50,8 +55,17 @@ impl PirlsWorkspace {
             delta_eta: Array1::zeros(n),
             xtwx_buf: Array2::zeros((p, p)),
             vec_buf_p: Array1::zeros(p),
+            chol_cache: None,
         }
     }
+}
+
+pub(crate) struct CholeskyCacheEntry {
+    hash: u64,
+    ridge: f64,
+    cond_estimate: Option<f64>,
+    factor: FaerLlt<f64>,
+    dim: usize,
 }
 
 const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
@@ -1582,15 +1596,42 @@ pub fn solve_penalized_least_squares(
         workspace.wz -= &offset;
         workspace.wz *= &workspace.sqrt_w; // wz = z .* sqrt_w
 
-        let xtwx = {
-            let r = &workspace.wx; // sqrt(W) X
-            r.t().dot(r)
-        };
-        let xtwz = workspace.wx.t().dot(&workspace.wz);
+        let p_dim = x_transformed.ncols();
+        if workspace.xtwx_buf.dim() != (p_dim, p_dim) {
+            workspace.xtwx_buf = Array2::zeros((p_dim, p_dim));
+        }
+        let wx_view = FaerArrayView::new(&workspace.wx);
+        let mut xtwx_view = array2_to_mat_mut(&mut workspace.xtwx_buf);
+        matmul(
+            xtwx_view.as_mut(),
+            Accum::Replace,
+            wx_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            get_global_parallelism(),
+        );
+
+        if workspace.vec_buf_p.len() != p_dim {
+            workspace.vec_buf_p = Array1::zeros(p_dim);
+        }
+        let wz_view = FaerColView::new(&workspace.wz);
+        let mut xtwz_view = array1_to_col_mat_mut(&mut workspace.vec_buf_p);
+        matmul(
+            xtwz_view.as_mut(),
+            Accum::Replace,
+            wx_view.as_ref().transpose(),
+            wz_view.as_ref(),
+            1.0,
+            get_global_parallelism(),
+        );
 
         // H = XtWX + S_lambda (symmetrize to avoid false SPD failures)
-        let mut penalized_hessian = xtwx + s_transformed;
-        let p_dim = x_transformed.ncols();
+        let mut penalized_hessian = workspace.xtwx_buf.clone();
+        for i in 0..p_dim {
+            for j in 0..p_dim {
+                penalized_hessian[(i, j)] += s_transformed[(i, j)];
+            }
+        }
         for i in 0..p_dim {
             for j in 0..i {
                 let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -1598,107 +1639,154 @@ pub fn solve_penalized_least_squares(
                 penalized_hessian[[j, i]] = v;
             }
         }
-        // Try strict SPD (LLᵀ). If it fails, fall back to robust QR path below.
-        let (chol_opt, ridge_used, cond_est) = attempt_spd_cholesky(&mut penalized_hessian);
-        match chol_opt {
-            Some(chol) => {
-                if ridge_used > 0.0 {
-                    let cond_display = cond_est
-                        .map(|c| format!("{c:.2e}"))
-                        .unwrap_or_else(|| "unavailable".to_string());
-                    log::warn!(
-                        "Added ridge {:.3e} before SPD solve (cond ≈ {})",
-                        ridge_used,
-                        cond_display
-                    );
-                }
+        let matrix_hash = hash_array2(&penalized_hessian);
+        let mut ridge_used;
+        let mut cond_est;
 
-                // Guard: estimate conditioning of H; if too ill-conditioned, fall back to QR path
-                let cond_bad = match calculate_condition_number(&penalized_hessian) {
-                    Ok(cond) => !cond.is_finite() || cond > 1e8,
-                    Err(_) => false,
-                };
-                if cond_bad {
-                    diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
-                } else {
-                    // Single multi-RHS solve: [ XtWz | Eᵀ ]
-                    let rk_rows = e_transformed.nrows();
-                    let nrhs = 1 + rk_rows;
-                    let mut rhs = Array2::<f64>::zeros((p_dim, nrhs));
-                    for i in 0..p_dim {
-                        rhs[(i, 0)] = xtwz[i];
-                    }
-                    for j in 0..rk_rows {
-                        for i in 0..p_dim {
-                            rhs[(i, 1 + j)] = e_transformed[(j, i)];
-                        }
-                    }
-                    let rhs_view = FaerArrayView::new(&rhs);
-                    let sol = chol.solve(rhs_view.as_ref());
+        let mut solve_spd = |penalized: &Array2<f64>,
+                             chol: &FaerLlt<f64>,
+                             ridge_used: f64,
+                             cond_est: Option<f64>|
+         -> Result<Option<(StablePLSResult, usize)>, EstimationError> {
+            if ridge_used > 0.0 {
+                let cond_display = cond_est
+                    .map(|c| format!("{c:.2e}"))
+                    .unwrap_or_else(|| "unavailable".to_string());
+                log::warn!(
+                    "Added ridge {:.3e} before SPD solve (cond ≈ {})",
+                    ridge_used,
+                    cond_display
+                );
+            }
 
-                    // β̂ from first column
-                    let mut beta_transformed = Array1::zeros(p_dim);
-                    for i in 0..p_dim {
-                        beta_transformed[i] = sol[(i, 0)];
-                    }
-                    if !beta_transformed.iter().all(|v| v.is_finite()) {
-                        return Err(EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        });
-                    }
+            let cond_bad = match calculate_condition_number(penalized) {
+                Ok(cond) => !cond.is_finite() || cond > 1e8,
+                Err(_) => false,
+            };
+            if cond_bad {
+                diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
+                return Ok(None);
+            }
 
-                    // EDF = p - ⟨H⁻¹Eᵀ, Eᵀ⟩_F using remaining columns (compensated summation)
-                    let mut frob = 0.0f64;
-                    let mut comp = 0.0f64;
-                    for j in 0..rk_rows {
-                        for i in 0..p_dim {
-                            let prod = sol[(i, 1 + j)] * e_transformed[(j, i)];
-                            let y_k = prod - comp;
-                            let t = frob + y_k;
-                            comp = (t - frob) - y_k;
-                            frob = t;
-                        }
-                    }
-                    let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
-                    let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
-                    if !edf.is_finite() {
-                        return Err(EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        });
-                    }
-
-                    // Scale parameter
-                    let scale = calculate_scale(
-                        &beta_transformed,
-                        x_transformed,
-                        y,
-                        weights,
-                        edf,
-                        link_function,
-                    );
-                    if !scale.is_finite() {
-                        return Err(EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        });
-                    }
-
-                    println!(
-                        "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
-                        edf, scale
-                    );
-
-                    return Ok((
-                        StablePLSResult {
-                            beta: beta_transformed,
-                            penalized_hessian,
-                            edf,
-                            scale,
-                        },
-                        p_dim,
-                    ));
+            let rk_rows = e_transformed.nrows();
+            let nrhs = 1 + rk_rows;
+            let mut rhs = Array2::<f64>::zeros((p_dim, nrhs));
+            for i in 0..p_dim {
+                rhs[(i, 0)] = workspace.vec_buf_p[i];
+            }
+            for j in 0..rk_rows {
+                for i in 0..p_dim {
+                    rhs[(i, 1 + j)] = e_transformed[(j, i)];
                 }
             }
-            None => diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed),
+            let rhs_view = FaerArrayView::new(&rhs);
+            let sol = chol.solve(rhs_view.as_ref());
+
+            let mut beta_transformed = Array1::zeros(p_dim);
+            for i in 0..p_dim {
+                beta_transformed[i] = sol[(i, 0)];
+            }
+            if !beta_transformed.iter().all(|v| v.is_finite()) {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+
+            let mut frob = 0.0f64;
+            let mut comp = 0.0f64;
+            for j in 0..rk_rows {
+                for i in 0..p_dim {
+                    let prod = sol[(i, 1 + j)] * e_transformed[(j, i)];
+                    let y_k = prod - comp;
+                    let t = frob + y_k;
+                    comp = (t - frob) - y_k;
+                    frob = t;
+                }
+            }
+            let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
+            let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
+            if !edf.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+
+            let scale = calculate_scale(
+                &beta_transformed,
+                x_transformed,
+                y,
+                weights,
+                edf,
+                link_function,
+            );
+            if !scale.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+
+            println!(
+                "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
+                edf, scale
+            );
+
+            Ok(Some((
+                StablePLSResult {
+                    beta: beta_transformed,
+                    penalized_hessian: penalized.clone(),
+                    edf,
+                    scale,
+                },
+                p_dim,
+            )))
+        };
+
+        let mut skip_new_factor = false;
+        if let Some(entry) = workspace.chol_cache.as_ref() {
+            if entry.hash == matrix_hash && entry.dim == p_dim {
+                ridge_used = entry.ridge;
+                cond_est = entry.cond_estimate;
+                if ridge_used > 0.0 {
+                    for i in 0..p_dim {
+                        penalized_hessian[[i, i]] += ridge_used;
+                    }
+                }
+
+                if let Some(result) =
+                    solve_spd(&penalized_hessian, &entry.factor, ridge_used, cond_est)?
+                {
+                    return Ok(result);
+                } else {
+                    skip_new_factor = true;
+                }
+            }
+        }
+
+        if !skip_new_factor {
+            let (chol_opt, ridge, cond) = attempt_spd_cholesky(&mut penalized_hessian);
+            ridge_used = ridge;
+            cond_est = cond;
+            match chol_opt {
+                Some(chol) => {
+                    workspace.chol_cache = Some(CholeskyCacheEntry {
+                        hash: matrix_hash,
+                        ridge: ridge_used,
+                        cond_estimate: cond_est,
+                        factor: chol,
+                        dim: p_dim,
+                    });
+                    let entry = workspace.chol_cache.as_ref().unwrap();
+                    if let Some(result) =
+                        solve_spd(&penalized_hessian, &entry.factor, ridge_used, cond_est)?
+                    {
+                        return Ok(result);
+                    }
+                }
+                None => {
+                    workspace.chol_cache = None;
+                    diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed);
+                }
+            }
         }
         // If LLᵀ fails, continue into the robust QR path below.
     }
