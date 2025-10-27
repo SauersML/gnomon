@@ -3499,15 +3499,12 @@ mod tests {
             .expect("eigh transformed");
         let eigs_transformed: Array1<f64> = eigs_transformed;
         let eig_tol = 1e-8;
-        let null_orig = eigs_original
-            .iter()
-            .cloned()
-            .filter(|v| *v < eig_tol)
-            .count();
+
+        let null_orig = eigs_original.iter().copied().filter(|&v| v < eig_tol).count();
         let null_trans = eigs_transformed
             .iter()
-            .cloned()
-            .filter(|v| *v < eig_tol)
+            .copied()
+            .filter(|&v| v < eig_tol)
             .count();
         assert_eq!(
             null_orig, null_trans,
@@ -3516,7 +3513,8 @@ mod tests {
 
         let log_det_direct: f64 = eigs_original
             .iter()
-            .cloned()
+
+            .copied()
             .filter(|&v| v > eig_tol)
             .map(|v| v.ln())
             .sum();

@@ -24,6 +24,9 @@
 // External Crate for Optimization
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
+#[allow(unused_imports)]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use self::internal::RemlState;
 
 // Crate-level imports
@@ -56,8 +59,7 @@ fn log_basis_cache_stats(context: &str) {
 }
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
-use rayon::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
@@ -621,28 +623,6 @@ fn run_bfgs_for_candidate(
     )?;
 
     Ok((solution, grad_norm_rho, is_stationary))
-}
-
-fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
-    let len = rho.len();
-    if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-        return (0.0, Array1::zeros(len));
-    }
-
-    let inv_bound = 1.0 / RHO_BOUND;
-    let sharp = RHO_SOFT_PRIOR_SHARPNESS;
-    let mut grad = Array1::zeros(len);
-    let mut cost = 0.0;
-    for (idx, &ri) in rho.iter().enumerate() {
-        let scaled = sharp * ri * inv_bound;
-        cost += scaled.cosh().ln();
-        grad[idx] = sharp * inv_bound * scaled.tanh();
-    }
-    if RHO_SOFT_PRIOR_WEIGHT != 1.0 {
-        grad.mapv_inplace(|g| g * RHO_SOFT_PRIOR_WEIGHT);
-        cost *= RHO_SOFT_PRIOR_WEIGHT;
-    }
-    (cost, grad)
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -2047,11 +2027,15 @@ pub mod internal {
     struct RemlWorkspace {
         rho_plus: Array1<f64>,
         rho_minus: Array1<f64>,
-        rho_temp: Array1<f64>,
+        lambda_values: Array1<f64>,
         grad_primary: Array1<f64>,
         grad_secondary: Array1<f64>,
+        cost_gradient: Array1<f64>,
+        prior_gradient: Array1<f64>,
         concat: Array2<f64>,
         solved: Array2<f64>,
+        hessian_xtwx: Array2<f64>,
+        hessian_raw: Array2<f64>,
         block_ranges: Vec<(usize, usize)>,
         solved_rows: usize,
     }
@@ -2061,18 +2045,113 @@ pub mod internal {
             RemlWorkspace {
                 rho_plus: Array1::zeros(max_penalties),
                 rho_minus: Array1::zeros(max_penalties),
-                rho_temp: Array1::zeros(max_penalties),
+                lambda_values: Array1::zeros(max_penalties),
                 grad_primary: Array1::zeros(max_penalties),
                 grad_secondary: Array1::zeros(max_penalties),
+                cost_gradient: Array1::zeros(max_penalties),
+                prior_gradient: Array1::zeros(max_penalties),
                 concat: Array2::zeros((coeffs, total_rank)),
                 solved: Array2::zeros((coeffs, total_rank)),
+                hessian_xtwx: Array2::zeros((coeffs, coeffs)),
+                hessian_raw: Array2::zeros((coeffs, coeffs)),
                 block_ranges: Vec::with_capacity(max_penalties),
                 solved_rows: coeffs,
             }
         }
 
+        fn reset_for_eval(&mut self, penalties: usize) {
+            self.block_ranges.clear();
+            self.solved_rows = 0;
+            if penalties == 0 {
+                return;
+            }
+            self.grad_primary.slice_mut(s![..penalties]).fill(0.0);
+            self.grad_secondary.slice_mut(s![..penalties]).fill(0.0);
+            self.cost_gradient.slice_mut(s![..penalties]).fill(0.0);
+            self.prior_gradient.slice_mut(s![..penalties]).fill(0.0);
+        }
+
         fn reset_block_ranges(&mut self) {
             self.block_ranges.clear();
+            self.solved_rows = 0;
+        }
+
+        fn set_lambda_values(&mut self, rho: &Array1<f64>) {
+            let len = rho.len();
+            if len == 0 {
+                return;
+            }
+            let mut view = self.lambda_values.slice_mut(s![..len]);
+            for (dst, &src) in view.iter_mut().zip(rho.iter()) {
+                *dst = src.exp();
+            }
+        }
+
+        fn lambda_view(&self, len: usize) -> ArrayView1<'_, f64> {
+            self.lambda_values.slice(s![..len])
+        }
+
+        fn cost_gradient_view(&mut self, len: usize) -> ArrayViewMut1<'_, f64> {
+            self.cost_gradient.slice_mut(s![..len])
+        }
+
+        fn zero_cost_gradient(&mut self, len: usize) {
+            self.cost_gradient.slice_mut(s![..len]).fill(0.0);
+        }
+
+        fn cost_gradient_view_const(&self, len: usize) -> ArrayView1<'_, f64> {
+            self.cost_gradient.slice(s![..len])
+        }
+
+        fn soft_prior_cost(&mut self, rho: &Array1<f64>) -> f64 {
+            let len = rho.len();
+            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+                if len > 0 {
+                    self.prior_gradient.slice_mut(s![..len]).fill(0.0);
+                }
+                return 0.0;
+            }
+
+            let inv_bound = 1.0 / RHO_BOUND;
+            let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+            let mut cost = 0.0;
+            for &ri in rho.iter() {
+                let scaled = sharp * ri * inv_bound;
+                cost += scaled.cosh().ln();
+            }
+
+            cost * RHO_SOFT_PRIOR_WEIGHT
+        }
+
+        fn soft_prior_cost_and_grad<'a>(
+            &'a mut self,
+            rho: &Array1<f64>,
+        ) -> (f64, ArrayView1<'a, f64>) {
+            let len = rho.len();
+            let mut grad_view = self.prior_gradient.slice_mut(s![..len]);
+            grad_view.fill(0.0);
+
+            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+                return (0.0, self.prior_gradient.slice(s![..len]));
+            }
+
+            let inv_bound = 1.0 / RHO_BOUND;
+            let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+            let mut cost = 0.0;
+            for (grad, &ri) in grad_view.iter_mut().zip(rho.iter()) {
+                let scaled = sharp * ri * inv_bound;
+                cost += scaled.cosh().ln();
+                *grad = sharp * inv_bound * scaled.tanh();
+            }
+
+            if RHO_SOFT_PRIOR_WEIGHT != 1.0 {
+                for grad in grad_view.iter_mut() {
+                    *grad *= RHO_SOFT_PRIOR_WEIGHT;
+                }
+                cost *= RHO_SOFT_PRIOR_WEIGHT;
+            }
+
+            (cost, self.prior_gradient.slice(s![..len]))
         }
     }
 
@@ -2355,7 +2434,7 @@ pub mod internal {
         fn edf_from_h_and_rk(
             &self,
             pr: &PirlsResult,
-            lambdas: &Array1<f64>,
+            lambdas: ArrayView1<'_, f64>,
             h_eff: &Array2<f64>,
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
@@ -2808,6 +2887,13 @@ pub mod internal {
             let h_eff = bundle.h_eff.as_ref();
             let ridge_used = bundle.ridge_used;
 
+            let penalties = p.len();
+            let mut workspace_ref = self.workspace.borrow_mut();
+            workspace_ref.reset_for_eval(penalties);
+            let workspace = &mut *workspace_ref;
+            workspace.set_lambda_values(p);
+            let lambdas = workspace.lambda_view(penalties).to_owned();
+
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
                 let kλ = p.len();
@@ -2859,8 +2945,6 @@ pub mod internal {
                     }
                 }
             }
-            let lambdas = p.mapv(f64::exp);
-
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
@@ -2917,7 +3001,7 @@ pub mod internal {
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
 
                     if n - edf < 1.0 {
@@ -2958,7 +3042,7 @@ pub mod internal {
                         + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    let (prior_cost, _) = rho_soft_prior(p);
+                    let prior_cost = workspace.soft_prior_cost(p);
 
                     // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
                     Ok(reml + prior_cost)
@@ -3013,12 +3097,12 @@ pub mod internal {
                     // Diagnostics: effective degrees of freedom via trace identity
                     // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
-                    let mut xtwx =
-                        Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    let xtwx = &mut workspace.hessian_xtwx;
+                    xtwx.fill(0.0);
                     let x_orig = self.x();
                     let w_orig = self.weights();
                     for i in 0..x_orig.nrows() {
@@ -3031,13 +3115,16 @@ pub mod internal {
                         }
                     }
 
-                    let mut h_raw = xtwx.clone();
+                    let mut h_raw_view = workspace.hessian_raw.view_mut();
+                    h_raw_view.assign(xtwx);
                     for (k, &lambda) in lambdas.iter().enumerate() {
                         let s_k = &self.s_full_list[k];
                         if lambda != 0.0 {
-                            h_raw.scaled_add(lambda, s_k);
+                            h_raw_view.scaled_add(lambda, s_k);
                         }
                     }
+
+                    let h_raw = workspace.hessian_raw.clone();
 
                     let stabilized_eigs = pirls_result
                         .penalized_hessian_transformed
@@ -3079,7 +3166,7 @@ pub mod internal {
                         laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
                     );
 
-                    let (prior_cost, _) = rho_soft_prior(p);
+                    let prior_cost = workspace.soft_prior_cost(p);
 
                     Ok(-laml + prior_cost)
                 }
@@ -3396,7 +3483,10 @@ pub mod internal {
             let mut workspace_ref = self.workspace.borrow_mut();
             let workspace = &mut *workspace_ref;
             let len = p.len();
-            let mut cost_gradient = Array1::zeros(len);
+            workspace.reset_for_eval(len);
+            workspace.set_lambda_values(p);
+            workspace.zero_cost_gradient(len);
+            let lambdas = workspace.lambda_view(len).to_owned();
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
@@ -3425,11 +3515,7 @@ pub mod internal {
             }
 
             // --- Extract common components ---
-            let lambdas = p.mapv(f64::exp); // This is λ
-            let should_parallelize = {
-                let threshold = self.config.reml_parallel_threshold;
-                threshold > 0 && lambdas.len() >= threshold
-            };
+            let _ = self.config.reml_parallel_threshold;
 
             let n = self.y.len() as f64;
 
@@ -3592,18 +3678,13 @@ pub mod internal {
                         deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
                     };
 
-                    let grad_slice = cost_gradient
-                        .as_slice_mut()
-                        .expect("gradient storage is contiguous");
-                    if should_parallelize {
-                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
-                            *slot = compute_gaussian_grad(k);
-                        });
-                    } else {
-                        for (k, slot) in grad_slice.iter_mut().enumerate() {
-                            *slot = compute_gaussian_grad(k);
-                        }
+                    let mut gaussian_grad = Vec::with_capacity(lambdas.len());
+                    for k in 0..lambdas.len() {
+                        gaussian_grad.push(compute_gaussian_grad(k));
                     }
+                    workspace
+                        .cost_gradient_view(len)
+                        .assign(&Array1::from_vec(gaussian_grad));
                 }
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
@@ -3679,53 +3760,61 @@ pub mod internal {
                         gradient_value
                     };
 
-                    let grad_slice = cost_gradient
-                        .as_slice_mut()
-                        .expect("gradient storage is contiguous");
-                    if should_parallelize {
-                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
-                            *slot = assemble_laml_grad(k);
-                        });
-                    } else {
-                        for (k, slot) in grad_slice.iter_mut().enumerate() {
-                            *slot = assemble_laml_grad(k);
-                        }
+                    let mut laml_grad = Vec::with_capacity(lambdas.len());
+                    for k in 0..lambdas.len() {
+                        laml_grad.push(assemble_laml_grad(k));
                     }
+                    workspace
+                        .cost_gradient_view(len)
+                        .assign(&Array1::from_vec(laml_grad));
                     // mgcv-style assembly
                     println!("LAML gradient computation finished.");
                 }
             }
 
-            let (_, prior_grad) = rho_soft_prior(p);
-            cost_gradient += &prior_grad;
+            let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
+            let prior_grad = prior_grad_view.to_owned();
+            {
+                let mut cost_gradient_view = workspace.cost_gradient_view(len);
+                cost_gradient_view += &prior_grad;
+            }
+
+            // Capture the gradient snapshot before releasing the workspace borrow so
+            // that diagnostics can continue without holding the RefCell borrow.
+            let gradient_result = workspace.cost_gradient_view_const(len).to_owned();
+            let gradient_snapshot = if p.is_empty() {
+                None
+            } else {
+                Some(gradient_result.clone())
+            };
+
+            drop(workspace_ref);
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
-            // The cost_gradient variable as computed above is already -∇V(ρ),
+            // The gradient buffer stored in the workspace already holds -∇V(ρ),
             // which is exactly what the optimizer needs.
             // No final negation is needed.
 
             // One-direction secant test (cheap FD validation)
-            if !p.is_empty() {
+            if let Some(gradient_snapshot) = gradient_snapshot {
                 let h = 1e-4;
-                workspace.rho_temp.fill(0.0);
-                workspace.rho_temp[0] = 1.0; // pick k=0 or max|grad|
-                let gdot = cost_gradient.dot(&workspace.rho_temp);
-
-                workspace.rho_plus.assign(p);
-                for i in 0..p.len() {
-                    workspace.rho_plus[i] += h * workspace.rho_temp[i];
+                let mut direction = Array1::zeros(p.len());
+                if let Some(dir0) = direction.get_mut(0) {
+                    *dir0 = 1.0; // pick k=0 or max|grad|
                 }
-                let fp = self
-                    .compute_cost(&workspace.rho_plus)
-                    .unwrap_or(f64::INFINITY);
+                let gdot = gradient_snapshot.dot(&direction);
 
-                workspace.rho_minus.assign(p);
-                for i in 0..p.len() {
-                    workspace.rho_minus[i] -= h * workspace.rho_temp[i];
+                let mut rho_plus = p.clone();
+                for i in 0..rho_plus.len() {
+                    rho_plus[i] += h * direction[i];
                 }
-                let fm = self
-                    .compute_cost(&workspace.rho_minus)
-                    .unwrap_or(f64::INFINITY);
+                let fp = self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY);
+
+                let mut rho_minus = p.clone();
+                for i in 0..rho_minus.len() {
+                    rho_minus[i] -= h * direction[i];
+                }
+                let fm = self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY);
 
                 let secant = (fp - fm) / (2.0 * h);
                 let denom = gdot.abs().max(secant.abs()).max(1e-8);
@@ -3738,7 +3827,7 @@ pub mod internal {
                 );
 
                 // Check for exploding gradients
-                let big = cost_gradient
+                let big = gradient_snapshot
                     .iter()
                     .map(|x| x.abs())
                     .fold(0. / 0., f64::max);
@@ -3751,7 +3840,7 @@ pub mod internal {
                 }
             }
 
-            Ok(cost_gradient)
+            Ok(gradient_result)
         }
     }
 
