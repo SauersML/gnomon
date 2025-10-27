@@ -1,9 +1,11 @@
+use ahash::AHasher;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagRef};
 use faer::linalg::solvers::{self, Solve};
 use faer::linalg::svd::{self, ComputeSvdVectors};
-use faer::{Mat, MatRef, Side, get_global_parallelism};
+use faer::{Mat, MatMut, MatRef, Side, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use std::hash::Hasher;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,6 +16,39 @@ pub enum FaerLinalgError {
     SelfAdjointEigen(solvers::EvdError),
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
+}
+
+#[inline]
+pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
+    assert!(
+        array.is_standard_layout(),
+        "array2_to_mat_mut expects standard layout storage"
+    );
+    let (nrows, ncols) = array.dim();
+    let slice = array
+        .as_slice_memory_order_mut()
+        .expect("standard-layout array must expose a contiguous slice");
+    MatMut::from_row_major_slice_mut(slice, nrows, ncols)
+}
+
+#[inline]
+pub fn array1_to_col_mat_mut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
+    let len = array.len();
+    let slice = array
+        .as_slice_memory_order_mut()
+        .expect("vector must expose a contiguous slice");
+    MatMut::from_row_major_slice_mut(slice, len, 1)
+}
+
+#[inline]
+pub fn hash_array2(matrix: &Array2<f64>) -> u64 {
+    let mut hasher = AHasher::default();
+    hasher.write_usize(matrix.nrows());
+    hasher.write_usize(matrix.ncols());
+    for value in matrix.iter() {
+        hasher.write(&value.to_ne_bytes());
+    }
+    hasher.finish()
 }
 
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
