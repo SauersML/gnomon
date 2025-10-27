@@ -188,10 +188,10 @@ impl BasisCache {
             .inner
             .lock()
             .expect("basis cache mutex should not be poisoned");
-        if let Some(entry) = guard.map.get(key) {
+        if let Some(entry) = guard.map.get(key).cloned() {
             guard.hits = guard.hits.saturating_add(1);
             guard.touch(key);
-            Some(entry.basis.clone())
+            Some(entry.basis)
         } else {
             guard.misses = guard.misses.saturating_add(1);
             None
