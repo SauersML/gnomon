@@ -2188,6 +2188,24 @@ pub mod internal {
             self.current_eval_bundle.borrow_mut().take();
         }
 
+        /// Compute soft prior cost without needing workspace
+        fn compute_soft_prior_cost(&self, rho: &Array1<f64>) -> f64 {
+            let len = rho.len();
+            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
+                return 0.0;
+            }
+
+            let inv_bound = 1.0 / RHO_BOUND;
+            let sharp = RHO_SOFT_PRIOR_SHARPNESS;
+            let mut cost = 0.0;
+            for &ri in rho.iter() {
+                let scaled = sharp * ri * inv_bound;
+                cost += scaled.cosh().ln();
+            }
+
+            cost * RHO_SOFT_PRIOR_WEIGHT
+        }
+
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
         ///
@@ -2888,11 +2906,7 @@ pub mod internal {
             let ridge_used = bundle.ridge_used;
 
             let penalties = p.len();
-            let mut workspace_ref = self.workspace.lock().unwrap();
-            workspace_ref.reset_for_eval(penalties);
-            let workspace = &mut *workspace_ref;
-            workspace.set_lambda_values(p);
-            let lambdas = workspace.lambda_view(penalties).to_owned();
+            let lambdas = p.mapv(f64::exp);
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
@@ -3042,7 +3056,7 @@ pub mod internal {
                         + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    let prior_cost = workspace.soft_prior_cost(p);
+                    let prior_cost = self.compute_soft_prior_cost(p);
 
                     // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
                     Ok(reml + prior_cost)
@@ -3101,8 +3115,8 @@ pub mod internal {
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
-                    let xtwx = &mut workspace.hessian_xtwx;
-                    xtwx.fill(0.0);
+                    let mut xtwx =
+                        Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
                     let x_orig = self.x();
                     let w_orig = self.weights();
                     for i in 0..x_orig.nrows() {
@@ -3115,16 +3129,13 @@ pub mod internal {
                         }
                     }
 
-                    let mut h_raw_view = workspace.hessian_raw.view_mut();
-                    h_raw_view.assign(xtwx);
+                    let mut h_raw = xtwx.clone();
                     for (k, &lambda) in lambdas.iter().enumerate() {
                         let s_k = &self.s_full_list[k];
                         if lambda != 0.0 {
-                            h_raw_view.scaled_add(lambda, s_k);
+                            h_raw.scaled_add(lambda, s_k);
                         }
                     }
-
-                    let h_raw = workspace.hessian_raw.clone();
 
                     let stabilized_eigs = pirls_result
                         .penalized_hessian_transformed
@@ -3166,7 +3177,7 @@ pub mod internal {
                         laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
                     );
 
-                    let prior_cost = workspace.soft_prior_cost(p);
+                    let prior_cost = self.compute_soft_prior_cost(p);
 
                     Ok(-laml + prior_cost)
                 }
