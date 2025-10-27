@@ -2032,8 +2032,8 @@ pub mod internal {
         grad_secondary: Array1<f64>,
         cost_gradient: Array1<f64>,
         prior_gradient: Array1<f64>,
-        concat: Array2<f64>,
-        solved: Array2<f64>,
+        concat: FaerMat<f64>,
+        solved: FaerMat<f64>,
         block_ranges: Vec<(usize, usize)>,
         solved_rows: usize,
     }
@@ -2048,8 +2048,8 @@ pub mod internal {
                 grad_secondary: Array1::zeros(max_penalties),
                 cost_gradient: Array1::zeros(max_penalties),
                 prior_gradient: Array1::zeros(max_penalties),
-                concat: Array2::zeros((coeffs, total_rank)),
-                solved: Array2::zeros((coeffs, total_rank)),
+                concat: FaerMat::<f64>::zeros(coeffs, total_rank),
+                solved: FaerMat::<f64>::zeros(coeffs, total_rank),
                 block_ranges: Vec::with_capacity(max_penalties),
                 solved_rows: coeffs,
             }
@@ -3591,26 +3591,30 @@ pub mod internal {
                     workspace.solved_rows = h_eff.nrows();
 
                     if numeric_logh_grad.is_none() && total_rank > 0 {
-                        workspace.concat.fill(0.0);
+                        workspace.concat.as_mut().fill(0.0);
                         let rows = h_eff.nrows();
                         for ((start, end), rt) in
                             workspace.block_ranges.iter().zip(rs_transposed.iter())
                         {
                             if *end > *start {
-                                workspace
-                                    .concat
-                                    .slice_mut(s![..rows, *start..*end])
-                                    .assign(rt);
+                                let width = end - start;
+                                let src_rows = rt.nrows().min(rows);
+                                for i in 0..src_rows {
+                                    for j in 0..width {
+                                        workspace.concat[(i, start + j)] = rt[(i, j)];
+                                    }
+                                }
                             }
                         }
-                        let concat_view = FaerArrayView::new(&workspace.concat);
-                        let solved = factor_g.solve(concat_view.as_ref());
+                        let solved = factor_g.solve(workspace.concat.as_ref());
                         let solved_ref = solved.as_ref();
                         let (rows, cols) = solved_ref.shape();
                         workspace.solved_rows = rows;
-                        for j in 0..cols {
-                            for i in 0..rows {
-                                workspace.solved[(i, j)] = solved_ref[(i, j)];
+                        let solved_mut = workspace.solved.as_mut();
+                        solved_mut.fill(0.0);
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                solved_mut[(i, j)] = solved_ref[(i, j)];
                             }
                         }
                     } else {
@@ -3622,8 +3626,8 @@ pub mod internal {
                     let beta_ref = beta_transformed;
                     let solved_rows = workspace.solved_rows;
                     let block_ranges_ref = &workspace.block_ranges;
-                    let solved_ref = &workspace.solved;
-                    let concat_ref = &workspace.concat;
+                    let solved_ref = workspace.solved.as_ref();
+                    let concat_ref = workspace.concat.as_ref();
                     let compute_gaussian_grad = |k: usize| -> f64 {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
@@ -3641,14 +3645,20 @@ pub mod internal {
                         } else if solved_rows > 0 {
                             let (start, end) = block_ranges_ref[k];
                             if end > start {
-                                let solved_block = solved_ref.slice(s![..solved_rows, start..end]);
-                                let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
-                                let trace_h_inv_s_k = kahan_sum(
-                                    solved_block
-                                        .iter()
-                                        .zip(rt_block.iter())
-                                        .map(|(&x, &y)| x * y),
-                                );
+                                let trace_h_inv_s_k = {
+                                    let mut sum = 0.0;
+                                    let mut c = 0.0;
+                                    for i in 0..solved_rows {
+                                        for j in start..end {
+                                            let prod = solved_ref[(i, j)] * concat_ref[(i, j)];
+                                            let y = prod - c;
+                                            let t = sum + y;
+                                            c = (t - sum) - y;
+                                            sum = t;
+                                        }
+                                    }
+                                    sum
+                                };
                                 let tra1 = lambdas[k] * trace_h_inv_s_k;
                                 tra1 / 2.0
                             } else {

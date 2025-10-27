@@ -60,14 +60,28 @@ impl<'a> FaerArrayView<'a> {
                     array.ncols(),
                 ))
             } else {
+                // Safety: ndarray guarantees that the pointer returned by `as_ptr` is valid for the
+                // logical matrix with the provided shape and strides. faer's `MatRef::from_raw_parts`
+                // accepts arbitrary (potentially negative) strides expressed in element counts, which
+                // aligns with ndarray's representation. This allows us to materialise a faer view
+                // without copying even for non-standard layouts.
                 let (rows, cols) = array.dim();
-                let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
-                FaerStorage::Owned(owned)
+                let strides = array.strides();
+                let ptr = array.as_ptr();
+                let row_stride = strides[0];
+                let col_stride = strides[1];
+                let view =
+                    unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) };
+                FaerStorage::Borrowed(view)
             }
         } else {
             let (rows, cols) = array.dim();
-            let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
-            FaerStorage::Owned(owned)
+            let strides = array.strides();
+            let ptr = array.as_ptr();
+            let row_stride = strides[0];
+            let col_stride = strides[1];
+            let view = unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) };
+            FaerStorage::Borrowed(view)
         };
         Self { storage }
     }
@@ -88,8 +102,11 @@ impl<'a> FaerColView<'a> {
         let storage = if let Some(slice) = array.as_slice() {
             FaerStorage::Borrowed(MatRef::from_row_major_slice(slice, len, 1))
         } else {
-            let owned = Mat::from_fn(len, 1, |i, _| array[i]);
-            FaerStorage::Owned(owned)
+            let strides = array.strides();
+            let ptr = array.as_ptr();
+            let row_stride = strides[0];
+            let view = unsafe { MatRef::from_raw_parts(ptr, len, 1, row_stride, 0) };
+            FaerStorage::Borrowed(view)
         };
         Self { storage }
     }
