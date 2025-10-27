@@ -7992,7 +7992,6 @@ pub mod internal {
 #[test]
 fn test_train_model_fails_gracefully_on_perfect_separation() {
     use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind};
-    use std::collections::HashMap;
 
     // Stage: Create a perfectly separated dataset
     let n_samples = 400;
