@@ -4,7 +4,6 @@ use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
-use faer::matrix_free::LinOp;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
@@ -177,9 +176,10 @@ fn robust_eigh_faer(
         match candidate.as_ref().self_adjoint_eigen(side) {
             Ok(eig) => {
                 let diag = eig.S();
-                let mut eigenvalues = Vec::with_capacity(diag.nrows());
+                let diag_len = diag.dim();
+                let mut eigenvalues = Vec::with_capacity(diag_len);
                 let mut scale = 0.0_f64;
-                for idx in 0..diag.nrows() {
+                for idx in 0..diag_len {
                     let val = diag[idx];
                     if val.is_finite() {
                         scale = scale.max(val.abs());
