@@ -7,7 +7,7 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis};
 use std::time::{Duration, Instant};
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -1115,18 +1115,30 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
 /// # Parameters
 /// * `matrix`: The matrix whose columns will be permuted.
 /// * `pivot`: The forward permutation vector.
-fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
-    let r = matrix.nrows();
-    let c = matrix.ncols();
-    let mut pivoted_matrix = Array2::zeros((r, c));
+fn pivot_columns_into<S>(
+    matrix: &ndarray::ArrayBase<S, ndarray::Ix2>,
+    pivot: &[usize],
+    mut out: ArrayViewMut2<f64>,
+) where
+    S: ndarray::Data<Elem = f64>,
+{
+    let (r, c) = matrix.dim();
+    assert_eq!(out.dim(), (r, c));
+    assert!(pivot.len() >= c, "pivot vector shorter than column count");
 
     for j in 0..c {
         let original_col_index = pivot[j];
-        pivoted_matrix
-            .column_mut(j)
-            .assign(&matrix.column(original_col_index));
+        out.column_mut(j).assign(&matrix.column(original_col_index));
     }
+}
 
+fn pivot_columns<S>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>, pivot: &[usize]) -> Array2<f64>
+where
+    S: ndarray::Data<Elem = f64>,
+{
+    let (r, c) = matrix.dim();
+    let mut pivoted_matrix = Array2::zeros((r, c));
+    pivot_columns_into(matrix, pivot, pivoted_matrix.view_mut());
     pivoted_matrix
 }
 
@@ -1742,7 +1754,7 @@ pub fn solve_penalized_least_squares(
     let wz = &workspace.wz;
 
     // Perform initial pivoted QR on the weighted design matrix
-    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
+    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(wx)?;
 
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p_dim);
@@ -1756,21 +1768,13 @@ pub fn solve_penalized_least_squares(
 
     // Stage: Rank determination using the scaled augmented system
 
-    // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
-    // This ensures the columns of both matrices are aligned correctly
-    let eb_pivoted = pivot_columns(eb.view(), &initial_pivot);
-
     // Calculate Frobenius norms for scaling
     let r_norm = frobenius_norm(&r1_pivoted);
-    let eb_norm = if eb_pivoted.nrows() > 0 {
-        frobenius_norm(&eb_pivoted)
-    } else {
-        1.0
-    };
+    let eb_rows = eb.nrows();
+    let eb_norm = if eb_rows > 0 { frobenius_norm(eb) } else { 1.0 };
 
     // Create the scaled augmented matrix for numerical stability using pivoted matrices
     // [R1_pivoted/Rnorm; Eb_pivoted/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
-    let eb_rows = eb_pivoted.nrows();
     let scaled_rows = r_rows + eb_rows;
     assert!(workspace.scaled_matrix.nrows() >= scaled_rows);
     assert!(workspace.scaled_matrix.ncols() >= p_dim);
@@ -1788,14 +1792,13 @@ pub fn solve_penalized_least_squares(
     }
     if eb_rows > 0 {
         let mut bot = scaled_matrix.slice_mut(ns![r_rows.., ..]);
-        bot.assign(&eb_pivoted);
+        pivot_columns_into(eb, &initial_pivot, bot.view_mut());
         let inv = 1.0 / eb_norm;
         bot.mapv_inplace(|v| v * inv);
     }
 
     // Perform pivoted QR on the scaled matrix for rank determination
-    let scaled_owned = scaled_matrix.to_owned();
-    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_owned)?;
+    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_matrix)?;
 
     // Determine rank using condition number on the scaled matrix
     let mut rank = p_dim.min(scaled_rows);
@@ -1822,23 +1825,6 @@ pub fn solve_penalized_least_squares(
 
     // Stage: Create the rank-reduced system using the rank pivot
 
-    // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
-    let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
-
-    // Apply the rank-determining pivot to the working matrices, then keep the first `rank` columns
-    // This ensures we drop by position in the rank-ordered system (Option A fix)
-    let r1_ranked = pivot_columns(r1_pivoted.view(), &rank_pivot_scaled);
-    let e_transformed_ranked = pivot_columns(e_transformed_pivoted.view(), &rank_pivot_scaled);
-
-    // Keep the first `rank` columns by position
-    let r1_dropped = r1_ranked.slice(s![.., ..rank]).to_owned();
-
-    let e_transformed_rows = e_transformed_ranked.nrows();
-    let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
-    if e_transformed_rows > 0 {
-        e_transformed_dropped.assign(&e_transformed_ranked.slice(s![.., ..rank]));
-    }
-
     // Record kept positions in the initial pivoted order for later reconstruction
     let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
 
@@ -1846,6 +1832,7 @@ pub fn solve_penalized_least_squares(
 
     // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
     // This uses the lambda-DEPENDENT penalty for actual penalty application
+    let e_transformed_rows = e_transformed.nrows();
     let final_aug_rows = r_rows + e_transformed_rows;
     assert!(workspace.final_aug_matrix.nrows() >= final_aug_rows);
     assert!(workspace.final_aug_matrix.ncols() >= rank);
@@ -1854,18 +1841,23 @@ pub fn solve_penalized_least_squares(
         .slice_mut(s![..final_aug_rows, ..rank]);
 
     // Fill via slice assignments (Suggestion #9)
-    final_aug_matrix
-        .slice_mut(ns![..r_rows, ..])
-        .assign(&r1_dropped);
+    {
+        let mut top = final_aug_matrix.slice_mut(ns![..r_rows, ..]);
+        for (dest_col, &src_idx) in kept_positions.iter().enumerate() {
+            top.column_mut(dest_col).assign(&r1_pivoted.column(src_idx));
+        }
+    }
     if e_transformed_rows > 0 {
-        final_aug_matrix
-            .slice_mut(ns![r_rows.., ..])
-            .assign(&e_transformed_dropped);
+        let mut bot = final_aug_matrix.slice_mut(ns![r_rows.., ..]);
+        for (dest_col, &src_idx) in kept_positions.iter().enumerate() {
+            let orig_col = initial_pivot[src_idx];
+            bot.column_mut(dest_col)
+                .assign(&e_transformed.column(orig_col));
+        }
     }
 
     // Perform final pivoted QR on the unscaled, reduced system
-    let final_aug_owned = final_aug_matrix.to_owned();
-    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
+    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_matrix)?;
 
     // Add tiny ridge jitter to avoid singular/infinite condition number
     let r_final_sq = r_final.slice(s![..rank, ..rank]);
@@ -2101,45 +2093,32 @@ where
 /// Perform pivoted QR decomposition using faer's robust implementation
 /// This uses faer's high-level ColPivQr solver which guarantees mathematical
 /// consistency between the Q, R, and P factors of the decomposition A*P = Q*R
-fn pivoted_qr_faer(
-    matrix: &Array2<f64>,
-) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
-    use faer::Mat;
+fn pivoted_qr_faer<S>(
+    matrix: &ndarray::ArrayBase<S, ndarray::Ix2>,
+) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError>
+where
+    S: ndarray::Data<Elem = f64>,
+{
     use faer::linalg::solvers::ColPivQr;
 
     let m = matrix.nrows();
     let n = matrix.ncols();
     let k = m.min(n);
 
-    // Stage: Convert ndarray to a faer matrix
-    let mut a_faer = Mat::zeros(m, n);
-    for i in 0..m {
-        for j in 0..n {
-            a_faer[(i, j)] = matrix[[i, j]];
-        }
-    }
+    // Stage: Convert ndarray to a faer matrix without unnecessary copies when possible
+    let matrix_view = FaerArrayView::new(matrix);
 
     // Stage: Perform the column-pivoted QR decomposition using the high-level API
     // This guarantees that Q, R, and P are all from the same consistent decomposition
-    let qr = ColPivQr::new(a_faer.as_ref());
+    let qr = ColPivQr::new(matrix_view.as_ref());
 
     // Stage: Extract the consistent Q factor (thin version)
     let q_faer = qr.compute_thin_Q();
-    let mut q = Array2::zeros((m, k));
-    for i in 0..m {
-        for j in 0..k {
-            q[[i, j]] = q_faer[(i, j)];
-        }
-    }
+    let q = Array2::from_shape_fn((m, k), |(i, j)| q_faer[(i, j)]);
 
     // Stage: Extract the consistent R factor
     let r_faer = qr.R();
-    let mut r = Array2::zeros((k, n));
-    for i in 0..k {
-        for j in 0..n {
-            r[[i, j]] = r_faer[(i, j)];
-        }
-    }
+    let r = Array2::from_shape_fn((k, n), |(i, j)| r_faer[(i, j)]);
 
     // Stage: Extract the consistent column permutation (pivot)
     let perm = qr.P();
@@ -2153,10 +2132,10 @@ fn pivoted_qr_faer(
     let qr_product = q.dot(&r);
 
     // Try candidate p0
-    let a_p0 = pivot_columns(matrix.view(), &p0);
+    let a_p0 = pivot_columns(matrix, &p0);
 
     // Try candidate p1
-    let a_p1 = pivot_columns(matrix.view(), &p1);
+    let a_p1 = pivot_columns(matrix, &p1);
 
     // Use relative error for scale-robust comparison
     let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
@@ -3782,7 +3761,7 @@ mod tests {
 
         // Stage: Verify that the fundamental QR identity holds
         // First, apply the permutation to the original matrix 'a'.
-        let a_pivoted = pivot_columns(a.view(), &pivot);
+        let a_pivoted = pivot_columns(&a, &pivot);
 
         // Then, compute Q*R using the results from the function.
         let qr_product = q.dot(&r);
