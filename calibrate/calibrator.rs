@@ -10,7 +10,8 @@ use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::parallel::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -24,6 +25,7 @@ use std::collections::HashSet;
 use crate::calibrate::estimate::{
     ExternalOptimOptions, ExternalOptimResult, optimize_external_design,
 };
+use rayon::slice::ParallelSliceMut;
 
 /// Features used to train the calibrator GAM
 pub struct CalibratorFeatures {
@@ -568,9 +570,14 @@ pub fn build_calibrator_design(
     fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
         let rows = matrix.nrows();
         let mut result = Array2::<f64>::zeros((rows, indices.len()));
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            result.column_mut(new_idx).assign(&matrix.column(old_idx));
-        }
+        result
+            .axis_iter_mut(Axis(1))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(new_idx, mut dest_col)| {
+                let old_idx = indices[new_idx];
+                dest_col.assign(&matrix.column(old_idx));
+            });
         result
     }
 
@@ -580,13 +587,15 @@ pub fn build_calibrator_design(
         }
 
         let tol = 1e-9_f64;
-        let mut keep: Vec<usize> = Vec::with_capacity(basis.ncols());
-        for j in 0..basis.ncols() {
-            let norm_sq: f64 = basis.column(j).iter().map(|&v| v * v).sum();
-            if norm_sq.sqrt() > tol {
-                keep.push(j);
-            }
-        }
+        let keep: Vec<usize> = basis
+            .axis_iter(Axis(1))
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(j, col)| {
+                let norm_sq: f64 = col.iter().map(|&v| v * v).sum();
+                (norm_sq.sqrt() > tol).then_some(j)
+            })
+            .collect();
 
         if keep.len() == basis.ncols() {
             return;
@@ -657,7 +666,7 @@ pub fn build_calibrator_design(
             return Array1::zeros(raw.len());
         }
 
-        positives.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        positives.par_sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = if positives.len() % 2 == 1 {
             positives[positives.len() / 2]
         } else {
@@ -689,21 +698,45 @@ pub fn build_calibrator_design(
         if basis.is_empty() {
             return 0.0;
         }
-        let mut accum = 0.0;
-        for col in 0..basis.ncols() {
-            let mut dot = 0.0;
-            for row in 0..basis.nrows() {
-                let w = weights[row];
-                if w <= 0.0 {
-                    continue;
-                }
-                let basis_val = basis[[row, col]];
-                let target_val = target.map(|t| t[row]).unwrap_or(1.0);
-                dot += w * basis_val * target_val;
-            }
-            accum += dot * dot;
-        }
-        accum.sqrt()
+        let weights_view = weights.view();
+        let accum_sq = if let Some(target_arr) = target {
+            let target_view = target_arr.view();
+            basis
+                .axis_iter(Axis(1))
+                .into_par_iter()
+                .map(|col| {
+                    let dot = Zip::from(&col).and(&weights_view).and(&target_view).fold(
+                        0.0,
+                        |acc, &basis_val, &w, &t| {
+                            if w > 0.0 {
+                                acc + w * basis_val * t
+                            } else {
+                                acc
+                            }
+                        },
+                    );
+                    dot * dot
+                })
+                .sum::<f64>()
+        } else {
+            basis
+                .axis_iter(Axis(1))
+                .into_par_iter()
+                .map(|col| {
+                    let dot =
+                        Zip::from(&col)
+                            .and(&weights_view)
+                            .fold(
+                                0.0,
+                                |acc, &basis_val, &w| {
+                                    if w > 0.0 { acc + w * basis_val } else { acc }
+                                },
+                            );
+                    dot * dot
+                })
+                .sum::<f64>()
+        };
+        accum_sq.sqrt()
     }
 
     // Standardize inputs and record parameters
