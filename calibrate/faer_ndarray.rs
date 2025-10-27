@@ -229,7 +229,7 @@ fn compute_partial_eigen(
     n_eigval: usize,
     params: PartialEigenParams,
 ) -> Result<PartialEigenInfo, FaerLinalgError> {
-    let mut v0 = normalized_start_vector(mat.nrows());
+    let v0 = normalized_start_vector(mat.nrows());
     let par = sequential_par();
     let mut mem = MemBuffer::new(mf_eigen::partial_eigen_scratch(&mat, n_eigval, par, params));
     let mut stack = MemStack::new(&mut mem);

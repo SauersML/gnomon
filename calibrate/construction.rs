@@ -1467,7 +1467,8 @@ pub fn create_balanced_penalty_root(
     }
 
     // Take the matrix square root of the balanced penalty
-    let (eigenvalues, eigenvectors) = partial_positive_eigh(&s_balanced, 1e-12)?;
+    let (eigenvalues, eigenvectors) = partial_positive_eigh(&s_balanced, 1e-12)
+        .map_err(EstimationError::EigendecompositionFailed)?;
 
     if eigenvalues.is_empty() {
         return Ok(Array2::zeros((0, p)));
@@ -1500,7 +1501,8 @@ pub fn compute_penalty_square_roots(
         let p = s.nrows();
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
-        let (eigenvalues, eigenvectors) = partial_positive_eigh(s, 1e-12)?;
+        let (eigenvalues, eigenvectors) =
+            partial_positive_eigh(s, 1e-12).map_err(EstimationError::EigendecompositionFailed)?;
 
         if eigenvalues.is_empty() {
             // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)
@@ -1632,7 +1634,8 @@ pub fn stable_reparameterization(
         });
     }
 
-    let (bal_pos_vals, bal_pos_vecs) = partial_positive_eigh(&s_balanced, 1e-12)?;
+    let (bal_pos_vals, bal_pos_vecs) = partial_positive_eigh(&s_balanced, 1e-12)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let mut qs = Array2::zeros((p, p));
     let mut penalized_rank = bal_pos_vals.len();
     let mut used_partial_basis = true;
@@ -1735,7 +1738,8 @@ pub fn stable_reparameterization(
         s_k_transformed_cache.push(s_k);
     }
 
-    let (s_pos_eigenvalues, s_pos_eigenvectors) = partial_positive_eigh(&s_transformed, 1e-12)?;
+    let (s_pos_eigenvalues, s_pos_eigenvectors) = partial_positive_eigh(&s_transformed, 1e-12)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let penalty_rank = s_pos_eigenvalues.len();
 
     let mut e_matrix = Array2::zeros((p, penalty_rank));
