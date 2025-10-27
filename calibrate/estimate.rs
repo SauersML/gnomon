@@ -193,7 +193,7 @@ impl RidgePlanner {
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const LAML_RIDGE: f64 = 1e-8;
@@ -2175,7 +2175,7 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
-        workspace: RefCell<RemlWorkspace>,
+        workspace: Mutex<RemlWorkspace>,
     }
 
     impl<'a> RemlState<'a> {
@@ -2364,7 +2364,7 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
-                workspace: RefCell::new(workspace),
+                workspace: Mutex::new(workspace),
             })
         }
 
@@ -2573,7 +2573,7 @@ pub mod internal {
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            let mut workspace = self.workspace.borrow_mut();
+            let mut workspace = self.workspace.lock().unwrap();
             self.numeric_penalised_ll_grad_with_workspace(rho, &mut workspace)
         }
 
@@ -2888,7 +2888,7 @@ pub mod internal {
             let ridge_used = bundle.ridge_used;
 
             let penalties = p.len();
-            let mut workspace_ref = self.workspace.borrow_mut();
+            let mut workspace_ref = self.workspace.lock().unwrap();
             workspace_ref.reset_for_eval(penalties);
             let workspace = &mut *workspace_ref;
             workspace.set_lambda_values(p);
@@ -3480,7 +3480,7 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
             let rs_transposed = &reparam_result.rs_transposed;
 
-            let mut workspace_ref = self.workspace.borrow_mut();
+            let mut workspace_ref = self.workspace.lock().unwrap();
             let workspace = &mut *workspace_ref;
             let len = p.len();
             workspace.reset_for_eval(len);
