@@ -3033,7 +3033,7 @@ pub mod internal {
                     let p_eff = pirls_result.beta_transformed.len() as f64;
                     let edf = self.edf_from_h_and_rk(
                         pirls_result,
-                        lambdas,
+                        workspace.lambda_buffer.slice(s![..len]),
                         h_eff,
                         &mut workspace.rho_log_buffer,
                         &mut workspace.e_t,
