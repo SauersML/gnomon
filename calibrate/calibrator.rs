@@ -2,6 +2,9 @@ use crate::calibrate::basis::{
     BasisError, apply_weighted_orthogonality_constraint, create_difference_penalty_matrix,
 };
 use crate::calibrate::estimate::EstimationError;
+use crate::calibrate::faer_ndarray::FaerArrayView;
+#[cfg(test)]
+use crate::calibrate::faer_ndarray::FaerColView;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls; // for PirlsResult
@@ -186,7 +189,7 @@ pub fn compute_alo_features(
         k[[d, d]] += 1e-12;
     }
     let p = k.nrows();
-    let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
+    let k_view = FaerArrayView::new(&k);
 
     enum Factor {
         Llt(FaerLlt<f64>),
@@ -201,12 +204,12 @@ pub fn compute_alo_features(
         }
     }
 
-    let factor = if let Ok(f) = FaerLlt::new(k_f.as_ref(), Side::Lower) {
+    let factor = if let Ok(f) = FaerLlt::new(k_view.as_ref(), Side::Lower) {
         // SPD fast path
         Factor::Llt(f)
     } else {
         // Robust to semi-definiteness / near-rank-deficiency without changing K
-        Factor::Ldlt(FaerLdlt::new(k_f.as_ref(), Side::Lower).map_err(|_| {
+        Factor::Ldlt(FaerLdlt::new(k_view.as_ref(), Side::Lower).map_err(|_| {
             EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
             }
@@ -241,7 +244,7 @@ pub fn compute_alo_features(
     };
 
     // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
-    let xtwx_f = FaerMat::<f64>::from_fn(p, p, |i, j| xtwx[[i, j]]);
+    let xtwx_view = FaerArrayView::new(&xtwx);
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
     let eta_hat = base.x_transformed.dot(&base.beta_transformed);
@@ -263,17 +266,29 @@ pub fn compute_alo_features(
     let mut t_buf = vec![0.0f64; p];
     let block_cols = 8192usize;
 
+    let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
+
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
         let width = chunk_end - chunk_start;
 
-        let rhs_chunk = FaerMat::<f64>::from_fn(p, width, |row, col| ut[[row, chunk_start + col]]);
+        {
+            let mut rhs_slice = rhs_chunk_buf.slice_mut(s![.., ..width]);
+            for row in 0..p {
+                for col in 0..width {
+                    rhs_slice[[row, col]] = ut[[row, chunk_start + col]];
+                }
+            }
+        }
+
+        let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
+        let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
         let mut t_chunk = FaerMat::<f64>::zeros(p, width);
         matmul(
             t_chunk.as_mut(),
             Accum::Replace,
-            xtwx_f.as_ref(),
+            xtwx_view.as_ref(),
             s_chunk.as_ref(),
             1.0,
             Par::Seq,
@@ -2817,8 +2832,8 @@ mod tests {
         // K = X' W X + S_λ (same K the ALO code uses)
         let k = fit_res.penalized_hessian_transformed.clone();
         let p = k.nrows();
-        let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-        let factor = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+        let k_view = FaerArrayView::new(&k);
+        let factor = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
 
         // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
         let xtwx = u.t().dot(&u);
@@ -2832,7 +2847,7 @@ mod tests {
             let ui = u.row(irow).to_owned();
 
             // Solve K s_i = u_i
-            let rhs = FaerMat::<f64>::from_fn(p, 1, |j, _| ui[j]);
+            let rhs = FaerColView::new(&ui);
             let si = factor.solve(rhs.as_ref());
 
             // Calculate quad = s_i' XtWX s_i
@@ -2917,13 +2932,13 @@ mod tests {
         } // tiny ridge for stability
 
         // Factor K using faer LLT
-        let k_f = FaerMat::<f64>::from_fn(p, p, |i, j| k[[i, j]]);
-        let llt = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+        let k_view = FaerArrayView::new(&k);
+        let llt = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
 
         // Compute a_ii = u_i^\top K^{-1} u_i for each observation
         for i in 0..n {
             let ui = u.row(i).to_owned();
-            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let rhs = FaerColView::new(&ui);
             let s = llt.solve(rhs.as_ref());
             let mut dot = 0.0;
             for r in 0..p {
@@ -3011,11 +3026,11 @@ mod tests {
             k_zero_ridge[[i, i]] += 1e-12;
         }
 
-        let k_zero_f = FaerMat::<f64>::from_fn(p, p, |i, j| k_zero_ridge[[i, j]]);
-        let llt_zero = FaerLlt::new(k_zero_f.as_ref(), Side::Lower).unwrap();
+        let k_zero_view = FaerArrayView::new(&k_zero_ridge);
+        let llt_zero = FaerLlt::new(k_zero_view.as_ref(), Side::Lower).unwrap();
 
         let u_zero_i = u_zero.row(test_idx).to_owned();
-        let rhs_zero = FaerMat::<f64>::from_fn(p, 1, |r, _| u_zero_i[r]);
+        let rhs_zero = FaerColView::new(&u_zero_i);
         let s_zero_i = llt_zero.solve(rhs_zero.as_ref());
 
         let mut dot_zero = 0.0;
@@ -3057,7 +3072,7 @@ mod tests {
             h[[d, d]] += 1e-12;
         }
         let p_dim = h.nrows();
-        let h_f = FaerMat::<f64>::from_fn(p_dim, p_dim, |i, j| h[[i, j]]);
+        let h_view = FaerArrayView::new(&h);
 
         enum SolverFactor {
             Llt(FaerLlt<f64>),
@@ -3072,10 +3087,11 @@ mod tests {
             }
         }
 
-        let factor = if let Ok(f) = FaerLlt::new(h_f.as_ref(), Side::Lower) {
+        let factor = if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
             SolverFactor::Llt(f)
         } else {
-            let ldlt = FaerLdlt::new(h_f.as_ref(), Side::Lower).expect("LDLT factorization failed");
+            let ldlt =
+                FaerLdlt::new(h_view.as_ref(), Side::Lower).expect("LDLT factorization failed");
             SolverFactor::Ldlt(ldlt)
         };
 
@@ -3084,8 +3100,8 @@ mod tests {
 
         // Solve H S = Uᵀ once; column i of S corresponds to s_i = H^{-1} u_i
         let rhs = ut.to_owned();
-        let rhs_f = FaerMat::<f64>::from_fn(p_dim, n, |i, j| rhs[[i, j]]);
-        let s_all = factor.solve(rhs_f.as_ref());
+        let rhs_view = FaerArrayView::new(&rhs);
+        let s_all = factor.solve(rhs_view.as_ref());
         let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
         let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
@@ -3220,10 +3236,10 @@ mod tests {
                 xtwx[[d, d]] += 1e-10;
             }
 
-            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| xtwx[[r, c]]);
-            let llt = FaerLlt::new(k_f.as_ref(), Side::Lower).unwrap();
+            let k_view = FaerArrayView::new(&xtwx);
+            let llt = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
             let ui = x_i.to_owned();
-            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let rhs = FaerColView::new(&ui);
             let sol = llt.solve(rhs.as_ref());
             let mut quad = 0.0;
             for r in 0..p {
@@ -3331,11 +3347,11 @@ mod tests {
                 k[[d, d]] += 1e-12;
             }
 
-            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
-            let llt =
-                FaerLlt::new(k_f.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
+            let k_view = FaerArrayView::new(&k);
+            let llt = FaerLlt::new(k_view.as_ref(), Side::Lower)
+                .expect("LLT should succeed for SPD K_LOO");
             let ui = x_i.to_owned();
-            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let rhs = FaerColView::new(&ui);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
             for r in 0..p {
@@ -3434,11 +3450,11 @@ mod tests {
                 k[[d, d]] += 1e-12;
             }
 
-            let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
-            let llt =
-                FaerLlt::new(k_f.as_ref(), Side::Lower).expect("LLT should succeed for SPD K_LOO");
+            let k_view = FaerArrayView::new(&k);
+            let llt = FaerLlt::new(k_view.as_ref(), Side::Lower)
+                .expect("LLT should succeed for SPD K_LOO");
             let ui = x_i.to_owned();
-            let rhs = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let rhs = FaerColView::new(&ui);
             let solved = llt.solve(rhs.as_ref());
             let mut ci = 0.0;
             for r in 0..p {
@@ -3945,12 +3961,8 @@ mod tests {
         for i in 0..s_with_tiny_ridge.ncols() {
             s_with_tiny_ridge[[i, i]] += tiny_ridge;
         }
-        let s_f = FaerMat::<f64>::from_fn(
-            s_with_tiny_ridge.nrows(),
-            s_with_tiny_ridge.ncols(),
-            |r, c| s_with_tiny_ridge[[r, c]],
-        );
-        let llt_result = FaerLlt::new(s_f.as_ref(), Side::Lower);
+        let s_view = FaerArrayView::new(&s_with_tiny_ridge);
+        let llt_result = FaerLlt::new(s_view.as_ref(), Side::Lower);
 
         assert!(
             llt_result.is_ok(),
@@ -7389,7 +7401,7 @@ mod tests {
         for d in 0..p {
             k[[d, d]] += 1e-12;
         }
-        let k_f = FaerMat::<f64>::from_fn(p, p, |r, c| k[[r, c]]);
+        let k_view = FaerArrayView::new(&k);
 
         enum Factor {
             Llt(FaerLlt<f64>),
@@ -7404,11 +7416,11 @@ mod tests {
             }
         }
 
-        let factor = FaerLlt::new(k_f.as_ref(), Side::Lower)
+        let factor = FaerLlt::new(k_view.as_ref(), Side::Lower)
             .map(Factor::Llt)
             .unwrap_or_else(|_| {
                 Factor::Ldlt(
-                    FaerLdlt::new(k_f.as_ref(), Side::Lower)
+                    FaerLdlt::new(k_view.as_ref(), Side::Lower)
                         .expect("LDLT factorization should succeed for test"),
                 )
             });
@@ -7431,7 +7443,7 @@ mod tests {
 
         for i in 0..n {
             let ui = u.row(i).to_owned();
-            let rhs_view = FaerMat::<f64>::from_fn(p, 1, |r, _| ui[r]);
+            let rhs_view = FaerColView::new(&ui);
             let si = factor.solve(rhs_view.as_ref());
             let si_arr = Array1::from_shape_fn(p, |j| si[(j, 0)]);
 
