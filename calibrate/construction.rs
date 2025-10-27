@@ -5,7 +5,7 @@ use crate::calibrate::faer_ndarray::{FaerArrayView, FaerEigh, FaerLinalgError, F
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
 use faer::mat::MatMut;
-use faer::{Accum, Mat, Par, Side};
+use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::Zip;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
@@ -225,6 +225,210 @@ fn sanitize_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
     }
 
     sanitized
+}
+
+fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
+    let (rows, cols) = array.dim();
+    Mat::from_fn(rows, cols, |i, j| array[[i, j]])
+}
+
+fn mat_to_array(mat: &Mat<f64>) -> Array2<f64> {
+    Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
+}
+
+fn mat_max_abs_element(matrix: MatRef<'_, f64>) -> f64 {
+    let (rows, cols) = matrix.shape();
+    let mut max_val = 0.0_f64;
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = matrix[(i, j)];
+            if val.is_finite() {
+                max_val = max_val.max(val.abs());
+            }
+        }
+    }
+    max_val
+}
+
+fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
+    let (rows, cols) = matrix.as_ref().shape();
+    debug_assert_eq!(rows, cols, "Matrix must be square for sanitization");
+
+    let mut sanitized = matrix.clone();
+
+    for i in 0..rows {
+        let diag = sanitized[(i, i)];
+        if !diag.is_finite() {
+            sanitized[(i, i)] = 0.0;
+        }
+        for j in (i + 1)..cols {
+            let mut upper = sanitized[(i, j)];
+            let mut lower = sanitized[(j, i)];
+            if !upper.is_finite() {
+                upper = 0.0;
+            }
+            if !lower.is_finite() {
+                lower = 0.0;
+            }
+            let avg = 0.5 * (upper + lower);
+            sanitized[(i, j)] = avg;
+            sanitized[(j, i)] = avg;
+        }
+    }
+
+    let scale = mat_max_abs_element(sanitized.as_ref());
+    let tiny = (scale * 1e-14).max(1e-30);
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = sanitized[(i, j)];
+            if !val.is_finite() {
+                sanitized[(i, j)] = 0.0;
+            } else if val.abs() < tiny {
+                sanitized[(i, j)] = 0.0;
+            }
+        }
+    }
+
+    sanitized
+}
+
+fn frobenius_norm_faer(matrix: &Mat<f64>) -> f64 {
+    let (rows, cols) = matrix.as_ref().shape();
+    let mut sum_sq = 0.0_f64;
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = matrix[(i, j)];
+            sum_sq += val * val;
+        }
+    }
+    sum_sq.sqrt()
+}
+
+fn penalty_from_root_faer(root: &Mat<f64>) -> Mat<f64> {
+    let cols = root.ncols();
+    let mut full = Mat::<f64>::zeros(cols, cols);
+    let root_ref = root.as_ref();
+    let root_t = root_ref.transpose();
+    matmul(
+        full.as_mut(),
+        Accum::Replace,
+        root_t,
+        root_ref,
+        1.0,
+        Par::Seq,
+    );
+    sanitize_symmetric_faer(&full)
+}
+
+fn robust_eigh_faer(
+    matrix: &Mat<f64>,
+    side: Side,
+    context: &str,
+) -> Result<(Vec<f64>, Mat<f64>), EstimationError> {
+    let (rows, cols) = matrix.as_ref().shape();
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = matrix[(i, j)];
+            if !val.is_finite() {
+                let max_abs = mat_max_abs_element(matrix.as_ref());
+                return Err(EstimationError::InvalidInput(format!(
+                    "{} contains non-finite entries (max finite magnitude {:.3e})",
+                    context, max_abs
+                )));
+            }
+        }
+    }
+
+    let mut candidate = sanitize_symmetric_faer(matrix);
+    let mut ridge = 0.0_f64;
+
+    for attempt in 0..4 {
+        match candidate.as_ref().self_adjoint_eigen(side) {
+            Ok(eig) => {
+                let diag = eig.S();
+                let diag_len = diag.dim();
+                let mut eigenvalues = Vec::with_capacity(diag_len);
+                let mut scale = 0.0_f64;
+                for idx in 0..diag_len {
+                    let val = diag[idx];
+                    if val.is_finite() {
+                        scale = scale.max(val.abs());
+                    }
+                    eigenvalues.push(val);
+                }
+                let tolerance = if scale.is_finite() {
+                    (scale * 1e-12).max(1e-12)
+                } else {
+                    1e-12
+                };
+
+                for val in eigenvalues.iter_mut() {
+                    if !val.is_finite() {
+                        *val = 0.0;
+                        continue;
+                    }
+                    if val.abs() < tolerance {
+                        *val = 0.0;
+                    } else if *val < 0.0 {
+                        if val.abs() <= tolerance * 10.0 {
+                            *val = 0.0;
+                        } else {
+                            log::warn!(
+                                "{} produced large negative eigenvalue {:.3e}; clamping for stability",
+                                context,
+                                *val
+                            );
+                            *val = 0.0;
+                        }
+                    }
+                }
+
+                let vectors_ref = eig.U();
+                let mut eigenvectors = Mat::<f64>::zeros(vectors_ref.nrows(), vectors_ref.ncols());
+                for i in 0..vectors_ref.nrows() {
+                    for j in 0..vectors_ref.ncols() {
+                        eigenvectors[(i, j)] = vectors_ref[(i, j)];
+                    }
+                }
+
+                return Ok((eigenvalues, eigenvectors));
+            }
+            Err(err) => {
+                if attempt == 3 {
+                    return Err(EstimationError::EigendecompositionFailed(
+                        FaerLinalgError::SelfAdjointEigen(err),
+                    ));
+                }
+
+                let mut diag_scale = 0.0_f64;
+                for idx in 0..candidate.nrows() {
+                    let val = candidate[(idx, idx)];
+                    if val.is_finite() {
+                        diag_scale = diag_scale.max(val.abs());
+                    }
+                }
+                let base = if diag_scale.is_finite() {
+                    (diag_scale * 1e-8).max(1e-10)
+                } else {
+                    1e-8
+                };
+
+                ridge = if ridge == 0.0 { base } else { ridge * 10.0 };
+                for idx in 0..candidate.nrows() {
+                    candidate[(idx, idx)] += ridge;
+                }
+
+                log::warn!(
+                    "{} eigendecomposition failed on attempt {}. Added ridge {:.3e} before retrying.",
+                    context,
+                    attempt + 1,
+                    ridge
+                );
+            }
+        }
+    }
+
+    unreachable!("robust_eigh_faer should return or error within 4 attempts")
 }
 
 fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
@@ -1932,15 +2136,23 @@ pub fn stable_reparameterization(
         });
     }
 
-    let s_original_list: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs_k| penalty_from_root(rs_k)).collect();
+    let rs_faer: Vec<Mat<f64>> = rs_list.iter().map(array_to_faer).collect();
+    let s_original_list: Vec<Mat<f64>> = rs_faer
+        .iter()
+        .map(|rs_k| penalty_from_root_faer(rs_k))
+        .collect();
 
-    let mut s_balanced = Array2::zeros((p, p));
+    let mut s_balanced = Mat::<f64>::zeros(p, p);
     let mut has_nonzero = false;
     for s_k in &s_original_list {
-        let frob_norm = s_k.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        let frob_norm = frobenius_norm_faer(s_k);
         if frob_norm > 1e-12 {
-            s_balanced.scaled_add(1.0 / frob_norm, s_k);
+            let scale = 1.0 / frob_norm;
+            for i in 0..p {
+                for j in 0..p {
+                    s_balanced[(i, j)] += scale * s_k[(i, j)];
+                }
+            }
             has_nonzero = true;
         }
     }
@@ -1957,8 +2169,8 @@ pub fn stable_reparameterization(
         });
     }
 
-    let (bal_eigenvalues, bal_eigenvectors): (Array1<f64>, Array2<f64>) =
-        robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+    let (bal_eigenvalues, bal_eigenvectors) =
+        robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
 
     let mut order: Vec<usize> = (0..p).collect();
     order.sort_by(|&i, &j| {
@@ -1968,17 +2180,17 @@ pub fn stable_reparameterization(
             .then(i.cmp(&j))
     });
 
-    let mut qs = Array2::zeros((p, p));
+    let mut qs = Mat::<f64>::zeros(p, p);
     for (col_idx, &idx) in order.iter().enumerate() {
-        qs.column_mut(col_idx).assign(&bal_eigenvectors.column(idx));
+        for row in 0..p {
+            qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
+        }
     }
 
-    let bal_eigenvalues_ordered = Array1::from(
-        order
-            .iter()
-            .map(|&idx| bal_eigenvalues[idx])
-            .collect::<Vec<_>>(),
-    );
+    let mut bal_eigenvalues_ordered = Vec::with_capacity(p);
+    for &idx in &order {
+        bal_eigenvalues_ordered.push(bal_eigenvalues[idx]);
+    }
     let max_bal = bal_eigenvalues_ordered
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -1992,34 +2204,39 @@ pub fn stable_reparameterization(
         .take_while(|&&val| val > rank_tol)
         .count();
 
-    let mut rs_transformed: Vec<Array2<f64>> =
-        rs_list.iter().map(|rs| faer_matmul(rs, &qs)).collect();
+    let mut rs_transformed: Vec<Mat<f64>> = Vec::with_capacity(m);
+    for rs in &rs_faer {
+        let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
+        matmul(
+            product.as_mut(),
+            Accum::Replace,
+            rs.as_ref(),
+            qs.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        rs_transformed.push(product);
+    }
 
-    let s_lambda = lambdas
-        .par_iter()
-        .zip(rs_transformed.par_iter())
-        .filter_map(|(&lambda, rs_k)| {
-            if lambda == 0.0 {
-                return None;
+    let mut s_lambda = Mat::<f64>::zeros(p, p);
+    for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
+        let s_k = penalty_from_root_faer(rs_k);
+        for i in 0..p {
+            for j in 0..p {
+                s_lambda[(i, j)] += *lambda * s_k[(i, j)];
             }
-
-            let mut s_k = penalty_from_root(rs_k);
-            if lambda != 1.0 {
-                s_k.mapv_inplace(|val| val * lambda);
-            }
-            Some(s_k)
-        })
-        .reduce(|| Array2::zeros((p, p)), |mut acc, contrib| {
-            acc += &contrib;
-            acc
-        });
+        }
+    }
 
     if penalized_rank > 0 {
-        let range_block = s_lambda
-            .slice(s![..penalized_rank, ..penalized_rank])
-            .to_owned();
-        let (range_eigenvalues, range_eigenvectors): (Array1<f64>, Array2<f64>) =
-            robust_eigh(&range_block, Side::Lower, "range penalty block")?;
+        let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
+        for i in 0..penalized_rank {
+            for j in 0..penalized_rank {
+                range_block[(i, j)] = s_lambda[(i, j)];
+            }
+        }
+        let (range_eigenvalues, range_eigenvectors) =
+            robust_eigh_faer(&range_block, Side::Lower, "range penalty block")?;
 
         let mut range_order: Vec<usize> = (0..penalized_rank).collect();
         range_order.sort_by(|&i, &j| {
@@ -2029,40 +2246,75 @@ pub fn stable_reparameterization(
                 .then(i.cmp(&j))
         });
 
-        let mut range_rotation = Array2::zeros((penalized_rank, penalized_rank));
+        let mut range_rotation = Mat::<f64>::zeros(penalized_rank, penalized_rank);
         for (col_idx, &idx) in range_order.iter().enumerate() {
-            range_rotation
-                .column_mut(col_idx)
-                .assign(&range_eigenvectors.column(idx));
+            for row in 0..penalized_rank {
+                range_rotation[(row, col_idx)] = range_eigenvectors[(row, idx)];
+            }
         }
 
-        let qs_range = qs
-            .slice(s![.., ..penalized_rank])
-            .to_owned()
-            .dot(&range_rotation);
-        qs.slice_mut(s![.., ..penalized_rank]).assign(&qs_range);
+        let mut qs_subset = Mat::<f64>::zeros(p, penalized_rank);
+        for row in 0..p {
+            for col in 0..penalized_rank {
+                qs_subset[(row, col)] = qs[(row, col)];
+            }
+        }
+        let mut qs_range = Mat::<f64>::zeros(p, penalized_rank);
+        matmul(
+            qs_range.as_mut(),
+            Accum::Replace,
+            qs_subset.as_ref(),
+            range_rotation.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        for row in 0..p {
+            for col in 0..penalized_rank {
+                qs[(row, col)] = qs_range[(row, col)];
+            }
+        }
 
         for rs in rs_transformed.iter_mut() {
             if rs.ncols() >= penalized_rank {
-                let updated = rs
-                    .slice(s![.., ..penalized_rank])
-                    .to_owned()
-                    .dot(&range_rotation);
-                rs.slice_mut(s![.., ..penalized_rank]).assign(&updated);
+                let rows = rs.nrows();
+                let mut rs_subset = Mat::<f64>::zeros(rows, penalized_rank);
+                for i in 0..rows {
+                    for j in 0..penalized_rank {
+                        rs_subset[(i, j)] = rs[(i, j)];
+                    }
+                }
+                let mut updated = Mat::<f64>::zeros(rows, penalized_rank);
+                matmul(
+                    updated.as_mut(),
+                    Accum::Replace,
+                    rs_subset.as_ref(),
+                    range_rotation.as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
+                for i in 0..rows {
+                    for j in 0..penalized_rank {
+                        rs[(i, j)] = updated[(i, j)];
+                    }
+                }
             }
         }
     }
 
-    let mut s_transformed = Array2::zeros((p, p));
-    let mut s_k_transformed_cache: Vec<Array2<f64>> = Vec::with_capacity(m);
+    let mut s_transformed = Mat::<f64>::zeros(p, p);
+    let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
     for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-        let s_k = penalty_from_root(rs_k);
-        s_transformed.scaled_add(*lambda, &s_k);
+        let s_k = penalty_from_root_faer(rs_k);
+        for i in 0..p {
+            for j in 0..p {
+                s_transformed[(i, j)] += *lambda * s_k[(i, j)];
+            }
+        }
         s_k_transformed_cache.push(s_k);
     }
 
-    let (s_eigenvalues_raw, s_eigenvectors): (Array1<f64>, Array2<f64>) =
-        robust_eigh(&s_transformed, Side::Lower, "combined penalty matrix")?;
+    let (s_eigenvalues_raw, s_eigenvectors) =
+        robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
 
     let max_eigenval = s_eigenvalues_raw
         .iter()
@@ -2075,23 +2327,19 @@ pub fn stable_reparameterization(
     let penalty_rank = s_eigenvalues_raw
         .iter()
         .filter(|&&ev| ev > tolerance)
-        .count()
-        .max(0);
+        .count();
 
-    let mut e_matrix = Array2::zeros((p, penalty_rank));
-    let mut col_idx = 0;
+    let mut e_transformed_mat = Mat::<f64>::zeros(penalty_rank, p);
+    let mut row_idx = 0;
     for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = s_eigenvectors.column(i);
-            e_matrix
-                .column_mut(col_idx)
-                .assign(&(&eigenvec * sqrt_eigenval));
-            col_idx += 1;
+            for row in 0..p {
+                e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, i)] * sqrt_eigenval;
+            }
+            row_idx += 1;
         }
     }
-
-    let e_transformed = e_matrix.t().to_owned();
 
     let log_det: f64 = s_eigenvalues_raw
         .iter()
@@ -2099,34 +2347,49 @@ pub fn stable_reparameterization(
         .map(|&ev| ev.ln())
         .sum();
 
-    let mut det1 = Array1::zeros(lambdas.len());
+    let mut det1_vec = vec![0.0; lambdas.len()];
 
-    let mut s_plus = Array2::zeros((p, p));
-    for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
+    let mut s_plus = Mat::<f64>::zeros(p, p);
+    for (idx, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
         if eigenval > tolerance {
-            let v_i = s_eigenvectors.column(i);
-            let outer_product = v_i
-                .to_owned()
-                .insert_axis(Axis(1))
-                .dot(&v_i.to_owned().insert_axis(Axis(0)));
-            s_plus.scaled_add(1.0 / eigenval, &outer_product);
+            let inv = 1.0 / eigenval;
+            for i in 0..p {
+                let vi = s_eigenvectors[(i, idx)];
+                for j in 0..p {
+                    s_plus[(i, j)] += inv * vi * s_eigenvectors[(j, idx)];
+                }
+            }
         }
     }
 
-    for k in 0..lambdas.len() {
-        let s_plus_times_s_k = s_plus.dot(&s_k_transformed_cache[k]);
-        let trace: f64 = s_plus_times_s_k.diag().sum();
-        det1[k] = lambdas[k] * trace;
+    for (k, lambda) in lambdas.iter().enumerate() {
+        let mut product = Mat::<f64>::zeros(p, p);
+        matmul(
+            product.as_mut(),
+            Accum::Replace,
+            s_plus.as_ref(),
+            s_k_transformed_cache[k].as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        let mut trace = 0.0_f64;
+        for i in 0..p {
+            trace += product[(i, i)];
+        }
+        det1_vec[k] = *lambda * trace;
     }
 
     Ok(ReparamResult {
-        s_transformed,
+        s_transformed: mat_to_array(&s_transformed),
         log_det,
-        det1,
-        qs,
-        rs_transformed: rs_transformed.clone(),
-        rs_transposed: rs_transformed.iter().map(|m| transpose_owned(m)).collect(),
-        e_transformed,
+        det1: Array1::from(det1_vec),
+        qs: mat_to_array(&qs),
+        rs_transformed: rs_transformed.iter().map(|mat| mat_to_array(mat)).collect(),
+        rs_transposed: rs_transformed
+            .iter()
+            .map(|mat| Array2::from_shape_fn((mat.ncols(), mat.nrows()), |(i, j)| mat[(j, i)]))
+            .collect(),
+        e_transformed: mat_to_array(&e_transformed_mat),
     })
 }
 
