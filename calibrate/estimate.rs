@@ -27,6 +27,7 @@ use wolfe_bfgs::{Bfgs, BfgsSolution};
 use self::internal::RemlState;
 
 // Crate-level imports
+use crate::calibrate::basis;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
@@ -36,6 +37,23 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
+
+fn log_basis_cache_stats(context: &str) {
+    let stats = basis::basis_cache_stats();
+    let total = stats.hits.saturating_add(stats.misses);
+    let hit_rate = if total > 0 {
+        (stats.hits as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    log::info!(
+        "Basis cache stats [{}]: hits={}, misses={}, hit_rate={:.2}%",
+        context,
+        stats.hits,
+        stats.misses,
+        hit_rate
+    );
+}
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
@@ -719,6 +737,8 @@ pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
+    basis::clear_basis_cache();
+
     log::info!(
         "Starting model training with REML. {} total samples.",
         data.y.len()
@@ -874,6 +894,8 @@ pub fn train_model(
         trained_model
             .assert_layout_consistency_with_layout(&layout)
             .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
+
+        log_basis_cache_stats("train_model");
 
         return Ok(trained_model);
     }
@@ -1535,6 +1557,8 @@ pub fn train_model(
     trained_model
         .assert_layout_consistency_with_layout(&layout)
         .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
+
+    log_basis_cache_stats("train_model");
 
     Ok(trained_model)
 }
