@@ -604,25 +604,45 @@ fn run_bfgs_for_candidate(
     Ok((solution, grad_norm_rho, is_stationary))
 }
 
-fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+fn rho_soft_prior_components(
+    rho: &Array1<f64>,
+    mut grad_out: Option<ndarray::ArrayViewMut1<'_, f64>>,
+) -> f64 {
     let len = rho.len();
     if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-        return (0.0, Array1::zeros(len));
+        if let Some(mut grad) = grad_out {
+            grad.fill(0.0);
+        }
+        return 0.0;
     }
 
     let inv_bound = 1.0 / RHO_BOUND;
     let sharp = RHO_SOFT_PRIOR_SHARPNESS;
-    let mut grad = Array1::zeros(len);
+    if let Some(ref mut grad) = grad_out {
+        grad.fill(0.0);
+    }
     let mut cost = 0.0;
     for (idx, &ri) in rho.iter().enumerate() {
         let scaled = sharp * ri * inv_bound;
         cost += scaled.cosh().ln();
-        grad[idx] = sharp * inv_bound * scaled.tanh();
+        if let Some(ref mut grad) = grad_out {
+            grad[idx] = sharp * inv_bound * scaled.tanh();
+        }
     }
     if RHO_SOFT_PRIOR_WEIGHT != 1.0 {
-        grad.mapv_inplace(|g| g * RHO_SOFT_PRIOR_WEIGHT);
         cost *= RHO_SOFT_PRIOR_WEIGHT;
+        if let Some(ref mut grad) = grad_out {
+            for g in grad.iter_mut() {
+                *g *= RHO_SOFT_PRIOR_WEIGHT;
+            }
+        }
     }
+    cost
+}
+
+fn rho_soft_prior(rho: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut grad = Array1::zeros(rho.len());
+    let cost = rho_soft_prior_components(rho, Some(grad.view_mut()));
     (cost, grad)
 }
 
@@ -2023,8 +2043,15 @@ pub mod internal {
         rho_temp: Array1<f64>,
         grad_primary: Array1<f64>,
         grad_secondary: Array1<f64>,
+        lambda_buffer: Array1<f64>,
+        rho_log_buffer: Array1<f64>,
+        cost_gradient: Array1<f64>,
+        prior_grad: Array1<f64>,
         concat: Array2<f64>,
         solved: Array2<f64>,
+        xtwx: Array2<f64>,
+        h_raw: Array2<f64>,
+        e_t: Array2<f64>,
         block_ranges: Vec<(usize, usize)>,
         solved_rows: usize,
     }
@@ -2037,11 +2064,37 @@ pub mod internal {
                 rho_temp: Array1::zeros(max_penalties),
                 grad_primary: Array1::zeros(max_penalties),
                 grad_secondary: Array1::zeros(max_penalties),
+                lambda_buffer: Array1::zeros(max_penalties),
+                rho_log_buffer: Array1::zeros(max_penalties),
+                cost_gradient: Array1::zeros(max_penalties),
+                prior_grad: Array1::zeros(max_penalties),
                 concat: Array2::zeros((coeffs, total_rank)),
                 solved: Array2::zeros((coeffs, total_rank)),
+                xtwx: Array2::zeros((coeffs, coeffs)),
+                h_raw: Array2::zeros((coeffs, coeffs)),
+                e_t: Array2::zeros((coeffs, total_rank)),
                 block_ranges: Vec::with_capacity(max_penalties),
-                solved_rows: coeffs,
+                solved_rows: 0,
             }
+        }
+
+        fn reset(&mut self) {
+            self.rho_plus.fill(0.0);
+            self.rho_minus.fill(0.0);
+            self.rho_temp.fill(0.0);
+            self.grad_primary.fill(0.0);
+            self.grad_secondary.fill(0.0);
+            self.lambda_buffer.fill(0.0);
+            self.rho_log_buffer.fill(0.0);
+            self.cost_gradient.fill(0.0);
+            self.prior_grad.fill(0.0);
+            self.concat.fill(0.0);
+            self.solved.fill(0.0);
+            self.xtwx.fill(0.0);
+            self.h_raw.fill(0.0);
+            self.e_t.fill(0.0);
+            self.block_ranges.clear();
+            self.solved_rows = 0;
         }
 
         fn reset_block_ranges(&mut self) {
@@ -2265,7 +2318,7 @@ pub mod internal {
         /// Creates a sanitized cache key from rho values.
         /// Returns None if any component is NaN, which indicates that caching should be skipped.
         /// Maps -0.0 to 0.0 to ensure consistency in caching.
-        fn rho_key_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
+        fn rho_key_sanitized(&self, rho: ArrayView1<'_, f64>) -> Option<Vec<u64>> {
             let mut key = Vec::with_capacity(rho.len());
             for &v in rho.iter() {
                 if v.is_nan() {
@@ -2297,7 +2350,7 @@ pub mod internal {
         }
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
-            let key = self.rho_key_sanitized(rho);
+            let key = self.rho_key_sanitized(rho.view());
             if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
                 if existing.matches(&key) {
                     return Ok(existing.clone());
@@ -2328,8 +2381,10 @@ pub mod internal {
         fn edf_from_h_and_rk(
             &self,
             pr: &PirlsResult,
-            lambdas: &Array1<f64>,
+            lambdas: ndarray::ArrayView1<'_, f64>,
             h_eff: &Array2<f64>,
+            rho_log_buffer: &mut Array1<f64>,
+            e_t_buffer: &mut Array2<f64>,
         ) -> Result<f64, EstimationError> {
             // Why caching by ρ is sound:
             // The effective degrees of freedom (EDF) calculation is one of only two places where
@@ -2347,13 +2402,25 @@ pub mod internal {
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
 
             // Factor the effective Hessian once
-            let rho_like = lambdas.mapv(|lam| lam.ln());
-            let factor = self.get_faer_factor(&rho_like, h_eff);
+            let len = lambdas.len();
+            if len > 0 {
+                for (dst, &lam) in rho_log_buffer.iter_mut().take(len).zip(lambdas.iter()) {
+                    *dst = lam.ln();
+                }
+            }
+            let rho_like = rho_log_buffer.slice(s![..len]);
+            let factor = self.get_faer_factor(rho_like, h_eff);
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
-            let e_t = pr.reparam_result.e_transformed.t().to_owned(); // (p × rank_total)
-            let e_view = FaerArrayView::new(&e_t);
+            let rows = pr.beta_transformed.len();
+            let cols = pr.reparam_result.e_transformed.nrows();
+            {
+                let mut e_t_slice = e_t_buffer.slice_mut(s![..rows, ..cols]);
+                e_t_slice.assign(&pr.reparam_result.e_transformed.t());
+            }
+            let e_t_slice = e_t_buffer.slice(s![..rows, ..cols]);
+            let e_view = FaerArrayView::new(&e_t_slice);
             let x = factor.solve(e_view.as_ref());
             let trace_h_inv_s_lambda = faer_frob_inner(x.as_ref(), e_view.as_ref());
 
@@ -2427,7 +2494,7 @@ pub mod internal {
             }
         }
 
-        fn get_faer_factor(&self, rho: &Array1<f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
+        fn get_faer_factor(&self, rho: ArrayView1<'_, f64>, h: &Array2<f64>) -> Arc<FaerFactor> {
             // Cache strategy: ρ alone is the key.
             // The cache deliberately ignores which Hessian matrix we are factoring.  Today this is
             // sound because every caller obeys a single rule:
@@ -2606,7 +2673,7 @@ pub mod internal {
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
-            let key_opt = self.rho_key_sanitized(rho);
+            let key_opt = self.rho_key_sanitized(rho.view());
             if let Some(key) = &key_opt {
                 if let Some(cached_result) = self.cache.borrow().get(key) {
                     return Ok(Arc::clone(cached_result));
@@ -2744,6 +2811,10 @@ pub mod internal {
             let h_eff = bundle.h_eff.as_ref();
             let ridge_used = bundle.ridge_used;
 
+            let mut workspace_ref = self.workspace.borrow_mut();
+            workspace_ref.reset();
+            let workspace = &mut *workspace_ref;
+
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
             if !p.is_empty() {
                 let kλ = p.len();
@@ -2795,7 +2866,12 @@ pub mod internal {
                     }
                 }
             }
-            let lambdas = p.mapv(f64::exp);
+            let len = p.len();
+            if len > 0 {
+                for (dst, &rho_val) in workspace.lambda_buffer.iter_mut().take(len).zip(p.iter()) {
+                    *dst = rho_val.exp();
+                }
+            }
 
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
@@ -2853,7 +2929,13 @@ pub mod internal {
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
 
                     // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(
+                        pirls_result,
+                        workspace.lambda_buffer.slice(s![..len]),
+                        h_eff,
+                        &mut workspace.rho_log_buffer,
+                        &mut workspace.e_t,
+                    )?;
                     eprintln!("[Diag] EDF total={:.3}", edf);
 
                     if n - edf < 1.0 {
@@ -2894,7 +2976,7 @@ pub mod internal {
                         + 0.5 * (log_det_h - log_det_s_plus)
                         + ((n - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
-                    let (prior_cost, _) = rho_soft_prior(p);
+                    let prior_cost = rho_soft_prior_components(p, None);
 
                     // Return the REML score (which is a negative log-likelihood, i.e., a cost to be minimized)
                     Ok(reml + prior_cost)
@@ -2949,12 +3031,18 @@ pub mod internal {
                     // Diagnostics: effective degrees of freedom via trace identity
                     // EDF = p - tr(H^{-1} S_λ), computed using the same stabilized Hessian
                     let p_eff = pirls_result.beta_transformed.len() as f64;
-                    let edf = self.edf_from_h_and_rk(pirls_result, &lambdas, h_eff)?;
+                    let edf = self.edf_from_h_and_rk(
+                        pirls_result,
+                        lambdas,
+                        h_eff,
+                        &mut workspace.rho_log_buffer,
+                        &mut workspace.e_t,
+                    )?;
                     let trace_h_inv_s_lambda = (p_eff - edf).max(0.0);
 
                     // Build raw Hessian for diagnostic condition number comparison
-                    let mut xtwx =
-                        Array2::<f64>::zeros((self.layout.total_coeffs, self.layout.total_coeffs));
+                    let xtwx = &mut workspace.xtwx;
+                    xtwx.fill(0.0);
                     let x_orig = self.x();
                     let w_orig = self.weights();
                     for i in 0..x_orig.nrows() {
@@ -2967,8 +3055,10 @@ pub mod internal {
                         }
                     }
 
-                    let mut h_raw = xtwx.clone();
-                    for (k, &lambda) in lambdas.iter().enumerate() {
+                    let h_raw = &mut workspace.h_raw;
+                    h_raw.assign(xtwx);
+                    for k in 0..len {
+                        let lambda = workspace.lambda_buffer[k];
                         let s_k = &self.s_full_list[k];
                         if lambda != 0.0 {
                             h_raw.scaled_add(lambda, s_k);
@@ -3015,7 +3105,7 @@ pub mod internal {
                         laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
                     );
 
-                    let (prior_cost, _) = rho_soft_prior(p);
+                    let prior_cost = rho_soft_prior_components(p, None);
 
                     Ok(-laml + prior_cost)
                 }
@@ -3330,9 +3420,14 @@ pub mod internal {
             let rs_transposed = &reparam_result.rs_transposed;
 
             let mut workspace_ref = self.workspace.borrow_mut();
+            workspace_ref.reset();
             let workspace = &mut *workspace_ref;
             let len = p.len();
-            let mut cost_gradient = Array1::zeros(len);
+            if len > 0 {
+                for (dst, &rho_val) in workspace.lambda_buffer.iter_mut().take(len).zip(p.iter()) {
+                    *dst = rho_val.exp();
+                }
+            }
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
@@ -3361,7 +3456,6 @@ pub mod internal {
             }
 
             // --- Extract common components ---
-            let lambdas = p.mapv(f64::exp); // This is λ
 
             let n = self.y.len() as f64;
 
@@ -3381,7 +3475,7 @@ pub mod internal {
                     let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
                     let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
 
-                    let factor_g = self.get_faer_factor(p, h_eff);
+                    let factor_g = self.get_faer_factor(p.view(), h_eff);
                     let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
                     let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
                     let scale = dp_c / (n - mp).max(LAML_RIDGE);
@@ -3391,10 +3485,9 @@ pub mod internal {
                             "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
                             dp_c
                         );
-                        let mut grad_total_view =
-                            workspace.grad_secondary.slice_mut(s![..lambdas.len()]);
+                        let mut grad_total_view = workspace.grad_secondary.slice_mut(s![..len]);
                         grad_total_view.fill(0.0);
-                        for k in 0..lambdas.len() {
+                        for k in 0..len {
                             let h = 1e-3_f64 * (1.0 + p[k].abs());
                             if h == 0.0 {
                                 continue;
@@ -3477,7 +3570,7 @@ pub mod internal {
                         workspace.solved_rows = 0;
                     }
 
-                    for k in 0..lambdas.len() {
+                    for k in 0..len {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
                         let r_beta = r_k.dot(beta_transformed);
@@ -3489,7 +3582,8 @@ pub mod internal {
                         // dφ/dρ contribution.  This matches Wood (2011) and mgcv’s
                         // `REML1 <- oo$D1/(2*scale*gamma)` expression.
 
-                        let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
+                        let lambda = workspace.lambda_buffer[k];
+                        let d1 = lambda * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
                         let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
                         // Component 2: derivative of the penalized Hessian determinant.
@@ -3512,7 +3606,7 @@ pub mod internal {
                                         .zip(rt_block.iter())
                                         .map(|(&x, &y)| x * y),
                                 );
-                                let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
+                                let tra1 = lambda * trace_h_inv_s_k; // Corresponds to oo$trA1
                                 tra1 / 2.0
                             } else {
                                 0.0
@@ -3532,7 +3626,7 @@ pub mod internal {
                         // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
                         // the gradient already accounts for the changing scale; adding dφ/dρ here would
                         // double-count the effect and contradict the envelope theorem.
-                        cost_gradient[k] =
+                        workspace.cost_gradient[k] =
                             deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
                     }
                 }
@@ -3591,7 +3685,7 @@ pub mod internal {
                     );
 
                     // --- Loop through penalties to assemble gradient components ---
-                    for k in 0..lambdas.len() {
+                    for k in 0..len {
                         // (1) ½ d log|H| / dρ_k using FULL numeric derivative (consistent with cost)
                         let log_det_h_grad_term = g_half_logh[k];
 
@@ -3603,7 +3697,7 @@ pub mod internal {
 
                         // Final assembly for COST gradient:
                         // dC/dρ_k = (- d penalised_ll / dρ_k) + ½ d log|H|/dρ_k − ½ d log|S_λ|_+/dρ_k
-                        cost_gradient[k] =
+                        workspace.cost_gradient[k] =
                             pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
 
                         // Per-component gradient breakdown for observability
@@ -3612,7 +3706,7 @@ pub mod internal {
                             pll_grad_term,
                             log_det_h_grad_term,
                             -0.5 * det1_full[k],
-                            cost_gradient[k]
+                            workspace.cost_gradient[k]
                         );
                     }
                     // mgcv-style assembly
@@ -3620,8 +3714,16 @@ pub mod internal {
                 }
             }
 
-            let (_, prior_grad) = rho_soft_prior(p);
-            cost_gradient += &prior_grad;
+            {
+                let prior_grad_view = workspace.prior_grad.slice_mut(s![..len]);
+                let _ = rho_soft_prior_components(p, Some(prior_grad_view));
+            }
+            {
+                let prior_grad_view = workspace.prior_grad.slice(s![..len]);
+                for i in 0..len {
+                    workspace.cost_gradient[i] += prior_grad_view[i];
+                }
+            }
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
             // The cost_gradient variable as computed above is already -∇V(ρ),
@@ -3633,7 +3735,9 @@ pub mod internal {
                 let h = 1e-4;
                 workspace.rho_temp.fill(0.0);
                 workspace.rho_temp[0] = 1.0; // pick k=0 or max|grad|
-                let gdot = cost_gradient.dot(&workspace.rho_temp);
+                let grad_view = workspace.cost_gradient.slice(s![..len]);
+                let direction = workspace.rho_temp.slice(s![..len]);
+                let gdot = grad_view.dot(&direction);
 
                 workspace.rho_plus.assign(p);
                 for i in 0..p.len() {
@@ -3662,7 +3766,8 @@ pub mod internal {
                 );
 
                 // Check for exploding gradients
-                let big = cost_gradient
+                let big = workspace
+                    .cost_gradient
                     .iter()
                     .map(|x| x.abs())
                     .fold(0. / 0., f64::max);
@@ -3675,7 +3780,7 @@ pub mod internal {
                 }
             }
 
-            Ok(cost_gradient)
+            Ok(workspace.cost_gradient.slice(s![..len]).to_owned())
         }
     }
 
@@ -4716,7 +4821,7 @@ pub mod internal {
             // ½·λk tr(H_eff⁻¹ S_k)
             let pr = state.execute_pirls_if_needed(rho).expect("pirls");
             let (h_eff, _) = state.effective_hessian(&pr).expect("effective Hessian");
-            let factor = state.get_faer_factor(rho, &h_eff);
+            let factor = state.get_faer_factor(rho.view(), &h_eff);
             let lambdas = rho.mapv(f64::exp);
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {

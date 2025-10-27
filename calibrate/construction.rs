@@ -1678,10 +1678,13 @@ pub fn stable_reparameterization(
             }
             Some(s_k)
         })
-        .reduce(|| Array2::zeros((p, p)), |mut acc, contrib| {
-            acc += &contrib;
-            acc
-        });
+        .reduce(
+            || Array2::zeros((p, p)),
+            |mut acc, contrib| {
+                acc += &contrib;
+                acc
+            },
+        );
 
     if penalized_rank > 0 {
         let range_block = s_lambda
