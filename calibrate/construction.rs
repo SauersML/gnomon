@@ -2696,6 +2696,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 0,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config,
             pc_configs,
             pgs_range: range_from_column(&data.p),
@@ -3474,6 +3475,7 @@ mod tests {
             _,
             _,
             _,
+            _,
         ) = build_design_and_penalty_matrices(data_train, config).expect("build matrices");
         let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
         let reparam = stable_reparameterization(&rs_list, &trained.lambdas, &layout)
@@ -3485,16 +3487,28 @@ mod tests {
         for (lambda, s_k) in trained.lambdas.iter().zip(s_list.iter()) {
             s_lambda_original.scaled_add(*lambda, s_k);
         }
-        let (eigs_original, _) =
-            s_lambda_original.clone().eigh(Side::Upper).expect("eigh original");
+        let (eigs_original, _) = s_lambda_original
+            .clone()
+            .eigh(Side::Upper)
+            .expect("eigh original");
+        let eigs_original: Array1<f64> = eigs_original;
         let (eigs_transformed, _) = reparam
             .s_transformed
             .clone()
             .eigh(Side::Upper)
             .expect("eigh transformed");
+        let eigs_transformed: Array1<f64> = eigs_transformed;
         let eig_tol = 1e-8;
-        let null_orig = eigs_original.iter().filter(|&&v| v < eig_tol).count();
-        let null_trans = eigs_transformed.iter().filter(|&&v| v < eig_tol).count();
+        let null_orig = eigs_original
+            .iter()
+            .cloned()
+            .filter(|v| *v < eig_tol)
+            .count();
+        let null_trans = eigs_transformed
+            .iter()
+            .cloned()
+            .filter(|v| *v < eig_tol)
+            .count();
         assert_eq!(
             null_orig, null_trans,
             "// VIOLATION: Null space dimension changed after reparameterization"
@@ -3502,8 +3516,9 @@ mod tests {
 
         let log_det_direct: f64 = eigs_original
             .iter()
-            .filter(|&&v| v > eig_tol)
-            .map(|&v| v.ln())
+            .cloned()
+            .filter(|&v| v > eig_tol)
+            .map(|v| v.ln())
             .sum();
         assert!(
             reparam.log_det.is_finite(),
