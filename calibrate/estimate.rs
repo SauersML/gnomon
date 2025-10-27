@@ -24,6 +24,9 @@
 // External Crate for Optimization
 use wolfe_bfgs::{Bfgs, BfgsSolution};
 
+#[allow(unused_imports)]
+use rayon::iter::IntoParallelIterator;
+
 use self::internal::RemlState;
 
 // Crate-level imports

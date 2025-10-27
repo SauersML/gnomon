@@ -2491,6 +2491,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 0,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config,
             pc_configs,
             pgs_range: range_from_column(&data.p),
@@ -3269,6 +3270,7 @@ mod tests {
             _,
             _,
             _,
+            _,
         ) = build_design_and_penalty_matrices(data_train, config).expect("build matrices");
         let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
         let reparam = stable_reparameterization(&rs_list, &trained.lambdas, &layout)
@@ -3288,8 +3290,12 @@ mod tests {
             .eigh(Side::Upper)
             .expect("eigh transformed");
         let eig_tol = 1e-8;
-        let null_orig = eigs_original.iter().filter(|&&v| v < eig_tol).count();
-        let null_trans = eigs_transformed.iter().filter(|&&v| v < eig_tol).count();
+        let null_orig = eigs_original.iter().copied().filter(|&v| v < eig_tol).count();
+        let null_trans = eigs_transformed
+            .iter()
+            .copied()
+            .filter(|&v| v < eig_tol)
+            .count();
         assert_eq!(
             null_orig, null_trans,
             "// VIOLATION: Null space dimension changed after reparameterization"
@@ -3297,8 +3303,9 @@ mod tests {
 
         let log_det_direct: f64 = eigs_original
             .iter()
-            .filter(|&&v| v > eig_tol)
-            .map(|&v| v.ln())
+            .copied()
+            .filter(|&v| v > eig_tol)
+            .map(|v| v.ln())
             .sum();
         assert!(
             reparam.log_det.is_finite(),
