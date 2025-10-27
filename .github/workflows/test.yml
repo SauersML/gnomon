@@ -123,11 +123,14 @@ jobs:
       - name: Run Rust unit tests
         id: test_step
         if: steps.rust_changes.outputs.core == 'true'
-        run: >-
-          cargo +nightly test --release --
-          --show-output
-          --skip calibrate::
-          --skip map::
+        run: |
+          set -euo pipefail
+          rm -f cargo-test.log
+          cargo +nightly test --release -- \
+            --show-output \
+            --skip calibrate:: \
+            --skip map:: \
+            2>&1 | tee cargo-test.log
         continue-on-error: true
 
       - name: Run score-specific tests
@@ -270,7 +273,23 @@ jobs:
           if [[ -f report.md ]]; then
             cp report.md build-output/
           fi
+          if [[ -f cargo-test.log ]]; then
+            cp cargo-test.log build-output/
+          fi
           rm -rf target/debug target/.fingerprint target/incremental
+
+      - name: Summarize Rust test failures
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
+        shell: bash
+        run: |
+          if [[ ! -s cargo-test.log ]]; then
+            echo "::warning::cargo-test.log missing or empty; skipping failure summary."
+            exit 0
+          fi
+          echo '=== Rust test failure context (FAILED ±20 lines) ==='
+          if ! rg --color=never --no-heading --context 20 'FAILED' cargo-test.log; then
+            echo "::warning::No lines containing 'FAILED' found in cargo-test.log."
+          fi
 
       - name: Cleanup workspace leftovers (always)
         if: always()
