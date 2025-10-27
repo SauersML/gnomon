@@ -2461,23 +2461,6 @@ pub mod internal {
             fact
         }
 
-        /// Evaluate the penalized log-likelihood part at rho using the converged PIRLS state.
-        /// Matches compute_cost’s definition: penalised_ll = -0.5*deviance - 0.5*beta'S_lambda beta.
-        fn penalised_ll_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-            let pr = self.execute_pirls_if_needed(rho)?;
-            let penalty = pr.stable_penalty_term;
-            let penalised = -0.5 * pr.deviance - 0.5 * penalty;
-            if self.config.firth_bias_reduction
-                && matches!(self.config.link_function, LinkFunction::Logit)
-            {
-                // The Jeffreys prior adjustment stabilizes the inner IRLS solve but
-                // should not feed into the smoothing-parameter objective.  Treat the
-                // stored log-determinant as constant with respect to ρ.
-                let _ = pr.firth_log_det;
-            }
-            Ok(penalised)
-        }
-
         /// Numerical gradient of the penalized log-likelihood part w.r.t. rho via central differences.
         /// Returns g_pll where g_pll[k] = - d/d rho_k penalised_ll(rho), suitable for COST gradient assembly.
         #[cfg(test)]
@@ -2499,25 +2482,79 @@ pub mod internal {
                 return Ok(Array1::zeros(0));
             }
 
+            let x = self.x;
+            let offset_view = self.offset.view();
+            let y = self.y;
+            let weights = self.weights;
+            let rs_list = &self.rs_list;
+            let layout = self.layout;
+            let config = self.config;
+            let firth_bias = config.firth_bias_reduction;
+            let link_is_logit = matches!(config.link_function, LinkFunction::Logit);
+
+            // Run a fresh PIRLS solve for each perturbed smoothing vector.  We avoid the
+            // `execute_pirls_if_needed` cache here because these evaluations happen in parallel
+            // and never reuse the same ρ, so the cache would not help and would require
+            // synchronization across threads.
+            let evaluate_penalised_ll = |rho_vec: &Array1<f64>| -> Result<f64, EstimationError> {
+                let pirls_result = pirls::fit_model_for_fixed_rho(
+                    rho_vec.view(),
+                    x,
+                    offset_view,
+                    y,
+                    weights,
+                    rs_list,
+                    layout,
+                    config,
+                )?;
+
+                match pirls_result.status {
+                    pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                        let penalty = pirls_result.stable_penalty_term;
+                        let penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                        if firth_bias && link_is_logit {
+                            let _ = pirls_result.firth_log_det;
+                        }
+                        Ok(penalised)
+                    }
+                    pirls::PirlsStatus::Unstable => {
+                        Err(EstimationError::PerfectSeparationDetected {
+                            iteration: pirls_result.iteration,
+                            max_abs_eta: pirls_result.max_abs_eta,
+                        })
+                    }
+                    pirls::PirlsStatus::MaxIterationsReached => {
+                        Err(EstimationError::PirlsDidNotConverge {
+                            max_iterations: pirls_result.iteration,
+                            last_change: 0.0,
+                        })
+                    }
+                }
+            };
+
+            let grad_values = (0..len)
+                .into_par_iter()
+                .map(|k| -> Result<f64, EstimationError> {
+                    let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
+                    let h_abs = 1e-5_f64;
+                    let h = h_rel.max(h_abs);
+
+                    let mut rho_plus = rho.clone();
+                    rho_plus[k] += 0.5 * h;
+                    let mut rho_minus = rho.clone();
+                    rho_minus[k] -= 0.5 * h;
+
+                    let fp = evaluate_penalised_ll(&rho_plus)?;
+                    let fm = evaluate_penalised_ll(&rho_minus)?;
+                    Ok(-(fp - fm) / h)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let grad_array = Array1::from_vec(grad_values);
             let mut g_view = workspace.grad_secondary.slice_mut(s![..len]);
-            g_view.fill(0.0);
+            g_view.assign(&grad_array);
 
-            for k in 0..len {
-                let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
-                let h_abs = 1e-5_f64;
-                let h = h_rel.max(h_abs);
-
-                workspace.rho_plus.assign(rho);
-                workspace.rho_plus[k] += 0.5 * h;
-                workspace.rho_minus.assign(rho);
-                workspace.rho_minus[k] -= 0.5 * h;
-
-                let fp = self.penalised_ll_at(&workspace.rho_plus)?;
-                let fm = self.penalised_ll_at(&workspace.rho_minus)?;
-                g_view[k] = -(fp - fm) / h;
-            }
-
-            Ok(g_view.to_owned())
+            Ok(grad_array)
         }
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
@@ -3506,10 +3543,8 @@ pub mod internal {
                         } else if solved_rows > 0 {
                             let (start, end) = block_ranges_ref[k];
                             if end > start {
-                                let solved_block = solved_ref
-                                    .slice(s![..solved_rows, start..end]);
-                                let rt_block = concat_ref
-                                    .slice(s![..solved_rows, start..end]);
+                                let solved_block = solved_ref.slice(s![..solved_rows, start..end]);
+                                let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
                                 let trace_h_inv_s_k = kahan_sum(
                                     solved_block
                                         .iter()
