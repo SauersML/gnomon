@@ -1,10 +1,9 @@
 use crate::calibrate::basis::{self, create_bspline_basis};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
-use faer::mat::MatMut;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::Zip;
 use ndarray::parallel::prelude::*;
@@ -429,63 +428,6 @@ fn robust_eigh_faer(
     }
 
     unreachable!("robust_eigh_faer should return or error within 4 attempts")
-}
-
-fn penalty_from_root(root: &Array2<f64>) -> Array2<f64> {
-    let (_, cols) = root.dim();
-    if cols == 0 {
-        return Array2::zeros((0, 0));
-    }
-
-    let root_view = FaerArrayView::new(root);
-    let mut gram = Mat::<f64>::zeros(cols, cols);
-    matmul(
-        gram.as_mut(),
-        Accum::Replace,
-        root_view.as_ref().transpose(),
-        root_view.as_ref(),
-        1.0,
-        Par::Seq,
-    );
-
-    let gram_array = Array2::from_shape_fn((cols, cols), |(i, j)| gram[(i, j)]);
-    sanitize_symmetric(&gram_array)
-}
-
-fn faer_matmul(lhs: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-    let (rows, k_lhs) = lhs.dim();
-    let (k_rhs, cols) = rhs.dim();
-    let mut product = Array2::<f64>::zeros((rows, cols));
-    if rows == 0 || cols == 0 {
-        return product;
-    }
-
-    assert_eq!(
-        k_lhs, k_rhs,
-        "Inner dimensions must match for matrix multiplication"
-    );
-    if k_lhs == 0 {
-        return product;
-    }
-
-    let lhs_view = FaerArrayView::new(lhs);
-    let rhs_view = FaerArrayView::new(rhs);
-    {
-        let slice = product
-            .as_slice_memory_order_mut()
-            .expect("Matrix product output must be contiguous");
-        let product_view = MatMut::from_row_major_slice_mut(slice, rows, cols);
-        matmul(
-            product_view,
-            Accum::Replace,
-            lhs_view.as_ref(),
-            rhs_view.as_ref(),
-            1.0,
-            Par::Seq,
-        );
-    }
-
-    product
 }
 
 fn transpose_owned(matrix: &Array2<f64>) -> Array2<f64> {
