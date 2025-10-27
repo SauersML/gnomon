@@ -2385,12 +2385,12 @@ mod tests {
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
-        internal_construct_design_matrix, internal_flatten_coefficients, BasisConfig,
-        InteractionPenaltyKind, LinkFunction, ModelConfig, PrincipalComponentConfig,
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, PrincipalComponentConfig,
+        internal_construct_design_matrix, internal_flatten_coefficients,
     };
     use approx::assert_abs_diff_eq;
-    use ndarray::{array, Array1, Array2};
     use ndarray::s;
+    use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
@@ -2421,11 +2421,7 @@ mod tests {
     }
 
     /// Helper asserting that the reparameterization preserves critical invariants.
-    fn assert_reparam_invariants(
-        result: &ReparamResult,
-        rs_list: &[Array2<f64>],
-        lambdas: &[f64],
-    ) {
+    fn assert_reparam_invariants(result: &ReparamResult, rs_list: &[Array2<f64>], lambdas: &[f64]) {
         // --- Orthonormality ---
         let qs = &result.qs;
         let qtq = qs.t().dot(qs);
@@ -2452,12 +2448,11 @@ mod tests {
         );
 
         // --- Eigenvalue-based log-determinant ---
-        let (eigenvalues, eigenvectors) =
-            result
-                .s_transformed
-                .clone()
-                .eigh(Side::Upper)
-                .expect("eigh for invariants");
+        let (eigenvalues, eigenvectors) = result
+            .s_transformed
+            .clone()
+            .eigh(Side::Upper)
+            .expect("eigh for invariants");
         let tol = eigenvalues
             .iter()
             .fold(0.0f64, |acc, &v| acc.max(v))
@@ -2485,11 +2480,7 @@ mod tests {
         for (idx, (lambda_k, rs_k)) in lambdas.iter().zip(rs_list.iter()).enumerate() {
             let rs_qs = rs_k.dot(qs);
             let s_k_transformed = rs_qs.t().dot(&rs_qs);
-            let trace_term: f64 = s_lambda_plus
-                .dot(&s_k_transformed)
-                .diag()
-                .iter()
-                .sum();
+            let trace_term: f64 = s_lambda_plus.dot(&s_k_transformed).diag().iter().sum();
             let expected_det1 = lambda_k * trace_term;
             assert!(
                 (result.det1[idx] - expected_det1).abs() < 1e-8,
@@ -2604,11 +2595,7 @@ mod tests {
     }
 
     /// Generate logistic training data with controllable seeds.
-    fn create_logistic_training_data(
-        n_samples: usize,
-        num_pcs: usize,
-        seed: u64,
-    ) -> TrainingData {
+    fn create_logistic_training_data(n_samples: usize, num_pcs: usize, seed: u64) -> TrainingData {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut p = Array1::zeros(n_samples);
         for val in p.iter_mut() {
@@ -2635,13 +2622,29 @@ mod tests {
         let mut y = Array1::zeros(n_samples);
         for i in 0..n_samples {
             let prob = 1.0 / (1.0 + (-eta[i]).exp());
-            y[i] = if rng.gen_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+            y[i] = if rng.gen_range(0.0..1.0) < prob {
+                1.0
+            } else {
+                0.0
+            };
         }
 
-        let sex = Array1::from_iter((0..n_samples).map(|_| if rng.gen_range(0.0..1.0) < 0.5 { 1.0 } else { 0.0 }));
+        let sex = Array1::from_iter((0..n_samples).map(|_| {
+            if rng.gen_range(0.0..1.0) < 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }));
         let weights = Array1::ones(n_samples);
 
-        TrainingData { y, p, sex, pcs, weights }
+        TrainingData {
+            y,
+            p,
+            sex,
+            pcs,
+            weights,
+        }
     }
 
     fn range_from_column(col: &Array1<f64>) -> (f64, f64) {
@@ -3430,32 +3433,28 @@ mod tests {
     #[test]
     fn test_reparam_invariants_imbalanced_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("imbalanced");
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("imbalanced");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("imbalanced");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_near_zero_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("near_zero");
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("near_zero");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("near_zero");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_high_rank_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("high_rank");
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("high_rank");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("high_rank");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
     #[test]
     fn test_reparam_invariants_degenerate_penalties() {
         let (rs_list, lambdas, layout) = create_synthetic_penalty_scenario("degenerate");
-        let reparam =
-            stable_reparameterization(&rs_list, &lambdas, &layout).expect("degenerate");
+        let reparam = stable_reparameterization(&rs_list, &lambdas, &layout).expect("degenerate");
         assert_reparam_invariants(&reparam, &rs_list, &lambdas);
     }
 
@@ -3465,21 +3464,11 @@ mod tests {
         config: &ModelConfig,
     ) {
         let trained = train_model(data_train, config).expect("training succeeds");
-        let (
-            _,
-            s_list,
-            layout,
-            _,
-            _,
-            _,
-            _,
-            _,
-            _,
-            _,
-        ) = build_design_and_penalty_matrices(data_train, config).expect("build matrices");
+        let (_, s_list, layout, _, _, _, _, _, _, _) =
+            build_design_and_penalty_matrices(data_train, config).expect("build matrices");
         let rs_list = compute_penalty_square_roots(&s_list).expect("square roots");
-        let reparam = stable_reparameterization(&rs_list, &trained.lambdas, &layout)
-            .expect("reparam");
+        let reparam =
+            stable_reparameterization(&rs_list, &trained.lambdas, &layout).expect("reparam");
         assert_reparam_invariants(&reparam, &rs_list, &trained.lambdas);
 
         // --- Null space dimension check ---
@@ -3500,7 +3489,11 @@ mod tests {
         let eigs_transformed: Array1<f64> = eigs_transformed;
         let eig_tol = 1e-8;
 
-        let null_orig = eigs_original.iter().copied().filter(|&v| v < eig_tol).count();
+        let null_orig = eigs_original
+            .iter()
+            .copied()
+            .filter(|&v| v < eig_tol)
+            .count();
         let null_trans = eigs_transformed
             .iter()
             .copied()
@@ -3513,7 +3506,6 @@ mod tests {
 
         let log_det_direct: f64 = eigs_original
             .iter()
-
             .copied()
             .filter(|&v| v > eig_tol)
             .map(|v| v.ln())
@@ -3529,8 +3521,8 @@ mod tests {
 
         // --- Prediction equivalence ---
         let coeffs = &trained.coefficients;
-        let beta_original = internal_flatten_coefficients(coeffs, &trained.config)
-            .expect("flatten coefficients");
+        let beta_original =
+            internal_flatten_coefficients(coeffs, &trained.config).expect("flatten coefficients");
         let pcs_test = if trained.config.pc_configs.is_empty() {
             Array2::zeros((data_test.p.len(), 0))
         } else {

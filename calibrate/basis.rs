@@ -4,8 +4,9 @@ use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -97,60 +98,55 @@ struct BasisCacheKey {
     derivative: usize,
 }
 
-#[derive(Clone, Debug)]
-struct BasisCacheEntry {
-    basis: Array2<f64>,
-}
-
 #[derive(Debug)]
 struct BasisCacheInner {
-    map: AHashMap<BasisCacheKey, BasisCacheEntry>,
-    order: Vec<BasisCacheKey>,
+    map: AHashMap<BasisCacheKey, (Arc<Array2<f64>>, u64)>,
+    order: VecDeque<(BasisCacheKey, u64)>,
     max_size: usize,
     hits: u64,
     misses: u64,
+    generation: u64,
 }
 
 impl BasisCacheInner {
     fn new(max_size: usize) -> Self {
         Self {
             map: AHashMap::with_capacity(max_size.max(1)),
-            order: Vec::with_capacity(max_size.max(1)),
+            order: VecDeque::with_capacity(max_size.max(1)),
             max_size,
             hits: 0,
             misses: 0,
+            generation: 0,
         }
     }
 
-    fn touch(&mut self, key: &BasisCacheKey) {
-        if let Some(position) = self.order.iter().position(|existing| existing == key) {
-            let moved = self.order.remove(position);
-            self.order.push(moved);
+    fn evict_one(&mut self) {
+        while let Some((candidate_key, candidate_gen)) = self.order.pop_front() {
+            match self.map.get(&candidate_key) {
+                Some((_, stored_gen)) if *stored_gen == candidate_gen => {
+                    self.map.remove(&candidate_key);
+                    break;
+                }
+                Some(_) => continue,
+                None => continue,
+            }
         }
     }
 
-    fn evict_oldest(&mut self) {
-        if let Some(oldest) = self.order.first().cloned() {
-            self.order.remove(0);
-            self.map.remove(&oldest);
-        }
-    }
-
-    fn insert(&mut self, key: BasisCacheKey, basis: Array2<f64>) {
+    fn insert(&mut self, key: BasisCacheKey, basis: Arc<Array2<f64>>) {
         if self.max_size == 0 {
             return;
         }
 
-        if self.map.contains_key(&key) {
-            self.order.retain(|existing| existing != &key);
-        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
 
-        if self.map.len() >= self.max_size {
-            self.evict_oldest();
-        }
+        self.order.push_back((key.clone(), generation));
+        self.map.insert(key, (basis, generation));
 
-        self.order.push(key.clone());
-        self.map.insert(key, BasisCacheEntry { basis });
+        while self.map.len() > self.max_size {
+            self.evict_one();
+        }
     }
 
     fn set_max_size(&mut self, new_max: usize) {
@@ -162,7 +158,7 @@ impl BasisCacheInner {
         }
 
         while self.map.len() > self.max_size {
-            self.evict_oldest();
+            self.evict_one();
         }
 
         if self.order.capacity() < self.max_size {
@@ -183,22 +179,32 @@ impl BasisCache {
         }
     }
 
-    fn get(&self, key: &BasisCacheKey) -> Option<Array2<f64>> {
+    fn get(&self, key: &BasisCacheKey) -> Option<Arc<Array2<f64>>> {
         let mut guard = self
             .inner
             .lock()
             .expect("basis cache mutex should not be poisoned");
-        if let Some(entry) = guard.map.get(key).cloned() {
+        if guard.map.contains_key(key) {
             guard.hits = guard.hits.saturating_add(1);
-            guard.touch(key);
-            Some(entry.basis)
+            guard.generation = guard.generation.wrapping_add(1);
+            let new_generation = guard.generation;
+            let basis_clone = {
+                let (basis, generation) = guard
+                    .map
+                    .get_mut(key)
+                    .expect("entry should exist after contains_key");
+                *generation = new_generation;
+                Arc::clone(basis)
+            };
+            guard.order.push_back((key.clone(), new_generation));
+            Some(basis_clone)
         } else {
             guard.misses = guard.misses.saturating_add(1);
             None
         }
     }
 
-    fn insert(&self, key: BasisCacheKey, basis: Array2<f64>) {
+    fn insert(&self, key: BasisCacheKey, basis: Arc<Array2<f64>>) {
         let mut guard = self
             .inner
             .lock()
@@ -215,6 +221,7 @@ impl BasisCache {
         guard.order.clear();
         guard.hits = 0;
         guard.misses = 0;
+        guard.generation = 0;
     }
 
     fn stats(&self) -> BasisCacheStats {
@@ -301,14 +308,14 @@ pub fn basis_cache_stats() -> BasisCacheStats {
 ///
 /// # Returns
 ///
-/// On success, returns a `Result` containing a tuple `(Array2<f64>, Array1<f64>)`:
+/// On success, returns a `Result` containing a tuple `(Arc<Array2<f64>>, Array1<f64>)`:
 /// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
 /// - A copy of the **knot vector** used.
 pub fn create_bspline_basis_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
     degree: usize,
-) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+) -> Result<(Arc<Array2<f64>>, Array1<f64>), BasisError> {
     // Validate degree
     if degree < 1 {
         return Err(BasisError::InvalidDegree(degree));
@@ -396,9 +403,10 @@ pub fn create_bspline_basis_with_knots(
         fill_rows(&mut scratch);
     }
 
-    global_basis_cache().insert(cache_key, basis_matrix.clone());
+    let basis_arc = Arc::new(basis_matrix);
+    global_basis_cache().insert(cache_key, Arc::clone(&basis_arc));
 
-    Ok((basis_matrix, knot_vec))
+    Ok((basis_arc, knot_vec))
 }
 
 /// Creates a B-spline basis expansion matrix with uniformly spaced knots.
@@ -436,7 +444,7 @@ pub fn create_bspline_basis(
     data_range: (f64, f64),
     num_internal_knots: usize,
     degree: usize,
-) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+) -> Result<(Arc<Array2<f64>>, Array1<f64>), BasisError> {
     if degree < 1 {
         return Err(BasisError::InvalidDegree(degree));
     }
@@ -505,9 +513,10 @@ pub fn create_bspline_basis(
         fill_rows(&mut scratch);
     }
 
-    global_basis_cache().insert(cache_key, basis_matrix.clone());
+    let basis_arc = Arc::new(basis_matrix);
+    global_basis_cache().insert(cache_key, Arc::clone(&basis_arc));
 
-    Ok((basis_matrix, knot_vector))
+    Ok((basis_arc, knot_vector))
 }
 
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
