@@ -412,7 +412,7 @@ mod tests {
         let mut ordered: Vec<(usize, f64)> = full_vals
             .iter()
             .enumerate()
-            .filter(|(_, &val)| val > tol)
+            .filter(|(_, val)| *val > tol)
             .map(|(i, &val)| (i, val))
             .collect();
         ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
