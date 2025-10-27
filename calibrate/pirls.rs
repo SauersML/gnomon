@@ -7,7 +7,8 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::linalg::general_mat_vec_mul;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
 use std::time::{Duration, Instant};
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
@@ -30,6 +31,9 @@ pub struct PirlsWorkspace {
     pub xtwx_buf: Array2<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
+    // Cached Sβ and SΔβ products for penalty evaluations
+    pub s_beta: Array1<f64>,
+    pub s_delta: Array1<f64>,
 }
 
 impl PirlsWorkspace {
@@ -50,6 +54,8 @@ impl PirlsWorkspace {
             delta_eta: Array1::zeros(n),
             xtwx_buf: Array2::zeros((p, p)),
             vec_buf_p: Array1::zeros(p),
+            s_beta: Array1::zeros(p),
+            s_delta: Array1::zeros(p),
         }
     }
 }
@@ -111,6 +117,26 @@ fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64,
     }
 
     (None, total_added, cond_est)
+}
+
+#[inline]
+fn mat_vec_into(matrix: &Array2<f64>, vector: &Array1<f64>, out: &mut Array1<f64>) {
+    let target_len = matrix.nrows();
+    if out.len() != target_len {
+        *out = Array1::zeros(target_len);
+    }
+    out.fill(0.0);
+    general_mat_vec_mul(1.0, matrix, vector, 0.0, out);
+}
+
+#[inline]
+fn compute_penalty(
+    beta: &Array1<f64>,
+    s_transformed: &Array2<f64>,
+    buffer: &mut Array1<f64>,
+) -> f64 {
+    mat_vec_into(s_transformed, beta, buffer);
+    beta.dot(buffer)
 }
 
 /// The status of the P-IRLS convergence.
@@ -359,7 +385,7 @@ pub fn fit_model_for_fixed_rho(
         last_mu_solve = mu.clone();
 
         // Calculate the penalty for the current beta using the transformed total penalty matrix
-        let penalty_current = beta_current.dot(&s_transformed.dot(&beta_current));
+        let penalty_current = compute_penalty(&beta_current, s_transformed, &mut workspace.s_beta);
 
         // This is the true objective function value at the start of the iteration
         let penalized_deviance_current = deviance_current + penalty_current;
@@ -442,11 +468,10 @@ pub fn fit_model_for_fixed_rho(
         // Reuse workspace for XΔβ
         workspace.delta_eta = x_transformed.dot(&beta_update);
         // Quadratic form reuse for penalty(β + αΔ)
-        let s_beta_current = s_transformed.dot(&beta_current);
-        let penalty_current_cached = beta_current.dot(&s_beta_current);
-        let s_delta = s_transformed.dot(&beta_update);
-        let cross = s_beta_current.dot(&beta_update);
-        let quad = beta_update.dot(&s_delta);
+        let penalty_current_cached = penalty_current;
+        mat_vec_into(s_transformed, &beta_update, &mut workspace.s_delta);
+        let cross = workspace.s_beta.dot(&beta_update);
+        let quad = beta_update.dot(&workspace.s_delta);
         let mut alpha = 1.0;
         loop {
             // Candidate eta for current α (avoid forming beta_candidate until accept)
@@ -553,7 +578,8 @@ pub fn fit_model_for_fixed_rho(
             };
 
             // Calculate the stable penalty term using the transformed quantities
-            let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+            let stable_penalty_term =
+                compute_penalty(&beta_transformed, s_transformed, &mut workspace.s_beta);
 
             // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
             let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
@@ -677,7 +703,7 @@ pub fn fit_model_for_fixed_rho(
                         result.penalized_hessian
                     };
                 let stable_penalty_term =
-                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+                    compute_penalty(&beta_transformed, s_transformed, &mut workspace.s_beta);
                 let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
                 println!(
@@ -713,7 +739,7 @@ pub fn fit_model_for_fixed_rho(
         }
 
         // Calculate the penalized deviance using the transformed penalty matrix
-        let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+        let penalty_new = compute_penalty(&beta_transformed, s_transformed, &mut workspace.s_beta);
         let penalized_deviance_new = last_deviance + penalty_new;
 
         // Set scale parameter based on link function
@@ -757,17 +783,16 @@ pub fn fit_model_for_fixed_rho(
             // Use the cached weights and working response from the solve
             // Suggestion #3: Compute gradient without building WX and WZ
             // grad_data_part = Xᵀ W (Xβ - z); reuse workspace buffers
-            let tmp_eta = {
-                let mut eta = offset.to_owned();
-                eta += &x_transformed.dot(&beta_transformed);
-                eta
-            };
-            workspace.working_residual = &tmp_eta - &z_solve; // (offset + Xβ) - z
-            workspace.weighted_residual = &weights_solve * &workspace.working_residual; // W (Xβ - z)
+            workspace.working_residual.assign(&eta); // (offset + Xβ)
+            workspace.working_residual -= &z_solve; // (offset + Xβ) - z
+            workspace
+                .weighted_residual
+                .assign(&workspace.working_residual);
+            workspace.weighted_residual *= &weights_solve; // W (Xβ - z)
             let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
-            let grad_penalty_part = s_transformed.dot(&beta_transformed);
+            mat_vec_into(s_transformed, &beta_transformed, &mut workspace.s_beta);
             // Drop the 2x factor to match the objective we actually minimize
-            let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
+            let gradient_wrt_solve = grad_data_part + &workspace.s_beta;
 
             let gradient_norm = gradient_wrt_solve
                 .iter()
@@ -822,7 +847,7 @@ pub fn fit_model_for_fixed_rho(
 
                 // Calculate the stable penalty term using the transformed quantities
                 let stable_penalty_term =
-                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+                    compute_penalty(&beta_transformed, s_transformed, &mut workspace.s_beta);
 
                 // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
                 let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
@@ -909,27 +934,26 @@ pub fn fit_model_for_fixed_rho(
     };
 
     // Calculate the stable penalty term using the transformed quantities
-    let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+    let stable_penalty_term =
+        compute_penalty(&beta_transformed, s_transformed, &mut workspace.s_beta);
 
     // Compute a final gradient check w.r.t the last W_solve and z_solve
     let x_transformed_t = x_transformed.t().to_owned();
-    let tmp_eta = {
-        let mut eta = offset.to_owned();
-        eta += &x_transformed.dot(&beta_transformed);
-        eta
-    };
-    workspace.working_residual = &tmp_eta - &last_z_solve; // Xβ - z_solve
-    workspace.weighted_residual = &last_weights_solve * &workspace.working_residual; // W_solve (Xβ - z_solve)
+    workspace.working_residual.assign(&eta); // (offset + Xβ)
+    workspace.working_residual -= &last_z_solve; // Xβ - z_solve using stored eta
+    workspace
+        .weighted_residual
+        .assign(&workspace.working_residual);
+    workspace.weighted_residual *= &last_weights_solve; // W_solve (Xβ - z_solve)
     let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
-    let grad_penalty_part = s_transformed.dot(&beta_transformed);
-    let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
+    let gradient_wrt_solve = grad_data_part + &workspace.s_beta;
     let gradient_norm = gradient_wrt_solve
         .iter()
         .map(|&v| v.abs())
         .fold(0.0, f64::max);
 
     // Build a scale-consistent tolerance similar to the inner loop
-    let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+    let penalty_new = stable_penalty_term;
     let penalized_deviance_new = last_deviance + penalty_new;
     let scale_term = match config.link_function {
         LinkFunction::Logit => 1.0,
@@ -1467,13 +1491,23 @@ pub fn solve_penalized_least_squares(
         println!("[PLS Solver] Using fast path for unpenalized WLS");
 
         // Weighted design and RHS
-        let sqrt_w = weights.mapv(f64::sqrt);
-        let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-        let z_eff = &z - &offset;
-        let wz = &sqrt_w * &z_eff;
+        Zip::from(&mut workspace.sqrt_w)
+            .and(&weights)
+            .for_each(|dst, &w| *dst = w.sqrt());
+        if workspace.wx.dim() != x_transformed.dim() {
+            workspace.wx = Array2::zeros(x_transformed.dim());
+        }
+        workspace.wx.assign(&x_transformed);
+        let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
+        workspace.wx *= &sqrt_w_col;
+        let wx = &workspace.wx;
+        workspace.wz.assign(&z);
+        workspace.wz -= &offset;
+        workspace.wz *= &workspace.sqrt_w;
+        let wz = &workspace.wz;
 
         // Stage: Use pivoted QR only to determine rank and column ordering
-        let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
+        let (_, r_factor, pivot) = pivoted_qr_faer(wx.view())?;
         let diag = r_factor.diag();
         let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         let tol = max_diag * 1e-12;
@@ -1504,7 +1538,7 @@ pub fn solve_penalized_least_squares(
         let tol_svd = smax * 1e-12;
 
         // Compute Σ⁺ Uᵀ wz without building dense Σ⁺
-        let utb = u.t().dot(&wz);
+        let utb = u.t().dot(wz);
         let mut s_inv_utb = Array1::<f64>::zeros(s.len());
         for i in 0..s.len() {
             if s[i] > tol_svd {
@@ -1520,7 +1554,7 @@ pub fn solve_penalized_least_squares(
         }
 
         // Stage: Build the Hessian H = Xᵀ W X (since S=0) using the preallocated buffer
-        use ndarray::linalg::{general_mat_mul, general_mat_vec_mul};
+        use ndarray::linalg::general_mat_mul;
         let p_wx = wx.ncols();
         if workspace.xtwx_buf.dim() != (p_wx, p_wx) {
             // resize if needed (shouldn't happen in steady state)
@@ -1565,7 +1599,9 @@ pub fn solve_penalized_least_squares(
     // FAST PATH (penalized case): Use symmetric solve on H = Xᵀ W X + S_λ
     if e_transformed.nrows() > 0 {
         // Weighted design and RHS via broadcasting
-        workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+        Zip::from(&mut workspace.sqrt_w)
+            .and(&weights)
+            .for_each(|dst, &w| *dst = w.sqrt());
         let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
         if workspace.wx.dim() != x_transformed.dim() {
             workspace.wx = Array2::zeros(x_transformed.dim());
@@ -1727,7 +1763,9 @@ pub fn solve_penalized_least_squares(
     // Stage: Initial QR decomposition of the weighted design matrix
 
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
-    workspace.sqrt_w.assign(&weights.mapv(f64::sqrt)); // Weights are guaranteed non-negative
+    Zip::from(&mut workspace.sqrt_w)
+        .and(&weights)
+        .for_each(|dst, &w| *dst = w.sqrt());
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
     // wx <- X .* sqrt_w (broadcast)
     if workspace.wx.dim() != x_transformed.dim() {
@@ -1742,7 +1780,7 @@ pub fn solve_penalized_least_squares(
     let wz = &workspace.wz;
 
     // Perform initial pivoted QR on the weighted design matrix
-    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
+    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(wx.view())?;
 
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p_dim);
@@ -1774,28 +1812,29 @@ pub fn solve_penalized_least_squares(
     let scaled_rows = r_rows + eb_rows;
     assert!(workspace.scaled_matrix.nrows() >= scaled_rows);
     assert!(workspace.scaled_matrix.ncols() >= p_dim);
-    let mut scaled_matrix = workspace
-        .scaled_matrix
-        .slice_mut(s![..scaled_rows, ..p_dim]);
-
-    // Fill in with slice assignments and scale in place
-    use ndarray::s as ns;
     {
-        let mut top = scaled_matrix.slice_mut(ns![..r_rows, ..]);
-        top.assign(&r1_pivoted);
-        let inv = 1.0 / r_norm;
-        top.mapv_inplace(|v| v * inv);
-    }
-    if eb_rows > 0 {
-        let mut bot = scaled_matrix.slice_mut(ns![r_rows.., ..]);
-        bot.assign(&eb_pivoted);
-        let inv = 1.0 / eb_norm;
-        bot.mapv_inplace(|v| v * inv);
+        let mut scaled_matrix_mut = workspace
+            .scaled_matrix
+            .slice_mut(s![..scaled_rows, ..p_dim]);
+
+        // Fill in with slice assignments and scale in place
+        {
+            let mut top = scaled_matrix_mut.slice_mut(s![..r_rows, ..]);
+            top.assign(&r1_pivoted);
+            let inv = 1.0 / r_norm;
+            top.mapv_inplace(|v| v * inv);
+        }
+        if eb_rows > 0 {
+            let mut bot = scaled_matrix_mut.slice_mut(s![r_rows.., ..]);
+            bot.assign(&eb_pivoted);
+            let inv = 1.0 / eb_norm;
+            bot.mapv_inplace(|v| v * inv);
+        }
     }
 
     // Perform pivoted QR on the scaled matrix for rank determination
-    let scaled_owned = scaled_matrix.to_owned();
-    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_owned)?;
+    let scaled_view = workspace.scaled_matrix.slice(s![..scaled_rows, ..p_dim]);
+    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(scaled_view)?;
 
     // Determine rank using condition number on the scaled matrix
     let mut rank = p_dim.min(scaled_rows);
@@ -1849,23 +1888,27 @@ pub fn solve_penalized_least_squares(
     let final_aug_rows = r_rows + e_transformed_rows;
     assert!(workspace.final_aug_matrix.nrows() >= final_aug_rows);
     assert!(workspace.final_aug_matrix.ncols() >= rank);
-    let mut final_aug_matrix = workspace
-        .final_aug_matrix
-        .slice_mut(s![..final_aug_rows, ..rank]);
+    {
+        let mut final_aug_matrix_mut = workspace
+            .final_aug_matrix
+            .slice_mut(s![..final_aug_rows, ..rank]);
 
-    // Fill via slice assignments (Suggestion #9)
-    final_aug_matrix
-        .slice_mut(ns![..r_rows, ..])
-        .assign(&r1_dropped);
-    if e_transformed_rows > 0 {
-        final_aug_matrix
-            .slice_mut(ns![r_rows.., ..])
-            .assign(&e_transformed_dropped);
+        // Fill via slice assignments (Suggestion #9)
+        final_aug_matrix_mut
+            .slice_mut(s![..r_rows, ..])
+            .assign(&r1_dropped);
+        if e_transformed_rows > 0 {
+            final_aug_matrix_mut
+                .slice_mut(s![r_rows.., ..])
+                .assign(&e_transformed_dropped);
+        }
     }
 
     // Perform final pivoted QR on the unscaled, reduced system
-    let final_aug_owned = final_aug_matrix.to_owned();
-    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
+    let final_aug_view = workspace
+        .final_aug_matrix
+        .slice(s![..final_aug_rows, ..rank]);
+    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(final_aug_view)?;
 
     // Add tiny ridge jitter to avoid singular/infinite condition number
     let r_final_sq = r_final.slice(s![..rank, ..rank]);
@@ -1964,14 +2007,16 @@ pub fn solve_penalized_least_squares(
     // VERIFICATION: Check that the normal equations hold for the reconstructed beta
     // This is critical to ensure correctness - make it unconditional for now
     {
-        let residual = {
-            let mut eta = offset.to_owned();
-            eta += &x_transformed.dot(&beta_transformed);
-            eta - &z
-        };
-        let weighted_residual = &weights * &residual;
-        let grad_dev_part = x_transformed.t().dot(&weighted_residual);
-        let grad_pen_part = s_transformed.dot(&beta_transformed);
+        workspace.working_residual.assign(&offset);
+        workspace.working_residual += &x_transformed.dot(&beta_transformed);
+        workspace.working_residual -= &z;
+        workspace
+            .weighted_residual
+            .assign(&workspace.working_residual);
+        workspace.weighted_residual *= &weights;
+        let grad_dev_part = x_transformed.t().dot(&workspace.weighted_residual);
+        mat_vec_into(s_transformed, &beta_transformed, &mut workspace.s_beta);
+        let grad_pen_part = workspace.s_beta.clone();
         let grad = &grad_dev_part + &grad_pen_part;
         let grad_norm_inf = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
 
@@ -2102,7 +2147,7 @@ where
 /// This uses faer's high-level ColPivQr solver which guarantees mathematical
 /// consistency between the Q, R, and P factors of the decomposition A*P = Q*R
 fn pivoted_qr_faer(
-    matrix: &Array2<f64>,
+    matrix: ArrayView2<f64>,
 ) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
     use faer::Mat;
     use faer::linalg::solvers::ColPivQr;
@@ -3778,7 +3823,8 @@ mod tests {
         ]);
 
         // Stage: Execute the function under test
-        let (q, r, pivot) = pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
+        let (q, r, pivot) =
+            pivoted_qr_faer(a.view()).expect("QR decomposition itself should not fail");
 
         // Stage: Verify that the fundamental QR identity holds
         // First, apply the permutation to the original matrix 'a'.
