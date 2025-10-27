@@ -2017,6 +2017,38 @@ pub mod internal {
         }
     }
 
+    struct RemlWorkspace {
+        rho_plus: Array1<f64>,
+        rho_minus: Array1<f64>,
+        rho_temp: Array1<f64>,
+        grad_primary: Array1<f64>,
+        grad_secondary: Array1<f64>,
+        concat: Array2<f64>,
+        solved: Array2<f64>,
+        block_ranges: Vec<(usize, usize)>,
+        solved_rows: usize,
+    }
+
+    impl RemlWorkspace {
+        fn new(max_penalties: usize, coeffs: usize, total_rank: usize) -> Self {
+            RemlWorkspace {
+                rho_plus: Array1::zeros(max_penalties),
+                rho_minus: Array1::zeros(max_penalties),
+                rho_temp: Array1::zeros(max_penalties),
+                grad_primary: Array1::zeros(max_penalties),
+                grad_secondary: Array1::zeros(max_penalties),
+                concat: Array2::zeros((coeffs, total_rank)),
+                solved: Array2::zeros((coeffs, total_rank)),
+                block_ranges: Vec::with_capacity(max_penalties),
+                solved_rows: coeffs,
+            }
+        }
+
+        fn reset_block_ranges(&mut self) {
+            self.block_ranges.clear();
+        }
+    }
+
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
@@ -2037,6 +2069,7 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
+        workspace: RefCell<RemlWorkspace>,
     }
 
     impl<'a> RemlState<'a> {
@@ -2203,6 +2236,10 @@ pub mod internal {
                 None => vec![0; expected_len],
             };
 
+            let penalty_count = rs_list.len();
+            let total_rank: usize = rs_list.iter().map(|rk| rk.nrows()).sum();
+            let workspace = RemlWorkspace::new(penalty_count, layout.total_coeffs, total_rank);
+
             Ok(Self {
                 y,
                 x,
@@ -2221,6 +2258,7 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
+                workspace: RefCell::new(workspace),
             })
         }
 
@@ -2441,30 +2479,44 @@ pub mod internal {
 
         /// Numerical gradient of the penalized log-likelihood part w.r.t. rho via central differences.
         /// Returns g_pll where g_pll[k] = - d/d rho_k penalised_ll(rho), suitable for COST gradient assembly.
+        #[cfg(test)]
         fn numeric_penalised_ll_grad(
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            let mut workspace = self.workspace.borrow_mut();
+            self.numeric_penalised_ll_grad_with_workspace(rho, &mut workspace)
+        }
+
+        fn numeric_penalised_ll_grad_with_workspace(
+            &self,
+            rho: &Array1<f64>,
+            workspace: &mut RemlWorkspace,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let len = rho.len();
+            if len == 0 {
                 return Ok(Array1::zeros(0));
             }
-            let mut g = Array1::zeros(rho.len());
-            for k in 0..rho.len() {
-                // Step scheme consistent with compute_fd_gradient
+
+            let mut g_view = workspace.grad_secondary.slice_mut(s![..len]);
+            g_view.fill(0.0);
+
+            for k in 0..len {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
 
-                let mut rp = rho.clone();
-                let mut rm = rho.clone();
-                rp[k] += 0.5 * h;
-                rm[k] -= 0.5 * h;
-                let fp = self.penalised_ll_at(&rp)?;
-                let fm = self.penalised_ll_at(&rm)?;
-                // Minus sign: COST gradient uses - d penalised_ll / d rho
-                g[k] = -(fp - fm) / h;
+                workspace.rho_plus.assign(rho);
+                workspace.rho_plus[k] += 0.5 * h;
+                workspace.rho_minus.assign(rho);
+                workspace.rho_minus[k] -= 0.5 * h;
+
+                let fp = self.penalised_ll_at(&workspace.rho_plus)?;
+                let fm = self.penalised_ll_at(&workspace.rho_minus)?;
+                g_view[k] = -(fp - fm) / h;
             }
-            Ok(g)
+
+            Ok(g_view.to_owned())
         }
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
@@ -2487,27 +2539,35 @@ pub mod internal {
         }
 
         /// Numerical gradient of 0.5 * log|H_eff(rho)| with respect to rho via central differences.
-        fn numeric_half_logh_grad(
+        fn numeric_half_logh_grad_with_workspace(
             &self,
             rho: &Array1<f64>,
+            workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            let len = rho.len();
+            if len == 0 {
                 return Ok(Array1::zeros(0));
             }
-            let mut g = Array1::zeros(rho.len());
-            for k in 0..rho.len() {
+
+            let mut g_view = workspace.grad_primary.slice_mut(s![..len]);
+            g_view.fill(0.0);
+
+            for k in 0..len {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
-                let mut rp = rho.clone();
-                rp[k] += 0.5 * h;
-                let mut rm = rho.clone();
-                rm[k] -= 0.5 * h;
-                let fp = self.half_logh_at(&rp)?;
-                let fm = self.half_logh_at(&rm)?;
-                g[k] = (fp - fm) / h;
+
+                workspace.rho_plus.assign(rho);
+                workspace.rho_plus[k] += 0.5 * h;
+                workspace.rho_minus.assign(rho);
+                workspace.rho_minus[k] -= 0.5 * h;
+
+                let fp = self.half_logh_at(&workspace.rho_plus)?;
+                let fm = self.half_logh_at(&workspace.rho_minus)?;
+                g_view[k] = (fp - fm) / h;
             }
-            Ok(g)
+
+            Ok(g_view.to_owned())
         }
 
         // Accessor methods for private fields
@@ -3269,6 +3329,11 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
             let rs_transposed = &reparam_result.rs_transposed;
 
+            let mut workspace_ref = self.workspace.borrow_mut();
+            let workspace = &mut *workspace_ref;
+            let len = p.len();
+            let mut cost_gradient = Array1::zeros(len);
+
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
             if ridge_used > 0.0 {
@@ -3298,12 +3363,6 @@ pub mod internal {
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
 
-            // --- Create the gradient vector ---
-            // This variable holds the gradient of the COST function (-V_REML or -V_LAML),
-            // which the optimizer minimizes. Due to sign conventions in the term calculations,
-            // the formula directly computes the cost gradient.
-            let mut cost_gradient = Array1::zeros(lambdas.len());
-
             let n = self.y.len() as f64;
 
             // Implement Wood (2011) exact REML/LAML gradient formulas
@@ -3332,21 +3391,23 @@ pub mod internal {
                             "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
                             dp_c
                         );
-                        let mut grad_total = Array1::zeros(lambdas.len());
+                        let mut grad_total_view =
+                            workspace.grad_secondary.slice_mut(s![..lambdas.len()]);
+                        grad_total_view.fill(0.0);
                         for k in 0..lambdas.len() {
                             let h = 1e-3_f64 * (1.0 + p[k].abs());
                             if h == 0.0 {
                                 continue;
                             }
-                            let mut rho_plus = p.clone();
-                            let mut rho_minus = p.clone();
-                            rho_plus[k] += h;
-                            rho_minus[k] -= h;
-                            let cost_plus = self.compute_cost(&rho_plus)?;
-                            let cost_minus = self.compute_cost(&rho_minus)?;
-                            grad_total[k] = (cost_plus - cost_minus) / (2.0 * h);
+                            workspace.rho_plus.assign(p);
+                            workspace.rho_plus[k] += h;
+                            workspace.rho_minus.assign(p);
+                            workspace.rho_minus[k] -= h;
+                            let cost_plus = self.compute_cost(&workspace.rho_plus)?;
+                            let cost_minus = self.compute_cost(&workspace.rho_minus)?;
+                            grad_total_view[k] = (cost_plus - cost_minus) / (2.0 * h);
                         }
-                        return Ok(grad_total);
+                        return Ok(grad_total_view.to_owned());
                     }
 
                     // Three-term gradient computation following mgcv gdi1
@@ -3375,40 +3436,46 @@ pub mod internal {
                             "[REML WARNING] Switching ½·log|H| gradient to numeric finite differences; dp_c={:.3e}.",
                             dp_c
                         );
-                        Some(self.numeric_half_logh_grad(p)?)
+                        Some(self.numeric_half_logh_grad_with_workspace(p, workspace)?)
                     } else {
                         None
                     };
 
-                    // Three-term gradient computation following mgcv gdi1
-                    let mut block_ranges = Vec::with_capacity(rs_transposed.len());
+                    workspace.reset_block_ranges();
                     let mut total_rank = 0;
                     for rt in rs_transposed {
                         let cols = rt.ncols();
-                        block_ranges.push((total_rank, total_rank + cols));
+                        workspace.block_ranges.push((total_rank, total_rank + cols));
                         total_rank += cols;
                     }
+                    workspace.solved_rows = h_eff.nrows();
 
-                    let (rt_concat_opt, h_inv_concat_opt) = if numeric_logh_grad.is_none()
-                        && total_rank > 0
-                    {
-                        let mut concat = Array2::zeros((h_eff.nrows(), total_rank));
-                        for ((start, end), rt) in block_ranges.iter().zip(rs_transposed.iter()) {
+                    if numeric_logh_grad.is_none() && total_rank > 0 {
+                        workspace.concat.fill(0.0);
+                        let rows = h_eff.nrows();
+                        for ((start, end), rt) in
+                            workspace.block_ranges.iter().zip(rs_transposed.iter())
+                        {
                             if *end > *start {
-                                concat.slice_mut(s![.., *start..*end]).assign(rt);
+                                workspace
+                                    .concat
+                                    .slice_mut(s![..rows, *start..*end])
+                                    .assign(rt);
                             }
                         }
-                        let concat_view = FaerArrayView::new(&concat);
+                        let concat_view = FaerArrayView::new(&workspace.concat);
                         let solved = factor_g.solve(concat_view.as_ref());
                         let solved_ref = solved.as_ref();
-                        let solved_arr = Array2::from_shape_fn(
-                            (solved_ref.nrows(), solved_ref.ncols()),
-                            |(i, j)| solved_ref[(i, j)],
-                        );
-                        (Some(concat), Some(solved_arr))
+                        let (rows, cols) = solved_ref.shape();
+                        workspace.solved_rows = rows;
+                        for j in 0..cols {
+                            for i in 0..rows {
+                                workspace.solved[(i, j)] = solved_ref[(i, j)];
+                            }
+                        }
                     } else {
-                        (None, None)
-                    };
+                        workspace.solved_rows = 0;
+                    }
 
                     for k in 0..lambdas.len() {
                         let r_k = &rs_transformed[k];
@@ -3430,25 +3497,28 @@ pub mod internal {
                         // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
                         let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
                             g[k]
-                        } else {
-                            let trace_h_inv_s_k = if let (Some(rt_concat), Some(h_inv_concat)) =
-                                (rt_concat_opt.as_ref(), h_inv_concat_opt.as_ref())
-                            {
-                                let (start, end) = block_ranges[k];
-                                if end > start {
-                                    let h_block = h_inv_concat.slice(s![.., start..end]);
-                                    let rt_block = rt_concat.slice(s![.., start..end]);
-                                    kahan_sum(
-                                        h_block.iter().zip(rt_block.iter()).map(|(&x, &y)| x * y),
-                                    )
-                                } else {
-                                    0.0
-                                }
+                        } else if workspace.solved_rows > 0 {
+                            let (start, end) = workspace.block_ranges[k];
+                            if end > start {
+                                let solved_block = workspace
+                                    .solved
+                                    .slice(s![..workspace.solved_rows, start..end]);
+                                let rt_block = workspace
+                                    .concat
+                                    .slice(s![..workspace.solved_rows, start..end]);
+                                let trace_h_inv_s_k = kahan_sum(
+                                    solved_block
+                                        .iter()
+                                        .zip(rt_block.iter())
+                                        .map(|(&x, &y)| x * y),
+                                );
+                                let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
+                                tra1 / 2.0
                             } else {
                                 0.0
-                            };
-                            let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
-                            tra1 / 2.0
+                            }
+                        } else {
+                            0.0
                         };
 
                         // Component 3: derivative of the penalty pseudo-determinant.
@@ -3462,9 +3532,8 @@ pub mod internal {
                         // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
                         // the gradient already accounts for the changing scale; adding dφ/dρ here would
                         // double-count the effect and contradict the envelope theorem.
-                        cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
-                                         + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
-                                         - log_det_s_grad_term; // Corresponds to `- rp$det1/2`
+                        cost_gradient[k] =
+                            deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term;
                     }
                 }
                 _ => {
@@ -3473,10 +3542,10 @@ pub mod internal {
 
                     // Include the missing derivative of the penalized log-likelihood part via FD.
                     // This ensures exact consistency with the COST used in compute_cost.
-                    let g_pll = self.numeric_penalised_ll_grad(p)?;
+                    let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
 
                     // Full numerical derivative of 0.5·log|H_eff(ρ)| for exact consistency with cost
-                    let g_half_logh = self.numeric_half_logh_grad(p)?;
+                    let g_half_logh = self.numeric_half_logh_grad_with_workspace(p, workspace)?;
 
                     // No explicit deviance-by-beta channel here; we rely on numeric components for consistency.
 
@@ -3562,15 +3631,26 @@ pub mod internal {
             // One-direction secant test (cheap FD validation)
             if !p.is_empty() {
                 let h = 1e-4;
-                let mut dir = Array1::zeros(p.len());
-                dir[0] = 1.0; // pick k=0 or max|grad|
-                let gdot = cost_gradient.dot(&dir);
+                workspace.rho_temp.fill(0.0);
+                workspace.rho_temp[0] = 1.0; // pick k=0 or max|grad|
+                let gdot = cost_gradient.dot(&workspace.rho_temp);
+
+                workspace.rho_plus.assign(p);
+                for i in 0..p.len() {
+                    workspace.rho_plus[i] += h * workspace.rho_temp[i];
+                }
                 let fp = self
-                    .compute_cost(&(p.clone() + &(h * &dir)))
+                    .compute_cost(&workspace.rho_plus)
                     .unwrap_or(f64::INFINITY);
+
+                workspace.rho_minus.assign(p);
+                for i in 0..p.len() {
+                    workspace.rho_minus[i] -= h * workspace.rho_temp[i];
+                }
                 let fm = self
-                    .compute_cost(&(p.clone() - &(h * &dir)))
+                    .compute_cost(&workspace.rho_minus)
                     .unwrap_or(f64::INFINITY);
+
                 let secant = (fp - fm) / (2.0 * h);
                 let denom = gdot.abs().max(secant.abs()).max(1e-8);
                 eprintln!(
