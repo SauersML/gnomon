@@ -2034,8 +2034,6 @@ pub mod internal {
         prior_gradient: Array1<f64>,
         concat: Array2<f64>,
         solved: Array2<f64>,
-        hessian_xtwx: Array2<f64>,
-        hessian_raw: Array2<f64>,
         block_ranges: Vec<(usize, usize)>,
         solved_rows: usize,
     }
@@ -2052,8 +2050,6 @@ pub mod internal {
                 prior_gradient: Array1::zeros(max_penalties),
                 concat: Array2::zeros((coeffs, total_rank)),
                 solved: Array2::zeros((coeffs, total_rank)),
-                hessian_xtwx: Array2::zeros((coeffs, coeffs)),
-                hessian_raw: Array2::zeros((coeffs, coeffs)),
                 block_ranges: Vec::with_capacity(max_penalties),
                 solved_rows: coeffs,
             }
@@ -2101,26 +2097,6 @@ pub mod internal {
 
         fn cost_gradient_view_const(&self, len: usize) -> ArrayView1<'_, f64> {
             self.cost_gradient.slice(s![..len])
-        }
-
-        fn soft_prior_cost(&mut self, rho: &Array1<f64>) -> f64 {
-            let len = rho.len();
-            if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
-                if len > 0 {
-                    self.prior_gradient.slice_mut(s![..len]).fill(0.0);
-                }
-                return 0.0;
-            }
-
-            let inv_bound = 1.0 / RHO_BOUND;
-            let sharp = RHO_SOFT_PRIOR_SHARPNESS;
-            let mut cost = 0.0;
-            for &ri in rho.iter() {
-                let scaled = sharp * ri * inv_bound;
-                cost += scaled.cosh().ln();
-            }
-
-            cost * RHO_SOFT_PRIOR_WEIGHT
         }
 
         fn soft_prior_cost_and_grad<'a>(
@@ -2905,7 +2881,6 @@ pub mod internal {
             let h_eff = bundle.h_eff.as_ref();
             let ridge_used = bundle.ridge_used;
 
-            let penalties = p.len();
             let lambdas = p.mapv(f64::exp);
 
             // Sanity check: penalty dimension consistency across lambdas, R_k, and det1.
