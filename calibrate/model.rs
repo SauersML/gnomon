@@ -85,6 +85,10 @@ pub struct Constraint {
     pub z_transform: Array2<f64>,
 }
 
+pub fn default_reml_parallel_threshold() -> usize {
+    4
+}
+
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +101,10 @@ pub struct ModelConfig {
     pub reml_max_iterations: u64,
     #[serde(default)]
     pub firth_bias_reduction: bool,
+    /// Minimum number of penalties required before enabling REML gradient parallelization.
+    /// Set to zero to force sequential execution regardless of penalty count.
+    #[serde(default = "default_reml_parallel_threshold")]
+    pub reml_parallel_threshold: usize,
     pub pgs_basis_config: BasisConfig,
     /// Bundled configuration for each principal component.
     /// This ensures that for each PC, we have the correct basis config, name, and range together.
@@ -141,6 +149,7 @@ impl ModelConfig {
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 0,
                 degree: 0,
@@ -1169,6 +1178,7 @@ mod tests {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 1, // Number of internal knots
                     degree,
@@ -1260,6 +1270,7 @@ mod tests {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 1,
@@ -1358,6 +1369,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -1460,6 +1472,7 @@ mod tests {
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
             pgs_basis_config: pgs_basis_config.clone(),
             pc_configs: vec![PrincipalComponentConfig {
                 name: "PC1".to_string(),
@@ -1504,6 +1517,7 @@ mod tests {
             pc_null_transforms,
             interaction_centering_means,
             interaction_orth_alpha,
+            _,
         ) = crate::calibrate::construction::build_design_and_penalty_matrices(
             &dummy_data,
             &model_config,
@@ -1520,6 +1534,7 @@ mod tests {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: default_reml_parallel_threshold(),
                 pgs_basis_config: pgs_basis_config.clone(),
                 pc_configs: vec![PrincipalComponentConfig {
                     name: "PC1".to_string(),
