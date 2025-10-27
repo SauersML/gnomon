@@ -10,6 +10,7 @@ use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls; // for PirlsResult
 // no penalty root helpers needed directly here
 
+use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 // no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
@@ -17,6 +18,8 @@ use faer::Side;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::{Accum, Par};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::join;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -262,62 +265,92 @@ pub fn compute_alo_features(
     let mut a_hi_95 = 0usize;
     let mut a_hi_99 = 0usize;
 
-    let mut s_buf = vec![0.0f64; p];
-    let mut t_buf = vec![0.0f64; p];
     let block_cols = 8192usize;
 
     let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols));
+
+    struct ObsResult {
+        ai: f64,
+        se_loo: f64,
+        var_full: f64,
+        var_without_i: f64,
+        var_loo: f64,
+        se_full: f64,
+        denom_raw: f64,
+        wi: f64,
+    }
 
     for chunk_start in (0..n).step_by(block_cols) {
         let chunk_end = (chunk_start + block_cols).min(n);
         let width = chunk_end - chunk_start;
 
-        {
-            let mut rhs_slice = rhs_chunk_buf.slice_mut(s![.., ..width]);
-            for row in 0..p {
-                for col in 0..width {
-                    rhs_slice[[row, col]] = ut[[row, chunk_start + col]];
-                }
-            }
-        }
+        rhs_chunk_buf
+            .slice_mut(s![.., ..width])
+            .assign(&ut.slice(s![.., chunk_start..chunk_end]));
 
         let rhs_chunk_view = rhs_chunk_buf.slice(s![.., ..width]);
         let rhs_chunk = FaerArrayView::new(&rhs_chunk_view);
         let s_chunk = factor.solve(rhs_chunk.as_ref());
         let mut t_chunk = FaerMat::<f64>::zeros(p, width);
+        let matmul_mode = if p * width >= 4096 {
+            Par::rayon(rayon::current_num_threads())
+        } else {
+            Par::Seq
+        };
         matmul(
             t_chunk.as_mut(),
             Accum::Replace,
             xtwx_view.as_ref(),
             s_chunk.as_ref(),
             1.0,
-            Par::Seq,
+            matmul_mode,
         );
 
-        for local_col in 0..width {
-            let obs = chunk_start + local_col;
-            for r in 0..p {
-                s_buf[r] = s_chunk[(r, local_col)];
-                t_buf[r] = t_chunk[(r, local_col)];
-            }
+        let chunk_results: Vec<ObsResult> = (0..width)
+            .into_par_iter()
+            .map(|local_col| {
+                let obs = chunk_start + local_col;
+                let mut ai = 0.0;
+                let mut quad = 0.0;
+                for r in 0..p {
+                    let s_val = s_chunk[(r, local_col)];
+                    ai += s_val * u[[obs, r]];
+                    quad += s_val * t_chunk[(r, local_col)];
+                }
+                let wi = base.final_weights[obs].max(1e-12);
+                let var_full = phi * (quad / wi);
+                let denom_raw = 1.0 - ai;
+                let denom = denom_raw.max(1e-12);
+                let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
+                let denom_sq = denom * denom;
+                let var_loo = var_without_i / denom_sq;
+                let se_full = var_full.max(0.0).sqrt();
+                let se_loo = var_loo.max(0.0).sqrt();
 
-            let u_row = u.row(obs);
-            let ai = s_buf
-                .iter()
-                .zip(u_row.iter())
-                .map(|(s, &u_val)| s * u_val)
-                .sum::<f64>();
+                ObsResult {
+                    ai,
+                    se_loo,
+                    var_full,
+                    var_without_i,
+                    var_loo,
+                    se_full,
+                    denom_raw,
+                    wi,
+                }
+            })
+            .collect();
+
+        for (local_col, result) in chunk_results.into_iter().enumerate() {
+            let obs = chunk_start + local_col;
+            let ai = result.ai;
             aii[obs] = ai;
             percentiles_data.push(ai);
 
             if ai.is_finite() {
                 sum_aii += ai;
+                max_aii = max_aii.max(ai);
             } else {
                 sum_aii = f64::NAN;
-            }
-
-            if ai.is_finite() {
-                max_aii = max_aii.max(ai);
             }
 
             if ai < 0.0 || ai > 1.0 || !ai.is_finite() {
@@ -343,47 +376,35 @@ pub fn compute_alo_features(
                 a_hi_99 += 1;
             }
 
-            let wi = base.final_weights[obs].max(1e-12);
-
-            let quad = s_buf
-                .iter()
-                .zip(t_buf.iter())
-                .map(|(s, t)| s * t)
-                .sum::<f64>();
-            let var_full = phi * (quad / wi);
-
-            let denom_raw = 1.0 - ai;
-            if denom_raw <= 0.0 {
+            if result.denom_raw <= 0.0 {
                 eprintln!(
                     "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
                     obs, ai
                 );
             }
-            let denom = denom_raw.max(1e-12);
+            let denom = result.denom_raw.max(1e-12);
 
-            let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
-            let denom_sq = denom * denom;
-            let var_loo = var_without_i / denom_sq;
-            let se_full = var_full.max(0.0).sqrt();
-            let se_loo = var_loo.max(0.0).sqrt();
-            se_tilde[obs] = se_loo;
+            se_tilde[obs] = result.se_loo;
 
             if diag_counter < max_diag_samples {
-                let c_i = ai / wi;
+                let c_i = ai / result.wi;
                 let se_unw = c_i.max(0.0).sqrt();
                 println!("[GNOMON DIAG] ALO SE formula (obs {}):", obs);
-                println!("  - w_i: {:.6e}", wi);
+                println!("  - w_i: {:.6e}", result.wi);
                 println!("  - a_ii: {:.6e}", ai);
-                println!("  - 1 - a_ii: {:.6e}", denom_raw);
-                println!("  - var_full (full sample): {:.6e}", var_full);
-                println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
-                println!("  - var_loo (inflated): {:.6e}", var_loo);
-                println!("  - SE_full (full sample): {:.6e}", se_full);
-                println!("  - SE_tilde (LOO): {:.6e}", se_loo);
+                println!("  - 1 - a_ii: {:.6e}", result.denom_raw);
+                println!("  - var_full (full sample): {:.6e}", result.var_full);
+                println!(
+                    "  - var_without_i (remove obs i): {:.6e}",
+                    result.var_without_i
+                );
+                println!("  - var_loo (inflated): {:.6e}", result.var_loo);
+                println!("  - SE_full (full sample): {:.6e}", result.se_full);
+                println!("  - SE_tilde (LOO): {:.6e}", result.se_loo);
                 println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
                 println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
                 let expected_ratio = {
-                    let infl = var_without_i / var_full.max(1e-24);
+                    let infl = result.var_without_i / result.var_full.max(1e-24);
                     if infl >= 0.0 {
                         (infl.sqrt() / denom.max(1e-12)).abs()
                     } else {
@@ -392,8 +413,8 @@ pub fn compute_alo_features(
                 };
                 println!(
                     "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
-                    if se_full > 0.0 {
-                        se_loo / se_full
+                    if result.se_full > 0.0 {
+                        result.se_loo / result.se_full
                     } else {
                         f64::NAN
                     },
@@ -415,51 +436,40 @@ pub fn compute_alo_features(
     // (reusing the leverage_eta_tilde array from above would be more efficient, but we do this
     // calculation from scratch for clarity and to add additional diagnostics)
     let mut eta_tilde = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        // Robust ALO denominator with epsilon floor
-        let denom_raw = 1.0 - aii[i];
-        let denom = if denom_raw <= 1e-12 {
-            eprintln!(
-                "[CAL] WARNING: 1 - a_ii ≤ eps at i={}, a_ii={:.6e}",
-                i, aii[i]
-            );
-            1e-12
-        } else {
-            denom_raw
-        };
+    let eta_slice = eta_tilde
+        .as_slice_mut()
+        .expect("eta_tilde should be contiguous");
+    let aii_slice = aii.as_slice().expect("aii should be contiguous");
+    let eta_hat_slice = eta_hat.as_slice().expect("eta_hat should be contiguous");
+    let z_slice = z.as_slice().expect("z should be contiguous");
 
-        // CORRECT ALO predictor formula using the Sherman-Morrison identity:
-        //   η̂^{(-i)} = (η̂_i - a_ii * z_i) / (1 - a_ii)
-        //
-        // Mathematical justification:
-        // - Define z_i = η̂_i + (y_i - μ_i)/v_i as the working response
-        // - The LOO predictor is β̂^{(-i)} * x_i, where β̂^{(-i)} is fit without obs i
-        // - Using the Sherman-Morrison formula for the rank-1 update to the inverse:
-        //    η̂^{(-i)} = (η̂_i - a_ii z_i) / (1 - a_ii)
-        //    where a_ii = x_i^T(X^TWX)^{-1}x_i is the leverage
-        //
-        // This formula is mathematically correct even when denom is very small
-        // and provides exact LOO predictions for linear/linearized models
+    eta_slice
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, eta_out)| {
+            let ai = aii_slice[i];
+            let denom_raw = 1.0 - ai;
+            let denom = if denom_raw <= 1e-12 {
+                eprintln!("[CAL] WARNING: 1 - a_ii ≤ eps at i={}, a_ii={:.6e}", i, ai);
+                1e-12
+            } else {
+                denom_raw
+            };
 
-        if denom <= 1e-4 {
-            // Log warning when leverage is close to 1
-            eprintln!(
-                "[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}",
-                i, aii[i]
-            );
-        }
+            if denom <= 1e-4 {
+                eprintln!("[CAL] ALO 1-a_ii very small at i={}, a_ii={:.6e}", i, ai);
+            }
 
-        eta_tilde[i] = (eta_hat[i] - aii[i] * z[i]) / denom;
-
-        // Optional: soft-clip extreme values if needed
-        if !eta_tilde[i].is_finite() || eta_tilde[i].abs() > 1e6 {
-            eprintln!(
-                "[CAL] ALO eta_tilde extreme value at i={}: {}, capping",
-                i, eta_tilde[i]
-            );
-            eta_tilde[i] = eta_tilde[i].clamp(-1e6, 1e6);
-        }
-    }
+            let mut eta_value: f64 = (eta_hat_slice[i] - ai * z_slice[i]) / denom;
+            if !eta_value.is_finite() || eta_value.abs() > 1e6 {
+                eprintln!(
+                    "[CAL] ALO eta_tilde extreme value at i={}: {}, capping",
+                    i, eta_value
+                );
+                eta_value = eta_value.clamp(-1e6, 1e6);
+            }
+            *eta_out = eta_value;
+        });
 
     // Comprehensive leverage and dispersion diagnostics
     // These metrics help identify potential numerical issues or ill-conditioned fits
@@ -565,28 +575,33 @@ pub fn build_calibrator_design(
 ) -> Result<(Array2<f64>, Vec<Array2<f64>>, InternalSchema, Array1<f64>), EstimationError> {
     let n = features.pred.len();
 
-    fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
-        let rows = matrix.nrows();
-        let mut result = Array2::<f64>::zeros((rows, indices.len()));
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            result.column_mut(new_idx).assign(&matrix.column(old_idx));
-        }
-        result
-    }
-
     fn prune_near_zero_columns(basis: &mut Array2<f64>, transform: &mut Array2<f64>, label: &str) {
         if basis.ncols() == 0 {
             return;
         }
 
         let tol = 1e-9_f64;
-        let mut keep: Vec<usize> = Vec::with_capacity(basis.ncols());
-        for j in 0..basis.ncols() {
-            let norm_sq: f64 = basis.column(j).iter().map(|&v| v * v).sum();
-            if norm_sq.sqrt() > tol {
-                keep.push(j);
-            }
-        }
+        let cols = basis.ncols();
+        let rows = basis.nrows();
+        let keep: Vec<usize> = if cols < 32 || rows < 512 {
+            (0..cols)
+                .filter(|&j| {
+                    let norm_sq: f64 = basis.column(j).iter().map(|&v| v * v).sum();
+                    norm_sq.sqrt() > tol
+                })
+                .collect()
+        } else {
+            basis
+                .view()
+                .axis_iter(Axis(1))
+                .into_par_iter()
+                .enumerate()
+                .filter_map(|(j, col)| {
+                    let norm_sq: f64 = col.iter().map(|&v| v * v).sum();
+                    if norm_sq.sqrt() > tol { Some(j) } else { None }
+                })
+                .collect()
+        };
 
         if keep.len() == basis.ncols() {
             return;
@@ -594,17 +609,16 @@ pub fn build_calibrator_design(
 
         let dropped = basis.ncols() - keep.len();
         let kept = keep.len();
-        let rows = basis.nrows();
         let t_rows = transform.nrows();
 
         if keep.is_empty() {
             *basis = Array2::<f64>::zeros((rows, 0));
             *transform = Array2::<f64>::zeros((t_rows, 0));
         } else {
-            let basis_snapshot = basis.clone();
-            let transform_snapshot = transform.clone();
-            *basis = select_columns(&basis_snapshot, &keep);
-            *transform = select_columns(&transform_snapshot, &keep);
+            let new_basis = basis.view().select(Axis(1), &keep);
+            let new_transform = transform.view().select(Axis(1), &keep);
+            *basis = new_basis;
+            *transform = new_transform;
         }
 
         eprintln!(
@@ -689,21 +703,64 @@ pub fn build_calibrator_design(
         if basis.is_empty() {
             return 0.0;
         }
-        let mut accum = 0.0;
-        for col in 0..basis.ncols() {
-            let mut dot = 0.0;
-            for row in 0..basis.nrows() {
-                let w = weights[row];
-                if w <= 0.0 {
-                    continue;
-                }
-                let basis_val = basis[[row, col]];
-                let target_val = target.map(|t| t[row]).unwrap_or(1.0);
-                dot += w * basis_val * target_val;
-            }
-            accum += dot * dot;
-        }
-        accum.sqrt()
+
+        let dot_sq_sum =
+            if basis.ncols() < 8 || basis.nrows() < 256 {
+                basis.axis_iter(Axis(1)).fold(0.0, |acc, col| {
+                    let dot = match target {
+                        Some(t) => col.iter().zip(weights.iter()).zip(t.iter()).fold(
+                            0.0,
+                            |sum, ((&basis_val, &w), &target_val)| {
+                                if w <= 0.0 {
+                                    sum
+                                } else {
+                                    sum + w * basis_val * target_val
+                                }
+                            },
+                        ),
+                        None => {
+                            col.iter()
+                                .zip(weights.iter())
+                                .fold(
+                                    0.0,
+                                    |sum, (&basis_val, &w)| {
+                                        if w <= 0.0 { sum } else { sum + w * basis_val }
+                                    },
+                                )
+                        }
+                    };
+                    acc + dot * dot
+                })
+            } else {
+                basis
+                    .axis_iter(Axis(1))
+                    .into_par_iter()
+                    .map(|col| {
+                        let dot =
+                            match target {
+                                Some(t) => col.iter().zip(weights.iter()).zip(t.iter()).fold(
+                                    0.0,
+                                    |sum, ((&basis_val, &w), &target_val)| {
+                                        if w <= 0.0 {
+                                            sum
+                                        } else {
+                                            sum + w * basis_val * target_val
+                                        }
+                                    },
+                                ),
+                                None => col.iter().zip(weights.iter()).fold(
+                                    0.0,
+                                    |sum, (&basis_val, &w)| {
+                                        if w <= 0.0 { sum } else { sum + w * basis_val }
+                                    },
+                                ),
+                            };
+                        dot * dot
+                    })
+                    .sum()
+            };
+
+        dot_sq_sum.sqrt()
     }
 
     // Standardize inputs and record parameters
@@ -715,36 +772,82 @@ pub fn build_calibrator_design(
         }
 
         if let Some(w) = weights {
-            let mut sum_w = 0.0;
-            let mut mean_num = 0.0;
-            for (&x, &wi) in v.iter().zip(w.iter()) {
-                if wi > 0.0 {
-                    sum_w += wi;
-                    mean_num += wi * x;
+            let threshold = 1024usize;
+            if n < threshold {
+                let mut sum_w = 0.0;
+                let mut mean_num = 0.0;
+                for (&x, &wi) in v.iter().zip(w.iter()) {
+                    if wi > 0.0 {
+                        sum_w += wi;
+                        mean_num += wi * x;
+                    }
                 }
-            }
-            if sum_w <= 0.0 {
-                return (0.0, 0.0);
-            }
-            let mean = mean_num / sum_w;
-            let mut var = 0.0;
-            for (&x, &wi) in v.iter().zip(w.iter()) {
-                if wi > 0.0 {
-                    let d = x - mean;
-                    var += wi * d * d;
+                if sum_w <= 0.0 {
+                    return (0.0, 0.0);
                 }
+                let mean = mean_num / sum_w;
+                let mut var = 0.0;
+                for (&x, &wi) in v.iter().zip(w.iter()) {
+                    if wi > 0.0 {
+                        let d = x - mean;
+                        var += wi * d * d;
+                    }
+                }
+                var /= sum_w;
+                (mean, var.sqrt())
+            } else {
+                let values = v.as_slice().expect("Array1 should be contiguous");
+                let weights_slice = w.as_slice().expect("weights array should be contiguous");
+                let (sum_w, mean_num) = values
+                    .par_iter()
+                    .zip(weights_slice.par_iter())
+                    .map(|(&x, &wi)| if wi > 0.0 { (wi, wi * x) } else { (0.0, 0.0) })
+                    .reduce(
+                        || (0.0, 0.0),
+                        |(sw1, mn1), (sw2, mn2)| (sw1 + sw2, mn1 + mn2),
+                    );
+                if sum_w <= 0.0 {
+                    return (0.0, 0.0);
+                }
+                let mean = mean_num / sum_w;
+                let var = values
+                    .par_iter()
+                    .zip(weights_slice.par_iter())
+                    .map(|(&x, &wi)| {
+                        if wi > 0.0 {
+                            let d = x - mean;
+                            wi * d * d
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum::<f64>()
+                    / sum_w;
+                (mean, var.sqrt())
             }
-            var /= sum_w;
-            (mean, var.sqrt())
         } else {
-            let mean = v.sum() / (n as f64);
-            let mut var = 0.0;
-            for &x in v.iter() {
-                let d = x - mean;
-                var += d * d;
+            if n < 1024 {
+                let mean = v.sum() / (n as f64);
+                let mut var = 0.0;
+                for &x in v.iter() {
+                    let d = x - mean;
+                    var += d * d;
+                }
+                var /= n as f64;
+                (mean, var.sqrt())
+            } else {
+                let values = v.as_slice().expect("Array1 should be contiguous");
+                let mean = values.par_iter().copied().sum::<f64>() / (n as f64);
+                let var = values
+                    .par_iter()
+                    .map(|&x| {
+                        let d = x - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / (n as f64);
+                (mean, var.sqrt())
             }
-            var /= n as f64;
-            (mean, var.sqrt())
         }
     }
     fn standardize_with(mean: f64, std: f64, v: &Array1<f64>) -> (Array1<f64>, (f64, f64)) {
@@ -1185,16 +1288,44 @@ pub fn build_calibrator_design(
         usize::MAX,
     );
 
-    let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
-        pred_std.view(),
-        knots_pred.view(),
-        spec.pred_basis.degree,
-    )?;
-    let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
-        se_std.view(),
-        knots_se.view(),
-        spec.se_basis.degree,
-    )?;
+    let pred_degree = spec.pred_basis.degree;
+    let se_degree = spec.se_basis.degree;
+    let dist_degree = spec.dist_basis.degree;
+    let (pred_res, (se_res, dist_res)) = join(
+        || {
+            crate::calibrate::basis::create_bspline_basis_with_knots(
+                pred_std.view(),
+                knots_pred.view(),
+                pred_degree,
+            )
+        },
+        || {
+            join(
+                || {
+                    crate::calibrate::basis::create_bspline_basis_with_knots(
+                        se_std.view(),
+                        knots_se.view(),
+                        se_degree,
+                    )
+                },
+                || {
+                    if use_wiggle_only_dist {
+                        Ok(None)
+                    } else {
+                        crate::calibrate::basis::create_bspline_basis_with_knots(
+                            dist_std.view(),
+                            knots_dist_generated.view(),
+                            dist_degree,
+                        )
+                        .map(Some)
+                    }
+                },
+            )
+        },
+    );
+    let (b_pred_raw, _) = pred_res?;
+    let (b_se_raw, _) = se_res?;
+    let dist_basis_candidate = dist_res?;
     let pred_raw_cols = b_pred_raw.ncols();
     let se_raw_cols = b_se_raw.ncols();
 
@@ -1352,11 +1483,13 @@ pub fn build_calibrator_design(
             stz_se = Array2::<f64>::zeros((stz_se.nrows(), 0));
         } else {
             let mut interacted = b_se_c.clone();
-            for (row, &pc) in pred_centered.iter().enumerate() {
-                for col in 0..interacted.ncols() {
-                    interacted[[row, col]] *= pc;
-                }
-            }
+            interacted
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(row_idx, mut row)| {
+                    row *= pred_centered[row_idx];
+                });
             let mut backbone_constraints = Array2::<f64>::zeros((n, 2));
             backbone_constraints.column_mut(0).assign(&ones);
             backbone_constraints
@@ -1453,11 +1586,8 @@ pub fn build_calibrator_design(
         (b, stz, knots, s0, 0)
     } else {
         // Create the spline basis for distance
-        let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
-            dist_std.view(),
-            knots_dist_generated.view(),
-            spec.dist_basis.degree,
-        )?;
+        let (b_dist_raw, _) = dist_basis_candidate
+            .expect("distance basis should be constructed when wiggle-only drop is disabled");
         let dist_raw_cols = b_dist_raw.ncols();
 
         // Always enforce identifiability constraints so the optimizer sees the true nullspace
