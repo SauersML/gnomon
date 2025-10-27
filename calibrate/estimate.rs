@@ -34,7 +34,7 @@ use crate::calibrate::basis;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
-    compute_penalty_square_roots,
+    compute_penalty_square_roots, penalty_root_cache_stats,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
@@ -51,6 +51,23 @@ fn log_basis_cache_stats(context: &str) {
     };
     log::info!(
         "Basis cache stats [{}]: hits={}, misses={}, hit_rate={:.2}%",
+        context,
+        stats.hits,
+        stats.misses,
+        hit_rate
+    );
+}
+
+fn log_penalty_root_cache_stats(context: &str) {
+    let stats = penalty_root_cache_stats();
+    let total = stats.hits.saturating_add(stats.misses);
+    let hit_rate = if total > 0 {
+        (stats.hits as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    log::info!(
+        "Penalty root cache stats [{}]: hits={}, misses={}, hit_rate={:.2}%",
         context,
         stats.hits,
         stats.misses,
@@ -876,6 +893,7 @@ pub fn train_model(
             .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
 
         log_basis_cache_stats("train_model");
+        log_penalty_root_cache_stats("train_model");
 
         return Ok(trained_model);
     }
@@ -1539,6 +1557,7 @@ pub fn train_model(
         .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
 
     log_basis_cache_stats("train_model");
+    log_penalty_root_cache_stats("train_model");
 
     Ok(trained_model)
 }

@@ -3,14 +3,16 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
+use ahash::{AHashMap, AHasher};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::Zip;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayViewMut2, Axis, s};
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub enum PenaltyRepresentation {
@@ -177,6 +179,56 @@ impl PenaltyMatrix {
 
     pub fn block_dense(&self) -> Array2<f64> {
         self.representation.to_block_dense()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PenaltyRootCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+#[derive(Default)]
+struct PenaltyRootCache {
+    map: AHashMap<PenaltyRootCacheKey, Arc<Array2<f64>>>,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct PenaltyRootCacheKey {
+    rows: usize,
+    cols: usize,
+    hash: u64,
+}
+
+fn penalty_root_cache() -> &'static Mutex<PenaltyRootCache> {
+    static CACHE: OnceLock<Mutex<PenaltyRootCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(PenaltyRootCache::default()))
+}
+
+fn penalty_root_cache_key(matrix: &Array2<f64>) -> PenaltyRootCacheKey {
+    let (rows, cols) = matrix.dim();
+    let mut hasher = AHasher::default();
+    hasher.write_usize(rows);
+    hasher.write_usize(cols);
+    for value in matrix.iter() {
+        hasher.write_u64(value.to_bits());
+    }
+    PenaltyRootCacheKey {
+        rows,
+        cols,
+        hash: hasher.finish(),
+    }
+}
+
+pub fn penalty_root_cache_stats() -> PenaltyRootCacheStats {
+    let cache = penalty_root_cache()
+        .lock()
+        .expect("penalty root cache mutex should not be poisoned");
+    PenaltyRootCacheStats {
+        hits: cache.hits,
+        misses: cache.misses,
     }
 }
 
@@ -1953,6 +2005,23 @@ pub fn compute_penalty_square_roots(
     let mut rs_list = Vec::with_capacity(s_list.len());
 
     for s in s_list {
+        let cache_key = penalty_root_cache_key(s);
+        if let Some(cached) = {
+            let mut cache = penalty_root_cache()
+                .lock()
+                .expect("penalty root cache mutex should not be poisoned");
+            if let Some(entry) = cache.map.get(&cache_key) {
+                cache.hits = cache.hits.saturating_add(1);
+                Some((**entry).clone())
+            } else {
+                cache.misses = cache.misses.saturating_add(1);
+                None
+            }
+        } {
+            rs_list.push(cached);
+            continue;
+        }
+
         let p = s.nrows();
 
         // Use eigendecomposition for symmetric positive semi-definite matrices
@@ -1971,25 +2040,36 @@ pub fn compute_penalty_square_roots(
 
         let rank_k: usize = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
 
-        if rank_k == 0 {
+        let rs = if rank_k == 0 {
             // Zero penalty matrix - return 0 x p matrix (STANDARDIZED: rank x p)
-            rs_list.push(Array2::zeros((0, p)));
-            continue;
-        }
+            Array2::zeros((0, p))
+        } else {
+            // STANDARDIZED: Create rank x p square root matrix where S = rs^T * rs
+            // Each row is sqrt(eigenvalue) * eigenvector^T
+            let mut rs = Array2::zeros((rank_k, p));
+            let mut row_idx = 0;
 
-        // STANDARDIZED: Create rank x p square root matrix where S = rs^T * rs
-        // Each row is sqrt(eigenvalue) * eigenvector^T
-        let mut rs = Array2::zeros((rank_k, p));
-        let mut row_idx = 0;
-
-        for (i, &eigenval) in eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_eigenval = eigenval.sqrt();
-                let eigenvec = eigenvectors.column(i);
-                // Each row of rs is sqrt(eigenvalue) * eigenvector^T
-                rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
-                row_idx += 1;
+            for (i, &eigenval) in eigenvalues.iter().enumerate() {
+                if eigenval > tolerance {
+                    let sqrt_eigenval = eigenval.sqrt();
+                    let eigenvec = eigenvectors.column(i);
+                    // Each row of rs is sqrt(eigenvalue) * eigenvector^T
+                    rs.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
+                    row_idx += 1;
+                }
             }
+
+            rs
+        };
+
+        {
+            let mut cache = penalty_root_cache()
+                .lock()
+                .expect("penalty root cache mutex should not be poisoned");
+            cache
+                .map
+                .entry(cache_key)
+                .or_insert_with(|| Arc::new(rs.clone()));
         }
 
         rs_list.push(rs);
