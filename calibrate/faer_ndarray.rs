@@ -25,78 +25,46 @@ fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
     Array1::from_shape_fn(mat.nrows(), |i| mat[(i, 0)])
 }
 
-enum FaerStorage<'a> {
-    Borrowed(MatRef<'a, f64>),
-    Owned(Mat<f64>),
-}
-
-impl<'a> FaerStorage<'a> {
-    #[inline]
-    fn as_ref(&self) -> MatRef<'_, f64> {
-        match self {
-            FaerStorage::Borrowed(view) => *view,
-            FaerStorage::Owned(mat) => mat.as_ref(),
-        }
-    }
-}
-
 pub struct FaerArrayView<'a> {
-    storage: FaerStorage<'a>,
+    view: MatRef<'a, f64>,
 }
 
 impl<'a> FaerArrayView<'a> {
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
-        let storage = if let Some(slice) = array.as_slice_memory_order() {
-            if array.is_standard_layout() {
-                FaerStorage::Borrowed(MatRef::from_row_major_slice(
-                    slice,
-                    array.nrows(),
-                    array.ncols(),
-                ))
-            } else if array.t().is_standard_layout() {
-                FaerStorage::Borrowed(MatRef::from_column_major_slice(
-                    slice,
-                    array.nrows(),
-                    array.ncols(),
-                ))
-            } else {
-                let (rows, cols) = array.dim();
-                let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
-                FaerStorage::Owned(owned)
-            }
-        } else {
-            let (rows, cols) = array.dim();
-            let owned = Mat::from_fn(rows, cols, |i, j| array[(i, j)]);
-            FaerStorage::Owned(owned)
-        };
-        Self { storage }
+        let (rows, cols) = array.dim();
+        let strides = array.strides();
+        // SAFETY: `ArrayBase` guarantees that the pointer returned by `as_ptr` is valid for the
+        // lifetime of the array view, and the stride metadata from `strides()` accurately describes
+        // how to traverse the 2-D view in memory. We forward this information to faer so that it can
+        // operate on the ndarray-backed storage without performing any intermediate copies.
+        let view =
+            unsafe { MatRef::from_raw_parts(array.as_ptr(), rows, cols, strides[0], strides[1]) };
+        Self { view }
     }
 
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, f64> {
-        self.storage.as_ref()
+        self.view
     }
 }
 
 pub struct FaerColView<'a> {
-    storage: FaerStorage<'a>,
+    view: MatRef<'a, f64>,
 }
 
 impl<'a> FaerColView<'a> {
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix1>) -> Self {
         let len = array.len();
-        let storage = if let Some(slice) = array.as_slice() {
-            FaerStorage::Borrowed(MatRef::from_row_major_slice(slice, len, 1))
-        } else {
-            let owned = Mat::from_fn(len, 1, |i, _| array[i]);
-            FaerStorage::Owned(owned)
-        };
-        Self { storage }
+        let stride = array.strides()[0];
+        // SAFETY: identical reasoning as `FaerArrayView::new`; here we reinterpret the 1-D ndarray
+        // storage as an n×1 matrix so that faer can consume it directly.
+        let view = unsafe { MatRef::from_raw_parts(array.as_ptr(), len, 1, stride, 0) };
+        Self { view }
     }
 
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, f64> {
-        self.storage.as_ref()
+        self.view
     }
 }
 
