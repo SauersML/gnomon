@@ -27,6 +27,7 @@ use wolfe_bfgs::{Bfgs, BfgsSolution};
 use self::internal::RemlState;
 
 // Crate-level imports
+use crate::calibrate::basis;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
     ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
@@ -37,8 +38,26 @@ use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
+fn log_basis_cache_stats(context: &str) {
+    let stats = basis::basis_cache_stats();
+    let total = stats.hits.saturating_add(stats.misses);
+    let hit_rate = if total > 0 {
+        (stats.hits as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    log::info!(
+        "Basis cache stats [{}]: hits={}, misses={}, hit_rate={:.2}%",
+        context,
+        stats.hits,
+        stats.misses,
+        hit_rate
+    );
+}
+
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use rayon::prelude::*;
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use faer::Mat as FaerMat;
@@ -718,6 +737,8 @@ pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
+    basis::clear_basis_cache();
+
     log::info!(
         "Starting model training with REML. {} total samples.",
         data.y.len()
@@ -734,7 +755,9 @@ pub fn train_model(
         pc_null_transforms,
         interaction_centering_means,
         interaction_orth_alpha,
+        penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
+    drop(penalty_structs);
     log_layout_info(&layout);
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -806,9 +829,10 @@ pub fn train_model(
 
         let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
         // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
-        let h_trans = final_fit.penalized_hessian_transformed.clone();
         let qs = &final_fit.reparam_result.qs;
-        let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+        let penalized_hessian_orig = qs
+            .dot(&final_fit.penalized_hessian_transformed)
+            .dot(&qs.t());
         // Compute scale for Identity; 1.0 for Logit
         let scale_val = match config.link_function {
             LinkFunction::Logit => 1.0,
@@ -870,6 +894,8 @@ pub fn train_model(
         trained_model
             .assert_layout_consistency_with_layout(&layout)
             .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
+
+        log_basis_cache_stats("train_model");
 
         return Ok(trained_model);
     }
@@ -1249,9 +1275,10 @@ pub fn train_model(
     // back to the original, interpretable basis.
     let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
     // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
-    let h_trans = final_fit.penalized_hessian_transformed.clone();
     let qs = &final_fit.reparam_result.qs;
-    let penalized_hessian_orig = qs.dot(&h_trans).dot(&qs.t());
+    let penalized_hessian_orig = qs
+        .dot(&final_fit.penalized_hessian_transformed)
+        .dot(&qs.t());
     // Compute scale for Identity; 1.0 for Logit
     let scale_val = match config.link_function {
         LinkFunction::Logit => 1.0,
@@ -1531,6 +1558,8 @@ pub fn train_model(
         .assert_layout_consistency_with_layout(&layout)
         .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
 
+    log_basis_cache_stats("train_model");
+
     Ok(trained_model)
 }
 
@@ -1635,14 +1664,13 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let rs_list_ref: Vec<Array2<f64>> = rs_list.clone();
     let pirls_res = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
         y_o.view(),
         w_o.view(),
-        &rs_list_ref,
+        &rs_list,
         &layout,
         &cfg,
     )?;
@@ -2016,6 +2044,38 @@ pub mod internal {
         }
     }
 
+    struct RemlWorkspace {
+        rho_plus: Array1<f64>,
+        rho_minus: Array1<f64>,
+        rho_temp: Array1<f64>,
+        grad_primary: Array1<f64>,
+        grad_secondary: Array1<f64>,
+        concat: Array2<f64>,
+        solved: Array2<f64>,
+        block_ranges: Vec<(usize, usize)>,
+        solved_rows: usize,
+    }
+
+    impl RemlWorkspace {
+        fn new(max_penalties: usize, coeffs: usize, total_rank: usize) -> Self {
+            RemlWorkspace {
+                rho_plus: Array1::zeros(max_penalties),
+                rho_minus: Array1::zeros(max_penalties),
+                rho_temp: Array1::zeros(max_penalties),
+                grad_primary: Array1::zeros(max_penalties),
+                grad_secondary: Array1::zeros(max_penalties),
+                concat: Array2::zeros((coeffs, total_rank)),
+                solved: Array2::zeros((coeffs, total_rank)),
+                block_ranges: Vec::with_capacity(max_penalties),
+                solved_rows: coeffs,
+            }
+        }
+
+        fn reset_block_ranges(&mut self) {
+            self.block_ranges.clear();
+        }
+    }
+
     pub(super) struct RemlState<'a> {
         y: ArrayView1<'a, f64>,
         x: ArrayView2<'a, f64>,
@@ -2036,6 +2096,7 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
+        workspace: RefCell<RemlWorkspace>,
     }
 
     impl<'a> RemlState<'a> {
@@ -2202,6 +2263,10 @@ pub mod internal {
                 None => vec![0; expected_len],
             };
 
+            let penalty_count = rs_list.len();
+            let total_rank: usize = rs_list.iter().map(|rk| rk.nrows()).sum();
+            let workspace = RemlWorkspace::new(penalty_count, layout.total_coeffs, total_rank);
+
             Ok(Self {
                 y,
                 x,
@@ -2220,6 +2285,7 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
+                workspace: RefCell::new(workspace),
             })
         }
 
@@ -2440,30 +2506,44 @@ pub mod internal {
 
         /// Numerical gradient of the penalized log-likelihood part w.r.t. rho via central differences.
         /// Returns g_pll where g_pll[k] = - d/d rho_k penalised_ll(rho), suitable for COST gradient assembly.
+        #[cfg(test)]
         fn numeric_penalised_ll_grad(
             &self,
             rho: &Array1<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            let mut workspace = self.workspace.borrow_mut();
+            self.numeric_penalised_ll_grad_with_workspace(rho, &mut workspace)
+        }
+
+        fn numeric_penalised_ll_grad_with_workspace(
+            &self,
+            rho: &Array1<f64>,
+            workspace: &mut RemlWorkspace,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let len = rho.len();
+            if len == 0 {
                 return Ok(Array1::zeros(0));
             }
-            let mut g = Array1::zeros(rho.len());
-            for k in 0..rho.len() {
-                // Step scheme consistent with compute_fd_gradient
+
+            let mut g_view = workspace.grad_secondary.slice_mut(s![..len]);
+            g_view.fill(0.0);
+
+            for k in 0..len {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
 
-                let mut rp = rho.clone();
-                let mut rm = rho.clone();
-                rp[k] += 0.5 * h;
-                rm[k] -= 0.5 * h;
-                let fp = self.penalised_ll_at(&rp)?;
-                let fm = self.penalised_ll_at(&rm)?;
-                // Minus sign: COST gradient uses - d penalised_ll / d rho
-                g[k] = -(fp - fm) / h;
+                workspace.rho_plus.assign(rho);
+                workspace.rho_plus[k] += 0.5 * h;
+                workspace.rho_minus.assign(rho);
+                workspace.rho_minus[k] -= 0.5 * h;
+
+                let fp = self.penalised_ll_at(&workspace.rho_plus)?;
+                let fm = self.penalised_ll_at(&workspace.rho_minus)?;
+                g_view[k] = -(fp - fm) / h;
             }
-            Ok(g)
+
+            Ok(g_view.to_owned())
         }
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
@@ -2486,27 +2566,35 @@ pub mod internal {
         }
 
         /// Numerical gradient of 0.5 * log|H_eff(rho)| with respect to rho via central differences.
-        fn numeric_half_logh_grad(
+        fn numeric_half_logh_grad_with_workspace(
             &self,
             rho: &Array1<f64>,
+            workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
-            if rho.len() == 0 {
+            let len = rho.len();
+            if len == 0 {
                 return Ok(Array1::zeros(0));
             }
-            let mut g = Array1::zeros(rho.len());
-            for k in 0..rho.len() {
+
+            let mut g_view = workspace.grad_primary.slice_mut(s![..len]);
+            g_view.fill(0.0);
+
+            for k in 0..len {
                 let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
                 let h_abs = 1e-5_f64;
                 let h = h_rel.max(h_abs);
-                let mut rp = rho.clone();
-                rp[k] += 0.5 * h;
-                let mut rm = rho.clone();
-                rm[k] -= 0.5 * h;
-                let fp = self.half_logh_at(&rp)?;
-                let fm = self.half_logh_at(&rm)?;
-                g[k] = (fp - fm) / h;
+
+                workspace.rho_plus.assign(rho);
+                workspace.rho_plus[k] += 0.5 * h;
+                workspace.rho_minus.assign(rho);
+                workspace.rho_minus[k] -= 0.5 * h;
+
+                let fp = self.half_logh_at(&workspace.rho_plus)?;
+                let fm = self.half_logh_at(&workspace.rho_minus)?;
+                g_view[k] = (fp - fm) / h;
             }
-            Ok(g)
+
+            Ok(g_view.to_owned())
         }
 
         // Accessor methods for private fields
@@ -3268,6 +3356,11 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
             let rs_transposed = &reparam_result.rs_transposed;
 
+            let mut workspace_ref = self.workspace.borrow_mut();
+            let workspace = &mut *workspace_ref;
+            let len = p.len();
+            let mut cost_gradient = Array1::zeros(len);
+
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
             if ridge_used > 0.0 {
@@ -3296,12 +3389,10 @@ pub mod internal {
 
             // --- Extract common components ---
             let lambdas = p.mapv(f64::exp); // This is λ
-
-            // --- Create the gradient vector ---
-            // This variable holds the gradient of the COST function (-V_REML or -V_LAML),
-            // which the optimizer minimizes. Due to sign conventions in the term calculations,
-            // the formula directly computes the cost gradient.
-            let mut cost_gradient = Array1::zeros(lambdas.len());
+            let should_parallelize = {
+                let threshold = self.config.reml_parallel_threshold;
+                threshold > 0 && lambdas.len() >= threshold
+            };
 
             let n = self.y.len() as f64;
 
@@ -3331,21 +3422,23 @@ pub mod internal {
                             "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
                             dp_c
                         );
-                        let mut grad_total = Array1::zeros(lambdas.len());
+                        let mut grad_total_view =
+                            workspace.grad_secondary.slice_mut(s![..lambdas.len()]);
+                        grad_total_view.fill(0.0);
                         for k in 0..lambdas.len() {
                             let h = 1e-3_f64 * (1.0 + p[k].abs());
                             if h == 0.0 {
                                 continue;
                             }
-                            let mut rho_plus = p.clone();
-                            let mut rho_minus = p.clone();
-                            rho_plus[k] += h;
-                            rho_minus[k] -= h;
-                            let cost_plus = self.compute_cost(&rho_plus)?;
-                            let cost_minus = self.compute_cost(&rho_minus)?;
-                            grad_total[k] = (cost_plus - cost_minus) / (2.0 * h);
+                            workspace.rho_plus.assign(p);
+                            workspace.rho_plus[k] += h;
+                            workspace.rho_minus.assign(p);
+                            workspace.rho_minus[k] -= h;
+                            let cost_plus = self.compute_cost(&workspace.rho_plus)?;
+                            let cost_minus = self.compute_cost(&workspace.rho_minus)?;
+                            grad_total_view[k] = (cost_plus - cost_minus) / (2.0 * h);
                         }
-                        return Ok(grad_total);
+                        return Ok(grad_total_view.to_owned());
                     }
 
                     // Three-term gradient computation following mgcv gdi1
@@ -3374,96 +3467,107 @@ pub mod internal {
                             "[REML WARNING] Switching ½·log|H| gradient to numeric finite differences; dp_c={:.3e}.",
                             dp_c
                         );
-                        Some(self.numeric_half_logh_grad(p)?)
+                        Some(self.numeric_half_logh_grad_with_workspace(p, workspace)?)
                     } else {
                         None
                     };
 
-                    // Three-term gradient computation following mgcv gdi1
-                    let mut block_ranges = Vec::with_capacity(rs_transposed.len());
+                    workspace.reset_block_ranges();
                     let mut total_rank = 0;
                     for rt in rs_transposed {
                         let cols = rt.ncols();
-                        block_ranges.push((total_rank, total_rank + cols));
+                        workspace.block_ranges.push((total_rank, total_rank + cols));
                         total_rank += cols;
                     }
+                    workspace.solved_rows = h_eff.nrows();
 
-                    let (rt_concat_opt, h_inv_concat_opt) = if numeric_logh_grad.is_none()
-                        && total_rank > 0
-                    {
-                        let mut concat = Array2::zeros((h_eff.nrows(), total_rank));
-                        for ((start, end), rt) in block_ranges.iter().zip(rs_transposed.iter()) {
+                    if numeric_logh_grad.is_none() && total_rank > 0 {
+                        workspace.concat.fill(0.0);
+                        let rows = h_eff.nrows();
+                        for ((start, end), rt) in
+                            workspace.block_ranges.iter().zip(rs_transposed.iter())
+                        {
                             if *end > *start {
-                                concat.slice_mut(s![.., *start..*end]).assign(rt);
+                                workspace
+                                    .concat
+                                    .slice_mut(s![..rows, *start..*end])
+                                    .assign(rt);
                             }
                         }
-                        let concat_view = FaerArrayView::new(&concat);
+                        let concat_view = FaerArrayView::new(&workspace.concat);
                         let solved = factor_g.solve(concat_view.as_ref());
                         let solved_ref = solved.as_ref();
-                        let solved_arr = Array2::from_shape_fn(
-                            (solved_ref.nrows(), solved_ref.ncols()),
-                            |(i, j)| solved_ref[(i, j)],
-                        );
-                        (Some(concat), Some(solved_arr))
+                        let (rows, cols) = solved_ref.shape();
+                        workspace.solved_rows = rows;
+                        for j in 0..cols {
+                            for i in 0..rows {
+                                workspace.solved[(i, j)] = solved_ref[(i, j)];
+                            }
+                        }
                     } else {
-                        (None, None)
-                    };
+                        workspace.solved_rows = 0;
+                    }
 
-                    for k in 0..lambdas.len() {
+                    let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
+                    let det1_values = &pirls_result.reparam_result.det1;
+                    let beta_ref = beta_transformed;
+                    let solved_rows = workspace.solved_rows;
+                    let block_ranges_ref = &workspace.block_ranges;
+                    let solved_ref = &workspace.solved;
+                    let concat_ref = &workspace.concat;
+                    let compute_gaussian_grad = |k: usize| -> f64 {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
-                        let r_beta = r_k.dot(beta_transformed);
+                        let r_beta = r_k.dot(beta_ref);
                         let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
                         // Component 1: derivative of the penalized deviance.
                         // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
-                        // φ is treated as fixed at φ̂ when taking the derivative, so there is no hidden
-                        // dφ/dρ contribution.  This matches Wood (2011) and mgcv’s
-                        // `REML1 <- oo$D1/(2*scale*gamma)` expression.
-
-                        let d1 = lambdas[k] * beta_transformed.dot(&s_k_beta_transformed); // Direct penalty term only
+                        let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
                         let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
                         // Component 2: derivative of the penalized Hessian determinant.
-                        // R/C counterpart: `oo$trA1/2`.
-                        // Calculate tr(H⁻¹ S_k) via Rᵀ RHS using the cached faer factor
-                        let log_det_h_grad_term = if let Some(ref g) = numeric_logh_grad {
+                        let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
                             g[k]
-                        } else {
-                            let trace_h_inv_s_k = if let (Some(rt_concat), Some(h_inv_concat)) =
-                                (rt_concat_opt.as_ref(), h_inv_concat_opt.as_ref())
-                            {
-                                let (start, end) = block_ranges[k];
-                                if end > start {
-                                    let h_block = h_inv_concat.slice(s![.., start..end]);
-                                    let rt_block = rt_concat.slice(s![.., start..end]);
-                                    kahan_sum(
-                                        h_block.iter().zip(rt_block.iter()).map(|(&x, &y)| x * y),
-                                    )
-                                } else {
-                                    0.0
-                                }
+                        } else if solved_rows > 0 {
+                            let (start, end) = block_ranges_ref[k];
+                            if end > start {
+                                let solved_block = solved_ref
+                                    .slice(s![..solved_rows, start..end]);
+                                let rt_block = concat_ref
+                                    .slice(s![..solved_rows, start..end]);
+                                let trace_h_inv_s_k = kahan_sum(
+                                    solved_block
+                                        .iter()
+                                        .zip(rt_block.iter())
+                                        .map(|(&x, &y)| x * y),
+                                );
+                                let tra1 = lambdas[k] * trace_h_inv_s_k;
+                                tra1 / 2.0
                             } else {
                                 0.0
-                            };
-                            let tra1 = lambdas[k] * trace_h_inv_s_k; // Corresponds to oo$trA1
-                            tra1 / 2.0
+                            }
+                        } else {
+                            0.0
                         };
 
                         // Component 3: derivative of the penalty pseudo-determinant.
-                        // Use the stable derivative from the P-IRLS reparameterization.
-                        let log_det_s_grad_term = 0.5 * pirls_result.reparam_result.det1[k];
+                        let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                        // Final gradient assembly for the minimizer.
-                        // This calculation now matches the formula for `REML1` in `gam.fit3.R`,
-                        // which is the gradient of the cost function that `newton` minimizes.
-                        // `REML1 <- oo$D1/(2*scale) + oo$trA1/2 - rp$det1/2`.
-                        // Reminder: since φ was profiled out and we evaluate the partial derivative at φ̂,
-                        // the gradient already accounts for the changing scale; adding dφ/dρ here would
-                        // double-count the effect and contradict the envelope theorem.
-                        cost_gradient[k] = deviance_grad_term  // Corresponds to `+ oo$D1/...`
-                                         + log_det_h_grad_term           // Corresponds to `+ oo$trA1/2`
-                                         - log_det_s_grad_term; // Corresponds to `- rp$det1/2`
+                        deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
+                    };
+
+                    let grad_slice = cost_gradient
+                        .as_slice_mut()
+                        .expect("gradient storage is contiguous");
+                    if should_parallelize {
+                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
+                            *slot = compute_gaussian_grad(k);
+                        });
+                    } else {
+                        for (k, slot) in grad_slice.iter_mut().enumerate() {
+                            *slot = compute_gaussian_grad(k);
+                        }
                     }
                 }
                 _ => {
@@ -3472,16 +3576,16 @@ pub mod internal {
 
                     // Include the missing derivative of the penalized log-likelihood part via FD.
                     // This ensures exact consistency with the COST used in compute_cost.
-                    let g_pll = self.numeric_penalised_ll_grad(p)?;
+                    let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
 
                     // Full numerical derivative of 0.5·log|H_eff(ρ)| for exact consistency with cost
-                    let g_half_logh = self.numeric_half_logh_grad(p)?;
+                    let g_half_logh = self.numeric_half_logh_grad_with_workspace(p, workspace)?;
 
                     // No explicit deviance-by-beta channel here; we rely on numeric components for consistency.
 
                     // Use stabilized derivatives of log|Sλ|_+ directly from the reparameterization:
                     // det1[k] = λ_k tr(S_λ^+ S_k) in the stabilized basis.
-                    let det1_full = pirls_result.reparam_result.det1.to_vec();
+                    let det1_full = pirls_result.reparam_result.det1.clone();
                     eprintln!("[Sλ] Using stabilized det1 from reparam: {:?}", det1_full);
 
                     // Report current ½·log|H_eff| using the same stabilized path as cost
@@ -3521,29 +3625,36 @@ pub mod internal {
                     );
 
                     // --- Loop through penalties to assemble gradient components ---
-                    for k in 0..lambdas.len() {
-                        // (1) ½ d log|H| / dρ_k using FULL numeric derivative (consistent with cost)
-                        let log_det_h_grad_term = g_half_logh[k];
-
-                        // (2) −½ d log|S_λ|_+ / dρ_k using ORIGINAL basis (det1_full)
-                        let log_det_s_grad_term = 0.5 * det1_full[k];
-
-                        // (3) Numerical derivative of penalized log-likelihood part
-                        let pll_grad_term = g_pll[k];
-
-                        // Final assembly for COST gradient:
-                        // dC/dρ_k = (- d penalised_ll / dρ_k) + ½ d log|H|/dρ_k − ½ d log|S_λ|_+/dρ_k
-                        cost_gradient[k] =
+                    let det1_full_ref = &det1_full;
+                    let g_pll_ref = &g_pll;
+                    let g_half_logh_ref = &g_half_logh;
+                    let assemble_laml_grad = |k: usize| -> f64 {
+                        let log_det_h_grad_term = g_half_logh_ref[k];
+                        let log_det_s_grad_term = 0.5 * det1_full_ref[k];
+                        let pll_grad_term = g_pll_ref[k];
+                        let gradient_value =
                             pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
-
-                        // Per-component gradient breakdown for observability
                         eprintln!(
                             "[LAML g] k={k} d(-ℓ_p)={:+.6e}  +½ dlog|H|(full)={:+.6e}  -½ dlog|S|={:+.6e}  => g={:+.6e}",
                             pll_grad_term,
                             log_det_h_grad_term,
-                            -0.5 * det1_full[k],
-                            cost_gradient[k]
+                            -0.5 * det1_full_ref[k],
+                            gradient_value
                         );
+                        gradient_value
+                    };
+
+                    let grad_slice = cost_gradient
+                        .as_slice_mut()
+                        .expect("gradient storage is contiguous");
+                    if should_parallelize {
+                        grad_slice.par_iter_mut().enumerate().for_each(|(k, slot)| {
+                            *slot = assemble_laml_grad(k);
+                        });
+                    } else {
+                        for (k, slot) in grad_slice.iter_mut().enumerate() {
+                            *slot = assemble_laml_grad(k);
+                        }
                     }
                     // mgcv-style assembly
                     println!("LAML gradient computation finished.");
@@ -3561,15 +3672,26 @@ pub mod internal {
             // One-direction secant test (cheap FD validation)
             if !p.is_empty() {
                 let h = 1e-4;
-                let mut dir = Array1::zeros(p.len());
-                dir[0] = 1.0; // pick k=0 or max|grad|
-                let gdot = cost_gradient.dot(&dir);
+                workspace.rho_temp.fill(0.0);
+                workspace.rho_temp[0] = 1.0; // pick k=0 or max|grad|
+                let gdot = cost_gradient.dot(&workspace.rho_temp);
+
+                workspace.rho_plus.assign(p);
+                for i in 0..p.len() {
+                    workspace.rho_plus[i] += h * workspace.rho_temp[i];
+                }
                 let fp = self
-                    .compute_cost(&(p.clone() + &(h * &dir)))
+                    .compute_cost(&workspace.rho_plus)
                     .unwrap_or(f64::INFINITY);
+
+                workspace.rho_minus.assign(p);
+                for i in 0..p.len() {
+                    workspace.rho_minus[i] -= h * workspace.rho_temp[i];
+                }
                 let fm = self
-                    .compute_cost(&(p.clone() - &(h * &dir)))
+                    .compute_cost(&workspace.rho_minus)
                     .unwrap_or(f64::INFINITY);
+
                 let secant = (fp - fm) / (2.0 * h);
                 let denom = gdot.abs().max(secant.abs()).max(1e-8);
                 eprintln!(
@@ -3845,6 +3967,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 30,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 5,
                     degree: 3,
@@ -4151,6 +4274,66 @@ pub mod internal {
             assert!(rel_l2 < 1e-3, "relative L2 too high: {rel_l2:.3e}");
             assert!(rel_dir < 1e-3, "directional secant mismatch: {rel_dir:.3e}");
         }
+
+        #[test]
+        fn reml_gradient_parallel_matches_sequential() {
+            let (y, w, x, offset, s_list) = make_identity_gradient_fixture();
+            let p = x.ncols();
+            let k = s_list.len();
+
+            let layout = ModelLayout::external(p, k);
+
+            let mut config_sequential =
+                ModelConfig::external(LinkFunction::Identity, 1e-10, 200, false);
+            config_sequential.reml_parallel_threshold = usize::MAX;
+
+            let mut config_parallel = config_sequential.clone();
+            config_parallel.reml_parallel_threshold = 1;
+
+            let state_sequential = internal::RemlState::new_with_offset(
+                y.view(),
+                x.view(),
+                w.view(),
+                offset.view(),
+                s_list.clone(),
+                &layout,
+                &config_sequential,
+                None,
+            )
+            .expect("sequential RemlState should be constructed");
+
+            let state_parallel = internal::RemlState::new_with_offset(
+                y.view(),
+                x.view(),
+                w.view(),
+                offset.view(),
+                s_list,
+                &layout,
+                &config_parallel,
+                None,
+            )
+            .expect("parallel RemlState should be constructed");
+
+            let rho = Array1::from(vec![0.30_f64, -0.45_f64]);
+
+            let grad_seq = state_sequential
+                .compute_gradient(&rho)
+                .expect("sequential gradient should evaluate");
+            let grad_par = state_parallel
+                .compute_gradient(&rho)
+                .expect("parallel gradient should evaluate");
+
+            let max_abs_diff = grad_seq
+                .iter()
+                .zip(grad_par.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+
+            assert!(
+                max_abs_diff < 1e-10,
+                "parallel and sequential gradients diverged: max |Δ| = {max_abs_diff:.3e}"
+            );
+        }
         ///
         /// This is the robust replacement for the simplistic data generation that causes perfect separation.
         /// It creates a smooth, non-linear relationship with added noise to ensure the resulting
@@ -4241,6 +4424,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 6,
                     degree: 3,
@@ -4438,6 +4622,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4532,6 +4717,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 4,
                     degree: 3,
@@ -4799,6 +4985,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4831,7 +5018,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -4909,6 +5096,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -4941,7 +5129,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
             };
 
-            let (x, s_list, layout, _, _, _, _, _, _) =
+            let (x, s_list, layout, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
 
             // Get P-IRLS result at a reasonable smoothing level
@@ -5131,9 +5319,10 @@ pub mod internal {
                     );
 
                     // Complexity: edf and Hessian min-eig by refitting at chosen lambdas on training X
-                    let (x_tr, s_list, layout, _, _, _, _, _, _) =
+                    let (x_tr, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                         build_design_and_penalty_matrices(&data_train, &trained.config)
                             .expect("layout");
+                    drop(penalty_structs);
 
                     if penalty_labels.is_none() {
                         let (labels, types) = assign_penalty_labels(&layout);
@@ -6038,6 +6227,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6163,6 +6353,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-2,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2, // Fewer knots for stability
                     degree: 2,    // Lower degree for stability
@@ -6196,8 +6387,9 @@ pub mod internal {
             };
 
             // --- Build model structure ---
-            let (x_matrix, mut s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, mut s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             assert!(
                 layout.num_penalties > 0,
@@ -6210,9 +6402,9 @@ pub mod internal {
             // a massive factor to ensure they have an actual smoothing effect that's
             // measurable in the final cost function.
             // Reduced from 1e9 to avoid numerical brittleness, while still ensuring the penalty is dominant.
-            let penalty_scale_factor = 10_000.0;
+            let penalty_scale_factor: f64 = 10_000.0;
             for s in s_list.iter_mut() {
-                s.mapv_inplace(|x| x * penalty_scale_factor);
+                s.mapv_inplace(|x: f64| x * penalty_scale_factor);
             }
 
             // --- Identify the penalty indices corresponding to the main effects of PC1 and PC2 ---
@@ -6391,6 +6583,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -6515,6 +6708,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -6538,8 +6732,9 @@ pub mod internal {
             };
 
             // Test with extreme lambda values that might cause issues
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             // Try with very large lambda values (exp(10) ~ 22000)
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
@@ -6650,6 +6845,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 15,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3, // Smaller than original 5
                     degree: 3,
@@ -6673,8 +6869,9 @@ pub mod internal {
             };
 
             // Test that we can at least compute cost without getting infinity
-            let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
+            drop(penalty_structs);
 
             let reml_state = internal::RemlState::new(
                 data.y.view(),
@@ -6776,6 +6973,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 15, // Too many knots for small data
                     degree: 3,
@@ -6955,6 +7153,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 6, // Reduced to avoid ModelOverparameterized
                     degree: 3,
@@ -7070,6 +7269,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-6,
                 reml_max_iterations: 50,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7093,9 +7293,10 @@ pub mod internal {
             };
 
             // Build design and penalty matrices
-            let (x_matrix, s_list, layout, constraints, _, _, _, _, _) =
+            let (x_matrix, s_list, layout, constraints, _, _, _, _, _, penalty_structs) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
+            drop(penalty_structs);
 
             // In the pure pre-centering approach, the PC basis is constrained first.
             // Let's examine if the columns approximately sum to zero, but don't enforce it
@@ -7126,7 +7327,7 @@ pub mod internal {
             for (key, constraint) in constraints.iter() {
                 if key.starts_with("INT_P") {
                     // Check that the constraint is an identity matrix
-                    let z = constraint;
+                    let z: &Array2<f64> = constraint;
                     assert_eq!(
                         z.nrows(),
                         z.ncols(),
@@ -7174,7 +7375,7 @@ pub mod internal {
                         penalty_matrix.slice(s![block.col_range.clone(), block.col_range.clone()]);
 
                     // The block diagonal should have some non-zero elements (penalty structure)
-                    let block_sum = block_submatrix.iter().map(|&x| x.abs()).sum::<f64>();
+                    let block_sum: f64 = block_submatrix.iter().map(|&x: &f64| x.abs()).sum();
                     assert!(
                         block_sum > 1e-10,
                         "Interaction penalty block should have non-zero penalty structure"
@@ -7222,6 +7423,8 @@ pub mod internal {
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
                     firth_bias_reduction: false,
+                    reml_parallel_threshold:
+                        crate::calibrate::model::default_reml_parallel_threshold(),
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -7240,7 +7443,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // Stage: Build guaranteed-consistent structures for this simple model
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -7364,6 +7567,8 @@ pub mod internal {
                     reml_convergence_tolerance: 1e-3,
                     reml_max_iterations: 20,
                     firth_bias_reduction: false,
+                    reml_parallel_threshold:
+                        crate::calibrate::model::default_reml_parallel_threshold(),
                     pgs_basis_config: BasisConfig {
                         num_knots: 3,
                         degree: 3,
@@ -7383,7 +7588,7 @@ pub mod internal {
                 simple_config.pgs_basis_config.num_knots = 3;
 
                 // Stage: Generate consistent structures using the canonical function
-                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+                let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                     build_design_and_penalty_matrices(&data, &simple_config).unwrap_or_else(|e| {
                         panic!("Matrix build failed for {:?}: {:?}", link_function, e)
                     });
@@ -7535,6 +7740,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 2,
                     degree: 3,
@@ -7582,7 +7788,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -7733,6 +7939,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7749,7 +7956,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -7855,6 +8062,7 @@ pub mod internal {
                 reml_convergence_tolerance: 1e-3,
                 reml_max_iterations: 20,
                 firth_bias_reduction: false,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
                 pgs_basis_config: BasisConfig {
                     num_knots: 3,
                     degree: 3,
@@ -7871,7 +8079,7 @@ pub mod internal {
             };
 
             // Stage: Generate consistent structures using the canonical function
-            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _) =
+            let (x_simple, s_list_simple, layout_simple, _, _, _, _, _, _, _) =
                 build_design_and_penalty_matrices(&data, &simple_config)
                     .unwrap_or_else(|e| panic!("Matrix build failed: {:?}", e));
 
@@ -7968,6 +8176,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         reml_convergence_tolerance: 1e-3,
         reml_max_iterations: 20,
         firth_bias_reduction: false,
+        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 5,
             degree: 3,
@@ -8043,6 +8252,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         reml_convergence_tolerance: 1e-6,
         reml_max_iterations: 20,
         firth_bias_reduction: false,
+        reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
         pgs_basis_config: BasisConfig {
             num_knots: 3,
             degree: 3,
@@ -8067,7 +8277,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Try to build the matrices - if this fails, the test is still valid
     let matrices_result = build_design_and_penalty_matrices(&data, &config);
-    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _)) = matrices_result {
+    if let Ok((x_matrix, s_list, layout, _, _, _, _, _, _, _)) = matrices_result {
         let reml_state_result = RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -8252,6 +8462,7 @@ mod optimizer_progress_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 50,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 3,
                 degree: 3,
@@ -8275,8 +8486,9 @@ mod optimizer_progress_tests {
         };
 
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
-        let (x_matrix, s_list, layout, _, _, _, _, _, _) =
+        let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config)?;
+        drop(penalty_structs);
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -8366,6 +8578,7 @@ mod reparam_consistency_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -8524,6 +8737,7 @@ mod gradient_validation_tests {
             reml_convergence_tolerance: 1e-3,
             reml_max_iterations: 20,
             firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
                 num_knots: 4,
                 degree: 3,
@@ -8546,7 +8760,7 @@ mod gradient_validation_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
         };
 
-        let (x, s_list, layout, _, _, _, _, _, _) =
+        let (x, s_list, layout, _, _, _, _, _, _, _) =
             build_design_and_penalty_matrices(&data, &config).expect("matrix build");
         assert!(
             layout.num_penalties > 0,
