@@ -1993,6 +1993,14 @@ pub mod internal {
                 FaerFactor::Ldlt(f) => f.solve(rhs),
             }
         }
+
+        fn solve_in_place(&self, rhs: faer::MatMut<'_, f64>) {
+            match self {
+                FaerFactor::Llt(f) => f.solve_in_place(rhs),
+                FaerFactor::Lblt(f) => f.solve_in_place(rhs),
+                FaerFactor::Ldlt(f) => f.solve_in_place(rhs),
+            }
+        }
     }
 
     /// Holds the state for the outer REML optimization and supplies cost and
@@ -3603,16 +3611,27 @@ pub mod internal {
                                     .assign(rt);
                             }
                         }
-                        let concat_view = FaerArrayView::new(&workspace.concat);
-                        let solved = factor_g.solve(concat_view.as_ref());
-                        let solved_ref = solved.as_ref();
-                        let (rows, cols) = solved_ref.shape();
-                        workspace.solved_rows = rows;
-                        for j in 0..cols {
-                            for i in 0..rows {
-                                workspace.solved[(i, j)] = solved_ref[(i, j)];
+                        let rows = h_eff.nrows();
+                        let cols = total_rank;
+                        {
+                            let mut solved_slice = workspace.solved.slice_mut(s![..rows, ..cols]);
+                            solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
+                            if let Some(slice) = solved_slice.as_slice_mut() {
+                                let mut solved_view =
+                                    faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
+                                factor_g.solve_in_place(solved_view.as_mut());
+                            } else {
+                                let mut temp =
+                                    faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
+                                factor_g.solve_in_place(temp.as_mut());
+                                for j in 0..cols {
+                                    for i in 0..rows {
+                                        solved_slice[(i, j)] = temp[(i, j)];
+                                    }
+                                }
                             }
                         }
+                        workspace.solved_rows = rows;
                     } else {
                         workspace.solved_rows = 0;
                     }
