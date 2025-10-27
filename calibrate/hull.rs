@@ -1,5 +1,5 @@
 use ndarray::parallel::prelude::*;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, Zip};
 use serde::{Deserialize, Serialize};
 
 /// Error type for hull building and projection.
@@ -172,13 +172,17 @@ impl PeeledHull {
         // Dykstra variables
         let mut x = y.to_owned();
         let mut p_corr: Vec<Array1<f64>> = (0..m).map(|_| Array1::zeros(d)).collect();
+        let mut x_prev = Array1::zeros(d);
+        let mut y_i = Array1::zeros(d);
 
         for _ in 0..max_cycles {
-            let x_prev = x.clone();
+            x_prev.assign(&x);
             for (i, (a, b)) in self.facets.iter().enumerate() {
                 // y_i = x + p_i
-                let mut y_i = x.clone();
-                y_i += &p_corr[i];
+                y_i.assign(&x);
+                Zip::from(&mut y_i)
+                    .and(&p_corr[i])
+                    .for_each(|yi, &pc| *yi += pc);
 
                 // Project y_i onto halfspace H_i: a^T z <= b
                 let a_tb = a.dot(&y_i) - *b;
@@ -186,19 +190,30 @@ impl PeeledHull {
                 if a_tb > 0.0 {
                     // Outside; move along normal inward
                     let alpha = a_tb / a_norm2;
-                    let z = &y_i - &(a * alpha);
-                    // Update correction and current x
-                    p_corr[i] = &y_i - &z;
-                    x = z;
+                    Zip::from(&mut x)
+                        .and(&y_i)
+                        .and(a)
+                        .for_each(|x_elem, &y_elem, &a_elem| {
+                            *x_elem = y_elem - a_elem * alpha;
+                        });
+                    Zip::from(&mut p_corr[i]).and(&y_i).and(&x).for_each(
+                        |pc_elem, &y_elem, &z_elem| {
+                            *pc_elem = y_elem - z_elem;
+                        },
+                    );
                 } else {
                     // Inside; projection is itself
+                    x.assign(&y_i);
                     p_corr[i].fill(0.0);
-                    x = y_i;
                 }
             }
 
             // Convergence check
-            let diff = (&x - &x_prev).mapv(|v| v.abs()).sum();
+            let diff = x
+                .iter()
+                .zip(x_prev.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f64>();
             if diff < tol {
                 return x;
             }

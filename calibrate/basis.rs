@@ -4,6 +4,7 @@ use faer::Side;
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -105,7 +106,7 @@ struct BasisCacheEntry {
 #[derive(Debug)]
 struct BasisCacheInner {
     map: AHashMap<BasisCacheKey, BasisCacheEntry>,
-    order: Vec<BasisCacheKey>,
+    order: VecDeque<BasisCacheKey>,
     max_size: usize,
     hits: u64,
     misses: u64,
@@ -115,7 +116,7 @@ impl BasisCacheInner {
     fn new(max_size: usize) -> Self {
         Self {
             map: AHashMap::with_capacity(max_size.max(1)),
-            order: Vec::with_capacity(max_size.max(1)),
+            order: VecDeque::with_capacity(max_size.max(1)),
             max_size,
             hits: 0,
             misses: 0,
@@ -124,14 +125,17 @@ impl BasisCacheInner {
 
     fn touch(&mut self, key: &BasisCacheKey) {
         if let Some(position) = self.order.iter().position(|existing| existing == key) {
-            let moved = self.order.remove(position);
-            self.order.push(moved);
+            if position + 1 == self.order.len() {
+                return;
+            }
+            if let Some(moved) = self.order.remove(position) {
+                self.order.push_back(moved);
+            }
         }
     }
 
     fn evict_oldest(&mut self) {
-        if let Some(oldest) = self.order.first().cloned() {
-            self.order.remove(0);
+        if let Some(oldest) = self.order.pop_front() {
             self.map.remove(&oldest);
         }
     }
@@ -141,15 +145,15 @@ impl BasisCacheInner {
             return;
         }
 
-        if self.map.contains_key(&key) {
-            self.order.retain(|existing| existing != &key);
+        if let Some(position) = self.order.iter().position(|existing| existing == &key) {
+            self.order.remove(position);
         }
 
         if self.map.len() >= self.max_size {
             self.evict_oldest();
         }
 
-        self.order.push(key.clone());
+        self.order.push_back(key.clone());
         self.map.insert(key, BasisCacheEntry { basis });
     }
 
