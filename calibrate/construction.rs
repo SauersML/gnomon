@@ -1836,13 +1836,14 @@ mod tests {
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
         internal_construct_design_matrix, internal_flatten_coefficients, BasisConfig,
-        LinkFunction, ModelConfig, PrincipalComponentConfig,
+        InteractionPenaltyKind, LinkFunction, ModelConfig, PrincipalComponentConfig,
     };
     use approx::assert_abs_diff_eq;
     use ndarray::{array, Array1, Array2};
     use ndarray::s;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::HashMap;
 
     /// Maximum absolute difference helper for matrix comparisons.
     fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
