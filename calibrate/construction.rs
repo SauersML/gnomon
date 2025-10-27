@@ -1664,11 +1664,24 @@ pub fn stable_reparameterization(
 
     let mut rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|rs| rs.dot(&qs)).collect();
 
-    let mut s_lambda = Array2::zeros((p, p));
-    for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
-        let s_k = penalty_from_root(rs_k);
-        s_lambda.scaled_add(*lambda, &s_k);
-    }
+    let s_lambda = lambdas
+        .par_iter()
+        .zip(rs_transformed.par_iter())
+        .filter_map(|(&lambda, rs_k)| {
+            if lambda == 0.0 {
+                return None;
+            }
+
+            let mut s_k = penalty_from_root(rs_k);
+            if lambda != 1.0 {
+                s_k.mapv_inplace(|val| val * lambda);
+            }
+            Some(s_k)
+        })
+        .reduce(|| Array2::zeros((p, p)), |mut acc, contrib| {
+            acc += &contrib;
+            acc
+        });
 
     if penalized_rank > 0 {
         let range_block = s_lambda
