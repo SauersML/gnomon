@@ -199,6 +199,7 @@ pub struct PirlsResult {
 /// - Extract a single penalty square root from the transformed penalty
 /// - Run the P-IRLS loop entirely in the transformed basis
 /// - Transform the coefficients back to the original basis only when returning
+/// - Reuse a cached balanced penalty root when available to avoid repeated eigendecompositions
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.  
@@ -209,6 +210,7 @@ pub fn fit_model_for_fixed_rho(
     y: ArrayView1<f64>,
     prior_weights: ArrayView1<f64>, // Prior weights vector
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
+    balanced_penalty_root: Option<&Array2<f64>>, // Optional cached lambda-independent root
     layout: &ModelLayout,
     config: &ModelConfig,
 ) -> Result<PirlsResult, EstimationError> {
@@ -230,23 +232,27 @@ pub fn fit_model_for_fixed_rho(
         println!("Lambdas: {:?}", lambdas);
     }
 
-    // Stage: Create the lambda-independent balanced penalty root for stable rank detection
-    // This is computed ONCE from the unweighted penalty structure and never changes
-    log::info!("Creating lambda-independent balanced penalty root for stable rank detection");
-
-    // Reconstruct full penalty matrices from square roots for balanced penalty creation
-    // STANDARDIZED: With rank x p roots, use S = R^T * R
-    let mut s_list_full = Vec::with_capacity(rs_original.len());
-    for rs in rs_original {
-        let s_full = rs.t().dot(rs);
-        s_list_full.push(s_full);
-    }
+    // Stage: Obtain the lambda-independent balanced penalty root for stable rank detection.
+    // Callers can supply a cached copy (preferred) to avoid redundant decompositions.
+    log::info!("Preparing lambda-independent balanced penalty root for stable rank detection");
 
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
     let p = x.ncols();
-    let eb = create_balanced_penalty_root(&s_list_full, p)?;
+
+    let mut eb_storage: Option<Array2<f64>> = None;
+    let eb: &Array2<f64> = if let Some(precomputed) = balanced_penalty_root {
+        precomputed
+    } else {
+        let mut s_list_full = Vec::with_capacity(rs_original.len());
+        for rs in rs_original {
+            s_list_full.push(rs.t().dot(rs));
+        }
+        eb_storage = Some(create_balanced_penalty_root(&s_list_full, p)?);
+        eb_storage.as_ref().unwrap()
+    };
+
     println!(
-        "[Balanced Penalty] Created lambda-independent eb with shape: {:?}",
+        "[Balanced Penalty] Using lambda-independent eb with shape: {:?}",
         eb.shape()
     );
 
@@ -2503,6 +2509,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )?;
@@ -2910,6 +2917,7 @@ mod tests {
             y.view(),
             weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -2923,6 +2931,7 @@ mod tests {
             y.view(),
             weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -3035,6 +3044,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
@@ -3165,6 +3175,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             &layout,
             &config,
         )
