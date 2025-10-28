@@ -107,7 +107,7 @@ For subject `i` define:
 For coefficient block `β`:
 - Score contribution:
   ```
-  g_i = δ_i * x_i^{exit} - ω_i * ΔH_i * x_i^{exit} + ω_i * exp_entry_i * x_i^{entry}
+  g_i = δ_i * x_i^{exit} - ω_i * exp_term_i * x_i^{exit} + ω_i * exp_entry_i * x_i^{entry}
   + δ_i * J_i,
   ```
   where `ω_i` already includes censoring/Fine–Gray weighting, and `J_i` captures derivatives from the hazard derivative term:
@@ -116,7 +116,7 @@ For coefficient block `β`:
   ```
 - Hessian contribution (negative definite):
   ```
-  H_i = ω_i * ΔH_i * x_i^{exit} x_i^{exit}^T - ω_i * exp_entry_i * x_i^{entry} x_i^{entry}^T
+  H_i = ω_i * exp_term_i * x_i^{exit} x_i^{exit}^T + ω_i * exp_entry_i * x_i^{entry} x_i^{entry}^T
         - δ_i * R_i,
   ```
   with `R_i` accounting for the second derivative of the log-derivative term.

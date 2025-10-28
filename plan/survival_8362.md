@@ -41,7 +41,7 @@
   - Censor/competing: `∂²ℓ/∂η² = -H_i(b_i)`.
 - Left truncation adds `+H_i(a_i)`.
 - Implement P-IRLS by treating `W_i = -∂²ℓ/∂η²` and `z_i = η_i - g_i/∂g/∂η`, where `g_i = ∂ℓ/∂η`. Because link is identity in η-space (η is natural parameter), the working response simplifies to `z_i = η_i + g_i/W_i`.
-- Need to ensure weights remain positive; `W_i = H_i(b_i) - H_i(a_i)` for truncated observations, which stays non-negative because `H_i` is monotone increasing in time. Guard against overflow by clamping exponentials.
+- Need to ensure weights remain positive; exit-time contributions give `W_i^{\text{exit}} = H_i(b_i)` and left-truncation adds a separate term `W_i^{\text{entry}} = H_i(a_i)` evaluated at the entry age. Both are non-negative because `H_i` is monotone increasing in time. Guard against overflow by clamping exponentials.
 - The derivative of log hazard `log[s'(u)/exp(u)]` influences the gradient; precompute `s'(u)` via derivative basis evaluation.
 
 ### 2.4 Absolute Risk Predictions

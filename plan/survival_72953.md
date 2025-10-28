@@ -40,10 +40,10 @@
 - The subdistribution hazard for subject `i` at age `t` is `λ_s(t | x_i) = d/dt Λ_s(t | x_i)`, where `Λ_s(t | x_i) = H_0(t) ⋅ exp(x_i^⊤ β)` with `x_i` representing covariates evaluated at age `t`. Because RP models parameterize `log Λ_s`, the linear predictor `η_i(t) = log Λ_s(t | x_i)`.
 - The Fine–Gray log-likelihood is:
   
-  `ℓ(β, θ) = Σ_{i: d_i=1} 
-     [η_i(a_exit_i) + log(Δ H_0(a_exit_i)) - log(Σ_{j} R_j(a_exit_i) Δ H_0(a_exit_i) exp(x_j^⊤ β))]`
+  `ℓ(β, θ) = Σ_{i: d_i=1}
+     [η_i(a_exit_i) - log(Σ_{j} R_j(a_exit_i) \exp(η_j(a_exit_i)))]`
   
-  where `R_j(t)` is the subdistribution risk indicator: 1 if `a_entry_j ≤ t` and the subject has neither experienced the target event before `t`, nor been censored; it remains 1 after a competing event but the covariate-dependent weight incorporates the cumulative incidence of the competing event. The term `Δ H_0` denotes the baseline cumulative hazard increment between entry and exit for each subject.
+  where `R_j(t)` is the subdistribution risk indicator: 1 if `a_entry_j ≤ t` and the subject has neither experienced the target event before `t`, nor been censored; it remains 1 after a competing event but the covariate-dependent weight incorporates the cumulative incidence of the competing event.
 - Implement the computational recipe used by Beyersmann et al.: maintain risk-set weights `W_j(t) = ℓ( max(t, a_exit_j) )` and apply the Fine–Gray cumulative incidence weighting factor `G_j(t)` (Kaplan–Meier of censoring/competing). Practical plan:
   1. Sort subjects by `a_exit`.
   2. Compute censoring weights `G_j(t)` by fitting Kaplan–Meier on the union of target + competing events, treating the target event as failure and competing as censoring for `G`.

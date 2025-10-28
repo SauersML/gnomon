@@ -29,9 +29,9 @@
   - Represent survival log-likelihood via Poisson GLM on disaggregated intervals (Andersen-Gill). For Royston–Parmar, we can avoid data splitting by using analytical gradient/Hessian for log cumulative hazard basis. Use weights derived from risk set contributions at unique event ages.
   - Proposed approach: derive log-likelihood contributions
     \[
-    \ell = \sum_i \delta_i \{ \eta_i(a_i) + \log w_i \} - w_i \exp(\eta_i(a_i))
+    \ell = \sum_i \delta_i \, \eta_i(a_i) - w_i \, \exp(\eta_i(a_i))
     \]
-    where `w_i` encodes cumulative hazard exposure (requires computing interval integrals). For Fine–Gray, modify `w_i` using subdistribution weights.
+    where `w_i` encodes cumulative hazard exposure (requires computing interval integrals). For Fine–Gray, modify `w_i` using subdistribution weights but keep it outside of the logarithm so exposures only scale the cumulative hazard term.
   - Implement as custom `LinkFunction::RoystonParmar` that supplies `WorkingResponse` & `FisherWeights` to PIRLS given current `eta`.
   - Because existing PIRLS expects canonical links with known variance, extend PIRLS to accept trait-specific closures (see §5.2).
 
