@@ -51,11 +51,12 @@
   2. Precompute censoring survival `G_j(t_k)` for each distinct event age, storing it in a structure shared across IRLS iterations.
   3. During each IRLS iteration evaluate `η_exit = X_exit β̃`, `dη_exit = D_exit β̃`, and form `H_exit = exp(η_exit)`; guard derivative values from numerical underflow via a small positive floor before taking logs.
   4. Assemble risk-set weights `s_j(t_k) = w_j G_j(t_k) H_j(t_k) (∂η_j/∂t)(t_k) / R(t_k)` for use in score and Hessian calculations.
+- Define the augmented design row `\tilde{X}_i^{exit}(t) = X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t)` so differentiation of `log h_i(t)` and `log R(t)` share the same derivative-aware terms.
 - Score vector for coefficient block `β̃` at event time `t_k`:
-  - Event contribution: `U_i^{event} = w_i [X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t_k)]`.
-  - Risk-set subtraction: `U_{risk}(t_k) = Σ_{j∈R_k} s_j(t_k) X_j^{exit}`.
+  - Event contribution: `U_i^{event} = w_i \tilde{X}_i^{exit}(t_k)`.
+  - Risk-set subtraction: `U_{risk}(t_k) = Σ_{j∈R_k} s_j(t_k) \tilde{X}_j^{exit}(t_k)`.
   - Total score accumulates `Σ_{k} (U_i^{event} - U_{risk}(t_k))` over all event times plus penalty gradients.
-- Observed negative Hessian at `t_k` is `X_{R_k}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] X_{R_k}` plus the derivative block `Σ_{i∈D_k} w_i (D_i^{exit})^⊤ D_i^{exit} / (∂η_i/∂t)(t_k)^2`. Summing over event times and adding penalty matrices yields the full Hessian used inside PIRLS.
+- Observed negative Hessian at `t_k` is `\tilde{X}_{R_k}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] \tilde{X}_{R_k}` plus the derivative block `Σ_{i∈D_k} w_i (D_i^{exit})^⊤ D_i^{exit} / (∂η_i/∂t)(t_k)^2`. Summing over event times and adding penalty matrices yields the full Hessian used inside PIRLS.
 - Deviance for diagnostics follows Fine–Gray practice: `D = -2 Σ_{k} Σ_{i∈D_k} w_i [η_i(t_k) + log (∂η_i/∂t)(t_k) - log R(t_k)]`. Track this per iteration for convergence checks and REML updates.
 
 ## 4. Data Schema and Preprocessing
