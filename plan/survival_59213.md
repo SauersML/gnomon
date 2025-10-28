@@ -38,9 +38,9 @@
 ### 2.3 Absolute Risk Prediction
 - After fitting, compute cumulative incidence for horizon \(h\) at current age \(a_0\):
   \[
-  \Pr(T \le a_0+h, \text{cause}=k \mid T > a_0) = 1 - \exp\{- [H_k(a_0+h) - H_k(a_0)] \}
+  \Pr(T \le a_0+h, \text{cause}=k \mid T > a_0) = \frac{F_k(a_0+h) - F_k(a_0)}{1 - \sum_j F_j(a_0)}
   \]
-  - With subdistribution hazard, ensure conversion from subdistribution cumulative hazard to CIF is consistent with Fine–Gray (requires recasting to cause-specific CIF if necessary).
+  where \(F_k\) denotes the Fine–Gray cumulative incidence for cause \(k\). Because the subdistribution hazard references the original time-zero risk set, conditioning on survival to \(a_0\) requires renormalizing by the remaining survival mass \(1 - \sum_j F_j(a_0)\). If a cause-specific conditioning workflow is needed, convert the fitted subdistribution hazards into cause-specific hazards before evaluating the CIF.
 - Provide scoring API: `predict_absolute_risk(current_age, horizon, pgs, pcs, sex, optional offsets)` returning CIF along with baseline survival, cause-specific hazard, and optionally standard errors via delta method (if feasible).
 
 ## 3. Data Layer Extensions (`calibrate::data`)
