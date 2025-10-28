@@ -1,29 +1,33 @@
 # Poisson Quadrature Cross-Check (Support Document)
 
-This document records how we will use Poisson pseudo-observations to validate the Fine–Gray RP implementation. It is *not* an independent production path; see [`survival_72953.md`](./survival_72953.md) for the canonical model.
+This note explains how we use Poisson pseudo-observations to **validate** the analytic Fine–Gray RP implementation described in `survival_72953.md`. It is not a production alternative.
 
-## 1. Objective
-Provide a numerical approximation to the full Fine–Gray likelihood by discretising age into small intervals and fitting a Poisson regression with offsets that encode cumulative exposure. Matching coefficients and smoothing behaviour between this approximation and the analytic implementation offers an end-to-end regression test (following the strategy of Bender et al., 2005, and Crowther & Lambert, 2014, Section 3.5).
+## 1. Construction of pseudo-observations
+1. Partition each subject’s age interval `[a_i, b_i]` into quadrature nodes `a_i = t_{i0} < t_{i1} < … < t_{iQ} = b_i`. Gauss–Legendre nodes offer higher accuracy, but equally spaced grids (5–7 points) suffice for regression tests.
+2. For each interval `(t_{iq-1}, t_{iq}]`, build a pseudo-row with
+   - Exposure `E_{iq} = H_i(t_{iq}) - H_i(t_{iq-1})` using the current RP coefficients.
+   - Linear predictor `η_{iq}` evaluated at the midpoint age, including time-varying effects.
+   - Response `y_{iq} = 1` only if the target event occurs in the interval; otherwise `y_{iq} = 0`.
+   - Offset `log(E_{iq})` so that the Poisson mean satisfies `μ_{iq} = E_{iq} exp(η_{iq})`.
+3. Fit a Poisson GAM with the same smoothing penalties as the analytic model. The quadrature grid handles left truncation automatically by omitting intervals below the entry age.
 
-## 2. Construction
-1. Choose quadrature nodes `a_i = entry`, `b_i = exit`, and intermediate points via Gauss–Legendre or equally spaced bins (5–7 per subject is typically sufficient for validation datasets).
-2. For each interval `[t_{q-1}, t_q)` create a pseudo-row with:
-   - Exposure `E_{iq} = H_i(t_q) - H_i(t_{q-1})` evaluated using the current RP coefficients.
-   - Outcome `y_{iq}` equal to 1 only if the target event occurs in that interval (Fine–Gray keeps competing events in the risk set, so they contribute zero counts with positive exposure).
-   - Offset `log(E_{iq})` and covariates evaluated at the interval midpoint.
-3. Fit a Poisson log-link GAM using the existing infrastructure. Because exposure is already encoded in the offset, the Poisson score matches the survival score up to discretisation error.
+## 2. Relationship to the analytic likelihood
+- Summing the Poisson log-likelihood across pseudo-rows approximates the continuous-time likelihood `Σ_i w_i [ d_i log h_i - H_i(b_i) + H_i(a_i) ]` with a Riemann sum. As the grid refines, the Poisson score converges to the analytic score in `survival_48271.md`.
+- The hazard derivative term appears implicitly: differentiating the offset-adjusted Poisson log-likelihood produces the same `D_exit / (∂η/∂a)` correction found analytically.
+- Because the quadrature path multiplies the row count by `Q`, it is computationally heavier than the analytic fit and is therefore restricted to validation workflows.
 
-## 3. Relationship to the canonical IRLS
-- As the quadrature grid is refined, the Poisson working weights converge to `w_i H_i(t)` from the analytic formulas in `survival_48271.md`.
-- Left truncation is handled by omitting intervals before `entry` and using the same exposure subtraction as the continuous model.
-- Time-varying effects (PGS×age) are evaluated at quadrature nodes, ensuring the approximation respects their smooth structure.
+## 3. Validation workflow
+1. Fit the analytic Fine–Gray RP model.
+2. Generate pseudo-observations with the fitted coefficients and re-fit the Poisson approximation while **freezing** smoothing parameters.
+3. Compare:
+   - Score vectors from both fits (should agree within numerical tolerance).
+   - Predicted CIFs on a validation grid of ages and covariate patterns.
+   - Penalised log-likelihood values.
+4. Raise diagnostics if discrepancies exceed tolerance; otherwise record the match to document derivative correctness.
 
-## 4. Usage plan
-- Implement an optional debug mode (`--survival-validate-poisson`) that, after fitting the analytic model, generates pseudo-rows and refits the Poisson approximation with the *same* smoothing parameters. We compare coefficients, fitted CIFs, and score vectors.
-- Differences beyond tolerance trigger diagnostics but do not block production runs; the Poisson route exists solely to catch coding errors in the analytic derivatives.
+## 4. Computational guidance
+- Materialise pseudo-rows in batches to limit memory usage; discard each batch after evaluating the Poisson score.
+- Parallelise across subjects because pseudo-row generation is embarrassingly parallel.
+- Use the same monotonicity guard for `∂η/∂a` as in the analytic fit to avoid numerical differences caused by clipping.
 
-## 5. Computational considerations
-- Even at 7 nodes per subject, a million-subject cohort yields ≈7 million pseudo-rows—manageable for offline validation but not for routine training. Hence the feature is opt-in.
-- Memory reuse: allocate buffers for one batch of subjects at a time to avoid quadratic growth.
-
-This support path guarantees that the analytic Fine–Gray implementation is auditable and reproducible without reintroducing the flawed partial-likelihood formulation.
+This cross-check ties the quadrature-based intuition to the analytic derivatives without reviving the discredited partial-likelihood draft.
