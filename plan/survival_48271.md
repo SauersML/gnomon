@@ -24,10 +24,9 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
 
 ### 3.2 Likelihood with left truncation and competing risks
 - Observed tuple per subject: `(a_entry, a_exit, δ_target, δ_competing, weight)`, where `δ_target` = 1 if event-of-interest by `a_exit`, `δ_competing` = 1 if competing event occurred first, and right-censor when both zero.
-- Fine–Gray pseudo-likelihood (Lambert & Royston 2017) expresses the log-likelihood as
-  - `ℓ = Σ_i [ δ_i log λ_i^*(a_i) + log G_i(a_i) + log w_i(a_i) - ∫_{a_entry}^{a_exit} λ_i^*(a) S_i^*(a) / G_i(a) da ]`, where `G_i` is censoring survival and `w_i` Fine–Gray weights. Implement with counting-process form using cumulative subdistribution hazard `H_i^*` so the integral reduces to `H_i^*(a_exit) - H_i^*(a_entry)` once the pseudo-risk weights are incorporated.
-- Left truncation handled by conditioning on survival up to `a_entry`, yielding subtraction of `H_i^*(a_entry)` within the integral term.
-- Competing events modify both event indicators and at-risk weighting. Use pseudo-observations weights `ω_i = Π_j I(T_j ≥ T_i) / ᵍ_j` from Fine–Gray; maintain them explicitly per record to avoid on-the-fly recomputation.
+- Optimize a penalized Fine–Gray *pseudo-likelihood* so the parametric baseline remains identifiable. Retain the Royston–Parmar spline for `log H_0`, but include the baseline-dependent increments `δ_i [f_0(u_exit) + log( d/da f_0(u_exit) + ∂g_{pgs}/∂a )] - ω_i ΔH_i` that the previous pseudo-likelihood supplied. Augment these terms with the standard Fine–Gray risk-set ratios `δ_i [η_i(a_exit) - log Σ_j R_j(a_exit) exp(η_j(a_exit))]` for the proportional-hazards component. Censoring/competing adjustments enter through Kaplan–Meier weights `G_j(t)` inside each risk denominator and in the pseudo-likelihood weights on the baseline increments. This matches Beyersmann et al. (2010) while preserving score and Hessian information for the spline coefficients.
+- Left truncation is enforced by excluding subjects with `a_entry > t` from each risk denominator and by working with cumulative hazard increments `ΔH_i = exp(η_i(a_exit)) - exp(η_i(a_entry)) ≥ 0`.
+- Competing events remain in the risk set after their event age with zero event indicator but non-zero `G_j(t)` weights, as required by the Fine–Gray subdistribution hazard.
 
 ### 3.3 Penalization
 - Baseline smooth `f_0` penalized with difference penalty of order `ModelConfig::penalty_order` on the age spline coefficients.
@@ -104,22 +103,9 @@ For subject `i` define:
 - Implement safe guard ensuring `d/da f_0 + ... > 0` by exponentiating a log-derivative parameterization or clamping to small positive constant (e.g., `1e-6`) before taking log.
 
 ### 6.3 Gradient/Hessian formulas
-For coefficient block `β`:
-- Score contribution:
-  ```
-  g_i = δ_i * x_i^{exit} - ω_i * ΔH_i * x_i^{exit} + ω_i * exp_entry_i * x_i^{entry}
-  + δ_i * J_i,
-  ```
-  where `ω_i` already includes censoring/Fine–Gray weighting, and `J_i` captures derivatives from the hazard derivative term:
-  ```
-  J_i = (d/da log λ_i^*)' x_i^{exit}.
-  ```
-- Hessian contribution (negative definite):
-  ```
-  H_i = ω_i * ΔH_i * x_i^{exit} x_i^{exit}^T - ω_i * exp_entry_i * x_i^{entry} x_i^{entry}^T
-        - δ_i * R_i,
-  ```
-  with `R_i` accounting for the second derivative of the log-derivative term.
+- Assemble the score in classic Fine–Gray form: for each event time `t_k`, compute normalized weights `s_j(t_k) = w_j G_j(t_k) exp(η_j(t_k)) / Σ_{ℓ} w_ℓ G_ℓ(t_k) exp(η_ℓ(t_k))`. The contribution for an event `i` at `t_k` is `x_i^{exit} - Σ_j s_j(t_k) x_j^{exit}` (scaled by sample weights). Left truncation is already handled because individuals with `a_entry > t_k` never appear in the risk set and because the cumulative hazard increment `ΔH_i` subtracts `exp_entry_i`.
+- Build the negative Hessian as the sum over event times of `X_{R(t_k)}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] X_{R(t_k)}`. This captures the off-diagonal coupling induced by shared risk denominators and matches the Fine–Gray Fisher information rather than collapsing to diagonal weights. Implement accumulation using existing dense cross-product helpers to stream over event slices.
+- The derivative of the time-varying smooth enters through `(∂z_i/∂a)`; cache these derivatives alongside basis evaluations so that hazard diagnostics and any derivative-based penalties remain well defined.
 
 ### 6.4 Mapping to P-IRLS
 - Augment `pirls::WorkingModel` abstraction:
@@ -174,13 +160,15 @@ For coefficient block `β`:
   ```
 - Provide helper `evaluate_cumulative_hazard(age, covariates)` computing `H_i^*(age)` and derivative via stored bases.
 
-### 8.2 Absolute risk API
-- Add method `TrainedModel::predict_survival_risk(age_current, horizon, pgs, pcs, sex, calibrate: bool)` returning cumulative incidence between `age_current` and `age_current + horizon`:
+- Add method `TrainedModel::predict_survival_risk(age_current, horizon, pgs, pcs, sex, calibrate: bool)` returning conditional cumulative incidence between `age_current` and `age_current + horizon`:
   ```
-  risk = F^*(age_current + horizon) - F^*(age_current)
-       = 1 - exp(-H_i^*(age_current + horizon)) - (1 - exp(-H_i^*(age_current))).
+  let cif_target = |t| 1.0 - (-H_i^*(t)).exp();
+  let cif_comp = competing_cif(t); // recovered from Fine–Gray preprocessing
+  let numer = cif_target(age_current + horizon) - cif_target(age_current);
+  let denom = (1.0 - cif_target(age_current) - cif_comp(age_current)).max(1e-12);
+  let risk = numer / denom;
   ```
-- Accept vectorized inputs for batch scoring. Provide CLI subcommand `score survival` accepting TSV with columns `age_current`, `horizon`, `score`, `sex`, `PC*`.
+  - Accept vectorized inputs for batch scoring. Provide CLI subcommand `score survival` accepting TSV with columns `age_current`, `horizon`, `score`, `sex`, `PC*`.
 
 ### 8.3 Calibration integration
 - Extend calibrator feature computation to survival context:
