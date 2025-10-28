@@ -1,133 +1,263 @@
-# Royston–Parmar Fine–Gray Survival Blueprint (Canonical)
+# Royston–Parmar Fine–Gray Survival Integration Plan
 
-## 1. Why the full Fine–Gray likelihood
-Fine–Gray subdistribution hazards describe the density of experiencing the target event in the presence of competing events. For a subject who enters the study at age `a_i` and exits at `b_i`, the continuous-time likelihood contribution is
+## 1. Objectives and Scope
+1. Extend the `calibrate/` crate to support a Royston–Parmar flexible parametric survival model that uses attained age as the timescale and accounts for competing risks via a Fine–Gray subdistribution hazard formulation.
+2. Preserve and reuse the existing penalized GAM infrastructure—basis generation (`basis.rs`), design assembly (`construction.rs`), P-IRLS solver (`pirls.rs`), and REML/LAML smoothing selection (`estimate.rs`)—while introducing survival-specific data structures, likelihood computations, and prediction logic.
+3. Deliver an inference API capable of producing calibrated absolute risk between an individual’s current age and arbitrary future horizons, integrating with the existing post-hoc calibrator when enabled.
+4. Maintain backward compatibility with binary and Gaussian models by isolating survival functionality behind new model types, configuration flags, and serialization fields.
 
+## 2. Current Infrastructure Survey
+- **Data handling (`calibrate/data.rs`):** Strict schema loader for phenotype, score, sex, PCs, weights. Needs extension to ingest survival-specific columns (entry/exit age, event type) and to produce survival-specific data bundles.
+- **Basis and penalties (`calibrate/basis.rs`):** Provides B-spline basis construction, difference penalties, tensor product structures, and null-space constraints. We can reuse this machinery for the log-age baseline spline and for the PGS×age interaction smooth, but must add convenience wrappers for log-age transformations and monotonicity constraints.
+- **Design layout (`calibrate/construction.rs`):** Builds the block-structured design matrix and penalty map recorded in `ModelLayout`. Survival mode will require new block descriptors (baseline age spline, hazard shift covariates, optional tensor interactions) and updated null-space handling.
+- **Optimization (`calibrate/pirls.rs` & `calibrate/estimate.rs`):** Implements penalized iteratively reweighted least squares and nested REML optimization keyed off `ModelConfig::link_function`. We must add a new link variant with survival-specific working response and deviance calculations, plus support for the additional sufficient statistics demanded by the full Fine–Gray likelihood (exit/entry cumulative hazards, hazard derivatives, Jacobian factors).
+- **Model artifact (`calibrate/model.rs`):** Serializes `ModelConfig`, stores design metadata, and executes prediction with optional calibrator adjustments. Survival models must capture age transformations, baseline spline coefficients, competing-risk metadata, and a horizon-aware prediction path.
+- **Calibrator (`calibrate/calibrator.rs`):** Builds a secondary GAM using diagnostics from the base fit. Survival predictions will use different diagnostics (e.g., CIF standard errors, age-based hull distances) but can reuse the same P-IRLS machinery with tailored feature construction.
+- **Hull guard (`calibrate/hull.rs`):** Currently handles convex hulls in PGS/PC space; we will extend to include attained age for extrapolation safeguards.
+
+## 3. Mathematical Specification
+### 3.1 Time scale and transformations
+- Let `a` denote attained age in years. Training data provide `a_entry` (left truncation) and `a_exit` (event or censoring age). Define transformation constants: `a_min = min(a_entry)` and `δ = 0.1` years (guard). Map each age to `u = log(a - a_min + δ)` so the spline basis operates on a stabilized log-age scale. Record `(a_min, δ)` and `a_max = max(a_exit)` for prediction.
+- Evaluate baseline basis functions at both entry and exit ages to compute cumulative hazard differences, a requirement for Fine–Gray risk increments.
+
+### 3.2 Baseline cumulative hazard
+- Represent the log cumulative baseline hazard `ℓ(a) = log H_0(a)` as a penalized B-spline smooth over `u`. Let `B(u)` be the basis matrix (rows = observations, columns = spline coefficients). The baseline contribution to the linear predictor for subject `i` at age `a_exit_i` is `η_{0,i} = B(u_exit_i) θ`. For left truncation we subtract the baseline evaluated at entry age: `η_{0,i}^{entry} = B(u_entry_i) θ`. The effective cumulative hazard contribution for the observation interval is `exp(η_{0,i}) - exp(η_{0,i}^{entry})`.
+- Enforce identifiability via one of two equivalent constraints: (a) impose `ℓ(a_ref) = 0` at reference age `a_ref` (e.g., weighted median of `a_exit`) by subtracting `B(u_ref)` from each basis evaluation; or (b) drop the first column of the constrained basis (`basis.rs` already supports sum-to-zero transformations). Option (a) preserves interpretability and will be implemented by augmenting the basis builder to subtract `B(u_ref)` before applying difference penalties.
+- Apply a second-order difference penalty on `θ` (wiggliness control) using existing `difference_penalty` function. Provide a configuration knob for penalty order in `ModelConfig` (default 2, optional 3 for extra smoothness).
+
+### 3.3 Covariate effects
+- The hazard multiplicative shifts are additive on the log cumulative hazard scale:
+  - `β_pgs` for the raw polygenic score.
+  - Optional `β_sex` (binary).
+  - Linear coefficients `β_pc_j` for each principal component (default), with option to promote to smooths if future work requires.
+  - Optional smooth interaction `f_{pgs×age}(PGS, u)` capturing non-proportional hazards. Implement as a tensor-product smooth with marginal bases: univariate B-spline in `PGS` (as already built for calibration) and the log-age spline `B(u)` with anisotropic penalties (existing `InteractionPenaltyKind::Anisotropic`). Center the interaction to ensure pure `ti()` semantics (requires extending current orthogonalization to include the new log-age marginal).
+- Whenever covariate effects vary with age, cache both the basis values and their derivatives with respect to log-age so that hazard derivatives include the term `(∂z_i(u)/∂u)^T θ`. The derivative is needed for subdistribution hazard evaluation, deviance diagnostics, and any variance calculations that involve `d/dt` of the cumulative hazard.
+
+### 3.4 Fine–Gray full likelihood
+- For each subject `i`, define:
+  - `d_i = 1` if the target event occurred at `a_exit_i`, `0` otherwise.
+  - `c_i = 1` if a competing event occurred, `0` otherwise.
+  - Weight `w_i` from training data (defaults to 1).
+- Let `η_i(t)` denote the log subdistribution cumulative hazard at age `t`, evaluated with the baseline spline and covariate blocks assembled in Sections 3.2–3.3. The Jacobian of the log-age transform is `J(t) = t - a_min + δ`. The Fine–Gray event density under the RP parametrisation is
+
+  `f_i(t) = H_i(t) * (∂η_i/∂t)(t) * exp(-H_i(t)) / J(t)`
+
+  where `H_i(t) = exp(η_i(t))`. We therefore require both the value and the age-derivative of `η` at entry and exit ages.
+- The log-likelihood contribution for subject `i` is
+
+  `ℓ_i = w_i [ d_i ( η_i(a_exit_i) + log(∂η_i/∂t (a_exit_i)) - log J(a_exit_i) )
+                - H_i(a_exit_i) + H_i(a_entry_i) ]`
+
+  with the convention that `H_i(a_entry_i) = 0` when the subject is untruncated (`a_entry_i = a_min`). Competing events contribute via the survival decrement `-H_i(a_exit_i)` but have `d_i = 0` so they add no hazard-derivative term.
+- Implementation steps:
+  1. Precompute design matrices `X_exit`, `X_entry` for `η` at exit and entry ages, respectively, along with derivative matrices `D_exit`, `D_entry` representing `∂η/∂t` in coefficient space. These matrices include all covariate and interaction effects.
+  2. Cache Jacobian factors `log_j_exit = log(a_exit - a_min + δ)` and `log_j_entry` for re-use across iterations.
+  3. During each IRLS iteration evaluate `η_exit = X_exit β̃`, `η_entry = X_entry β̃`, `deta_exit = D_exit β̃`, `deta_entry = D_entry β̃`, then form `H_exit = exp(η_exit)` and `H_entry = exp(η_entry)`.
+  4. Guard `deta_*` from underflow by clipping to `1e-12` before taking logarithms. This is a numerical safeguard only; it does not cap the hazard derivative in the model.
+- Score vector for coefficient block `β̃`:
+  - Exit contribution: `U_exit[i,:] = w_i [ d_i ( X_exit[i,:] + D_exit[i,:] / deta_exit[i] ) - H_exit[i] X_exit[i,:] ]`.
+  - Entry contribution: `U_entry[i,:] = + w_i H_entry[i] X_entry[i,:]` (only if left-truncated; zero otherwise).
+  - Total score accumulates both contributions plus penalty gradients.
+- Observed negative Hessian breaks down into:
+  1. Exit survival term `H_exit = Σ_i w_i H_exit[i] X_exit[i,:]^⊤ X_exit[i,:]` (positive semi-definite).
+  2. Entry survival term `H_entry = Σ_i w_i H_entry[i] X_entry[i,:]^⊤ X_entry[i,:]`, subtracted because `ℓ_i` increases with `H_entry`.
+  3. Hazard-derivative correction for events `d_i = 1`: `H_deriv[i] = w_i (D_exit[i,:]^⊤ D_exit[i,:]) / deta_exit[i]^2` (rank-one, positive semi-definite).
+  4. Penalty matrices `Σ_k λ_k P_k` from smoothing priors.
+- Assemble `-∂²ℓ` as `H_exit - H_entry + Σ_{events} H_deriv + Σ penalties`. The resulting matrix is dense but structured: diagonal-dominant with low-rank updates. We exploit this by batching event corrections and applying Sherman–Morrison adjustments to the Cholesky factor where beneficial.
+- Working response: solve `( -∂²ℓ ) δ = U` for `δ`, then set `z = η + δ` as usual. Because the Hessian is non-diagonal, re-use the existing conjugate-gradient or trust-region solver from `pirls.rs` that already handles penalised non-canonical links.
+- Deviance for diagnostics: `D = -2 Σ_i ℓ_i` (without penalties). Persist both per-iteration deviance and final value for downstream calibration checks.
+
+## 4. Data Schema and Preprocessing
+### 4.1 Survival data structs
+```rust
+pub struct SurvivalTrainingData {
+    pub pgs: Array1<f64>,
+    pub sex: Array1<f64>,
+    pub pcs: Array2<f64>,
+    pub weights: Array1<f64>,
+    pub age_entry: Array1<f64>,
+    pub age_exit: Array1<f64>,
+    pub event_type: Array1<u8>, // 0=censor,1=target,2=competing
+}
 ```
-ℓ_i = log f_i(b_i) - log S_i(a_i)
+- Add `SurvivalPredictionInputs` for inference:
+```rust
+pub struct SurvivalPredictionInputs<'a> {
+    pub pgs: ArrayView1<'a, f64>,
+    pub sex: ArrayView1<'a, f64>,
+    pub pcs: ArrayView2<'a, f64>,
+    pub current_age: ArrayView1<'a, f64>,
+    pub horizon_age: ArrayView1<'a, f64>, // same length as individuals or length-1 broadcast
+}
 ```
 
-where `f_i` is the Fine–Gray event density for the target cause and `S_i` is the corresponding subdistribution survival function. Because Royston–Parmar (RP) models parameterise the **log cumulative hazard** `η_i(a) = log H_i(a)` with splines, the event density expands to
+### 4.2 Loader enhancements (`calibrate/data.rs`)
+- Introduce `load_survival_training_data(path, num_pcs)` alongside existing loaders. Required columns: `score`, `sex`, `PC*`, `weights`, `age_entry`, `age_exit`, `event_type`. Optional `phenotype` is ignored in survival mode to prevent confusion.
+- Validation logic:
+  - Confirm `age_entry`, `age_exit` numeric, positive, finite.
+  - Enforce `age_exit >= age_entry` with tolerance `1e-6`.
+  - Map `event_type` strings/numbers to `u8`. Accept synonyms: `{0, "censor", "none"}`, `{1, "event", "case"}`, `{2, "compete", "death"}`.
+  - Disallow all-zero events; raise informative error prompting user to verify event coding.
+  - Ensure at least one primary event and one censored observation for identifiability.
+- Compute and return sorted indices by `age_exit`; store for reuse in survival preprocessor.
 
+### 4.3 Survival preprocessor module
+- Create `calibrate/survival/mod.rs` housing:
+  - `struct SurvivalStats` containing sorted indices, log-age transforms, Jacobian logs, precomputed design matrices for exit/entry (`X_exit`, `X_entry`) and their derivative counterparts (`D_exit`, `D_entry`), event indicators, and sampling weights.
+  - `fn build_survival_stats(data: &SurvivalTrainingData, prior_weights: &Array1<f64>, layout: &ModelLayout) -> SurvivalStats` performing:
+    1. Sort indices by `age_exit` (for reproducible derivative validation) but retain original ordering for design rows.
+    2. Compute log-age transforms `u_exit`, `u_entry`, Jacobian factors `log_j_exit`, `log_j_entry`.
+    3. Evaluate baseline and interaction bases at `u_exit` and `u_entry` to produce dense `X_exit`, `X_entry`, `D_exit`, `D_entry` aligned with coefficient ordering in `ModelLayout`.
+    4. Cache boolean masks for `d_i` (target events) and `left_truncated_i` for branching within the IRLS loop.
+- Provide methods on `SurvivalStats` to evaluate `η` and its derivative from a coefficient vector, returning a struct with `eta_exit`, `eta_entry`, `deta_exit`, `deta_entry`, `H_exit`, `H_entry`, and scratch buffers for scores/Hessian components.
+
+## 5. Design and Penalty Construction
+### 5.1 Extending `ModelLayout`
+- Add new enum variant `ModelFamily::SurvivalFineGray` stored in `ModelConfig`. Extend `ModelLayout` to track:
+  - `baseline_exit_design: Array2<f64>` and `baseline_entry_design: Array2<f64>`.
+  - Column ranges for baseline smooth, covariate shifts, tensor interactions.
+  - Penalty metadata: `baseline_penalty_id`, `pgs_age_penalty_id`, etc.
+- Modify `construction::build_design_and_penalty_matrices` to branch on `ModelFamily`. In survival mode:
+  - Build baseline spline using new helper `basis::log_age_spline(age_values, knots, degree, reference_age)`.
+  - Append covariate columns (PGS, sex, PCs) as dense columns.
+  - If `pgs_age_interaction` enabled, use existing `tensor_product_basis` function with log-age basis and PGS basis; ensure orthogonalization w.r.t. main effects (`interaction_orth_alpha` map in `ModelConfig`).
+  - Generate penalties using `difference_penalty` for baseline, `tensor_penalty` for interactions, and `null_shrinkage` as needed.
+- Update `ModelLayout::total_coeffs` and penalty assembly to include the new blocks. Provide functions to retrieve baseline column indices for downstream prediction routines.
+
+### 5.2 Null-space handling
+- Baseline smooth must have one degree of freedom removed to anchor the cumulative hazard. Implement via `basis::apply_reference_constraint` returning `(design_matrix, z_transform)` to drop the null direction. Store `z_transform` in `ModelConfig::sum_to_zero_constraints` under key `"baseline_age"` to reproduce predictions.
+- Ensure PGS and PC columns remain unpenalized and orthogonal to the baseline by subtracting weighted means (existing code already handles centering for parametric columns; confirm and extend if necessary).
+- For tensor interactions, reuse existing `interaction_orth_alpha` logic to ensure no leakage into main effects.
+
+## 6. Solver Integration
+### 6.1 Link function expansion
+- In `calibrate/model.rs`, add:
+```rust
+pub enum LinkFunction {
+    Logit,
+    Identity,
+    FineGrayRp,
+}
 ```
-log f_i(b_i) = log h_i(b_i) + log S_i(b_i) = η_i(b_i) + log(∂H_i/∂a|_{b_i}) - log J(b_i) - H_i(b_i)
+- Update all `match` statements (e.g., default iteration counts, scale estimation) to handle the new variant. For survival, set `min_iterations = 5` to guard against premature convergence due to complex likelihood surfaces.
+
+### 6.2 Working response computation
+- Add module `calibrate/survival/irls.rs` with helper
+```rust
+pub fn assemble_fine_gray_iteration(
+    coeffs: &Array1<f64>,
+    stats: &SurvivalStats,
+) -> FineGrayIterationState
 ```
+  that evaluates `η`, `∂η/∂t`, `H`, score vector, and Hessian blocks described in Section 3.4, storing them in `FineGrayIterationState` for reuse during REML updates.
+- Modify `pirls::update_glm_vectors` to delegate to survival helper when `link == FineGrayRp`. Provide access to `SurvivalStats` via new field in `ModelLayout` or via closure capturing from `estimate::train_model`.
+- Ensure P-IRLS workspace caches working vectors sized to survival data. Some arrays (e.g., `delta_eta`) remain applicable without change.
 
-with `J(b_i)` representing the Jacobian of the time transformation detailed in Section 2. The term `log(∂H_i/∂a)` is the hazard derivative that earlier drafts labelled `log λ_i^*`. Removing it would drop the normalising constant of the density and violate the Fine–Gray likelihood. Consequently, we abandon the Cox-style partial likelihood and maximise the **full log-likelihood**
+### 6.3 Deviance and gradient tracking
+- Add `calculate_survival_deviance(iter_state: &FineGrayIterationState)` to compute `-2 ℓ`. Integrate into `calculate_deviance` by pattern matching on link. Store deviance per iteration for convergence diagnostics and REML objective.
+- Update gradient norm computation to use survival-specific residuals `U_i`. Provide fallback if all weights zero (e.g., due to zero events) with descriptive error.
 
-```
-ℓ = Σ_i w_i [ d_i ( η_i(b_i) + log(∂η_i/∂a|_{b_i}) - log J(b_i) ) - H_i(b_i) + H_i(a_i) ]
-```
+### 6.4 REML/LAML adjustments
+- In `estimate.rs`, treat `FineGrayRp` like other non-Gaussian links: LAML objective with log determinant adjustments. Ensure derivative of penalized deviance with respect to smoothing parameters uses the survival Hessian; `pirls.rs` already returns `penalized_hessian` and `edf`, so as long as survival branch populates them correctly no extra work is needed.
+- Disable Firth bias reduction in survival mode by erroring if `firth_bias_reduction=true && link==FineGrayRp` (document limitation).
 
-where `d_i` is one for target events, zero otherwise, and `w_i` encodes sampling weights. This expression matches the derivation in Crowther & Lambert (2014, Appendix A) once translated to attained-age time and left truncation. It also aligns with the Stata implementation distributed with Crowther (2023). Any hybrid that mixes risk sets with a parametric baseline would double-count the Jacobian and break the curvature structure, which is why PR #540 was rejected.
+## 7. Prediction Pipeline
+### 7.1 Baseline evaluation
+- Store in `TrainedModel`:
+  - `age_transform: AgeTransform { a_min, delta, reference_age }`.
+  - `baseline_knots` and `baseline_degree` for reproducing spline basis.
+  - `baseline_z_transform` for constraint reproduction.
+  - `baseline_coefficients` subset of overall coefficient vector (extract via column ranges recorded in `ModelLayout`).
+  - Optional precomputed `baseline_cumulative_grid` (Array1) evaluated on a fine log-age grid to speed up interpolation.
+- Provide helper `fn evaluate_baseline_cumhaz(&self, age: f64) -> f64` performing: transform age to `u`, evaluate constrained basis, compute `H_0(age) = exp(B(u) θ)`, optionally using interpolation if grid available.
 
-## 2. Parameterisation and bases
-- **Time scale.** We store a minimum attainable age `a_min` and a positive shift `δ`. Ages are mapped to `u = log(a - a_min + δ)` so that the spline basis receives well-scaled inputs even when `a ≈ a_min`. The Jacobian in Section 1 is `J(a) = a - a_min + δ`.
-- **Log cumulative hazard.** The baseline is expressed as `ℓ_0(u) = B(u)θ`, where `B(u)` is a B-spline basis. Penalised differences of `θ` enforce smoothness, while monotonicity is obtained by exponentiating `η = ℓ_0 + covariate contributions` and adding a barrier if numerical derivatives threaten negativity.
-- **Covariates.** Static effects enter linearly through `x_i^⊤β`. Time-varying effects (e.g., PGS×age) use tensor-product smooths `f_i(u)` with precomputed derivative bases `B_f'(u)`.
-- **Hazard.** Differentiating the linear predictor yields
-  ```
-  ∂η_i/∂a = (∂η_i/∂u) * (∂u/∂a) = (B'(u)θ + ∂f_i/∂u) / (a - a_min + δ)
-  h_i(a) = H_i(a) * ∂η_i/∂a
-  ```
-  Both `η` and its derivative are linear in the spline coefficients, so we can accumulate them efficiently.
+### 7.2 Absolute risk computation
+- Extend `TrainedModel::predict` signature or add `predict_survival` method that accepts `SurvivalPredictionInputs` and returns `Array1<f64>` of absolute risk over the specified horizon(s).
+- Steps per individual:
+  1. Clamp `current_age` and `horizon_age` within `[a_min + δ, a_max + margin]`, using hull guard to detect extrapolation.
+  2. Evaluate `η(t)` and `∂η/∂t` for a Gauss–Kronrod grid spanning `[current_age, horizon_age]`. Use cached design matrices to avoid reallocations.
+  3. Integrate the subdistribution hazard `h(t) = H(t) ⋅ ∂η/∂t` over the grid to obtain `ΔH = ∫ h(t) dt`. When no time-varying effects are present the integrand reduces to `s ⋅ dH_0`, allowing reuse of pre-tabulated baseline increments; keep both branches.
+  4. Form cumulative incidences `CIF_target(current) = 1 - exp(-H(current))` and `CIF_target(horizon) = 1 - exp(-(H(current) + ΔH))`.
+  5. Acquire competing subdistribution cumulative incidence at `current_age` by evaluating the companion model (or Kaplan–Meier proxy for MVP). Apply renormalisation `conditional = (CIF_target(horizon) - CIF_target(current)) / max(1e-12, 1 - CIF_target(current) - CIF_competing(current))`.
+  6. Return the conditional risk, optionally along with `linear_predictor` and `std_error` if caller requests. For the latter propagate uncertainty using the stored Hessian inverse and quadrature weights (delta method on `ΔH`).
+- Provide convenience for multiple horizons: accept `horizon_grid: &[f64]` and vectorize evaluation by reusing baseline grid and covariate shifts.
 
-## 3. Gradients and curvature
-### 3.1 Score contributions
-Let `X_exit[i, :]` be the design row for `η_i(b_i)` and `D_exit[i, :]` the design row for `∂η_i/∂a` (including the Jacobian). The score for coefficient vector `β̃` (collecting baseline and covariate parameters) is
+### 7.3 Integration with calibrator
+- When calibrator enabled, compute diagnostics in survival context:
+  - Baseline absolute risk (`CIF`),
+  - Approximate variance of `η` using diagonal of inverse penalized Hessian and delta method to get variance of `CIF`,
+  - Hull distance in extended feature space (PGS, PCs, age).
+- Build calibrator design using existing routines but mark link as `Logit` to keep outputs in (0,1). Provide new calibrator feature generator `compute_survival_alo_features` mirroring `compute_alo_features` but using survival diagnostics.
+- Apply calibrator at prediction time by mapping base CIF to logits, adding calibrator correction, and mapping back via logistic transform.
 
-```
-U_i^{exit} = w_i [ d_i ( X_exit[i,:] + D_exit[i,:] / (∂η_i/∂a|_{b_i}) ) - H_i(b_i) X_exit[i,:] ]
-U_i^{entry} = + w_i H_i(a_i) X_entry[i,:]
-```
+## 8. CLI and Configuration
+- Add CLI enum `ModelKind { Binary, Continuous, Survival }` in `cli` crate. Update argument parser to accept `--survival` or `--model-kind survival`.
+- In training command:
+  - Route to survival loader and builder when `ModelKind::Survival`.
+  - Expose additional flags: `--baseline-knots`, `--baseline-degree`, `--pgs-age-interaction`, `--no-competing` (if user wants to drop competing events), `--no-calibrator` (already supported), `--horizon` for evaluation summary.
+- In inference command:
+  - Require input columns `current_age` and `horizon_age` (or `years_ahead`), verifying numeric and finite.
+  - Output CSV with columns `sample_id`, `current_age`, `horizon_age`, `absolute_risk`, `calibrated_absolute_risk` (if calibrator active), `std_error` (optional).
 
-where `X_entry` mirrors `X_exit` at the entry age. Competing events have `d_i = 0` and therefore contribute only the survival term `-H_i(b_i) X_exit[i,:]`; this mirrors right-censoring in ordinary survival analysis and requires no special term.
+## 9. Implementation Sequence & Milestones
+1. **Design groundwork**
+   - Introduce `ModelFamily::SurvivalFineGray` and `LinkFunction::FineGrayRp` scaffolding without behavior. Update serialization/tests to ensure round-trip.
+2. **Data ingestion**
+   - Implement survival data loader, validations, and unit tests covering missing columns, invalid codes, degenerate datasets.
+3. **Survival statistics module**
+   - Build `SurvivalStats` with precomputed design/derivative matrices and Jacobian logs. Validate by finite-difference checking scores on toy datasets.
+4. **Baseline spline support**
+   - Extend `basis.rs` with log-age helper and reference constraints. Add tests verifying monotonic cumulative hazard when coefficients increase.
+5. **Model layout adjustments**
+   - Modify `construction.rs` to assemble survival design/penalties. Ensure compatibility with existing logistic/Gaussian cases through regression tests.
+6. **P-IRLS integration**
+   - Implement `update_fine_gray_vectors`, hook into `pirls.rs`, and verify convergence on toy survival dataset (simulate via Python/R). Inspect deviance trajectory for monotonic decrease.
+7. **REML coupling**
+   - Enable smoothing parameter optimization; ensure gradients finite using numerical checks. Compare λ estimates to R `rstpm2` on matched dataset.
+8. **Prediction API**
+   - Add survival scoring path, baseline evaluation, CIF computation, and hull extension. Provide unit tests for monotonicity in age and horizon.
+9. **Calibrator adjustments**
+   - Extend feature extraction and calibrator design for survival. Validate that calibrator training converges and reduces Brier score on held-out simulation.
+10. **CLI integration & documentation**
+    - Wire CLI options, update README, and provide usage examples.
+11. **End-to-end validation**
+    - Full training/inference pipeline on synthetic dataset with known CIF; compare predictions vs. R reference to <1e-3 absolute difference.
+    - Stress tests: heavy censoring, all competing events, extremely late entry ages.
 
-### 3.2 Hessian structure
-The observed negative Hessian decomposes into three parts:
+## 10. Testing Strategy
+- **Unit tests**
+  - `data::load_survival_training_data`: invalid event labels, negative ages, exit < entry, no events.
+- `survival::build_survival_stats`: confirm derivative matrices match analytical derivatives on synthetic spline (≤5 subjects).
+- `survival::assemble_fine_gray_iteration`: compare gradient/Hessian to finite differences.
+  - `basis::log_age_spline`: ensure evaluation at reference age yields zero contribution after constraint.
+- **Property tests**
+  - Simulate data from known RP model (use Python or Rust to generate). Fit survival model and assert estimated coefficients within tolerance (e.g., |β_est - β_true| < 0.05) and CIF predictions within ±0.01.
+  - Randomly permute input order to ensure invariance (design matrices reference original ordering; stats builder must be stable).
+- **Integration tests**
+  - CLI-driven training/inference with sample TSVs; confirm output schema and calibration.
+  - Compare to R `rstpm2`/`cmprsk` by exporting training data and verifying log-likelihood and CIF at several ages.
+- **Performance benchmarks**
+- Benchmark training on synthetic dataset with 100k subjects to ensure runtime scales sub-quadratically and memory remains within reasonable bounds. Profile derivative assembly to identify bottlenecks.
+- **Calibrator validation**
+  - Evaluate Brier score and calibration plots before/after calibrator on validation split. Confirm calibrator does not violate monotonicity with age by checking CIF increases with horizon after calibration.
 
-1. **Exit survival term.** `H_exit = Σ_i w_i H_i(b_i) X_exit[i,:]^⊤ X_exit[i,:]` (positive semi-definite).
-2. **Entry survival term.** `H_entry = Σ_i w_i H_i(a_i) X_entry[i,:]^⊤ X_entry[i,:]` (positive semi-definite, subtracted because `ℓ` increases with `H_i(a_i)`).
-3. **Hazard derivative correction.** For each event (`d_i = 1`),
-   ```
-   H_i^{deriv} = w_i * (D_exit[i,:]^⊤ D_exit[i,:]) / (∂η_i/∂a|_{b_i})^2
-   ```
-   which is a rank-one, positive semi-definite matrix.
+## 11. Performance and Numerical Stability Considerations
+- Precompute and reuse `exp(η)` and derivative vectors within each IRLS iteration to avoid repeated exponentiation and basis multiplies.
+- Implement fused multiply–add loops for rank-one derivative corrections to reduce floating-point error when events are numerous.
+- Guard against negative or extremely small `∂η/∂t` by clipping at `1e-12` before logging; report descriptive error if clipping activates for >1% of events (indicative of spline undersmoothing).
+- Apply step-halving when deviance increases or when cumulative hazard becomes non-monotonic (detected via negative increments). Reuse existing step-halving infrastructure in `pirls.rs`.
+- Extend hull to include age axis: build 3D convex hull over `(PGS, PC1..PCk, age_exit)` or compute axis-aligned guard with signed distance function to detect extrapolation. Reuse `hull::PeeledHull` by augmenting input matrix with age column.
 
-The total **negative** Hessian is therefore
+## 12. Documentation & Communication
+- Update `calibrate/README.md` with a dedicated survival section covering mathematical formulation, data requirements, CLI usage, and prediction semantics.
+- Add Rustdoc comments to new structs (`SurvivalTrainingData`, `SurvivalStats`, `AgeTransform`, etc.) clarifying the Fine–Gray formulation and referencing key equations.
+- Provide example workflow in `examples/` (e.g., `examples/survival/README.md`) demonstrating training on synthetic data and scoring multiple horizons.
+- Coordinate with maintainers to ensure release notes highlight survival support and note limitations (single competing event type, static covariates).
 
-```
--∂²ℓ = H_exit - H_entry + Σ_{i:d_i=1} H_i^{deriv} + Σ_k λ_k P_k
-```
+## 13. Future Extensions (Post-MVP)
+- Multi-state extension supporting >1 competing risk by fitting separate subdistribution hazards with shared baseline or cause-specific baselines.
+- Support for time-varying covariates by interval-splitting each subject and reusing the counting-process representation.
+- Stratified baselines (e.g., by sex) by adding additional baseline smooth blocks with shared penalties.
+- Explore alternative link functions (e.g., log cumulative odds) for different risk interpretations.
+- GPU-accelerated derivative/Hessian assembly if profiling reveals bottlenecks.
 
-The first two terms arise from the exponential map and mirror standard Poisson/PH curvature. The derivative correction is new but sparse: it only touches event rows and has rank one per event. We accumulate it by storing `D_exit` for the event set and applying batched outer products. When left truncation is rare, `H_entry` is small; when it is common we include it explicitly and rely on the penalised trust-region solver (Section 4) to handle the indefinite directions that left truncation can introduce.
-
-### 3.3 Working response
-Because the Hessian is no longer diagonal, the classic scalar IRLS update `z = η + U/W` does not apply. Instead we solve the penalised Newton step
-
-```
-( -∂²ℓ ) δ = U
-β̃_{new} = β̃_{old} + δ
-```
-
-using a damped Cholesky or preconditioned conjugate gradient routine. This matches the strategy already used in our GAM stack for non-canonical links. The low-rank derivative corrections are applied via Sherman–Morrison updates so that each Newton step remains `O(n p)` despite the non-diagonal structure.
-
-## 4. Numerical solution strategy
-1. **Caching.** Store `η_exit`, `η_entry`, `H_exit`, `H_entry`, `∂η/∂a` and design rows (`X`, `D`) in contiguous memory. Event row indices are tracked separately for the derivative corrections.
-2. **Gradient/Hessian assembly.** Compute `U` and the three curvature components as described in Section 3.2. The derivative term uses fused multiply–adds to accumulate the outer products efficiently.
-3. **Solver.** Start from penalised iteratively reweighted least squares with a line search. When the assembled Hessian is not positive definite (which can occur under heavy left truncation), apply Levenberg–Marquardt damping by adding `γ diag(P)` until positive definiteness is restored.
-4. **Smoothing parameter updates.** REML/LAML optimisation uses the same assembled Hessian; the derivative of the penalised deviance with respect to smoothing parameters requires traces of products involving `-∂²ℓ`. We reuse the existing mgcv-style spd solve with Hutchinson trace estimation, now fed by the accurate Hessian rather than a diagonal proxy.
-5. **Convergence checks.** Monitor the maximum absolute score and the relative change in log-likelihood; fall back to line search if the Newton step increases the penalised deviance.
-
-## 5. Prediction and CIF computation
-To predict cumulative incidence between ages `t0` and `t1`:
-
-1. Evaluate `η(t)` and `∂η/∂a` on an adaptive Gauss–Kronrod grid; this respects continuously varying PGS×age effects.
-2. Integrate the subdistribution hazard `h(t) = H(t) ∂η/∂a` across the grid to obtain `H(t1) - H(t0)`; exponentiate to recover `CIF_target(t) = 1 - exp(-H(t))`.
-3. Combine with competing subdistribution hazards fitted analogously and renormalise via
-   ```
-   CIF_cond(t1 | t0) = (CIF_target(t1) - CIF_target(t0)) /
-                       max(ε, 1 - CIF_target(t0) - CIF_competing(t0))
-   ```
-4. When no time-varying effects are present and the hazard ratio is constant, the integral collapses to the familiar difference `1 - exp(-(H(t1) - H(t0)))`; otherwise the quadrature path is mandatory.
-
-## 6. Relationship to Poisson pseudo-observations
-`survival_59213.md` details a Poisson regression built from quadrature nodes `(t_{q-1}, t_q]`. The pseudo-row log-likelihood is `y_{iq} log μ_{iq} - μ_{iq}` with `μ_{iq} = E_{iq} exp(x_{iq}^⊤ β̃)` and exposure `E_{iq} = H(t_q) - H(t_{q-1})`. As the grid refines, the Poisson score converges to the analytic score derived above. This path therefore serves as a regression test for the analytic derivatives and confirms that we have not invented a hybrid likelihood.
-
-## 7. Data structures and metadata
-- Store baseline coefficients alongside `(event_type_id, a_min, δ, spline_basis_descriptor)` so that prediction code can locate the appropriate subdistribution hazard.
-- Cache `X_exit`, `X_entry`, and derivative blocks `D_exit`, `D_entry` to avoid recomputation when evaluating time-varying effects.
-- Guard `∂η/∂a` against underflow by clipping at `1e-12` before taking logarithms; this is purely a numerical stabiliser and does not impose a modelling floor on the hazard.
-
-## 8. Computational feasibility
-- Exit and entry survival terms are diagonal in observation space and cost `O(n p)` per iteration.
-- Derivative corrections are rank-one per event; for biobank cohorts with millions of individuals but far fewer events per iteration, the accumulated cost remains manageable. We exploit sparsity by batching events and using BLAS-3 updates.
-- Memory use is governed by storing two dense design matrices (exit and entry) plus their derivative counterparts; we stream them in blocks when `n` is very large.
-
-## 9. Literature support
-- Crowther, M. J., & Lambert, P. C. (2014). *Parametric modelling of survival data in the presence of competing risks: flexible parametric hazard models*. Statistics in Medicine, 33(4), 469–488.
-- Crowther, M. J. (2023). *Multistate models and competing risks with flexible parametric survival models*. Stata Journal, 23(3), 589–629.
-- Royston, P., & Parmar, M. K. B. (2002). *Flexible parametric proportional hazards and proportional odds models for censored survival data*. Statistics in Medicine, 21(15), 2175–2197.
-- Beyersmann, J., Latouche, A., Buchholz, A., & Schumacher, M. (2009). *Cause-specific versus subdistribution hazard models in competing risks: what do we need to know?* Statistics in Medicine, 28(7), 1089–1107. (Confirms that IPCW weighting belongs to Cox-style partial likelihood, not to fully parametric RP models.)
-
-## 10. Detailed responses to the 20 review questions
-1. **Hazard derivative vs. `log λ_i^*`.** In the full likelihood the event density is `h_i(b_i) S_i(b_i)`. Because `h_i = H_i * ∂η_i/∂a`, the logarithm naturally contains `log(∂η_i/∂a)`—identical to the earlier `log λ_i^*`. Omitting it corresponds to integrating the density with respect to the wrong measure.
-2. **Partial vs. full likelihood.** RP models are fully parametric and therefore must use the complete density. Crowther & Lambert (2014) explicitly derive the log-likelihood we adopt; there is no published evidence supporting a Cox-style partial likelihood with an RP baseline.
-3. **Literature support.** The references in Section 9 implement Fine–Gray with full likelihoods. Beyersmann et al. (2009) show that IPCW weighting is a device for Cox partial likelihoods; since we abandon the partial likelihood, IPCW weighting is not used here.
-4. **Poisson pseudo-observations.** The Poisson cross-check approximates the same integrals via quadrature. With a sufficiently fine grid the coefficients converge to those from the analytic fit, so the two plans are numerically equivalent.
-5. **Hazard derivatives.** Computing `h_i` requires `∂η_i/∂a`; prediction and fitting therefore evaluate derivatives explicitly. Earlier claims that we could avoid derivatives were incorrect and have been removed.
-6. **Hessian structure.** The survival terms are diagonal in observation space, but the hazard-derivative term introduces rank-one updates per event. We retain these low-rank corrections; they are the price of using the correct likelihood.
-7. **Left truncation weights.** `H_i(a_i)` enters with a positive sign in the log-likelihood, so its curvature contribution subtracts from the negative Hessian. We model it explicitly instead of writing exit-minus-entry heuristics.
-8. **Entry curvature sign.** Both entry and exit hazards are positive; the minus sign in the obsolete draft arose from mixing partial-likelihood algebra with left truncation. The canonical plan keeps their true signs inside the Newton system.
-9. **Scalability of the full Hessian.** Event counts are much smaller than cohort size, so the low-rank updates add only `O(p^2 * n_events)` work. We batch them and apply Sherman–Morrison updates to stay within linear-time scaling in practice.
-10. **Working response.** Because the Hessian is not diagonal, we no longer use scalar `U/W` updates. Instead we solve the Newton system directly, just as we do for other non-canonical GAM families.
-11. **Conditional CIF formula.** The renormalised expression in Section 5 is the default for all plans. The exponential difference is recognised as the proportional-hazard special case and implemented only when time-varying effects are absent.
-12. **Competing events.** Each competing cause receives its own RP Fine–Gray fit, so `CIF_competing` comes from the same modelling framework rather than from Kaplan–Meier estimators.
-13. **Time-varying effects in prediction.** Adaptive quadrature over `[t0, t1]` integrates `h(t)` with `∂η/∂a` evaluated at every node, so interactions that vary with age are respected exactly.
-14. **Evaluating interactions.** Predictions do not freeze the effect at `t1`; the quadrature grid samples the entire interval so the interaction is effectively integrated.
-15. **Baseline storage.** Baseline splines are bundled with metadata specifying the event type, the `(a_min, δ)` transform, and the derivative basis so that prediction code cannot mix up cause-specific baselines.
-16. **Derivative safeguard.** The `∂η/∂a > 0` guard prevents numerical sign flips caused by floating-point error. It does not impose a lower bound on the true hazard, which may be arbitrarily small.
-17. **Log-age shift.** B-splines are defined on ℝ, so negative `u` values are acceptable. The `δ` shift prevents evaluating `log 0` at the lower age boundary, satisfying the regularity conditions in Royston & Parmar (2002).
-18. **Design matrices to cache.** We store both the value and derivative design matrices at entry and exit ages for every smooth that depends on time. This ensures we can form scores and Hessians without repeated spline evaluation.
-19. **REML derivatives.** Because we assemble the full Hessian, REML/LAML updates naturally differentiate through it. The low-rank derivative corrections are included when computing the trace terms required by Wood-style smoothing parameter updates.
-20. **Computational comparison with Poisson GLM.** The analytic full likelihood evaluates each subject once per iteration. The Poisson approximation multiplies the dataset by the number of quadrature nodes, so it is orders of magnitude slower at biobank scale and therefore relegated to validation.
