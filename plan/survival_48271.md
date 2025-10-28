@@ -24,10 +24,14 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
 
 ### 3.2 Likelihood with left truncation and competing risks
 - Observed tuple per subject: `(a_entry, a_exit, δ_target, δ_competing, weight)`, where `δ_target` = 1 if event-of-interest by `a_exit`, `δ_competing` = 1 if competing event occurred first, and right-censor when both zero.
-- Optimize the standard Fine–Gray partial likelihood with the Royston–Parmar baseline supplying `η_i(a) = log H_i^*(a)`. For each event time `t_k`, form the weighted risk denominator `R(t_k) = Σ_{j: a_{entry,j} ≤ t_k} w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂a)(t_k)` so that hazard ratios include the Royston–Parmar derivative factor. The log-likelihood contribution of an event `i` at `t_k` is `δ_i [η_i(t_k) + log (∂η_i/∂a)(t_k) - log R(t_k)]`. Censoring and competing events remain in the denominator through the Kaplan–Meier weights `G_j(t_k)`, ensuring the estimator reproduces the Fine–Gray score equations without mixing incompatible objectives.
-- Left truncation is enforced by excluding subjects with `a_entry > t` from each risk denominator and by working with cumulative hazard increments `ΔH_i = exp(η_i(a_exit)) - exp(η_i(a_entry)) ≥ 0`.
-- Competing events remain in the risk set after their event age with zero event indicator but non-zero `G_j(t)` weights, as required by the Fine–Gray subdistribution hazard.
-- Denote by `d_i^{exit}` the derivative design row extracted from `D_baseline_exit` (and augmented with time-varying derivatives) so `(∂η_i/∂a)(t) = d_i^{exit} β̃` when evaluating hazards at `t = a_exit_i`.
+- Optimize the Fine–Gray **full likelihood** with the Royston–Parmar baseline supplying `η_i(a) = log H_i^*(a)`. Each subject contributes
+
+  `ℓ_i = w_i [δ_i log λ_i^*(a_exit) - (H_i^*(a_exit) - H_i^*(a_entry))]`,
+
+  where `δ_i = δ_target` and the cumulative hazard difference accounts for left truncation when `a_entry > 0`. This treats the subdistribution time-to-event as a fully parameterized model instead of relying on weighted risk-set ratios.
+- Competing events correspond to `δ_target = 0` but still subtract their cumulative hazard through `H_i^*(a_exit) - H_i^*(a_entry)`, retaining Fine–Gray semantics while maximizing a bona fide likelihood.
+- Left truncation is automatically enforced via the subtraction of `H_i^*(a_entry)`; no separate risk-set pruning is required.
+- Denote by `d_i^{exit}` the derivative design row extracted from `D_baseline_exit` (and augmented with time-varying derivatives) so `(∂η_i/∂a)(t) = d_i^{exit} β̃` when evaluating hazards at `t = a_exit_i`. This derivative feeds both the hazard term and its gradient contribution.
 
 ### 3.3 Penalization
 - Baseline smooth `f_0` penalized with difference penalty of order `ModelConfig::penalty_order` on the age spline coefficients.
@@ -103,11 +107,19 @@ For subject `i` define:
 - Precompute `∂f_0/∂u` via derivative basis and scale by `1/age` from chain rule. Similarly compute derivative for time-varying term `PGS × ∂T/∂u`.
 - Implement safe guard ensuring `d/da f_0 + ... > 0` by exponentiating a log-derivative parameterization or clamping to small positive constant (e.g., `1e-6`) before taking log.
 
-### 6.3 Gradient/Hessian formulas
-- Define the augmented design row `\tilde{x}_i^{exit}(t) = x_i^{exit} + d_i^{exit} / (∂η_i/∂a)(t)` so that derivatives of both `log h_i(t)` and `log R(t)` are evaluated consistently.
-- Assemble the score in classic Fine–Gray form: for each event time `t_k`, compute normalized weights `s_j(t_k) = w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂a)(t_k) / Σ_{ℓ} w_ℓ G_ℓ(t_k) exp(η_ℓ(t_k)) (∂η_ℓ/∂a)(t_k)`. The contribution for an event `i` at `t_k` is `\tilde{x}_i^{exit}(t_k) - Σ_j s_j(t_k) \tilde{x}_j^{exit}(t_k)` (scaled by sample weights). Left truncation is already handled because individuals with `a_entry > t_k` never appear in the risk set and because the cumulative hazard increment `ΔH_i` subtracts `exp_entry_i`.
-- Build the negative Hessian as the sum over event times of `\tilde{X}_{R(t_k)}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] \tilde{X}_{R(t_k)}` plus the derivative block `Σ_{i∈D_k} w_i (d_i^{exit})^⊤ d_i^{exit} / (∂η_i/∂a)(t_k)^2`. This captures the off-diagonal coupling induced by shared risk denominators and matches the Fine–Gray Fisher information rather than collapsing to diagonal weights. Implement accumulation using existing dense cross-product helpers to stream over event slices.
-- The derivative of the time-varying smooth enters through `(∂z_i/∂a)`; cache these derivatives alongside basis evaluations so that hazard diagnostics, numerator adjustments, and derivative-based penalties remain well defined.
+-### 6.3 Gradient/Hessian formulas
+- Define the augmented design row `\tilde{x}_i^{exit}(t) = x_i^{exit} + d_i^{exit} / (∂η_i/∂a)(t)` so that derivatives of `log λ_i^*(t)` are evaluated consistently for both baseline and time-varying pieces.
+- The score under the full likelihood becomes
+
+  `U = Σ_i w_i [δ_i \tilde{x}_i^{exit}(a_exit) - (H_i^*(a_exit) - H_i^*(a_entry)) x_i^{integral}]`,
+
+  where `x_i^{integral}` denotes the design row used for the cumulative hazard evaluation (baseline/time-varying pieces at both entry and exit). Cache `x_i^{integral}` and the derivative-weighted hazards so the subtraction `H_i^*(a_exit) - H_i^*(a_entry)` can be formed without re-evaluating splines every iteration.
+- Build the negative Hessian by differentiating the score directly: add `w_i δ_i (\tilde{x}_i^{exit})^⊤ \tilde{x}_i^{exit}` for the event term and subtract the integral of `H_i^*(t)` times the outer product of the design rows over the interval `[a_entry, a_exit]`. In practice approximate the integral with the cached cumulative hazard difference, yielding
+
+  `H = Σ_i w_i [δ_i (\tilde{x}_i^{exit})^⊤ \tilde{x}_i^{exit} + ΔH_i x_i^{integral ⊤} x_i^{integral}]`,
+
+  where `ΔH_i = H_i^*(a_exit) - H_i^*(a_entry)`. Reuse dense cross-product helpers so PIRLS sees a familiar penalized normal-equation structure.
+- The derivative of the time-varying smooth enters through `(∂z_i/∂a)`; cache these derivatives alongside basis evaluations so that hazard diagnostics and derivative-based penalties remain well defined.
 
 ### 6.4 Mapping to P-IRLS
 - Augment `pirls::WorkingModel` abstraction:

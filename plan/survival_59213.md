@@ -23,11 +23,15 @@
 
 ### 2.2 Likelihoods
 - **Primary endpoint**: Fine–Gray subdistribution hazard for competing risks.
-  - Use the standard Fine–Gray partial likelihood with a parametric baseline: event `i` at age `a_i` contributes `η_i(a_i) + log (∂η_i/∂a)(a_i) - log Σ_j R_j(a_i) exp(η_j(a_i)) (∂η_j/∂a)(a_i)`, where `(∂η/∂a)` comes from derivative design matrices (baseline spline derivative scaled by `1/a` plus any time-varying smooth derivatives) and `R_j(a_i)` indicates membership in the Fine–Gray risk set (including post-competing-event subjects) with Kaplan–Meier censoring weights.
-  - Cache both value and derivative designs at entry/exit ages so the subdistribution hazard `h_i(a) = exp(η_i(a)) (∂η_i/∂a)(a)` is available for numerator and denominator terms. The Royston–Parmar spline controls the parametric baseline `log H_0`; we never assemble a full likelihood that integrates the hazard over time. Left truncation simply removes individuals with `a_entry > a_i` from the risk set and the baseline increment becomes `ΔH_i = exp(η_i(a_i)) - exp(η_i(a_entry)) ≥ 0`.
+  - Maximize a **full likelihood** built from the parametric subdistribution hazard. For subject `i` with entry age `a_i^{entry}` and exit age `a_i^{exit}`, the contribution is
+
+    `ℓ_i = w_i [δ_i log h_i(a_i^{exit}) - (H_i(a_i^{exit}) - H_i(a_i^{entry}))]`,
+
+    where `δ_i` is the event-of-interest indicator evaluated at exit. Competing events have `δ_i = 0` but still subtract the cumulative hazard so the joint likelihood respects Fine–Gray semantics.
+  - Cache value and derivative designs at entry/exit ages so the subdistribution hazard `h_i(a) = exp(η_i(a)) (∂η_i/∂a)(a)` and cumulative hazard `H_i(a) = exp(η_i(a))` are both available. Left truncation is handled through `H_i(a_i^{entry})`, eliminating the need for risk-set bookkeeping.
 - **IRLS Formulation**:
-- Provide survival-specific working updates that return the score vector and the full negative Hessian assembled from risk-set cross-products `\tilde{X}_{R(t)}^⊤ [diag(s(t)) - s(t)s(t)^⊤] \tilde{X}_{R(t)}`, where `\tilde{X}_j = X_j^{exit} + D_j^{exit} / (∂η_j/∂a)(t)` augments each exit design row with the derivative contribution and `s(t)` uses the derivative-weighted hazards `w_j G_j(t) exp(η_j(t)) (∂η_j/∂a)(t) / R(t)`. This retains off-diagonal curvature induced by shared denominators and ensures gradients/Hessians respect the derivative basis.
-  - Extend PIRLS to accept a family implementation that supplies `(U, H, deviance)` rather than diagonal Fisher weights. This mirrors the existing penalized Newton solver but swaps the logistic/Gaussian diagonal weights for the Fine–Gray dense Hessian.
+- Provide survival-specific working updates that return the score vector and the full negative Hessian derived from the log-likelihood above. The score for observation `i` is `w_i [δ_i \tilde{X}_i^{exit} - ΔH_i X_i^{integral}]` with `ΔH_i = H_i(a_i^{exit}) - H_i(a_i^{entry})` and `\tilde{X}_i^{exit} = X_i^{exit} + D_i^{exit} / (∂η_i/∂a)(a_i^{exit})`. The integral design `X_i^{integral}` reuses the stored entry/exit basis evaluations to avoid numerical quadrature.
+  - Extend PIRLS to accept a family implementation that supplies `(U, H, deviance)` constructed from these per-observation quantities, mirroring the existing penalized Newton solver but using dense Hessians that incorporate both event and cumulative-hazard curvature.
 
 ### 2.3 Absolute Risk Prediction
 - After fitting, compute cumulative incidence for horizon \(h\) at current age \(a_0\):
@@ -66,10 +70,10 @@
 ### 3.2 Prediction Schema
 - Introduce `PredictionDataSurvival` with `current_age`, `pgs`, `pcs`, `sex`, optionally `horizon` vector (or pass at scoring time). If horizon column provided, allow per-person horizon.
 
-### 3.3 Risk-Set Preprocessing
-- Precompute unique sorted event ages (including competing events) for baseline spline support.
+### 3.3 Hazard Cache Preprocessing
+- Precompute unique sorted entry/exit ages for baseline spline support and to drive potential quadrature grids.
 - Derive log-age transformation arrays and Jacobians (1/a) for derivative calculations.
-- Compute Fine–Gray weights before PIRLS: apply cumulative incidence weighting using Kaplan–Meier of censoring/competing risk (requires partial sorting). Use `ndarray` operations; consider `faer` for prefix sums if necessary.
+- Build reusable caches of `H_i(a)` and `(∂η_i/∂a)(a)` at both entry and exit ages so PIRLS iterations can evaluate `ΔH_i` and event hazards without re-running spline evaluations. Store optional Gauss–Kronrod weights if higher-order integration between entry/exit ages becomes necessary.
 
 ### 3.4 Multiple Competing Risks (Future-proofing)
 - For now restrict to a single competing event column. Document extension path: generalize to `Vec<Array1<f64>>` with event type codes.
@@ -133,10 +137,10 @@
 - Modify `run_pirls` to dispatch on `ModelConfig.link_function` by obtaining boxed `LikelihoodFamily`. This isolates survival-specific math without polluting logistic implementation.
 
 ### 6.2 Survival Working Quantities
-- `y` remains the event indicator at exit age; Fine–Gray censoring adjustments live in the precomputed risk-set weights.
-- The survival family computes per-event denominators `R(t_k)` and normalized weights `s(t_k)` from the cached `SurvivalStats`. From these it forms the score `U` and full negative Hessian `H` as described in §2.2 and streams them back to PIRLS.
+- `y` remains the event indicator at exit age; censoring/competing adjustments are absorbed through the cumulative hazard difference `ΔH_i`.
+- The survival family uses the cached `SurvivalStats` to assemble the per-observation event hazard and cumulative hazard. From these it forms the score `U` and full negative Hessian `H` described in §2.2 and streams them back to PIRLS.
 - Working responses are derived from the penalized Newton system `H δ = U`; reuse the existing solver infrastructure to obtain `δ` and update `η` without ever forming diagonal Fisher weights.
-- Deviance is `-2 Σ_{events} w_i [η_i(a_i) - log R(a_i)]`, matching the partial likelihood up to an additive constant. Cache auxiliary vectors (risk denominators, cumulative `s_i` sums) for reuse across REML iterations.
+- Deviance is the negative twice log-likelihood `-2 Σ_i w_i [δ_i log h_i(a_i^{exit}) - ΔH_i]`. Cache `ΔH_i` and hazard terms for reuse across REML iterations.
 
 ### 6.3 REML Gradient/Hessian
 - REML objective still requires the log determinant of the penalized Hessian. For the survival family this Hessian is the dense matrix assembled from risk-set cross-products plus penalties; feed it directly into the existing Faer solves and determinant routines.

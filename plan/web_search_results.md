@@ -66,7 +66,7 @@ Yes, but of the *improper* distribution above: (f^*(t)=\frac{d}{dt}F_k(t)) is no
 
 **Can you do maximum likelihood with a parametric baseline, or must you use a partial likelihood?**
 
-* The *classic* Fine–Gray model is **semiparametric**: it specifies proportional subdistribution hazards with an **unspecified** baseline and is estimated by a **modified/weighted partial likelihood** using an altered risk set. That estimating objective is a partial (or “pseudo-”) likelihood, not a true full likelihood. ([JSTOR][1])
+* The *classic* Fine–Gray model is **semiparametric**: it specifies proportional subdistribution hazards with an **unspecified** baseline and is estimated by a **modified/weighted partial likelihood** using an altered risk set. That estimating objective is a partial (or “pseudo-”) likelihood, not a true full likelihood, and it is **not** the route we pursue in this project. ([JSTOR][1])
 * If you **fully specify** the baseline subdistribution hazard (or equivalently parameterize the CIF directly), then full-likelihood (or Bayesian) estimation is available and has been developed in several settings. Examples:
 
   * **Parametric CIF** via an *improper* baseline such as Gompertz (natural here because of the mass at (+\infty)); estimation proceeds by full likelihood. ([Carolina Digital Repository][3])
@@ -80,7 +80,7 @@ Two conceptual issues are worth keeping in mind when treating subdistribution ha
 1. The Fine–Gray *risk set* includes individuals who have already failed from other causes, with time-dependent weights; this is precisely why the classic estimator is partial/pseudo-likelihood rather than a straightforward full likelihood with ordinary risk sets. ([SAS Support][7])
 2. Fitting **multiple** Fine–Gray models (one per cause) and then summing predicted CIFs can be problematic; it can exceed 1 in finite samples and, more importantly, reflects internal incoherence of simultaneous proportional subdistribution hazards across causes. Use with care, or favor cause-specific hazard modeling when absolute risk for *multiple* causes is the target. ([PubMed][8])
 
-**Bottom line (Q1):** (S^*(t)) is a survivor of a defective distribution; (f^*(t)=\lambda^*(t)S^*(t)) is a subdensity integrating to (\pi_k). With a fully specified baseline (or parametric CIF), **MLE is valid** and used in the literature; the ubiquitous Fine–Gray estimator is **partial likelihood** because its baseline is unspecified. ([JSTOR][1])
+**Bottom line (Q1):** (S^*(t)) is a survivor of a defective distribution; (f^*(t)=\lambda^*(t)S^*(t)) is a subdensity integrating to (\pi_k). With a fully specified baseline (or parametric CIF), **MLE is valid** and used in the literature; we therefore adopt the full-likelihood formulation. The ubiquitous historical Fine–Gray estimator remains a **partial likelihood** because its baseline is unspecified. ([JSTOR][1])
 
 # Q2 — Royston–Parmar (RP) hazard: the derivative
 
@@ -164,20 +164,16 @@ and when your model is specified *on the (u)-scale* (e.g., (\eta(u)=\log H(t)) w
 [13]: https://en.wikipedia.org/wiki/Log-normal_distribution?utm_source=chatgpt.com "Log-normal distribution"
 
 
-Fine–Gray is a proportional **subdistribution** hazards (PSH) model. It isn’t built from a full likelihood for ((T,J)) (event time and cause); instead, the parameters are estimated by **weighted risk-set** estimating equations—equivalently, a *pseudo* partial likelihood formed on Fine–Gray risk sets that retain subjects who have experienced competing events, with inverse-probability-of-censoring weights (IPCW). In symbols, with (h_i^*(t)=h_0^*(t)\exp(\eta_i)), Option B reduces to
-[
-\sum_k\sum_{i\in D_k}\Big{\eta_i-\log\sum_{j\in R_k}w_j(t_k)\exp(\eta_j)\Big},
-]
-which is exactly the Fine–Gray score; there is no true per-subject full likelihood for the subdistribution hazard. ([PMC][1])
+Fine–Gray is a proportional **subdistribution** hazards (PSH) model. The classic estimator uses **weighted risk-set** estimating equations—equivalently, a *pseudo* partial likelihood formed on Fine–Gray risk sets that retain subjects who have experienced competing events, with inverse-probability-of-censoring weights (IPCW). ([PMC][1]) Our implementation, however, parameterizes the baseline subdistribution hazard with Royston–Parmar splines, which turns the objective into a bona fide full likelihood of the form described in Q1.
 
-Option A would be a valid per-subject likelihood only for a *genuine* hazard model (e.g., cause-specific hazards) where the risk set excludes those with competing events, or for a different parametric approach that models the cumulative incidence function via a **direct likelihood** (e.g., the stpm2cr “direct likelihood” FPM), which is **not** the Fine–Gray PSH. ([PubMed][2])
+Option A—per-subject likelihood contributions `ℓ_i = d_i \log λ_i^*(t_i) - (H_i(t_i) - H_i(a_{entry,i}))`—becomes valid once the baseline is fully specified. This is precisely the “direct likelihood” perspective used in stpm2cr and related flexible parametric models; it **is** compatible with the Fine–Gray scale when the baseline is parametric. ([PubMed][2])
 
-Two practical notes:
+Two practical notes when adopting the full-likelihood view:
 
-* Left truncation and time-varying entry are handled through (R_k) in Option B; censoring enters via the IPCW (w_j(t)). ([PMC][1])
-* The CIF follows from the subdistribution hazard as (F_1(t)=1-\exp{-H^*(t)}), but that identity alone does not yield a proper full likelihood for Fine–Gray. ([PMC][1])
+* Left truncation and time-varying entry are handled by subtracting `H_i(a_{entry,i})` rather than by pruning risk sets. ([PMC][1])
+* The CIF follows from the subdistribution hazard as (F_1(t)=1-\exp{-H^*(t)}); because we model `H^*` directly, this identity now sits inside the likelihood and yields coherent probabilities. ([PMC][1])
 
-So, for a Royston–Parmar model **on the Fine–Gray scale**, the statistically correct estimation framework is the **risk-set/weighted partial-likelihood** of Option B, not the per-subject “full likelihood” in Option A.
+So, for a Royston–Parmar model **on the Fine–Gray scale** with a parameterized baseline, the statistically consistent estimation framework is the **full likelihood** assembled per subject, not the historical risk-set partial likelihood.
 
 [1]: https://pmc.ncbi.nlm.nih.gov/articles/PMC7216972/?utm_source=chatgpt.com "On the relation between the cause‐specific hazard and ..."
 [2]: https://pubmed.ncbi.nlm.nih.gov/30305806/?utm_source=chatgpt.com "stpm2cr: A flexible parametric competing risks model using ..."
@@ -276,15 +272,15 @@ Are there published demonstrations of bias **from omitting** ∂η/∂t? I can�
   * **Left truncation** (delayed entry) is natively supported and simply modifies the individual likelihood contributions—well documented in Stata and R manuals. ([SAGE Journals][7])
   * Newer Stata code (**stpm3**, **standsurv**) emphasizes **analytic derivatives** and speed; the authors explicitly discuss computation and have worked on accelerating tricky cases (log-hazard scale being more numerically delicate). ([EconPapers][8])
 
-* **Partial-likelihood Cox/Fine–Gray:**
+* **Partial-likelihood Cox/Fine–Gray (for contrast only):**
 
-  * **coxph** and kin use efficient risk-set updates and are extremely optimized for **very large** n, with straightforward support for left truncation via (start, stop] risk intervals. If the goal is *only* relative effects and you don’t need a parametric baseline for extrapolation/absolute risk, partial likelihood is very competitive computationally. ([CRAN][9])
-  * Classic Fine–Gray (e.g., **cmprsk**) uses weighted estimating equations/partial-likelihood logic; it scales well but does **not** give you a parameterized baseline for extrapolation or smooth hazard/CIF shapes without post-hoc smoothing. ([CRAN][4])
+  * **coxph** and kin use efficient risk-set updates and are extremely optimized for **very large** n, with straightforward support for left truncation via (start, stop] risk intervals. They remain relevant when the goal is *only* relative effects and no parametric baseline is required, but they fall outside the scope of the full-likelihood approach we are implementing. ([CRAN][9])
+  * Classic Fine–Gray (e.g., **cmprsk**) uses weighted estimating equations/partial-likelihood logic; it scales well but does **not** give you a parameterized baseline for extrapolation or smooth hazard/CIF shapes without post-hoc smoothing, which is why we avoid it here. ([CRAN][4])
 
 **Practical heuristics for 100k+ with left truncation:**
 
 * If you need **extrapolation, absolute risks, smooth hazards/CIFs, or standardized contrasts**, RP full-likelihood is often preferable despite a somewhat heavier per-observation cost. Use a modest number of baseline and TVE spline degrees of freedom and the log-cumulative-hazard scale for stability. ([pclambert.net][3])
-* If you only need **relative effects** or plan to combine models in a prediction tool with heavy resampling, partial likelihood (Cox/cause-specific + Aalen–Johansen; or semi-parametric Fine–Gray) is typically faster and memory-lighter. ([CRAN][9])
+* If you only need **relative effects** or plan to combine models in a prediction tool with heavy resampling, partial likelihood (Cox/cause-specific + Aalen–Johansen; or semi-parametric Fine–Gray) can be faster and memory-lighter, but it forfeits the calibrated absolute-risk outputs we require. ([CRAN][9])
 
 ---
 
@@ -306,7 +302,7 @@ Are there published demonstrations of bias **from omitting** ∂η/∂t? I can�
 1. RP models for competing risks are implemented with **full likelihood**, either by modeling **cause-specific hazards** or by **directly modeling the CIF** (stpm2cr). Not partial likelihood. ([BioMed Central][1])
 2. To fit a “Fine–Gray with RP baseline,” use **stpm2cr** (direct-likelihood subdistribution model with RP splines). Standard Fine–Gray toolchains are semi-parametric and don’t parameterize the baseline. ([CRAN][2])
 3. The **∂η/∂t** term is **non-negotiable**—it’s how hazards are obtained from the RP linear predictor. I’m not aware of published case studies that *omit* it and quantify the bias; software computes it for you. ([Stata][5])
-4. With 100k+ and left truncation, **partial likelihood** (Cox/Fine–Gray) is often fastest for relative effects; **full-likelihood RP** is entirely feasible (especially on the log-cumulative-hazard scale) and preferred when you need smooth baselines, extrapolation, or standardized absolute risks. ([CRAN][9])
+4. With 100k+ and left truncation, **full-likelihood RP** remains feasible (especially on the log-cumulative-hazard scale) and is our chosen path because it delivers smooth baselines, extrapolation, and standardized absolute risks; partial-likelihood Cox/Fine–Gray remains an alternative only when relative effects suffice. ([CRAN][9])
 
 [1]: https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/1471-2288-13-13?utm_source=chatgpt.com "Flexible parametric modelling of cause-specific hazards to ..."
 [2]: https://cran.r-project.org/web/packages/rstpm2/rstpm2.pdf "rstpm2: Smooth Survival Models, Including Generalized Survival Models"
