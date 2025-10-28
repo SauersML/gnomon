@@ -51,11 +51,10 @@
   4. Score contribution for event `i`: `w_i [η_i(a_exit_i) - log(risk_sum)]`.
 - Because RP models provide `η_i(a_exit)` directly, we avoid time-derivative computations; however, we need `exp(η_i)` for risk-set sums and `∂ℓ/∂η` for P-IRLS.
 
-### 3.5 Gradient and Hessian for P-IRLS
 - Denote `r_i = w_i` if `d_i=1`, else 0. Let `s_i = w_i G_i(a_exit_i) exp(η_i(a_exit_i)) / risk_sum(a_exit_i)` for all subjects with `a_entry_i ≤ a_exit_i`. The score with respect to `η_i` is `U_i = r_i - Σ_{k: events at t_k} s_i(t_k)` where the sum covers event times `t_k` where subject `i` is in the Fine–Gray risk set. For efficiency we precompute `Σ_{k} s_i(t_k)` using cumulative sums over the sorted time axis.
-- The negative Hessian diagonal is `W_i = Σ_{k: t_k ≥ a_entry_i} s_i(t_k) (1 - s_i(t_k))`, derived from the second derivative of the log partial likelihood. We'll store `W_i` as the working weight for IRLS.
-- Working response `z_i = η_i + U_i / W_i` (for `W_i > 0`). Clamp `W_i` below with `1e-12` to avoid instability. Observations with zero weight contribute only through penalties.
-- Provide helper `update_fine_gray_vectors(eta, survival_stats) -> (mu, weights, z)` returning `mu = exp(η)` for reuse in prediction-standard-error calculations.
+- Assemble the negative Hessian as the full risk-set cross-product: for each event time `t_k`, form `W_k = diag(s(t_k)) - s(t_k) s(t_k)^⊤` over the risk-set vector `s(t_k)` and accumulate `H = Σ_k X_{R(t_k)}^⊤ W_k X_{R(t_k)}`. This preserves the off-diagonal curvature induced by shared risk denominators and prevents the Newton step from collapsing when multiple individuals share an event time. Implement the accumulation via existing dense cross-product utilities, processing one event slice at a time to control memory.
+- Solve the linear system `H δ = U` with the penalized normal-equation solver to obtain the Newton step, then set the working response `z = η + δ`. Inject a small ridge (`1e-8`) into `H` if it becomes near-singular. Observations with zero risk-set involvement contribute only through penalties.
+- Provide helper `update_fine_gray_vectors(eta, survival_stats) -> (mu, hessian, z)` returning `mu = exp(η)` for reuse in prediction-standard-error calculations and the assembled Hessian blocks for REML updates.
 - Deviance for monitoring: `D = -2 Σ_{events} w_i [η_i(a_exit_i) - log(risk_sum(a_exit_i))]` plus constant; store unpenalized deviance for diagnostics.
 
 ## 4. Data Schema and Preprocessing
@@ -166,10 +165,11 @@ pub fn update_fine_gray_vectors(
 - Extend `TrainedModel::predict` signature or add `predict_survival` method that accepts `SurvivalPredictionInputs` and returns `Array1<f64>` of absolute risk over the specified horizon(s).
 - Steps per individual:
   1. Clamp `current_age` and `horizon_age` within `[a_min + δ, a_max + margin]`, using hull guard to detect extrapolation.
-  2. Evaluate baseline cumulative hazard at both ages: `Λ0_current`, `Λ0_horizon`.
+  2. Evaluate the target-event baseline cumulative hazard at both ages: `Λ0_target(current)` and `Λ0_target(horizon)`. Reuse the stored Kaplan–Meier curve for competing events to obtain `CIF_competing(current)`.
   3. Compute covariate shift `s = exp(x^⊤ β)` using stored coefficients (PGS, sex, PCs, optional PGS×age evaluated at `horizon_age`).
-  4. Fine–Gray cumulative incidence: `CIF = 1 - exp(-(Λ0_horizon - Λ0_current) * s)`.
-  5. Return `CIF`, optionally along with `linear_predictor` and `std_error` if caller requests.
+  4. Convert to subject-specific cumulative incidences: `CIF_target(age) = 1 - exp(-Λ0_target(age) ⋅ s)` for both `age = current` and `age = horizon`.
+  5. Conditional absolute risk for the interval is `(CIF_target(horizon) - CIF_target(current)) / max(1e-12, 1 - CIF_target(current) - CIF_competing(current))`, ensuring the probability is conditioned on having avoided both the target and competing events up to `current_age`.
+  6. Return the conditional risk, optionally along with `linear_predictor` and `std_error` if caller requests.
 - Provide convenience for multiple horizons: accept `horizon_grid: &[f64]` and vectorize evaluation by reusing baseline grid and covariate shifts.
 
 ### 7.3 Integration with calibrator
