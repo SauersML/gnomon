@@ -227,3 +227,50 @@ Let's run our final set of six scores in the terminal:
 As expected, they have non-zero variance:
 
 <img width="1011" height="971" alt="image" src="https://github.com/user-attachments/assets/c5d2500a-9017-4bb5-aa5a-6432c2fb71b7" />
+
+Let's check how many SNPs are in the region for each score:
+```
+python3 -c "import os; [print(f'{f}: {sum(1 for line in open(f\"gnomon_score_cache/{f}\") if line.strip() and not line.startswith(\"variant_id\") and line.split()[0].split(\":\")[0] == \"17\" and 45535159 <= int(line.split()[0].split(\":\")[1]) <= 46342045)}') for f in sorted(os.listdir('gnomon_score_cache')) if f.endswith('.gnomon.tsv')]"
+```
+
+PGS000007.gnomon.tsv: 5
+PGS000015.gnomon.tsv: 13
+PGS000317.gnomon.tsv: 1
+PGS000332.gnomon.tsv: 3022
+PGS000335.gnomon.tsv: 29
+PGS000344.gnomon.tsv: 1
+PGS000507.gnomon.tsv: 235
+PGS000508.gnomon.tsv: 235
+PGS000765.gnomon.tsv: 0
+PGS003334.gnomon.tsv: 0
+PGS003386.gnomon.tsv: 0
+PGS003400.gnomon.tsv: 0
+PGS003433.gnomon.tsv: 213
+PGS003725.gnomon.tsv: 263
+PGS003852.gnomon.tsv: 55
+PGS003897.gnomon.tsv: 5
+PGS003957.gnomon.tsv: 0
+PGS003979.gnomon.tsv: 28
+PGS004146.gnomon.tsv: 25
+PGS004150.gnomon.tsv: 235
+PGS004227.gnomon.tsv: 0
+PGS004229.gnomon.tsv: 1
+PGS004303.gnomon.tsv: 0
+PGS004378.gnomon.tsv: 219
+PGS004589.gnomon.tsv: 0
+PGS004863.gnomon.tsv: 0
+PGS004869.gnomon.tsv: 235
+PGS004898.gnomon.tsv: 2
+PGS004904.gnomon.tsv: 0
+PGS005198.gnomon.tsv: 266
+PGS005199.gnomon.tsv: 263
+PGS005203.gnomon.tsv: 234
+PGS005235.gnomon.tsv: 7
+
+What about for the scores we chose?
+```
+python3 -c "pairs=[('PGS004146','PGS004229'),('PGS004869','PGS000507'),('PGS004378','PGS005198')]; [print(f'{p[0]} & {p[1]}: Total unique: {len(s1|s2)}, Unique to {p[0]}: {len(s1-s2)}, Unique to {p[1]}: {len(s2-s1)}') for p in pairs for s1 in [set(l.split()[0] for l in open(f'gnomon_score_cache/{p[0]}.gnomon.tsv') if l.strip() and not l.startswith('variant_id'))] for s2 in [set(l.split()[0] for l in open(f'gnomon_score_cache/{p[1]}.gnomon.tsv') if l.strip() and not l.startswith('variant_id'))]]"
+```
+PGS004146 & PGS004229: Total unique: 922124, Unique to PGS004146: 913267, Unique to PGS004229: 6353
+PGS004869 & PGS000507: Total unique: 1144023, Unique to PGS004869: 25079, Unique to PGS000507: 271963
+PGS004378 & PGS005198: Total unique: 1258570, Unique to PGS004378: 41062, Unique to PGS005198: 198724
