@@ -12,7 +12,7 @@ It is a proper survivor for a defective distribution: S*(0)=1 and S*(t)↓1−π
 f*(t)=dF₁(t)/dt (“subdensity”). It integrates to ∫₀^∞ f*(t)dt=F₁(∞)=π₁<1 in general. So it is not a proper density on [0,∞) unless you renormalize by π₁ (which would give the conditional density of T given J=1, but that conditional does not have hazard λ*).
 
 • Is L=∏[λ* (tᵢ)]^{dᵢ}×S*(tᵢ)/S*(t₀ᵢ) a valid full likelihood?
-No. That object treats all non–cause-1 outcomes as if they were independent right censoring for the subdistribution process, which they are not. A full likelihood for the observed competing-risks data requires the joint law of (T,J); specifying only λ*(t) leaves the probabilities and timing of other causes (and their effect on the observed process) unspecified. You can obtain a proper likelihood only by modeling the full system (e.g., all cause-specific hazards, or λ* plus enough structure for the other causes). The standard Fine–Gray estimator is thus not an MLE from a full likelihood; it is an M-estimator obtained from partial/pseudo-likelihood–type estimating equations.
+Not by itself. That object treats all non–cause-1 outcomes as if they were independent right censoring for the subdistribution process, which they are not. A full likelihood for the observed competing-risks data requires the joint law of (T,J); specifying only λ*(t) leaves the probabilities and timing of other causes (and their effect on the observed process) unspecified. To obtain a proper likelihood you must model the full system (e.g., all cause-specific hazards, or λ* plus enough structure for the other causes). Our plan therefore parameterizes the competing risks with Royston–Parmar baselines so the estimator is derived from a genuine full likelihood rather than a pseudo-likelihood.
 
 • Does that “likelihood” have a unique maximum; do MLE asymptotics apply?
 Because it is not a true likelihood for the observed data, uniqueness and MLE asymptotics are not the right questions. For the semiparametric Fine–Gray proportional subdistribution hazards model, the usual estimating-equation machinery gives consistency and asymptotic normality under the standard regularity conditions (i.i.d. sampling, independent censoring, correct specification). Variances come from the sandwich/influence-function form. Uniqueness is as for Cox-type fits: typically yes under identifiability (no separation, full rank), but it is not a concavity guarantee from a true log-likelihood.
@@ -133,7 +133,7 @@ and when your model is specified *on the (u)-scale* (e.g., (\eta(u)=\log H(t)) w
 • Fine & Gray’s original formulation and the “improper” (T^*). ([JSTOR][1])
 • Subdistribution = defective distribution; formal definitions and notation. ([CRAN][11])
 • Conceptual notes on censoring and subdistribution hazards. ([PMC][2])
-• The standard estimator is a modified/weighted partial likelihood; SAS tech note. ([SAS Support][7])
+• The classic Fine–Gray estimator uses a modified/weighted pseudo-likelihood; SAS tech note. ([SAS Support][7])
 • Fully parametric/Bayesian subdistribution hazards. ([PMC][4])
 • Parametric CIFs using improper baselines (e.g., Gompertz). ([Carolina Digital Repository][3])
 • Sieve semiparametric MLE for FG under interval censoring. ([PMC][5])
@@ -164,20 +164,18 @@ and when your model is specified *on the (u)-scale* (e.g., (\eta(u)=\log H(t)) w
 [13]: https://en.wikipedia.org/wiki/Log-normal_distribution?utm_source=chatgpt.com "Log-normal distribution"
 
 
-Fine–Gray is a proportional **subdistribution** hazards (PSH) model. It isn’t built from a full likelihood for ((T,J)) (event time and cause); instead, the parameters are estimated by **weighted risk-set** estimating equations—equivalently, a *pseudo* partial likelihood formed on Fine–Gray risk sets that retain subjects who have experienced competing events, with inverse-probability-of-censoring weights (IPCW). In symbols, with (h_i^*(t)=h_0^*(t)\exp(\eta_i)), Option B reduces to
+Fine–Gray is a proportional **subdistribution** hazards (PSH) model. In its classic semiparametric form it isn’t built from a full likelihood for ((T,J)) (event time and cause); instead, the parameters are estimated by **weighted risk-set** estimating equations—equivalently, a pseudo-likelihood formed on Fine–Gray risk sets that retain subjects who have experienced competing events, with inverse-probability-of-censoring weights (IPCW). In symbols, with (h_i^*(t)=h_0^*(t)\exp(\eta_i)), Option B reduces to
 [
 \sum_k\sum_{i\in D_k}\Big{\eta_i-\log\sum_{j\in R_k}w_j(t_k)\exp(\eta_j)\Big},
 ]
-which is exactly the Fine–Gray score; there is no true per-subject full likelihood for the subdistribution hazard. ([PMC][1])
+which is exactly the Fine–Gray score derived from those estimating equations. ([PMC][1])
 
-Option A would be a valid per-subject likelihood only for a *genuine* hazard model (e.g., cause-specific hazards) where the risk set excludes those with competing events, or for a different parametric approach that models the cumulative incidence function via a **direct likelihood** (e.g., the stpm2cr “direct likelihood” FPM), which is **not** the Fine–Gray PSH. ([PubMed][2])
+Option A—constructing the full likelihood directly—becomes valid once we specify a genuine hazard model (e.g., cause-specific hazards with parametric baselines) or a direct likelihood for the CIF. Our implementation follows this route: we parameterize the cause-specific cumulative hazards with Royston–Parmar splines, evaluate both entry and exit contributions, and optimize the resulting full likelihood instead of relying on the weighted risk-set surrogate. ([PubMed][2])
 
-Two practical notes:
+Two practical notes under the full-likelihood approach:
 
-* Left truncation and time-varying entry are handled through (R_k) in Option B; censoring enters via the IPCW (w_j(t)). ([PMC][1])
-* The CIF follows from the subdistribution hazard as (F_1(t)=1-\exp{-H^*(t)}), but that identity alone does not yield a proper full likelihood for Fine–Gray. ([PMC][1])
-
-So, for a Royston–Parmar model **on the Fine–Gray scale**, the statistically correct estimation framework is the **risk-set/weighted partial-likelihood** of Option B, not the per-subject “full likelihood” in Option A.
+* Left truncation is handled by subtracting survival accumulated before entry, i.e., using `Λ(b_i) - Λ(a_i)` in each subject’s contribution, so no IPCW weights are required. ([PMC][1])
+* The CIF follows from the fitted cause-specific hazards as usual via `F_1(t)=1-\exp{-Λ_1(t)}` once the full hazard system is specified. ([PMC][1])
 
 [1]: https://pmc.ncbi.nlm.nih.gov/articles/PMC7216972/?utm_source=chatgpt.com "On the relation between the cause‐specific hazard and ..."
 [2]: https://pubmed.ncbi.nlm.nih.gov/30305806/?utm_source=chatgpt.com "stpm2cr: A flexible parametric competing risks model using ..."

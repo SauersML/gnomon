@@ -22,12 +22,13 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
   - `g_{pgs}` is a smooth varying-coefficient term for `PGS × age` built from tensor-product basis (PGS marginal basis ⊗ age basis without intercept column so proportional hazard is recovered when smooth is zero).
 - Subdistribution hazard: `λ_i^*(a) = d/da H_i^*(a)` = `H_i^*(a) * (df_0/da + ∂g_{pgs}/∂a)`.
 
-### 3.2 Likelihood with left truncation and competing risks
-- Observed tuple per subject: `(a_entry, a_exit, δ_target, δ_competing, weight)`, where `δ_target` = 1 if event-of-interest by `a_exit`, `δ_competing` = 1 if competing event occurred first, and right-censor when both zero.
-- Optimize the standard Fine–Gray partial likelihood with the Royston–Parmar baseline supplying `η_i(a) = log H_i^*(a)`. For each event time `t_k`, form the weighted risk denominator `R(t_k) = Σ_{j: a_{entry,j} ≤ t_k} w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂a)(t_k)` so that hazard ratios include the Royston–Parmar derivative factor. The log-likelihood contribution of an event `i` at `t_k` is `δ_i [η_i(t_k) + log (∂η_i/∂a)(t_k) - log R(t_k)]`. Censoring and competing events remain in the denominator through the Kaplan–Meier weights `G_j(t_k)`, ensuring the estimator reproduces the Fine–Gray score equations without mixing incompatible objectives.
-- Left truncation is enforced by excluding subjects with `a_entry > t` from each risk denominator and by working with cumulative hazard increments `ΔH_i = exp(η_i(a_exit)) - exp(η_i(a_entry)) ≥ 0`.
-- Competing events remain in the risk set after their event age with zero event indicator but non-zero `G_j(t)` weights, as required by the Fine–Gray subdistribution hazard.
-- Denote by `d_i^{exit}` the derivative design row extracted from `D_baseline_exit` (and augmented with time-varying derivatives) so `(∂η_i/∂a)(t) = d_i^{exit} β̃` when evaluating hazards at `t = a_exit_i`.
+### 3.2 Full likelihood with left truncation and competing risks
+- Observed tuple per subject: `(a_entry, a_exit, δ_target, δ_competing, weight)`, where `δ_target` = 1 if the event of interest occurs by `a_exit`, `δ_competing` = 1 if a competing event occurs first, and right-censoring corresponds to both being zero.
+- Maximize the full log-likelihood for the joint cause-specific hazard system. With Royston–Parmar baselines we obtain cumulative hazards `Λ_target(a) = exp(η_i^{target}(a))` and `Λ_competing(a) = exp(η_i^{comp}(a))`. Define the total hazard `λ_total = λ_target + λ_competing` with survival `S(a) = exp(-∫_0^a λ_total(u) du)`. For an individual entering at `a_entry` and exiting at `a_exit`, the contribution is
+  `ℓ_i = w_i [ δ_target log λ_target(a_exit) + δ_competing log λ_competing(a_exit) + log S(a_exit) - log S(a_entry) ]`,
+  ensuring that left truncation divides out the survival accumulated prior to `a_entry`.
+- Implement numerical quadrature of the total hazard using the Royston–Parmar spline evaluations at entry/exit ages: precompute `Λ_total(a_exit) - Λ_total(a_entry)` and reuse it for both survival and gradient calculations. Competing events are handled explicitly through their own hazard block; no pseudo-risk weights or Kaplan–Meier adjustments are required.
+- Derivative design matrices `D_baseline_exit` supply `λ_target(a_exit)` and `λ_competing(a_exit)` through chain-rule combinations of spline derivatives. We therefore evaluate `(∂η_i/∂a)(t) = d_i^{exit} β̃` for each hazard component and plug the resulting rates directly into the full likelihood.
 
 ### 3.3 Penalization
 - Baseline smooth `f_0` penalized with difference penalty of order `ModelConfig::penalty_order` on the age spline coefficients.
@@ -51,15 +52,15 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
       pub prior_weights: Array1<f64>,
   }
   ```
-- Provide survival-specific loaders `load_survival_training_data` and `load_survival_prediction_data` that validate monotone ages (`age_entry < age_exit`), finite values, event indicator exclusivity, and precompute Fine–Gray risk weights if provided externally.
+  - Provide survival-specific loaders `load_survival_training_data` and `load_survival_prediction_data` that validate monotone ages (`age_entry < age_exit`), finite values, event indicator exclusivity, and populate any optional sample weights without invoking pseudo-risk weighting schemes.
 - Maintain backward compatibility by keeping existing GAM loader; CLI will select survival loader when new flag `--survival` is passed.
 
-### 4.2 Fine–Gray weight preprocessing
-- Add helper to compute pseudo-risk weights `ω_i`:
-  - Sort by `age_exit`.
-  - Compute Kaplan–Meier estimate of censoring survival `G(a)` using `censoring_weights`.
-  - For each record, assign `ω_i = prior_weights[i] * I(age_entry < age_exit) / G(a_exit)` with adjustments for left truncation `G(a_entry)`.
-  - Store both `ω_exit` and `ω_entry` to reuse during iterations.
+### 4.2 Hazard cache preprocessing
+- Add helper to precompute full-likelihood summaries per observation:
+  - Sort by `age_exit` so spline evaluations share permutation order with design construction.
+  - Evaluate baseline and time-varying spline bases (and derivatives) at both entry and exit ages, storing `B_entry`, `B_exit`, `D_exit` blocks in a `SurvivalStats` cache.
+  - Initialize arrays for `Λ_{k}(a_entry)`, `Λ_{k}(a_exit)`, and instantaneous hazards `λ_{k}(a_exit)` that will be refreshed each PIRLS iteration; this avoids pseudo-risk weights entirely.
+  - Record sample weights and event indicators alongside the cache to streamline score/Hessian accumulation.
 
 ## 5. Basis & design construction updates
 ### 5.1 Baseline age spline
