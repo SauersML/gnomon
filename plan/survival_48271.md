@@ -105,18 +105,18 @@ For subject `i` define:
 - Precompute `∂f_0/∂u` via derivative basis and scale by `1/age` from chain rule. Similarly compute derivative for time-varying term `PGS × ∂T/∂u`.
 - Implement safe guard ensuring `d/da f_0 + ... > 0` by exponentiating a log-derivative parameterization or clamping to small positive constant (e.g., `1e-6`) before taking log.
 
--### 6.3 Gradient/Hessian formulas
+### 6.3 Gradient/Hessian formulas
 - Define the augmented design row `\tilde{x}_i^{exit}(t) = x_i^{exit} + d_i^{exit} / (∂η_i/∂a)(t)` so that derivatives of `log λ_i^*(t)` are evaluated consistently for both baseline and time-varying pieces.
 - The score under the full likelihood becomes
 
-  `U = Σ_i w_i [δ_i \tilde{x}_i^{exit}(a_exit) - (H_i^*(a_exit) - H_i^*(a_entry)) x_i^{integral}]`,
+  `U = Σ_i w_i [δ_i \tilde{x}_i^{exit}(a_exit) - (exp(η_i^{exit}) x_i^{exit} - exp(η_i^{entry}) x_i^{entry})]`,
 
-  where `x_i^{integral}` denotes the design row used for the cumulative hazard evaluation (baseline/time-varying pieces at both entry and exit). Cache `x_i^{integral}` and the derivative-weighted hazards so the subtraction `H_i^*(a_exit) - H_i^*(a_entry)` can be formed without re-evaluating splines every iteration.
+  making the cumulative hazard contribution explicit through boundary-evaluated design rows. The implementation must therefore cache both `X_i^{exit}` and `X_i^{entry}` (for baseline and time-varying blocks) together with their exponentiated linear predictors `exp(η_i^{exit})`, `exp(η_i^{entry})` each iteration, rather than attempting to reuse a single pre-integrated design vector.
 - Build the negative Hessian by differentiating the score directly: add `w_i δ_i (\tilde{x}_i^{exit})^⊤ \tilde{x}_i^{exit}` for the event term and subtract the integral of `H_i^*(t)` times the outer product of the design rows over the interval `[a_entry, a_exit]`. In practice approximate the integral with the cached cumulative hazard difference, yielding
 
   `H = Σ_i w_i [δ_i (\tilde{x}_i^{exit})^⊤ \tilde{x}_i^{exit} + ΔH_i x_i^{integral ⊤} x_i^{integral}]`,
 
-  where `ΔH_i = H_i^*(a_exit) - H_i^*(a_entry)`. Reuse dense cross-product helpers so PIRLS sees a familiar penalized normal-equation structure.
+  where `ΔH_i = H_i^*(a_exit) - H_i^*(a_entry)` still reuses the exponentiated boundary terms and `x_i^{integral}` denotes the design row used for the cumulative hazard evaluation constructed from the cached entry/exit matrices. Reuse dense cross-product helpers so PIRLS sees a familiar penalized normal-equation structure.
 - The derivative of the time-varying smooth enters through `(∂z_i/∂a)`; cache these derivatives alongside basis evaluations so that hazard diagnostics and derivative-based penalties remain well defined.
 
 ### 6.4 Mapping to P-IRLS
