@@ -25,32 +25,22 @@
 - Subdistribution hazard: `h_i(u) = H_i(u) * (dη_i(u)/du) / exp(u)` where `dη_i(u)/du = Σ_j γ_j B'_j(u) + (∂z_i(u)/∂u)^T θ`. Time-varying covariate bases must therefore supply their derivatives with respect to `u = log(age)`; when no time-varying terms are used the second summand vanishes.
 
 ### 2.2 Likelihood Contributions
-- For event-of-interest at `b_i` (Fine–Gray): log-likelihood term `log h_i(u_i) + log S_i(u_i^-)`, with `S_i(u) = exp(-H_i(u))` being the survival function for the subdistribution hazard.
-- For censored or competing events: contribution `log S_i(u_i)`.
-- Left truncation at `a_i`: subtract `log S_i(v_i)` evaluated at `v_i = log(a_i)` from each individual's log-likelihood (i.e., condition on survival up to entry age).
-- Competing risks (Fine–Gray) keep individuals with competing events in the risk set; their contributions use the same `S_i(u_i)` term but without `log h_i`. A weight update step must ensure risk set weights reflect subdistribution hazard definition (weights stay 1 after competing event until evaluation time because hazard integrates over all individuals).
-- Weighted log-likelihood includes sample weights (`TrainingData::weights`).
+- Adopt the Fine–Gray *partial likelihood with a parametric baseline*: the Royston–Parmar spline determines `log H_0`, while the risk-set denominators follow the standard Fine–Gray construction (Beyersmann et al. 2010). We do **not** form a full likelihood; only event-time risk-set ratios contribute.
+- For each distinct event time `t_k`, compute the weighted risk denominator `R(t_k) = Σ_{j: a_j ≤ t_k} w_j G_j(t_k) exp(η_j(t_k))`, where `G_j` is the Kaplan–Meier censoring/competing survival. Event `i` at `t_k` contributes `w_i [η_i(t_k) - log R(t_k)]`.
+- Left truncation enters through the same risk sets: individuals with `a_i > t_k` are excluded from `R(t_k)`, and their cumulative hazard contribution subtracts `H_i(a_i)` from `H_i(b_i)` so that the working increments remain `ΔH_i = exp(η_i(b_i)) - exp(η_i(a_i)) ≥ 0`.
+- Maintain competing-event records in the risk set after their event time, consistent with Fine–Gray, by leaving their `G_j` weights active but setting the event indicator to zero.
+- Multiply all contributions by sample weights before accumulating the score or Hessian.
 
 ### 2.3 Gradients / IRLS quantities
-- Need gradient and Hessian of log-likelihood w.r.t. `η`. For each observation, derivative of contribution w.r.t. `η`:
-  - Event: `∂ℓ/∂η = 1 - H_i(b_i)` (because `log h = η + log[s'(u)/exp(u)]` → derivative w.r.t. η is 1) minus derivative from survival term `H_i(b_i)`.
-  - Censor/competing: `∂ℓ/∂η = -H_i(b_i)`.
-- Left truncation subtracts `-H_i(a_i)` contributions, so its score contribution is `+H_i(a_i)` because derivative of `-log S(a_i)` equals `+H_i(a_i)`.
-- Second derivatives (for IRLS weights):
-  - Event: `∂²ℓ/∂η² = -H_i(b_i)`.
-  - Censor/competing: `∂²ℓ/∂η² = -H_i(b_i)`.
-- Left truncation adds `+H_i(a_i)`.
-- Implement P-IRLS by treating `W_i = -∂²ℓ/∂η²` and `z_i = η_i - g_i/∂g/∂η`, where `g_i = ∂ℓ/∂η`. Because link is identity in η-space (η is natural parameter), the working response simplifies to `z_i = η_i + g_i/W_i`.
-- Need to ensure weights remain positive; exit-time contributions give `W_i^{\text{exit}} = H_i(b_i)` and left-truncation adds a separate term `W_i^{\text{entry}} = H_i(a_i)` evaluated at the entry age. Both are non-negative because `H_i` is monotone increasing in time. Guard against overflow by clamping exponentials.
-- The derivative of log hazard `log[s'(u)/exp(u)]` influences the gradient; precompute `s'(u)` via derivative basis evaluation.
+- Express the score in risk-set form: for subject `i`, `U_i = w_i d_i - Σ_{k: t_k ≥ a_i} w_i G_i(t_k) exp(η_i(t_k)) / R(t_k)`, where `d_i` is 1 when `i` experiences the target event at `t_k`. Cache the cumulative sum `Σ_k s_i(t_k)` so the subtraction uses precomputed totals during each IRLS iteration. Include the derivative contribution from time-varying effects via `(∂z_i(u)/∂u)^T θ` when evaluating the hazard term for diagnostic outputs.
+- Assemble the negative Hessian as `H = Σ_k X_{R(t_k)}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] X_{R(t_k)}`, where `s(t_k)` are the normalized risk weights for time `t_k`. This retains the off-diagonal curvature induced by shared denominators and matches the Fine–Gray Fisher information. Reuse dense cross-product helpers to stream over event times.
+- Left truncation contributes additively to the diagonal through `exp(η_i(a_i))`, so the effective diagonal weights become `exp(η_i(b_i)) - exp(η_i(a_i)) ≥ 0`. No negative working weights should occur provided the baseline cumulative hazard remains monotone; enforce monotonicity through the `log H_0` parameterization.
+- The working response can continue to use `z = η + H^{-1} U` inside the penalized Newton update, leveraging the same solver infrastructure as other families.
 
 ### 2.4 Absolute Risk Predictions
-- Absolute risk between current age `t0` and horizon `t1` (on age scale) for covariates x:
-  - Evaluate `H_i(u)` at both `u0 = log(t0)` and `u1 = log(t1)`.
-  - Subdistribution cumulative incidence function (CIF): `CIF(t1 | t0) = 1 - exp(-(H_i(u1) - H_i(u0)))`.
-  - For survival probability `S(t1 | t0) = exp(-(H_i(u1) - H_i(u0)))`.
-- Need to precompute `H_0(u)` spline basis for any requested age grid; store knots and basis degree in model config.
-- For predictions over multiple horizons, evaluate basis matrix for vector of ages to avoid recomputation.
+- Absolute risk between current age `t0` and horizon `t1` requires conditioning on being event-free (for all causes) at `t0`. Evaluate `CIF_target(t) = 1 - exp(-H_i(t))` and retain the Fine–Gray-derived competing incidence `CIF_competing(t)` from the censoring weights.
+- Conditional probability of the target event in `(t0, t1]` is `(CIF_target(t1) - CIF_target(t0)) / max(1e-12, 1 - CIF_target(t0) - CIF_competing(t0))`.
+- Provide helper routines to evaluate both the cumulative hazards and the derivative-based hazard when time-varying effects are present; cache basis evaluations at requested ages for efficiency.
 
 ## 3. Data & Schema Extensions (`calibrate/data.rs`)
 ### 3.1 Input Columns
