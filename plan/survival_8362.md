@@ -22,7 +22,7 @@
   - `x_i` includes baseline covariates (PGS main effect, PCs, optional sex) with proportional hazard interpretation.
   - `z_i(u)` can encode time-varying effects such as PGS×age (basis for interaction). Begin with optional PGS×log-age smooth.
 - Cumulative subdistribution hazard: `H_i(u) = exp(η_i(u))`.
-- Subdistribution hazard: `h_i(u) = H_i(u) * s'(u) / exp(u)` where `s'(u)` is derivative of spline part `Σ γ_j B'_j(u)`; derivative of log cumulative hazard w.r.t. log time is required.
+- Subdistribution hazard: `h_i(u) = H_i(u) * (dη_i(u)/du) / exp(u)` where `dη_i(u)/du = Σ_j γ_j B'_j(u) + (∂z_i(u)/∂u)^T θ`. Time-varying covariate bases must therefore supply their derivatives with respect to `u = log(age)`; when no time-varying terms are used the second summand vanishes.
 
 ### 2.2 Likelihood Contributions
 - For event-of-interest at `b_i` (Fine–Gray): log-likelihood term `log h_i(u_i) + log S_i(u_i^-)`, with `S_i(u) = exp(-H_i(u))` being the survival function for the subdistribution hazard.
@@ -35,13 +35,13 @@
 - Need gradient and Hessian of log-likelihood w.r.t. `η`. For each observation, derivative of contribution w.r.t. `η`:
   - Event: `∂ℓ/∂η = 1 - H_i(b_i)` (because `log h = η + log[s'(u)/exp(u)]` → derivative w.r.t. η is 1) minus derivative from survival term `H_i(b_i)`.
   - Censor/competing: `∂ℓ/∂η = -H_i(b_i)`.
-  - Left truncation subtracts `-H_i(a_i)` contributions (`+H_i(a_i)` in derivative) because derivative of `-log S(a_i)` is `+H_i(a_i)`.
+- Left truncation subtracts `-H_i(a_i)` contributions, so its score contribution is `+H_i(a_i)` because derivative of `-log S(a_i)` equals `+H_i(a_i)`.
 - Second derivatives (for IRLS weights):
   - Event: `∂²ℓ/∂η² = -H_i(b_i)`.
   - Censor/competing: `∂²ℓ/∂η² = -H_i(b_i)`.
-  - Left truncation adds `-H_i(a_i)`.
+- Left truncation adds `+H_i(a_i)`.
 - Implement P-IRLS by treating `W_i = -∂²ℓ/∂η²` and `z_i = η_i - g_i/∂g/∂η`, where `g_i = ∂ℓ/∂η`. Because link is identity in η-space (η is natural parameter), the working response simplifies to `z_i = η_i + g_i/W_i`.
-- Need to ensure weights remain positive; `H_i` is positive, so `W_i = H_i(b_i) + H_i(a_i)` (for truncated) > 0. Guard against overflow by clamping exponentials.
+- Need to ensure weights remain positive; `W_i = H_i(b_i) - H_i(a_i)` for truncated observations, which stays non-negative because `H_i` is monotone increasing in time. Guard against overflow by clamping exponentials.
 - The derivative of log hazard `log[s'(u)/exp(u)]` influences the gradient; precompute `s'(u)` via derivative basis evaluation.
 
 ### 2.4 Absolute Risk Predictions
