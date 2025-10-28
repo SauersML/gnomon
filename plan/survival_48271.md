@@ -24,9 +24,11 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
 
 ### 3.2 Likelihood with left truncation and competing risks
 - Observed tuple per subject: `(a_entry, a_exit, δ_target, δ_competing, weight)`, where `δ_target` = 1 if event-of-interest by `a_exit`, `δ_competing` = 1 if competing event occurred first, and right-censor when both zero.
-- Optimize the standard Fine–Gray partial likelihood with the Royston–Parmar baseline supplying `η_i(a) = log H_i^*(a)`. For each event time `t_k`, form the weighted risk denominator `R(t_k) = Σ_{j: a_{entry,j} ≤ t_k} w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂a)(t_k)` so that hazard ratios include the Royston–Parmar derivative factor. The log-likelihood contribution of an event `i` at `t_k` is `δ_i [η_i(t_k) + log (∂η_i/∂a)(t_k) - log R(t_k)]`. Censoring and competing events remain in the denominator through the Kaplan–Meier weights `G_j(t_k)`, ensuring the estimator reproduces the Fine–Gray score equations without mixing incompatible objectives.
-- Left truncation is enforced by excluding subjects with `a_entry > t` from each risk denominator and by working with cumulative hazard increments `ΔH_i = exp(η_i(a_exit)) - exp(η_i(a_entry)) ≥ 0`.
-- Competing events remain in the risk set after their event age with zero event indicator but non-zero `G_j(t)` weights, as required by the Fine–Gray subdistribution hazard.
+- Maximize the **full** Fine–Gray likelihood using the Royston–Parmar baseline via `η_i(a) = log H_i^*(a)`. Each record contributes
+  `ℓ_i = δ_target [log λ_i^*(a_exit) + log S_i^*(a_exit^-)] + δ_competing log g_i(a_exit) + (1-δ_target-δ_competing) log S_i^*(a_exit)`,
+  where `S_i^*(t) = exp(-H_i^*(t))` is the defective survivor for the target cause and `g_i` denotes the parametric density assigned to competing risks (see §3.4 for parameterization). This keeps the objective in genuine likelihood units rather than pseudo-risk ratios.
+- Left truncation is enforced by subtracting the cumulative hazards at `a_entry`, i.e. using log-likelihood contributions based on `H_i^*(a_exit) - H_i^*(a_entry)` and the analogous term for the competing-risk density so that conditional likelihoods are formed on `(a_entry, ∞)`.
+- Competing events are handled by the explicit `g_i` density term rather than by retaining them in a risk set; their probability mass is modeled directly.
 - Denote by `d_i^{exit}` the derivative design row extracted from `D_baseline_exit` (and augmented with time-varying derivatives) so `(∂η_i/∂a)(t) = d_i^{exit} β̃` when evaluating hazards at `t = a_exit_i`.
 
 ### 3.3 Penalization
@@ -104,9 +106,9 @@ For subject `i` define:
 - Implement safe guard ensuring `d/da f_0 + ... > 0` by exponentiating a log-derivative parameterization or clamping to small positive constant (e.g., `1e-6`) before taking log.
 
 ### 6.3 Gradient/Hessian formulas
-- Define the augmented design row `\tilde{x}_i^{exit}(t) = x_i^{exit} + d_i^{exit} / (∂η_i/∂a)(t)` so that derivatives of both `log h_i(t)` and `log R(t)` are evaluated consistently.
-- Assemble the score in classic Fine–Gray form: for each event time `t_k`, compute normalized weights `s_j(t_k) = w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂a)(t_k) / Σ_{ℓ} w_ℓ G_ℓ(t_k) exp(η_ℓ(t_k)) (∂η_ℓ/∂a)(t_k)`. The contribution for an event `i` at `t_k` is `\tilde{x}_i^{exit}(t_k) - Σ_j s_j(t_k) \tilde{x}_j^{exit}(t_k)` (scaled by sample weights). Left truncation is already handled because individuals with `a_entry > t_k` never appear in the risk set and because the cumulative hazard increment `ΔH_i` subtracts `exp_entry_i`.
-- Build the negative Hessian as the sum over event times of `\tilde{X}_{R(t_k)}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] \tilde{X}_{R(t_k)}` plus the derivative block `Σ_{i∈D_k} w_i (d_i^{exit})^⊤ d_i^{exit} / (∂η_i/∂a)(t_k)^2`. This captures the off-diagonal coupling induced by shared risk denominators and matches the Fine–Gray Fisher information rather than collapsing to diagonal weights. Implement accumulation using existing dense cross-product helpers to stream over event slices.
+- Define the augmented design row `\tilde{x}_i^{exit}(t) = x_i^{exit} + d_i^{exit} / (∂η_i/∂a)(t)` so that derivatives of both `log λ_i^*(t)` and `H_i^*(t)` are evaluated consistently.
+- Form the score by differentiating the per-subject full log-likelihood: each event with `δ_target=1` contributes `\tilde{x}_i^{exit}(t) - (∂H_i^*/∂β)(t)`; competing events contribute the gradient of `log g_i`; censored records contribute only the negative cumulative hazard derivative. Summing these terms over subjects yields the full-likelihood score without risk-set normalization.
+- Build the negative Hessian from the second derivatives of the same contributions: target events combine curvature from `log λ_i^*` and `H_i^*`; competing events add curvature from `log g_i`; censored observations contribute only the second derivative of the cumulative hazard. Implement accumulation using existing dense cross-product helpers, exploiting the independence across subjects afforded by the full-likelihood formulation.
 - The derivative of the time-varying smooth enters through `(∂z_i/∂a)`; cache these derivatives alongside basis evaluations so that hazard diagnostics, numerator adjustments, and derivative-based penalties remain well defined.
 
 ### 6.4 Mapping to P-IRLS
@@ -127,7 +129,7 @@ For subject `i` define:
 - Maintain workspace reuse by storing `H` in `PirslWorkspace::xtwx_buf`; ensure symmetry and add ridge if eigenvalues approach zero.
 
 ### 6.5 Deviance for REML/LAML
-- Define survival deviance as `-2ℓ` using the Fine–Gray log-likelihood with weights and penalty adjustments. Provide `calculate_survival_deviance` called by REML to keep gradient consistency.
+- Define survival deviance as `-2ℓ` using the full Fine–Gray log-likelihood with weights and penalty adjustments. Provide `calculate_survival_deviance` called by REML to keep gradient consistency.
 - Update `estimate.rs` to branch on `ModelLayoutKind` for deviance, gradient, and `PirslResult` extraction.
 
 ## 7. REML/LAML integration

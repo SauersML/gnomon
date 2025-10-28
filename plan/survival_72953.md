@@ -10,7 +10,7 @@
 - **Data handling (`calibrate/data.rs`):** Strict schema loader for phenotype, score, sex, PCs, weights. Needs extension to ingest survival-specific columns (entry/exit age, event type) and to produce survival-specific data bundles.
 - **Basis and penalties (`calibrate/basis.rs`):** Provides B-spline basis construction, difference penalties, tensor product structures, and null-space constraints. We can reuse this machinery for the log-age baseline spline and for the PGS×age interaction smooth, but must add convenience wrappers for log-age transformations and monotonicity constraints.
 - **Design layout (`calibrate/construction.rs`):** Builds the block-structured design matrix and penalty map recorded in `ModelLayout`. Survival mode will require new block descriptors (baseline age spline, hazard shift covariates, optional tensor interactions) and updated null-space handling.
-- **Optimization (`calibrate/pirls.rs` & `calibrate/estimate.rs`):** Implements penalized iteratively reweighted least squares and nested REML optimization keyed off `ModelConfig::link_function`. We must add a new link variant with survival-specific working response and deviance calculations, plus support for the additional sufficient statistics demanded by the Fine–Gray partial likelihood (exit/entry cumulative hazards, hazard derivatives, Jacobian factors).
+- **Optimization (`calibrate/pirls.rs` & `calibrate/estimate.rs`):** Implements penalized iteratively reweighted least squares and nested REML optimization keyed off `ModelConfig::link_function`. We must add a new link variant with survival-specific working response and deviance calculations, plus support for the additional sufficient statistics demanded by the Fine–Gray full likelihood (exit/entry cumulative hazards, hazard derivatives, Jacobian factors).
 - **Model artifact (`calibrate/model.rs`):** Serializes `ModelConfig`, stores design metadata, and executes prediction with optional calibrator adjustments. Survival models must capture age transformations, baseline spline coefficients, competing-risk metadata, and a horizon-aware prediction path.
 - **Calibrator (`calibrate/calibrator.rs`):** Builds a secondary GAM using diagnostics from the base fit. Survival predictions will use different diagnostics (e.g., CIF standard errors, age-based hull distances) but can reuse the same P-IRLS machinery with tailored feature construction.
 - **Hull guard (`calibrate/hull.rs`):** Currently handles convex hulls in PGS/PC space; we will extend to include attained age for extrapolation safeguards.
@@ -33,31 +33,24 @@
   - Optional smooth interaction `f_{pgs×age}(PGS, u)` capturing non-proportional hazards. Implement as a tensor-product smooth with marginal bases: univariate B-spline in `PGS` (as already built for calibration) and the log-age spline `B(u)` with anisotropic penalties (existing `InteractionPenaltyKind::Anisotropic`). Center the interaction to ensure pure `ti()` semantics (requires extending current orthogonalization to include the new log-age marginal).
 - Whenever covariate effects vary with age, cache both the basis values and their derivatives with respect to log-age so that hazard derivatives include the term `(∂z_i(u)/∂u)^T θ`. The derivative is needed for subdistribution hazard evaluation, deviance diagnostics, and any variance calculations that involve `d/dt` of the cumulative hazard.
 
-### 3.4 Fine–Gray partial likelihood
+### 3.4 Fine–Gray full likelihood
 - For each subject `i`, define indicators and weights: `d_i = 1` when the target event occurs at `a_exit_i`, `0` otherwise; `c_i = 1` for competing events; and sample weight `w_i` (default 1).
-- Let `η_i(t)` denote the log cumulative subdistribution hazard evaluated with the Royston–Parmar basis. The subdistribution hazard on the age scale is `λ_i^*(t) = exp(η_i(t)) (∂η_i/∂t)(t)`, so derivative design matrices must supply `(∂η_i/∂t)(t)` at each risk-set evaluation time.
-- For each distinct target-event time `t_k`, build the IPCW-weighted risk denominator
+- Let `η_i(t)` denote the log cumulative subdistribution hazard evaluated with the Royston–Parmar basis. The subdistribution hazard on the age scale is `λ_i^*(t) = exp(η_i(t)) (∂η_i/∂t)(t)` and the defective survivor is `S_i^*(t) = exp(-H_i^*(t))` with `H_i^*(t) = exp(η_i(t))`.
+- Assign a parametric density `g_i(t)` to competing risks (e.g., a parallel Royston–Parmar cause-specific hazard) so the observed likelihood for `(T_i, J_i)` is well defined.
+- The per-subject log-likelihood contribution on `(a_entry_i, a_exit_i]` is
 
-  `R(t_k) = Σ_{j: a_{entry,j} ≤ t_k} w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂t)(t_k)`,
+  `ℓ_i = w_i [ d_i (\log λ_i^*(a_exit_i) + \log S_i^*(a_exit_i^-)) + c_i \log g_i(a_exit_i) + (1-d_i-c_i) \log S_i^*(a_exit_i) ]`
 
-  where `G_j(t_k)` is the Kaplan–Meier estimate of the censoring/competing survival evaluated just prior to `t_k`. Subjects who experienced a competing event before `t_k` stay in the sum through the weight `G_j(t_k)`.
-- The log-likelihood contribution for an event `i` at `t_k` is
-
-  `ℓ_i^{event} = w_i [η_i(t_k) + log (∂η_i/∂t)(t_k) - log R(t_k)]`.
-
-  Non-events (`d_i = 0`) do not contribute a numerator term but remain in all denominators for `t_k ≥ a_{entry,i}`. Left truncation is handled by excluding individuals with `a_{entry,i} > t_k` from the risk set and by tracking cumulative hazards at entry ages for diagnostics.
+  minus the analogous terms evaluated at `a_entry_i` to enforce left truncation. This evaluates a true likelihood rather than pseudo-risk ratios.
 - Implementation steps:
   1. Precompute design matrices `X_exit`, `X_entry` for `η` at exit and entry ages, alongside derivative matrices `D_exit`, `D_entry` that encode `(∂η/∂t)` via the chain rule on the log-age scale.
-  2. Precompute censoring survival `G_j(t_k)` for each distinct event age, storing it in a structure shared across IRLS iterations.
-  3. During each IRLS iteration evaluate `η_exit = X_exit β̃`, `dη_exit = D_exit β̃`, and form `H_exit = exp(η_exit)`; guard derivative values from numerical underflow via a small positive floor before taking logs.
-  4. Assemble risk-set weights `s_j(t_k) = w_j G_j(t_k) H_j(t_k) (∂η_j/∂t)(t_k) / R(t_k)` for use in score and Hessian calculations.
-- Define the augmented design row `\tilde{X}_i^{exit}(t) = X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t)` so differentiation of `log h_i(t)` and `log R(t)` share the same derivative-aware terms.
-- Score vector for coefficient block `β̃` at event time `t_k`:
-  - Event contribution: `U_i^{event} = w_i \tilde{X}_i^{exit}(t_k)`.
-  - Risk-set subtraction: `U_{risk}(t_k) = Σ_{j∈R_k} s_j(t_k) \tilde{X}_j^{exit}(t_k)`.
-  - Total score accumulates `Σ_{k} (U_i^{event} - U_{risk}(t_k))` over all event times plus penalty gradients.
-- Observed negative Hessian at `t_k` is `\tilde{X}_{R_k}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] \tilde{X}_{R_k}` plus the derivative block `Σ_{i∈D_k} w_i (D_i^{exit})^⊤ D_i^{exit} / (∂η_i/∂t)(t_k)^2`. Summing over event times and adding penalty matrices yields the full Hessian used inside PIRLS.
-- Deviance for diagnostics follows Fine–Gray practice: `D = -2 Σ_{k} Σ_{i∈D_k} w_i [η_i(t_k) + log (∂η_i/∂t)(t_k) - log R(t_k)]`. Track this per iteration for convergence checks and REML updates.
+  2. Precompute any competing-risk density components (additional Royston–Parmar baselines or parametric forms) so `g_i(a)` is readily available together with its derivatives.
+  3. During each IRLS iteration evaluate `η_exit = X_exit β̃`, `η_entry = X_entry β̃`, `dη_exit = D_exit β̃`, and form both `λ_i^*(a) = exp(η_a) (∂η/∂t)(a)` and `H_i^*(a) = exp(η_a)` at entry/exit ages.
+  4. Guard derivative values from numerical underflow via a small positive floor before taking logs to maintain numerical stability of the likelihood.
+- Define the augmented design row `\tilde{X}_i^{exit}(t) = X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t)` so derivatives of `log λ_i^*(t)` and `H_i^*(t)` share the same derivative-aware terms.
+- Score vector for coefficient block `β̃` is `Σ_i ∂ℓ_i/∂β̃`, which for target events simplifies to `w_i [\tilde{X}_i^{exit}(a_exit_i) - (∂H_i^*/∂β̃)(a_exit_i)]` plus analogous terms for competing events and censoring.
+- Observed negative Hessian is `-Σ_i ∂^2 ℓ_i/∂β̃ ∂β̃^⊤`, combining curvature from `log λ_i^*`, `H_i^*`, and the competing-risk density. Adding penalty matrices yields the full Hessian used inside PIRLS.
+- Deviance for diagnostics follows full-likelihood practice: `D = -2 Σ_i ℓ_i`. Track this per iteration for convergence checks and REML updates.
 
 ## 4. Data Schema and Preprocessing
 ### 4.1 Survival data structs

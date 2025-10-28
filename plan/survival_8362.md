@@ -25,21 +25,24 @@
 - Subdistribution hazard: `h_i(u) = H_i(u) * (dη_i(u)/du) / exp(u)` where `dη_i(u)/du = Σ_j γ_j B'_j(u) + (∂z_i(u)/∂u)^T θ`. Time-varying covariate bases must therefore supply their derivatives with respect to `u = log(age)`; when no time-varying terms are used the second summand vanishes.
 
 ### 2.2 Likelihood Contributions
-- Adopt the Fine–Gray *partial likelihood with a parametric baseline*: the Royston–Parmar spline determines `log H_0`, while the risk-set denominators follow the standard Fine–Gray construction (Beyersmann et al. 2010). We do **not** form a full likelihood; only event-time risk-set ratios contribute.
-- For each distinct event time `t_k`, compute the weighted risk denominator
+- Adopt the Fine–Gray **full likelihood with a parametric baseline**: the Royston–Parmar spline determines `log H_0`, while explicit density terms are provided for both the target and competing events. Each observation contributes a genuine likelihood term rather than a pseudo-risk ratio.
+- For subject `i` with interval `(a_i, b_i]` and indicators `(d_i, c_i)`, evaluate
 
-  `R(t_k) = Σ_{j: a_j ≤ t_k} w_j G_j(t_k) exp(η_j(t_k)) (∂η_j/∂t)(t_k)`,
+  `ℓ_i = w_i [ d_i (\log λ_i^*(b_i) + \log S_i^*(b_i^-)) + c_i \log g_i(b_i) + (1-d_i-c_i) \log S_i^*(b_i) ]`
 
-  where `G_j` is the Kaplan–Meier censoring/competing survival and `(∂η_j/∂t)(t_k)` comes from the derivative design matrices (baseline derivative scaled by the Jacobian plus any time-varying covariate derivatives). Event `i` at `t_k` contributes `w_i [η_i(t_k) + log (∂η_i/∂t)(t_k) - log R(t_k)]`, so the hazard ratio inside the partial likelihood uses the Royston–Parmar subdistribution hazard.
-- Left truncation enters through the same risk sets: individuals with `a_i > t_k` are excluded from `R(t_k)`, and their cumulative hazard contribution subtracts `H_i(a_i)` from `H_i(b_i)` so that the working increments remain `ΔH_i = exp(η_i(b_i)) - exp(η_i(a_i)) ≥ 0`.
-- Maintain competing-event records in the risk set after their event time, consistent with Fine–Gray, by leaving their `G_j` weights active but setting the event indicator to zero.
+  where `λ_i^*(t) = exp(η_i(t)) (∂η_i/∂t)(t)` is the subdistribution hazard, `S_i^*(t) = exp(-H_i(t))` is the defective survivor for the target cause, and `g_i` is the parametric density assigned to the competing event (Section 2.1 can host a parallel cause-specific hazard spline). Left truncation is enforced by subtracting the same expression evaluated at `a_i`, conditioning on survival up to entry.
+- Maintain competing-event records through the explicit `g_i` term rather than by retaining them in a risk set; IPCW weights `G_i` remain available if we need censoring adjustments but no longer appear inside denominators.
 - Multiply all contributions by sample weights before accumulating the score or Hessian.
 
 ### 2.3 Gradients / IRLS quantities
-- Define the augmented design row `\tilde{X}_i^{exit}(t) = X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t)` so that differentiation of `log h_i(t)` and `log R(t)` uses the same derivative-aware combination.
-- Express the score in risk-set form: for subject `i`, `U_i = w_i d_i \tilde{X}_i^{exit}(t_{event}) - Σ_{k: t_k ≥ a_i} w_i G_i(t_k) exp(η_i(t_k)) (∂η_i/∂t)(t_k) / R(t_k) · \tilde{X}_i^{exit}(t_k)`, where `d_i` is 1 when `i` experiences the target event at `t_k`. Cache the cumulative sum `Σ_k s_i(t_k)` with `s_i(t_k) = w_i G_i(t_k) exp(η_i(t_k))(∂η_i/∂t)(t_k) / R(t_k)` so the subtraction uses precomputed totals during each IRLS iteration. Include the derivative contribution from time-varying effects via `(∂z_i(u)/∂u)^T θ` when evaluating both hazard and gradient terms.
-- Assemble the negative Hessian as `H = Σ_k \tilde{X}_{R(t_k)}^⊤ [diag(s(t_k)) - s(t_k) s(t_k)^⊤] \tilde{X}_{R(t_k)}` with `s(t_k)` defined using the derivative-weighted hazards above, and add the per-event derivative blocks `Σ_{i: d_i=1} w_i (D_i^{exit})^⊤ D_i^{exit} / (∂η_i/∂t)(t_k)^2`. This retains the off-diagonal curvature induced by shared denominators and matches the Fine–Gray Fisher information. Reuse dense cross-product helpers to stream over event times.
-- Left truncation contributes additively to the diagonal through `exp(η_i(a_i))`, so the effective diagonal weights become `exp(η_i(b_i)) - exp(η_i(a_i)) ≥ 0`. No negative working weights should occur provided the baseline cumulative hazard remains monotone; enforce monotonicity through the `log H_0` parameterization.
+- Define the augmented design row `\tilde{X}_i^{exit}(t) = X_i^{exit} + D_i^{exit} / (∂η_i/∂t)(t)` so that differentiation of `log λ_i^*(t)` and `H_i(t)` uses the same derivative-aware combination.
+- Express the score directly from the full likelihood: for subject `i`,
+
+  `U_i = ∂ℓ_i/∂β̃ = w_i [ d_i (\tilde{X}_i^{exit}(b_i) - ∂H_i/∂β̃ (b_i)) + c_i ∂\log g_i/∂β̃ (b_i) + (1-d_i-c_i) (-∂H_i/∂β̃ (b_i)) ]`
+
+  minus the corresponding entry-age derivatives from the left-truncation adjustment. Include the derivative contribution from time-varying effects via `(∂z_i(u)/∂u)^T θ` when evaluating both hazard and gradient terms.
+- Assemble the negative Hessian as `H = -Σ_i ∂^2 ℓ_i / ∂β̃ ∂β̃^⊤`, combining curvature from `log λ_i^*`, `H_i`, and `log g_i`. Because contributions decouple by subject, reuse dense cross-product helpers to batch-accumulate the Hessian without traversing risk sets.
+- Left truncation contributes additively through the same entry-age derivatives, so the effective weights involve `exp(η_i(b_i)) - exp(η_i(a_i)) ≥ 0`. Enforce monotonicity through the `log H_0` parameterization to avoid negative increments.
 - The working response can continue to use `z = η + H^{-1} U` inside the penalized Newton update, leveraging the same solver infrastructure as other families.
 
 ### 2.4 Absolute Risk Predictions

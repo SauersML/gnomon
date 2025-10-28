@@ -23,11 +23,11 @@
 
 ### 2.2 Likelihoods
 - **Primary endpoint**: Fine–Gray subdistribution hazard for competing risks.
-  - Use the standard Fine–Gray partial likelihood with a parametric baseline: event `i` at age `a_i` contributes `η_i(a_i) + log (∂η_i/∂a)(a_i) - log Σ_j R_j(a_i) exp(η_j(a_i)) (∂η_j/∂a)(a_i)`, where `(∂η/∂a)` comes from derivative design matrices (baseline spline derivative scaled by `1/a` plus any time-varying smooth derivatives) and `R_j(a_i)` indicates membership in the Fine–Gray risk set (including post-competing-event subjects) with Kaplan–Meier censoring weights.
-  - Cache both value and derivative designs at entry/exit ages so the subdistribution hazard `h_i(a) = exp(η_i(a)) (∂η_i/∂a)(a)` is available for numerator and denominator terms. The Royston–Parmar spline controls the parametric baseline `log H_0`; we never assemble a full likelihood that integrates the hazard over time. Left truncation simply removes individuals with `a_entry > a_i` from the risk set and the baseline increment becomes `ΔH_i = exp(η_i(a_i)) - exp(η_i(a_entry)) ≥ 0`.
+  - Maximize the **full** Fine–Gray likelihood with a parametric baseline: event `i` at age `a_i` contributes `log λ_i^*(a_i) + log S_i^*(a_i^-)`, where `S_i^*(t) = exp(-H_i^*(t))`. Competing events contribute a parametric density `g_i(a_i)` (modeled in §7), and censored observations contribute `log S_i^*(a_i)`. Left truncation is handled by subtracting the cumulative hazard evaluated at `a_entry` from each log-likelihood term so we condition on being at risk at entry.
+  - Cache both value and derivative designs at entry/exit ages so the subdistribution hazard `h_i(a) = exp(η_i(a)) (∂η_i/∂a)(a)` and cumulative hazard `H_i^*(a)` are available for evaluating `λ_i^*`, `S_i^*`, and their derivatives directly. The Royston–Parmar spline controls the parametric baseline `log H_0`, allowing the likelihood to integrate hazard over time explicitly instead of relying on risk-set ratios.
 - **IRLS Formulation**:
-- Provide survival-specific working updates that return the score vector and the full negative Hessian assembled from risk-set cross-products `\tilde{X}_{R(t)}^⊤ [diag(s(t)) - s(t)s(t)^⊤] \tilde{X}_{R(t)}`, where `\tilde{X}_j = X_j^{exit} + D_j^{exit} / (∂η_j/∂a)(t)` augments each exit design row with the derivative contribution and `s(t)` uses the derivative-weighted hazards `w_j G_j(t) exp(η_j(t)) (∂η_j/∂a)(t) / R(t)`. This retains off-diagonal curvature induced by shared denominators and ensures gradients/Hessians respect the derivative basis.
-  - Extend PIRLS to accept a family implementation that supplies `(U, H, deviance)` rather than diagonal Fisher weights. This mirrors the existing penalized Newton solver but swaps the logistic/Gaussian diagonal weights for the Fine–Gray dense Hessian.
+- Provide survival-specific working updates that return the score vector and the full negative Hessian assembled from the second derivatives of the per-subject log-likelihood contributions. Because the likelihood factorizes over individuals given the parameters, the Hessian is the sum of subject-level curvature terms rather than risk-set cross-products.
+  - Extend PIRLS to accept a family implementation that supplies `(U, H, deviance)` rather than diagonal Fisher weights. This mirrors the existing penalized Newton solver but swaps the logistic/Gaussian diagonal weights for the dense Hessian derived from the full likelihood.
 
 ### 2.3 Absolute Risk Prediction
 - After fitting, compute cumulative incidence for horizon \(h\) at current age \(a_0\):
@@ -66,10 +66,10 @@
 ### 3.2 Prediction Schema
 - Introduce `PredictionDataSurvival` with `current_age`, `pgs`, `pcs`, `sex`, optionally `horizon` vector (or pass at scoring time). If horizon column provided, allow per-person horizon.
 
-### 3.3 Risk-Set Preprocessing
+### 3.3 Likelihood Preprocessing
 - Precompute unique sorted event ages (including competing events) for baseline spline support.
 - Derive log-age transformation arrays and Jacobians (1/a) for derivative calculations.
-- Compute Fine–Gray weights before PIRLS: apply cumulative incidence weighting using Kaplan–Meier of censoring/competing risk (requires partial sorting). Use `ndarray` operations; consider `faer` for prefix sums if necessary.
+- Evaluate entry/exit cumulative hazards and defective survival terms ahead of PIRLS so repeated full-likelihood evaluations simply reuse `H_i^*(a_exit)`, `H_i^*(a_entry)`, and the competing-risk density components.
 
 ### 3.4 Multiple Competing Risks (Future-proofing)
 - For now restrict to a single competing event column. Document extension path: generalize to `Vec<Array1<f64>>` with event type codes.
@@ -133,31 +133,30 @@
 - Modify `run_pirls` to dispatch on `ModelConfig.link_function` by obtaining boxed `LikelihoodFamily`. This isolates survival-specific math without polluting logistic implementation.
 
 ### 6.2 Survival Working Quantities
-- `y` remains the event indicator at exit age; Fine–Gray censoring adjustments live in the precomputed risk-set weights.
-- The survival family computes per-event denominators `R(t_k)` and normalized weights `s(t_k)` from the cached `SurvivalStats`. From these it forms the score `U` and full negative Hessian `H` as described in §2.2 and streams them back to PIRLS.
+- `y` stores `(δ_primary, δ_competing)` so the likelihood family can distinguish targets, competing events, and censoring at each exit age.
+- The survival family evaluates the full log-likelihood for every subject using cached hazard/cumulative hazard pieces, accumulates the score `U`, and forms the dense negative Hessian `H` by summing subject-level curvature matrices (see §2.2). No risk-set denominators are required.
 - Working responses are derived from the penalized Newton system `H δ = U`; reuse the existing solver infrastructure to obtain `δ` and update `η` without ever forming diagonal Fisher weights.
-- Deviance is `-2 Σ_{events} w_i [η_i(a_i) - log R(a_i)]`, matching the partial likelihood up to an additive constant. Cache auxiliary vectors (risk denominators, cumulative `s_i` sums) for reuse across REML iterations.
+- Deviance is `-2 Σ_i w_i ℓ_i`, where `ℓ_i` is the per-subject full log-likelihood contribution. Cache auxiliary vectors (`λ_i^*`, `S_i^*`, competing density terms) for reuse across REML iterations.
 
 ### 6.3 REML Gradient/Hessian
-- REML objective still requires the log determinant of the penalized Hessian. For the survival family this Hessian is the dense matrix assembled from risk-set cross-products plus penalties; feed it directly into the existing Faer solves and determinant routines.
-- Ensure the survival branch populates the trace terms (`tr(W^{-1}S)`) using the same helper functions; they only require access to the assembled penalized Hessian, which the survival family now provides.
-- Guard against near-singular Hessians (e.g., few events) by injecting a small ridge (`1e-8`) before factorization, mirroring the safeguards in the other plans.
+REML objective still requires the log determinant of the penalized Hessian. For the survival family this Hessian is the dense matrix assembled from subject-level curvature plus penalties; feed it directly into the existing Faer solves and determinant routines.
+Ensure the survival branch populates the trace terms (`tr(W^{-1}S)`) using the same helper functions; they only require access to the assembled penalized Hessian, which the survival family now provides.
+Guard against near-singular Hessians (e.g., few events) by injecting a small ridge (`1e-8`) before factorization, mirroring the safeguards in the other plans.
 
 ## 7. Fine–Gray Specific Machinery
-### 7.1 Risk Set Construction Module
+### 7.1 Likelihood Cache Module
 - Add new module `calibrate::survival::fine_gray` to encapsulate data prep independent of PIRLS.
   - Input: `(age_entry, age_exit, event_primary, event_competing, weights)`.
-  - Output: `SurvivalStats` containing sorted indices, Kaplan–Meier censoring survivals `G(t)`, event-time slices, cumulative hazard entry/exit design matrices, and helper arrays for accumulating risk-set weights.
+  - Output: `SurvivalStats` containing sorted indices, Kaplan–Meier censoring survivals `G(t)` if needed for IPCW, cumulative hazard entry/exit design matrices, and helper arrays for evaluating full-likelihood pieces (`λ_i^*`, `S_i^*`, competing densities).
   - Steps:
     1. Sort by `age_exit` and record the permutation.
-    2. Compute Kaplan–Meier for censoring/competing risk; cache `G_i(t_k)` evaluated at each event age.
-    3. For each event time `t_k`, record the set of at-risk indices (including individuals with prior competing events) and precompute normalized weights numerator `w_i G_i(t_k)`.
-    4. Precompute baseline basis evaluations at both entry and exit ages so that each iteration can form `exp(η_exit)` / `exp(η_entry)` with simple dot products.
-    5. Store cumulative contribution buffers `Σ_k s_i(t_k)` to avoid recomputing risk-set traversals on every iteration.
+    2. Compute Kaplan–Meier for censoring/competing risk if IPCW weights are supplied; cache `G_i(t_k)` evaluated at each event age.
+    3. Precompute baseline basis evaluations at both entry and exit ages so that each iteration can form `exp(η_exit)` / `exp(η_entry)` with simple dot products.
+    4. Assemble reusable buffers for `H_i^*(a_exit)`, `H_i^*(a_entry)`, and any competing-risk density terms so repeated PIRLS iterations only require vectorized updates rather than recomputing integrals.
 
 ### 7.2 Baseline Increment Handling
 - Represent the baseline smooth as \(s(t) = B(t) \theta\) and cache both exit and entry evaluations. Because `H_i = exp(s(t) + x_i^T β + …)`, the cumulative hazard increment for each observation is simply `exp(η_exit) - exp(η_entry)`; no numerical quadrature is required.
-- Maintain these exponentiated values inside `SurvivalStats` so that each PIRLS iteration can reuse them when forming risk-set denominators and left-truncation adjustments.
+- Maintain these exponentiated values inside `SurvivalStats` so that each PIRLS iteration can reuse them when forming full-likelihood contributions and left-truncation adjustments.
 
 ## 8. Survival-Specific Linear Algebra
 ### 8.1 Design Matrix Augmentation
@@ -169,17 +168,17 @@
 - Compose the linear predictor at exit and entry ages via shared coefficient vector; expose helpers on `ModelLayout` to retrieve the relevant column spans for prediction and diagnostics.
 - Provide lightweight structs in `SurvivalStats` that hold `B_exit · θ`, `B_entry · θ`, and their exponentials to minimize repeated matrix multiplications during PIRLS iterations.
 
-### 8.2 Risk-Set Linear Algebra
-- Reuse existing dense cross-product utilities to accumulate `X_{R(t)}^⊤ [diag(s(t)) - s(t)s(t)^⊤] X_{R(t)}` slice by slice. Because each slice references only the rows active in that risk set, process them sequentially to control memory.
-- Ensure penalized Hessian assembly reuses existing buffers; the only difference from logistic/Gaussian paths is that the per-slice weight matrix is dense rather than diagonal.
+### 8.2 Full-Likelihood Linear Algebra
+- Reuse existing dense utilities to accumulate subject-level curvature `\sum_i w_i (∂^2 ℓ_i / ∂β^2)` without materializing large intermediate tensors. Because contributions are independent across subjects, process them in batches aligned with cache-friendly blocking.
+- Ensure penalized Hessian assembly reuses existing buffers; the survival family simply adds dense per-subject curvature to the baseline penalties before factorization.
 
 ### 8.3 Future Enhancements
-- If performance profiling shows the risk-set accumulation dominating runtime, investigate block-sparse representations or low-rank updates. Document this as a future extension rather than part of the MVP.
+- If performance profiling shows the likelihood accumulation dominating runtime, investigate block-sparse representations or low-rank updates. Document this as a future extension rather than part of the MVP.
 
 ## 9. Calibration Layer Integration (`calibrate::calibrator`)
 - Survival predictions output absolute risk (probability). Feed calibrator with features similar to logistic case: predicted CIF, standard error (approx), hull distance.
 - Supply the base CIF on the logit scale to the calibrator while retaining survival-specific metadata so downstream consumers know predictions are conditional absolute risks.
-- Calibrator training should aggregate weights at the individual level using the same Fine–Gray sample weights employed during fitting; no pseudo-row expansion is required because predictions are evaluated per individual per horizon.
+- Calibrator training should aggregate weights at the individual level using the same Fine–Gray sample weights employed during fitting; no pseudo-row expansion or risk-set bookkeeping is required because predictions are evaluated per individual per horizon.
 
 ## 10. Scoring API & CLI
 ### 10.1 Rust API (`calibrate::model::TrainedModel`)
@@ -200,14 +199,14 @@
 
 ## 11. Testing Strategy
 ### 11.1 Unit Tests
-- `calibrate::survival::fine_gray` unit tests: verify risk-set weight computation on synthetic dataset vs reference R `cmprsk::crr` outputs.
+- `calibrate::survival::fine_gray` unit tests: verify full-likelihood density/survivor calculations on synthetic datasets against direct numerical integration.
 - Baseline basis caching: confirm exit-entry evaluations and exponentials remain monotone and match manual calculations on toy datasets.
 - PIRLS dispatch: ensure logistic/Gaussian unchanged via regression tests (existing suite). Add `LinkFunction::RoystonParmarSurvival` branch coverage.
 
 ### 11.2 Integration Tests
 - Fit small dataset replicating published example (e.g., ovarian cancer data). Compare predicted CIF at ages 50, 60 with `rstpm2` or `flexsurv` references.
 - Competing risk scenario: dataset where all events are competing; verify CIF = 0 and model remains stable.
-- Left-truncation: create dataset with `age_entry > 0`, ensure risk set excludes earlier times (simulate by verifying log-likelihood vs manual calculation).
+- Left-truncation: create dataset with `age_entry > 0`, ensure conditional likelihood equals manual calculation using `H_i^*(a_exit) - H_i^*(a_entry)`.
 
 ### 11.3 Calibration Tests
 - Run calibrator on simulated data with known truth to ensure calibrated CIF matches empirical incidence (Kolmogorov–Smirnov test).
@@ -215,8 +214,8 @@
 
 ## 12. Performance & Stability Considerations
 - Precompute and cache B-spline basis for log-age evaluations at both entry and exit ages to minimize repeated computation. Reuse `basis::` caching with deterministic keys (include knot placement and transform parameters in the hash).
-- Monitor condition numbers in PIRLS: dense risk-set Hessians can become ill-conditioned when events are rare. Inject small ridge adjustments and enable step-halving when deviance increases.
-- Profile risk-set accumulation; if it dominates runtime, consider batching event times or parallelizing over slices. Document these options for future optimization.
+- Monitor condition numbers in PIRLS: dense full-likelihood Hessians can become ill-conditioned when events are rare. Inject small ridge adjustments and enable step-halving when deviance increases.
+- Profile likelihood accumulation; if it dominates runtime, consider batching subjects or parallelizing over blocks. Document these options for future optimization.
 - For extremely old ages (tails), add prior penalty on baseline slope to prevent divergence (increase `penalty_order` or add repeated boundary knots).
 
 ## 13. Documentation Deliverables
@@ -227,21 +226,21 @@
 
 ## 14. Implementation Sequencing & Validation Checkpoints
 1. **Data Layer**: Implement survival schema parsing (`TrainingDataSurvival`, CLI toggles). Validation: unit test verifying parsing & validation.
-2. **Fine–Gray Preprocessing Module**: Build risk set weights and cumulative contribution caches. Validation: compare to R reference.
+2. **Fine–Gray Preprocessing Module**: Build cumulative hazard/density caches needed for full-likelihood evaluation. Validation: compare to R reference via numerical quadrature.
 3. **Design/Penalty Updates**: Extend `ModelLayout`, `build_design_and_penalty_matrices` to produce survival design. Validation: ensure logistic path unaffected (existing tests) and new survival-specific tests compile.
 4. **LikelihoodFamily Abstraction**: Refactor PIRLS to use trait. Regression test logistic/Gaussian to ensure identical outputs (floating tolerance).
-5. **Survival Family Implementation**: Hook survival-specific working updates returning risk-set score/Hessian. Validation: simple dataset with constant hazard yields closed-form solution; compare to expected cumulative hazard.
+5. **Survival Family Implementation**: Hook survival-specific working updates returning full-likelihood score/Hessian. Validation: simple dataset with constant hazard yields closed-form solution; compare to expected cumulative hazard.
 6. **REML Integration**: Ensure smoothing selection works with new family; check gradient/Hessian finite and monotonic. Validate with small dataset (monitor `rho` convergence).
 7. **Scoring API**: Implement `predict_survival`. Validation: ensure outputs monotone in horizon, bounded 0-1, consistent with training data by comparing to Monte Carlo simulation.
 8. **Calibration Layer**: Adapt calibrator inputs for survival predictions; ensure toggles respect `calibrator_enabled`. Validation: run calibrator training pipeline.
 9. **CLI + Examples + Docs**: Expose features and document usage. Validation: CLI integration test on sample dataset.
-10. **Performance Profiling**: Benchmark on realistic dataset; profile risk-set assembly, caching, and linear solves. Provide metrics.
+10. **Performance Profiling**: Benchmark on realistic dataset; profile likelihood assembly, caching, and linear solves. Provide metrics.
 
 ## 15. Future Extensions (Document but Out-of-Scope)
 - Multiple competing risks generalization using stacked Fine–Gray pseudo-data.
 - Non-proportional hazards for PCs or sex via additional interactions.
 - Time-varying covariates implemented via counting process rows.
 - Stratified baselines (sex-specific) implemented by block-diagonal penalties.
-- Low-rank or block-sparse approximations of risk-set cross-products for improved speed.
+- Low-rank or block-sparse approximations of per-subject curvature aggregations for improved speed.
 - Bayesian smoothing priors to encode prior knowledge of hazard shape.
 

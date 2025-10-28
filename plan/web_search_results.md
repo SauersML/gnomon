@@ -12,10 +12,10 @@ It is a proper survivor for a defective distribution: S*(0)=1 and S*(t)↓1−π
 f*(t)=dF₁(t)/dt (“subdensity”). It integrates to ∫₀^∞ f*(t)dt=F₁(∞)=π₁<1 in general. So it is not a proper density on [0,∞) unless you renormalize by π₁ (which would give the conditional density of T given J=1, but that conditional does not have hazard λ*).
 
 • Is L=∏[λ* (tᵢ)]^{dᵢ}×S*(tᵢ)/S*(t₀ᵢ) a valid full likelihood?
-No. That object treats all non–cause-1 outcomes as if they were independent right censoring for the subdistribution process, which they are not. A full likelihood for the observed competing-risks data requires the joint law of (T,J); specifying only λ*(t) leaves the probabilities and timing of other causes (and their effect on the observed process) unspecified. You can obtain a proper likelihood only by modeling the full system (e.g., all cause-specific hazards, or λ* plus enough structure for the other causes). The standard Fine–Gray estimator is thus not an MLE from a full likelihood; it is an M-estimator obtained from partial/pseudo-likelihood–type estimating equations.
+Not by itself. That object treats all non–cause-1 outcomes as if they were independent right censoring for the subdistribution process, which they are not. A genuine full likelihood for the observed competing-risks data requires the joint law of (T,J); specifying only λ*(t) leaves the probabilities and timing of other causes (and their effect on the observed process) unspecified. To obtain a proper likelihood you must model the full system (e.g., all cause-specific hazards, or λ* plus enough structure for the other causes). Once that structure is supplied—as we do in our plans—the resulting estimator is a bona fide MLE under a full likelihood.
 
 • Does that “likelihood” have a unique maximum; do MLE asymptotics apply?
-Because it is not a true likelihood for the observed data, uniqueness and MLE asymptotics are not the right questions. For the semiparametric Fine–Gray proportional subdistribution hazards model, the usual estimating-equation machinery gives consistency and asymptotic normality under the standard regularity conditions (i.i.d. sampling, independent censoring, correct specification). Variances come from the sandwich/influence-function form. Uniqueness is as for Cox-type fits: typically yes under identifiability (no separation, full rank), but it is not a concavity guarantee from a true log-likelihood.
+Only after augmenting λ*(t) with enough information to describe the competing causes. With a fully specified parametric baseline and a model for the remaining causes, the objective is a true log-likelihood and standard MLE theory applies (concavity depends on the parametrization, but Fisher-information arguments and asymptotic normality are valid). In contrast, the semiparametric Fine–Gray proportional subdistribution hazards estimator—without such augmentation—relies on estimating-equation machinery rather than full-likelihood optimization.
 
 Q2. Hazard for Royston–Parmar (log cumulative hazard scale)
 
@@ -133,7 +133,7 @@ and when your model is specified *on the (u)-scale* (e.g., (\eta(u)=\log H(t)) w
 • Fine & Gray’s original formulation and the “improper” (T^*). ([JSTOR][1])
 • Subdistribution = defective distribution; formal definitions and notation. ([CRAN][11])
 • Conceptual notes on censoring and subdistribution hazards. ([PMC][2])
-• The standard estimator is a modified/weighted partial likelihood; SAS tech note. ([SAS Support][7])
+- The classic estimator maximizes a modified/weighted pseudo-likelihood; SAS tech note. ([SAS Support][7])
 • Fully parametric/Bayesian subdistribution hazards. ([PMC][4])
 • Parametric CIFs using improper baselines (e.g., Gompertz). ([Carolina Digital Repository][3])
 • Sieve semiparametric MLE for FG under interval censoring. ([PMC][5])
