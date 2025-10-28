@@ -55,15 +55,13 @@ The survival extension must respect these boundaries: reuse basis caching, hook 
       pub prior_weights: Array1<f64>,
   }
   ```
-- Provide survival-specific loaders `load_survival_training_data` and `load_survival_prediction_data` that validate monotone ages (`age_entry < age_exit`), finite values, event indicator exclusivity, and precompute Fine–Gray risk weights if provided externally.
+- Provide survival-specific loaders `load_survival_training_data` and `load_survival_prediction_data` that validate monotone ages (`age_entry < age_exit`), finite values, event indicator exclusivity, and pass through optional user-supplied sampling weights without transformation.
 - Maintain backward compatibility by keeping existing GAM loader; CLI will select survival loader when new flag `--survival` is passed.
 
-### 4.2 Fine–Gray weight preprocessing
-- Add helper to compute pseudo-risk weights `ω_i`:
-  - Sort by `age_exit`.
-  - Compute Kaplan–Meier estimate of censoring survival `G(a)` using `censoring_weights`.
-  - For each record, assign `ω_i = prior_weights[i] * I(age_entry < age_exit) / G(a_exit)` with adjustments for left truncation `G(a_entry)`.
-  - Store both `ω_exit` and `ω_entry` to reuse during iterations.
+### 4.2 Optional sampling weights
+- Accept user-provided sampling or censoring weights via `censoring_weights` and default to ones when absent.
+- Validate that supplied weights are positive and finite, then pass them through to likelihood assembly without additional preprocessing.
+- Ensure downstream code multiplies likelihood contributions by these weights directly; no pseudo-risk or inverse-censoring weights are cached.
 
 ## 5. Basis & design construction updates
 ### 5.1 Baseline age spline
@@ -177,7 +175,7 @@ For subject `i` define:
 - Add method `TrainedModel::predict_survival_risk(age_current, horizon, pgs, pcs, sex, calibrate: bool)` returning conditional cumulative incidence between `age_current` and `age_current + horizon`:
   ```
   let cif_target = |t| 1.0 - (-H_i^*(t)).exp();
-  let cif_comp = competing_cif(t); // recovered from Fine–Gray preprocessing
+  let cif_comp = competing_cif(t); // computed from modelled competing-risk subdistribution
   let numer = cif_target(age_current + horizon) - cif_target(age_current);
   let denom = (1.0 - cif_target(age_current) - cif_comp(age_current)).max(1e-12);
   let risk = numer / denom;
@@ -192,7 +190,7 @@ For subject `i` define:
 - Calibrator link remains `Logit` but on absolute risk; calibrator design uses same code path with new feature adapter bridging survival outputs to calibrator inputs.
 
 ## 9. Competing risk handling
-- Represent event state via two indicator vectors; compute Fine–Gray weights once during preprocessing.
+- Represent event state via two indicator vectors; rely solely on provided sampling weights (default ones) during likelihood evaluation.
 - Provide optional cause-specific hazard output for debugging by exposing `predict_cause_specific_hazard(age)` (target cause only); but core API returns subdistribution risk.
 - Store metadata about competing-risk handling (e.g., `competing_events_present: bool`, `num_competing_events: usize`) in `SurvivalModelArtifacts` for downstream compatibility checks.
 
@@ -223,10 +221,10 @@ For subject `i` define:
 
 ## 12. Performance considerations
 - Precompute `log-age` vectors and share across baseline/time-varying evaluations to avoid repeated `ln`.
-- Cache `exp(η)` terms and Fine–Gray weights between gradient/Hessian computations within an iteration.
+- Cache `exp(η)` terms and other likelihood intermediates (e.g., cumulative hazard differences) between gradient/Hessian computations within an iteration.
 - Use Faer batched GEMM to form Hessian contributions: treat baseline/entry matrices as separate blocks and accumulate into shared buffer.
 - Exploit sparsity: baseline/time-varying design matrices can remain dense but low-rank; ensure `PirslWorkspace::xtwx_buf` sized accordingly.
-- For large cohorts, compute pseudo-risk weights using streaming approach to avoid storing full risk set matrix (O(n) memory).
+- No additional preprocessing buffers are required for censoring adjustments beyond the direct likelihood inputs, keeping memory bounded by design matrix storage.
 
 ## 13. Implementation sequence & checkpoints
 1. **Data layer**: introduce survival loaders, update CLI gating. Validate TSV parsing via unit tests.
