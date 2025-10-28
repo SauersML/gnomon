@@ -183,33 +183,46 @@ def ensure_reference_fasta(reference_url: str, work_dir: Path) -> Path:
     return extracted_fasta
 
 
-def download_pgs_score(pgs_id: str, cache_dir: Path) -> Path:
-    """Download the harmonized PGS scoring file, preferring GRCh37 coordinates."""
+def download_pgs_score(
+    pgs_id: str, cache_dir: Path, assembly: str = "GRCh37"
+) -> Path:
+    """Download the harmonized PGS scoring file for ``assembly``."""
+
+    valid_assemblies = {"GRCh37", "GRCh38"}
+    if assembly not in valid_assemblies:
+        raise ValueError(
+            f"Unsupported assembly '{assembly}'. Expected one of: {sorted(valid_assemblies)}."
+        )
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    base = Path(pgs_id)
-    possible_suffixes = ("GRCh37", "GRCh38")
-    for assembly in possible_suffixes:
-        filename = f"{pgs_id}_hmPOS_{assembly}.txt.gz"
-        url = f"{PGS_BASE_URL}/{pgs_id}/ScoringFiles/Harmonized/{filename}"
-        target_gz = cache_dir / filename
-        target_txt = cache_dir / filename[:-3]
-        if target_txt.exists():
-            debug(f"Using cached score {target_txt}")
-            return target_txt
+    filename = f"{pgs_id}_hmPOS_{assembly}.txt.gz"
+    url = f"{PGS_BASE_URL}/{pgs_id}/ScoringFiles/Harmonized/{filename}"
+    target_gz = cache_dir / filename
+    target_txt = cache_dir / filename[:-3]
+
+    if target_txt.exists():
+        debug(f"Using cached score {target_txt}")
+        return target_txt
+
+    if not target_gz.exists():
         try:
             stream_download(url, target_gz)
-        except RuntimeError:
-            debug(f"Score {pgs_id} missing for {assembly}; trying next assembly")
-            continue
-        debug(f"Decompressing {target_gz}")
-        with gzip.open(target_gz, "rb") as src, open(target_txt, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        target_gz.unlink(missing_ok=True)
-        return target_txt
-    raise RuntimeError(
-        f"Unable to locate harmonized score for {pgs_id} in assemblies {possible_suffixes}."
-    )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Unable to download harmonized score for {pgs_id} ({assembly})."
+            ) from exc
+
+    debug(f"Decompressing {target_gz}")
+    with gzip.open(target_gz, "rb") as src, open(target_txt, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    target_gz.unlink(missing_ok=True)
+
+    if not target_txt.exists():
+        raise RuntimeError(
+            f"Failed to prepare harmonized score for {pgs_id} ({assembly}); expected {target_txt}."
+        )
+
+    return target_txt
 
 
 # --------------------------------------------------------------------------------------
@@ -243,6 +256,7 @@ def convert_genome_to_vcf(
     sample_id: str,
     reference_fasta: Path,
     output_dir: Path,
+    assembly: str,
 ) -> Path:
     """Invoke the ``convert_genome`` CLI."""
 
@@ -261,7 +275,7 @@ def convert_genome_to_vcf(
             "--sample",
             sample_id,
             "--assembly",
-            "GRCh37",
+            assembly,
         )
     )
     if not vcf_path.exists():
@@ -418,12 +432,17 @@ def orchestrate(args: argparse.Namespace) -> None:
     for genome_path, sample_id in genome_inputs:
         debug(f"Processing genome {genome_path.name} (sample {sample_id})")
         vcf_path = convert_genome_to_vcf(
-            tools.convert_genome, genome_path, sample_id, reference_fasta, vcf_dir
+            tools.convert_genome,
+            genome_path,
+            sample_id,
+            reference_fasta,
+            vcf_dir,
+            args.assembly,
         )
         plink_prefix = vcf_to_plink(tools.plink2, vcf_path, plink_dir, sample_id)
 
         for pgs_id in args.scores:
-            score_path = download_pgs_score(pgs_id, score_cache)
+            score_path = download_pgs_score(pgs_id, score_cache, assembly=args.assembly)
             sscore_path = run_gnomon_score(tools.gnomon, score_path, plink_prefix)
             print()
             print(
@@ -469,6 +488,15 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(DEFAULT_PGS_IDS),
         help="PGS catalog identifiers to download and score (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--assembly",
+        default="GRCh37",
+        choices=("GRCh37", "GRCh38"),
+        help=(
+            "Genome assembly to use for convert_genome and PGS downloads "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--reference-url",
