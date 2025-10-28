@@ -271,6 +271,6 @@ What about for the scores we chose?
 ```
 python3 -c "pairs=[('PGS004146','PGS004229'),('PGS004869','PGS000507'),('PGS004378','PGS005198')]; [print(f'{p[0]} & {p[1]}: Total unique: {len(s1|s2)}, Unique to {p[0]}: {len(s1-s2)}, Unique to {p[1]}: {len(s2-s1)}') for p in pairs for s1 in [set(l.split()[0] for l in open(f'gnomon_score_cache/{p[0]}.gnomon.tsv') if l.strip() and not l.startswith('variant_id'))] for s2 in [set(l.split()[0] for l in open(f'gnomon_score_cache/{p[1]}.gnomon.tsv') if l.strip() and not l.startswith('variant_id'))]]"
 ```
-PGS004146 & PGS004229: Total unique: 922124, Unique to PGS004146: 913267, Unique to PGS004229: 6353
-PGS004869 & PGS000507: Total unique: 1144023, Unique to PGS004869: 25079, Unique to PGS000507: 271963
-PGS004378 & PGS005198: Total unique: 1258570, Unique to PGS004378: 41062, Unique to PGS005198: 198724
+- PGS004146 & PGS004229: Total unique: 922124, Unique to PGS004146: 913267, Unique to PGS004229: 6353
+- PGS004869 & PGS000507: Total unique: 1144023, Unique to PGS004869: 25079, Unique to PGS000507: 271963
+- PGS004378 & PGS005198: Total unique: 1258570, Unique to PGS004378: 41062, Unique to PGS005198: 198724
