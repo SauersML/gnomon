@@ -1,7 +1,13 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard for the target cause. We explicitly work in the Fine–Gray formulation and therefore assume:
+
+- non-informative (independent) censoring conditional on the modeled covariates so that inverse-probability-of-censoring weights consistently recover the subdistribution score;
+- well-defined, strictly non-decreasing cumulative incidence functions for all causes so the subdistribution hazard exists; and
+- correctly specified delayed-entry handling (no left truncation induced by data errors).
+
+The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
@@ -62,7 +68,8 @@ pub struct SurvivalPredictionInputs<'a> {
     pub covariates: CovariateViews<'a>,
 }
 ```
-- Loaders validate ordering, exclusivity, and finiteness. There is no construction of inverse-probability weights or risk-set slices.
+- Loaders validate ordering, exclusivity, and finiteness. IPC weights are constructed inside the survival working model, so the
+  ingestion path remains free of risk-set slicing.
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
@@ -107,23 +114,29 @@ pub struct SurvivalLayout {
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
+Let the effective weight be `ŵ_i = w_i × g_i` where `g_i` is the inverse-probability-of-censoring weight evaluated at `age_exit_i`.
+Estimate the censoring survival `G(t)` with a Kaplan–Meier fit on the censoring process (treating events of any cause as
+censoring) in the guarded age domain with delayed-entry accounted for. The IPC weight is `g_i = 1 / max(G(age_exit_i), ε)` with
+`ε ≈ 1e-12` to stabilise late horizons.
+
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
+ℓ_i = ŵ_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. Because the formulation optimises the subdistribution
+hazard directly, no auxiliary risk set or state-space expansion is required.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
 - Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
 - Score contribution:
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += ŵ_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
 - Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += ŵ_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
@@ -138,6 +151,10 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
+All prediction surfaces operate on the subdistribution hazard, so the Fine–Gray identity `F_target(t) = 1 - exp(-H_sub(t))`
+holds exactly for every age queried at scoring time without reapplying censoring weights.
+Prediction remains valid under the same independent-censoring assumption used in training and further presumes that any
+competing-risk inputs share the guarded age transform so denominators align.
 ### 7.1 Stored artifacts
 `SurvivalModelArtifacts` persist:
 ```rust
@@ -157,12 +174,12 @@ pub struct SurvivalModelArtifacts {
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
-- `H(t) = exp(η(t))`.
+- `H_sub(t) = exp(η(t))`.
 - Absolute risk between `t0` and `t1`:
 ```
-CIF_target(t) = 1 - exp(-H(t)).
+CIF_target(t) = 1 - exp(-H_sub(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
+F_competing_t0 supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
@@ -198,6 +215,9 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
+- Add a regression test that scores cumulative incidence curves on held-out cohorts and compares them against an external
+  subdistribution-hazard reference implementation (e.g., the `cmprsk` Fine–Gray solver) within a tight tolerance across a shared
+  age grid.
 
 ## 10. Implementation roadmap
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
