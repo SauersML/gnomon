@@ -1,13 +1,46 @@
-use crate::calibrate::basis::{create_bspline_basis_with_knots, create_difference_penalty_matrix};
+use crate::calibrate::basis::{
+    BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
+};
 use crate::calibrate::faer_ndarray::FaerSvd;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use thiserror::Error;
+
+const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
+const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
+const DEFAULT_BARRIER_SCALE: f64 = 1.0;
+const DEFAULT_RISK_EPSILON: f64 = 1e-12;
+
+/// Errors surfaced while validating survival data structures or evaluating the model.
+#[derive(Debug, Error)]
+pub enum SurvivalError {
+    #[error("age vectors must have at least one element")]
+    EmptyAgeVector,
+    #[error("age values must be finite")]
+    NonFiniteAge,
+    #[error("age_entry must be strictly less than age_exit for every subject")]
+    InvalidAgeOrder,
+    #[error("event indicators must be 0 or 1")]
+    InvalidEventFlag,
+    #[error("event_target and event_competing indicators must be mutually exclusive")]
+    ConflictingEvents,
+    #[error("sample weights must be finite and non-negative")]
+    InvalidSampleWeight,
+    #[error("covariate arrays must have consistent dimensions")]
+    CovariateDimensionMismatch,
+    #[error("covariate values must be finite")]
+    NonFiniteCovariate,
+    #[error("design matrix columns do not match coefficient length")]
+    DesignDimensionMismatch,
+    #[error("basis evaluation failed: {0}")]
+    Basis(#[from] BasisError),
+}
 
 /// Working model abstraction shared between GAM and survival implementations.
 pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> WorkingState;
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
 }
 
 /// Aggregated state returned by [`WorkingModel::update`].
@@ -27,17 +60,23 @@ pub struct AgeTransform {
 }
 
 impl AgeTransform {
-    pub fn new(age_entry: &Array1<f64>, delta: f64) -> Self {
+    pub fn from_training(age_entry: &Array1<f64>, delta: f64) -> Result<Self, SurvivalError> {
+        if age_entry.is_empty() {
+            return Err(SurvivalError::EmptyAgeVector);
+        }
         let mut min_age = f64::INFINITY;
         for &value in age_entry.iter() {
+            if !value.is_finite() {
+                return Err(SurvivalError::NonFiniteAge);
+            }
             if value < min_age {
                 min_age = value;
             }
         }
-        Self {
+        Ok(Self {
             minimum_age: min_age,
             delta,
-        }
+        })
     }
 
     #[inline]
@@ -105,31 +144,48 @@ impl PenaltyBlocks {
         Self { blocks }
     }
 
-    pub fn add_contributions(
-        &self,
-        beta: &Array1<f64>,
-        gradient: &mut Array1<f64>,
-        hessian: &mut Array2<f64>,
-        deviance: &mut f64,
-    ) {
+    pub fn gradient(&self, beta: &Array1<f64>) -> Array1<f64> {
+        let mut grad = Array1::zeros(beta.len());
         for block in &self.blocks {
-            let view = beta.slice(s![block.range.clone()]);
-            let s_beta = block.matrix.dot(&view);
-            let penalty_value = view.dot(&s_beta);
-            let mut grad_slice = gradient.slice_mut(s![block.range.clone()]);
-            grad_slice.scaled_add(-2.0 * block.lambda, &s_beta);
+            if block.lambda == 0.0 {
+                continue;
+            }
 
-            let mut block_hessian = block.matrix.clone();
-            block_hessian *= -2.0 * block.lambda;
+            let view = beta.slice(s![block.range.clone()]);
+            let contrib = block.matrix.dot(&view.to_owned());
+            let mut grad_slice = grad.slice_mut(s![block.range.clone()]);
+            grad_slice += &(block.lambda * contrib);
+        }
+        grad
+    }
+
+    pub fn hessian(&self, dim: usize) -> Array2<f64> {
+        let mut hessian = Array2::zeros((dim, dim));
+        for block in &self.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
             let rows = block.range.clone();
             for (local_i, row_idx) in rows.clone().enumerate() {
                 for (local_j, col_idx) in rows.clone().enumerate() {
-                    hessian[[row_idx, col_idx]] += block_hessian[[local_i, local_j]];
+                    hessian[[row_idx, col_idx]] += block.lambda * block.matrix[[local_i, local_j]];
                 }
             }
-
-            *deviance -= block.lambda * penalty_value;
         }
+        hessian
+    }
+
+    pub fn deviance(&self, beta: &Array1<f64>) -> f64 {
+        let mut value = 0.0;
+        for block in &self.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            let view = beta.slice(s![block.range.clone()]);
+            let quad = view.dot(&block.matrix.dot(&view.to_owned()));
+            value += block.lambda * quad;
+        }
+        value
     }
 }
 
@@ -165,28 +221,59 @@ pub struct SurvivalTrainingData {
 }
 
 impl SurvivalTrainingData {
-    pub fn validate(&self) {
-        assert_eq!(self.age_entry.len(), self.age_exit.len());
+    pub fn validate(&self) -> Result<(), SurvivalError> {
         let n = self.age_entry.len();
-        assert_eq!(self.event_target.len(), n);
-        assert_eq!(self.event_competing.len(), n);
-        assert_eq!(self.sample_weight.len(), n);
-        assert_eq!(self.pgs.len(), n);
-        assert_eq!(self.sex.len(), n);
-        assert_eq!(self.pcs.nrows(), n);
+        if n == 0 {
+            return Err(SurvivalError::EmptyAgeVector);
+        }
+        let dimension_mismatch = self.age_exit.len() != n
+            || self.event_target.len() != n
+            || self.event_competing.len() != n
+            || self.sample_weight.len() != n
+            || self.pgs.len() != n
+            || self.sex.len() != n
+            || self.pcs.nrows() != n;
+        if dimension_mismatch {
+            return Err(SurvivalError::CovariateDimensionMismatch);
+        }
+
         for i in 0..n {
-            assert!(
-                self.age_entry[i] < self.age_exit[i],
-                "age_entry must be less than age_exit"
-            );
+            let entry = self.age_entry[i];
+            let exit = self.age_exit[i];
+            if !entry.is_finite() || !exit.is_finite() {
+                return Err(SurvivalError::NonFiniteAge);
+            }
+            if !(entry < exit) {
+                return Err(SurvivalError::InvalidAgeOrder);
+            }
+
             let target = self.event_target[i];
             let competing = self.event_competing[i];
-            assert!((target == 0 || target == 1) && (competing == 0 || competing == 1));
-            assert!(
-                target == 0 || competing == 0,
-                "events must be mutually exclusive"
-            );
+            if target > 1 || competing > 1 {
+                return Err(SurvivalError::InvalidEventFlag);
+            }
+            if target == 1 && competing == 1 {
+                return Err(SurvivalError::ConflictingEvents);
+            }
+
+            let weight = self.sample_weight[i];
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(SurvivalError::InvalidSampleWeight);
+            }
+
+            let pgs = self.pgs[i];
+            let sex = self.sex[i];
+            if !pgs.is_finite() || !sex.is_finite() {
+                return Err(SurvivalError::NonFiniteCovariate);
+            }
+            for j in 0..self.pcs.ncols() {
+                if !self.pcs[[i, j]].is_finite() {
+                    return Err(SurvivalError::NonFiniteCovariate);
+                }
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -195,39 +282,40 @@ fn make_reference_constraint(
     knot_vector: ArrayView1<f64>,
     degree: usize,
     reference_u: f64,
-) -> ReferenceConstraint {
+) -> Result<ReferenceConstraint, SurvivalError> {
     let data = array![reference_u];
-    let (basis_arc, _) = create_bspline_basis_with_knots(data.view(), knot_vector, degree)
-        .expect("reference basis evaluation");
+    let (basis_arc, _) = create_bspline_basis_with_knots(data.view(), knot_vector, degree)?;
     let basis = (*basis_arc).clone();
     let row = basis.row(0).to_owned();
-    let transform = nullspace_transform(&row);
-    ReferenceConstraint {
+    let transform = nullspace_transform(&row)?;
+    Ok(ReferenceConstraint {
         transform,
         reference_log_age: reference_u,
-    }
+    })
 }
 
 /// Build a nullspace transform for a single-row constraint.
-fn nullspace_transform(constraint_row: &Array1<f64>) -> Array2<f64> {
+fn nullspace_transform(constraint_row: &Array1<f64>) -> Result<Array2<f64>, SurvivalError> {
     let k = constraint_row.len();
     let mut row_mat = Array2::<f64>::zeros((k, 1));
     row_mat.column_mut(0).assign(constraint_row);
     let (u_opt, ..) = row_mat
         .svd(true, false)
-        .expect("SVD should succeed for constraint row");
-    let u = u_opt.expect("U matrix available");
-    u.slice(s![.., 1..]).to_owned()
+        .map_err(|err| SurvivalError::Basis(BasisError::from(err)))?;
+    let u = u_opt.ok_or_else(|| SurvivalError::Basis(BasisError::ConstraintNullspaceNotFound))?;
+    Ok(u.slice(s![.., 1..]).to_owned())
 }
 
 /// Evaluate a basis and its derivative with respect to the guarded log-age.
 fn evaluate_basis_and_derivative(
     log_ages: ArrayView1<f64>,
     descriptor: &BasisDescriptor,
-) -> (Array2<f64>, Array2<f64>) {
-    let (basis_arc, _) =
-        create_bspline_basis_with_knots(log_ages, descriptor.knot_vector.view(), descriptor.degree)
-            .expect("basis evaluation");
+) -> Result<(Array2<f64>, Array2<f64>), SurvivalError> {
+    let (basis_arc, _) = create_bspline_basis_with_knots(
+        log_ages,
+        descriptor.knot_vector.view(),
+        descriptor.degree,
+    )?;
     let basis = (*basis_arc).clone();
 
     let eps = 1e-6;
@@ -239,21 +327,19 @@ fn evaluate_basis_and_derivative(
         perturbed_plus.view(),
         descriptor.knot_vector.view(),
         descriptor.degree,
-    )
-    .expect("basis+ evaluation");
+    )?;
     let (basis_minus_arc, _) = create_bspline_basis_with_knots(
         perturbed_minus.view(),
         descriptor.knot_vector.view(),
         descriptor.degree,
-    )
-    .expect("basis- evaluation");
+    )?;
     let basis_plus = (*basis_plus_arc).clone();
     let basis_minus = (*basis_minus_arc).clone();
     let mut derivative = basis_plus;
     derivative -= &basis_minus;
     derivative.mapv_inplace(|v| v / (2.0 * eps));
 
-    (basis, derivative)
+    Ok((basis, derivative))
 }
 
 /// Construct the cached survival layout for PIRLS updates.
@@ -265,20 +351,20 @@ pub fn build_survival_layout(
     baseline_penalty_order: usize,
     baseline_lambda: f64,
     monotonic_grid_size: usize,
-) -> (SurvivalLayout, MonotonicityPenalty) {
-    data.validate();
+) -> Result<(SurvivalLayout, MonotonicityPenalty), SurvivalError> {
+    data.validate()?;
     let n = data.age_entry.len();
-    let age_transform = AgeTransform::new(&data.age_entry, delta);
+    let age_transform = AgeTransform::from_training(&data.age_entry, delta)?;
     let log_entry = age_transform.transform_array(&data.age_entry);
     let log_exit = age_transform.transform_array(&data.age_exit);
 
     let reference_u = log_exit.mean().unwrap_or(0.0);
     let reference_constraint =
-        make_reference_constraint(age_basis.knot_vector.view(), age_basis.degree, reference_u);
+        make_reference_constraint(age_basis.knot_vector.view(), age_basis.degree, reference_u)?;
 
-    let (baseline_entry_raw, _) = evaluate_basis_and_derivative(log_entry.view(), age_basis);
+    let (baseline_entry_raw, _) = evaluate_basis_and_derivative(log_entry.view(), age_basis)?;
     let (baseline_exit_raw, baseline_exit_deriv_u) =
-        evaluate_basis_and_derivative(log_exit.view(), age_basis);
+        evaluate_basis_and_derivative(log_exit.view(), age_basis)?;
 
     let constrained_entry = reference_constraint.apply(&baseline_entry_raw);
     let constrained_exit = reference_constraint.apply(&baseline_exit_raw);
@@ -303,8 +389,7 @@ pub fn build_survival_layout(
         concatenate_design(&baseline_derivative_exit, None, &zero_static);
 
     let penalty_matrix =
-        create_difference_penalty_matrix(constrained_exit.ncols(), baseline_penalty_order)
-            .expect("difference penalty");
+        create_difference_penalty_matrix(constrained_exit.ncols(), baseline_penalty_order)?;
     let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
         matrix: penalty_matrix,
         lambda: baseline_lambda,
@@ -333,9 +418,9 @@ pub fn build_survival_layout(
         &data.age_exit,
         monotonic_grid_size,
         baseline_lambda * 1e-4,
-    );
+    )?;
 
-    (layout, monotonicity)
+    Ok((layout, monotonicity))
 }
 
 fn assemble_static_covariates(data: &SurvivalTrainingData) -> Array2<f64> {
@@ -373,18 +458,38 @@ pub struct MonotonicityPenalty {
     pub derivative_design: Array2<f64>,
 }
 
+/// Configuration controlling guard behaviour and optional softplus barrier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SurvivalSpec {
+    pub derivative_guard: f64,
+    pub barrier_weight: f64,
+    pub barrier_scale: f64,
+    pub use_expected_information: bool,
+}
+
+impl Default for SurvivalSpec {
+    fn default() -> Self {
+        Self {
+            derivative_guard: DEFAULT_DERIVATIVE_GUARD,
+            barrier_weight: DEFAULT_BARRIER_WEIGHT,
+            barrier_scale: DEFAULT_BARRIER_SCALE,
+            use_expected_information: false,
+        }
+    }
+}
+
 fn build_monotonicity_penalty(
     layout: &SurvivalLayout,
     age_basis: &BasisDescriptor,
     ages_exit: &Array1<f64>,
     grid_size: usize,
     lambda: f64,
-) -> MonotonicityPenalty {
+) -> Result<MonotonicityPenalty, SurvivalError> {
     if grid_size == 0 {
-        return MonotonicityPenalty {
+        return Ok(MonotonicityPenalty {
             lambda,
             derivative_design: Array2::<f64>::zeros((0, layout.combined_exit.ncols())),
-        };
+        });
     }
 
     let mut min_age = f64::INFINITY;
@@ -398,10 +503,10 @@ fn build_monotonicity_penalty(
         }
     }
     if !min_age.is_finite() || !max_age.is_finite() || min_age >= max_age {
-        return MonotonicityPenalty {
+        return Ok(MonotonicityPenalty {
             lambda,
             derivative_design: Array2::<f64>::zeros((0, layout.combined_exit.ncols())),
-        };
+        });
     }
 
     let mut grid = Array1::<f64>::zeros(grid_size);
@@ -416,7 +521,7 @@ fn build_monotonicity_penalty(
     }
 
     let log_grid = grid.mapv(|age| layout.age_transform.transform(age));
-    let (_, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis);
+    let (_, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis)?;
     let constrained_derivative_u = layout.reference_constraint.apply(&derivative_u);
     let mut derivative_age = constrained_derivative_u;
     for (mut row, &age) in derivative_age.rows_mut().into_iter().zip(grid.iter()) {
@@ -429,10 +534,10 @@ fn build_monotonicity_penalty(
     combined
         .slice_mut(s![.., ..baseline_cols])
         .assign(&derivative_age);
-    MonotonicityPenalty {
+    Ok(MonotonicityPenalty {
         lambda,
         derivative_design: combined,
-    }
+    })
 }
 
 /// Royston–Parmar working model implementation.
@@ -441,6 +546,7 @@ pub struct WorkingModelSurvival {
     pub sample_weight: Array1<f64>,
     pub event_target: Array1<u8>,
     pub monotonicity: MonotonicityPenalty,
+    pub spec: SurvivalSpec,
 }
 
 impl WorkingModelSurvival {
@@ -448,18 +554,26 @@ impl WorkingModelSurvival {
         layout: SurvivalLayout,
         data: &SurvivalTrainingData,
         monotonicity: MonotonicityPenalty,
-    ) -> Self {
-        Self {
+        spec: SurvivalSpec,
+    ) -> Result<Self, SurvivalError> {
+        data.validate()?;
+        Ok(Self {
             layout,
             sample_weight: data.sample_weight.clone(),
             event_target: data.event_target.clone(),
             monotonicity,
-        }
+            spec,
+        })
     }
 }
 
 impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> WorkingState {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+        let expected_dim = self.layout.combined_exit.ncols();
+        if beta.len() != expected_dim {
+            return Err(SurvivalError::DesignDimensionMismatch);
+        }
+
         let eta_exit = self.layout.combined_exit.dot(beta);
         let eta_entry = self.layout.combined_entry.dot(beta);
         let derivative_exit = self.layout.combined_derivative_exit.dot(beta);
@@ -475,7 +589,7 @@ impl WorkingModel for WorkingModelSurvival {
         let mut hessian = Array2::<f64>::zeros((p, p));
         let mut deviance = 0.0;
 
-        let epsilon = 1e-10;
+        let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
         for i in 0..n {
             let weight = self.sample_weight[i];
             if weight == 0.0 {
@@ -487,10 +601,10 @@ impl WorkingModel for WorkingModelSurvival {
             let h_s = h_entry[i];
             let delta = delta_h[i];
             let d_eta_exit = derivative_exit[i];
-            let guarded_derivative = if d_eta_exit > epsilon {
+            let guarded_derivative = if d_eta_exit > guard_threshold {
                 d_eta_exit
             } else {
-                epsilon
+                guard_threshold
             };
             let log_guard = guarded_derivative.ln();
             let ell = weight * (d * (eta_e + log_guard) - delta);
@@ -521,11 +635,33 @@ impl WorkingModel for WorkingModelSurvival {
                     }
                 }
             }
+
+            if self.spec.barrier_weight > 0.0 {
+                let scaled = -d_eta_exit / self.spec.barrier_scale;
+                let softplus = (1.0 + scaled.exp()).ln();
+                deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
+                let sigmoid = 1.0 / (1.0 + (-scaled).exp());
+                let barrier_grad_coeff =
+                    self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
+                let barrier_hess_coeff =
+                    self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
+                        / (self.spec.barrier_scale * self.spec.barrier_scale);
+                for j in 0..p {
+                    gradient[j] -= barrier_grad_coeff * d_exit[j];
+                    for k in j..p {
+                        let value = barrier_hess_coeff * d_exit[j] * d_exit[k];
+                        hessian[[j, k]] += value;
+                        if j != k {
+                            hessian[[k, j]] += value;
+                        }
+                    }
+                }
+            }
         }
 
-        self.layout
-            .penalties
-            .add_contributions(beta, &mut gradient, &mut hessian, &mut deviance);
+        gradient -= &self.layout.penalties.gradient(beta);
+        hessian -= &self.layout.penalties.hessian(beta.len());
+        deviance += self.layout.penalties.deviance(beta);
 
         if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
             apply_monotonicity_penalty(
@@ -537,12 +673,12 @@ impl WorkingModel for WorkingModelSurvival {
             );
         }
 
-        WorkingState {
+        Ok(WorkingState {
             eta: eta_exit,
             gradient,
             hessian,
             deviance,
-        }
+        })
     }
 }
 
@@ -664,7 +800,7 @@ pub fn conditional_absolute_risk(
     let cif0 = cumulative_incidence(t0, covariates, artifacts);
     let cif1 = cumulative_incidence(t1, covariates, artifacts);
     let delta = (cif1 - cif0).max(0.0);
-    let denom = (1.0 - cif0 - cif_competing_t0).max(1e-12);
+    let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
     delta / denom
 }
 
@@ -713,6 +849,8 @@ impl LogitExt for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::array;
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -733,8 +871,14 @@ mod tests {
         data: &SurvivalTrainingData,
         beta: &Array1<f64>,
     ) -> WorkingState {
-        let mut model = WorkingModelSurvival::new(layout.clone(), data, penalty.clone());
-        model.update(beta)
+        let mut model = WorkingModelSurvival::new(
+            layout.clone(),
+            data,
+            penalty.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        model.update(beta).unwrap()
     }
 
     #[test]
@@ -750,10 +894,11 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10);
-        let mut model = WorkingModelSurvival::new(layout, &data, penalty);
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10).unwrap();
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
-        let state = model.update(&beta);
+        let state = model.update(&beta).unwrap();
         assert!(state.deviance.is_finite());
     }
 
@@ -764,8 +909,14 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10);
-        let model = WorkingModelSurvival::new(layout.clone(), &data, penalty.clone());
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10).unwrap();
+        let model = WorkingModelSurvival::new(
+            layout.clone(),
+            &data,
+            penalty.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -796,13 +947,68 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8);
-        let mut model = WorkingModelSurvival::new(layout, &data, penalty);
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8).unwrap();
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
-        let state = model.update(&beta);
+        let state = model.update(&beta).unwrap();
         assert_eq!(state.gradient.len(), beta.len());
         assert_eq!(state.hessian.nrows(), beta.len());
         assert_eq!(state.hessian.ncols(), beta.len());
+    }
+
+    #[test]
+    fn penalty_contributes_to_working_state() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.6, 0).unwrap();
+        let mut penalised_layout = layout.clone();
+        let mut unpenalised_layout = layout.clone();
+        for block in &mut unpenalised_layout.penalties.blocks {
+            block.lambda = 0.0;
+        }
+
+        let zero_monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            derivative_design: monotonicity.derivative_design.clone(),
+        };
+
+        let mut beta = Array1::<f64>::zeros(penalised_layout.combined_exit.ncols());
+        for (idx, value) in beta.iter_mut().enumerate() {
+            *value = 0.03 * (idx as f64 + 1.0);
+        }
+
+        let penalised = evaluate_state(&penalised_layout, &zero_monotonicity, &data, &beta);
+        let unpenalised = evaluate_state(&unpenalised_layout, &zero_monotonicity, &data, &beta);
+
+        let penalty_deviance = penalised_layout.penalties.deviance(&beta);
+        assert_abs_diff_eq!(
+            penalised.deviance,
+            unpenalised.deviance + penalty_deviance,
+            epsilon = 1e-10
+        );
+
+        let penalty_gradient = penalised_layout.penalties.gradient(&beta);
+        let expected_gradient = &unpenalised.gradient - &penalty_gradient;
+        for (observed, expected) in penalised.gradient.iter().zip(expected_gradient.iter()) {
+            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-10);
+        }
+
+        let penalty_hessian = penalised_layout.penalties.hessian(beta.len());
+        let expected_hessian = &unpenalised.hessian - &penalty_hessian;
+        for (observed_row, expected_row) in penalised
+            .hessian
+            .rows()
+            .into_iter()
+            .zip(expected_hessian.rows())
+        {
+            for (observed, expected) in observed_row.iter().zip(expected_row.iter()) {
+                assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-10);
+            }
+        }
     }
 
     #[test]
@@ -813,7 +1019,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0);
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0).unwrap();
         let p = layout.combined_exit.ncols();
         let baseline_cols = layout.baseline_exit.ncols();
         let mut beta = Array1::<f64>::zeros(p);
