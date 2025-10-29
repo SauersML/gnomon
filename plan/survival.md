@@ -174,18 +174,17 @@ pub struct SurvivalModelArtifacts {
 ```
 CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-CIF_competing_total_t0 supplied externally (see below; must equal the total competing CIF accumulated up to t0).
-assert 0 ≤ CIF_competing_total_t0 ≤ 1 - CIF_target(t0).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - CIF_competing_total_t0).
+F_competing_t0` supplied externally (see below).
+conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
-  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)` so the total competing CIF at `t0` can be evaluated; or
-  - user-supplied total competing CIF values evaluated at the requested `t0` for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
+  - user-supplied competing CIF values for the cohort.
+- Document that without individualized competing CIFs the denominator becomes 1 minus the sum of all cause CIFs at t0, so cohort-level plug-ins may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -193,10 +192,9 @@ Expose:
 ```rust
 fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
-fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_total_t0: f64) -> f64;
+fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
 - All prediction APIs surface per-subject risks under the frequency-weighted fit. We do not rescale outputs for inverse-probability sampling or provide sandwich-standard-error corrections at prediction time.
-- When `t0` equals the subject's entry age, reuse the cached `H_entry` from training to avoid recomputing the cumulative hazard.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
