@@ -20,6 +20,8 @@ pub enum SurvivalError {
     EmptyAgeVector,
     #[error("age values must be finite")]
     NonFiniteAge,
+    #[error("age transform guard delta must be positive")]
+    NonPositiveGuard,
     #[error("age {age} is outside the guarded log-age domain (a_min={minimum}, delta={delta})")]
     GuardDomainViolation { age: f64, minimum: f64, delta: f64 },
     #[error("age_entry must be strictly less than age_exit for every subject")]
@@ -63,6 +65,9 @@ pub struct AgeTransform {
 
 impl AgeTransform {
     pub fn from_training(age_entry: &Array1<f64>, delta: f64) -> Result<Self, SurvivalError> {
+        if delta <= 0.0 {
+            return Err(SurvivalError::NonPositiveGuard);
+        }
         if age_entry.is_empty() {
             return Err(SurvivalError::EmptyAgeVector);
         }
@@ -914,6 +919,13 @@ mod tests {
     fn logit_extension_behaves() {
         assert!(0.5f64.logit().abs() < 1e-12);
         assert!(f64::is_finite(0.01f64.logit()));
+    }
+
+    #[test]
+    fn age_transform_rejects_non_positive_guard() {
+        let ages = array![50.0, 55.0];
+        let err = AgeTransform::from_training(&ages, 0.0).unwrap_err();
+        assert!(matches!(err, SurvivalError::NonPositiveGuard));
     }
 
     #[test]
