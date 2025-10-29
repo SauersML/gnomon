@@ -691,8 +691,8 @@ impl WorkingModel for WorkingModelSurvival {
             }
         }
 
-        gradient -= &self.layout.penalties.gradient(beta);
-        hessian -= &self.layout.penalties.hessian(beta.len());
+        gradient += &self.layout.penalties.gradient(beta);
+        hessian += &self.layout.penalties.hessian(beta.len());
         deviance += self.layout.penalties.deviance(beta);
 
         if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
@@ -1009,7 +1009,7 @@ mod tests {
             degree: 2,
         };
         let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.6, 0).unwrap();
-        let mut penalised_layout = layout.clone();
+        let penalised_layout = layout.clone();
         let mut unpenalised_layout = layout.clone();
         for block in &mut unpenalised_layout.penalties.blocks {
             block.lambda = 0.0;
@@ -1036,13 +1036,13 @@ mod tests {
         );
 
         let penalty_gradient = penalised_layout.penalties.gradient(&beta);
-        let expected_gradient = &unpenalised.gradient - &penalty_gradient;
+        let expected_gradient = &unpenalised.gradient + &penalty_gradient;
         for (observed, expected) in penalised.gradient.iter().zip(expected_gradient.iter()) {
             assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-10);
         }
 
         let penalty_hessian = penalised_layout.penalties.hessian(beta.len());
-        let expected_hessian = &unpenalised.hessian - &penalty_hessian;
+        let expected_hessian = &unpenalised.hessian + &penalty_hessian;
         for (observed_row, expected_row) in penalised
             .hessian
             .rows()
@@ -1110,12 +1110,15 @@ mod tests {
             degree: 2,
         };
         let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: CovariateLayout {
-                column_names: vec![],
+                column_names: static_names,
             },
             penalties: PenaltyDescriptor {
                 order: 2,
