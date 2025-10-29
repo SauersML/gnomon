@@ -1,7 +1,7 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the target-cause subdistribution cumulative hazard (Fine–Gray formulation). The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
@@ -33,6 +33,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ### 3.1 Required columns
 Expect TSV/Parquet columns (names fixed):
 - `age_entry`, `age_exit` (years, `age_entry < age_exit`),
+- `age_admin_end` (years, administrative end of follow-up for the cohort member, `age_admin_end ≥ age_exit`),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
 - `sample_weight` (optional, defaults to 1.0 and multiplies log-likelihood contributions directly),
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
@@ -100,32 +101,37 @@ pub struct SurvivalLayout {
 
 ## 5. Likelihood, score, and Hessian
 ### 5.1 Per-subject quantities
-- `η_exit = X_exit β`, `η_entry = X_entry β`.
-- `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale.
+- `η_entry = X_entry β`, `H_entry = exp(η_entry)`.
+- `η_exit = X_exit β`, `H_exit = exp(η_exit)` for reference when `d = 1`.
+- `η_stop = X(t_stop) β`, `H_stop = exp(η_stop)`, and `ΔH = H_stop - H_entry` (non-negative by construction of the cumulative hazard), with `t_stop` defined in §5.2.
+- `dη_exit = D_exit β` already on the age scale and only used when `d = 1`.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
-For subject `i`:
+For subject `i` define
+
+- `t_stop_i = age_exit_i` when `d_i = 1` and `t_stop_i = age_admin_end_i` otherwise,
+- `η_stop_i = X(t_stop_i) β`, `H_stop_i = exp(η_stop_i)`, and `ΔH_i = H_stop_i - H_entry_i`.
+
+The per-subject contribution is
 ```
 ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+When `d_i = 0` the integral term runs to `age_admin_end_i`, so individuals who experience competing events continue to contribute hazard mass until the administrative horizon. There is no auxiliary risk set or post-processing of weights.
 
 ### 5.3 Score and Hessian
-- Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
+- Define `x_entry` as the design row at `age_entry` and `x_stop` at `t_stop` (baseline + time-varying + static covariates). For events, `x_event = x_stop` and `D_event` is the derivative row at `age_exit` on the age scale.
+- Let `x̃_event = x_event + D_event / dη_exit` where the division is elementwise after broadcasting the scalar derivative. The derivative term is only evaluated when `d_i = 1`.
 - Score contribution:
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += w_i [ d_i x̃_event - H_stop_i x_stop + H_entry_i x_entry ].
 ```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
+(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`. Competing-risk subjects use the same `x_stop` evaluated at `age_admin_end`.)
 - Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [ d_i x̃_event^T x̃_event + H_stop_i x_stop^T x_stop + H_entry_i x_entry^T x_entry ].
 ```
-- `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
+- `WorkingState::eta` returns `η_stop` so diagnostics (calibrator, standard errors) can reuse the stop-age evaluation.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
@@ -156,24 +162,18 @@ pub struct SurvivalModelArtifacts {
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
-- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
-- `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1`:
+- Evaluate the constrained spline basis at age `t` to obtain the subdistribution linear predictor `η_subdist(t)`.
+- `H_subdist(t) = exp(η_subdist(t))` is the cumulative subdistribution hazard, and the target-cause CIF follows directly:
 ```
-CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+F_target(t) = 1 - exp(-H_subdist(t)).
 ```
-- Default `ε = 1e-12` to maintain numeric stability.
-- No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
+- Absolute risk between `t0` and `t1` is `ΔF = F_target(t1) - F_target(t0)` with no Aalen–Johansen composition. For conditional risk calculations retain the denominator `max(ε, 1 - F_target(t0) - F_competing(t0))` using individualized competing CIFs.
+- Default `ε = 1e-12` to maintain numeric stability. Endpoint evaluation is exact under the RP basis; no quadrature is necessary.
 
 ### 7.3 Competing risks
-- Encourage fitting companion RP models for key competing causes. Scoring accepts either:
-  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
-  - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
-- Remove any suggestion of Kaplan–Meier proxies.
+- Fit companion RP subdistribution models for each competing cause so that every cause exposes its own `F_cause(t) = 1 - exp(-H_subdist_cause(t))` trajectory.
+- When multiple cause CIFs are available, compose cohort-level quantities by summing `F_cause(t)` across mutually exclusive causes and clipping at 1.0. Conditional risks should always use per-subject `F_competing(t)` obtained either from these companion models or from external estimates transformed into CIF space.
+- Scoring APIs accept either handles to other `SurvivalModelArtifacts` (preferred, ensures consistent age transforms and constraints) or user-supplied CIF arrays already on the `F_cause(t)` scale. Do not mix subdistribution hazards with cause-specific survival outputs; convert them to CIFs before combining.
 
 ### 7.4 Conditioned scoring API
 Expose:
@@ -184,10 +184,10 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ```
 
 ## 8. Calibration
-- Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
-- Features: base prediction, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
+- Calibrate on the logit of the observed target-cause CIF at one or more evaluation horizons. Empirical CIFs should come from the same subdistribution framework (e.g., Fine–Gray estimates with delayed entry) to match the likelihood.
+- Features: base prediction `F_target(t)`, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
 - Use out-of-fold predictions during training to avoid optimism.
-- Remove age-hull or KM-based diagnostics from calibrator features.
+- Remove age-hull or KM-based diagnostics from calibrator features; external competing-risk summaries must first be converted to CIFs before inclusion.
 
 ## 9. Testing and diagnostics
 - Unit tests:
