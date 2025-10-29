@@ -32,16 +32,21 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
 Expect TSV/Parquet columns (names fixed):
-- `age_entry`, `age_exit` (years, `age_entry < age_exit`),
+- `age_entry`, `age_exit`, `age_admin_end` (years, `age_entry < age_exit ≤ age_admin_end` and `age_admin_end` required for every record),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
 - `sample_weight` (optional, defaults to 1.0 and multiplies log-likelihood contributions directly),
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
+
+`age_admin_end` captures the administrative censoring horizon for each subject. Target events will typically match
+`age_exit`, while competing events keep their earlier event age in `age_exit` but continue to contribute risk through
+`age_admin_end`.
 
 ### 3.2 Training and scoring bundles
 ```rust
 pub struct SurvivalTrainingData {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
+    pub age_admin_end: Array1<f64>,
     pub event_target: Array1<u8>,
     pub event_competing: Array1<u8>,
     pub sample_weight: Array1<f64>,
@@ -56,13 +61,14 @@ pub struct SurvivalTrainingData {
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
     pub age_exit: ArrayView1<'a, f64>,
+    pub age_admin_end: ArrayView1<'a, f64>,
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
     pub covariates: CovariateViews<'a>,
 }
 ```
-- Loaders validate ordering, exclusivity, and finiteness. There is no construction of inverse-probability weights or risk-set slices.
+- Loaders validate ordering, exclusivity, finiteness, and enforce `age_entry < age_exit ≤ age_admin_end`. Records flagged as competing events keep `age_admin_end` as their integration upper bound even when `age_exit < age_admin_end`. There is no construction of inverse-probability weights or risk-set slices.
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
@@ -81,14 +87,18 @@ pub struct SurvivalPredictionInputs<'a> {
 - Center the interaction to prevent leakage into main effects; cache and serialize the centering transform.
 
 ### 4.4 Stored layout pieces
-`SurvivalLayout` aggregates the cached designs:
+`SurvivalLayout` aggregates the cached designs. Exit matrices evaluate the subject at `age_exit` (event or censor age), while
+the admin matrices evaluate at `age_admin_end` so that competing events continue integrating the target hazard up to the
+administrative censoring horizon:
 ```rust
 pub struct SurvivalLayout {
     pub baseline_entry: Array2<f64>,
     pub baseline_exit: Array2<f64>,
+    pub baseline_admin: Array2<f64>,
     pub baseline_derivative_exit: Array2<f64>,
     pub time_varying_entry: Option<Array2<f64>>,
     pub time_varying_exit: Option<Array2<f64>>,
+    pub time_varying_admin: Option<Array2<f64>>,
     pub time_varying_derivative_exit: Option<Array2<f64>>,
     pub static_covariates: Array2<f64>,
     pub age_transform: AgeTransform,
@@ -100,9 +110,9 @@ pub struct SurvivalLayout {
 
 ## 5. Likelihood, score, and Hessian
 ### 5.1 Per-subject quantities
-- `η_exit = X_exit β`, `η_entry = X_entry β`.
-- `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
+- `η_exit = X_exit β` at the event or censor age, `η_admin = X_admin β` at the administrative end of follow-up, and `η_entry = X_entry β`.
+- `H_exit = exp(η_exit)`, `H_admin = exp(η_admin)`, `H_entry = exp(η_entry)`.
+- `ΔH = H_admin - H_entry` (non-negative by construction of the cumulative hazard and using the enforced ordering).
 - `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
@@ -111,21 +121,23 @@ For subject `i`:
 ```
 ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. The latter term always integrates up to
+`age_admin_end`, so competing events remain in the risk set through administrative censoring without any auxiliary
+weighting scheme.
 
 ### 5.3 Score and Hessian
-- Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
+- Define `x_exit`, `x_admin`, and `x_entry` as the full design rows (baseline + time-varying + static covariates).
 - Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
 - Score contribution:
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += w_i [ d_i x̃_exit - H_admin_i x_admin + H_entry_i x_entry ].
 ```
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
 - Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [ d_i x̃_exit^T x̃_exit + H_admin_i x_admin^T x_admin + H_entry_i x_entry^T x_entry ].
 ```
-- `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
+- `WorkingState::eta` returns `η_exit` for consistency with event-time diagnostics, while `H_admin` drives the cumulative hazard.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
@@ -203,7 +215,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
 2. **Data loaders**: implement survival-specific loaders with the two-flag event schema and guarded age transform metadata.
 3. **Basis updates**: extend basis evaluation to emit values and derivatives on the log-age scale plus reference constraints.
-4. **Layout builder**: construct `SurvivalLayout` with entry/exit caches and derivative matrices; serialize transforms.
+4. **Layout builder**: construct `SurvivalLayout` with entry/exit/admin caches and derivative matrices; serialize transforms.
 5. **Working model**: implement the RP likelihood, gradient, Hessian, and soft barrier contributions.
 6. **PIRLS integration**: refactor the solver to consume dense Hessians from `WorkingState` while preserving the GAM path.
 7. **Artifact + scoring**: persist age transforms, constraints, and Hessian factors; implement endpoint-based prediction APIs.
