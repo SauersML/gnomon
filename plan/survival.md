@@ -23,8 +23,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- `WorkingState::hessian` always lives in coefficient space (`p × p`) so downstream PIRLS code receives the full Fisher information contribution for the active coefficients.
-- Logistic and Gaussian models assemble `Xᵀ W X` internally and return dense Hessians through this trait, matching the survival implementation. The RP survival model likewise returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- Logistic and Gaussian models return the assembled dense Hessian (`XᵀWX`) through this trait, matching the existing PIRLS implementation. The RP survival model likewise produces a dense Hessian from its likelihood while providing its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
@@ -134,7 +133,7 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
-- The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
+- The outer REML loop is unchanged. It already consumes dense Hessians from the GAM families, and the survival family supplies the same structure.
 - The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
@@ -206,7 +205,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 3. **Basis updates**: extend basis evaluation to emit values and derivatives on the log-age scale plus reference constraints.
 4. **Layout builder**: construct `SurvivalLayout` with entry/exit caches and derivative matrices; serialize transforms.
 5. **Working model**: implement the RP likelihood, gradient, Hessian, and soft barrier contributions.
-6. **PIRLS integration**: refactor the solver to consume dense Hessians from `WorkingState` while preserving the GAM path.
+6. **PIRLS integration**: plug the survival `WorkingState` into the existing dense-Hessian pathway without introducing link-specific branches.
 7. **Artifact + scoring**: persist age transforms, constraints, and Hessian factors; implement endpoint-based prediction APIs.
 8. **Calibrator**: adapt calibrator feature extraction to the survival outputs and ensure logit-risk calibration works end-to-end.
 9. **Testing**: add unit/integration tests described above, including monotonicity and left-truncation checks.
