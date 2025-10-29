@@ -28,7 +28,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
 - PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite factorization (e.g., Faer `ldlt` with rook pivoting) when the observed information is used. No alternate update loops or GLM-specific vectors are required. Document the permutation so the factor can be reapplied outside the PIRLS loop.
-- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost.
+- Provide a damped Newton / trust-region fallback that perturbs the symmetric-indefinite system when the observed information fails (`H + S + λ I`). This retains the observed score and curvature while guaranteeing a positive-definite solve without requiring a Fisher-information quadrature implementation.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
