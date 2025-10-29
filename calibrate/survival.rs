@@ -781,6 +781,10 @@ pub fn cumulative_hazard(
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
+    let expected_covs = artifacts.static_covariate_layout.column_names.len();
+    if covariates.len() != expected_covs {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
     let log_age = artifacts.age_transform.transform(age)?;
     let (basis_arc, _) = create_bspline_basis_with_knots(
         array![log_age].view(),
@@ -1119,5 +1123,34 @@ mod tests {
             penalty.derivative_design.ncols(),
             layout.combined_exit.ncols()
         );
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_covariate_mismatch() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: CovariateLayout {
+                column_names: vec!["pgs".into(), "sex".into(), "pc1".into(), "pc2".into()],
+            },
+            penalties: PenaltyDescriptor {
+                order: 2,
+                lambda: 0.5,
+            },
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            hessian_factor: None,
+        };
+        let mismatched_covs =
+            Array1::<f64>::zeros(artifacts.static_covariate_layout.column_names.len() + 1);
+        let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
 }
