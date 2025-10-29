@@ -23,7 +23,8 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- `WorkingState::hessian` always lives in coefficient space (`p × p`) so downstream PIRLS code receives the full Fisher information contribution for the active coefficients.
+- Logistic and Gaussian models assemble `Xᵀ W X` internally and return dense Hessians through this trait, matching the survival implementation. The RP survival model likewise returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
