@@ -32,10 +32,12 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
 Expect TSV/Parquet columns (names fixed):
-- `age_entry`, `age_exit` (years, `age_entry < age_exit`),
+- `age_entry`, `age_exit` (years, `age_entry < age_exit`; `age_exit` records the last follow-up age, even when a competing event occurs, so competing events remain at risk afterward),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
 - `sample_weight` (optional, defaults to 1.0 and multiplies log-likelihood contributions directly),
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
+
+Optionally accept an `age_competing_event` column that records the age at which the competing event happened. Loader validations ensure `age_exit ≥ age_competing_event` whenever both are finite, preserving the guarantee that `age_exit` reflects the latest observed time.
 
 ### 3.2 Training and scoring bundles
 ```rust
