@@ -359,6 +359,11 @@ impl WorkingModel for WorkingModelSurvival {
                 let mut event_grad = x_exit.to_owned();
                 event_grad += &(&x_deriv / guard);
                 gradient.scaled_add(weight, &event_grad);
+                rank_one_update(&mut hessian, x_exit, weight);
+                if deta > 0.0 {
+                    let curvature = -weight / (deta * deta);
+                    rank_one_update(&mut hessian, x_deriv, curvature);
+                }
             }
 
             let barrier = Self::softplus(-deta_exit[i]);
