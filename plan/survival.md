@@ -158,21 +158,27 @@ pub struct SurvivalModelArtifacts {
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
 - `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1`:
+- Absolute risk between `t0` and `t1` draws directly from the model's cumulative incidence:
 ```
 CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+ΔF_raw = CIF_target(t1) - CIF_target(t0).
+ΔF = clip(ΔF_raw, 0.0, 1.0).
 ```
-- Default `ε = 1e-12` to maintain numeric stability.
+- Here `clip(x, a, b)` truncates `x` into the closed interval `[a, b]` to guard against numerical drift.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Document how the competing-risk term feeds the conditional denominator:
+```
+F_competing(t0) = supplied competing CIF at `t0` (artifact- or cohort-derived).
+denom_raw = 1.0 - CIF_target(t0) - F_competing(t0).
+denom = clip(denom_raw, 0.0, 1.0).
+```
+- Clipping the denominator keeps the conditional risk bounded when competing incidence estimates drift slightly outside `[0, 1]`.
+- Without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -182,6 +188,7 @@ fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
 fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
+- Implement `conditional_absolute_risk` as `clip(ΔF_raw, 0.0, 1.0) / clip(denom_raw, ε, 1.0)` with `ε = 1e-12` for stability.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
@@ -194,7 +201,8 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - gradient/Hessian correctness via finite differences on small synthetic data;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
-  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
+  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`);
+  - synthetic cohorts where `t1 ≈ t0` to ensure the conditional risk stays within `[0, 1]` under nearly identical horizons.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
