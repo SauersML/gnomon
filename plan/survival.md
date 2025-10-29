@@ -120,12 +120,12 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 ```
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`, and there is no accompanying event term proportional to `x_exit x_exit^T`.)
-- Observed negative Hessian contribution:
+(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
+- The cross-terms that would normally mix `x_exit` and `D_exit` vanish because `dη_exit = D_exit β` is linear in `β`, so its Jacobian is constant and has zero second derivative.
+- Hessian contribution:
 ```
-H += w_i [ d_i (D_exit_i^T D_exit_i) / dη_exit_i^2 + H_exit_i x_exit^T x_exit - H_entry_i x_entry^T x_entry ].
+H += w_i [ d_i (D_exit^T D_exit / dη_exit_i^2) + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
-- Implementation should work directly with this curvature decomposition—outer product of the derivative design for events, a positive exit curvature term, and a subtractive entry curvature term—rather than reconstructing any `x̃_exit`-based surrogate.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
@@ -135,7 +135,7 @@ H += w_i [ d_i (D_exit_i^T D_exit_i) / dη_exit_i^2 + H_exit_i x_exit^T x_exit -
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
-- The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs.
+- The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs, with the event block contributing only `D_exit^T D_exit / dη_exit^2` alongside the integral terms.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
