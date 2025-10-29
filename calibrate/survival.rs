@@ -110,21 +110,25 @@ impl PenaltyBlocks {
         beta: &Array1<f64>,
         gradient: &mut Array1<f64>,
         hessian: &mut Array2<f64>,
+        deviance: &mut f64,
     ) {
         for block in &self.blocks {
             let view = beta.slice(s![block.range.clone()]);
-            let penalty_grad = block.matrix.dot(&view) * block.lambda;
+            let s_beta = block.matrix.dot(&view);
+            let penalty_value = view.dot(&s_beta);
             let mut grad_slice = gradient.slice_mut(s![block.range.clone()]);
-            grad_slice += &penalty_grad;
+            grad_slice.scaled_add(-2.0 * block.lambda, &s_beta);
 
             let mut block_hessian = block.matrix.clone();
-            block_hessian *= block.lambda;
+            block_hessian *= -2.0 * block.lambda;
             let rows = block.range.clone();
             for (local_i, row_idx) in rows.clone().enumerate() {
                 for (local_j, col_idx) in rows.clone().enumerate() {
                     hessian[[row_idx, col_idx]] += block_hessian[[local_i, local_j]];
                 }
             }
+
+            *deviance -= block.lambda * penalty_value;
         }
     }
 }
@@ -415,9 +419,9 @@ fn build_monotonicity_penalty(
     let (_, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis);
     let constrained_derivative_u = layout.reference_constraint.apply(&derivative_u);
     let mut derivative_age = constrained_derivative_u;
-    for (mut row, &age) in derivative_age.rows_mut().zip(grid.iter()) {
+    for (mut row, &age) in derivative_age.rows_mut().into_iter().zip(grid.iter()) {
         let factor = layout.age_transform.derivative_factor(age);
-        row.mapv_inplace(|v| v * factor);
+        row *= factor;
     }
 
     let mut combined = Array2::<f64>::zeros((grid_size, layout.combined_exit.ncols()));
@@ -521,7 +525,7 @@ impl WorkingModel for WorkingModelSurvival {
 
         self.layout
             .penalties
-            .add_contributions(beta, &mut gradient, &mut hessian);
+            .add_contributions(beta, &mut gradient, &mut hessian, &mut deviance);
 
         if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
             apply_monotonicity_penalty(
@@ -723,6 +727,16 @@ mod tests {
         }
     }
 
+    fn evaluate_state(
+        layout: &SurvivalLayout,
+        penalty: &MonotonicityPenalty,
+        data: &SurvivalTrainingData,
+        beta: &Array1<f64>,
+    ) -> WorkingState {
+        let mut model = WorkingModelSurvival::new(layout.clone(), data, penalty.clone());
+        model.update(beta)
+    }
+
     #[test]
     fn logit_extension_behaves() {
         assert!(0.5f64.logit().abs() < 1e-12);
@@ -733,7 +747,7 @@ mod tests {
     fn monotonic_penalty_positive() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
         let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10);
@@ -747,7 +761,7 @@ mod tests {
     fn conditional_risk_monotone() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
         let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10);
@@ -767,7 +781,7 @@ mod tests {
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
         };
-        let covs = Array1::<f64>::zeros(artifacts.coefficients.len());
+        let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts);
         let cif1 = cumulative_incidence(60.0, &covs, &artifacts);
         assert!(cif1 >= cif0 - 1e-9);
@@ -779,7 +793,7 @@ mod tests {
     fn working_state_shapes() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
         let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8);
@@ -789,5 +803,52 @@ mod tests {
         assert_eq!(state.gradient.len(), beta.len());
         assert_eq!(state.hessian.nrows(), beta.len());
         assert_eq!(state.hessian.ncols(), beta.len());
+    }
+
+    #[test]
+    fn smoothing_penalty_matches_finite_difference() {
+        let mut data = toy_training_data();
+        data.sample_weight.fill(0.0);
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0);
+        let p = layout.combined_exit.ncols();
+        let baseline_cols = layout.baseline_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..baseline_cols {
+            let centered = idx as f64 - (baseline_cols as f64 / 2.0);
+            beta[idx] = 0.05 * centered * centered;
+        }
+        for idx in baseline_cols..p {
+            beta[idx] = -0.02 * (idx as f64 + 1.0);
+        }
+
+        let base_state = evaluate_state(&layout, &penalty, &data, &beta);
+        let eps = 1e-6;
+
+        for j in 0..p {
+            let mut beta_plus = beta.clone();
+            beta_plus[j] += eps;
+            let plus_state = evaluate_state(&layout, &penalty, &data, &beta_plus);
+
+            let mut beta_minus = beta.clone();
+            beta_minus[j] -= eps;
+            let minus_state = evaluate_state(&layout, &penalty, &data, &beta_minus);
+
+            let numeric_grad = (plus_state.deviance - minus_state.deviance) / (2.0 * eps);
+            assert!(
+                (numeric_grad - base_state.gradient[j]).abs() < 1e-4,
+                "gradient mismatch at index {}",
+                j
+            );
+
+            let numeric_hessian_col = (&plus_state.gradient - &minus_state.gradient) / (2.0 * eps);
+            for k in 0..p {
+                let diff = numeric_hessian_col[k] - base_state.hessian[[k, j]];
+                assert!(diff.abs() < 1e-3, "hessian mismatch at ({}, {})", k, j);
+            }
+        }
     }
 }
