@@ -128,9 +128,10 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity penalty
-- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+### 5.4 Monotonicity safeguard and penalty
+- Enforce feasibility with an optimization safeguard that guarantees the penalized deviance is non-increasing. Implement a deterministic line search (preferred) or trust-region gate that rejects steps violating the penalized deviance descent criterion while also guaranteeing `dη_exit > 0` for every attempted evaluation.
+- Add a soft inequality penalty to discourage near-zero `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
+- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping; feasibility must come entirely from the safeguarded optimizer.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -192,9 +193,10 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - deviance decreases monotonically under PIRLS iterations;
+  - safeguard activation: construct a scenario that forces the line search/trust region to shorten the step, confirm the accepted update keeps the penalized deviance non-increasing, and log that feasibility checks rejected the raw step;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
+- Regression test: craft a near-boundary design where the raw Newton step would evaluate `dη_exit ≤ 0`; assert the safeguard prevents those evaluations and that optimization proceeds without touching infeasible derivatives.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
