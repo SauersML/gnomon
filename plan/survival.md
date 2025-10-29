@@ -128,9 +128,17 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity penalty
-- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+### 5.4 Hard feasibility for `dη`
+- Enforce non-negativity of `dη_exit` directly so the PIRLS iterate always remains in the feasible region. Prefer reparameterising the derivative coefficients via a strictly positive basis expansion (e.g., represent `dη` as an exponential of an unconstrained spline or an M-spline mixture) so that any coefficient vector implies `dη_exit > 0`. When that refactor is impractical, fall back to an interior-point barrier evaluated at each event time with a large weight (e.g., `λ_barrier ≈ 10^6`) so the solver treats feasibility violations as hard failures rather than mild penalties.
+- Integrate the chosen mechanism into `WorkingModelSurvival::update` so the returned gradient and Hessian already reflect either the reparameterisation Jacobian or the barrier contributions. PIRLS therefore solves the usual `(H + S) Δβ = g` system without post-hoc clamps.
+
+### 5.5 Line search and PIRLS updates
+- Wrap every PIRLS coefficient update in a backtracking line search that rejects steps producing `dη_exit ≤ 0`. Evaluate `dη_exit` at all event ages after applying the proposed step; if any derivative is non-positive, shrink the step (e.g., halve repeatedly) until strict feasibility and deviance decrease both hold. Cache the current feasible iterate so the solver can restore it after failed attempts.
+- Because `WorkingState::eta` already includes the feasibility mechanism, the line search operates purely on the PIRLS iterate and plugs into the existing solver loop without additional branching. The monotonic deviance requirement mirrors the GAM path, ensuring convergence diagnostics stay consistent.
+
+### 5.6 Softplus grid shape prior
+- Keep the softplus grid penalty as a mild shape prior only. Evaluate `dη` on a dense grid of ages (e.g., 200 points) and accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
+- Document that this prior supports the hard feasibility mechanism by nudging the optimizer away from the boundary but does not by itself enforce positivity. Include its gradient/Hessian alongside other penalties when forming the working state.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
