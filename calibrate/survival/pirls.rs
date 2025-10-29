@@ -3,7 +3,7 @@ use super::working::{WorkingModel, WorkingState};
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView, array1_to_col_mat_mut};
 use faer::Side;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Solve as FaerSolve};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -41,8 +41,13 @@ fn accumulate_penalties(
     penalties: &[PenaltyBlocks],
 ) {
     for penalty in penalties {
-        gradient += &(penalty.lambda * penalty.matrix.dot(beta));
-        hessian += &(penalty.lambda * penalty.matrix.clone());
+        let start = penalty.offset;
+        let end = start + penalty.matrix.ncols();
+        let beta_block = beta.slice(s![start..end]).to_owned();
+        let penalty_gradient = penalty.matrix.dot(&beta_block) * penalty.lambda;
+        gradient.slice_mut(s![start..end]) += &penalty_gradient;
+        let penalty_hessian = penalty.matrix.view() * penalty.lambda;
+        hessian.slice_mut(s![start..end, start..end]) += &penalty_hessian;
     }
 }
 

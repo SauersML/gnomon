@@ -129,6 +129,7 @@ impl SurvivalLayoutBuilder {
             baseline_exit.ncols(),
             self.penalty_order,
             PenaltyDescriptor::Baseline,
+            0,
         )?;
 
         Ok(SurvivalLayout {
