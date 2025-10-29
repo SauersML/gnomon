@@ -178,6 +178,8 @@ F_competing_t0` supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
+- Require that administrative censoring (loss to follow-up, study end) be independent of the target subdistribution event time
+  conditional on the observed covariates so that the full-likelihood inference remains unbiased.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
@@ -185,6 +187,10 @@ conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
 - Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Competing events enter through the survival factor `S(t) = exp(-H(t))` and **not** via censoring weights; the target CIF is
+  `F_target(t) = 1 - S(t)` regardless of how many companion causes are modeled.
+- Warn users that separately fitted CIFs for multiple causes will generally fail to sum to one in finite samples; encourage
+  presenting them jointly with the implied residual survival rather than enforcing artificial renormalization.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
