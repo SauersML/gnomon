@@ -27,7 +27,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = U` using the existing Faer linear algebra, with `H` and `U` built exactly as in Section 5.3. No alternate update loops or GLM-specific vectors are required.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. No alternate update loops or GLM-specific vectors are required.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -115,20 +115,17 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `D_exit` denote the cached derivative row so that `dη_exit = D_exit β` on the age scale.
+- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
 - Score contribution:
 ```
-U += w_i [ d_i (x_exit + D_exit / dη_exit) - H_exit_i x_exit - H_entry_i x_entry ].
+U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
+(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
 - Hessian contribution:
 ```
-H += w_i [
-    d_i \, ( x_exit^T x_exit + D_exit^T D_exit / dη_exit^2 )
-    + H_exit_i \, x_exit^T x_exit
-    - H_entry_i \, x_entry^T x_entry
-].
+H += w_i [ -d_i D_exit^T D_exit / (dη_exit_i)^2 + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
-  The event block therefore contains only the outer product of `x_exit` and the rank-one derivative term `D_exit^T D_exit / dη_exit^2`, while the entry hazard subtracts its outer product to reflect the negative sign in the score.
+- The linear predictor itself contributes no curvature beyond the derivative term; only the `log(dη_exit)` factor produces the negative outer product.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
@@ -196,6 +193,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
+  - analytic Hessians match autodiff or finite-difference checks on toy datasets with rare target events;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
