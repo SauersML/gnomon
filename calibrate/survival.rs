@@ -754,12 +754,18 @@ impl WorkingModel for WorkingModelSurvival {
                 let softplus = stable_softplus(scaled);
                 barrier_deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
                 let sigmoid = stable_sigmoid(scaled);
-                let barrier_grad_coeff =
-                    self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
+                let barrier_grad_coeff = 2.0
+                    * self.spec.barrier_weight
+                    * weight
+                    * sigmoid
+                    / self.spec.barrier_scale;
                 accumulate_weighted_vector(&mut barrier_gradient, -barrier_grad_coeff, &d_exit);
-                let barrier_hess_coeff =
-                    self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
-                        / (self.spec.barrier_scale * self.spec.barrier_scale);
+                let barrier_hess_coeff = 2.0
+                    * self.spec.barrier_weight
+                    * weight
+                    * sigmoid
+                    * (1.0 - sigmoid)
+                    / (self.spec.barrier_scale * self.spec.barrier_scale);
                 accumulate_symmetric_outer(&mut barrier_hessian, barrier_hess_coeff, &d_exit);
             }
         }
@@ -825,9 +831,9 @@ fn apply_monotonicity_penalty(
         let softplus = stable_softplus(-value);
         penalty_sum += softplus;
         let sigma = stable_sigmoid(-value);
-        let grad_scale = -lambda * sigma;
+        let grad_scale = -2.0 * lambda * sigma;
         accumulate_weighted_vector(gradient, grad_scale, &row);
-        let h_scale = lambda * sigma * (1.0 - sigma);
+        let h_scale = 2.0 * lambda * sigma * (1.0 - sigma);
         accumulate_symmetric_outer(hessian, h_scale, &row);
         if value < 0.0 {
             violation_count += 1;
