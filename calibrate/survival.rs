@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -421,11 +421,28 @@ impl SurvivalModelArtifacts {
     pub fn cumulative_hazard(&self, age: f64, covariates: &ArrayView1<'_, f64>) -> f64 {
         let u = self.age_transform.transform(age);
         let basis_exit = self.reference_constraint.apply(&self.age_basis);
-        let baseline = basis_exit
-            .row(0)
-            .dot(&self.coefficients.slice(s![..basis_exit.ncols()]));
-        let static_offset = covariates.dot(&self.coefficients.slice(s![basis_exit.ncols()..]));
-        (baseline + static_offset + u).exp()
+        let baseline_values = evaluate_basis_at_age(&basis_exit, u);
+        let mut coeff_start = 0;
+        let mut eta = baseline_values.dot(&self.coefficients.slice(s![..basis_exit.ncols()]));
+        coeff_start += basis_exit.ncols();
+
+        if let Some(tv_basis) = &self.time_varying_basis {
+            let tv_values = evaluate_basis_at_age(tv_basis, u);
+            eta += tv_values.dot(
+                &self
+                    .coefficients
+                    .slice(s![coeff_start..coeff_start + tv_values.len()]),
+            );
+            coeff_start += tv_values.len();
+        }
+
+        debug_assert_eq!(self.static_covariate_layout.ncols(), covariates.len());
+        debug_assert!(coeff_start + covariates.len() <= self.coefficients.len());
+        let static_coeffs = self
+            .coefficients
+            .slice(s![coeff_start..coeff_start + covariates.len()]);
+        let static_offset = covariates.dot(&static_coeffs);
+        (eta + static_offset + u).exp()
     }
 
     pub fn cumulative_incidence(&self, age: f64, covariates: &ArrayView1<'_, f64>) -> f64 {
@@ -446,6 +463,20 @@ impl SurvivalModelArtifacts {
         let denom = (1.0 - cif0 - cif_competing_t0).max(1e-12);
         (delta / denom).min(1.0)
     }
+}
+
+fn evaluate_basis_at_age(basis: &Array2<f64>, u: f64) -> Array1<f64> {
+    let mut values = Array1::zeros(basis.ncols());
+    for col in 0..basis.ncols() {
+        let mut power = 1.0;
+        let mut acc = 0.0;
+        for row in 0..basis.nrows() {
+            acc += basis[[row, col]] * power;
+            power *= u;
+        }
+        values[col] = acc;
+    }
+    values
 }
 
 /// Delta-method standard error helper using the stored Hessian factor.
