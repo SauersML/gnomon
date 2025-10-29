@@ -174,9 +174,9 @@ pub struct SurvivalModelArtifacts {
 ```
 CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
+- `F_competing_t0` is supplied externally (see §7.3).
 - Default `ε = 1e-12` to maintain numeric stability.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
