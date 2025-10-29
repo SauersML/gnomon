@@ -102,23 +102,20 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- Reparameterise the derivative to maintain non-negativity: store an unconstrained vector `γ` and evaluate
-  `dη_exit = softplus(D_exit γ) + ε_pos` on the age scale with a fixed `ε_pos ≈ 1e-10`.
+- `ΔH = H_exit - H_entry` (non-negative when the exit hazard stays above the entry hazard; unconstrained derivatives can violate this and drive `ΔH < 0`).
+- `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(max(dη_exit_i, ε_log))) - ΔH_i ].
+ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
-Use `ε_log ≈ 1e-12` to guarantee the log term remains finite even before the monotonicity safeguards converge.
 Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative. The
-  `max(dη_exit_i, ε_log)` guard is shared with the log-likelihood to avoid division by a vanishing derivative.
+- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
 - Score contribution:
 ```
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
@@ -132,13 +129,10 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
-- Combine the derivative reparameterisation with a structural monotonic basis: represent the baseline derivative with a
-  monotone I-spline (`BasisDescriptor::MonotoneSpline`) whose coefficients are constrained to be non-negative via the shared
-  `softplus` transform.
-- Retain a secondary soft barrier on the dense age grid to suppress numerical drift, but increase the weight to `λ_soft ≈ 1e-2`
-  so violations are corrected decisively.
-- Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` and add the barrier Hessian/gradient to the working state like any other
-  smoothness penalty. Remove any ad-hoc derivative clamping; the reparameterisation and penalties provide the enforcement.
+- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
+- Clamp `dη_exit` (and the grid evaluations) to a small `ε` (e.g., `1e-6`) immediately before applying `log(dη_exit)` so the score and Hessian stay finite when backpropagating through batches that momentarily violate monotonicity.
+- Consider stronger guards when the soft penalty is insufficient: increase `λ_soft`, or reparameterize `η(age)` with a monotone basis (e.g., integrate `exp(f(age))`) so that positivity is enforced by construction. The reparameterization hooks into training by swapping the design/derivative builders while leaving the downstream likelihood code unchanged.
+- Feed the clamp, penalty, or reparameterization contributions into the same autograd tape / working-state accumulator used for smoothness penalties so the optimizer receives consistent gradients and Hessians during joint training.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -203,9 +197,6 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
-  - derivative safeguard: construct fixtures whose unconstrained derivative would be negative, confirm the `softplus`
-    reparameterisation keeps `dη_exit ≥ ε_pos`, and verify the `log(max(dη_exit, ε_log))` guard remains finite during
-    optimisation.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
