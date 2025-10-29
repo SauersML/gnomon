@@ -126,7 +126,7 @@ U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
@@ -162,7 +162,7 @@ pub struct SurvivalModelArtifacts {
 ```
 CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
+`F_competing_t0` supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
