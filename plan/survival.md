@@ -128,9 +128,13 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity penalty
-- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+### 5.4 Strict monotonicity enforcement
+- Guarantee strict positivity of `dη` at every observed exit age by construction. Two acceptable schemes:
+  - parameterise the derivative as `dη_exit = exp(g(t))` for a free function `g(t)` so that the chain rule and Hessian contributions automatically respect the exponential transform; or
+  - enforce PIRLS step-halving barriers that reject updates crossing `dη_exit ≤ 0` at any exit knot, shrinking the step until all guarded points remain positive.
+- Persist the chosen mechanism in the serialized layout (e.g., mark the derivative-as-exponential transform or store the barrier guard set and tolerances) so scoring can rebuild identical derivative evaluations.
+- Retain the existing soft inequality penalty (`λ_soft ≈ 1e-4`) only as a secondary safeguard once strict positivity is enforced, applied to the dense evaluation grid to nudge solutions away from the boundary.
+- Add the barrier (or transformed) Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -195,6 +199,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
+- Add an integration test that fails if any PIRLS iterate produces `dη_exit ≤ 0` at observed exit ages, ensuring the structural guard fires before serialization.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
