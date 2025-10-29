@@ -110,13 +110,13 @@ pub struct SurvivalLayout {
 ### 5.2 Log-likelihood
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
+ℓ_i = w_i [ d_i (η_exit_i + log(max(dη_exit_i, ε))) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+Guard the derivative with a tiny floor (e.g., `ε = 1e-10`) inside the logarithm so the penalty logic still observes the raw `dη_exit` while the likelihood remains finite. Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
+- Let `x̃_exit = x_exit + D_exit / max(dη_exit, ε)` where the division is elementwise after broadcasting the scalar derivative and reuses the same floor `ε` employed in the log-likelihood guard.
 - Score contribution:
 ```
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
@@ -131,7 +131,8 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+- The softplus barrier coexists with the `max(dη_exit, ε)` guard: the guard prevents catastrophic likelihood explosions, while the barrier still sees the unguarded derivative and nudges it positive.
+- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping, and surface violations by logging diagnostics on subjects or grid points where `dη_exit < 0` and optionally tripping early stopping if repeated violations persist.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
