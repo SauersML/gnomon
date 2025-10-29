@@ -103,48 +103,42 @@ pub struct SurvivalLayout {
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
 - `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale.
+- Reparameterise the derivative to maintain non-negativity: store an unconstrained vector `γ` and evaluate
+  `dη_exit = softplus(D_exit γ) + ε_pos` on the age scale with a fixed `ε_pos ≈ 1e-10`.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
+ℓ_i = w_i [ d_i (η_exit_i + log(max(dη_exit_i, ε_log))) - ΔH_i ].
 ```
+Use `ε_log ≈ 1e-12` to guarantee the log term remains finite even before the monotonicity safeguards converge.
 Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- The derivative design row `D_exit` produces `dη_exit = D_exit β`, so `D_exit / dη_exit` divides each element of `D_exit` by the scalar `dη_exit`.
-- The log-likelihood from §5.2 gives the score
-  ```
-  U_i = ∂ℓ_i/∂β = w_i [ d_i (x_exit + D_exit / dη_exit) - H_exit_i x_exit + H_entry_i x_entry ].
-  ```
-  The entry term carries a positive sign in the score because `∂(-ΔH_i)/∂β = -H_exit_i x_exit + H_entry_i x_entry`.
-- Differentiating once more yields the observed Hessian of the log-likelihood:
-  ```
-  ∂²ℓ_i/∂β∂βᵀ = -w_i [ d_i (D_exit D_exitᵀ)/(dη_exit)² + H_exit_i x_exit x_exitᵀ - H_entry_i x_entry x_entryᵀ ].
-  ```
-  The first block comes from the derivative of `log(dη_exit)`, and the entry contribution enters with the opposite sign of the exit block.
-- PIRLS works with the negative Hessian, so each subject contributes
-  ```
-  H_i = -∂²ℓ_i/∂β∂βᵀ = w_i [ d_i (D_exit D_exitᵀ)/(dη_exit)² + H_exit_i x_exit x_exitᵀ - H_entry_i x_entry x_entryᵀ ].
-  ```
-- `WorkingState::hessian` must therefore supply this negative Hessian so the PIRLS solve `(H + S) Δβ = g` uses the expected sign convention.
+- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative. The
+  `max(dη_exit_i, ε_log)` guard is shared with the log-likelihood to avoid division by a vanishing derivative.
+- Score contribution:
+```
+U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+```
+(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
+- Hessian contribution:
+```
+H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+```
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Hard feasibility for `dη`
-- Enforce non-negativity of `dη_exit` directly so the PIRLS iterate always remains in the feasible region. Prefer reparameterising the derivative coefficients via a strictly positive basis expansion (e.g., represent `dη` as an exponential of an unconstrained spline or an M-spline mixture) so that any coefficient vector implies `dη_exit > 0`. When that refactor is impractical, fall back to an interior-point barrier evaluated at each event time with a large weight (e.g., `λ_barrier ≈ 10^6`) so the solver treats feasibility violations as hard failures rather than mild penalties.
-- Integrate the chosen mechanism into `WorkingModelSurvival::update` so the returned gradient and Hessian already reflect either the reparameterisation Jacobian or the barrier contributions. PIRLS therefore solves the usual `(H + S) Δβ = g` system without post-hoc clamps.
-
-### 5.5 Line search and PIRLS updates
-- Wrap every PIRLS coefficient update in a backtracking line search that rejects steps producing `dη_exit ≤ 0`. Evaluate `dη_exit` at all event ages after applying the proposed step; if any derivative is non-positive, shrink the step (e.g., halve repeatedly) until strict feasibility and deviance decrease both hold. Cache the current feasible iterate so the solver can restore it after failed attempts.
-- Because `WorkingState::eta` already includes the feasibility mechanism, the line search operates purely on the PIRLS iterate and plugs into the existing solver loop without additional branching. The monotonic deviance requirement mirrors the GAM path, ensuring convergence diagnostics stay consistent.
-
-### 5.6 Softplus grid shape prior
-- Keep the softplus grid penalty as a mild shape prior only. Evaluate `dη` on a dense grid of ages (e.g., 200 points) and accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Document that this prior supports the hard feasibility mechanism by nudging the optimizer away from the boundary but does not by itself enforce positivity. Include its gradient/Hessian alongside other penalties when forming the working state.
+### 5.4 Monotonicity penalty
+- Combine the derivative reparameterisation with a structural monotonic basis: represent the baseline derivative with a
+  monotone I-spline (`BasisDescriptor::MonotoneSpline`) whose coefficients are constrained to be non-negative via the shared
+  `softplus` transform.
+- Retain a secondary soft barrier on the dense age grid to suppress numerical drift, but increase the weight to `λ_soft ≈ 1e-2`
+  so violations are corrected decisively.
+- Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` and add the barrier Hessian/gradient to the working state like any other
+  smoothness penalty. Remove any ad-hoc derivative clamping; the reparameterisation and penalties provide the enforcement.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -209,6 +203,9 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
+  - derivative safeguard: construct fixtures whose unconstrained derivative would be negative, confirm the `softplus`
+    reparameterisation keeps `dη_exit ≥ ε_pos`, and verify the `log(max(dη_exit, ε_log))` guard remains finite during
+    optimisation.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
