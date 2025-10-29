@@ -146,6 +146,7 @@ pub enum HessianFactor {
     Observed {
         ldlt_factor: LdltFactor,
         permutation: PermutationMatrix,
+        inertia: Inertia, // track negative/zero/positive pivot counts
     },
     Expected {
         cholesky_factor: CholeskyFactor,
@@ -160,10 +161,10 @@ pub struct SurvivalModelArtifacts {
     pub penalties: PenaltyDescriptor,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
-    pub hessian_factor: Option<HessianFactor>,
+    pub hessian_factor: Option<HessianFactor>, // penalised observed information when present
 }
 ```
-- The Hessian factor enables delta-method standard errors and must record the permutation applied during the LDLᵀ factorization when the observed information is stored.
+- The Hessian factor enables delta-method standard errors and must record the permutation applied during the LDLᵀ factorization when the observed information is stored. Persist the penalised observed information (observed curvature plus smoothing penalty) so downstream diagnostics and standard errors use the exact PIRLS system; the inertia entry records the count of negative pivots encountered during factorization for later diagnostics. If an unpenalised variant is ever stored, the artifact must document the rationale and provide enough metadata to reconstruct the penalised system on demand.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 - Training-time sample weights do not propagate into the artifact beyond the fitted coefficients; scored risks therefore reflect the frequency-weighted fit without any post-hoc design-effect adjustment.
 
@@ -231,7 +232,7 @@ Store in the trained model artifact:
 - reference constraint transform (matrix or factorisation);
 - `AgeTransform { a_min, delta }`;
 - centering transforms for interactions and covariate ranges for guard rails;
-- penalized Hessian (or its Cholesky factor) for delta-method standard errors;
+- penalised observed information factor (including permutation and inertia) for delta-method standard errors;
 - optional handles to companion competing-risk models.
 
 With this plan the survival implementation is unified, risk-set-free, and fully reproducible across training and serving, while remaining compatible with the existing PIRLS and calibrator infrastructure.
