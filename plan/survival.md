@@ -120,11 +120,12 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 ```
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Hessian contribution:
+(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`, and there is no accompanying event term proportional to `x_exit x_exit^T`.)
+- Observed negative Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [ d_i (D_exit_i^T D_exit_i) / dη_exit_i^2 + H_exit_i x_exit^T x_exit - H_entry_i x_entry^T x_entry ].
 ```
+- Implementation should work directly with this curvature decomposition—outer product of the derivative design for events, a positive exit curvature term, and a subtractive entry curvature term—rather than reconstructing any `x̃_exit`-based surrogate.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
