@@ -211,23 +211,25 @@ impl PenaltyBlocks {
         grad
     }
 
-    fn hessian(&self) -> Array2<f64> {
-        let mut hessian = Array2::zeros((self.dimension(), self.dimension()));
+    fn hessian(&self, expected_dim: usize) -> Array2<f64> {
+        let mut hessian = Array2::zeros((expected_dim, expected_dim));
+        if expected_dim == 0 {
+            return hessian;
+        }
         for block in &self.blocks {
             if block.lambda == 0.0 {
                 continue;
             }
+            debug_assert_eq!(
+                block.matrix.nrows(),
+                expected_dim,
+                "penalty dimension mismatch"
+            );
             hessian += &(block.lambda * &block.matrix);
         }
         hessian
     }
 
-    fn dimension(&self) -> usize {
-        self.blocks
-            .first()
-            .map(|block| block.matrix.nrows())
-            .unwrap_or(0)
-    }
 }
 
 /// Column partition describing where each design block lives within the coefficient vector.
@@ -498,7 +500,7 @@ impl<'a> WorkingModel for LogisticWorkingModel<'a> {
             let m = mu[i];
             deviance -= 2.0 * w * (y * (m.max(eps)).ln() + (1.0 - y) * (1.0 - m).max(eps).ln());
         }
-        hessian -= &self.penalties.hessian();
+        hessian -= &self.penalties.hessian(beta.len());
         Ok(WorkingState {
             eta,
             gradient,
@@ -547,7 +549,7 @@ impl<'a> WorkingModel for GaussianWorkingModel<'a> {
             let row = self.design.row(i);
             hessian -= &(outer_product(&row.to_owned()) * w);
         }
-        hessian -= &self.penalties.hessian();
+        hessian -= &self.penalties.hessian(beta.len());
         let deviance = (self.weights.dot(&(&residual * &residual)));
         Ok(WorkingState {
             eta,
@@ -740,7 +742,7 @@ impl<'a> WorkingModel for SurvivalWorkingModel<'a> {
         }
 
         gradient -= &self.layout.penalties.gradient(beta);
-        hessian -= &self.layout.penalties.hessian();
+        hessian -= &self.layout.penalties.hessian(beta.len());
         Ok(WorkingState {
             eta: eta_exit,
             gradient,
