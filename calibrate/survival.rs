@@ -20,6 +20,8 @@ pub enum SurvivalError {
     EmptyAgeVector,
     #[error("age values must be finite")]
     NonFiniteAge,
+    #[error("age transform guard delta must be positive")]
+    NonPositiveGuard,
     #[error("age {age} is outside the guarded log-age domain (a_min={minimum}, delta={delta})")]
     GuardDomainViolation { age: f64, minimum: f64, delta: f64 },
     #[error("age_entry must be strictly less than age_exit for every subject")]
@@ -63,6 +65,9 @@ pub struct AgeTransform {
 
 impl AgeTransform {
     pub fn from_training(age_entry: &Array1<f64>, delta: f64) -> Result<Self, SurvivalError> {
+        if delta <= 0.0 {
+            return Err(SurvivalError::NonPositiveGuard);
+        }
         if age_entry.is_empty() {
             return Err(SurvivalError::EmptyAgeVector);
         }
@@ -177,7 +182,7 @@ impl PenaltyBlocks {
             let view = beta.slice(s![block.range.clone()]);
             let contrib = block.matrix.dot(&view.to_owned());
             let mut grad_slice = grad.slice_mut(s![block.range.clone()]);
-            grad_slice += &(block.lambda * contrib);
+            grad_slice += &(2.0 * block.lambda * contrib);
         }
         grad
     }
@@ -191,7 +196,8 @@ impl PenaltyBlocks {
             let rows = block.range.clone();
             for (local_i, row_idx) in rows.clone().enumerate() {
                 for (local_j, col_idx) in rows.clone().enumerate() {
-                    hessian[[row_idx, col_idx]] += block.lambda * block.matrix[[local_i, local_j]];
+                    hessian[[row_idx, col_idx]] +=
+                        2.0 * block.lambda * block.matrix[[local_i, local_j]];
                 }
             }
         }
@@ -916,6 +922,13 @@ mod tests {
     }
 
     #[test]
+    fn age_transform_rejects_non_positive_guard() {
+        let ages = array![50.0, 55.0];
+        let err = AgeTransform::from_training(&ages, 0.0).unwrap_err();
+        assert!(matches!(err, SurvivalError::NonPositiveGuard));
+    }
+
+    #[test]
     fn monotonic_penalty_positive() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -945,12 +958,15 @@ mod tests {
             SurvivalSpec::default(),
         )
         .unwrap();
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: CovariateLayout {
-                column_names: vec![],
+                column_names: static_names,
             },
             penalties: PenaltyDescriptor {
                 order: 2,
@@ -1133,12 +1149,15 @@ mod tests {
             degree: 2,
         };
         let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: CovariateLayout {
-                column_names: vec!["pgs".into(), "sex".into(), "pc1".into(), "pc2".into()],
+                column_names: static_names.clone(),
             },
             penalties: PenaltyDescriptor {
                 order: 2,
@@ -1148,8 +1167,7 @@ mod tests {
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
         };
-        let mismatched_covs =
-            Array1::<f64>::zeros(artifacts.static_covariate_layout.column_names.len() + 1);
+        let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
