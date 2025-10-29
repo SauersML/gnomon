@@ -177,7 +177,7 @@ impl PenaltyBlocks {
             let view = beta.slice(s![block.range.clone()]);
             let contrib = block.matrix.dot(&view.to_owned());
             let mut grad_slice = grad.slice_mut(s![block.range.clone()]);
-            grad_slice += &(block.lambda * contrib);
+            grad_slice += &(2.0 * block.lambda * contrib);
         }
         grad
     }
@@ -191,7 +191,8 @@ impl PenaltyBlocks {
             let rows = block.range.clone();
             for (local_i, row_idx) in rows.clone().enumerate() {
                 for (local_j, col_idx) in rows.clone().enumerate() {
-                    hessian[[row_idx, col_idx]] += block.lambda * block.matrix[[local_i, local_j]];
+                    hessian[[row_idx, col_idx]] +=
+                        2.0 * block.lambda * block.matrix[[local_i, local_j]];
                 }
             }
         }
@@ -1073,7 +1074,7 @@ mod tests {
 
             let numeric_grad = (plus_state.deviance - minus_state.deviance) / (2.0 * eps);
             assert!(
-                (numeric_grad - base_state.gradient[j]).abs() < 5e-4,
+                (numeric_grad - base_state.gradient[j]).abs() < 1e-4,
                 "gradient mismatch at index {}",
                 j
             );
