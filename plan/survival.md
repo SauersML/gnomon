@@ -102,8 +102,8 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale.
+- `ΔH = H_exit - H_entry` (kept non-negative by the enforced monotonicity described in §5.4).
+- `dη_exit = exp(D_exit γ)` evaluated on the age scale with its Jacobian handled via the chain rule.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
@@ -112,6 +112,7 @@ For subject `i`:
 ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
 Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+The derivative term is guarded by the coercive strategy in §5.4 so `log(dη_exit_i)` never receives a non-positive argument during optimization.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
@@ -125,12 +126,14 @@ U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
+- When forming `x̃_exit`, treat `D_exit` as the derivative of `η_exit` with respect to `γ`. The exponential map contributes an elementwise multiplication by `dη_exit`, so the existing algebra stays intact once the Jacobian factors are folded in.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity penalty
-- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+### 5.4 Monotonicity enforcement
+- Reparameterise the derivative evaluations through an exponential map. Maintain auxiliary coefficients `γ` with the same layout as `β`, compute the raw derivative `\tilde{dη}_exit = D_exit γ`, and set `dη_exit = exp(\tilde{dη}_exit)`. The working state uses `γ` as its optimization variables while back-substituting `dη_exit` and its chain rule contributions when forming gradients and Hessians.
+- Evaluate the derivative on a dense age grid (e.g., 200 points across training support) to confirm `dη_grid = exp(D_grid γ)` remains positive. If any grid derivative underflows below a small tolerance (e.g., `< 1e-12`), perform a backtracking line search and reject the step until all evaluation points satisfy the bound.
+- The exponential reparameterization renders `dη_exit` strictly positive everywhere, which simultaneously keeps `ΔH` monotone increasing in age and ensures the log-derivative term in §5.2 only receives positive inputs. No ad-hoc clamping is required; the line-search safeguard deals with numerical underflow.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
