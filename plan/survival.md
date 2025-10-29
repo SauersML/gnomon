@@ -33,13 +33,14 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ### 3.1 Required columns
 Expect TSV/Parquet columns (names fixed):
 - `age_entry`, `age_exit`, `age_admin_end` (years, `age_entry < age_exit ≤ age_admin_end` and `age_admin_end` required for every record),
+- `age_competing_event` (optional numeric column; required and finite when `event_competing = 1`, empty/`NaN` otherwise),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
 - `sample_weight` (optional, defaults to 1.0 and multiplies log-likelihood contributions directly),
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
 
 `age_admin_end` captures the administrative censoring horizon for each subject. Target events will typically match
 `age_exit`, while competing events keep their earlier event age in `age_exit` but continue to contribute risk through
-`age_admin_end`.
+`age_admin_end`. Rows that record a competing event set `event_competing = 1`, `event_target = 0`, and must satisfy `age_entry < age_competing_event ≤ age_exit`. When an external registry extends follow-up beyond the competing occurrence, `age_exit` captures that administrative horizon while `age_competing_event` pins the actual occurrence time.
 
 ### 3.2 Training and scoring bundles
 ```rust
@@ -47,6 +48,8 @@ pub struct SurvivalTrainingData {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
     pub age_admin_end: Array1<f64>,
+    pub age_competing_event: Option<Array1<f64>>,
+>>>>>>> origin/codex/expand-section-3.1-for-age_exit
     pub event_target: Array1<u8>,
     pub event_competing: Array1<u8>,
     pub sample_weight: Array1<f64>,
@@ -62,13 +65,14 @@ pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
     pub age_exit: ArrayView1<'a, f64>,
     pub age_admin_end: ArrayView1<'a, f64>,
+    pub age_competing_event: Option<ArrayView1<'a, f64>>,
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
     pub covariates: CovariateViews<'a>,
 }
 ```
-- Loaders validate ordering, exclusivity, finiteness, and enforce `age_entry < age_exit ≤ age_admin_end`. Records flagged as competing events keep `age_admin_end` as their integration upper bound even when `age_exit < age_admin_end`. There is no construction of inverse-probability weights or risk-set slices.
+- Loaders validate ordering, exclusivity, finiteness, and enforce `age_entry < age_exit ≤ age_admin_end`. The competing indicator requires `age_competing_event` within `(age_entry, age_exit]` and non-competing rows leave the optional column empty. Records flagged as competing events keep `age_admin_end` as their integration upper bound even when `age_exit < age_admin_end`. There is no construction of inverse-probability weights or risk-set slices.
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
