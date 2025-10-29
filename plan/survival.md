@@ -34,7 +34,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 Expect TSV/Parquet columns (names fixed):
 - `age_entry`, `age_exit` (years, `age_entry < age_exit`),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
-- `sample_weight` (optional, defaults to 1.0 and multiplies log-likelihood contributions directly),
+- `sample_weight` (optional, defaults to 1.0). We interpret this strictly as a frequency weight that scales each subject's likelihood contribution. Inverse-probability sampling weights are out of scope until we implement robust variance estimation and diagnostics for extreme weights.
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
 
 ### 3.2 Training and scoring bundles
@@ -44,7 +44,7 @@ pub struct SurvivalTrainingData {
     pub age_exit: Array1<f64>,
     pub event_target: Array1<u8>,
     pub event_competing: Array1<u8>,
-    pub sample_weight: Array1<f64>,
+    pub sample_weight: Array1<f64>, // frequency weights only; no robust-IPW support
     pub pgs: Array1<f64>,
     pub sex: Array1<f64>,
     pub pcs: Array2<f64>,
@@ -58,7 +58,7 @@ pub struct SurvivalPredictionInputs<'a> {
     pub age_exit: ArrayView1<'a, f64>,
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
-    pub sample_weight: ArrayView1<'a, f64>,
+    pub sample_weight: ArrayView1<'a, f64>, // carried for completeness; still treated as frequency weights
     pub covariates: CovariateViews<'a>,
 }
 ```
@@ -154,6 +154,7 @@ pub struct SurvivalModelArtifacts {
 ```
 - The Hessian factor enables delta-method standard errors.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
+- Training-time sample weights do not propagate into the artifact beyond the fitted coefficients; scored risks therefore reflect the frequency-weighted fit without any post-hoc design-effect adjustment.
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
@@ -182,12 +183,14 @@ fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
 fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
+- All prediction APIs surface per-subject risks under the frequency-weighted fit. We do not rescale outputs for inverse-probability sampling or provide sandwich-standard-error corrections at prediction time.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
 - Features: base prediction, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
 - Use out-of-fold predictions during training to avoid optimism.
 - Remove age-hull or KM-based diagnostics from calibrator features.
+- Calibration routines inherit the same frequency-weight assumption as the core likelihood. We do not provide robust calibrators for inverse-probability weighting; extreme weights should be addressed upstream or by extending the model with sandwich variance reporting.
 
 ## 9. Testing and diagnostics
 - Unit tests:
@@ -197,6 +200,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
+- Add weighted evaluation tests that verify frequency-weighted metrics (e.g., log-likelihood, Brier score) against a trusted reference implementation so future changes preserve the intended weighting semantics.
 - Remove benchmarks centered on risk-set algebra or quadrature.
 
 ## 10. Implementation roadmap
