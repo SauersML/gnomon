@@ -115,19 +115,24 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
-- Score contribution:
-```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
-```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Hessian contribution:
-```
-H += w_i [ -d_i D_exit^T D_exit / (dη_exit_i)^2 + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
-```
-- The linear predictor itself contributes no curvature beyond the derivative term; only the `log(dη_exit)` factor produces the negative outer product.
+- The derivative design row `D_exit` produces `dη_exit = D_exit β`, so `D_exit / dη_exit` divides each element of `D_exit` by the scalar `dη_exit`.
+- The log-likelihood from §5.2 gives the score
+  ```
+  U_i = ∂ℓ_i/∂β = w_i [ d_i (x_exit + D_exit / dη_exit) - H_exit_i x_exit + H_entry_i x_entry ].
+  ```
+  The entry term carries a positive sign in the score because `∂(-ΔH_i)/∂β = -H_exit_i x_exit + H_entry_i x_entry`.
+- Differentiating once more yields the observed Hessian of the log-likelihood:
+  ```
+  ∂²ℓ_i/∂β∂βᵀ = -w_i [ d_i (D_exit D_exitᵀ)/(dη_exit)² + H_exit_i x_exit x_exitᵀ - H_entry_i x_entry x_entryᵀ ].
+  ```
+  The first block comes from the derivative of `log(dη_exit)`, and the entry contribution enters with the opposite sign of the exit block.
+- PIRLS works with the negative Hessian, so each subject contributes
+  ```
+  H_i = -∂²ℓ_i/∂β∂βᵀ = w_i [ d_i (D_exit D_exitᵀ)/(dη_exit)² + H_exit_i x_exit x_exitᵀ - H_entry_i x_entry x_entryᵀ ].
+  ```
+- `WorkingState::hessian` must therefore supply this negative Hessian so the PIRLS solve `(H + S) Δβ = g` uses the expected sign convention.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
@@ -193,7 +198,6 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - analytic Hessians match autodiff or finite-difference checks on toy datasets with rare target events;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
