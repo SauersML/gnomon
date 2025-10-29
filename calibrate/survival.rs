@@ -958,12 +958,15 @@ mod tests {
             SurvivalSpec::default(),
         )
         .unwrap();
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: CovariateLayout {
-                column_names: vec![],
+                column_names: static_names,
             },
             penalties: PenaltyDescriptor {
                 order: 2,
@@ -1146,12 +1149,15 @@ mod tests {
             degree: 2,
         };
         let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: CovariateLayout {
-                column_names: vec!["pgs".into(), "sex".into(), "pc1".into(), "pc2".into()],
+                column_names: static_names.clone(),
             },
             penalties: PenaltyDescriptor {
                 order: 2,
@@ -1161,8 +1167,7 @@ mod tests {
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
         };
-        let mismatched_covs =
-            Array1::<f64>::zeros(artifacts.static_covariate_layout.column_names.len() + 1);
+        let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
