@@ -27,7 +27,8 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. No alternate update loops or GLM-specific vectors are required.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite factorization (e.g., Faer `ldlt` with rook pivoting) when the observed information is used. No alternate update loops or GLM-specific vectors are required. Document the permutation so the factor can be reapplied outside the PIRLS loop.
+- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -134,13 +135,23 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
-- The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs.
+- The penalty trace term uses the provided Hessian: apply the stored symmetric-indefinite factor (`ldlt_solve`) when working with the observed information, or the SPD Cholesky solve when the expected information approximation is chosen.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
 ### 7.1 Stored artifacts
 `SurvivalModelArtifacts` persist:
 ```rust
+pub enum HessianFactor {
+    Observed {
+        ldlt_factor: LdltFactor,
+        permutation: PermutationMatrix,
+    },
+    Expected {
+        cholesky_factor: CholeskyFactor,
+    },
+}
+
 pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
     pub age_basis: BasisDescriptor,
@@ -149,10 +160,10 @@ pub struct SurvivalModelArtifacts {
     pub penalties: PenaltyDescriptor,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
-    pub hessian_factor: Option<CholeskyFactor>,
+    pub hessian_factor: Option<HessianFactor>,
 }
 ```
-- The Hessian factor enables delta-method standard errors.
+- The Hessian factor enables delta-method standard errors and must record the permutation applied during the LDLᵀ factorization when the observed information is stored.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
