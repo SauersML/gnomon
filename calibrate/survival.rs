@@ -254,7 +254,8 @@ impl WorkingModel for WorkingModelSurvival {
             gradient -= &(x_exit_vec.clone() * (w * h_exit_i));
             gradient += &(x_entry_vec.clone() * (w * h_entry_i));
 
-            rank1_update(&mut hessian, &x_tilde, w * d);
+            let derivative_basis = &d_exit_vec / guard;
+            rank1_update(&mut hessian, &derivative_basis, w * d);
             rank1_update(&mut hessian, &x_exit_vec, w * h_exit_i);
             rank1_update(&mut hessian, &x_entry_vec, w * h_entry_i);
         }
