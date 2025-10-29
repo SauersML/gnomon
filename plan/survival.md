@@ -67,12 +67,10 @@ pub struct SurvivalPredictionInputs<'a> {
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
-- Compute `a_min = min(age_entry)` and choose a guard `δ > 0` from the empirical age-entry distribution (e.g., a low percentile such as the 0.5th) subject to sensible floors/ceilings (e.g., clamp to `[1e-3, 1.0]`) so that `age - a_min + δ` remains well separated from zero without introducing an outsized shift.
+- Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
 - Map ages to `u = log(age - a_min + δ)` for both training and scoring.
 - Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
 - Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
-- Enforce a runtime guard that rejects evaluations for any age `< a_min - δ/2`; this check must run wherever ages are ingested (loaders, scoring APIs) and return a structured error that records the offending age, the guard threshold, and recommended remediation (refresh the training cohort or clamp requests to be within support).
-- Document that when the guard triggers the prediction should fail fast with a message instructing operators to either widen the training support or adjust the requested age range; silent clipping is forbidden.
 
 ### 4.2 Baseline spline and reference constraint
 - Build a B-spline basis over `u` for the baseline log cumulative hazard `η_0(u)`.
@@ -176,16 +174,17 @@ pub struct SurvivalModelArtifacts {
 ```
 CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+CIF_competing_total_t0 supplied externally (see below; must equal the total competing CIF accumulated up to t0).
+assert 0 ≤ CIF_competing_total_t0 ≤ 1 - CIF_target(t0).
+conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - CIF_competing_total_t0).
 ```
-- `F_competing_t0` is supplied externally (see §7.3).
 - Default `ε = 1e-12` to maintain numeric stability.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
-  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
-  - user-supplied competing CIF values for the cohort.
+  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)` so the total competing CIF at `t0` can be evaluated; or
+  - user-supplied total competing CIF values evaluated at the requested `t0` for the cohort.
 - Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
@@ -194,14 +193,13 @@ Expose:
 ```rust
 fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
-fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
+fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_total_t0: f64) -> f64;
 ```
 - All prediction APIs surface per-subject risks under the frequency-weighted fit. We do not rescale outputs for inverse-probability sampling or provide sandwich-standard-error corrections at prediction time.
+- When `t0` equals the subject's entry age, reuse the cached `H_entry` from training to avoid recomputing the cumulative hazard.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
-- Before taking logits, clamp the predicted risks to `[ε, 1-ε]` using the same `ε` guard as §7.2 so that downstream calibration shares the scoring-time stability guarantees.
-- When propagating delta-method variances through the calibration step, apply the same clamping to the mean prediction and carry the derivative of the clamp in the Jacobian so that variance estimates respect the truncated support.
 - Features: base prediction, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
 - Use out-of-fold predictions during training to avoid optimism.
 - Remove age-hull or KM-based diagnostics from calibrator features.
@@ -209,15 +207,14 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 
 ## 9. Testing and diagnostics
 - Unit tests:
-  - gradient/Hessian correctness, using complex-step derivatives for the log-derivative term and finite differences elsewhere on small synthetic data;
+  - gradient/Hessian correctness via finite differences on small synthetic data;
   - deviance decreases monotonically under PIRLS iterations;
-  - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations and that the LDLᵀ factorization recovers the expected inertia when truncation removes early events;
+  - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Add weighted evaluation tests that verify frequency-weighted metrics (e.g., log-likelihood, Brier score) against a trusted reference implementation so future changes preserve the intended weighting semantics.
 - Remove benchmarks centered on risk-set algebra or quadrature.
-- Add left-truncation diagnostics that stress LDLᵀ inertia: synthesize censored cohorts where entry times force alternating event status so the stabilized factorization must pivot and record signature changes, verifying logging and metrics when inertia deviates from the SPD baseline.
 
 ## 10. Implementation roadmap
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
