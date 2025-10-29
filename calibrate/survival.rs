@@ -20,6 +20,8 @@ pub enum SurvivalError {
     EmptyAgeVector,
     #[error("age values must be finite")]
     NonFiniteAge,
+    #[error("age {age} is outside the guarded log-age domain (a_min={minimum}, delta={delta})")]
+    GuardDomainViolation { age: f64, minimum: f64, delta: f64 },
     #[error("age_entry must be strictly less than age_exit for every subject")]
     InvalidAgeOrder,
     #[error("event indicators must be 0 or 1")]
@@ -79,18 +81,39 @@ impl AgeTransform {
         })
     }
 
-    #[inline]
-    pub fn transform(&self, age: f64) -> f64 {
-        (age - self.minimum_age + self.delta).ln()
+    fn guard_shift(&self, age: f64) -> Result<f64, SurvivalError> {
+        if !age.is_finite() {
+            return Err(SurvivalError::NonFiniteAge);
+        }
+        let shifted = age - self.minimum_age + self.delta;
+        if !shifted.is_finite() || shifted <= 0.0 {
+            return Err(SurvivalError::GuardDomainViolation {
+                age,
+                minimum: self.minimum_age,
+                delta: self.delta,
+            });
+        }
+        Ok(shifted)
     }
 
     #[inline]
-    pub fn derivative_factor(&self, age: f64) -> f64 {
-        1.0 / (age - self.minimum_age + self.delta)
+    pub fn transform(&self, age: f64) -> Result<f64, SurvivalError> {
+        let shifted = self.guard_shift(age)?;
+        Ok(shifted.ln())
     }
 
-    pub fn transform_array(&self, ages: &Array1<f64>) -> Array1<f64> {
-        ages.mapv(|age| self.transform(age))
+    #[inline]
+    pub fn derivative_factor(&self, age: f64) -> Result<f64, SurvivalError> {
+        let shifted = self.guard_shift(age)?;
+        Ok(1.0 / shifted)
+    }
+
+    pub fn transform_array(&self, ages: &Array1<f64>) -> Result<Array1<f64>, SurvivalError> {
+        let mut result = Array1::<f64>::zeros(ages.len());
+        for (idx, &age) in ages.iter().enumerate() {
+            result[idx] = self.transform(age)?;
+        }
+        Ok(result)
     }
 }
 
@@ -355,8 +378,8 @@ pub fn build_survival_layout(
     data.validate()?;
     let n = data.age_entry.len();
     let age_transform = AgeTransform::from_training(&data.age_entry, delta)?;
-    let log_entry = age_transform.transform_array(&data.age_entry);
-    let log_exit = age_transform.transform_array(&data.age_exit);
+    let log_entry = age_transform.transform_array(&data.age_entry)?;
+    let log_exit = age_transform.transform_array(&data.age_exit)?;
 
     let reference_u = log_exit.mean().unwrap_or(0.0);
     let reference_constraint =
@@ -376,7 +399,7 @@ pub fn build_survival_layout(
         .into_iter()
         .zip(data.age_exit.iter().copied())
     {
-        let factor = age_transform.derivative_factor(age);
+        let factor = age_transform.derivative_factor(age)?;
         row.mapv_inplace(|v| v * factor);
     }
 
@@ -520,12 +543,15 @@ fn build_monotonicity_penalty(
         }
     }
 
-    let log_grid = grid.mapv(|age| layout.age_transform.transform(age));
+    let mut log_grid = Array1::<f64>::zeros(grid_size);
+    for (idx, &age) in grid.iter().enumerate() {
+        log_grid[idx] = layout.age_transform.transform(age)?;
+    }
     let (_, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis)?;
     let constrained_derivative_u = layout.reference_constraint.apply(&derivative_u);
     let mut derivative_age = constrained_derivative_u;
     for (mut row, &age) in derivative_age.rows_mut().into_iter().zip(grid.iter()) {
-        let factor = layout.age_transform.derivative_factor(age);
+        let factor = layout.age_transform.derivative_factor(age)?;
         row *= factor;
     }
 
@@ -754,14 +780,13 @@ pub fn cumulative_hazard(
     age: f64,
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
-) -> f64 {
-    let log_age = artifacts.age_transform.transform(age);
+) -> Result<f64, SurvivalError> {
+    let log_age = artifacts.age_transform.transform(age)?;
     let (basis_arc, _) = create_bspline_basis_with_knots(
         array![log_age].view(),
         artifacts.age_basis.knot_vector.view(),
         artifacts.age_basis.degree,
-    )
-    .expect("prediction basis");
+    )?;
     let basis = (*basis_arc).clone();
     let constrained = artifacts.reference_constraint.apply(&basis);
 
@@ -771,23 +796,22 @@ pub fn cumulative_hazard(
             array![log_age].view(),
             time_basis.knot_vector.view(),
             time_basis.degree,
-        )
-        .expect("time basis");
+        )?;
         let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
         design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
     }
     design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
     let eta = design.dot(&artifacts.coefficients);
-    eta.exp()
+    Ok(eta.exp())
 }
 
 pub fn cumulative_incidence(
     age: f64,
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
-) -> f64 {
-    let h = cumulative_hazard(age, covariates, artifacts);
-    1.0 - (-h).exp()
+) -> Result<f64, SurvivalError> {
+    let h = cumulative_hazard(age, covariates, artifacts)?;
+    Ok(1.0 - (-h).exp())
 }
 
 pub fn conditional_absolute_risk(
@@ -796,12 +820,12 @@ pub fn conditional_absolute_risk(
     covariates: &Array1<f64>,
     cif_competing_t0: f64,
     artifacts: &SurvivalModelArtifacts,
-) -> f64 {
-    let cif0 = cumulative_incidence(t0, covariates, artifacts);
-    let cif1 = cumulative_incidence(t1, covariates, artifacts);
+) -> Result<f64, SurvivalError> {
+    let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
+    let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
     let delta = (cif1 - cif0).max(0.0);
     let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
-    delta / denom
+    Ok(delta / denom)
 }
 
 /// Calibrator feature extraction for survival predictions.
@@ -933,10 +957,10 @@ mod tests {
             hessian_factor: None,
         };
         let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
-        let cif0 = cumulative_incidence(55.0, &covs, &artifacts);
-        let cif1 = cumulative_incidence(60.0, &covs, &artifacts);
+        let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
+        let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
         assert!(cif1 >= cif0 - 1e-9);
-        let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts);
+        let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
     }
 
@@ -1056,5 +1080,44 @@ mod tests {
                 assert!(diff.abs() < 1e-3, "hessian mismatch at ({}, {})", k, j);
             }
         }
+    }
+
+    #[test]
+    fn cumulative_hazard_respects_guard() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: CovariateLayout {
+                column_names: vec![],
+            },
+            penalties: PenaltyDescriptor {
+                order: 2,
+                lambda: 0.5,
+            },
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            hessian_factor: None,
+        };
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let guard_floor = artifacts.age_transform.minimum_age - artifacts.age_transform.delta - 0.5;
+        let err = cumulative_hazard(guard_floor, &covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::GuardDomainViolation { .. }));
+
+        let ok_age = artifacts.age_transform.minimum_age;
+        assert!(cumulative_hazard(ok_age, &covs, &artifacts).is_ok());
+
+        // Ensure the monotonicity penalty builder is still exercised.
+        assert_eq!(
+            penalty.derivative_design.ncols(),
+            layout.combined_exit.ncols()
+        );
     }
 }
