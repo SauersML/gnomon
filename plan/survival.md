@@ -1,7 +1,7 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the cause-specific cumulative hazard. The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
@@ -107,11 +107,11 @@ pub struct SurvivalLayout {
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
-For subject `i`:
+Work on the cause-specific cumulative hazard scale so the full likelihood matches the standard counting-process construction with delayed entry. For subject `i`:
 ```
 ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. The difference `ΔH_i = H_exit_i - H_entry_i` already accounts for the at-risk time, so no supplementary subdistribution weighting or pseudo risk set is required.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
@@ -156,17 +156,16 @@ pub struct SurvivalModelArtifacts {
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
-- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
-- `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1`:
+- Evaluate `η_c(t)` for each cause by reconstructing the constrained basis at age `t` using the stored transform.
+- `H_c(t) = exp(η_c(t))` gives the cause-specific cumulative hazard, while the corresponding hazard evaluates to `λ_c(t) = dH_c/dt = dη_c/dt · exp(η_c(t))` using the cached derivative design.
+- The overall survival function across all causes is `S(t) = exp(-Σ_c H_c(t))`.
+- The target cumulative incidence function follows the standard integral:
 ```
-CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+CIF_target(t) = ∫_0^t S(u) λ_target(u) du.
 ```
-- Default `ε = 1e-12` to maintain numeric stability.
-- No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
+  Implement Gauss–Kronrod or adaptive Gauss–Legendre quadrature on guarded age grids so the numerical error remains below `1e-6` relative tolerance. Store the quadrature rule alongside the prediction artifacts so scoring can reuse the same nodes and weights across calls.
+- Absolute risk between `t0` and `t1` becomes `ΔF = CIF_target(t1) - CIF_target(t0)` with the competing CIF at `t0` supplied externally (see below). Use `conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0)` and keep the default `ε = 1e-12` for numeric stability.
+- Document the O(K·Q) cost per subject, where `K` is the number of causes scored jointly and `Q` the quadrature nodes, so downstream consumers can budget for the additional numerical work compared with a closed-form subdistribution formulation.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
