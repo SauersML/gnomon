@@ -23,13 +23,12 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- `WorkingState::hessian` is always the coefficient-space curvature (the "Fisher" matrix `Xᵀ W X`).
-- Logistic and Gaussian models must materialize this matrix before returning from `update`; passing diagonal observation weights is no longer permitted.
-- The RP survival model produces the same coefficient-space Hessian alongside its deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- `WorkingState::hessian` always lives in coefficient space (`p × p`) so downstream PIRLS code receives the full Fisher information contribution for the active coefficients.
+- Logistic and Gaussian models assemble `Xᵀ W X` internally and return dense Hessians through this trait, matching the survival implementation. The RP survival model likewise returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. The solver never inspects per-observation weights; it only consumes the assembled coefficient Hessian.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. No alternate update loops or GLM-specific vectors are required.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -68,11 +67,9 @@ pub struct SurvivalPredictionInputs<'a> {
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
-- Compute `a_min = min(age_entry)` and `a_max = max(age_exit)` and choose a small guard `δ > 0` (e.g., `0.1`).
-- Define a minimum allowable scoring age `age_guard = a_min - 0.5 δ`, which guarantees `age - a_min + δ ≥ 0.5 δ`.
+- Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
 - Map ages to `u = log(age - a_min + δ)` for both training and scoring.
-- Store `AgeTransform { a_min, a_max, delta, min_allowed: age_guard, below_min_policy: Reject, above_max_policy: Warn }` in the trained artifact and reuse it verbatim at prediction time.
-- At prediction time, reject (hard error) any request with `age < age_guard` so the transform never extrapolates below the learned support; log a warning (tagged by `above_max_policy`) but continue for `age > a_max` to highlight the extrapolation.
+- Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
 - Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
 
 ### 4.2 Baseline spline and reference constraint
@@ -160,7 +157,7 @@ pub struct SurvivalModelArtifacts {
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
-- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform. Enforce `t ≥ min_allowed` by returning a structured error (mirroring `below_min_policy: Reject`) before any basis work, and emit the stored extrapolation warning if `t > a_max`.
+- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
 - `H(t) = exp(η(t))`.
 - Absolute risk between `t0` and `t1`:
 ```
@@ -198,8 +195,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - gradient/Hessian correctness via finite differences on small synthetic data;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
-  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`);
-  - scoring guard rails: verify ages at `min_allowed`, slightly above it, and clearly below it, plus ages past `a_max`, trigger the documented error/warning paths.
+  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
@@ -219,7 +215,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 Store in the trained model artifact:
 - baseline knot vector and spline degree;
 - reference constraint transform (matrix or factorisation);
-- `AgeTransform { a_min, a_max, delta, min_allowed, below_min_policy, above_max_policy }`;
+- `AgeTransform { a_min, delta }`;
 - centering transforms for interactions and covariate ranges for guard rails;
 - penalized Hessian (or its Cholesky factor) for delta-method standard errors;
 - optional handles to companion competing-risk models.
