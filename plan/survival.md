@@ -102,7 +102,7 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
+- `ΔH = H_exit - H_entry` (non-negative when the exit hazard stays above the entry hazard; unconstrained derivatives can violate this and drive `ΔH < 0`).
 - `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
@@ -130,7 +130,9 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+- Clamp `dη_exit` (and the grid evaluations) to a small `ε` (e.g., `1e-6`) immediately before applying `log(dη_exit)` so the score and Hessian stay finite when backpropagating through batches that momentarily violate monotonicity.
+- Consider stronger guards when the soft penalty is insufficient: increase `λ_soft`, or reparameterize `η(age)` with a monotone basis (e.g., integrate `exp(f(age))`) so that positivity is enforced by construction. The reparameterization hooks into training by swapping the design/derivative builders while leaving the downstream likelihood code unchanged.
+- Feed the clamp, penalty, or reparameterization contributions into the same autograd tape / working-state accumulator used for smoothness penalties so the optimizer receives consistent gradients and Hessians during joint training.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
