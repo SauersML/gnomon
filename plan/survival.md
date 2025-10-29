@@ -1,7 +1,7 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the cause-specific cumulative hazard for a designated target event. The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
@@ -155,25 +155,18 @@ pub struct SurvivalModelArtifacts {
 - The Hessian factor enables delta-method standard errors.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
-### 7.2 Hazard and cumulative incidence
-- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
-- `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1`:
-```
-CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
-```
+### 7.2 Hazard, survival, and cumulative incidence
+- Evaluate `η_k(t)` for each cause `k` by reconstructing the constrained basis at requested age `t` using the stored transform of its model and set `H_k(t) = exp(η_k(t))`.
+- Recover the instantaneous hazard via the cached derivative designs: `λ_k(t) = dH_k(t)/dt`. The guarded log-age transform keeps the derivative stable near the entry boundary.
+- Assemble the overall survival as `S(t) = exp(-Σ_k H_k(t))` using the target cause and all supplied competing causes.
+- Cumulative incidence for the target cause is defined by `CIF_target(t) = ∫_0^t S(u) λ_target(u) du`. Evaluate the integral with an adaptive Gauss–Kronrod or Simpson rule that reuses the derivative evaluations already required for PIRLS diagnostics, and cache quadrature nodes so repeated subject-level queries amortise setup costs.
+- Conditional absolute risk between `t0` and `t1` uses `ΔF = CIF_target(t1) - CIF_target(t0)` and divides by `max(ε, 1 - CIF_target(t0) - F_competing(t0))`, where `F_competing` is the combined cumulative incidence of all non-target causes.
 - Default `ε = 1e-12` to maintain numeric stability.
-- No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
-- Encourage fitting companion RP models for key competing causes. Scoring accepts either:
-  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
-  - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
-- Remove any suggestion of Kaplan–Meier proxies.
+- Encourage fitting companion RP models for each competing cause so scoring has access to `{H_k(t), λ_k(t)}` for all causes. Provide utilities that accept a list of `SurvivalModelArtifacts` and materialise the shared quadrature grid before evaluating any subject-level requests.
+- When external inputs are supplied instead of trained artifacts, require both cumulative hazards and hazard evaluations on the quadrature grid so the numerical integration remains well-defined.
+- Document that without individualized cause-specific hazards the resulting cumulative incidence can be biased because the survival term omits other causes. Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
 Expose:
@@ -182,6 +175,8 @@ fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
 fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
+- `cumulative_incidence` and `conditional_absolute_risk` operate on an object that already knows the companion hazards and prec
+  omputed quadrature grid, ensuring survival across all causes is integrated consistently.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
