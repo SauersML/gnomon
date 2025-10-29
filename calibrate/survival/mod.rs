@@ -818,10 +818,9 @@ fn softplus(x: f64) -> f64 {
 
 fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
         let z = x.exp();
         z / (1.0 + z)
-    } else {
-        let z = (-x).exp();
-        1.0 / (1.0 + z)
     }
 }
