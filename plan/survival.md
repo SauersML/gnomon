@@ -66,10 +66,10 @@ pub struct SurvivalPredictionInputs<'a> {
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
-- Select a lower reference `L` strictly below the training support (e.g., a buffered low-percentile of `age_entry`) so that `age_entry > L` for every subject.
-- Map ages to `u_raw = log(age - L)` for both training and scoring, then standardise with `u = (u_raw - μ_u) / σ_u`, where `μ_u` and `σ_u > 0` are the training mean and scale of `u_raw`.
-- Persist `AgeTransform { lower_reference: L, mean: μ_u, scale: σ_u }` in the trained artifact and reuse it verbatim at prediction time.
-- Apply the chain-rule factor `∂u/∂age = (1/σ_u) · 1/(age - L)` in both training layouts and scoring-time derivative reconstructions so every age derivative accounts for the stored standardisation.
+- Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
+- Map ages to `u = log(age - a_min + δ)` for both training and scoring.
+- Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
+- Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
 
 ### 4.2 Baseline spline and reference constraint
 - Build a B-spline basis over `u` for the baseline log cumulative hazard `η_0(u)`.
@@ -96,14 +96,14 @@ pub struct SurvivalLayout {
     pub penalties: PenaltyBlocks,
 }
 ```
-- Derivative matrices apply the stored chain-rule factor `(1/σ_u) · 1/(age - L)` so they already represent `(∂η/∂age)` contributions at exit. No derivative-at-entry cache is required.
+- Derivative matrices apply the chain-rule scaling so they already represent `(∂η/∂age)` contributions at exit. No derivative-at-entry cache is required.
 
 ## 5. Likelihood, score, and Hessian
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
 - `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale because `D_exit` incorporates `(1/σ_u) · 1/(age - L)` from the guarded transform.
+- `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
@@ -153,28 +153,32 @@ pub struct SurvivalModelArtifacts {
 }
 ```
 - The Hessian factor enables delta-method standard errors.
-- `AgeTransform` records `lower_reference`, `mean`, and `scale` so the guarded log-age standardisation replays identically at scoring time.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
 - `H(t) = exp(η(t))`.
-- Any requested age derivatives reuse the stored chain-rule factor `(1/σ_u) · 1/(t - L)` to match the training layout scaling.
-- Absolute risk between `t0` and `t1`:
+- Absolute risk between `t0` and `t1` draws directly from the model's cumulative incidence:
 ```
 CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+ΔF_raw = CIF_target(t1) - CIF_target(t0).
+ΔF = clip(ΔF_raw, 0.0, 1.0).
 ```
-- Default `ε = 1e-12` to maintain numeric stability.
+- Here `clip(x, a, b)` truncates `x` into the closed interval `[a, b]` to guard against numerical drift.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Document how the competing-risk term feeds the conditional denominator:
+```
+F_competing(t0) = supplied competing CIF at `t0` (artifact- or cohort-derived).
+denom_raw = 1.0 - CIF_target(t0) - F_competing(t0).
+denom = clip(denom_raw, 0.0, 1.0).
+```
+- Clipping the denominator keeps the conditional risk bounded when competing incidence estimates drift slightly outside `[0, 1]`.
+- Without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -184,6 +188,7 @@ fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
 fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
+- Implement `conditional_absolute_risk` as `clip(ΔF_raw, 0.0, 1.0) / clip(denom_raw, ε, 1.0)` with `ε = 1e-12` for stability.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
@@ -197,7 +202,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`);
-  - scoring stability for cohorts containing ages slightly below the training minimum, exercising the stored `L`, `μ_u`, and `σ_u` guards.
+  - synthetic cohorts where `t1 ≈ t0` to ensure the conditional risk stays within `[0, 1]` under nearly identical horizons.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
@@ -217,7 +222,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 Store in the trained model artifact:
 - baseline knot vector and spline degree;
 - reference constraint transform (matrix or factorisation);
-- `AgeTransform { lower_reference: L, mean: μ_u, scale: σ_u }`;
+- `AgeTransform { a_min, delta }`;
 - centering transforms for interactions and covariate ranges for guard rails;
 - penalized Hessian (or its Cholesky factor) for delta-method standard errors;
 - optional handles to companion competing-risk models.
