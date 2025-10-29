@@ -423,9 +423,23 @@ impl WorkingModel for WorkingModelSurvival {
             hess_barrier += &barrier_outer;
         }
 
-        let gradient = grad_barrier * 2.0 - &(grad_loglik * 2.0);
-        let hessian = hess_barrier * 2.0 - &(hess_loglik * 2.0);
-        let deviance = -2.0 * (loglik - barrier_value);
+        let mut gradient = grad_barrier * 2.0 - &(grad_loglik * 2.0);
+        let mut hessian = hess_barrier * 2.0 - &(hess_loglik * 2.0);
+        let mut deviance = -2.0 * (loglik - barrier_value);
+
+        for block in &self.layout.penalties.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            assert_eq!(block.matrix.nrows(), beta.len());
+            assert_eq!(block.matrix.ncols(), beta.len());
+
+            let s_beta = block.matrix.dot(beta);
+            let scale = 2.0 * block.lambda;
+            gradient += &s_beta.mapv(|v| v * scale);
+            hessian += &block.matrix.mapv(|v| v * scale);
+            deviance += block.lambda * beta.dot(&s_beta);
+        }
 
         WorkingState {
             eta: eta_exit,
@@ -596,8 +610,10 @@ mod tests {
             z_transform: Array2::from_elem((1, 1), 1.0),
         };
 
+        let mut penalty_matrix = Array2::zeros((2, 2));
+        penalty_matrix[[0, 0]] = 1.0;
         let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
-            matrix: Array2::eye(1),
+            matrix: penalty_matrix,
             lambda: 1.0,
         }]);
 
