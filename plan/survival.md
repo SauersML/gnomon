@@ -19,15 +19,16 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
   pub struct WorkingState {
       pub eta: Array1<f64>,
       pub gradient: Array1<f64>,
-      pub hessian: Array2<f64>, // symmetric but not assumed positive definite
+      pub hessian: Array2<f64>,
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal (positive) Hessians through this trait. The RP survival model returns a dense Hessian that may be indefinite together with its deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions and defers definiteness handling to the shared linear algebra layer.
+- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite LDLᵀ factorisation with rook pivoting (Faer’s `symmetric_indefinite` routine). The permutation and block-diagonal scalings are cached to support reuse in smoothing updates. No alternate update loops or GLM-specific vectors are required.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite factorization (e.g., Faer `ldlt` with rook pivoting) when the observed information is used. No alternate update loops or GLM-specific vectors are required. Document the permutation so the factor can be reapplied outside the PIRLS loop.
+- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -134,17 +135,23 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
-- Form the penalised system `A = H + Σ λ S` and factorise it once per PIRLS iteration with the symmetric-indefinite LDLᵀ routine, returning permutation `P`, unit-lower `L`, and block-diagonal `D` (1×1 or 2×2 pivots). Smoothing parameter updates reuse this factor to compute:
-  - `A^{-1} g` by applying `Pᵀ`, solving `Ly = P g`, `Dz = y`, and `Lᵀ x = z`.
-  - log-determinants `log |A| = Σ log |D_i|`, accumulating log-absolute-determinants of the pivot blocks.
-  - trace terms `tr(A^{-1} S_j)` by solving `A X = S_j` column-wise with the stored factor (batched triangular solves) and contracting `trace(S_j X)` without forming dense inverses.
-- When Hessian noise causes persistent negative pivots, switch to a positive-semidefinite expected-information approximation `Ĥ` constructed by replacing the observed Hessian blocks with the expected Fisher information integrated over a 5-point Gauss–Legendre quadrature on the log-age scale. The same LDLᵀ machinery applies because `Ĥ + Σ λ S` is positive semidefinite but stabilised by the penalties. Record this substitution for downstream diagnostics.
+- The penalty trace term uses the provided Hessian: apply the stored symmetric-indefinite factor (`ldlt_solve`) when working with the observed information, or the SPD Cholesky solve when the expected information approximation is chosen.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
 ### 7.1 Stored artifacts
 `SurvivalModelArtifacts` persist:
 ```rust
+pub enum HessianFactor {
+    Observed {
+        ldlt_factor: LdltFactor,
+        permutation: PermutationMatrix,
+    },
+    Expected {
+        cholesky_factor: CholeskyFactor,
+    },
+}
+
 pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
     pub age_basis: BasisDescriptor,
@@ -153,37 +160,30 @@ pub struct SurvivalModelArtifacts {
     pub penalties: PenaltyDescriptor,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
-    pub hessian_factor: Option<LdltFactor>,
+    pub hessian_factor: Option<HessianFactor>,
 }
 ```
-- The Hessian factor stores the permutation, block structure, and diagonal entries from the LDLᵀ solve so delta-method standard errors and score diagnostics can reuse it without rebuilding the factorisation.
-- If an expected-information approximation `Ĥ` was required for stability, persist a `FactorProvenance::ExpectedInformation` flag along with the quadrature metadata (log-age knots and weights) to reproduce trace/log-determinant calculations during scoring or refits.
+- The Hessian factor enables delta-method standard errors and must record the permutation applied during the LDLᵀ factorization when the observed information is stored.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
 - `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1` draws directly from the model's cumulative incidence:
+- Absolute risk between `t0` and `t1`:
 ```
 CIF_target(t) = 1 - exp(-H(t)).
-ΔF_raw = CIF_target(t1) - CIF_target(t0).
-ΔF = clip(ΔF_raw, 0.0, 1.0).
+ΔF = CIF_target(t1) - CIF_target(t0).
+F_competing_t0` supplied externally (see below).
+conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
-- Here `clip(x, a, b)` truncates `x` into the closed interval `[a, b]` to guard against numerical drift.
+- Default `ε = 1e-12` to maintain numeric stability.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document how the competing-risk term feeds the conditional denominator:
-```
-F_competing(t0) = supplied competing CIF at `t0` (artifact- or cohort-derived).
-denom_raw = 1.0 - CIF_target(t0) - F_competing(t0).
-denom = clip(denom_raw, 0.0, 1.0).
-```
-- Clipping the denominator keeps the conditional risk bounded when competing incidence estimates drift slightly outside `[0, 1]`.
-- Without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -193,7 +193,6 @@ fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
 fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
 ```
-- Implement `conditional_absolute_risk` as `clip(ΔF_raw, 0.0, 1.0) / clip(denom_raw, ε, 1.0)` with `ε = 1e-12` for stability.
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
@@ -206,8 +205,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - gradient/Hessian correctness via finite differences on small synthetic data;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
-  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`);
-  - synthetic cohorts where `t1 ≈ t0` to ensure the conditional risk stays within `[0, 1]` under nearly identical horizons.
+  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
