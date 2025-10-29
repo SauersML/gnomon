@@ -24,11 +24,12 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
   }
   ```
 - Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- Document that the PIRLS module now houses a penalised Newton solver implemented with an LDLᵀ factorisation. The name stays `pirls` for continuity, but the shared solver treats all families through this penalised Newton/LDLᵀ lens.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
 - PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite factorization (e.g., Faer `ldlt` with rook pivoting) when the observed information is used. No alternate update loops or GLM-specific vectors are required. Document the permutation so the factor can be reapplied outside the PIRLS loop.
-- Provide a damped Newton / trust-region fallback that perturbs the symmetric-indefinite system when the observed information fails (`H + S + λ I`). This retains the observed score and curvature while guaranteeing a positive-definite solve without requiring a Fisher-information quadrature implementation.
+- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -103,7 +104,8 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = exp(η_entry) * expm1(η_exit - η_entry)` (numerically stable and non-negative up to round-off; allow tiny negative residuals only inside diagnostics).
+- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
+- Accept that floating-point noise can produce small negative `ΔH` in early iterations; diagnostics may floor these residuals at zero, but the likelihood must continue to consume the raw values to preserve gradient consistency.
 - `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
@@ -122,26 +124,21 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Exact second derivative (Hessian of the log-likelihood contribution):
+- Hessian contribution:
 ```
-∂²ℓ_i/∂β∂βᵀ = w_i [ -H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry - d_i D_exit^T D_exit / dη_exit_i^2 ].
+H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
-- Observed information is the negative Hessian, so the accumulation supplied by `WorkingState::hessian` uses
-```
-H += -∂²ℓ_i/∂β∂βᵀ = w_i [ H_exit_i x_exit^T x_exit - H_entry_i x_entry^T x_entry + d_i D_exit^T D_exit / dη_exit_i^2 ].
-```
-- `WorkingState::hessian` therefore stores the exact observed information rather than a Gauss–Newton approximation.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
 - Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
+- When reporting diagnostics (e.g., monotonicity warnings), floor any slightly negative `ΔH` at zero so the readouts remain interpretable without perturbing the actual likelihood contributions.
 
 ## 6. REML / smoothing integration
-- The outer REML loop is unchanged. It now receives `WorkingState` with dense observed-information Hessians when the survival family is active.
-- The PIRLS solve forms `H + S` from the observed information and applies an LDLᵀ factorization with rook pivoting; the SPD Cholesky path remains only for the optional expected-information approximation.
-- The penalty trace term reuses the same factor (`ldlt_solve` for observed information, Cholesky for the approximation) so REML and LAML derivatives stay consistent.
+- The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
+- The penalty trace term uses the provided Hessian: apply the stored symmetric-indefinite factor (`ldlt_solve`) when working with the observed information, or the SPD Cholesky solve when the expected information approximation is chosen.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
@@ -190,7 +187,7 @@ conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator becomes 1 minus the sum of all cause CIFs at t0, so cohort-level plug-ins may lose calibration.
+- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -212,7 +209,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - PIRLS line search enforces an Armijo/Wolfe-style deviance decrease before accepting each step;
+  - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
@@ -234,7 +231,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 11. Persisted metadata checklist
 Store in the trained model artifact:
 - baseline knot vector and spline degree;
-- reference constraint transform (matrix or factorisation);
+- reference constraint transform (matrix or factorisation) and the associated reference point `u_ref` used to anchor the baseline log cumulative hazard;
 - `AgeTransform { a_min, delta }`;
 - centering transforms for interactions and covariate ranges for guard rails;
 - penalized Hessian (or its Cholesky factor) for delta-method standard errors;
