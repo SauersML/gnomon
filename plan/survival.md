@@ -205,14 +205,15 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 
 ## 9. Testing and diagnostics
 - Unit tests:
-  - gradient/Hessian correctness via finite differences on small synthetic data;
+  - gradient/Hessian correctness, using complex-step derivatives for the log-derivative term and finite differences elsewhere on small synthetic data;
   - deviance decreases monotonically under PIRLS iterations;
-  - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
+  - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations and that the LDLᵀ factorization recovers the expected inertia when truncation removes early events;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Add weighted evaluation tests that verify frequency-weighted metrics (e.g., log-likelihood, Brier score) against a trusted reference implementation so future changes preserve the intended weighting semantics.
 - Remove benchmarks centered on risk-set algebra or quadrature.
+- Add left-truncation diagnostics that stress LDLᵀ inertia: synthesize censored cohorts where entry times force alternating event status so the stabilized factorization must pivot and record signature changes, verifying logging and metrics when inertia deviates from the SPD baseline.
 
 ## 10. Implementation roadmap
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
