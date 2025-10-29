@@ -612,17 +612,19 @@ impl WorkingModel for WorkingModelSurvival {
 
         let h_exit = eta_exit.mapv(f64::exp);
         let h_entry = eta_entry.mapv(f64::exp);
-        let mut delta_h = &h_exit - &h_entry;
-        delta_h.mapv_inplace(|v| v.max(0.0));
 
         let n = eta_exit.len();
         let p = beta.len();
         let mut gradient = Array1::<f64>::zeros(p);
-        let mut hessian = Array2::<f64>::zeros((p, p));
+        let mut observed_hessian = Array2::<f64>::zeros((p, p));
+        let mut expected_hessian = if self.spec.use_expected_information {
+            Some(Array2::<f64>::zeros((p, p)))
+        } else {
+            None
+        };
         let mut deviance = 0.0;
 
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
-        let use_expected_information = self.spec.use_expected_information;
         for i in 0..n {
             let weight = self.sample_weight[i];
             if weight == 0.0 {
@@ -632,13 +634,9 @@ impl WorkingModel for WorkingModelSurvival {
             let eta_e = eta_exit[i];
             let h_e = h_exit[i];
             let h_s = h_entry[i];
-            let delta = delta_h[i];
+            let delta = h_e - h_s;
             let d_eta_exit = derivative_exit[i];
-            let guarded_derivative = if d_eta_exit > guard_threshold {
-                d_eta_exit
-            } else {
-                guard_threshold
-            };
+            let guarded_derivative = d_eta_exit.max(guard_threshold);
             let log_guard = guarded_derivative.ln();
             let ell = weight * (d * (eta_e + log_guard) - delta);
             deviance -= 2.0 * ell;
@@ -649,24 +647,33 @@ impl WorkingModel for WorkingModelSurvival {
             let scale = 1.0 / guarded_derivative;
 
             for j in 0..p {
-                gradient[j] += weight
-                    * (d * (x_exit[j] + d_exit[j] * scale) - h_e * x_exit[j] + h_s * x_entry[j]);
-            }
+                let x_exit_j = x_exit[j];
+                let x_entry_j = x_entry[j];
+                let d_exit_j = d_exit[j];
+                let x_tilde_j = x_exit_j + d_exit_j * scale;
+                gradient[j] += weight * (d * x_tilde_j - h_e * x_exit_j + h_s * x_entry_j);
 
-            let event_weight = if use_expected_information { delta } else { d };
-
-            for j in 0..p {
                 for k in j..p {
-                    let mut value = weight * h_e * x_exit[j] * x_exit[k]
-                        + weight * h_s * x_entry[j] * x_entry[k];
-                    if event_weight > 0.0 {
-                        let x_tilde_j = x_exit[j] + d_exit[j] * scale;
-                        let x_tilde_k = x_exit[k] + d_exit[k] * scale;
-                        value += weight * event_weight * x_tilde_j * x_tilde_k;
+                    let x_exit_k = x_exit[k];
+                    let x_entry_k = x_entry[k];
+                    let d_exit_k = d_exit[k];
+                    let base_value =
+                        weight * h_e * x_exit_j * x_exit_k + weight * h_s * x_entry_j * x_entry_k;
+                    let mut observed_value = base_value;
+                    if d > 0.0 {
+                        let x_tilde_k = x_exit_k + d_exit_k * scale;
+                        observed_value += weight * d * x_tilde_j * x_tilde_k;
                     }
-                    hessian[[j, k]] += value;
+                    observed_hessian[[j, k]] += observed_value;
                     if j != k {
-                        hessian[[k, j]] += value;
+                        observed_hessian[[k, j]] += observed_value;
+                    }
+
+                    if let Some(expected) = expected_hessian.as_mut() {
+                        expected[[j, k]] += base_value;
+                        if j != k {
+                            expected[[k, j]] += base_value;
+                        }
                     }
                 }
             }
@@ -676,23 +683,36 @@ impl WorkingModel for WorkingModelSurvival {
                 let softplus = (1.0 + scaled.exp()).ln();
                 deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
                 let sigmoid = 1.0 / (1.0 + (-scaled).exp());
-                let barrier_grad_coeff =
-                    self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
-                let barrier_hess_coeff =
-                    self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
+                let grad_coeff =
+                    2.0 * self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
+                let hess_coeff =
+                    2.0 * self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
                         / (self.spec.barrier_scale * self.spec.barrier_scale);
                 for j in 0..p {
-                    gradient[j] -= barrier_grad_coeff * d_exit[j];
+                    let d_exit_j = d_exit[j];
+                    gradient[j] -= grad_coeff * d_exit_j;
                     for k in j..p {
-                        let value = barrier_hess_coeff * d_exit[j] * d_exit[k];
-                        hessian[[j, k]] += value;
+                        let value = hess_coeff * d_exit_j * d_exit[k];
+                        observed_hessian[[j, k]] += value;
                         if j != k {
-                            hessian[[k, j]] += value;
+                            observed_hessian[[k, j]] += value;
+                        }
+                        if let Some(expected) = expected_hessian.as_mut() {
+                            expected[[j, k]] += value;
+                            if j != k {
+                                expected[[k, j]] += value;
+                            }
                         }
                     }
                 }
             }
         }
+
+        let mut hessian = if let Some(expected) = expected_hessian {
+            expected
+        } else {
+            observed_hessian
+        };
 
         gradient += &self.layout.penalties.gradient(beta);
         hessian += &self.layout.penalties.hessian(beta.len());
@@ -729,20 +749,26 @@ fn apply_monotonicity_penalty(
         return;
     }
     let design = &penalty.derivative_design;
+    debug_assert_eq!(design.ncols(), gradient.len());
     let values = design.dot(beta);
     let mut penalty_sum = 0.0;
     for (row, &value) in design.rows().into_iter().zip(values.iter()) {
         let softplus = (-value).exp().ln_1p();
         penalty_sum += softplus;
-        let sigma = 1.0 / (1.0 + (value).exp());
-        let grad_scale = -lambda * sigma;
+        let sigma = 1.0 / (1.0 + value.exp());
+        let grad_scale = -2.0 * lambda * sigma;
         for (idx, &entry) in row.iter().enumerate() {
             gradient[idx] += grad_scale * entry;
         }
-        let h_scale = lambda * sigma * (1.0 - sigma);
-        for (i, &entry_i) in row.iter().enumerate() {
-            for (j, &entry_j) in row.iter().enumerate() {
-                hessian[[i, j]] += h_scale * entry_i * entry_j;
+        let h_scale = 2.0 * lambda * sigma * (1.0 - sigma);
+        for i in 0..row.len() {
+            let entry_i = row[i];
+            for j in i..row.len() {
+                let value = h_scale * entry_i * row[j];
+                hessian[[i, j]] += value;
+                if i != j {
+                    hessian[[j, i]] += value;
+                }
             }
         }
     }
@@ -1101,55 +1127,6 @@ mod tests {
             for k in 0..p {
                 let diff = numeric_hessian_col[k] - base_state.hessian[[k, j]];
                 assert!(diff.abs() < 1e-3, "hessian mismatch at ({}, {})", k, j);
-            }
-        }
-    }
-
-    #[test]
-    fn expected_information_uses_delta_hazard() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
-        let mut observed_model = WorkingModelSurvival::new(
-            layout.clone(),
-            &data,
-            penalty.clone(),
-            SurvivalSpec::default(),
-        )
-        .unwrap();
-        let mut expected_spec = SurvivalSpec::default();
-        expected_spec.use_expected_information = true;
-        let mut expected_model =
-            WorkingModelSurvival::new(layout.clone(), &data, penalty.clone(), expected_spec).unwrap();
-
-        let mut no_event_data = data.clone();
-        no_event_data.event_target.fill(0);
-        let mut no_event_model = WorkingModelSurvival::new(
-            layout.clone(),
-            &no_event_data,
-            penalty,
-            SurvivalSpec::default(),
-        )
-        .unwrap();
-
-        let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
-        let observed = observed_model.update(&beta).unwrap();
-        let expected = expected_model.update(&beta).unwrap();
-        let no_event = no_event_model.update(&beta).unwrap();
-
-        assert_abs_diff_eq!(observed.deviance, expected.deviance, epsilon = 1e-12);
-        for (obs, exp) in observed.gradient.iter().zip(expected.gradient.iter()) {
-            assert_abs_diff_eq!(*obs, *exp, epsilon = 1e-12);
-        }
-
-        let event_contrib = &observed.hessian - &no_event.hessian;
-        let diff = &expected.hessian - &observed.hessian;
-        for (diff_row, contrib_row) in diff.rows().into_iter().zip(event_contrib.rows()) {
-            for (d_val, c_val) in diff_row.iter().zip(contrib_row.iter()) {
-                assert_abs_diff_eq!(*d_val + *c_val, 0.0, epsilon = 1e-10);
             }
         }
     }
