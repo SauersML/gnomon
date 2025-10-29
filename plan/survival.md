@@ -28,7 +28,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
 - PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite factorization (e.g., Faer `ldlt` with rook pivoting) when the observed information is used. No alternate update loops or GLM-specific vectors are required. Document the permutation so the factor can be reapplied outside the PIRLS loop.
-- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost.
+- An optional SPD fallback may instead build the expected information by applying quadrature over the baseline hazard grid (reuse the monotonicity grid) and smoothing penalty blocks; this trades the exact observed curvature for guaranteed positive definiteness and higher per-iteration cost. The quadrature should approximate the Fisher information integral `integral Y_star(t) * lambda_star(t) * x(t) x(t)^T dt`, where `Y_star` keeps subjects at risk after competing events and `lambda_star` equals `exp(eta(t)) * d_eta_dt(t)`.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -104,30 +104,33 @@ pub struct SurvivalLayout {
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
 - `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale.
+- `d_eta_exit_raw = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
+ℓ_i = w_i [ d_i (η_exit_i + log(d_eta_exit_raw_i)) - ΔH_i ].
 ```
 Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
+- Guard the scalar derivative with `d_eta_exit = max(d_eta_exit_raw, ε_deriv)` before any division (choose `ε_deriv` around `1e-9`).
+- Let `x_tilde_exit = x_exit + D_exit / d_eta_exit`, where the division is elementwise after broadcasting the guarded scalar derivative.
 - Score contribution:
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += w_i [ d_i x_tilde_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Hessian contribution:
+- Hessian contribution (observed information, matching the solver contract in §2.2):
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [ d_i (D_exit^T D_exit) / d_eta_exit^2 + H_exit_i x_exit^T x_exit - H_entry_i x_entry^T x_entry ].
 ```
+  - `D_exit` does not depend on `β`, so the event curvature is the outer product `D_exit^T D_exit` scaled by the guarded derivative squared.
+  - The entry block carries a negative sign so the matrix remains the observed information rather than the log-likelihood Hessian.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
@@ -174,17 +177,18 @@ pub struct SurvivalModelArtifacts {
 ```
 CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
+F_competing_t0 supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
+- Require `F_competing_t0` to represent the sum of cumulative incidence functions for all non-target causes at `t0`; document aggregation logic if callers provide multiple sources.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
 
 ### 7.3 Competing risks
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration. When multiple competing CIFs are available, sum them before passing `F_competing_t0` so the conditional risk denominator matches `1 - Σ_all F_cause(t0)`.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
@@ -206,7 +210,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - deviance decreases monotonically under PIRLS iterations;
+  - deviance logged each PIRLS step; emit a warning if it increases without an accompanying step-halving or backtracking response;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
