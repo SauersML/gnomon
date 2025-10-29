@@ -24,7 +24,6 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
   }
   ```
 - Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
-- Document that the PIRLS module now houses a penalised Newton solver implemented with an LDLᵀ factorisation. The name stays `pirls` for continuity, but the shared solver treats all families through this penalised Newton/LDLᵀ lens.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
@@ -105,20 +104,19 @@ pub struct SurvivalLayout {
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
 - `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- Accept that floating-point noise can produce small negative `ΔH` in early iterations; diagnostics may floor these residuals at zero, but the likelihood must continue to consume the raw values to preserve gradient consistency.
 - `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
 For subject `i`:
 ```
-ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
+ℓ_i = w_i [ d_i (η_exit_i + log(max(dη_exit_i, ε))) - ΔH_i ].
 ```
-Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
+Guard the derivative with a tiny floor (e.g., `ε = 1e-10`) inside the logarithm so the penalty logic still observes the raw `dη_exit` while the likelihood remains finite. Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
+- Let `x̃_exit = x_exit + D_exit / max(dη_exit, ε)` where the division is elementwise after broadcasting the scalar derivative and reuses the same floor `ε` employed in the log-likelihood guard.
 - Score contribution:
 ```
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
@@ -133,8 +131,8 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
-- When reporting diagnostics (e.g., monotonicity warnings), floor any slightly negative `ΔH` at zero so the readouts remain interpretable without perturbing the actual likelihood contributions.
+- The softplus barrier coexists with the `max(dη_exit, ε)` guard: the guard prevents catastrophic likelihood explosions, while the barrier still sees the unguarded derivative and nudges it positive.
+- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping, and surface violations by logging diagnostics on subjects or grid points where `dη_exit < 0` and optionally tripping early stopping if repeated violations persist.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -231,7 +229,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 11. Persisted metadata checklist
 Store in the trained model artifact:
 - baseline knot vector and spline degree;
-- reference constraint transform (matrix or factorisation) and the associated reference point `u_ref` used to anchor the baseline log cumulative hazard;
+- reference constraint transform (matrix or factorisation);
 - `AgeTransform { a_min, delta }`;
 - centering transforms for interactions and covariate ranges for guard rails;
 - penalized Hessian (or its Cholesky factor) for delta-method standard errors;
