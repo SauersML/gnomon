@@ -115,18 +115,24 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
 - Score contribution:
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += w_i [ d_i (x_exit + D_exit^T / dη_exit_i) - H_exit_i x_exit - H_entry_i x_entry ].
 ```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
+  - The event term keeps the usual design direction `x_exit` and adds the derivative adjustment from `log dη_exit`.
+  - The entry hazard contributes a negative gradient because differentiating `-H_entry` yields `-H_entry x_entry`.
 - Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [
+    d_i (x_exit^T x_exit + D_exit^T D_exit / dη_exit_i^2)
+    + H_exit_i x_exit^T x_exit
+    - H_entry_i x_entry^T x_entry
+].
 ```
+  - The event block carries only the rank-one derivative term `D_exit^T D_exit / dη_exit^2` alongside the design outer product.
+  - The entry block subtracts `x_entry^T x_entry` to mirror the negative score contribution.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
