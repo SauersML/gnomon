@@ -1,7 +1,7 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the cause-specific cumulative hazard. The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
