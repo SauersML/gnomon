@@ -102,8 +102,8 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (kept non-negative by the enforced monotonicity described in §5.4).
-- `dη_exit = exp(D_exit γ)` evaluated on the age scale with its Jacobian handled via the chain rule.
+- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
+- `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
@@ -112,7 +112,6 @@ For subject `i`:
 ℓ_i = w_i [ d_i (η_exit_i + log(dη_exit_i)) - ΔH_i ].
 ```
 Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There is no auxiliary risk set.
-The derivative term is guarded by the coercive strategy in §5.4 so `log(dη_exit_i)` never receives a non-positive argument during optimization.
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
@@ -126,14 +125,16 @@ U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
-- When forming `x̃_exit`, treat `D_exit` as the derivative of `η_exit` with respect to `γ`. The exponential map contributes an elementwise multiplication by `dη_exit`, so the existing algebra stays intact once the Jacobian factors are folded in.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity enforcement
-- Reparameterise the derivative evaluations through an exponential map. Maintain auxiliary coefficients `γ` with the same layout as `β`, compute the raw derivative `\tilde{dη}_exit = D_exit γ`, and set `dη_exit = exp(\tilde{dη}_exit)`. The working state uses `γ` as its optimization variables while back-substituting `dη_exit` and its chain rule contributions when forming gradients and Hessians.
-- Evaluate the derivative on a dense age grid (e.g., 200 points across training support) to confirm `dη_grid = exp(D_grid γ)` remains positive. If any grid derivative underflows below a small tolerance (e.g., `< 1e-12`), perform a backtracking line search and reject the step until all evaluation points satisfy the bound.
-- The exponential reparameterization renders `dη_exit` strictly positive everywhere, which simultaneously keeps `ΔH` monotone increasing in age and ensures the log-derivative term in §5.2 only receives positive inputs. No ad-hoc clamping is required; the line-search safeguard deals with numerical underflow.
+### 5.4 Strict monotonicity enforcement
+- Guarantee strict positivity of `dη` at every observed exit age by construction. Two acceptable schemes:
+  - parameterise the derivative as `dη_exit = exp(g(t))` for a free function `g(t)` so that the chain rule and Hessian contributions automatically respect the exponential transform; or
+  - enforce PIRLS step-halving barriers that reject updates crossing `dη_exit ≤ 0` at any exit knot, shrinking the step until all guarded points remain positive.
+- Persist the chosen mechanism in the serialized layout (e.g., mark the derivative-as-exponential transform or store the barrier guard set and tolerances) so scoring can rebuild identical derivative evaluations.
+- Retain the existing soft inequality penalty (`λ_soft ≈ 1e-4`) only as a secondary safeguard once strict positivity is enforced, applied to the dense evaluation grid to nudge solutions away from the boundary.
+- Add the barrier (or transformed) Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -198,6 +199,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
+- Add an integration test that fails if any PIRLS iterate produces `dη_exit ≤ 0` at observed exit ages, ensuring the structural guard fires before serialization.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
