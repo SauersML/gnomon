@@ -67,10 +67,12 @@ pub struct SurvivalPredictionInputs<'a> {
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
-- Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
+- Compute `a_min = min(age_entry)` and choose a guard `δ > 0` from the empirical age-entry distribution (e.g., a low percentile such as the 0.5th) subject to sensible floors/ceilings (e.g., clamp to `[1e-3, 1.0]`) so that `age - a_min + δ` remains well separated from zero without introducing an outsized shift.
 - Map ages to `u = log(age - a_min + δ)` for both training and scoring.
 - Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
 - Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
+- Enforce a runtime guard that rejects evaluations for any age `< a_min - δ/2`; this check must run wherever ages are ingested (loaders, scoring APIs) and return a structured error that records the offending age, the guard threshold, and recommended remediation (refresh the training cohort or clamp requests to be within support).
+- Document that when the guard triggers the prediction should fail fast with a message instructing operators to either widen the training support or adjust the requested age range; silent clipping is forbidden.
 
 ### 4.2 Baseline spline and reference constraint
 - Build a B-spline basis over `u` for the baseline log cumulative hazard `η_0(u)`.
