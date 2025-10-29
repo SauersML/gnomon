@@ -123,8 +123,9 @@ U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
 - Hessian contribution:
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+H += w_i [ -d_i D_exit^T D_exit / (dη_exit_i)^2 + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
 ```
+- The linear predictor itself contributes no curvature beyond the derivative term; only the `log(dη_exit)` factor produces the negative outer product.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
@@ -192,6 +193,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
+  - analytic Hessians match autodiff or finite-difference checks on toy datasets with rare target events;
   - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
