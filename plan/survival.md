@@ -67,9 +67,12 @@ pub struct SurvivalPredictionInputs<'a> {
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
 - Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
+- Define a secondary tolerance `ε` (default `1e-6`) that buffers the open interval implied by the logarithm. The minimum supported age is therefore `age_min_supported = a_min - δ + ε` and the transform domain is `age ≥ age_min_supported`.
 - Map ages to `u = log(age - a_min + δ)` for both training and scoring.
-- Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
+- Store `AgeTransform { a_min, delta, epsilon }` in the trained artifact and reuse it verbatim at prediction time.
 - Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
+- Emit a structured warning during training when any `age_entry` or `age_exit` falls within `5ε` of `age_min_supported`, signalling that tighter preprocessing or a larger guard may be required to avoid numerical issues.
+- Reject records where `age_entry < age_min_supported` or `age_exit < age_min_supported` with a hard error so the training corpus never feeds inadmissible ages into the log transform.
 
 ### 4.2 Baseline spline and reference constraint
 - Build a B-spline basis over `u` for the baseline log cumulative hazard `η_0(u)`.
@@ -157,6 +160,8 @@ pub struct SurvivalModelArtifacts {
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
+- Before evaluation, enforce the stored domain guard: if `t < age_min_supported` return `Error::AgeBelowDomain` and surface the same message used in training. Implementations **must not** silently clamp these ages so that serving behavior matches training diagnostics.
+- Log a non-fatal warning when `t` is within `5ε` of `age_min_supported` to highlight calls that are numerically precarious but still legal.
 - `H(t) = exp(η(t))`.
 - Absolute risk between `t0` and `t1`:
 ```
