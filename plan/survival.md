@@ -23,7 +23,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- Logistic and Gaussian models already assemble and return dense Hessians (the usual `X'WX` blocks) through this trait, so `WorkingState::hessian` always represents the full curvature matrix in coefficient space. The RP survival model follows the same contract and returns its dense Hessian alongside the deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions or assuming per-observation diagonal structure.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
@@ -133,7 +133,7 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
-- The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
+- The outer REML loop is unchanged. It already consumes dense Hessians from the existing Gaussian/Logistic GLM families and continues to do so for the survival path.
 - The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
