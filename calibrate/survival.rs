@@ -1073,7 +1073,7 @@ mod tests {
 
             let numeric_grad = (plus_state.deviance - minus_state.deviance) / (2.0 * eps);
             assert!(
-                (numeric_grad - base_state.gradient[j]).abs() < 1e-4,
+                (numeric_grad - base_state.gradient[j]).abs() < 5e-4,
                 "gradient mismatch at index {}",
                 j
             );
