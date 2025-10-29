@@ -184,7 +184,7 @@ conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Document that without individualized competing CIFs the denominator becomes 1 minus the sum of all cause CIFs at t0, so cohort-level plug-ins may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
