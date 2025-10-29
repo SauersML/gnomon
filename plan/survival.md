@@ -1,7 +1,7 @@
 # Survival Royston–Parmar Model Architecture
 
 ## 1. Purpose
-Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the subdistribution cumulative hazard. The design must:
+Deliver a first-class survival model family built on the Royston–Parmar (RP) parameterisation of the cause-specific cumulative hazard. The design must:
 
 - share the existing basis, penalty, and PIRLS infrastructure with the GAM families while contributing its own gradient, Hessian, and deviance;
 - expose a clean per-subject full-likelihood objective that respects delayed entry and competing risks without any risk-set or pseudo-weight preprocessing; and
@@ -155,33 +155,39 @@ pub struct SurvivalModelArtifacts {
 - The Hessian factor enables delta-method standard errors.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
-### 7.2 Hazard and cumulative incidence
-- Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
-- `H(t) = exp(η(t))`.
-- Absolute risk between `t0` and `t1`:
-```
-CIF_target(t) = 1 - exp(-H(t)).
-ΔF = CIF_target(t1) - CIF_target(t0).
-F_competing_t0` supplied externally (see below).
-conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
-```
-- Default `ε = 1e-12` to maintain numeric stability.
-- No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
+### 7.2 Hazard, survival, and cumulative incidence
+- Evaluate the cause-specific log cumulative hazard `η_target(t)` by reconstructing the constrained basis at age `t` using the
+  stored transform, and set `H_target(t) = exp(η_target(t))`.
+- Differentiate to obtain `h_target(t) = dH_target/dt` using the cached derivative basis on the age scale.
+- Gather cumulative hazards `H_c^{(j)}(t)` and hazards `h_c^{(j)}(t)` for every competing cause `j` active in scoring (see
+  Section 7.3). Combine them to form the all-cause survival `S(t) = exp(-H_total(t))` where `H_total(t) = H_target(t) + Σ_j
+  H_c^{(j)}(t)`.
+- Compute the target cumulative incidence along a monotone age grid `t_0 < … < t_m` that spans the requested horizon by
+  numerically integrating `S(t) h_target(t)`. Use adaptive Gauss–Kronrod or composite Simpson rules so the integral resolves
+  rapidly changing hazards. For example,
+  ```
+  CIF_target(t_k) = Σ_{r=1}^k ∫_{t_{r-1}}^{t_r} S(u) h_target(u) du.
+  ```
+- Absolute risk between `t0` and `t1` is `ΔF = CIF_target(t1) - CIF_target(t0)`.
+- Default `ε = 1e-12` to maintain numeric stability when forming conditional risks (see Section 7.4).
 
 ### 7.3 Competing risks
-- Encourage fitting companion RP models for key competing causes. Scoring accepts either:
-  - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
-  - user-supplied competing CIF values for the cohort.
-- Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
+- Encourage fitting companion RP models for key competing causes. Scoring requires cumulative hazard and hazard evaluations for
+  each such model so that `S(t)` reflects all causes. Accept either:
+  - handles to `SurvivalModelArtifacts` for competing causes, exposing `H_c^{(j)}(t)` and `h_c^{(j)}(t)`; or
+  - user-supplied cumulative hazard grids when external tooling provides them.
+- Warn that providing only a single cause-specific model forces the system to assume `H_total = H_target`, which inflates the
+  CIF and should be limited to sensitivity checks.
 - Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
 Expose:
 ```rust
 fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
-fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
-fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
+fn cumulative_incidence(age: f64, covariates: &Covariates, competing: &CompetingContext) -> f64;
+fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, competing: &CompetingContext) -> f64;
 ```
+where `CompetingContext` supplies the age grid, cumulative hazards, and hazards for all relevant competing causes (Section 7.3).
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
@@ -197,7 +203,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
-- Remove benchmarks centered on risk-set algebra or quadrature.
+- Add benchmarks that compare numerical integration accuracy against analytic solutions for simple hazard shapes.
 
 ## 10. Implementation roadmap
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
@@ -206,7 +212,8 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 4. **Layout builder**: construct `SurvivalLayout` with entry/exit caches and derivative matrices; serialize transforms.
 5. **Working model**: implement the RP likelihood, gradient, Hessian, and soft barrier contributions.
 6. **PIRLS integration**: refactor the solver to consume dense Hessians from `WorkingState` while preserving the GAM path.
-7. **Artifact + scoring**: persist age transforms, constraints, and Hessian factors; implement endpoint-based prediction APIs.
+7. **Artifact + scoring**: persist age transforms, constraints, and Hessian factors; implement scoring APIs that perform the
+   survival-weighted quadrature for cumulative incidence.
 8. **Calibrator**: adapt calibrator feature extraction to the survival outputs and ensure logit-risk calibration works end-to-end.
 9. **Testing**: add unit/integration tests described above, including monotonicity and left-truncation checks.
 
