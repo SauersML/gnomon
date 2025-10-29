@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use approx::assert_abs_diff_eq;
@@ -96,6 +97,14 @@ struct BasisCacheKey {
     degree: usize,
     data_hash: u64,
     derivative: usize,
+}
+
+/// Serializable descriptor for reproducing spline basis evaluations at
+/// prediction time.  Stores the knot vector and spline degree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BasisDescriptor {
+    pub knots: Array1<f64>,
+    pub degree: usize,
 }
 
 #[derive(Debug)]

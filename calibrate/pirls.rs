@@ -14,6 +14,19 @@ use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
 
+/// Unified interface for all PIRLS working models (GAM and survival).
+pub trait WorkingModel {
+    fn update(&mut self, beta: &Array1<f64>) -> WorkingState;
+}
+
+/// Sufficient statistics returned by a working model at each PIRLS iteration.
+pub struct WorkingState {
+    pub eta: Array1<f64>,
+    pub gradient: Array1<f64>,
+    pub hessian: Array2<f64>,
+    pub deviance: f64,
+}
+
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
