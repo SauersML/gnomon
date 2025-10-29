@@ -23,11 +23,13 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- `WorkingState::hessian` is always the coefficient-space curvature (the "Fisher" matrix `Xᵀ W X`).
+- Logistic and Gaussian models must materialize this matrix before returning from `update`; passing diagonal observation weights is no longer permitted.
+- The RP survival model produces the same coefficient-space Hessian alongside its deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. No alternate update loops or GLM-specific vectors are required.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. The solver never inspects per-observation weights; it only consumes the assembled coefficient Hessian.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
