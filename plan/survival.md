@@ -103,7 +103,7 @@ pub struct SurvivalLayout {
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
-- `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
+- `ΔH = exp(η_entry) * expm1(η_exit - η_entry)` (numerically stable and non-negative up to round-off; allow tiny negative residuals only inside diagnostics).
 - `dη_exit = D_exit β` already on the age scale.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
@@ -206,7 +206,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - deviance decreases monotonically under PIRLS iterations;
+  - PIRLS line search enforces an Armijo/Wolfe-style deviance decrease before accepting each step;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
   - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
