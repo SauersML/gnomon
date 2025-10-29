@@ -622,6 +622,7 @@ impl WorkingModel for WorkingModelSurvival {
         let mut deviance = 0.0;
 
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
+        let use_expected_information = self.spec.use_expected_information;
         for i in 0..n {
             let weight = self.sample_weight[i];
             if weight == 0.0 {
@@ -652,14 +653,16 @@ impl WorkingModel for WorkingModelSurvival {
                     * (d * (x_exit[j] + d_exit[j] * scale) - h_e * x_exit[j] + h_s * x_entry[j]);
             }
 
+            let event_weight = if use_expected_information { delta } else { d };
+
             for j in 0..p {
                 for k in j..p {
                     let mut value = weight * h_e * x_exit[j] * x_exit[k]
                         + weight * h_s * x_entry[j] * x_entry[k];
-                    if d > 0.0 {
+                    if event_weight > 0.0 {
                         let x_tilde_j = x_exit[j] + d_exit[j] * scale;
                         let x_tilde_k = x_exit[k] + d_exit[k] * scale;
-                        value += weight * d * x_tilde_j * x_tilde_k;
+                        value += weight * event_weight * x_tilde_j * x_tilde_k;
                     }
                     hessian[[j, k]] += value;
                     if j != k {
@@ -1098,6 +1101,55 @@ mod tests {
             for k in 0..p {
                 let diff = numeric_hessian_col[k] - base_state.hessian[[k, j]];
                 assert!(diff.abs() < 1e-3, "hessian mismatch at ({}, {})", k, j);
+            }
+        }
+    }
+
+    #[test]
+    fn expected_information_uses_delta_hazard() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let mut observed_model = WorkingModelSurvival::new(
+            layout.clone(),
+            &data,
+            penalty.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let mut expected_spec = SurvivalSpec::default();
+        expected_spec.use_expected_information = true;
+        let mut expected_model =
+            WorkingModelSurvival::new(layout.clone(), &data, penalty.clone(), expected_spec).unwrap();
+
+        let mut no_event_data = data.clone();
+        no_event_data.event_target.fill(0);
+        let mut no_event_model = WorkingModelSurvival::new(
+            layout.clone(),
+            &no_event_data,
+            penalty,
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+
+        let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let observed = observed_model.update(&beta).unwrap();
+        let expected = expected_model.update(&beta).unwrap();
+        let no_event = no_event_model.update(&beta).unwrap();
+
+        assert_abs_diff_eq!(observed.deviance, expected.deviance, epsilon = 1e-12);
+        for (obs, exp) in observed.gradient.iter().zip(expected.gradient.iter()) {
+            assert_abs_diff_eq!(*obs, *exp, epsilon = 1e-12);
+        }
+
+        let event_contrib = &observed.hessian - &no_event.hessian;
+        let diff = &expected.hessian - &observed.hessian;
+        for (diff_row, contrib_row) in diff.rows().into_iter().zip(event_contrib.rows()) {
+            for (d_val, c_val) in diff_row.iter().zip(contrib_row.iter()) {
+                assert_abs_diff_eq!(*d_val + *c_val, 0.0, epsilon = 1e-10);
             }
         }
     }
