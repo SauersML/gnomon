@@ -19,15 +19,15 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
   pub struct WorkingState {
       pub eta: Array1<f64>,
       pub gradient: Array1<f64>,
-      pub hessian: Array2<f64>,
+      pub hessian: Array2<f64>, // symmetric but not assumed positive definite
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- Logistic and Gaussian models continue to supply diagonal (positive) Hessians through this trait. The RP survival model returns a dense Hessian that may be indefinite together with its deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions and defers definiteness handling to the shared linear algebra layer.
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
-- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using the existing Faer linear algebra. No alternate update loops or GLM-specific vectors are required.
+- PIRLS adds the penalty Hessians and solves `(H + S) Δβ = g` using a symmetric-indefinite LDLᵀ factorisation with rook pivoting (Faer’s `symmetric_indefinite` routine). The permutation and block-diagonal scalings are cached to support reuse in smoothing updates. No alternate update loops or GLM-specific vectors are required.
 
 ## 3. Data schema and ingestion
 ### 3.1 Required columns
@@ -134,7 +134,11 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
-- The penalty trace term uses the provided Hessian: compute `solve_cholesky(H + Σ λ S)` as already done for GAMs.
+- Form the penalised system `A = H + Σ λ S` and factorise it once per PIRLS iteration with the symmetric-indefinite LDLᵀ routine, returning permutation `P`, unit-lower `L`, and block-diagonal `D` (1×1 or 2×2 pivots). Smoothing parameter updates reuse this factor to compute:
+  - `A^{-1} g` by applying `Pᵀ`, solving `Ly = P g`, `Dz = y`, and `Lᵀ x = z`.
+  - log-determinants `log |A| = Σ log |D_i|`, accumulating log-absolute-determinants of the pivot blocks.
+  - trace terms `tr(A^{-1} S_j)` by solving `A X = S_j` column-wise with the stored factor (batched triangular solves) and contracting `trace(S_j X)` without forming dense inverses.
+- When Hessian noise causes persistent negative pivots, switch to a positive-semidefinite expected-information approximation `Ĥ` constructed by replacing the observed Hessian blocks with the expected Fisher information integrated over a 5-point Gauss–Legendre quadrature on the log-age scale. The same LDLᵀ machinery applies because `Ĥ + Σ λ S` is positive semidefinite but stabilised by the penalties. Record this substitution for downstream diagnostics.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
@@ -149,10 +153,11 @@ pub struct SurvivalModelArtifacts {
     pub penalties: PenaltyDescriptor,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
-    pub hessian_factor: Option<CholeskyFactor>,
+    pub hessian_factor: Option<LdltFactor>,
 }
 ```
-- The Hessian factor enables delta-method standard errors.
+- The Hessian factor stores the permutation, block structure, and diagonal entries from the LDLᵀ solve so delta-method standard errors and score diagnostics can reuse it without rebuilding the factorisation.
+- If an expected-information approximation `Ĥ` was required for stability, persist a `FactorProvenance::ExpectedInformation` flag along with the quadrature metadata (log-age knots and weights) to reproduce trace/log-determinant calculations during scoring or refits.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
