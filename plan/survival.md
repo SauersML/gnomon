@@ -115,16 +115,18 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 
 ### 5.3 Score and Hessian
 - Define `x_exit` and `x_entry` as the full design rows (baseline + time-varying + static covariates).
-- Let `x̃_exit = x_exit + D_exit / dη_exit` where the division is elementwise after broadcasting the scalar derivative.
-- Score contribution:
+- Differentiate the log-likelihood in §5.2 directly to obtain the score contribution
 ```
-U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
+U += w_i [ d_i x_exit + d_i (D_exit / dη_exit_i) - H_exit_i x_exit + H_entry_i x_entry ].
 ```
-(The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Hessian contribution:
+  The term involving `D_exit` comes from `∂/∂β log(dη_exit)` and `+H_entry x_entry` reflects the sign flip from differentiating
+  `-(-H_entry)` in the log-likelihood.
+- Differentiating the score again gives the negative Hessian (observed information)
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+𝕀_obs += w_i [ d_i · (D_exit D_exitᵀ)/(dη_exit_i)² + H_exit_i x_exit x_exitᵀ - H_entry_i x_entry x_entryᵀ ].
 ```
+  The entry contribution appears with the opposite sign of the exit term, so the observed information can be indefinite whenever
+  delayed entry is present.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
