@@ -122,20 +122,26 @@ Competing and censored records have `d_i = 0` but still subtract `ΔH_i`. There 
 U += w_i [ d_i x̃_exit - H_exit_i x_exit + H_entry_i x_entry ].
 ```
 (The `H_entry` term enters with a positive sign because the derivative of `-H_entry` contributes `+x_entry`.)
-- Hessian contribution:
+- Exact second derivative (Hessian of the log-likelihood contribution):
 ```
-H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry ].
+∂²ℓ_i/∂β∂βᵀ = w_i [ -H_exit_i x_exit^T x_exit + H_entry_i x_entry^T x_entry - d_i D_exit^T D_exit / dη_exit_i^2 ].
 ```
+- Observed information is the negative Hessian, so the accumulation supplied by `WorkingState::hessian` uses
+```
+H += -∂²ℓ_i/∂β∂βᵀ = w_i [ H_exit_i x_exit^T x_exit - H_entry_i x_entry^T x_entry + d_i D_exit^T D_exit / dη_exit_i^2 ].
+```
+- `WorkingState::hessian` therefore stores the exact observed information rather than a Gauss–Newton approximation.
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
-- Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
+- Deviance `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
 - Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
-- The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
-- The penalty trace term uses the provided Hessian: apply the stored symmetric-indefinite factor (`ldlt_solve`) when working with the observed information, or the SPD Cholesky solve when the expected information approximation is chosen.
+- The outer REML loop is unchanged. It now receives `WorkingState` with dense observed-information Hessians when the survival family is active.
+- The PIRLS solve forms `H + S` from the observed information and applies an LDLᵀ factorization with rook pivoting; the SPD Cholesky path remains only for the optional expected-information approximation.
+- The penalty trace term reuses the same factor (`ldlt_solve` for observed information, Cholesky for the approximation) so REML and LAML derivatives stay consistent.
 - No special-case link logic remains in `estimate.rs`; branching is solely on `ModelFamily`.
 
 ## 7. Prediction APIs
