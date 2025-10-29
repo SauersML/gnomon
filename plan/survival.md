@@ -198,6 +198,8 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
+- Before taking logits, clamp the predicted risks to `[ε, 1-ε]` using the same `ε` guard as §7.2 so that downstream calibration shares the scoring-time stability guarantees.
+- When propagating delta-method variances through the calibration step, apply the same clamping to the mean prediction and carry the derivative of the clamp in the Jacobian so that variance estimates respect the truncated support.
 - Features: base prediction, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
 - Use out-of-fold predictions during training to avoid optimism.
 - Remove age-hull or KM-based diagnostics from calibrator features.
