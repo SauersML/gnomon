@@ -2,8 +2,9 @@ use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
 use crate::calibrate::faer_ndarray::FaerSvd;
+use log::warn;
 use ndarray::prelude::*;
-use ndarray::{Array1, Array2, concatenate};
+use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -36,6 +37,8 @@ pub enum SurvivalError {
     CovariateDimensionMismatch,
     #[error("covariate values must be finite")]
     NonFiniteCovariate,
+    #[error("linear predictor became non-finite during evaluation")]
+    NonFiniteLinearPredictor,
     #[error("design matrix columns do not match coefficient length")]
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
@@ -371,6 +374,59 @@ fn evaluate_basis_and_derivative(
     Ok((basis, derivative))
 }
 
+fn stable_softplus(x: f64) -> f64 {
+    if x.is_infinite() {
+        if x.is_sign_positive() { x } else { 0.0 }
+    } else if x > 20.0 {
+        x
+    } else if x < -20.0 {
+        x.exp().ln_1p()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+fn stable_sigmoid(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let exp_x = x.exp();
+        exp_x / (1.0 + exp_x)
+    }
+}
+
+fn accumulate_weighted_vector<S>(target: &mut Array1<f64>, scale: f64, values: &ArrayBase<S, Ix1>)
+where
+    S: Data<Elem = f64>,
+{
+    if scale == 0.0 {
+        return;
+    }
+    Zip::from(target)
+        .and(values)
+        .for_each(|t, &v| *t += scale * v);
+}
+
+fn accumulate_symmetric_outer<S>(target: &mut Array2<f64>, scale: f64, values: &ArrayBase<S, Ix1>)
+where
+    S: Data<Elem = f64>,
+{
+    if scale == 0.0 {
+        return;
+    }
+    let len = values.len();
+    for j in 0..len {
+        let vj = values[j];
+        for k in j..len {
+            let contribution = scale * vj * values[k];
+            target[[j, k]] += contribution;
+            if j != k {
+                target[[k, j]] += contribution;
+            }
+        }
+    }
+}
+
 /// Construct the cached survival layout for PIRLS updates.
 #[allow(clippy::too_many_arguments)]
 pub fn build_survival_layout(
@@ -610,18 +666,21 @@ impl WorkingModel for WorkingModelSurvival {
         let eta_entry = self.layout.combined_entry.dot(beta);
         let derivative_exit = self.layout.combined_derivative_exit.dot(beta);
 
-        let h_exit = eta_exit.mapv(f64::exp);
-        let h_entry = eta_entry.mapv(f64::exp);
-        let mut delta_h = &h_exit - &h_entry;
-        delta_h.mapv_inplace(|v| v.max(0.0));
-
         let n = eta_exit.len();
         let p = beta.len();
         let mut gradient = Array1::<f64>::zeros(p);
         let mut hessian = Array2::<f64>::zeros((p, p));
-        let mut deviance = 0.0;
-
+        let mut log_likelihood = 0.0;
+        let mut barrier_deviance = 0.0;
+        let mut barrier_gradient = Array1::<f64>::zeros(p);
+        let mut barrier_hessian = Array2::<f64>::zeros((p, p));
+        let mut guard_activation_count = 0usize;
+        let mut negative_derivative_count = 0usize;
+        let mut guard_examples: Vec<(usize, f64)> = Vec::new();
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
+        let h_exit = eta_exit.mapv(f64::exp);
+        let h_entry = eta_entry.mapv(f64::exp);
+
         for i in 0..n {
             let weight = self.sample_weight[i];
             if weight == 0.0 {
@@ -631,68 +690,90 @@ impl WorkingModel for WorkingModelSurvival {
             let eta_e = eta_exit[i];
             let h_e = h_exit[i];
             let h_s = h_entry[i];
-            let delta = delta_h[i];
+            if !eta_e.is_finite() || !h_e.is_finite() || !h_s.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
             let d_eta_exit = derivative_exit[i];
-            let guarded_derivative = if d_eta_exit > guard_threshold {
-                d_eta_exit
-            } else {
+            if !d_eta_exit.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            let guard_applied = d_eta_exit <= guard_threshold;
+            let guarded_derivative = if guard_applied {
                 guard_threshold
+            } else {
+                d_eta_exit
             };
             let log_guard = guarded_derivative.ln();
-            let ell = weight * (d * (eta_e + log_guard) - delta);
-            deviance -= 2.0 * ell;
+            let delta = h_e - h_s;
+            log_likelihood += weight * (d * (eta_e + log_guard) - delta);
+
+            if guard_applied {
+                guard_activation_count += 1;
+                if d_eta_exit < 0.0 {
+                    negative_derivative_count += 1;
+                    if guard_examples.len() < 5 {
+                        guard_examples.push((i, d_eta_exit));
+                    }
+                }
+            }
 
             let x_exit = self.layout.combined_exit.row(i);
             let x_entry = self.layout.combined_entry.row(i);
             let d_exit = self.layout.combined_derivative_exit.row(i);
-            let scale = 1.0 / guarded_derivative;
+            accumulate_weighted_vector(&mut gradient, -weight * h_e, &x_exit);
+            accumulate_weighted_vector(&mut gradient, weight * h_s, &x_entry);
 
-            for j in 0..p {
-                gradient[j] += weight
-                    * (d * (x_exit[j] + d_exit[j] * scale) - h_e * x_exit[j] + h_s * x_entry[j]);
+            let scale = if guard_applied {
+                0.0
+            } else {
+                1.0 / guarded_derivative
+            };
+            let mut x_tilde = x_exit.to_owned();
+            Zip::from(&mut x_tilde)
+                .and(&d_exit)
+                .for_each(|value, &deriv| *value += deriv * scale);
+
+            if d > 0.0 {
+                accumulate_weighted_vector(&mut gradient, weight * d, &x_tilde);
             }
 
-            for j in 0..p {
-                for k in j..p {
-                    let mut value = weight * h_e * x_exit[j] * x_exit[k]
-                        + weight * h_s * x_entry[j] * x_entry[k];
-                    if d > 0.0 {
-                        let x_tilde_j = x_exit[j] + d_exit[j] * scale;
-                        let x_tilde_k = x_exit[k] + d_exit[k] * scale;
-                        value += weight * d * x_tilde_j * x_tilde_k;
-                    }
-                    hessian[[j, k]] += value;
-                    if j != k {
-                        hessian[[k, j]] += value;
-                    }
-                }
+            accumulate_symmetric_outer(&mut hessian, weight * h_e, &x_exit);
+            accumulate_symmetric_outer(&mut hessian, weight * h_s, &x_entry);
+
+            let event_scale = if self.spec.use_expected_information {
+                weight * h_e
+            } else {
+                weight * d
+            };
+            if event_scale != 0.0 {
+                accumulate_symmetric_outer(&mut hessian, event_scale, &x_tilde);
             }
 
             if self.spec.barrier_weight > 0.0 {
                 let scaled = -d_eta_exit / self.spec.barrier_scale;
-                let softplus = (1.0 + scaled.exp()).ln();
-                deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
-                let sigmoid = 1.0 / (1.0 + (-scaled).exp());
+                let softplus = stable_softplus(scaled);
+                barrier_deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
+                let sigmoid = stable_sigmoid(scaled);
                 let barrier_grad_coeff =
                     self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
+                accumulate_weighted_vector(&mut barrier_gradient, -barrier_grad_coeff, &d_exit);
                 let barrier_hess_coeff =
                     self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
                         / (self.spec.barrier_scale * self.spec.barrier_scale);
-                for j in 0..p {
-                    gradient[j] -= barrier_grad_coeff * d_exit[j];
-                    for k in j..p {
-                        let value = barrier_hess_coeff * d_exit[j] * d_exit[k];
-                        hessian[[j, k]] += value;
-                        if j != k {
-                            hessian[[k, j]] += value;
-                        }
-                    }
-                }
+                accumulate_symmetric_outer(&mut barrier_hessian, barrier_hess_coeff, &d_exit);
             }
         }
 
-        gradient += &self.layout.penalties.gradient(beta);
-        hessian += &self.layout.penalties.hessian(beta.len());
+        gradient.mapv_inplace(|value| value * -2.0);
+        hessian.mapv_inplace(|value| value * -2.0);
+        gradient += &barrier_gradient;
+        hessian += &barrier_hessian;
+        let mut deviance = -2.0 * log_likelihood + barrier_deviance;
+
+        let penalty_gradient = self.layout.penalties.gradient(beta);
+        gradient += &penalty_gradient;
+        let penalty_hessian = self.layout.penalties.hessian(beta.len());
+        hessian += &penalty_hessian;
         deviance += self.layout.penalties.deviance(beta);
 
         if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
@@ -702,6 +783,16 @@ impl WorkingModel for WorkingModelSurvival {
                 &mut gradient,
                 &mut hessian,
                 &mut deviance,
+            );
+        }
+
+        if guard_activation_count > 0 {
+            let guard_fraction = guard_activation_count as f64 / n as f64;
+            warn!(
+                "Derivative guard activated for {guard_activation_count} of {n} subjects ({:.2}% of sample). Negative derivatives observed for {} subjects. Example raw dη_exit values: {:?}.",
+                guard_fraction * 100.0,
+                negative_derivative_count,
+                guard_examples
             );
         }
 
@@ -728,22 +819,39 @@ fn apply_monotonicity_penalty(
     let design = &penalty.derivative_design;
     let values = design.dot(beta);
     let mut penalty_sum = 0.0;
+    let mut violation_count = 0usize;
+    let mut violation_examples: Vec<f64> = Vec::new();
     for (row, &value) in design.rows().into_iter().zip(values.iter()) {
-        let softplus = (-value).exp().ln_1p();
+        let softplus = stable_softplus(-value);
         penalty_sum += softplus;
-        let sigma = 1.0 / (1.0 + (value).exp());
+        let sigma = stable_sigmoid(-value);
         let grad_scale = -lambda * sigma;
-        for (idx, &entry) in row.iter().enumerate() {
-            gradient[idx] += grad_scale * entry;
-        }
+        accumulate_weighted_vector(gradient, grad_scale, &row);
         let h_scale = lambda * sigma * (1.0 - sigma);
-        for (i, &entry_i) in row.iter().enumerate() {
-            for (j, &entry_j) in row.iter().enumerate() {
-                hessian[[i, j]] += h_scale * entry_i * entry_j;
+        accumulate_symmetric_outer(hessian, h_scale, &row);
+        if value < 0.0 {
+            violation_count += 1;
+            if violation_examples.len() < 5 {
+                violation_examples.push(value);
             }
         }
     }
     *deviance += 2.0 * lambda * penalty_sum;
+
+    if design.nrows() > 0 && violation_count > 0 {
+        let fraction = violation_count as f64 / design.nrows() as f64;
+        warn!(
+            "Monotonicity grid penalty activated for {violation_count} of {} evaluation ages ({:.2}% of grid). Example derivative values: {:?}.",
+            design.nrows(),
+            fraction * 100.0,
+            violation_examples
+        );
+        if fraction > 0.05 {
+            warn!(
+                "More than 5% of grid ages triggered the monotonicity penalty; consider increasing baseline knots or smoothing."
+            );
+        }
+    }
 }
 
 /// Stored factorization metadata for downstream diagnostics.
@@ -999,6 +1107,231 @@ mod tests {
         assert_eq!(state.gradient.len(), beta.len());
         assert_eq!(state.hessian.nrows(), beta.len());
         assert_eq!(state.hessian.ncols(), beta.len());
+    }
+
+    #[test]
+    fn likelihood_matches_manual_computation() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        for (idx, value) in beta.iter_mut().enumerate() {
+            *value = 0.01 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update(&beta).unwrap();
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        let guard = spec.derivative_guard.max(f64::EPSILON);
+
+        let mut manual = 0.0;
+        for i in 0..data.age_entry.len() {
+            let d = f64::from(data.event_target[i]);
+            let weight = data.sample_weight[i];
+            let guarded = derivative_exit[i].max(guard);
+            let h_exit = eta_exit[i].exp();
+            let h_entry = eta_entry[i].exp();
+            manual += weight * (d * (eta_exit[i] + guarded.ln()) - (h_exit - h_entry));
+        }
+
+        assert_abs_diff_eq!(state.deviance, -2.0 * manual, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn gradient_and_hessian_match_numeric() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        let baseline_cols = layout.baseline_exit.ncols();
+        for idx in 0..baseline_cols {
+            beta[idx] = 0.05 * (idx as f64 + 1.0);
+        }
+        for idx in baseline_cols..p {
+            beta[idx] = 0.01 * (idx as f64 + 1.0);
+        }
+
+        let guard = spec.derivative_guard.max(f64::EPSILON);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        if derivative_exit.iter().any(|value| *value <= guard * 10.0) {
+            for idx in 0..baseline_cols {
+                beta[idx] += 0.05;
+            }
+        }
+
+        let base_state = model.update(&beta).unwrap();
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let derivative_vector = layout.combined_derivative_exit.dot(&beta);
+        let h_exit = eta_exit.mapv(f64::exp);
+        let h_entry = eta_entry.mapv(f64::exp);
+
+        let mut manual_gradient = Array1::<f64>::zeros(p);
+        let mut manual_hessian = Array2::<f64>::zeros((p, p));
+
+        for i in 0..data.age_entry.len() {
+            let weight = data.sample_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let d = f64::from(data.event_target[i]);
+            let x_exit_row = layout.combined_exit.row(i);
+            let x_entry_row = layout.combined_entry.row(i);
+            let d_exit_row = layout.combined_derivative_exit.row(i);
+            let guard_threshold = spec.derivative_guard.max(f64::EPSILON);
+            let raw_derivative = derivative_vector[i];
+            let guard_applied = raw_derivative <= guard_threshold;
+            let guarded = if guard_applied {
+                guard_threshold
+            } else {
+                raw_derivative
+            };
+            let scale = if guard_applied { 0.0 } else { 1.0 / guarded };
+            let mut x_tilde = x_exit_row.to_owned();
+            Zip::from(&mut x_tilde)
+                .and(&d_exit_row)
+                .for_each(|value, &deriv| *value += deriv * scale);
+
+            accumulate_weighted_vector(&mut manual_gradient, 2.0 * weight * h_exit[i], &x_exit_row);
+            accumulate_weighted_vector(
+                &mut manual_gradient,
+                -2.0 * weight * h_entry[i],
+                &x_entry_row,
+            );
+            if d > 0.0 {
+                accumulate_weighted_vector(&mut manual_gradient, -2.0 * weight * d, &x_tilde);
+            }
+
+            accumulate_symmetric_outer(&mut manual_hessian, -2.0 * weight * h_exit[i], &x_exit_row);
+            accumulate_symmetric_outer(
+                &mut manual_hessian,
+                -2.0 * weight * h_entry[i],
+                &x_entry_row,
+            );
+            let event_scale = if spec.use_expected_information {
+                weight * h_exit[i]
+            } else {
+                weight * d
+            };
+            if event_scale != 0.0 {
+                accumulate_symmetric_outer(&mut manual_hessian, -2.0 * event_scale, &x_tilde);
+            }
+        }
+
+        for (observed, expected) in manual_gradient.iter().zip(base_state.gradient.iter()) {
+            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-8);
+        }
+
+        for (manual_row, observed_row) in manual_hessian
+            .rows()
+            .into_iter()
+            .zip(base_state.hessian.rows())
+        {
+            for (manual_val, observed_val) in manual_row.iter().zip(observed_row.iter()) {
+                assert_abs_diff_eq!(*manual_val, *observed_val, epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn expected_information_adjusts_hessian() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let mut spec_observed = SurvivalSpec::default();
+        spec_observed.barrier_weight = 0.0;
+        spec_observed.use_expected_information = false;
+        let mut spec_expected = spec_observed;
+        spec_expected.use_expected_information = true;
+
+        let mut observed_model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec_observed)
+                .unwrap();
+        let mut expected_model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec_expected)
+                .unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.015 * (idx as f64 + 1.0);
+        }
+
+        let observed_state = observed_model.update(&beta).unwrap();
+        let expected_state = expected_model.update(&beta).unwrap();
+
+        for (obs, exp) in observed_state
+            .gradient
+            .iter()
+            .zip(expected_state.gradient.iter())
+        {
+            assert_abs_diff_eq!(*obs, *exp, epsilon = 1e-10);
+        }
+
+        let guard = spec_observed.derivative_guard.max(f64::EPSILON);
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        let mut expected_diff = Array2::<f64>::zeros((p, p));
+        for i in 0..data.age_entry.len() {
+            let weight = data.sample_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let h_exit = eta_exit[i].exp();
+            let d = f64::from(data.event_target[i]);
+            let raw_derivative = derivative_exit[i];
+            let guard_applied = raw_derivative <= guard;
+            let guarded = if guard_applied { guard } else { raw_derivative };
+            let scale = if guard_applied { 0.0 } else { 1.0 / guarded };
+            let mut x_tilde = layout.combined_exit.row(i).to_owned();
+            Zip::from(&mut x_tilde)
+                .and(&layout.combined_derivative_exit.row(i))
+                .for_each(|value, &deriv| *value += deriv * scale);
+            let diff_scale = -2.0 * weight * (h_exit - d);
+            if diff_scale == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                for k in 0..p {
+                    expected_diff[[j, k]] += diff_scale * x_tilde[j] * x_tilde[k];
+                }
+            }
+        }
+
+        let diff = &expected_state.hessian - &observed_state.hessian;
+        for (observed, expected) in diff.iter().zip(expected_diff.iter()) {
+            let tolerance = 1e-12 * expected.abs().max(1.0);
+            assert!(
+                (*observed - *expected).abs() < tolerance,
+                "expected-information difference mismatch: observed={}, expected={}, tolerance={}",
+                observed,
+                expected,
+                tolerance
+            );
+        }
     }
 
     #[test]
