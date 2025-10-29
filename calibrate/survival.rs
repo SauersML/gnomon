@@ -15,7 +15,7 @@ const DEFAULT_BARRIER_SCALE: f64 = 1.0;
 const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 
 /// Errors surfaced while validating survival-specific data structures.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum SurvivalError {
     #[error("age_entry must be strictly less than age_exit for every subject")]
     InvalidAgeOrder,
@@ -230,6 +230,17 @@ impl PenaltyBlocks {
         hessian
     }
 
+    fn deviance(&self, beta: &Array1<f64>) -> f64 {
+        let mut value = 0.0;
+        for block in &self.blocks {
+            if block.lambda == 0.0 {
+                continue;
+            }
+            let quad = beta.dot(&block.matrix.dot(beta));
+            value += block.lambda * quad;
+        }
+        value
+    }
 }
 
 /// Column partition describing where each design block lives within the coefficient vector.
@@ -242,14 +253,13 @@ pub struct ColumnPartition {
 
 impl ColumnPartition {
     fn validate(&self, total_dim: usize) -> Result<(), SurvivalError> {
-        let mut last = 0usize;
         if self.baseline.start != 0 {
             return Err(SurvivalError::DesignDimensionMismatch);
         }
         if self.baseline.end > total_dim {
             return Err(SurvivalError::DesignDimensionMismatch);
         }
-        last = self.baseline.end;
+        let mut last = self.baseline.end;
         if let Some(tv) = &self.time_varying {
             if tv.start != last || tv.end > total_dim {
                 return Err(SurvivalError::DesignDimensionMismatch);
@@ -501,6 +511,7 @@ impl<'a> WorkingModel for LogisticWorkingModel<'a> {
             deviance -= 2.0 * w * (y * (m.max(eps)).ln() + (1.0 - y) * (1.0 - m).max(eps).ln());
         }
         hessian -= &self.penalties.hessian(beta.len());
+        deviance += self.penalties.deviance(beta);
         Ok(WorkingState {
             eta,
             gradient,
@@ -550,7 +561,7 @@ impl<'a> WorkingModel for GaussianWorkingModel<'a> {
             hessian -= &(outer_product(&row.to_owned()) * w);
         }
         hessian -= &self.penalties.hessian(beta.len());
-        let deviance = (self.weights.dot(&(&residual * &residual)));
+        let deviance = self.weights.dot(&(&residual * &residual)) + self.penalties.deviance(beta);
         Ok(WorkingState {
             eta,
             gradient,
@@ -743,6 +754,7 @@ impl<'a> WorkingModel for SurvivalWorkingModel<'a> {
 
         gradient -= &self.layout.penalties.gradient(beta);
         hessian -= &self.layout.penalties.hessian(beta.len());
+        deviance += self.layout.penalties.deviance(beta);
         Ok(WorkingState {
             eta: eta_exit,
             gradient,
@@ -829,7 +841,7 @@ impl SurvivalModelArtifacts {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::{Array, Array1, Array2, array, s};
+    use ndarray::{Array, Array1, Array2, array};
 
     fn simple_layout(n: usize) -> (SurvivalLayout, SurvivalTrainingData) {
         let age_entry = Array::linspace(50.0, 50.0 + n as f64 - 1.0, n);
@@ -880,25 +892,82 @@ mod tests {
     }
 
     #[test]
-    fn gradient_matches_finite_difference() {
-        let (layout, data) = simple_layout(5);
-        let mut model = SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
-        let beta = array![0.1, -0.2];
-        let state = model.update(&beta).unwrap();
+    fn penalty_contributes_to_working_state() {
+        let (layout, data) = simple_layout(4);
+        let mut penalised_model =
+            SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
+        let beta = array![0.12, -0.08];
+        let penalised = penalised_model.update(&beta).unwrap();
+
+        let mut unpenalised_layout = layout.clone();
+        for block in &mut unpenalised_layout.penalties.blocks {
+            block.lambda = 0.0;
+        }
+        let mut unpenalised_model =
+            SurvivalWorkingModel::new(&unpenalised_layout, &data, SurvivalSpec::default()).unwrap();
+        let unpenalised = unpenalised_model.update(&beta).unwrap();
+
+        let penalty_deviance = layout.penalties.deviance(&beta);
+        assert_abs_diff_eq!(
+            penalised.deviance,
+            unpenalised.deviance + penalty_deviance,
+            epsilon = 1e-10
+        );
+
+        let penalty_gradient = layout.penalties.gradient(&beta);
+        let expected_gradient = &unpenalised.gradient - &penalty_gradient;
+        for (observed, expected) in penalised.gradient.iter().zip(expected_gradient.iter()) {
+            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-10);
+        }
+
+        let penalty_hessian = layout.penalties.hessian(beta.len());
+        let expected_hessian = &unpenalised.hessian - &penalty_hessian;
+        for (observed_row, expected_row) in penalised
+            .hessian
+            .rows()
+            .into_iter()
+            .zip(expected_hessian.rows())
+        {
+            for (observed, expected) in observed_row.iter().zip(expected_row.iter()) {
+                assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-10);
+            }
+        }
 
         let epsilon = 1e-6;
-        let mut numeric_gradient = Array1::zeros(beta.len());
+        let mut numeric_penalised = Array1::zeros(beta.len());
+        let mut numeric_unpenalised = Array1::zeros(beta.len());
         for j in 0..beta.len() {
             let mut beta_plus = beta.clone();
             beta_plus[j] += epsilon;
             let mut beta_minus = beta.clone();
             beta_minus[j] -= epsilon;
-            let state_plus = model.update(&beta_plus).unwrap();
-            let state_minus = model.update(&beta_minus).unwrap();
-            numeric_gradient[j] = (state_plus.deviance - state_minus.deviance) / (2.0 * epsilon);
+
+            let mut model_plus =
+                SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
+            let state_plus = model_plus.update(&beta_plus).unwrap();
+            let mut model_minus =
+                SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
+            let state_minus = model_minus.update(&beta_minus).unwrap();
+            numeric_penalised[j] = (state_plus.deviance - state_minus.deviance) / (2.0 * epsilon);
+
+            let mut model_plus_unpen =
+                SurvivalWorkingModel::new(&unpenalised_layout, &data, SurvivalSpec::default())
+                    .unwrap();
+            let state_plus_unpen = model_plus_unpen.update(&beta_plus).unwrap();
+            let mut model_minus_unpen =
+                SurvivalWorkingModel::new(&unpenalised_layout, &data, SurvivalSpec::default())
+                    .unwrap();
+            let state_minus_unpen = model_minus_unpen.update(&beta_minus).unwrap();
+            numeric_unpenalised[j] =
+                (state_plus_unpen.deviance - state_minus_unpen.deviance) / (2.0 * epsilon);
         }
+        let penalty_gradient_dev = layout.penalties.gradient(&beta) * 2.0;
         for j in 0..beta.len() {
-            assert_abs_diff_eq!(state.gradient[j], numeric_gradient[j], epsilon = 1e-4);
+            assert_abs_diff_eq!(
+                numeric_penalised[j],
+                numeric_unpenalised[j] + penalty_gradient_dev[j],
+                epsilon = 1e-6
+            );
         }
     }
 
@@ -906,7 +975,7 @@ mod tests {
     fn delta_h_matches_difference() {
         let (layout, data) = simple_layout(3);
         let beta = array![0.05, 0.02];
-        let mut model = SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
+        let model = SurvivalWorkingModel::new(&layout, &data, SurvivalSpec::default()).unwrap();
         let (eta_entry, eta_exit, _) = model.linear_predictors(&beta);
         let delta_from_state =
             (&eta_exit.mapv(|v| v.exp()) - &eta_entry.mapv(|v| v.exp())).to_vec();
@@ -920,6 +989,7 @@ mod tests {
     #[test]
     fn risk_monotonicity() {
         let (layout, data) = simple_layout(1);
+        let _ = data;
         let artifacts = SurvivalModelArtifacts {
             coefficients: array![0.05, 0.02],
             age_basis: Array2::from_elem((1, 2), 1.0),
