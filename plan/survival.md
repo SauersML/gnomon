@@ -66,10 +66,10 @@ pub struct SurvivalPredictionInputs<'a> {
 
 ## 4. Basis, transforms, and constraints
 ### 4.1 Guarded age transform
-- Compute `a_min = min(age_entry)` and choose a small guard `δ > 0` (e.g., `0.1`).
-- Map ages to `u = log(age - a_min + δ)` for both training and scoring.
-- Store `AgeTransform { a_min, delta }` in the trained artifact and reuse it verbatim at prediction time.
-- Apply the chain rule factor `∂u/∂age = 1/(age - a_min + δ)` wherever derivatives of `η(u)` are converted back to age derivatives.
+- Select a lower reference `L` strictly below the training support (e.g., a buffered low-percentile of `age_entry`) so that `age_entry > L` for every subject.
+- Map ages to `u_raw = log(age - L)` for both training and scoring, then standardise with `u = (u_raw - μ_u) / σ_u`, where `μ_u` and `σ_u > 0` are the training mean and scale of `u_raw`.
+- Persist `AgeTransform { lower_reference: L, mean: μ_u, scale: σ_u }` in the trained artifact and reuse it verbatim at prediction time.
+- Apply the chain-rule factor `∂u/∂age = (1/σ_u) · 1/(age - L)` in both training layouts and scoring-time derivative reconstructions so every age derivative accounts for the stored standardisation.
 
 ### 4.2 Baseline spline and reference constraint
 - Build a B-spline basis over `u` for the baseline log cumulative hazard `η_0(u)`.
@@ -96,14 +96,14 @@ pub struct SurvivalLayout {
     pub penalties: PenaltyBlocks,
 }
 ```
-- Derivative matrices apply the chain-rule scaling so they already represent `(∂η/∂age)` contributions at exit. No derivative-at-entry cache is required.
+- Derivative matrices apply the stored chain-rule factor `(1/σ_u) · 1/(age - L)` so they already represent `(∂η/∂age)` contributions at exit. No derivative-at-entry cache is required.
 
 ## 5. Likelihood, score, and Hessian
 ### 5.1 Per-subject quantities
 - `η_exit = X_exit β`, `η_entry = X_entry β`.
 - `H_exit = exp(η_exit)`, `H_entry = exp(η_entry)`.
 - `ΔH = H_exit - H_entry` (non-negative by construction of the cumulative hazard).
-- `dη_exit = D_exit β` already on the age scale.
+- `dη_exit = D_exit β` already on the age scale because `D_exit` incorporates `(1/σ_u) · 1/(age - L)` from the guarded transform.
 - Target event indicator `d = event_target`, sample weight `w = sample_weight`.
 
 ### 5.2 Log-likelihood
@@ -128,10 +128,9 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - `WorkingState::eta` returns `η_exit` so diagnostics (calibrator, standard errors) can reuse it.
 - Devianee `D = -2 Σ_i ℓ_i` feeds REML/LAML.
 
-### 5.4 Monotonicity safeguard and penalty
-- Enforce feasibility with an optimization safeguard that guarantees the penalized deviance is non-increasing. Implement a deterministic line search (preferred) or trust-region gate that rejects steps violating the penalized deviance descent criterion while also guaranteeing `dη_exit > 0` for every attempted evaluation.
-- Add a soft inequality penalty to discourage near-zero `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping; feasibility must come entirely from the safeguarded optimizer.
+### 5.4 Monotonicity penalty
+- Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
+- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -154,11 +153,13 @@ pub struct SurvivalModelArtifacts {
 }
 ```
 - The Hessian factor enables delta-method standard errors.
+- `AgeTransform` records `lower_reference`, `mean`, and `scale` so the guarded log-age standardisation replays identically at scoring time.
 - Column ranges for covariates and interactions are recorded for scoring-time guards.
 
 ### 7.2 Hazard and cumulative incidence
 - Evaluate `η(t)` by reconstructing the constrained basis at requested age `t` using the stored transform.
 - `H(t) = exp(η(t))`.
+- Any requested age derivatives reuse the stored chain-rule factor `(1/σ_u) · 1/(t - L)` to match the training layout scaling.
 - Absolute risk between `t0` and `t1`:
 ```
 CIF_target(t) = 1 - exp(-H(t)).
@@ -193,10 +194,10 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 9. Testing and diagnostics
 - Unit tests:
   - gradient/Hessian correctness via finite differences on small synthetic data;
-  - safeguard activation: construct a scenario that forces the line search/trust region to shorten the step, confirm the accepted update keeps the penalized deviance non-increasing, and log that feasibility checks rejected the raw step;
+  - deviance decreases monotonically under PIRLS iterations;
   - left-truncation: confirm `ΔH` equals the difference of endpoint evaluations;
-  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`).
-- Regression test: craft a near-boundary design where the raw Newton step would evaluate `dη_exit ≤ 0`; assert the safeguard prevents those evaluations and that optimization proceeds without touching infeasible derivatives.
+  - prediction monotonicity in horizon (risk between `t0` and `t1` is non-negative and increases with `t1`);
+  - scoring stability for cohorts containing ages slightly below the training minimum, exercising the stored `L`, `μ_u`, and `σ_u` guards.
 - Grid diagnostic: monitor the fraction of grid ages where the soft barrier activates. If it exceeds a small threshold (e.g., 5%), emit a warning suggesting more knots or stronger smoothing.
 - Compare with reference tooling (`rstpm2` or `flexsurv`) on CIFs at named ages and Brier scores with/without calibration.
 - Remove benchmarks centered on risk-set algebra or quadrature.
@@ -216,7 +217,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 Store in the trained model artifact:
 - baseline knot vector and spline degree;
 - reference constraint transform (matrix or factorisation);
-- `AgeTransform { a_min, delta }`;
+- `AgeTransform { lower_reference: L, mean: μ_u, scale: σ_u }`;
 - centering transforms for interactions and covariate ranges for guard rails;
 - penalized Hessian (or its Cholesky factor) for delta-method standard errors;
 - optional handles to companion competing-risk models.
