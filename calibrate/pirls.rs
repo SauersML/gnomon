@@ -60,6 +60,34 @@ impl PirlsWorkspace {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
+where
+    F: FnOnce() -> R,
+{
+    PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+        *trace.borrow_mut() = Some(Vec::new());
+    });
+    let result = run();
+    let captured = PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
+    (result, captured)
+}
+
+#[cfg(test)]
+fn record_penalized_deviance(value: f64) {
+    PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+        if let Some(ref mut buf) = *trace.borrow_mut() {
+            buf.push(value);
+        }
+    });
+}
+
 pub(crate) struct CholeskyCacheEntry {
     hash: u64,
     ridge: f64,
@@ -383,6 +411,9 @@ pub fn fit_model_for_fixed_rho(
 
         // This is the true objective function value at the start of the iteration
         let penalized_deviance_current = deviance_current + penalty_current;
+
+        #[cfg(test)]
+        record_penalized_deviance(penalized_deviance_current);
 
         // Check for non-finite values - this safety check is kept from modern version
         if !eta.iter().all(|x| x.is_finite())
@@ -2794,6 +2825,39 @@ mod tests {
 
         println!(
             "✓ Test passed: Different smoothing parameters correctly produced different reparameterizations."
+        );
+    }
+
+    #[test]
+    fn pirls_penalized_deviance_is_monotone() {
+        let (result, trace) = super::capture_pirls_penalized_deviance(|| {
+            run_pirls_test_scenario(LinkFunction::Logit, SignalType::LinearSignal)
+        });
+
+        let scenario = result.expect("P-IRLS scenario should converge");
+        assert!(
+            trace.len() > 1,
+            "expected multiple PIRLS iterations to be recorded"
+        );
+
+        for window in trace.windows(2) {
+            let prev = window[0];
+            let next = window[1];
+            assert!(
+                next <= prev * (1.0 + 1e-10) + 1e-12,
+                "penalized deviance should be non-increasing (prev={prev}, next={next})"
+            );
+        }
+
+        assert!(
+            trace.windows(2).any(|window| window[1] < window[0] - 1e-8),
+            "expected at least one strict penalized deviance decrease"
+        );
+
+        assert_eq!(
+            scenario.pirls_result.status,
+            PirlsStatus::Converged,
+            "scenario should converge successfully"
         );
     }
 

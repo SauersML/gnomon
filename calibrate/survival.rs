@@ -988,7 +988,7 @@ impl LogitExt for f64 {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::array;
+    use ndarray::{Array1, array};
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1017,6 +1017,97 @@ mod tests {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
     }
 
+    fn trusted_reference_artifacts() -> SurvivalModelArtifacts {
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 1.0, 1.0],
+            degree: 1,
+        };
+        let reference_log_age = 0.0_f64;
+        let (basis_arc, _) = create_bspline_basis_with_knots(
+            array![reference_log_age].view(),
+            basis.knot_vector.view(),
+            basis.degree,
+        )
+        .expect("basis evaluation");
+        let basis_row = (*basis_arc).row(0);
+        assert_eq!(
+            basis_row.len(),
+            2,
+            "reference fixture expects two basis functions"
+        );
+        let norm = (basis_row[0].powi(2) + basis_row[1].powi(2)).sqrt();
+        let transform = array![[basis_row[1] / norm], [-basis_row[0] / norm]];
+
+        let static_names = vec!["pgs".to_string(), "sex".to_string()];
+        let coefficients = array![0.35, 0.45, -0.12];
+
+        SurvivalModelArtifacts {
+            coefficients,
+            age_basis: basis,
+            time_varying_basis: None,
+            static_covariate_layout: CovariateLayout {
+                column_names: static_names,
+            },
+            penalties: PenaltyDescriptor {
+                order: 2,
+                lambda: 0.05,
+            },
+            age_transform: AgeTransform {
+                minimum_age: 40.0,
+                delta: 1.0,
+            },
+            reference_constraint: ReferenceConstraint {
+                transform,
+                reference_log_age,
+            },
+            hessian_factor: None,
+        }
+    }
+
+    fn trusted_reference_covariates() -> Vec<(f64, Array1<f64>)> {
+        vec![
+            (58.0, array![0.25, 0.0]),
+            (61.0, array![-0.15, 1.0]),
+            (64.0, array![0.32, 0.0]),
+            (67.0, array![0.05, 1.0]),
+        ]
+    }
+
+    fn trusted_reference_events() -> (Array1<u8>, Array1<f64>) {
+        (array![1, 0, 1, 0], array![1.0, 2.0, 3.0, 4.0])
+    }
+
+    fn trusted_reference_expected_cifs() -> Vec<f64> {
+        vec![
+            0.3292075181763382,
+            0.24497924964961038,
+            0.3122529095902712,
+            0.2461683546859772,
+        ]
+    }
+
+    fn trusted_reference_expected_brier() -> f64 {
+        0.22313758356852675
+    }
+
+    fn weighted_brier(y: &Array1<u8>, p: &Array1<f64>, w: &Array1<f64>) -> f64 {
+        let mut numerator = 0.0;
+        let mut denom = 0.0;
+        for i in 0..y.len() {
+            let weight = w[i];
+            numerator += weight * (p[i] - f64::from(y[i])).powi(2);
+            denom += weight;
+        }
+        numerator / denom.max(f64::MIN_POSITIVE)
+    }
+
+    fn apply_reference_calibration(prob: f64) -> f64 {
+        let clamped = prob.max(1e-12).min(1.0 - 1e-12);
+        let logit = (clamped / (1.0 - clamped)).ln();
+        let adjusted = 0.15 + 0.85 * logit;
+        1.0 / (1.0 + (-adjusted).exp())
+    }
+
     fn evaluate_state(
         layout: &SurvivalLayout,
         penalty: &MonotonicityPenalty,
@@ -1037,6 +1128,36 @@ mod tests {
     fn logit_extension_behaves() {
         assert!(0.5f64.logit().abs() < 1e-12);
         assert!(f64::is_finite(0.01f64.logit()));
+    }
+
+    #[test]
+    fn cumulative_incidence_matches_reference_library() {
+        let artifacts = trusted_reference_artifacts();
+        let expected = trusted_reference_expected_cifs();
+        for ((age, covariates), expected_cif) in trusted_reference_covariates()
+            .into_iter()
+            .zip(expected.into_iter())
+        {
+            let observed = cumulative_incidence(age, &covariates, &artifacts)
+                .expect("cumulative incidence evaluation");
+            assert_abs_diff_eq!(observed, expected_cif, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn brier_score_matches_reference_library() {
+        let artifacts = trusted_reference_artifacts();
+        let horizon = 70.0;
+        let mut predictions = Array1::<f64>::zeros(4);
+        for (idx, (age, covariates)) in trusted_reference_covariates().into_iter().enumerate() {
+            let cif = cumulative_incidence(age.min(horizon), &covariates, &artifacts)
+                .expect("cumulative incidence evaluation");
+            predictions[idx] = cif;
+        }
+        let (events, weights) = trusted_reference_events();
+        let brier = weighted_brier(&events, &predictions, &weights);
+        let expected = trusted_reference_expected_brier();
+        assert_abs_diff_eq!(brier, expected, epsilon = 1e-9);
     }
 
     #[test]
@@ -1100,6 +1221,40 @@ mod tests {
         assert!(cif1 >= cif0 - 1e-9);
         let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
+    }
+
+    #[test]
+    fn conditional_risk_monotonic_with_calibration_toggle() {
+        let artifacts = trusted_reference_artifacts();
+        let covariates = array![0.12, 1.0];
+        let t0 = 55.0;
+        let horizons = [60.0, 64.0, 68.0];
+
+        let mut base: Vec<f64> = Vec::new();
+        for &t1 in &horizons {
+            let risk = conditional_absolute_risk(t0, t1, &covariates, 0.05, &artifacts)
+                .expect("conditional risk evaluation");
+            base.push(risk);
+        }
+
+        for window in base.windows(2) {
+            assert!(
+                window[1] >= window[0] - 1e-12,
+                "base conditional risk must be monotone"
+            );
+        }
+
+        let calibrated: Vec<f64> = base
+            .iter()
+            .copied()
+            .map(apply_reference_calibration)
+            .collect();
+        for window in calibrated.windows(2) {
+            assert!(
+                window[1] >= window[0] - 1e-12,
+                "calibrated conditional risk must be monotone"
+            );
+        }
     }
 
     #[test]
@@ -1565,6 +1720,40 @@ mod tests {
         {
             assert_abs_diff_eq!(*h_weighted, *h_expanded, epsilon = 1e-4);
         }
+    }
+
+    #[test]
+    fn weighted_brier_matches_frequency_replication() {
+        let artifacts = trusted_reference_artifacts();
+        let (events, weights) = trusted_reference_events();
+        let horizon = 70.0;
+
+        let predictions: Array1<f64> = trusted_reference_covariates()
+            .into_iter()
+            .map(|(age, cov)| {
+                cumulative_incidence(age.min(horizon), &cov, &artifacts)
+                    .expect("cumulative incidence evaluation")
+            })
+            .collect();
+
+        let weighted = weighted_brier(&events, &predictions, &weights);
+
+        let mut expanded_events = Vec::new();
+        let mut expanded_predictions = Vec::new();
+        for i in 0..events.len() {
+            let copies = weights[i] as usize;
+            for _ in 0..copies {
+                expanded_events.push(events[i]);
+                expanded_predictions.push(predictions[i]);
+            }
+        }
+
+        let expanded_events = Array1::from(expanded_events);
+        let expanded_predictions = Array1::from(expanded_predictions);
+        let uniform_weights = Array1::from_elem(expanded_events.len(), 1.0);
+        let replicated = weighted_brier(&expanded_events, &expanded_predictions, &uniform_weights);
+
+        assert_abs_diff_eq!(weighted, replicated, epsilon = 1e-12);
     }
 
     #[test]
