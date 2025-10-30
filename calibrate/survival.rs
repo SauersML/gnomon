@@ -1003,6 +1003,22 @@ pub enum HessianFactor {
     },
 }
 
+impl HessianFactor {
+    /// Return the inertia (negative, zero, positive eigenvalue counts) implied by the
+    /// stored factorization. This is primarily useful for diagnostics that need to
+    /// understand how many directions of negative curvature were encountered while
+    /// solving the penalized system.
+    pub fn inertia(&self) -> (usize, usize, usize) {
+        match self {
+            HessianFactor::Observed { inertia, .. } => *inertia,
+            HessianFactor::Expected { cholesky_factor } => {
+                let dim = cholesky_factor.nrows();
+                (0, 0, dim)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
@@ -2041,5 +2057,20 @@ mod tests {
         let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn hessian_factor_reports_inertia() {
+        let observed = HessianFactor::Observed {
+            ldlt_factor: Array2::zeros((2, 2)),
+            permutation: vec![0, 1],
+            inertia: (1, 0, 1),
+        };
+        assert_eq!(observed.inertia(), (1, 0, 1));
+
+        let expected = HessianFactor::Expected {
+            cholesky_factor: Array2::eye(3),
+        };
+        assert_eq!(expected.inertia(), (0, 0, 3));
     }
 }
