@@ -675,34 +675,18 @@ pub fn build_survival_layout(
     let extra_static_covariates = data.extra_static_covariates.clone();
     let static_covariate_names = assemble_static_covariate_names(data);
 
-    let combined_entry = concatenate_design(
-        &constrained_entry,
-        None,
-        &static_covariates,
-        &extra_static_covariates,
-    );
-    let combined_exit = concatenate_design(
-        &constrained_exit,
-        None,
-        &static_covariates,
-        &extra_static_covariates,
-    );
-    let zero_static = Array2::<f64>::zeros((n, static_covariates.ncols()));
-    let zero_extra = Array2::<f64>::zeros((n, extra_static_covariates.ncols()));
-    let combined_derivative_exit =
-        concatenate_design(&baseline_derivative_exit, None, &zero_static, &zero_extra);
-
+    let baseline_cols = constrained_exit.ncols();
     let penalty_matrix =
-        create_difference_penalty_matrix(constrained_exit.ncols(), baseline_penalty_order)?;
-    let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
-        matrix: penalty_matrix,
+        create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
+    let mut penalty_blocks = vec![PenaltyBlock {
+        matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
         range: 0..baseline_cols,
     }];
     let mut penalty_descriptors = vec![PenaltyDescriptor {
         order: baseline_penalty_order,
         lambda: baseline_lambda,
-        matrix: baseline_penalty_matrix.clone(),
+        matrix: penalty_matrix.clone(),
         column_range: ColumnRange::new(0, baseline_cols),
     }];
 
@@ -738,7 +722,7 @@ pub fn build_survival_layout(
             let time_cols = baseline_cols * pgs_cols;
 
             if time_cols > 0 {
-                let age_penalty_1d = baseline_penalty_matrix.clone();
+                let age_penalty_1d = penalty_matrix.clone();
                 let pgs_penalty_1d =
                     create_difference_penalty_matrix(pgs_cols, config.pgs_penalty_order)?;
 
@@ -835,17 +819,21 @@ pub fn build_survival_layout(
         &constrained_entry,
         time_varying_entry.as_ref(),
         &static_covariates,
+        &extra_static_covariates,
     );
     let combined_exit = concatenate_design(
         &constrained_exit,
         time_varying_exit.as_ref(),
         &static_covariates,
+        &extra_static_covariates,
     );
     let zero_static = Array2::<f64>::zeros((n, static_covariates.ncols()));
+    let zero_extra = Array2::<f64>::zeros((n, extra_static_covariates.ncols()));
     let combined_derivative_exit = concatenate_design(
         &baseline_derivative_exit,
         time_varying_derivative_exit.as_ref(),
         &zero_static,
+        &zero_extra,
     );
 
     let layout = SurvivalLayout {
@@ -1655,7 +1643,7 @@ fn covariate_label(layout: &CovariateLayout, index: usize) -> String {
 }
 
 fn enforce_covariate_ranges(
-    covariates: &Array1<f64>,
+    covariates: ArrayView1<f64>,
     layout: &CovariateLayout,
 ) -> Result<(), SurvivalError> {
     let expected = layout.column_names.len();

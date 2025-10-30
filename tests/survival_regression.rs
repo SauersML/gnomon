@@ -21,15 +21,18 @@ impl TrustedReference {
     fn new() -> Self {
         let data = trusted_reference_data();
         let basis = reference_basis();
-        let (layout, monotonicity) = build_survival_layout(
+        let bundle = build_survival_layout(
             &data,
             &basis,
             GUARD_DELTA,
             BASELINE_PENALTY_ORDER,
             BASELINE_LAMBDA,
             MONOTONIC_GRID,
+            None,
         )
         .expect("layout");
+        let layout = bundle.layout;
+        let monotonicity = bundle.monotonicity;
 
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
@@ -67,6 +70,8 @@ fn trusted_reference_data() -> SurvivalTrainingData {
         pgs,
         sex,
         pcs,
+        extra_static_covariates: Array2::zeros((age_exit.len(), 0)),
+        extra_static_names: Vec::new(),
     }
 }
 
@@ -186,6 +191,7 @@ fn build_artifacts(
         interaction_metadata: Vec::new(),
         companion_models: Vec::new(),
         hessian_factor: None,
+        calibrator: None,
     }
 }
 
@@ -291,9 +297,9 @@ fn conditional_risk_monotonic_with_calibration_toggle() {
     let mut base = Vec::new();
     let mut calibrated = Vec::new();
     for &t1 in &horizons {
-        let raw = conditional_absolute_risk(t0, t1, &covs, 0.0, &trusted.artifacts).unwrap();
+        let raw = conditional_absolute_risk(t0, t1, &covs, Some(0.0), None, &trusted.artifacts).unwrap();
         base.push(raw);
-        let cal = conditional_absolute_risk(t0, t1, &covs, 0.12, &trusted.artifacts).unwrap();
+        let cal = conditional_absolute_risk(t0, t1, &covs, Some(0.12), None, &trusted.artifacts).unwrap();
         calibrated.push(cal);
     }
     assert!(base.windows(2).all(|w| w[1] + 1e-12 >= w[0]));

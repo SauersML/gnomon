@@ -836,7 +836,8 @@ impl TrainedModel {
                 entry_age,
                 exit_age,
                 &cov_row,
-                cif_competing,
+                Some(cif_competing),
+                None,
                 artifacts,
             )?;
             conditional_risk[i] = risk_val;
