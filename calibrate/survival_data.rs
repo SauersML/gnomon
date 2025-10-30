@@ -159,7 +159,12 @@ struct SurvivalArrays {
 
 fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, SurvivalDataError> {
     let df = read_tabular(path)?;
-    let name_map = build_case_insensitive_map(df.get_column_names());
+    let name_map = build_case_insensitive_map(
+        df.get_column_names()
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect(),
+    );
 
     let age_entry = extract_f64_column(&df, &name_map, "age_entry")?;
     let age_exit = extract_f64_column(&df, &name_map, "age_exit")?;
@@ -234,9 +239,11 @@ fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
         }
         _ => {
             let file = File::open(path)?;
-            CsvReader::new(file)
+            let options = CsvReadOptions::default()
                 .with_has_header(true)
-                .with_separator(b'\t')
+                .map_parse_options(|opts| opts.with_separator(b'\t'));
+            options
+                .into_reader_with_file_handle(file)
                 .finish()
                 .map_err(SurvivalDataError::from)
         }
