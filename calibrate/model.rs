@@ -453,7 +453,6 @@ impl TrainedModel {
         match &self.config.model_family {
             ModelFamily::Gam(link) => Ok(*link),
             ModelFamily::Survival(_) => Err(ModelError::UnsupportedForSurvival(operation)),
-            }),
         }
     }
 
