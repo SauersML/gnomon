@@ -9,6 +9,7 @@ use ndarray::{Array1, Array2, Axis, array};
 const GUARD_DELTA: f64 = 0.1;
 const BASELINE_PENALTY_ORDER: usize = 2;
 const BASELINE_LAMBDA: f64 = 0.5;
+const MONOTONIC_LAMBDA: f64 = BASELINE_LAMBDA * 1e-4;
 const MONOTONIC_GRID: usize = 6;
 
 struct TrustedReference {
@@ -27,6 +28,7 @@ impl TrustedReference {
             GUARD_DELTA,
             BASELINE_PENALTY_ORDER,
             BASELINE_LAMBDA,
+            MONOTONIC_LAMBDA,
             MONOTONIC_GRID,
             None,
         )

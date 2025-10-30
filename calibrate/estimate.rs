@@ -1562,7 +1562,8 @@ pub fn train_survival_model(
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, SurvivalError,
-        SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange, WorkingModelSurvival,
+        SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
+        WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
 
@@ -1706,6 +1707,7 @@ pub fn train_survival_model(
         survival_cfg.guard_delta,
         config.penalty_order,
         survival_cfg.initial_lambda,
+        survival_cfg.monotonic_lambda,
         survival_cfg.monotonic_grid_size,
     )
     .map_err(map_error)?;
