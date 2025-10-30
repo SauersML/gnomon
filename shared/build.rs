@@ -54,7 +54,7 @@ static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
     static ENABLE_WARNINGS: OnceLock<bool> = OnceLock::new();
-    *ENABLE_WARNINGS.get_or_init(|| match std::env::var("GNOMON_BUILD_VERBOSE") {
+    *ENABLE_WARNINGS.get_or_init(|| match std::env::var("BUILD_VERBOSE") {
         Ok(value) => {
             let normalized = value.trim();
             normalized.eq_ignore_ascii_case("true")
@@ -73,14 +73,14 @@ fn update_stage(label: &str) {
     }
 
     if warnings_enabled() {
-        println!("cargo:warning=gnomon build stage: {label}");
+        println!("cargo:warning=project build stage: {label}");
         let _ = io::stdout().flush();
     }
 }
 
 fn emit_stage_detail(detail: &str) {
     if warnings_enabled() {
-        println!("cargo:warning=gnomon build detail: {detail}");
+        println!("cargo:warning=project build detail: {detail}");
         let _ = io::stdout().flush();
     }
 }
