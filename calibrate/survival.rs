@@ -1783,8 +1783,10 @@ pub fn design_row_at_age(
             .slice_mut(s![baseline_cols..baseline_cols + time_cols])
             .assign(&tensor.row(0));
     }
-    let covariates_owned = covariates.to_owned();
-    design = concatenate(Axis(0), &[design.view(), covariates_owned.view()]).expect("cov concat");
+    // Fill in the static covariate slots
+    design
+        .slice_mut(s![baseline_cols + time_cols..])
+        .assign(&covariates);
     Ok(design)
 }
 
