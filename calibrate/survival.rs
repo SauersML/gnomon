@@ -45,6 +45,10 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("time-varying interaction metadata missing from artifacts")]
+    MissingTimeVaryingMetadata,
+    #[error("time-varying centering vector length mismatch")]
+    TimeVaryingDimensionMismatch,
 }
 
 /// Guarded log-age transformation used across training and scoring.
@@ -136,8 +140,16 @@ pub struct BasisDescriptor {
 /// Stored smoothing metadata for reproduction at prediction time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PenaltyDescriptor {
-    pub order: usize,
-    pub lambda: f64,
+    pub baseline_order: usize,
+    pub baseline_lambda: f64,
+    pub interaction: Option<InteractionPenaltyDescriptor>,
+}
+
+/// Stored interaction penalty metadata for anisotropic tensor products.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractionPenaltyDescriptor {
+    pub lambda_age: f64,
+    pub lambda_pgs: f64,
 }
 
 /// Column descriptions for static covariates.
@@ -218,6 +230,7 @@ pub struct SurvivalLayout {
     pub time_varying_entry: Option<Array2<f64>>,
     pub time_varying_exit: Option<Array2<f64>>,
     pub time_varying_derivative_exit: Option<Array2<f64>>,
+    pub time_varying_centering: Option<Array1<f64>>,
     pub static_covariates: Array2<f64>,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
@@ -442,13 +455,15 @@ where
 pub fn build_survival_layout(
     data: &SurvivalTrainingData,
     age_basis: &BasisDescriptor,
-    age_transform: AgeTransform,
+    delta: f64,
     baseline_penalty_order: usize,
     baseline_lambda: f64,
     monotonic_grid_size: usize,
+    time_varying: Option<TimeVaryingConfig>,
 ) -> Result<(SurvivalLayout, MonotonicityPenalty), SurvivalError> {
     data.validate()?;
     let n = data.age_entry.len();
+    let age_transform = AgeTransform::from_training(&data.age_entry, delta)?;
     let log_entry = age_transform.transform_array(&data.age_entry)?;
     let log_exit = age_transform.transform_array(&data.age_exit)?;
 
@@ -464,7 +479,7 @@ pub fn build_survival_layout(
     let constrained_exit = reference_constraint.apply(&baseline_exit_raw);
     let constrained_derivative_exit_u = reference_constraint.apply(&baseline_exit_deriv_u);
 
-    let mut baseline_derivative_exit = constrained_derivative_exit_u;
+    let mut baseline_derivative_exit = constrained_derivative_exit_u.clone();
     for (mut row, age) in baseline_derivative_exit
         .rows_mut()
         .into_iter()
@@ -474,29 +489,102 @@ pub fn build_survival_layout(
         row.mapv_inplace(|v| v * factor);
     }
 
+    let mut time_varying_entry = None;
+    let mut time_varying_exit = None;
+    let mut time_varying_derivative_exit = None;
+    let mut time_varying_centering = None;
+
+    if time_varying.is_some() {
+        let pgs_column = data.pgs.clone().insert_axis(Axis(1));
+        let mut entry_interaction =
+            row_wise_tensor_product(&pgs_column, &constrained_entry);
+        let mut exit_interaction =
+            row_wise_tensor_product(&pgs_column, &constrained_exit);
+        let derivative_u_interaction =
+            row_wise_tensor_product(&pgs_column, &constrained_derivative_exit_u);
+        let mut derivative_interaction = derivative_u_interaction;
+        for (mut row, age) in derivative_interaction
+            .rows_mut()
+            .into_iter()
+            .zip(data.age_exit.iter().copied())
+        {
+            let factor = age_transform.derivative_factor(age)?;
+            row.mapv_inplace(|v| v * factor);
+        }
+
+        let centering = weighted_column_means(&exit_interaction, &data.sample_weight);
+        for (mut col, &mean) in entry_interaction.columns_mut().into_iter().zip(centering.iter()) {
+            col.mapv_inplace(|v| v - mean);
+        }
+        for (mut col, &mean) in exit_interaction.columns_mut().into_iter().zip(centering.iter()) {
+            col.mapv_inplace(|v| v - mean);
+        }
+
+        time_varying_entry = Some(entry_interaction);
+        time_varying_exit = Some(exit_interaction);
+        time_varying_derivative_exit = Some(derivative_interaction);
+        time_varying_centering = Some(centering);
+    }
+
     let static_covariates = assemble_static_covariates(data);
 
-    let combined_entry = concatenate_design(&constrained_entry, None, &static_covariates);
-    let combined_exit = concatenate_design(&constrained_exit, None, &static_covariates);
+    let combined_entry = concatenate_design(
+        &constrained_entry,
+        time_varying_entry.as_ref(),
+        &static_covariates,
+    );
+    let combined_exit = concatenate_design(
+        &constrained_exit,
+        time_varying_exit.as_ref(),
+        &static_covariates,
+    );
     let zero_static = Array2::<f64>::zeros((n, static_covariates.ncols()));
-    let combined_derivative_exit =
-        concatenate_design(&baseline_derivative_exit, None, &zero_static);
+    let combined_derivative_exit = concatenate_design(
+        &baseline_derivative_exit,
+        time_varying_derivative_exit.as_ref(),
+        &zero_static,
+    );
 
-    let penalty_matrix =
-        create_difference_penalty_matrix(constrained_exit.ncols(), baseline_penalty_order)?;
-    let penalties = PenaltyBlocks::new(vec![PenaltyBlock {
-        matrix: penalty_matrix,
+    let baseline_cols = constrained_exit.ncols();
+    let mut penalty_blocks = Vec::new();
+    let baseline_penalty_matrix =
+        create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
+    penalty_blocks.push(PenaltyBlock {
+        matrix: baseline_penalty_matrix,
         lambda: baseline_lambda,
-        range: 0..constrained_exit.ncols(),
-    }]);
+        range: 0..baseline_cols,
+    });
+
+    if let (Some(tv_exit), Some(config)) = (&time_varying_exit, time_varying) {
+        let interaction_cols = tv_exit.ncols();
+        if interaction_cols > 0 {
+            let interaction_range = baseline_cols..baseline_cols + interaction_cols;
+            let age_penalty_matrix =
+                create_difference_penalty_matrix(interaction_cols, baseline_penalty_order)?;
+            penalty_blocks.push(PenaltyBlock {
+                matrix: age_penalty_matrix,
+                lambda: config.lambda_age,
+                range: interaction_range.clone(),
+            });
+            let ridge = Array2::<f64>::eye(interaction_cols);
+            penalty_blocks.push(PenaltyBlock {
+                matrix: ridge,
+                lambda: config.lambda_pgs,
+                range: interaction_range,
+            });
+        }
+    }
+
+    let penalties = PenaltyBlocks::new(penalty_blocks);
 
     let layout = SurvivalLayout {
         baseline_entry: constrained_entry,
         baseline_exit: constrained_exit,
         baseline_derivative_exit,
-        time_varying_entry: None,
-        time_varying_exit: None,
-        time_varying_derivative_exit: None,
+        time_varying_entry,
+        time_varying_exit,
+        time_varying_derivative_exit,
+        time_varying_centering,
         static_covariates,
         age_transform,
         reference_constraint,
@@ -543,6 +631,47 @@ fn concatenate_design(
     }
     parts.push(static_covariates.view());
     concatenate(Axis(1), &parts).expect("design concatenation")
+}
+
+fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    assert_eq!(a.nrows(), b.nrows(), "tensor product requires equal rows");
+    let n = a.nrows();
+    let a_cols = a.ncols();
+    let b_cols = b.ncols();
+    if n == 0 || a_cols == 0 || b_cols == 0 {
+        return Array2::<f64>::zeros((n, a_cols * b_cols));
+    }
+    let mut result = Array2::<f64>::zeros((n, a_cols * b_cols));
+    for i in 0..n {
+        let mut idx = 0usize;
+        let row_a = a.row(i);
+        let row_b = b.row(i);
+        for &va in row_a.iter() {
+            for &vb in row_b.iter() {
+                result[[i, idx]] = va * vb;
+                idx += 1;
+            }
+        }
+    }
+    result
+}
+
+fn weighted_column_means(design: &Array2<f64>, weights: &Array1<f64>) -> Array1<f64> {
+    assert_eq!(design.nrows(), weights.len(), "weights must match rows");
+    let denom = weights.sum();
+    if denom <= 0.0 {
+        return Array1::<f64>::zeros(design.ncols());
+    }
+    let mut means = Array1::<f64>::zeros(design.ncols());
+    for (row, &w) in design.rows().into_iter().zip(weights.iter()) {
+        if w == 0.0 {
+            continue;
+        }
+        Zip::from(&mut means).and(&row).for_each(|m, &value| {
+            *m += w * value;
+        });
+    }
+    means.mapv(|value| value / denom)
 }
 
 /// Soft barrier discouraging negative exit derivatives.
@@ -879,11 +1008,20 @@ pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
     pub age_basis: BasisDescriptor,
     pub time_varying_basis: Option<BasisDescriptor>,
+    pub time_varying_centering: Option<Array1<f64>>,
     pub static_covariate_layout: CovariateLayout,
     pub penalties: PenaltyDescriptor,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
     pub hessian_factor: Option<HessianFactor>,
+    pub pgs_column_index: Option<usize>,
+}
+
+/// Optional configuration for tensor-product PGS×age interactions.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeVaryingConfig {
+    pub lambda_age: f64,
+    pub lambda_pgs: f64,
 }
 
 /// Prediction inputs referencing existing arrays.
@@ -917,13 +1055,29 @@ pub fn cumulative_hazard(
 
     let mut design = constrained.row(0).to_owned();
     if let Some(time_basis) = &artifacts.time_varying_basis {
+        let pgs_index = artifacts
+            .pgs_column_index
+            .ok_or(SurvivalError::MissingTimeVaryingMetadata)?;
+        if pgs_index >= covariates.len() {
+            return Err(SurvivalError::CovariateDimensionMismatch);
+        }
+        let pgs_value = covariates[pgs_index];
         let (tv_arc, _) = create_bspline_basis_with_knots(
             array![log_age].view(),
             time_basis.knot_vector.view(),
             time_basis.degree,
         )?;
         let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
-        design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
+        let mut interaction_row = tv.row(0).to_owned();
+        interaction_row.mapv_inplace(|v| v * pgs_value);
+        if let Some(centering) = &artifacts.time_varying_centering {
+            if centering.len() != interaction_row.len() {
+                return Err(SurvivalError::TimeVaryingDimensionMismatch);
+            }
+            interaction_row -= centering;
+        }
+        design = concatenate(Axis(0), &[design.view(), interaction_row.view()])
+            .expect("time concat");
     }
     design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
     let eta = design.dot(&artifacts.coefficients);
@@ -1064,9 +1218,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, penalty) =
-            build_survival_layout(&data, &basis, age_transform, 2, 1.0, 10).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10, None).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
@@ -1081,9 +1234,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, penalty) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 10).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10, None).unwrap();
         let model = WorkingModelSurvival::new(
             layout.clone(),
             &data,
@@ -1098,16 +1250,19 @@ mod tests {
             coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
+            time_varying_centering: None,
             static_covariate_layout: CovariateLayout {
                 column_names: static_names,
             },
             penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
+                baseline_order: 2,
+                baseline_lambda: 0.5,
+                interaction: None,
             },
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
+            pgs_column_index: None,
         };
         let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
@@ -1118,15 +1273,78 @@ mod tests {
     }
 
     #[test]
+    fn pgs_age_interaction_layout_builds_tensor_product() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let config = TimeVaryingConfig {
+            lambda_age: 0.7,
+            lambda_pgs: 0.2,
+        };
+        let (layout, _) =
+            build_survival_layout(&data, &basis, 0.1, 2, 1.0, 6, Some(config)).unwrap();
+
+        let entry = layout.time_varying_entry.as_ref().expect("entry design");
+        let exit = layout.time_varying_exit.as_ref().expect("exit design");
+        let derivative = layout
+            .time_varying_derivative_exit
+            .as_ref()
+            .expect("derivative design");
+        assert_eq!(entry.ncols(), layout.baseline_entry.ncols());
+        assert_eq!(exit.ncols(), layout.baseline_exit.ncols());
+        assert_eq!(derivative.ncols(), layout.baseline_derivative_exit.ncols());
+
+        let centering = layout
+            .time_varying_centering
+            .as_ref()
+            .expect("centering vector");
+        assert_eq!(centering.len(), entry.ncols());
+        let mut restored_exit = exit.clone();
+        for (mut column, &mean) in restored_exit.columns_mut().into_iter().zip(centering.iter()) {
+            column.mapv_inplace(|v| v + mean);
+        }
+        let weighted_means = weighted_column_means(&restored_exit, &data.sample_weight);
+        for (mean, stored) in weighted_means.iter().zip(centering.iter()) {
+            assert_abs_diff_eq!(*mean, *stored, epsilon = 1e-10);
+        }
+        let centered_means = weighted_column_means(exit, &data.sample_weight);
+        for mean in centered_means.iter() {
+            assert!(mean.abs() < 1e-12, "interaction column not centered");
+        }
+
+        for (idx, (&pgs_value, base_row)) in data
+            .pgs
+            .iter()
+            .zip(layout.baseline_derivative_exit.rows())
+            .enumerate()
+        {
+            let interaction_row = derivative.row(idx);
+            for (d_int, d_base) in interaction_row.iter().zip(base_row.iter()) {
+                assert_abs_diff_eq!(*d_int, pgs_value * d_base, epsilon = 1e-12);
+            }
+        }
+
+        assert_eq!(layout.penalties.blocks.len(), 3);
+        let baseline_cols = layout.baseline_exit.ncols();
+        let interaction_cols = exit.ncols();
+        let range = baseline_cols..baseline_cols + interaction_cols;
+        assert_eq!(layout.penalties.blocks[1].range, range.clone());
+        assert_eq!(layout.penalties.blocks[2].range, range);
+        assert_abs_diff_eq!(layout.penalties.blocks[1].lambda, config.lambda_age, epsilon = 1e-12);
+        assert_abs_diff_eq!(layout.penalties.blocks[2].lambda, config.lambda_pgs, epsilon = 1e-12);
+    }
+
+    #[test]
     fn working_state_shapes() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, penalty) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 8).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8, None).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
@@ -1143,9 +1361,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1183,9 +1400,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 4).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.0, 4, None).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1209,16 +1425,19 @@ mod tests {
             coefficients: beta.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
+            time_varying_centering: None,
             static_covariate_layout: CovariateLayout {
                 column_names: static_names,
             },
             penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.0,
+                baseline_order: 2,
+                baseline_lambda: 0.0,
+                interaction: None,
             },
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
+            pgs_column_index: None,
         };
 
         let eta_exit = layout.combined_exit.dot(&beta);
@@ -1242,9 +1461,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1350,9 +1568,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.2, 6).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6, None).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.use_expected_information = true;
@@ -1404,9 +1621,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
         let mut spec_observed = SurvivalSpec::default();
         spec_observed.barrier_weight = 0.0;
         spec_observed.use_expected_information = false;
@@ -1512,7 +1728,7 @@ mod tests {
         let weighted_transform =
             AgeTransform::from_training(&weighted_data.age_entry, 0.1).unwrap();
         let (layout_weighted, monotonic_weighted) =
-            build_survival_layout(&weighted_data, &basis, weighted_transform, 2, 0.0, 0).unwrap();
+            build_survival_layout(&weighted_data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
         let replicate_pattern = [0usize, 1, 1];
         let layout_expanded = SurvivalLayout {
             baseline_entry: repeat_rows(&layout_weighted.baseline_entry, &replicate_pattern),
@@ -1533,6 +1749,7 @@ mod tests {
                 &layout_weighted.time_varying_derivative_exit,
                 &replicate_pattern,
             ),
+            time_varying_centering: layout_weighted.time_varying_centering.clone(),
             static_covariates: repeat_rows(&layout_weighted.static_covariates, &replicate_pattern),
             age_transform: layout_weighted.age_transform,
             reference_constraint: layout_weighted.reference_constraint.clone(),
@@ -1603,9 +1820,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, monotonicity) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.6, 0).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.6, 0, None).unwrap();
         let penalised_layout = layout.clone();
         let mut unpenalised_layout = layout.clone();
         for block in &mut unpenalised_layout.penalties.blocks {
@@ -1660,9 +1876,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, penalty) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.75, 0).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0, None).unwrap();
         let p = layout.combined_exit.ncols();
         let baseline_cols = layout.baseline_exit.ncols();
         let mut beta = Array1::<f64>::zeros(p);
@@ -1708,9 +1923,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
         let (layout, penalty) =
-            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 6).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
         let static_names: Vec<String> = (0..layout.static_covariates.ncols())
             .map(|idx| format!("cov{idx}"))
             .collect();
@@ -1718,16 +1932,19 @@ mod tests {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
+            time_varying_centering: None,
             static_covariate_layout: CovariateLayout {
                 column_names: static_names,
             },
             penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
+                baseline_order: 2,
+                baseline_lambda: 0.5,
+                interaction: None,
             },
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
+            pgs_column_index: None,
         };
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
 
@@ -1746,14 +1963,60 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_hazard_supports_pgs_age_interaction() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let config = TimeVaryingConfig {
+            lambda_age: 0.4,
+            lambda_pgs: 0.1,
+        };
+        let (layout, _) =
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, Some(config)).unwrap();
+        let static_names = vec![
+            "pgs".to_string(),
+            "sex".to_string(),
+            "pc0".to_string(),
+            "pc1".to_string(),
+        ];
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: Some(basis.clone()),
+            time_varying_centering: layout.time_varying_centering.clone(),
+            static_covariate_layout: CovariateLayout {
+                column_names: static_names,
+            },
+            penalties: PenaltyDescriptor {
+                baseline_order: 2,
+                baseline_lambda: 0.5,
+                interaction: Some(InteractionPenaltyDescriptor {
+                    lambda_age: config.lambda_age,
+                    lambda_pgs: config.lambda_pgs,
+                }),
+            },
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            hessian_factor: None,
+            pgs_column_index: Some(0),
+        };
+
+        let covs = layout.static_covariates.row(0).to_owned();
+        let hazard = cumulative_hazard(data.age_exit[0], &covs, &artifacts).unwrap();
+        assert!(hazard.is_finite());
+    }
+
+    #[test]
     fn cumulative_hazard_rejects_covariate_mismatch() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
-        let (layout, _) = build_survival_layout(&data, &basis, age_transform, 2, 0.5, 4).unwrap();
+        let (layout, _) =
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
         let static_names: Vec<String> = (0..layout.static_covariates.ncols())
             .map(|idx| format!("cov{idx}"))
             .collect();
@@ -1761,16 +2024,19 @@ mod tests {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
+            time_varying_centering: None,
             static_covariate_layout: CovariateLayout {
                 column_names: static_names.clone(),
             },
             penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
+                baseline_order: 2,
+                baseline_lambda: 0.5,
+                interaction: None,
             },
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             hessian_factor: None,
+            pgs_column_index: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
