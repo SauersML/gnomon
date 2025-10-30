@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::faer_ndarray::FaerSvd;
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView, FaerSvd};
+use faer::Side;
+use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -43,6 +45,10 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("delta-method variance computation failed: {0}")]
+    DeltaMethod(String),
+    #[error("calibrator inputs must have {expected} observations, got {provided}")]
+    CalibratorInputLengthMismatch { expected: usize, provided: usize },
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -991,33 +997,136 @@ pub fn conditional_absolute_risk(
 
 /// Calibrator feature extraction for survival predictions.
 pub fn survival_calibrator_features(
-    predictions: &Array1<f64>,
-    standard_errors: &Array1<f64>,
+    risks: &Array1<f64>,
+    jacobians: &Array2<f64>,
+    hessian_factor: Option<&HessianFactor>,
     leverage: Option<&Array1<f64>>,
-) -> Array2<f64> {
-    let n = predictions.len();
-    let leverage_len_ok = leverage.map_or(true, |l| l.len() == n);
-    assert!(
-        leverage_len_ok,
-        "leverage vector must match prediction length"
-    );
-    let mut features = Array2::<f64>::zeros((n, if leverage.is_some() { 3 } else { 2 }));
-    match leverage {
-        Some(lev) => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-                features[[i, 2]] = lev[i];
-            }
-        }
-        None => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-            }
+) -> Result<Array2<f64>, SurvivalError> {
+    let n = risks.len();
+    if jacobians.nrows() != n {
+        return Err(SurvivalError::CalibratorInputLengthMismatch {
+            expected: n,
+            provided: jacobians.nrows(),
+        });
+    }
+    if let Some(lev) = leverage {
+        if lev.len() != n {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: n,
+                provided: lev.len(),
+            });
         }
     }
-    features
+
+    if let Some(factor) = hessian_factor {
+        let expected_dim = match factor {
+            HessianFactor::Observed { ldlt_factor, .. } => ldlt_factor.nrows(),
+            HessianFactor::Expected { cholesky_factor } => cholesky_factor.nrows(),
+        };
+        if jacobians.ncols() != expected_dim {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: expected_dim,
+                provided: jacobians.ncols(),
+            });
+        }
+    }
+
+    let mut se_logit = Array1::<f64>::zeros(n);
+    if let Some(factor) = hessian_factor {
+        for (row_idx, jac_row) in jacobians.rows().into_iter().enumerate() {
+            let risk = risks[row_idx].clamp(1e-12, 1.0 - 1e-12);
+            let denom = (risk * (1.0 - risk)).max(1e-12);
+            let grad_logit = jac_row.to_owned().mapv(|v| v / denom);
+            let variance = delta_quadratic_form(factor, &grad_logit)?;
+            se_logit[row_idx] = variance.max(0.0).sqrt();
+        }
+    }
+
+    let cols = if leverage.is_some() { 3 } else { 2 };
+    let mut features = Array2::<f64>::zeros((n, cols));
+    for i in 0..n {
+        let risk = risks[i].clamp(1e-12, 1.0 - 1e-12);
+        features[[i, 0]] = risk.logit();
+        features[[i, 1]] = se_logit[i];
+        if let Some(lev) = leverage {
+            features[[i, 2]] = lev[i].clamp(0.0, 0.999);
+        }
+    }
+    Ok(features)
+}
+
+fn delta_quadratic_form(factor: &HessianFactor, grad: &Array1<f64>) -> Result<f64, SurvivalError> {
+    match factor {
+        HessianFactor::Observed {
+            ldlt_factor,
+            permutation,
+            ..
+        } => {
+            let dim = ldlt_factor.nrows();
+            if ldlt_factor.ncols() != dim || permutation.len() != dim || grad.len() != dim {
+                return Err(SurvivalError::DeltaMethod(
+                    "observed Hessian factor dimension mismatch".to_string(),
+                ));
+            }
+
+            let view = FaerArrayView::new(ldlt_factor);
+            let solver = FaerLdlt::new(view.as_ref(), Side::Lower)
+                .map_err(|err| SurvivalError::DeltaMethod(format!("LDLT solve failed: {err:?}")))?;
+
+            let mut permuted_grad = vec![0.0; dim];
+            for (i, &perm_idx) in permutation.iter().enumerate() {
+                if perm_idx >= dim {
+                    return Err(SurvivalError::DeltaMethod(
+                        "permutation index out of range".to_string(),
+                    ));
+                }
+                permuted_grad[i] = grad[perm_idx];
+            }
+
+            let permuted_grad = Array1::from(permuted_grad);
+            let grad_view = FaerColView::new(&permuted_grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+
+            let mut solved_vec = vec![0.0; dim];
+            for i in 0..dim {
+                solved_vec[i] = solved_view[(i, 0)];
+            }
+
+            let mut solved_unpermuted = vec![0.0; dim];
+            for (i, &perm_idx) in permutation.iter().enumerate() {
+                solved_unpermuted[perm_idx] = solved_vec[i];
+            }
+
+            let accum = grad
+                .iter()
+                .zip(solved_unpermuted.iter())
+                .map(|(g, s)| g * s)
+                .sum();
+            Ok(accum)
+        }
+        HessianFactor::Expected { cholesky_factor } => {
+            let dim = cholesky_factor.nrows();
+            if cholesky_factor.ncols() != dim || grad.len() != dim {
+                return Err(SurvivalError::DeltaMethod(
+                    "expected Hessian factor dimension mismatch".to_string(),
+                ));
+            }
+
+            let view = FaerArrayView::new(cholesky_factor);
+            let solver = FaerLlt::new(view.as_ref(), Side::Lower).map_err(|err| {
+                SurvivalError::DeltaMethod(format!("Cholesky solve failed: {err:?}"))
+            })?;
+            let grad_view = FaerColView::new(grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            Ok(accum)
+        }
+    }
 }
 
 trait LogitExt {
@@ -1034,8 +1143,11 @@ impl LogitExt for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView};
     use approx::assert_abs_diff_eq;
-    use ndarray::array;
+    use faer::Side;
+    use faer::linalg::solvers::Llt as FaerLlt;
+    use ndarray::{Array2, array};
     use serde_json;
 
     fn toy_training_data() -> SurvivalTrainingData {
@@ -1063,6 +1175,48 @@ mod tests {
 
     fn repeat_optional(matrix: &Option<Array2<f64>>, pattern: &[usize]) -> Option<Array2<f64>> {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
+    }
+
+    fn permute_symmetric(matrix: &Array2<f64>, permutation: &[usize]) -> Array2<f64> {
+        let n = permutation.len();
+        let mut result = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in 0..n {
+                result[[i, j]] = matrix[[permutation[i], permutation[j]]];
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn delta_quadratic_form_respects_permutation() {
+        let h = array![[5.0, 2.0, 1.0], [2.0, 6.0, 1.5], [1.0, 1.5, 4.0],];
+        let permutation = vec![2, 0, 1];
+        let h_permuted = permute_symmetric(&h, &permutation);
+
+        let factor = HessianFactor::Observed {
+            ldlt_factor: h_permuted,
+            permutation: permutation.clone(),
+            inertia: (3, 0, 0),
+        };
+
+        let grad = array![0.5, -1.0, 2.0];
+
+        let expected = {
+            let view = FaerArrayView::new(&h);
+            let solver = FaerLlt::new(view.as_ref(), Side::Lower).expect("LLT should succeed");
+            let grad_view = FaerColView::new(&grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            accum
+        };
+
+        let observed = delta_quadratic_form(&factor, &grad).expect("delta quadratic form");
+        assert_abs_diff_eq!(observed, expected, epsilon = 1e-12);
     }
 
     fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
