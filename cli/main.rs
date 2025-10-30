@@ -13,7 +13,7 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, TrainedModel,
 };
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
@@ -195,6 +195,16 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (eta, mean, signed_dist, se_eta_opt) =
         model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
 
+    let link_function = match &model.config.model_family {
+        ModelFamily::Gam(link) => *link,
+        ModelFamily::Survival(_) => {
+            return Err(Box::new(ModelError::UnsupportedModelFamily {
+                family: "survival",
+                operation: "saving predictions",
+            }));
+        }
+    };
+
     // Check if calibrator is available
     let calibrated_mean_opt = if args.no_calibration {
         println!("Skipping calibration via --no-calibration flag.");
@@ -218,7 +228,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
         &eta,
         &mean,
         se_eta_opt.as_ref(),
-        model.config.link_function(),
+        link_function,
         calibrated_mean_opt.as_ref(),
         output_path,
     )?;

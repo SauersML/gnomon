@@ -401,9 +401,25 @@ pub enum ModelError {
 
     #[error("Estimation error: {0}")]
     EstimationError(#[from] crate::calibrate::estimate::EstimationError),
+
+    #[error("Model family '{family}' is not supported for {operation}.")]
+    UnsupportedModelFamily {
+        family: &'static str,
+        operation: &'static str,
+    },
 }
 
 impl TrainedModel {
+    fn ensure_gam_link(&self, operation: &'static str) -> Result<LinkFunction, ModelError> {
+        match &self.config.model_family {
+            ModelFamily::Gam(link) => Ok(*link),
+            ModelFamily::Survival(_) => Err(ModelError::UnsupportedModelFamily {
+                family: "survival",
+                operation,
+            }),
+        }
+    }
+
     /// Detailed predictions including linear predictor, mean response, signed distance
     /// to the peeled hull boundary (negative inside), and optional SEs for eta.
     pub fn predict_detailed(
@@ -454,9 +470,12 @@ impl TrainedModel {
             )));
         }
 
+        // Ensure the model family is supported before invoking link-specific logic
+        let link_function = self.ensure_gam_link("prediction")?;
+
         // --- Linear predictor and mean ---
         let eta = x_new.dot(&beta);
-        let mean = match self.config.link_function() {
+        let mean = match link_function {
             LinkFunction::Logit => {
                 let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
                 let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
@@ -483,7 +502,7 @@ impl TrainedModel {
                     // Solve H v = x^T for v (1D)
                     let v = chol.solve_vec(&x_row);
                     let var_i = x_row.dot(&v);
-                    vars[i] = if self.config.link_function() == LinkFunction::Identity {
+                    vars[i] = if link_function == LinkFunction::Identity {
                         // For Gaussian identity, scale variance if scale present
                         if let Some(scale) = self.scale {
                             var_i * scale
@@ -537,6 +556,8 @@ impl TrainedModel {
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
         // Stage: Compute baseline predictions
+        let link_function = self.ensure_gam_link("calibrated prediction")?;
+
         let baseline = self.predict(p_new, sex_new, pcs_new)?;
         // Stage: If no calibrator is present, error loudly (no silent fallback)
         if self.calibrator.is_none() {
@@ -546,7 +567,7 @@ impl TrainedModel {
         // Stage: Retrieve eta, signed distance, and se(eta) via the detailed path
         let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
-        let pred_in = match self.config.link_function() {
+        let pred_in = match link_function {
             LinkFunction::Logit => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };

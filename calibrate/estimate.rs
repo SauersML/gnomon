@@ -703,6 +703,12 @@ pub enum EstimationError {
 
     #[error("Prediction error")]
     PredictionError,
+
+    #[error("Model family '{family}' is not supported for {operation}.")]
+    UnsupportedModelFamily {
+        family: &'static str,
+        operation: &'static str,
+    },
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -717,6 +723,13 @@ pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
+    if matches!(config.model_family, ModelFamily::Survival(_)) {
+        return Err(EstimationError::UnsupportedModelFamily {
+            family: "survival",
+            operation: "training",
+        });
+    }
+
     basis::clear_basis_cache();
 
     log::info!(
