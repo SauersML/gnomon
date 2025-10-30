@@ -38,6 +38,37 @@ pub enum SurvivalError {
     InvalidSampleWeight,
     #[error("covariate arrays must have consistent dimensions")]
     CovariateDimensionMismatch,
+    #[error("persisted static covariate ranges are missing for {expected} columns")]
+    MissingCovariateRanges { expected: usize },
+    #[error("persisted static covariate ranges size mismatch (expected {expected}, got {actual})")]
+    CovariateRangeLengthMismatch { expected: usize, actual: usize },
+    #[error(
+        "covariate `{column}` (index {index}) has invalid persisted range: min {min}, max {max}"
+    )]
+    InvalidCovariateRange {
+        column: String,
+        index: usize,
+        min: f64,
+        max: f64,
+    },
+    #[error(
+        "covariate `{column}` (index {index}) = {value} is below the persisted minimum {minimum}"
+    )]
+    CovariateBelowRange {
+        column: String,
+        index: usize,
+        value: f64,
+        minimum: f64,
+    },
+    #[error(
+        "covariate `{column}` (index {index}) = {value} exceeds the persisted maximum {maximum}"
+    )]
+    CovariateAboveRange {
+        column: String,
+        index: usize,
+        value: f64,
+        maximum: f64,
+    },
     #[error("covariate values must be finite")]
     NonFiniteCovariate,
     #[error("linear predictor became non-finite during evaluation")]
@@ -1537,6 +1568,72 @@ pub fn competing_cif_value<'a, 'b>(
     Err(SurvivalError::MissingCompanionCifData)
 }
 
+fn covariate_label(layout: &CovariateLayout, index: usize) -> String {
+    layout
+        .column_names
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| format!("column_{index}"))
+}
+
+fn enforce_covariate_ranges(
+    covariates: &Array1<f64>,
+    layout: &CovariateLayout,
+) -> Result<(), SurvivalError> {
+    let expected = layout.column_names.len();
+    if layout.ranges.is_empty() {
+        return Err(SurvivalError::MissingCovariateRanges { expected });
+    }
+    if layout.ranges.len() != expected {
+        return Err(SurvivalError::CovariateRangeLengthMismatch {
+            expected,
+            actual: layout.ranges.len(),
+        });
+    }
+    if covariates.len() != expected {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    for (idx, value) in covariates.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(SurvivalError::NonFiniteCovariate);
+        }
+        let range = &layout.ranges[idx];
+        if !range.min.is_finite() && !range.max.is_finite() {
+            // Both bounds are infinite, nothing to enforce.
+            continue;
+        }
+        if range.min.is_nan()
+            || range.max.is_nan()
+            || (range.min.is_finite() && range.max.is_finite() && range.min > range.max)
+        {
+            return Err(SurvivalError::InvalidCovariateRange {
+                column: covariate_label(layout, idx),
+                index: idx,
+                min: range.min,
+                max: range.max,
+            });
+        }
+        if range.min.is_finite() && *value < range.min {
+            return Err(SurvivalError::CovariateBelowRange {
+                column: covariate_label(layout, idx),
+                index: idx,
+                value: *value,
+                minimum: range.min,
+            });
+        }
+        if range.max.is_finite() && *value > range.max {
+            return Err(SurvivalError::CovariateAboveRange {
+                column: covariate_label(layout, idx),
+                index: idx,
+                value: *value,
+                maximum: range.max,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate the cumulative hazard at a given age.
 pub fn cumulative_hazard(
     age: f64,
@@ -1547,6 +1644,7 @@ pub fn cumulative_hazard(
     if covariates.len() != expected_covs {
         return Err(SurvivalError::CovariateDimensionMismatch);
     }
+    enforce_covariate_ranges(covariates, &artifacts.static_covariate_layout)?;
     let log_age = artifacts.age_transform.transform(age)?;
     let (basis_arc, _) = create_bspline_basis_with_knots(
         array![log_age].view(),
@@ -3098,6 +3196,70 @@ mod tests {
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_covariates_out_of_persisted_range() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+        };
+
+        let mut below_covs = layout.static_covariates.row(0).to_owned();
+        below_covs[0] = artifacts.static_covariate_layout.ranges[0].min - 1.0;
+        let err = cumulative_hazard(60.0, &below_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateBelowRange { .. }));
+
+        let mut above_covs = layout.static_covariates.row(0).to_owned();
+        above_covs[0] = artifacts.static_covariate_layout.ranges[0].max + 1.0;
+        let err = cumulative_hazard(60.0, &above_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateAboveRange { .. }));
+    }
+
+    #[test]
+    fn cumulative_hazard_errors_when_ranges_missing() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let mut covariate_layout = make_covariate_layout(&layout);
+        let expected = covariate_layout.column_names.len();
+        covariate_layout.ranges.clear();
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: covariate_layout,
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+        };
+
+        let covariates = layout.static_covariates.row(0).to_owned();
+        let err = cumulative_hazard(60.0, &covariates, &artifacts).unwrap_err();
+        assert!(
+            matches!(err, SurvivalError::MissingCovariateRanges { expected: e } if e == expected)
+        );
     }
 
     #[test]
