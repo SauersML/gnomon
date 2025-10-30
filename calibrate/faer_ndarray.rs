@@ -342,6 +342,10 @@ impl FaerCholeskyFactor {
     pub fn diag(&self) -> Array1<f64> {
         diag_to_array(self.factor.L().diagonal())
     }
+
+    pub fn lower_triangular(&self) -> Array2<f64> {
+        mat_to_array(self.factor.L())
+    }
 }
 
 pub trait FaerCholesky {
