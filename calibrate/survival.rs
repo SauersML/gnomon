@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
+use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
+use crate::calibrate::pirls::{WorkingModel, WorkingState};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -43,20 +45,6 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
-}
-
-/// Working model abstraction shared between GAM and survival implementations.
-pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
-}
-
-/// Aggregated state returned by [`WorkingModel::update`].
-#[derive(Debug, Clone)]
-pub struct WorkingState {
-    pub eta: Array1<f64>,
-    pub gradient: Array1<f64>,
-    pub hessian: Array2<f64>,
-    pub deviance: f64,
 }
 
 /// Guarded log-age transformation used across training and scoring.
@@ -877,8 +865,8 @@ impl WorkingModelSurvival {
     }
 }
 
-impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+impl WorkingModelSurvival {
+    fn update_internal(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
             return Err(SurvivalError::DesignDimensionMismatch);
@@ -1030,6 +1018,13 @@ impl WorkingModel for WorkingModelSurvival {
             hessian,
             deviance,
         })
+    }
+}
+
+impl WorkingModel for WorkingModelSurvival {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        self.update_internal(beta)
+            .map_err(|err| EstimationError::InvalidSpecification(err.to_string()))
     }
 }
 
