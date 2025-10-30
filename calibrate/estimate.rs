@@ -41,6 +41,16 @@ use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
+// Ndarray and faer linear algebra helpers
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+// faer: high-performance dense solvers
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
+use faer::Mat as FaerMat;
+use faer::Side;
+use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
+
 fn log_basis_cache_stats(context: &str) {
     let stats = basis::basis_cache_stats();
     let total = stats.hits.saturating_add(stats.misses);
@@ -57,16 +67,6 @@ fn log_basis_cache_stats(context: &str) {
         hit_rate
     );
 }
-
-// Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
-// faer: high-performance dense solvers
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
-use faer::Mat as FaerMat;
-use faer::Side;
-use faer::linalg::solvers::{
-    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
-};
 
 // Helper: Frobenius inner product for faer matrices using compensated summation
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
