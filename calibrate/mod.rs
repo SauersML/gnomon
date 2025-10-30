@@ -5,6 +5,7 @@
 pub mod basis;
 pub mod construction;
 pub mod data;
+pub mod survival_data;
 
 pub mod calibrator;
 pub mod estimate;
