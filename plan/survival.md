@@ -257,3 +257,9 @@ Store in the trained model artifact:
 - optional handles to companion competing-risk models.
 
 With this plan the survival implementation is unified, risk-set-free, and fully reproducible across training and serving, while remaining compatible with the existing PIRLS and calibrator infrastructure.
+
+## 12. Notes
+- Test truth and testing trusted metadata should not be hard-coded or via a static file. Instead, it should be generated each time, so the generation process is replicable and transparent. Other languages (Python, R) are allowed for this purpose.
+- Users must never be able to give penalty strengths: they should be chosen via REML instead.
+- The endpoint is "ever had disease X by time t” (has been diagnosed). Therefore, monotonicity should be a hard requirement, not a soft penalty.
+- Penalty strengths (e.g. setting lambda to some specific number) should not be hard-coded except to promote numerical stability, as REML should generally be used for tuning instead.

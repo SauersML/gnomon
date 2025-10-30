@@ -121,22 +121,43 @@ fn replicated_brier(
 #[test]
 fn cumulative_incidence_matches_reference_library() {
     let trusted = TrustedReference::load();
-    let expected = [
-        0.3292075182,
-        0.2449792496,
-        0.3122529096,
-        0.2461683547,
-    ];
-    assert_eq!(trusted.lifelines_cif.len(), expected.len());
-    for (observed, expected) in trusted.lifelines_cif.iter().zip(expected.iter()) {
-        assert!((observed - expected).abs() <= 1e-10);
+    
+    // Compute CIF values using our implementation
+    let mut computed_cif = Vec::new();
+    for (idx, exit_age) in trusted.data.age_exit.iter().enumerate().take(4) {
+        let cov = trusted.covariates_row(idx);
+        let cif = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
+        computed_cif.push(cif);
+    }
+    
+    // Compare computed values against lifelines reference
+    let expected = &trusted.lifelines_cif[..4];
+    assert_eq!(computed_cif.len(), expected.len());
+    for (computed, expected) in computed_cif.iter().zip(expected.iter()) {
+        assert!((computed - expected).abs() <= 1e-10, 
+            "CIF mismatch: computed={}, expected={}", computed, expected);
     }
 }
 
 #[test]
 fn brier_score_matches_reference_library() {
     let trusted = TrustedReference::load();
-    assert!((trusted.lifelines_weighted_brier - 0.2231375836).abs() <= 1e-12);
+    
+    // Compute predictions using our model
+    let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
+    for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
+        let cov = trusted.covariates_row(idx);
+        preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
+    }
+    
+    // Compute weighted Brier score
+    let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
+    let computed_brier = weighted_brier(&trusted.data.sample_weight, &outcomes, &preds);
+    
+    // Compare against lifelines reference
+    assert!((computed_brier - trusted.lifelines_weighted_brier).abs() <= 1e-10,
+        "Brier score mismatch: computed={}, expected={}", 
+        computed_brier, trusted.lifelines_weighted_brier);
 }
 
 #[test]
@@ -172,4 +193,3 @@ fn weighted_brier_matches_frequency_replication() {
     let replicated = replicated_brier(&trusted.data.sample_weight, &outcomes, &preds);
     assert!((weighted - replicated).abs() <= 1e-12);
 }
-
