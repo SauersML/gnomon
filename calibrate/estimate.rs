@@ -38,7 +38,10 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
+
+#[cfg(test)]
+use crate::calibrate::model::ModelFamily;
 use crate::calibrate::pirls::{self, PirlsResult};
 
 fn log_basis_cache_stats(context: &str) {
@@ -8605,7 +8608,7 @@ mod optimizer_progress_tests {
 
         // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
         let config = ModelConfig {
-            link_function,
+            model_family: ModelFamily::Gam(link_function),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 150,

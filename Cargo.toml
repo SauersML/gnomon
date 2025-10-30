@@ -79,6 +79,7 @@ strip = false
 [features]
 default = []
 no-inline-profiling = []
+survival-data = []
 
 [lints.rust]
 unused_variables = "deny"

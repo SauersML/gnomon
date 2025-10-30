@@ -41,6 +41,10 @@ pub enum SurvivalError {
     NonFiniteLinearPredictor,
     #[error("design matrix columns do not match coefficient length")]
     DesignDimensionMismatch,
+    #[error("stored Hessian factor dimensions do not match the design matrix")]
+    HessianDimensionMismatch,
+    #[error("stored Hessian factor is singular")]
+    HessianSingular,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
 }
@@ -345,6 +349,71 @@ impl SurvivalTrainingData {
 
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn validate_survival_inputs(
+    age_entry: ArrayView1<f64>,
+    age_exit: ArrayView1<f64>,
+    event_target: ArrayView1<u8>,
+    event_competing: ArrayView1<u8>,
+    sample_weight: ArrayView1<f64>,
+    pgs: ArrayView1<f64>,
+    sex: ArrayView1<f64>,
+    pcs: ArrayView2<f64>,
+) -> Result<(), SurvivalError> {
+    let n = age_entry.len();
+    if n == 0 {
+        return Err(SurvivalError::EmptyAgeVector);
+    }
+    let dimension_mismatch = age_exit.len() != n
+        || event_target.len() != n
+        || event_competing.len() != n
+        || sample_weight.len() != n
+        || pgs.len() != n
+        || sex.len() != n
+        || pcs.nrows() != n;
+    if dimension_mismatch {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    for i in 0..n {
+        let entry = age_entry[i];
+        let exit = age_exit[i];
+        if !entry.is_finite() || !exit.is_finite() {
+            return Err(SurvivalError::NonFiniteAge);
+        }
+        if !(entry < exit) {
+            return Err(SurvivalError::InvalidAgeOrder);
+        }
+
+        let target = event_target[i];
+        let competing = event_competing[i];
+        if target > 1 || competing > 1 {
+            return Err(SurvivalError::InvalidEventFlag);
+        }
+        if target == 1 && competing == 1 {
+            return Err(SurvivalError::ConflictingEvents);
+        }
+
+        let weight = sample_weight[i];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(SurvivalError::InvalidSampleWeight);
+        }
+
+        let pgs_val = pgs[i];
+        let sex_val = sex[i];
+        if !pgs_val.is_finite() || !sex_val.is_finite() {
+            return Err(SurvivalError::NonFiniteCovariate);
+        }
+        for j in 0..pcs.ncols() {
+            if !pcs[[i, j]].is_finite() {
+                return Err(SurvivalError::NonFiniteCovariate);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Guard that constrains the baseline spline at the chosen reference point.
@@ -1086,7 +1155,7 @@ fn apply_monotonicity_penalty(
 }
 
 /// Serialized representation of an LDLᵀ factor with Bunch–Kaufman pivoting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LdltFactor {
     pub lower: Array2<f64>,
     pub diag: Array1<f64>,
@@ -1094,7 +1163,7 @@ pub struct LdltFactor {
 }
 
 /// Serialized permutation metadata captured during factorization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PermutationDescriptor {
     pub forward: Vec<usize>,
     pub inverse: Vec<usize>,
@@ -1114,12 +1183,12 @@ pub enum HessianFactor {
 }
 
 /// Serialized Cholesky factor for SPD approximations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CholeskyFactor {
     pub lower: Array2<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompanionModelHandle {
     pub reference: String,
 }
@@ -1208,17 +1277,167 @@ pub fn conditional_absolute_risk(
 }
 
 /// Calibrator feature extraction for survival predictions.
+fn solve_ldlt(
+    factor: &LdltFactor,
+    permutation: &PermutationDescriptor,
+    rhs: &Array1<f64>,
+) -> Result<Array1<f64>, SurvivalError> {
+    let n = rhs.len();
+    if factor.lower.nrows() != n
+        || factor.lower.ncols() != n
+        || factor.diag.len() != n
+        || factor.subdiag.len() != n
+        || permutation.forward.len() != n
+        || permutation.inverse.len() != n
+    {
+        return Err(SurvivalError::HessianDimensionMismatch);
+    }
+
+    let mut permuted = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        permuted[i] = rhs[permutation.inverse[i]];
+    }
+
+    let mut y = permuted;
+    for i in 0..n {
+        let mut sum = y[i];
+        for j in 0..i {
+            sum -= factor.lower[[i, j]] * y[j];
+        }
+        y[i] = sum;
+    }
+
+    let mut z = Array1::<f64>::zeros(n);
+    let mut idx = 0usize;
+    while idx < n {
+        if idx + 1 < n && factor.subdiag[idx].abs() > 1e-12 {
+            let a = factor.diag[idx];
+            let b = factor.subdiag[idx];
+            let c = factor.diag[idx + 1];
+            let det = a * c - b * b;
+            if det.abs() <= 1e-18 {
+                return Err(SurvivalError::HessianSingular);
+            }
+            let y0 = y[idx];
+            let y1 = y[idx + 1];
+            z[idx] = (c * y0 - b * y1) / det;
+            z[idx + 1] = (-b * y0 + a * y1) / det;
+            idx += 2;
+        } else {
+            let d = factor.diag[idx];
+            if d.abs() <= 1e-18 {
+                return Err(SurvivalError::HessianSingular);
+            }
+            z[idx] = y[idx] / d;
+            idx += 1;
+        }
+    }
+
+    let mut x_perm = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = z[i];
+        for j in i + 1..n {
+            sum -= factor.lower[[j, i]] * x_perm[j];
+        }
+        x_perm[i] = sum;
+    }
+
+    let mut solution = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        solution[permutation.forward[i]] = x_perm[i];
+    }
+
+    Ok(solution)
+}
+
+fn solve_cholesky(
+    factor: &CholeskyFactor,
+    rhs: &Array1<f64>,
+) -> Result<Array1<f64>, SurvivalError> {
+    let n = rhs.len();
+    if factor.lower.nrows() != n || factor.lower.ncols() != n {
+        return Err(SurvivalError::HessianDimensionMismatch);
+    }
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut sum = rhs[i];
+        for j in 0..i {
+            sum -= factor.lower[[i, j]] * y[j];
+        }
+        let diag = factor.lower[[i, i]];
+        if diag.abs() <= 1e-18 {
+            return Err(SurvivalError::HessianSingular);
+        }
+        y[i] = sum / diag;
+    }
+
+    let mut x = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for j in i + 1..n {
+            sum -= factor.lower[[j, i]] * x[j];
+        }
+        let diag = factor.lower[[i, i]];
+        if diag.abs() <= 1e-18 {
+            return Err(SurvivalError::HessianSingular);
+        }
+        x[i] = sum / diag;
+    }
+    Ok(x)
+}
+
+fn variance_from_factor(
+    factor: &HessianFactor,
+    design_row: &Array1<f64>,
+) -> Result<f64, SurvivalError> {
+    let solution = match factor {
+        HessianFactor::Observed {
+            factor,
+            permutation,
+            ..
+        } => solve_ldlt(factor, permutation, design_row)?,
+        HessianFactor::Expected { factor } => solve_cholesky(factor, design_row)?,
+    };
+    Ok(design_row.dot(&solution))
+}
+
+pub fn delta_method_standard_errors(
+    factor: &HessianFactor,
+    design: &Array2<f64>,
+) -> Result<Array1<f64>, SurvivalError> {
+    let n = design.nrows();
+    let mut result = Array1::<f64>::zeros(n);
+    for (idx, row) in design.rows().into_iter().enumerate() {
+        let variance = variance_from_factor(factor, &row.to_owned())?;
+        result[idx] = variance.max(0.0).sqrt();
+    }
+    Ok(result)
+}
+
 pub fn survival_calibrator_features(
     predictions: &Array1<f64>,
-    standard_errors: &Array1<f64>,
+    design: &Array2<f64>,
+    factor: Option<&HessianFactor>,
     leverage: Option<&Array1<f64>>,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, SurvivalError> {
     let n = predictions.len();
-    let leverage_len_ok = leverage.map_or(true, |l| l.len() == n);
-    assert!(
-        leverage_len_ok,
-        "leverage vector must match prediction length"
-    );
+    if design.nrows() != n {
+        return Err(SurvivalError::HessianDimensionMismatch);
+    }
+
+    if let Some(lev) = leverage {
+        if lev.len() != n {
+            return Err(SurvivalError::HessianDimensionMismatch);
+        }
+    }
+
+    let standard_errors = match factor {
+        Some(factor) => delta_method_standard_errors(factor, design)?,
+        None => Array1::<f64>::zeros(n),
+    };
+
+    let leverage =
+        leverage.map(|values| Array1::from_iter(values.iter().map(|&v| v.clamp(0.0, 1.0 - 1e-6))));
     let mut features = Array2::<f64>::zeros((n, if leverage.is_some() { 3 } else { 2 }));
     match leverage {
         Some(lev) => {
@@ -1235,7 +1454,7 @@ pub fn survival_calibrator_features(
             }
         }
     }
-    features
+    Ok(features)
 }
 
 trait LogitExt {
@@ -1252,11 +1471,101 @@ impl LogitExt for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::faer_ndarray::FaerEigh;
+    use crate::calibrate::faer_ndarray::{FaerEigh, ldlt_rook};
     use approx::assert_abs_diff_eq;
     use faer::Side;
     use ndarray::array;
     use serde_json;
+
+    fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
+        let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];
+        array![
+            [matrix[[1, 1]] / det, -matrix[[0, 1]] / det],
+            [-matrix[[1, 0]] / det, matrix[[0, 0]] / det]
+        ]
+    }
+
+    #[test]
+    fn delta_method_expected_factor_matches_manual_inverse() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let chol = CholeskyFactor {
+            lower: array![[2.0, 0.0], [0.5, (2.75_f64).sqrt()]],
+        };
+        let factor = HessianFactor::Expected { factor: chol };
+        let design = array![[1.0, 0.0], [0.0, 1.0], [0.3, -0.2]];
+
+        let se = delta_method_standard_errors(&factor, &design).unwrap();
+        let inv = manual_inverse(&hessian);
+
+        for (idx, row) in design.rows().into_iter().enumerate() {
+            let row_vec = row.to_owned();
+            let tmp = inv.dot(&row_vec);
+            let expected = row_vec.dot(&tmp).max(0.0).sqrt();
+            assert_abs_diff_eq!(se[idx], expected, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn delta_method_observed_factor_matches_expected() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let (lower, diag, subdiag, perm_fwd, perm_inv, inertia) = ldlt_rook(&hessian).unwrap();
+        let factor = HessianFactor::Observed {
+            factor: LdltFactor {
+                lower: lower.clone(),
+                diag: diag.clone(),
+                subdiag: subdiag.clone(),
+            },
+            permutation: PermutationDescriptor {
+                forward: perm_fwd.clone(),
+                inverse: perm_inv.clone(),
+            },
+            inertia,
+        };
+
+        let design = array![[1.0, 0.0], [0.0, 1.0], [0.3, -0.2]];
+        let expected_factor = HessianFactor::Expected {
+            factor: CholeskyFactor {
+                lower: array![[2.0, 0.0], [0.5, (2.75_f64).sqrt()]],
+            },
+        };
+
+        let se_observed = delta_method_standard_errors(&factor, &design).unwrap();
+        let se_expected = delta_method_standard_errors(&expected_factor, &design).unwrap();
+
+        for i in 0..se_observed.len() {
+            assert_abs_diff_eq!(se_observed[i], se_expected[i], epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn survival_calibrator_features_clamps_leverage_and_uses_delta_se() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let factor = HessianFactor::Expected {
+            factor: CholeskyFactor {
+                lower: array![[2.0, 0.0], [0.5, (2.75_f64).sqrt()]],
+            },
+        };
+        let design = array![[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        let predictions = array![0.2, 0.4, 0.7];
+        let leverage = array![1.2, -0.5, 0.95];
+
+        let features =
+            survival_calibrator_features(&predictions, &design, Some(&factor), Some(&leverage))
+                .unwrap();
+
+        let inv = manual_inverse(&hessian);
+        for (idx, row) in design.rows().into_iter().enumerate() {
+            let row_vec = row.to_owned();
+            let tmp = inv.dot(&row_vec);
+            let expected = row_vec.dot(&tmp).max(0.0).sqrt();
+            assert_abs_diff_eq!(features[[idx, 1]], expected, epsilon = 1e-10);
+        }
+
+        assert!(features.column(0).iter().all(|&v| v.is_finite()));
+        assert_abs_diff_eq!(features[[0, 2]], 1.0 - 1e-6, epsilon = 1e-12);
+        assert_abs_diff_eq!(features[[1, 2]], 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(features[[2, 2]], 0.95, epsilon = 1e-12);
+    }
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1420,29 +1729,27 @@ mod tests {
         match (&left.hessian_factor, &right.hessian_factor) {
             (
                 Some(HessianFactor::Observed {
-                    ldlt_factor: l_ldlt,
+                    factor: l_ldlt,
                     permutation: l_perm,
                     inertia: l_inertia,
                 }),
                 Some(HessianFactor::Observed {
-                    ldlt_factor: r_ldlt,
+                    factor: r_ldlt,
                     permutation: r_perm,
                     inertia: r_inertia,
                 }),
             ) => {
-                assert_array2_close(l_ldlt, r_ldlt, 1e-12);
+                assert_array2_close(&l_ldlt.lower, &r_ldlt.lower, 1e-12);
+                assert_array1_close(&l_ldlt.diag, &r_ldlt.diag, 1e-12);
+                assert_array1_close(&l_ldlt.subdiag, &r_ldlt.subdiag, 1e-12);
                 assert_eq!(l_perm, r_perm);
                 assert_eq!(l_inertia, r_inertia);
             }
             (
-                Some(HessianFactor::Expected {
-                    cholesky_factor: l_chol,
-                }),
-                Some(HessianFactor::Expected {
-                    cholesky_factor: r_chol,
-                }),
+                Some(HessianFactor::Expected { factor: l_chol }),
+                Some(HessianFactor::Expected { factor: r_chol }),
             ) => {
-                assert_array2_close(l_chol, r_chol, 1e-12);
+                assert_array2_close(&l_chol.lower, &r_chol.lower, 1e-12);
             }
             (None, None) => {}
             _ => panic!("hessian factor mismatch"),
@@ -2158,7 +2465,9 @@ mod tests {
             interaction_metadata: vec![interaction],
             companion_models: vec![companion],
             hessian_factor: Some(HessianFactor::Expected {
-                cholesky_factor: Array2::<f64>::eye(layout.combined_exit.ncols()),
+                factor: CholeskyFactor {
+                    lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
+                },
             }),
         };
 

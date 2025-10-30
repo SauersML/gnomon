@@ -4,7 +4,10 @@ use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, array1_to_col_mat_mut, array2_to_mat_mut,
     hash_array2,
 };
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
+use crate::calibrate::model::{LinkFunction, ModelConfig};
+
+#[cfg(test)]
+use crate::calibrate::model::ModelFamily;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
