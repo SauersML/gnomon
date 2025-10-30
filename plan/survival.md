@@ -141,7 +141,7 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 ### 5.4 Monotonicity penalty
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
 - The softplus barrier coexists with the `max(dη_exit, ε)` guard: the guard prevents catastrophic likelihood explosions, while the barrier still sees the unguarded derivative and nudges it positive.
-- Add the barrier Hessian/gradient to the working state like any other smoothness penalty. Remove any ad-hoc derivative clamping, and surface violations by logging diagnostics on subjects or grid points where `dη_exit < 0` and optionally tripping early stopping if repeated violations persist.
+- Add the barrier Hessian/gradient to the working state like any other smoothness penalty.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.
@@ -198,7 +198,6 @@ conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
   - user-supplied competing CIF values for the cohort.
 - Helper functions `resolve_companion_model` and `competing_cif_value` return competing CIFs, preferring explicit user values and surfacing `MissingCompanionCifData` when neither source is available.
 - Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
-- Remove any suggestion of Kaplan–Meier proxies.
 
 ### 7.4 Conditioned scoring API
 Expose:
@@ -235,7 +234,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
   replication for probabilistic scoring metrics.
 - Added `pirls_penalized_deviance_is_monotone` to assert that the penalised deviance trace strictly decreases across PIRLS
   iterations, catching regressions in the line-search and step-halving routines.
-- Remove benchmarks centered on risk-set algebra or quadrature.
+- No benchmarks should be centered on risk-set algebra or quadrature.
 
 ## 10. Implementation roadmap
 1. **Model family plumbing**: add survival variant to `ModelFamily`, update CLI flags, and ensure serialization handles the new branch.
