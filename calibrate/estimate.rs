@@ -1464,6 +1464,7 @@ pub fn train_model(
                 } else {
                     None
                 },
+                assumes_frequency_weights: true,
             };
 
             // Detailed one-time summary after calibration ends

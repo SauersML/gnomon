@@ -119,6 +119,15 @@ pub struct CalibratorModel {
 
     // Optional Gaussian scale
     pub scale: Option<f64>,
+    /// Calibration inherits the frequency-weight assumption from training. Persist the flag so
+    /// downstream consumers do not reinterpret the coefficients under inverse-probability
+    /// weighting without re-fitting the calibrator.
+    #[serde(default = "default_true")]
+    pub assumes_frequency_weights: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Internal schema returned when building the calibrator design
@@ -4676,6 +4685,7 @@ mod tests {
             column_spans: schema.column_spans,
             pred_param_range: schema.pred_param_range.clone(),
             scale: None, // Not used for logistic regression
+            assumes_frequency_weights: true,
         };
 
         // Get calibrated predictions
@@ -4843,6 +4853,7 @@ mod tests {
                 column_spans: schema.column_spans,
                 pred_param_range: schema.pred_param_range.clone(),
                 scale: None,
+                assumes_frequency_weights: true,
             };
 
             let cal_probs = predict_calibrator(
@@ -5007,6 +5018,7 @@ mod tests {
             column_spans: schema.column_spans.clone(),
             pred_param_range: schema.pred_param_range.clone(),
             scale: None,
+            assumes_frequency_weights: true,
         };
         let cal_probs = predict_calibrator(
             &cal_model,
@@ -5166,6 +5178,7 @@ mod tests {
             column_spans: schema.column_spans,
             pred_param_range: schema.pred_param_range.clone(),
             scale: None, // Not used for logistic regression
+            assumes_frequency_weights: true,
         };
 
         // Get calibrated predictions
@@ -5534,6 +5547,7 @@ mod tests {
             column_spans: schema.column_spans,
             pred_param_range: schema.pred_param_range.clone(),
             scale: Some(scale),
+            assumes_frequency_weights: true,
         };
 
         let cal_preds = predict_calibrator(
@@ -5824,6 +5838,7 @@ mod tests {
             column_spans: schema.column_spans,
             pred_param_range: schema.pred_param_range.clone(),
             scale: None,
+            assumes_frequency_weights: true,
         };
 
         // Create new test data with similar characteristics but different values
@@ -5933,6 +5948,7 @@ mod tests {
             column_spans: schema.column_spans.clone(),
             pred_param_range: schema.pred_param_range.clone(),
             scale: None,
+            assumes_frequency_weights: true,
         };
 
         // Generate predictions with original model
@@ -7228,6 +7244,7 @@ mod tests {
             column_spans: schema.column_spans,
             pred_param_range: schema.pred_param_range.clone(),
             scale: None,
+            assumes_frequency_weights: true,
         };
 
         let cal_probs = predict_calibrator(
