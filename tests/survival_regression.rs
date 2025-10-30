@@ -4,7 +4,7 @@ use gnomon::calibrate::survival::{
     SurvivalTrainingData, WorkingModel, WorkingModelSurvival, build_survival_layout,
     conditional_absolute_risk, cumulative_incidence,
 };
-use ndarray::{Array1, Array2, array, s};
+use ndarray::{Array1, Array2, Axis, array};
 
 const GUARD_DELTA: f64 = 0.1;
 const BASELINE_PENALTY_ORDER: usize = 2;
@@ -197,14 +197,21 @@ fn build_artifacts(
 }
 
 fn covariate_layout(layout: &gnomon::calibrate::survival::SurvivalLayout) -> CovariateLayout {
-    let column_names: Vec<String> = (0..layout.static_covariates.ncols())
-        .map(|idx| format!("cov{idx}"))
-        .collect();
-    let ranges = value_ranges(&layout.static_covariates);
+    // Match production logic: combine static + extra covariates
+    let mut ranges = value_ranges(&layout.static_covariates);
+    ranges.extend(value_ranges(&layout.extra_static_covariates));
     CovariateLayout {
-        column_names,
+        column_names: layout.static_covariate_names.clone(),
         ranges,
     }
+}
+
+/// Helper to combine static and extra covariates for a single row
+fn combined_covariates_row(layout: &gnomon::calibrate::survival::SurvivalLayout, row_idx: usize) -> Array1<f64> {
+    let static_row = layout.static_covariates.row(row_idx);
+    let extra_row = layout.extra_static_covariates.row(row_idx);
+    ndarray::concatenate(Axis(0), &[static_row, extra_row])
+        .expect("concatenate covariates")
 }
 
 fn value_ranges(matrix: &Array2<f64>) -> Vec<gnomon::calibrate::survival::ValueRange> {
@@ -269,19 +276,17 @@ fn cumulative_incidence_matches_reference_library() {
         0.6321204109495415,
         0.6321201334574286,
     ];
-    let covariates = trusted
-        .layout
-        .static_covariates
-        .slice(s![0..4, ..])
-        .to_owned();
-    for ((age, expected), cov_row) in ages.iter().zip(expected_cif.iter()).zip(covariates.rows()) {
-        let cif = cumulative_incidence(*age, &cov_row.to_owned(), &trusted.artifacts).unwrap();
+    // Test first 4 rows with expected CIF values
+    for (idx, (age, expected)) in ages.iter().zip(expected_cif.iter()).enumerate() {
+        let cov = combined_covariates_row(&trusted.layout, idx);
+        let cif = cumulative_incidence(*age, &cov, &trusted.artifacts).unwrap();
         assert!((cif - *expected).abs() <= 1e-9);
     }
 
+    // Test Brier score across all data
     let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
     for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
-        let cov = trusted.layout.static_covariates.row(idx).to_owned();
+        let cov = combined_covariates_row(&trusted.layout, idx);
         preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
     }
     let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
@@ -292,7 +297,7 @@ fn cumulative_incidence_matches_reference_library() {
 #[test]
 fn conditional_risk_monotonic_with_calibration_toggle() {
     let trusted = TrustedReference::new();
-    let covs = trusted.layout.static_covariates.row(0).to_owned();
+    let covs = combined_covariates_row(&trusted.layout, 0);
     let t0 = 55.0;
     let horizons = [60.0, 62.0, 64.0, 66.0];
     let mut base = Vec::new();
@@ -312,7 +317,7 @@ fn weighted_brier_matches_frequency_replication() {
     let trusted = TrustedReference::new();
     let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
     for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
-        let cov = trusted.layout.static_covariates.row(idx).to_owned();
+        let cov = combined_covariates_row(&trusted.layout, idx);
         preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
     }
     let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
