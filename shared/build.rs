@@ -13,6 +13,12 @@ struct ViolationCollector {
     file_path: PathBuf,
 }
 
+// A collector for disallowed `let _ = token;` patterns
+struct DisallowedLetCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 // A collector for forbidden comment content
 struct ForbiddenCommentCollector {
     violations: Vec<String>,
@@ -54,12 +60,16 @@ fn update_stage(label: &str) {
     }
 
     println!("cargo:warning=gnomon build stage: {label}");
-    let _ = io::stdout().flush();
+    io::stdout()
+        .flush()
+        .expect("failed to flush stdout after updating stage");
 }
 
 fn emit_stage_detail(detail: &str) {
     println!("cargo:warning=gnomon build detail: {detail}");
-    let _ = io::stdout().flush();
+    io::stdout()
+        .flush()
+        .expect("failed to flush stdout while emitting stage detail");
 }
 
 fn install_stage_panic_hook() {
@@ -104,6 +114,41 @@ impl ViolationCollector {
             .push_str("\n⚠️ Underscore-prefixed variable names are not allowed in this project.\n");
         error_msg.push_str(
             "   Either use the variable (removing the underscore) or remove it completely.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl DisallowedLetCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} disallowed 'let _ =' patterns in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Directly ignoring values with 'let _ =' is forbidden in this project.\n",
+        );
+        error_msg.push_str(
+            "   Handle the result explicitly or restructure the code to avoid silent ignores.\n",
         );
 
         Some(error_msg)
@@ -326,6 +371,39 @@ impl Sink for ViolationCollector {
     }
 }
 
+impl Sink for DisallowedLetCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 && part.contains("_") {
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+
+        if is_pure_comment || is_in_string {
+            return Ok(true);
+        }
+
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
 // Implement the Sink trait for the forbidden comment collector
 impl Sink for ForbiddenCommentCollector {
     type Error = std::io::Error;
@@ -511,6 +589,16 @@ fn main() {
     );
     emit_stage_detail(&underscore_report);
     all_violations.extend(underscore_violations);
+
+    // Scan Rust source files for disallowed `let _ = token;` patterns
+    update_stage("scan disallowed let ignore patterns");
+    let disallowed_let_violations = scan_for_disallowed_let_patterns();
+    let disallowed_let_report = format!(
+        "disallowed let pattern scan identified {} violation groups",
+        disallowed_let_violations.len()
+    );
+    emit_stage_detail(&disallowed_let_report);
+    all_violations.extend(disallowed_let_violations);
 
     // Scan Rust source files for forbidden comment patterns
     update_stage("scan forbidden comment patterns");
@@ -885,6 +973,51 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     }
 
     // Return all violations found
+    all_violations
+}
+
+fn scan_for_disallowed_let_patterns() -> Vec<String> {
+    let pattern = r"\blet\s+(?:mut\s+)?_\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| !is_in_target_directory(e.path()))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = DisallowedLetCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating regex matcher for disallowed let patterns: {}",
+                e
+            ));
+        }
+    }
+
     all_violations
 }
 
