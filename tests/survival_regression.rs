@@ -1,8 +1,10 @@
 use gnomon::calibrate::faer_ndarray::ldlt_rook;
+use gnomon::calibrate::calibrator::{CalibratorModel, CalibratorSpec};
+use gnomon::calibrate::model::{calibrator_enabled, set_calibrator_enabled, BasisConfig, LinkFunction};
 use gnomon::calibrate::survival::{
     ColumnRange, CovariateLayout, PenaltyDescriptor, SurvivalModelArtifacts, SurvivalSpec,
-    SurvivalTrainingData, WorkingModel, WorkingModelSurvival, build_survival_layout,
-    conditional_absolute_risk, cumulative_incidence,
+    SurvivalTrainingData, WorkingModelSurvival, build_survival_layout, conditional_absolute_risk,
+    cumulative_incidence, design_row_at_age, DEFAULT_RISK_EPSILON,
 };
 use ndarray::{Array1, Array2, Axis, array};
 
@@ -300,22 +302,160 @@ fn cumulative_incidence_matches_reference_library() {
 
 #[test]
 fn conditional_risk_monotonic_with_calibration_toggle() {
+    struct CalibratorFlagGuard(bool);
+    impl CalibratorFlagGuard {
+        fn new(previous: bool) -> Self {
+            Self(previous)
+        }
+
+        fn previous(&self) -> bool {
+            self.0
+        }
+    }
+    impl Drop for CalibratorFlagGuard {
+        fn drop(&mut self) {
+            set_calibrator_enabled(self.0);
+        }
+    }
+
+    fn identity_calibrator() -> CalibratorModel {
+        CalibratorModel {
+            spec: CalibratorSpec {
+                link: LinkFunction::Logit,
+                pred_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                se_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                dist_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                penalty_order_pred: 2,
+                penalty_order_se: 2,
+                penalty_order_dist: 2,
+                distance_hinge: false,
+                prior_weights: None,
+                firth: None,
+            },
+            knots_pred: Array1::zeros(0),
+            knots_se: Array1::zeros(0),
+            knots_dist: Array1::zeros(0),
+            pred_constraint_transform: Array2::zeros((0, 0)),
+            stz_se: Array2::zeros((0, 0)),
+            stz_dist: Array2::zeros((0, 0)),
+            penalty_nullspace_dims: (0, 0, 0, 0),
+            standardize_pred: (0.0, 1.0),
+            standardize_se: (0.0, 1.0),
+            standardize_dist: (0.0, 1.0),
+            interaction_center_pred: None,
+            se_wiggle_only_drop: false,
+            dist_wiggle_only_drop: false,
+            lambda_pred: 1.0,
+            lambda_pred_param: 1.0,
+            lambda_se: 1.0,
+            lambda_dist: 1.0,
+            coefficients: Array1::zeros(0),
+            column_spans: (0..0, 0..0, 0..0),
+            pred_param_range: 0..0,
+            scale: None,
+            assumes_frequency_weights: true,
+        }
+    }
+
+    fn risk_with_gradient(
+        t0: f64,
+        t1: f64,
+        covs: &Array1<f64>,
+        artifacts: &SurvivalModelArtifacts,
+    ) -> (f64, Array1<f64>) {
+        let risk =
+            conditional_absolute_risk(t0, t1, covs, Some(0.0), None, artifacts).expect("risk");
+        let coeffs = &artifacts.coefficients;
+        let design_entry = design_row_at_age(t0, covs.view(), artifacts).expect("design entry");
+        let design_exit = design_row_at_age(t1, covs.view(), artifacts).expect("design exit");
+        assert_eq!(design_entry.len(), coeffs.len());
+        assert_eq!(design_exit.len(), coeffs.len());
+
+        let eta_entry = design_entry.dot(coeffs);
+        let eta_exit = design_exit.dot(coeffs);
+        let h_entry = eta_entry.exp();
+        let h_exit = eta_exit.exp();
+        let exp_neg_entry = (-h_entry).exp();
+        let exp_neg_exit = (-h_exit).exp();
+        let f_entry = 1.0 - exp_neg_entry;
+        let f_exit = 1.0 - exp_neg_exit;
+        let delta_raw = f_exit - f_entry;
+        let denom_raw = 1.0 - f_entry;
+        let delta = delta_raw.max(0.0);
+        let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
+        let d_f_entry = h_entry * exp_neg_entry;
+        let d_f_exit = h_exit * exp_neg_exit;
+        let dr_deta_exit = if delta_raw > 0.0 { d_f_exit / denom } else { 0.0 };
+        let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+        let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+        let dden = -d_f_entry;
+        let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+            (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+        } else {
+            0.0
+        };
+
+        let risk_clamped = risk.max(1e-12).min(1.0 - 1e-12);
+        let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+        let grad_exit = design_exit.mapv(|v| v * dr_deta_exit * logistic_scale);
+        let grad_entry = design_entry.mapv(|v| v * dr_deta_entry * logistic_scale);
+        let gradient = grad_exit + grad_entry;
+
+        (risk, gradient)
+    }
+
     let trusted = TrustedReference::new();
     let covs = combined_covariates_row(&trusted.layout, 0);
+    let mut artifacts = trusted.artifacts.clone();
+    artifacts.calibrator = Some(identity_calibrator());
+
     let t0 = 55.0;
     let horizons = [60.0, 62.0, 64.0, 66.0];
-    let mut base = Vec::new();
-    let mut calibrated = Vec::new();
-    for &t1 in &horizons {
-        let raw =
-            conditional_absolute_risk(t0, t1, &covs, Some(0.0), None, &trusted.artifacts).unwrap();
-        base.push(raw);
-        let cal =
-            conditional_absolute_risk(t0, t1, &covs, Some(0.12), None, &trusted.artifacts).unwrap();
-        calibrated.push(cal);
+
+    let mut risks = Vec::new();
+    let mut design = Array2::<f64>::zeros((horizons.len(), artifacts.coefficients.len()));
+    for (row_idx, &t1) in horizons.iter().enumerate() {
+        let (risk, gradient) = risk_with_gradient(t0, t1, &covs, &artifacts);
+        risks.push(risk);
+        design
+            .row_mut(row_idx)
+            .assign(&gradient.view());
     }
-    assert!(base.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
-    assert!(calibrated.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
+
+    let risks_array = Array1::from_vec(risks.clone());
+    assert!(risks.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
+
+    let original_flag = calibrator_enabled();
+    let guard = CalibratorFlagGuard::new(original_flag);
+    let _ = guard.previous();
+
+    set_calibrator_enabled(false);
+    let uncalibrated = artifacts
+        .apply_logit_risk_calibrator(&risks_array, &design, None)
+        .expect("uncalibrated application");
+
+    set_calibrator_enabled(true);
+    let calibrated = artifacts
+        .apply_logit_risk_calibrator(&risks_array, &design, None)
+        .expect("calibrated application");
+
+    let uncalibrated_vec = uncalibrated.to_vec();
+    let calibrated_vec = calibrated.to_vec();
+    assert!(uncalibrated_vec
+        .windows(2)
+        .all(|w| w[1] + 1e-12 >= w[0]));
+    assert!(calibrated_vec
+        .windows(2)
+        .all(|w| w[1] + 1e-12 >= w[0]));
 }
 
 #[test]
