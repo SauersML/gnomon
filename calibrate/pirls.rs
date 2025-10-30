@@ -832,7 +832,33 @@ pub fn fit_model_for_fixed_rho(
             // Drop the 2x factor to match the objective we actually minimize
             let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
 
-            let gradient_norm = gradient_wrt_solve
+            let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
+                result.penalized_hessian.clone()
+            } else {
+                let (result, _) = solve_penalized_least_squares(
+                    x_transformed.view(),
+                    z.view(),
+                    weights.view(),
+                    offset.view(),
+                    &eb_transformed,
+                    e_transformed,
+                    &s_from_e_precomputed,
+                    &mut workspace,
+                    y.view(),
+                    config.link_function(),
+                )?;
+                result.penalized_hessian
+            };
+
+            let working_state = WorkingState {
+                eta: tmp_eta,
+                gradient: gradient_wrt_solve.to_owned(),
+                hessian: penalized_hessian_transformed.clone(),
+                deviance: last_deviance,
+            };
+
+            let gradient_norm = working_state
+                .gradient
                 .iter()
                 .map(|&x| x.abs())
                 .fold(0.0, f64::max);
@@ -864,39 +890,20 @@ pub fn fit_model_for_fixed_rho(
                     penalty_info
                 );
 
-                let penalized_hessian_transformed =
-                    if let Some((ref result, _)) = last_stable_result {
-                        result.penalized_hessian.clone()
-                    } else {
-                        let (result, _) = solve_penalized_least_squares(
-                            x_transformed.view(),
-                            z.view(),
-                            weights.view(),
-                            offset.view(),
-                            &eb_transformed,
-                            e_transformed,
-                            &s_from_e_precomputed,
-                            &mut workspace,
-                            y.view(),
-                            config.link_function(),
-                        )?;
-                        result.penalized_hessian
-                    };
-
                 // Calculate the stable penalty term using the transformed quantities
                 let stable_penalty_term =
                     beta_transformed.dot(&s_transformed.dot(&beta_transformed));
 
                 // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
-                let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+                let mut stabilized_hessian_transformed = working_state.hessian.clone();
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
                 // Populate the new PirlsResult struct with stable, transformed quantities
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
-                    penalized_hessian_transformed,
+                    penalized_hessian_transformed: working_state.hessian,
                     stabilized_hessian_transformed,
-                    deviance: last_deviance,
+                    deviance: working_state.deviance,
                     edf: edf_from_solver,
                     stable_penalty_term,
                     firth_log_det: firth_log_det_value,
@@ -986,7 +993,14 @@ pub fn fit_model_for_fixed_rho(
     let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
     let grad_penalty_part = s_transformed.dot(&beta_transformed);
     let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
-    let gradient_norm = gradient_wrt_solve
+    let working_state = WorkingState {
+        eta: tmp_eta,
+        gradient: gradient_wrt_solve.to_owned(),
+        hessian: penalized_hessian_transformed.clone(),
+        deviance: last_deviance,
+    };
+    let gradient_norm = working_state
+        .gradient
         .iter()
         .map(|&v| v.abs())
         .fold(0.0, f64::max);
@@ -1017,7 +1031,7 @@ pub fn fit_model_for_fixed_rho(
     let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
 
     // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
-    let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
+    let mut stabilized_hessian_transformed = working_state.hessian.clone();
     ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
     // If stationarity is met, return a stalled-but-valid minimum for acceptance
@@ -1029,7 +1043,7 @@ pub fn fit_model_for_fixed_rho(
 
     Ok(PirlsResult {
         beta_transformed,
-        penalized_hessian_transformed,
+        penalized_hessian_transformed: working_state.hessian,
         stabilized_hessian_transformed,
         deviance: last_deviance,
         edf: if let Some((ref result, _)) = last_stable_result {

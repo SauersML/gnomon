@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
+use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
+use crate::calibrate::pirls::{WorkingModel, WorkingState};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -49,18 +51,10 @@ pub enum SurvivalError {
     Basis(#[from] BasisError),
 }
 
-/// Working model abstraction shared between GAM and survival implementations.
-pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
-}
-
-/// Aggregated state returned by [`WorkingModel::update`].
-#[derive(Debug, Clone)]
-pub struct WorkingState {
-    pub eta: Array1<f64>,
-    pub gradient: Array1<f64>,
-    pub hessian: Array2<f64>,
-    pub deviance: f64,
+impl From<SurvivalError> for EstimationError {
+    fn from(error: SurvivalError) -> Self {
+        EstimationError::InvalidInput(format!("survival working model: {error}"))
+    }
 }
 
 /// Guarded log-age transformation used across training and scoring.
@@ -947,10 +941,10 @@ impl WorkingModelSurvival {
 }
 
 impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
-            return Err(SurvivalError::DesignDimensionMismatch);
+            return Err(SurvivalError::DesignDimensionMismatch.into());
         }
 
         let eta_exit = self.layout.combined_exit.dot(beta);
@@ -982,11 +976,11 @@ impl WorkingModel for WorkingModelSurvival {
             let h_e = h_exit[i];
             let h_s = h_entry[i];
             if !eta_e.is_finite() || !h_e.is_finite() || !h_s.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
+                return Err(SurvivalError::NonFiniteLinearPredictor.into());
             }
             let d_eta_exit = derivative_exit[i];
             if !d_eta_exit.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
+                return Err(SurvivalError::NonFiniteLinearPredictor.into());
             }
             let guard_applied = d_eta_exit <= guard_threshold;
             let guarded_derivative = if guard_applied {
@@ -1073,12 +1067,15 @@ impl WorkingModel for WorkingModelSurvival {
             };
 
         if self.spec.use_expected_information {
-            if let Some(expected_hessian) = self.build_expected_information_hessian(
-                beta,
-                &barrier_hessian,
-                &penalty_hessian,
-                monotonicity_hessian.as_ref(),
-            )? {
+            if let Some(expected_hessian) = self
+                .build_expected_information_hessian(
+                    beta,
+                    &barrier_hessian,
+                    &penalty_hessian,
+                    monotonicity_hessian.as_ref(),
+                )
+                .map_err(EstimationError::from)?
+            {
                 hessian = expected_hessian;
             }
         }
