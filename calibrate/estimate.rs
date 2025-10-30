@@ -1559,10 +1559,323 @@ pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    drop((bundle, config));
-    Err(EstimationError::InvalidSpecification(
-        "Survival model training is not yet implemented".to_string(),
-    ))
+    use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
+    use crate::calibrate::survival::{
+        AgeTransform, BasisDescriptor, ColumnRange, CovariateLayout, HessianFactor,
+        PenaltyDescriptor, SurvivalError, SurvivalLayout, SurvivalModelArtifacts, SurvivalSpec,
+        ValueRange, WorkingModelSurvival,
+    };
+    use ndarray::{Array1, Array2};
+
+    fn map_error(err: SurvivalError) -> EstimationError {
+        EstimationError::InvalidSpecification(err.to_string())
+    }
+
+    fn compute_log_age_extents(
+        transform: &AgeTransform,
+        data: &crate::calibrate::survival::SurvivalTrainingData,
+    ) -> Result<(Array1<f64>, f64, f64), EstimationError> {
+        let log_entry = transform
+            .transform_array(&data.age_entry)
+            .map_err(map_error)?;
+        let log_exit = transform
+            .transform_array(&data.age_exit)
+            .map_err(map_error)?;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        for value in log_entry.iter().chain(log_exit.iter()) {
+            min_val = min_val.min(*value);
+            max_val = max_val.max(*value);
+        }
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return Err(EstimationError::InvalidSpecification(
+                "Non-finite log-age encountered while constructing basis".to_string(),
+            ));
+        }
+        if (max_val - min_val).abs() < 1e-9 {
+            max_val = min_val + 1e-6;
+        }
+        Ok((log_entry, min_val, max_val))
+    }
+
+    fn build_covariate_layout(static_covariates: &Array2<f64>) -> CovariateLayout {
+        let column_names = (0..static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
+        let ranges = (0..static_covariates.ncols())
+            .map(|col_idx| {
+                let column = static_covariates.column(col_idx);
+                let mut min_val = f64::INFINITY;
+                let mut max_val = f64::NEG_INFINITY;
+                for &value in column.iter() {
+                    min_val = min_val.min(value);
+                    max_val = max_val.max(value);
+                }
+                if !min_val.is_finite() || !max_val.is_finite() {
+                    min_val = 0.0;
+                    max_val = 0.0;
+                }
+                ValueRange {
+                    min: min_val,
+                    max: max_val,
+                }
+            })
+            .collect();
+        CovariateLayout {
+            column_names,
+            ranges,
+        }
+    }
+
+    fn describe_penalties(layout: &SurvivalLayout, penalty_order: usize) -> Vec<PenaltyDescriptor> {
+        layout
+            .penalties
+            .blocks
+            .iter()
+            .map(|block| PenaltyDescriptor {
+                order: penalty_order,
+                lambda: block.lambda,
+                matrix: block.matrix.clone(),
+                column_range: ColumnRange::new(block.range.start, block.range.end),
+            })
+            .collect()
+    }
+
+    fn solve_newton_direction(
+        hessian: &Array2<f64>,
+        gradient: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        use crate::calibrate::faer_ndarray::{FaerArrayView, array1_to_col_mat_mut};
+        use faer::Side;
+        use faer::linalg::solvers::{Ldlt as FaerLdlt, Solve as FaerSolve};
+
+        let mut matrix = hessian.clone();
+        let mut rhs = gradient.mapv(|v| -v);
+        let mut attempt = 0usize;
+        loop {
+            match FaerLdlt::new(FaerArrayView::new(&matrix).as_ref(), Side::Lower) {
+                Ok(factor) => {
+                    {
+                        let mut rhs_mat = array1_to_col_mat_mut(&mut rhs);
+                        factor.solve_in_place(rhs_mat.as_mut());
+                    }
+                    return Ok(rhs);
+                }
+                Err(err) => {
+                    if attempt >= 6 {
+                        return Err(EstimationError::LinearSystemSolveFailed(err));
+                    }
+                    let ridge = 10f64.powi((attempt as i32) - 6);
+                    for i in 0..matrix.nrows() {
+                        matrix[[i, i]] += ridge;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    fn factor_hessian(
+        hessian: &Array2<f64>,
+        use_expected: bool,
+    ) -> Result<Option<HessianFactor>, EstimationError> {
+        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        if hessian.is_empty() {
+            return Ok(None);
+        }
+
+        if use_expected {
+            match hessian.cholesky(Side::Lower) {
+                Ok(factor) => {
+                    let lower = factor.lower_triangular();
+                    return Ok(Some(HessianFactor::Expected {
+                        factor: crate::calibrate::survival::CholeskyFactor { lower },
+                    }));
+                }
+                Err(err) => {
+                    return Err(EstimationError::LinearSystemSolveFailed(err));
+                }
+            }
+        }
+
+        let (lower, diag, subdiag, perm_fwd, perm_inv, inertia) =
+            crate::calibrate::faer_ndarray::ldlt_rook(hessian)
+                .map_err(EstimationError::LinearSystemSolveFailed)?;
+        Ok(Some(HessianFactor::Observed {
+            factor: crate::calibrate::survival::LdltFactor {
+                lower,
+                diag,
+                subdiag,
+            },
+            permutation: crate::calibrate::survival::PermutationDescriptor {
+                forward: perm_fwd,
+                inverse: perm_inv,
+            },
+            inertia,
+        }))
+    }
+
+    clear_basis_cache();
+
+    log::info!("Starting survival model training via penalized Newton updates.");
+    eprintln!("\n[STAGE 1/3] Constructing survival layout...");
+
+    let survival_cfg = config.survival.as_ref().ok_or_else(|| {
+        EstimationError::InvalidSpecification(
+            "Missing survival model configuration in ModelConfig".to_string(),
+        )
+    })?;
+
+    let survival_spec = config
+        .survival_spec()
+        .cloned()
+        .unwrap_or_else(SurvivalSpec::default);
+
+    let (log_entry, log_min, log_max) =
+        compute_log_age_extents(&bundle.age_transform, &bundle.data)?;
+
+    let (basis_arc, knot_vector) = create_bspline_basis(
+        log_entry.view(),
+        (log_min, log_max),
+        survival_cfg.baseline_basis.num_knots,
+        survival_cfg.baseline_basis.degree,
+    )?;
+    drop(basis_arc);
+    let age_basis = BasisDescriptor {
+        knot_vector,
+        degree: survival_cfg.baseline_basis.degree,
+    };
+
+    let (layout, monotonicity) = crate::calibrate::survival::build_survival_layout(
+        &bundle.data,
+        &age_basis,
+        survival_cfg.guard_delta,
+        config.penalty_order,
+        survival_cfg.initial_lambda,
+        survival_cfg.monotonic_grid_size,
+    )
+    .map_err(map_error)?;
+
+    eprintln!(
+        "[STAGE 1/3] Layout ready. Coefficients: {} (baseline columns: {}), penalties: {}",
+        layout.combined_exit.ncols(),
+        layout.baseline_exit.ncols(),
+        layout.penalties.blocks.len(),
+    );
+
+    eprintln!(
+        "\n[STAGE 2/3] Smoothing parameter optimisation for survival models is not yet automated; using initial λ = {:.3e}.",
+        survival_cfg.initial_lambda
+    );
+
+    eprintln!("\n[STAGE 3/3] Fitting survival model via penalized Newton iterations...");
+
+    let mut model =
+        WorkingModelSurvival::new(layout.clone(), &bundle.data, monotonicity, survival_spec)
+            .map_err(map_error)?;
+
+    let p = layout.combined_exit.ncols();
+    let mut beta = Array1::<f64>::zeros(p);
+    let mut last_deviance = f64::INFINITY;
+    let mut final_state = None;
+
+    for iter in 1..=config.max_iterations {
+        let state = model.update(&beta).map_err(map_error)?;
+        let grad_norm = state.gradient.mapv(|v| v * v).sum().sqrt();
+        let delta = solve_newton_direction(&state.hessian, &state.gradient)?;
+
+        let mut step = 1.0;
+        let mut accepted = false;
+        let mut candidate_beta = beta.clone();
+        let mut candidate_state = state.clone();
+        for _ in 0..20 {
+            candidate_beta = &beta + &(delta.mapv(|v| step * v));
+            match model.update(&candidate_beta).map_err(map_error) {
+                Ok(updated) => {
+                    if updated.deviance <= state.deviance || !updated.deviance.is_finite() {
+                        candidate_state = updated;
+                        accepted = true;
+                        break;
+                    }
+                    step *= 0.5;
+                }
+                Err(err) => {
+                    if step <= 1e-6 {
+                        return Err(err);
+                    }
+                    step *= 0.5;
+                }
+            }
+        }
+
+        if !accepted {
+            return Err(EstimationError::PirlsDidNotConverge {
+                max_iterations: iter,
+                last_change: grad_norm,
+            });
+        }
+
+        let deviance_change = last_deviance - candidate_state.deviance;
+        beta = candidate_beta;
+        last_deviance = candidate_state.deviance;
+        final_state = Some(candidate_state);
+
+        eprintln!(
+            "  [Iter {:>3}] deviance = {:.6e}, |grad| = {:.3e}, step = {:.3e}",
+            iter, last_deviance, grad_norm, step
+        );
+
+        if grad_norm < config.convergence_tolerance {
+            break;
+        }
+        if deviance_change.abs() < config.convergence_tolerance {
+            break;
+        }
+    }
+
+    let final_state = final_state.ok_or_else(|| EstimationError::PirlsDidNotConverge {
+        max_iterations: config.max_iterations,
+        last_change: 0.0,
+    })?;
+
+    let hessian_factor = factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
+
+    let penalties = describe_penalties(&layout, config.penalty_order);
+    let static_covariate_layout = build_covariate_layout(&layout.static_covariates);
+    let lambdas: Vec<f64> = layout
+        .penalties
+        .blocks
+        .iter()
+        .map(|block| block.lambda)
+        .collect();
+
+    let artifacts = SurvivalModelArtifacts {
+        coefficients: beta.clone(),
+        age_basis,
+        time_varying_basis: None,
+        static_covariate_layout,
+        penalties,
+        age_transform: layout.age_transform,
+        reference_constraint: layout.reference_constraint.clone(),
+        interaction_metadata: Vec::new(),
+        companion_models: Vec::new(),
+        hessian_factor,
+    };
+
+    log_basis_cache_stats("train_survival_model");
+
+    Ok(TrainedModel {
+        config: config.clone(),
+        coefficients: Default::default(),
+        lambdas,
+        hull: None,
+        penalized_hessian: None,
+        scale: None,
+        calibrator: None,
+        survival: Some(artifacts),
+    })
 }
 
 // ===== External optimizer facade for arbitrary designs (e.g., calibrator) =====

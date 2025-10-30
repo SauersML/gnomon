@@ -2386,8 +2386,7 @@ mod tests {
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
         BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
-        PrincipalComponentConfig, internal_construct_design_matrix,
-        internal_flatten_coefficients,
+        PrincipalComponentConfig, internal_construct_design_matrix, internal_flatten_coefficients,
     };
     use approx::assert_abs_diff_eq;
     use ndarray::s;

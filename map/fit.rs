@@ -1509,13 +1509,7 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
         self.matrix.ncols()
     }
 
-    fn apply(
-        &self,
-        mut out: MatMut<'_, f64>,
-        rhs: MatRef<'_, f64>,
-        par: Par,
-        _: &mut MemStack,
-    ) {
+    fn apply(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, _: &mut MemStack) {
         matmul(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0, par);
     }
 
