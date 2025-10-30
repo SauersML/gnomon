@@ -1,12 +1,10 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView, FaerSvd};
-use faer::Side;
-use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
+use crate::calibrate::faer_ndarray::FaerSvd;
 use log::warn;
 use ndarray::prelude::*;
-use ndarray::{ArrayBase, Data, Ix1, Zip, arr1, concatenate};
+use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -45,10 +43,6 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
-    #[error("delta-method variance computation failed: {0}")]
-    DeltaMethod(String),
-    #[error("calibrator inputs must have {expected} observations, got {provided}")]
-    CalibratorInputLengthMismatch { expected: usize, provided: usize },
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -162,44 +156,6 @@ pub struct PenaltyDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CovariateLayout {
     pub column_names: Vec<String>,
-}
-
-/// Borrowed covariate slices used during prediction.
-#[derive(Debug, Clone)]
-pub struct CovariateViews<'a> {
-    pub static_covariates: ArrayView2<'a, f64>,
-    pub time_varying: Option<ArrayView2<'a, f64>>,
-}
-
-impl<'a> CovariateViews<'a> {
-    pub fn len(&self) -> usize {
-        self.static_covariates.nrows()
-    }
-
-    pub fn row(&'a self, index: usize) -> CovariateValues<'a> {
-        let static_covariates = self.static_covariates.row(index);
-        let time_varying = self.time_varying.as_ref().map(|matrix| matrix.row(index));
-        CovariateValues {
-            static_covariates,
-            time_varying,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), SurvivalError> {
-        if let Some(matrix) = &self.time_varying {
-            if matrix.nrows() != self.static_covariates.nrows() {
-                return Err(SurvivalError::CovariateDimensionMismatch);
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Borrowed per-subject covariate values.
-#[derive(Debug, Clone)]
-pub struct CovariateValues<'a> {
-    pub static_covariates: ArrayView1<'a, f64>,
-    pub time_varying: Option<ArrayView1<'a, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -919,148 +875,6 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
-impl SurvivalModelArtifacts {
-    fn expected_static_dim(&self) -> usize {
-        self.static_covariate_layout.column_names.len()
-    }
-
-    fn validate_covariates(&self, covariates: &CovariateValues<'_>) -> Result<(), SurvivalError> {
-        if covariates.static_covariates.len() != self.expected_static_dim() {
-            return Err(SurvivalError::CovariateDimensionMismatch);
-        }
-        Ok(())
-    }
-
-    fn evaluate_baseline_row(&self, log_age: f64) -> Result<Array1<f64>, SurvivalError> {
-        let age_array = arr1(&[log_age]);
-        let (basis_arc, _) = create_bspline_basis_with_knots(
-            age_array.view(),
-            self.age_basis.knot_vector.view(),
-            self.age_basis.degree,
-        )?;
-        let basis = (*basis_arc).clone();
-        let constrained = self.reference_constraint.apply(&basis);
-        Ok(constrained.row(0).to_owned())
-    }
-
-    fn evaluate_time_varying_row(
-        &self,
-        log_age: f64,
-    ) -> Result<Option<Array1<f64>>, SurvivalError> {
-        if let Some(time_basis) = &self.time_varying_basis {
-            let age_array = arr1(&[log_age]);
-            let (tv_arc, _) = create_bspline_basis_with_knots(
-                age_array.view(),
-                time_basis.knot_vector.view(),
-                time_basis.degree,
-            )?;
-            let tv = self.reference_constraint.apply(&(*tv_arc).clone());
-            Ok(Some(tv.row(0).to_owned()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn assemble_design(
-        &self,
-        baseline: Array1<f64>,
-        time_varying: Option<Array1<f64>>,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<Array1<f64>, SurvivalError> {
-        let mut design = Array1::<f64>::zeros(self.coefficients.len());
-        let mut offset = 0;
-        let baseline_len = baseline.len();
-        design
-            .slice_mut(s![offset..offset + baseline_len])
-            .assign(&baseline);
-        offset += baseline_len;
-        if let Some(time_row) = time_varying {
-            let len = time_row.len();
-            design.slice_mut(s![offset..offset + len]).assign(&time_row);
-            offset += len;
-        }
-        if let Some(subject_time) = &covariates.time_varying {
-            let len = subject_time.len();
-            design
-                .slice_mut(s![offset..offset + len])
-                .assign(subject_time);
-            offset += len;
-        }
-        let static_len = covariates.static_covariates.len();
-        design
-            .slice_mut(s![offset..offset + static_len])
-            .assign(&covariates.static_covariates);
-        if offset + static_len != design.len() {
-            return Err(SurvivalError::DesignDimensionMismatch);
-        }
-        Ok(design)
-    }
-
-    /// Evaluate the cumulative hazard at a given age.
-    pub fn cumulative_hazard(
-        &self,
-        age: f64,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<f64, SurvivalError> {
-        self.validate_covariates(covariates)?;
-        let log_age = self.age_transform.transform(age)?;
-        let baseline = self.evaluate_baseline_row(log_age)?;
-        let time_varying = self.evaluate_time_varying_row(log_age)?;
-        let design = self.assemble_design(baseline, time_varying, covariates)?;
-        let eta = design.dot(&self.coefficients);
-        Ok(eta.exp())
-    }
-
-    /// Evaluate the cumulative incidence at a given age.
-    pub fn cumulative_incidence(
-        &self,
-        age: f64,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<f64, SurvivalError> {
-        let hazard = self.cumulative_hazard(age, covariates)?;
-        Ok(1.0 - (-hazard).exp())
-    }
-
-    /// Compute the absolute risk between two ages conditioned on survival to `t0`.
-    pub fn conditional_absolute_risk(
-        &self,
-        t0: f64,
-        t1: f64,
-        covariates: &CovariateValues<'_>,
-        cif_competing_t0: f64,
-    ) -> Result<f64, SurvivalError> {
-        let cif0 = self.cumulative_incidence(t0, covariates)?;
-        let cif1 = self.cumulative_incidence(t1, covariates)?;
-        let delta = (cif1 - cif0).max(0.0);
-        let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
-        Ok(delta / denom)
-    }
-
-    /// Conditioned risk using a supplied competing cumulative incidence value.
-    pub fn conditional_absolute_risk_with_competing_cif(
-        &self,
-        t0: f64,
-        t1: f64,
-        covariates: &CovariateValues<'_>,
-        cif_competing_t0: f64,
-    ) -> Result<f64, SurvivalError> {
-        self.conditional_absolute_risk(t0, t1, covariates, cif_competing_t0)
-    }
-
-    /// Conditioned risk using a companion survival model for competing events.
-    pub fn conditional_absolute_risk_with_companion(
-        &self,
-        t0: f64,
-        t1: f64,
-        covariates: &CovariateValues<'_>,
-        competing: &SurvivalModelArtifacts,
-        competing_covariates: &CovariateValues<'_>,
-    ) -> Result<f64, SurvivalError> {
-        let competing_cif = competing.cumulative_incidence(t0, competing_covariates)?;
-        self.conditional_absolute_risk(t0, t1, covariates, competing_cif)
-    }
-}
-
 /// Prediction inputs referencing existing arrays.
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
@@ -1068,148 +882,95 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
-    pub covariates: CovariateViews<'a>,
+    pub covariates: ArrayView2<'a, f64>,
 }
 
-/// Guarded age evaluations used for scoring.
-pub struct GuardedAges {
-    pub log_age_entry: Array1<f64>,
-    pub log_age_exit: Array1<f64>,
-    pub derivative_exit: Array1<f64>,
+/// Evaluate the cumulative hazard at a given age.
+pub fn cumulative_hazard(
+    age: f64,
+    covariates: &Array1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+) -> Result<f64, SurvivalError> {
+    let expected_covs = artifacts.static_covariate_layout.column_names.len();
+    if covariates.len() != expected_covs {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+    let log_age = artifacts.age_transform.transform(age)?;
+    let (basis_arc, _) = create_bspline_basis_with_knots(
+        array![log_age].view(),
+        artifacts.age_basis.knot_vector.view(),
+        artifacts.age_basis.degree,
+    )?;
+    let basis = (*basis_arc).clone();
+    let constrained = artifacts.reference_constraint.apply(&basis);
+
+    let mut design = constrained.row(0).to_owned();
+    if let Some(time_basis) = &artifacts.time_varying_basis {
+        let (tv_arc, _) = create_bspline_basis_with_knots(
+            array![log_age].view(),
+            time_basis.knot_vector.view(),
+            time_basis.degree,
+        )?;
+        let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
+        design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
+    }
+    design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
+    let eta = design.dot(&artifacts.coefficients);
+    Ok(eta.exp())
 }
 
-impl<'a> SurvivalPredictionInputs<'a> {
-    pub fn len(&self) -> usize {
-        self.age_entry.len()
-    }
+pub fn cumulative_incidence(
+    age: f64,
+    covariates: &Array1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+) -> Result<f64, SurvivalError> {
+    let h = cumulative_hazard(age, covariates, artifacts)?;
+    Ok(1.0 - (-h).exp())
+}
 
-    pub fn validate(&self) -> Result<(), SurvivalError> {
-        let n = self.age_entry.len();
-        let dims_mismatch = self.age_exit.len() != n
-            || self.event_target.len() != n
-            || self.event_competing.len() != n
-            || self.sample_weight.len() != n
-            || self.covariates.static_covariates.nrows() != n;
-        if dims_mismatch {
-            return Err(SurvivalError::CovariateDimensionMismatch);
-        }
-        self.covariates.validate()?;
-        for i in 0..n {
-            if !(self.age_entry[i] < self.age_exit[i]) {
-                return Err(SurvivalError::InvalidAgeOrder);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn evaluate_guarded_ages(
-        &self,
-        transform: &AgeTransform,
-    ) -> Result<GuardedAges, SurvivalError> {
-        let log_age_entry = transform.transform_array(&self.age_entry.to_owned())?;
-        let log_age_exit = transform.transform_array(&self.age_exit.to_owned())?;
-        let mut derivative_exit = Array1::<f64>::zeros(self.age_exit.len());
-        for (value, &age) in derivative_exit.iter_mut().zip(self.age_exit.iter()) {
-            *value = transform.derivative_factor(age)?;
-        }
-        Ok(GuardedAges {
-            log_age_entry,
-            log_age_exit,
-            derivative_exit,
-        })
-    }
+pub fn conditional_absolute_risk(
+    t0: f64,
+    t1: f64,
+    covariates: &Array1<f64>,
+    cif_competing_t0: f64,
+    artifacts: &SurvivalModelArtifacts,
+) -> Result<f64, SurvivalError> {
+    let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
+    let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
+    let delta = (cif1 - cif0).max(0.0);
+    let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
+    Ok(delta / denom)
 }
 
 /// Calibrator feature extraction for survival predictions.
 pub fn survival_calibrator_features(
-    risks: &Array1<f64>,
-    jacobians: &Array2<f64>,
-    hessian_factor: Option<&HessianFactor>,
+    predictions: &Array1<f64>,
+    standard_errors: &Array1<f64>,
     leverage: Option<&Array1<f64>>,
-) -> Result<Array2<f64>, SurvivalError> {
-    let n = risks.len();
-    if jacobians.nrows() != n {
-        return Err(SurvivalError::CalibratorInputLengthMismatch {
-            expected: n,
-            provided: jacobians.nrows(),
-        });
-    }
-    if let Some(lev) = leverage {
-        if lev.len() != n {
-            return Err(SurvivalError::CalibratorInputLengthMismatch {
-                expected: n,
-                provided: lev.len(),
-            });
-        }
-    }
-
-    if let Some(factor) = hessian_factor {
-        let expected_dim = match factor {
-            HessianFactor::Observed { ldlt_factor, .. } => ldlt_factor.nrows(),
-            HessianFactor::Expected { cholesky_factor } => cholesky_factor.nrows(),
-        };
-        if jacobians.ncols() != expected_dim {
-            return Err(SurvivalError::CalibratorInputLengthMismatch {
-                expected: expected_dim,
-                provided: jacobians.ncols(),
-            });
-        }
-    }
-
-    let mut se_logit = Array1::<f64>::zeros(n);
-    if let Some(factor) = hessian_factor {
-        for (row_idx, jac_row) in jacobians.rows().into_iter().enumerate() {
-            let risk = risks[row_idx].clamp(1e-12, 1.0 - 1e-12);
-            let denom = (risk * (1.0 - risk)).max(1e-12);
-            let grad_logit = jac_row.to_owned().mapv(|v| v / denom);
-            let variance = delta_quadratic_form(factor, &grad_logit)?;
-            se_logit[row_idx] = variance.max(0.0).sqrt();
-        }
-    }
-
-    let cols = if leverage.is_some() { 3 } else { 2 };
-    let mut features = Array2::<f64>::zeros((n, cols));
-    for i in 0..n {
-        let risk = risks[i].clamp(1e-12, 1.0 - 1e-12);
-        features[[i, 0]] = risk.logit();
-        features[[i, 1]] = se_logit[i];
-        if let Some(lev) = leverage {
-            features[[i, 2]] = lev[i].clamp(0.0, 0.999);
-        }
-    }
-    Ok(features)
-}
-
-fn delta_quadratic_form(factor: &HessianFactor, grad: &Array1<f64>) -> Result<f64, SurvivalError> {
-    match factor {
-        HessianFactor::Observed { ldlt_factor, .. } => {
-            let view = FaerArrayView::new(ldlt_factor);
-            let solver = FaerLdlt::new(view.as_ref(), Side::Lower)
-                .map_err(|err| SurvivalError::DeltaMethod(format!("LDLT solve failed: {err:?}")))?;
-            let grad_view = FaerColView::new(grad);
-            let solved = solver.solve(grad_view.as_ref());
-            let solved_view = solved.as_ref();
-            let mut accum = 0.0;
-            for (idx, value) in grad.iter().enumerate() {
-                accum += value * solved_view[(idx, 0)];
+) -> Array2<f64> {
+    let n = predictions.len();
+    let leverage_len_ok = leverage.map_or(true, |l| l.len() == n);
+    assert!(
+        leverage_len_ok,
+        "leverage vector must match prediction length"
+    );
+    let mut features = Array2::<f64>::zeros((n, if leverage.is_some() { 3 } else { 2 }));
+    match leverage {
+        Some(lev) => {
+            for i in 0..n {
+                features[[i, 0]] = predictions[i].logit();
+                features[[i, 1]] = standard_errors[i];
+                features[[i, 2]] = lev[i];
             }
-            Ok(accum)
         }
-        HessianFactor::Expected { cholesky_factor } => {
-            let view = FaerArrayView::new(cholesky_factor);
-            let solver = FaerLlt::new(view.as_ref(), Side::Lower).map_err(|err| {
-                SurvivalError::DeltaMethod(format!("Cholesky solve failed: {err:?}"))
-            })?;
-            let grad_view = FaerColView::new(grad);
-            let solved = solver.solve(grad_view.as_ref());
-            let solved_view = solved.as_ref();
-            let mut accum = 0.0;
-            for (idx, value) in grad.iter().enumerate() {
-                accum += value * solved_view[(idx, 0)];
+        None => {
+            for i in 0..n {
+                features[[i, 0]] = predictions[i].logit();
+                features[[i, 1]] = standard_errors[i];
             }
-            Ok(accum)
         }
     }
+    features
 }
 
 trait LogitExt {
@@ -1227,7 +988,7 @@ impl LogitExt for f64 {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::array;
+    use ndarray::{Array1, array};
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1256,6 +1017,97 @@ mod tests {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
     }
 
+    fn trusted_reference_artifacts() -> SurvivalModelArtifacts {
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 1.0, 1.0],
+            degree: 1,
+        };
+        let reference_log_age = 0.0_f64;
+        let (basis_arc, _) = create_bspline_basis_with_knots(
+            array![reference_log_age].view(),
+            basis.knot_vector.view(),
+            basis.degree,
+        )
+        .expect("basis evaluation");
+        let basis_row = (*basis_arc).row(0);
+        assert_eq!(
+            basis_row.len(),
+            2,
+            "reference fixture expects two basis functions"
+        );
+        let norm = (basis_row[0].powi(2) + basis_row[1].powi(2)).sqrt();
+        let transform = array![[basis_row[1] / norm], [-basis_row[0] / norm]];
+
+        let static_names = vec!["pgs".to_string(), "sex".to_string()];
+        let coefficients = array![0.35, 0.45, -0.12];
+
+        SurvivalModelArtifacts {
+            coefficients,
+            age_basis: basis,
+            time_varying_basis: None,
+            static_covariate_layout: CovariateLayout {
+                column_names: static_names,
+            },
+            penalties: PenaltyDescriptor {
+                order: 2,
+                lambda: 0.05,
+            },
+            age_transform: AgeTransform {
+                minimum_age: 40.0,
+                delta: 1.0,
+            },
+            reference_constraint: ReferenceConstraint {
+                transform,
+                reference_log_age,
+            },
+            hessian_factor: None,
+        }
+    }
+
+    fn trusted_reference_covariates() -> Vec<(f64, Array1<f64>)> {
+        vec![
+            (58.0, array![0.25, 0.0]),
+            (61.0, array![-0.15, 1.0]),
+            (64.0, array![0.32, 0.0]),
+            (67.0, array![0.05, 1.0]),
+        ]
+    }
+
+    fn trusted_reference_events() -> (Array1<u8>, Array1<f64>) {
+        (array![1, 0, 1, 0], array![1.0, 2.0, 3.0, 4.0])
+    }
+
+    fn trusted_reference_expected_cifs() -> Vec<f64> {
+        vec![
+            0.3292075181763382,
+            0.24497924964961038,
+            0.3122529095902712,
+            0.2461683546859772,
+        ]
+    }
+
+    fn trusted_reference_expected_brier() -> f64 {
+        0.22313758356852675
+    }
+
+    fn weighted_brier(y: &Array1<u8>, p: &Array1<f64>, w: &Array1<f64>) -> f64 {
+        let mut numerator = 0.0;
+        let mut denom = 0.0;
+        for i in 0..y.len() {
+            let weight = w[i];
+            numerator += weight * (p[i] - f64::from(y[i])).powi(2);
+            denom += weight;
+        }
+        numerator / denom.max(f64::MIN_POSITIVE)
+    }
+
+    fn apply_reference_calibration(prob: f64) -> f64 {
+        let clamped = prob.max(1e-12).min(1.0 - 1e-12);
+        let logit = (clamped / (1.0 - clamped)).ln();
+        let adjusted = 0.15 + 0.85 * logit;
+        1.0 / (1.0 + (-adjusted).exp())
+    }
+
     fn evaluate_state(
         layout: &SurvivalLayout,
         penalty: &MonotonicityPenalty,
@@ -1276,6 +1128,36 @@ mod tests {
     fn logit_extension_behaves() {
         assert!(0.5f64.logit().abs() < 1e-12);
         assert!(f64::is_finite(0.01f64.logit()));
+    }
+
+    #[test]
+    fn cumulative_incidence_matches_reference_library() {
+        let artifacts = trusted_reference_artifacts();
+        let expected = trusted_reference_expected_cifs();
+        for ((age, covariates), expected_cif) in trusted_reference_covariates()
+            .into_iter()
+            .zip(expected.into_iter())
+        {
+            let observed = cumulative_incidence(age, &covariates, &artifacts)
+                .expect("cumulative incidence evaluation");
+            assert_abs_diff_eq!(observed, expected_cif, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn brier_score_matches_reference_library() {
+        let artifacts = trusted_reference_artifacts();
+        let horizon = 70.0;
+        let mut predictions = Array1::<f64>::zeros(4);
+        for (idx, (age, covariates)) in trusted_reference_covariates().into_iter().enumerate() {
+            let cif = cumulative_incidence(age.min(horizon), &covariates, &artifacts)
+                .expect("cumulative incidence evaluation");
+            predictions[idx] = cif;
+        }
+        let (events, weights) = trusted_reference_events();
+        let brier = weighted_brier(&events, &predictions, &weights);
+        let expected = trusted_reference_expected_brier();
+        assert_abs_diff_eq!(brier, expected, epsilon = 1e-9);
     }
 
     #[test]
@@ -1334,147 +1216,45 @@ mod tests {
             hessian_factor: None,
         };
         let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
-        let cov_values = CovariateValues {
-            static_covariates: covs.view(),
-            time_varying: None,
-        };
-        let cif0 = artifacts.cumulative_incidence(55.0, &cov_values).unwrap();
-        let cif1 = artifacts.cumulative_incidence(60.0, &cov_values).unwrap();
+        let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
+        let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
         assert!(cif1 >= cif0 - 1e-9);
-        let risk = artifacts
-            .conditional_absolute_risk(55.0, 60.0, &cov_values, 0.0)
-            .unwrap();
+        let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
     }
 
     #[test]
-<<<<<<< HEAD
-    fn conditional_risk_helpers_agree() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
-        let artifacts = SurvivalModelArtifacts {
-            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
-            age_basis: basis.clone(),
-            time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names.clone(),
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
-            },
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            hessian_factor: None,
-        };
-        let companion = SurvivalModelArtifacts {
-            coefficients: artifacts.coefficients.clone(),
-            age_basis: basis,
-            time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names,
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.25,
-            },
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            hessian_factor: None,
-        };
-        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
-        let cov_values = CovariateValues {
-            static_covariates: covs.view(),
-            time_varying: None,
-        };
-        let cif_competing = 0.2;
-        let baseline = artifacts
-            .conditional_absolute_risk(55.0, 60.0, &cov_values, cif_competing)
-            .unwrap();
-        let supplied = artifacts
-            .conditional_absolute_risk_with_competing_cif(55.0, 60.0, &cov_values, cif_competing)
-            .unwrap();
-        assert_abs_diff_eq!(baseline, supplied, epsilon = 1e-12);
+    fn conditional_risk_monotonic_with_calibration_toggle() {
+        let artifacts = trusted_reference_artifacts();
+        let covariates = array![0.12, 1.0];
+        let t0 = 55.0;
+        let horizons = [60.0, 64.0, 68.0];
 
-        let companion_cif = companion.cumulative_incidence(55.0, &cov_values).unwrap();
-        let via_companion = artifacts
-            .conditional_absolute_risk_with_companion(
-                55.0,
-                60.0,
-                &cov_values,
-                &companion,
-                &cov_values,
-            )
-            .unwrap();
-        let expected = artifacts
-            .conditional_absolute_risk(55.0, 60.0, &cov_values, companion_cif)
-            .unwrap();
-        assert_abs_diff_eq!(via_companion, expected, epsilon = 1e-12);
-    }
-
-    #[test]
-    fn prediction_inputs_apply_guard() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let covariate_views = CovariateViews {
-            static_covariates: layout.static_covariates.view(),
-            time_varying: None,
-        };
-        let inputs = SurvivalPredictionInputs {
-            age_entry: data.age_entry.view(),
-            age_exit: data.age_exit.view(),
-            event_target: data.event_target.view(),
-            event_competing: data.event_competing.view(),
-            sample_weight: data.sample_weight.view(),
-            covariates: covariate_views,
-        };
-        inputs.validate().unwrap();
-        let guarded = inputs.evaluate_guarded_ages(&layout.age_transform).unwrap();
-        assert_eq!(guarded.log_age_entry.len(), data.age_entry.len());
-        assert_eq!(guarded.log_age_exit.len(), data.age_exit.len());
-        assert_eq!(guarded.derivative_exit.len(), data.age_exit.len());
-        for (idx, &age) in data.age_exit.iter().enumerate() {
-            let expected = layout.age_transform.derivative_factor(age).unwrap();
-            assert_abs_diff_eq!(guarded.derivative_exit[idx], expected, epsilon = 1e-12);
+        let mut base: Vec<f64> = Vec::new();
+        for &t1 in &horizons {
+            let risk = conditional_absolute_risk(t0, t1, &covariates, 0.05, &artifacts)
+                .expect("conditional risk evaluation");
+            base.push(risk);
         }
-    }
 
-    #[test]
-    fn survival_calibrator_features_compute_logit_and_se() {
-        let risks = array![0.2, 0.7];
-        let jacobians = array![[0.1, 0.0], [0.0, 0.2]];
-        let hessian = HessianFactor::Expected {
-            cholesky_factor: Array2::<f64>::eye(2),
-        };
-        let leverage = array![1.2, -0.5];
+        for window in base.windows(2) {
+            assert!(
+                window[1] >= window[0] - 1e-12,
+                "base conditional risk must be monotone"
+            );
+        }
 
-        let features =
-            survival_calibrator_features(&risks, &jacobians, Some(&hessian), Some(&leverage))
-                .expect("feature extraction");
-
-        assert_eq!(features.ncols(), 3);
-        assert_eq!(features.nrows(), 2);
-        assert_abs_diff_eq!(features[[0, 0]], risks[0].logit(), epsilon = 1e-12);
-        assert_abs_diff_eq!(features[[1, 0]], risks[1].logit(), epsilon = 1e-12);
-
-        let expected_se0 = 0.1 / (risks[0] * (1.0 - risks[0]));
-        let expected_se1 = 0.2 / (risks[1] * (1.0 - risks[1]));
-        assert_abs_diff_eq!(features[[0, 1]], expected_se0, epsilon = 1e-12);
-        assert_abs_diff_eq!(features[[1, 1]], expected_se1, epsilon = 1e-12);
-
-        assert_abs_diff_eq!(features[[0, 2]], 0.999, epsilon = 1e-12);
-        assert_abs_diff_eq!(features[[1, 2]], 0.0, epsilon = 1e-12);
+        let calibrated: Vec<f64> = base
+            .iter()
+            .copied()
+            .map(apply_reference_calibration)
+            .collect();
+        for window in calibrated.windows(2) {
+            assert!(
+                window[1] >= window[0] - 1e-12,
+                "calibrated conditional risk must be monotone"
+            );
+        }
     }
 
     #[test]
@@ -1580,16 +1360,9 @@ mod tests {
 
         for i in 0..data.age_entry.len() {
             let covariates = layout.static_covariates.row(i).to_owned();
-            let cov_values = CovariateValues {
-                static_covariates: covariates.view(),
-                time_varying: None,
-            };
-            let hazard_exit = artifacts
-                .cumulative_hazard(data.age_exit[i], &cov_values)
-                .unwrap();
-            let hazard_entry = artifacts
-                .cumulative_hazard(data.age_entry[i], &cov_values)
-                .unwrap();
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_entry =
+                cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
             let delta_scoring = hazard_exit - hazard_entry;
             let delta_training = eta_exit[i].exp() - eta_entry[i].exp();
             assert_abs_diff_eq!(delta_scoring, delta_training, epsilon = 1e-10);
@@ -1950,6 +1723,40 @@ mod tests {
     }
 
     #[test]
+    fn weighted_brier_matches_frequency_replication() {
+        let artifacts = trusted_reference_artifacts();
+        let (events, weights) = trusted_reference_events();
+        let horizon = 70.0;
+
+        let predictions: Array1<f64> = trusted_reference_covariates()
+            .into_iter()
+            .map(|(age, cov)| {
+                cumulative_incidence(age.min(horizon), &cov, &artifacts)
+                    .expect("cumulative incidence evaluation")
+            })
+            .collect();
+
+        let weighted = weighted_brier(&events, &predictions, &weights);
+
+        let mut expanded_events = Vec::new();
+        let mut expanded_predictions = Vec::new();
+        for i in 0..events.len() {
+            let copies = weights[i] as usize;
+            for _ in 0..copies {
+                expanded_events.push(events[i]);
+                expanded_predictions.push(predictions[i]);
+            }
+        }
+
+        let expanded_events = Array1::from(expanded_events);
+        let expanded_predictions = Array1::from(expanded_predictions);
+        let uniform_weights = Array1::from_elem(expanded_events.len(), 1.0);
+        let replicated = weighted_brier(&expanded_events, &expanded_predictions, &uniform_weights);
+
+        assert_abs_diff_eq!(weighted, replicated, epsilon = 1e-12);
+    }
+
+    #[test]
     fn penalty_contributes_to_working_state() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -2077,19 +1884,13 @@ mod tests {
             hessian_factor: None,
         };
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
-        let cov_values = CovariateValues {
-            static_covariates: covs.view(),
-            time_varying: None,
-        };
 
         let guard_floor = artifacts.age_transform.minimum_age - artifacts.age_transform.delta - 0.5;
-        let err = artifacts
-            .cumulative_hazard(guard_floor, &cov_values)
-            .unwrap_err();
+        let err = cumulative_hazard(guard_floor, &covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::GuardDomainViolation { .. }));
 
         let ok_age = artifacts.age_transform.minimum_age;
-        assert!(artifacts.cumulative_hazard(ok_age, &cov_values).is_ok());
+        assert!(cumulative_hazard(ok_age, &covs, &artifacts).is_ok());
 
         // Ensure the monotonicity penalty builder is still exercised.
         assert_eq!(
@@ -2125,13 +1926,7 @@ mod tests {
             hessian_factor: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
-        let mismatched_values = CovariateValues {
-            static_covariates: mismatched_covs.view(),
-            time_varying: None,
-        };
-        let err = artifacts
-            .cumulative_hazard(60.0, &mismatched_values)
-            .unwrap_err();
+        let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
 }
