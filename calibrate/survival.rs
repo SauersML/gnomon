@@ -273,6 +273,8 @@ pub struct SurvivalLayout {
     pub time_varying_exit: Option<Array2<f64>>,
     pub time_varying_derivative_exit: Option<Array2<f64>>,
     pub static_covariates: Array2<f64>,
+    pub extra_static_covariates: Array2<f64>,
+    pub static_covariate_names: Vec<String>,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
     pub penalties: PenaltyBlocks,
@@ -292,6 +294,8 @@ pub struct SurvivalTrainingData {
     pub pgs: Array1<f64>,
     pub sex: Array1<f64>,
     pub pcs: Array2<f64>,
+    pub extra_static_covariates: Array2<f64>,
+    pub extra_static_names: Vec<String>,
 }
 
 impl SurvivalTrainingData {
@@ -306,8 +310,12 @@ impl SurvivalTrainingData {
             || self.sample_weight.len() != n
             || self.pgs.len() != n
             || self.sex.len() != n
-            || self.pcs.nrows() != n;
+            || self.pcs.nrows() != n
+            || self.extra_static_covariates.nrows() != n;
         if dimension_mismatch {
+            return Err(SurvivalError::CovariateDimensionMismatch);
+        }
+        if self.extra_static_names.len() != self.extra_static_covariates.ncols() {
             return Err(SurvivalError::CovariateDimensionMismatch);
         }
 
@@ -345,6 +353,11 @@ impl SurvivalTrainingData {
                     return Err(SurvivalError::NonFiniteCovariate);
                 }
             }
+            for j in 0..self.extra_static_covariates.ncols() {
+                if !self.extra_static_covariates[[i, j]].is_finite() {
+                    return Err(SurvivalError::NonFiniteCovariate);
+                }
+            }
         }
 
         Ok(())
@@ -361,6 +374,7 @@ pub fn validate_survival_inputs(
     pgs: ArrayView1<f64>,
     sex: ArrayView1<f64>,
     pcs: ArrayView2<f64>,
+    extra_static: ArrayView2<f64>,
 ) -> Result<(), SurvivalError> {
     let n = age_entry.len();
     if n == 0 {
@@ -372,7 +386,8 @@ pub fn validate_survival_inputs(
         || sample_weight.len() != n
         || pgs.len() != n
         || sex.len() != n
-        || pcs.nrows() != n;
+        || pcs.nrows() != n
+        || extra_static.nrows() != n;
     if dimension_mismatch {
         return Err(SurvivalError::CovariateDimensionMismatch);
     }
@@ -408,6 +423,11 @@ pub fn validate_survival_inputs(
         }
         for j in 0..pcs.ncols() {
             if !pcs[[i, j]].is_finite() {
+                return Err(SurvivalError::NonFiniteCovariate);
+            }
+        }
+        for j in 0..extra_static.ncols() {
+            if !extra_static[[i, j]].is_finite() {
                 return Err(SurvivalError::NonFiniteCovariate);
             }
         }
@@ -573,12 +593,25 @@ pub fn build_survival_layout(
     }
 
     let static_covariates = assemble_static_covariates(data);
+    let extra_static_covariates = data.extra_static_covariates.clone();
+    let static_covariate_names = assemble_static_covariate_names(data);
 
-    let combined_entry = concatenate_design(&constrained_entry, None, &static_covariates);
-    let combined_exit = concatenate_design(&constrained_exit, None, &static_covariates);
+    let combined_entry = concatenate_design(
+        &constrained_entry,
+        None,
+        &static_covariates,
+        &extra_static_covariates,
+    );
+    let combined_exit = concatenate_design(
+        &constrained_exit,
+        None,
+        &static_covariates,
+        &extra_static_covariates,
+    );
     let zero_static = Array2::<f64>::zeros((n, static_covariates.ncols()));
+    let zero_extra = Array2::<f64>::zeros((n, extra_static_covariates.ncols()));
     let combined_derivative_exit =
-        concatenate_design(&baseline_derivative_exit, None, &zero_static);
+        concatenate_design(&baseline_derivative_exit, None, &zero_static, &zero_extra);
 
     let penalty_matrix =
         create_difference_penalty_matrix(constrained_exit.ncols(), baseline_penalty_order)?;
@@ -596,6 +629,8 @@ pub fn build_survival_layout(
         time_varying_exit: None,
         time_varying_derivative_exit: None,
         static_covariates,
+        extra_static_covariates,
+        static_covariate_names,
         age_transform,
         reference_constraint,
         penalties,
@@ -630,17 +665,34 @@ fn assemble_static_covariates(data: &SurvivalTrainingData) -> Array2<f64> {
     matrix
 }
 
+fn assemble_static_covariate_names(data: &SurvivalTrainingData) -> Vec<String> {
+    let mut names = Vec::with_capacity(2 + data.pcs.ncols() + data.extra_static_names.len());
+    names.push("pgs".to_string());
+    names.push("sex".to_string());
+    for idx in 0..data.pcs.ncols() {
+        names.push(format!("pc{}", idx + 1));
+    }
+    names.extend(data.extra_static_names.iter().cloned());
+    names
+}
+
 fn concatenate_design(
     baseline: &Array2<f64>,
     time_varying: Option<&Array2<f64>>,
     static_covariates: &Array2<f64>,
+    extra_static_covariates: &Array2<f64>,
 ) -> Array2<f64> {
     let mut parts: Vec<ArrayView2<f64>> = Vec::new();
     parts.push(baseline.view());
     if let Some(tv) = time_varying {
         parts.push(tv.view());
     }
-    parts.push(static_covariates.view());
+    if static_covariates.ncols() > 0 {
+        parts.push(static_covariates.view());
+    }
+    if extra_static_covariates.ncols() > 0 {
+        parts.push(extra_static_covariates.view());
+    }
     concatenate(Axis(1), &parts).expect("design concatenation")
 }
 
@@ -831,7 +883,9 @@ impl WorkingModelSurvival {
             .map(|arr| arr.ncols())
             .unwrap_or(0);
         let static_cols = self.layout.static_covariates.ncols();
+        let extra_cols = self.layout.extra_static_covariates.ncols();
         let static_offset = baseline_cols + time_cols;
+        let extra_offset = static_offset + static_cols;
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
         let left_bounds = &self.monotonicity.quadrature_left;
         let right_bounds = &self.monotonicity.quadrature_right;
@@ -863,8 +917,13 @@ impl WorkingModelSurvival {
                 design.assign(&self.monotonicity.quadrature_design.row(j));
                 if static_cols > 0 {
                     design
-                        .slice_mut(s![static_offset..static_offset + static_cols])
+                        .slice_mut(s![static_offset..extra_offset])
                         .assign(&self.layout.static_covariates.row(i));
+                }
+                if extra_cols > 0 {
+                    design
+                        .slice_mut(s![extra_offset..extra_offset + extra_cols])
+                        .assign(&self.layout.extra_static_covariates.row(i));
                 }
                 let eta = design.dot(beta);
                 if !eta.is_finite() {
@@ -1209,6 +1268,14 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
+#[derive(Clone)]
+pub struct CovariateViews<'a> {
+    pub pgs: ArrayView1<'a, f64>,
+    pub sex: ArrayView1<'a, f64>,
+    pub pcs: ArrayView2<'a, f64>,
+    pub static_covariates: ArrayView2<'a, f64>,
+}
+
 /// Prediction inputs referencing existing arrays.
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
@@ -1216,7 +1283,7 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
-    pub covariates: ArrayView2<'a, f64>,
+    pub covariates: CovariateViews<'a>,
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1577,6 +1644,8 @@ mod tests {
             pgs: array![0.1, -0.2, 0.3],
             sex: array![0.0, 1.0, 0.0],
             pcs: array![[0.01, -0.02], [0.02, 0.03], [-0.04, 0.05]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
         }
     }
 
@@ -1592,6 +1661,22 @@ mod tests {
 
     fn repeat_optional(matrix: &Option<Array2<f64>>, pattern: &[usize]) -> Option<Array2<f64>> {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
+    }
+
+    fn combined_static_row(layout: &SurvivalLayout, idx: usize) -> Array1<f64> {
+        let base = layout.static_covariates.row(idx);
+        let extra = layout.extra_static_covariates.row(idx);
+        let total = base.len() + extra.len();
+        let mut result = Array1::<f64>::zeros(total);
+        if base.len() > 0 {
+            result.slice_mut(s![..base.len()]).assign(&base);
+        }
+        if extra.len() > 0 {
+            result
+                .slice_mut(s![base.len()..base.len() + extra.len()])
+                .assign(&extra);
+        }
+        result
     }
 
     fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
@@ -1619,12 +1704,10 @@ mod tests {
     }
 
     fn make_covariate_layout(layout: &SurvivalLayout) -> CovariateLayout {
-        let column_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
-        let ranges = compute_value_ranges(&layout.static_covariates);
+        let mut ranges = compute_value_ranges(&layout.static_covariates);
+        ranges.extend(compute_value_ranges(&layout.extra_static_covariates));
         CovariateLayout {
-            column_names,
+            column_names: layout.static_covariate_names.clone(),
             ranges,
         }
     }
@@ -1827,7 +1910,9 @@ mod tests {
             companion_models: Vec::new(),
             hessian_factor: None,
         };
-        let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
+        let cov_cols =
+            model.layout.static_covariates.ncols() + model.layout.extra_static_covariates.ncols();
+        let covs = Array1::<f64>::zeros(cov_cols);
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
         let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
         assert!(cif1 >= cif0 - 1e-9);
@@ -1931,7 +2016,7 @@ mod tests {
         let eta_entry = layout.combined_entry.dot(&beta);
 
         for i in 0..data.age_entry.len() {
-            let covariates = layout.static_covariates.row(i).to_owned();
+            let covariates = combined_static_row(&layout, i);
             let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
             let hazard_entry =
                 cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
@@ -2162,6 +2247,8 @@ mod tests {
             pgs: array![0.1, -0.3],
             sex: array![0.0, 1.0],
             pcs: array![[0.01, -0.02], [0.02, 0.03]],
+            extra_static_covariates: Array2::<f64>::zeros((2, 0)),
+            extra_static_names: Vec::new(),
         };
 
         let expanded_data = SurvivalTrainingData {
@@ -2173,6 +2260,8 @@ mod tests {
             pgs: array![0.1, -0.3, -0.3],
             sex: array![0.0, 1.0, 1.0],
             pcs: array![[0.01, -0.02], [0.02, 0.03], [0.02, 0.03]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
         };
 
         let basis = BasisDescriptor {
@@ -2203,6 +2292,11 @@ mod tests {
                 &replicate_pattern,
             ),
             static_covariates: repeat_rows(&layout_weighted.static_covariates, &replicate_pattern),
+            extra_static_covariates: repeat_rows(
+                &layout_weighted.extra_static_covariates,
+                &replicate_pattern,
+            ),
+            static_covariate_names: layout_weighted.static_covariate_names.clone(),
             age_transform: layout_weighted.age_transform,
             reference_constraint: layout_weighted.reference_constraint.clone(),
             penalties: layout_weighted.penalties.clone(),
@@ -2390,7 +2484,9 @@ mod tests {
             companion_models: Vec::new(),
             hessian_factor: None,
         };
-        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+        let covs = Array1::<f64>::zeros(
+            layout.static_covariates.ncols() + layout.extra_static_covariates.ncols(),
+        );
 
         let guard_floor = artifacts.age_transform.minimum_age - artifacts.age_transform.delta - 0.5;
         let err = cumulative_hazard(guard_floor, &covs, &artifacts).unwrap_err();
@@ -2426,7 +2522,9 @@ mod tests {
             companion_models: Vec::new(),
             hessian_factor: None,
         };
-        let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
+        let mismatched_covs = Array1::<f64>::zeros(
+            layout.static_covariates.ncols() + layout.extra_static_covariates.ncols() + 1,
+        );
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
