@@ -12,7 +12,7 @@ use thiserror::Error;
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
 const DEFAULT_BARRIER_SCALE: f64 = 1.0;
-const DEFAULT_RISK_EPSILON: f64 = 1e-12;
+pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -1219,12 +1219,12 @@ pub struct SurvivalPredictionInputs<'a> {
     pub covariates: ArrayView2<'a, f64>,
 }
 
-/// Evaluate the cumulative hazard at a given age.
-pub fn cumulative_hazard(
+/// Reconstruct the design row at a given age for prediction.
+pub fn design_row_at_age(
     age: f64,
-    covariates: &Array1<f64>,
+    covariates: ArrayView1<f64>,
     artifacts: &SurvivalModelArtifacts,
-) -> Result<f64, SurvivalError> {
+) -> Result<Array1<f64>, SurvivalError> {
     let expected_covs = artifacts.static_covariate_layout.column_names.len();
     if covariates.len() != expected_covs {
         return Err(SurvivalError::CovariateDimensionMismatch);
@@ -1248,7 +1248,18 @@ pub fn cumulative_hazard(
         let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
         design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
     }
-    design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
+    let covariates_owned = covariates.to_owned();
+    design = concatenate(Axis(0), &[design.view(), covariates_owned.view()]).expect("cov concat");
+    Ok(design)
+}
+
+/// Evaluate the cumulative hazard at a given age.
+pub fn cumulative_hazard(
+    age: f64,
+    covariates: &Array1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+) -> Result<f64, SurvivalError> {
+    let design = design_row_at_age(age, covariates.view(), artifacts)?;
     let eta = design.dot(&artifacts.coefficients);
     Ok(eta.exp())
 }
