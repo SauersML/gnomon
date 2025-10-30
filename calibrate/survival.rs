@@ -1,13 +1,10 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerCholesky, FaerSvd, ldlt_rook};
-use crate::calibrate::pirls::{WorkingModel, WorkingState};
-use faer::Side;
+use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use log::warn;
 use ndarray::prelude::*;
-use ndarray::{ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Zip, arr1, concatenate};
+use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -46,6 +43,26 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("companion model '{reference}' was requested but no matching artifact was provided")]
+    MissingCompanionModel { reference: String },
+    #[error("competing CIF values must be supplied explicitly or via a companion model")]
+    MissingCompanionCifData,
+    #[error("provided competing CIF value {value} is not finite or falls outside [0, 1]")]
+    InvalidCompanionCif { value: f64 },
+}
+
+/// Working model abstraction shared between GAM and survival implementations.
+pub trait WorkingModel {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
+}
+
+/// Aggregated state returned by [`WorkingModel::update`].
+#[derive(Debug, Clone)]
+pub struct WorkingState {
+    pub eta: Array1<f64>,
+    pub gradient: Array1<f64>,
+    pub hessian: Array2<f64>,
+    pub deviance: f64,
 }
 
 /// Guarded log-age transformation used across training and scoring.
@@ -185,13 +202,6 @@ pub struct CovariateLayout {
     pub ranges: Vec<ValueRange>,
 }
 
-/// Borrowed per-subject covariate values used during scoring.
-#[derive(Debug, Clone)]
-pub struct CovariateValues<'a> {
-    pub static_covariates: ArrayView1<'a, f64>,
-    pub time_varying: Option<ArrayView1<'a, f64>>,
-}
-
 #[derive(Debug, Clone)]
 pub struct PenaltyBlock {
     pub matrix: Array2<f64>,
@@ -288,149 +298,59 @@ pub struct SurvivalTrainingData {
 
 impl SurvivalTrainingData {
     pub fn validate(&self) -> Result<(), SurvivalError> {
-        validate_survival_inputs(
-            self.age_entry.view(),
-            self.age_exit.view(),
-            self.event_target.view(),
-            self.event_competing.view(),
-            self.sample_weight.view(),
-            self.pgs.view(),
-            self.sex.view(),
-            self.pcs.view(),
-        )
-    }
-}
-
-/// Validate the shared survival training and prediction arrays.
-pub fn validate_survival_inputs(
-    age_entry: ArrayView1<'_, f64>,
-    age_exit: ArrayView1<'_, f64>,
-    event_target: ArrayView1<'_, u8>,
-    event_competing: ArrayView1<'_, u8>,
-    sample_weight: ArrayView1<'_, f64>,
-    pgs: ArrayView1<'_, f64>,
-    sex: ArrayView1<'_, f64>,
-    pcs: ArrayView2<'_, f64>,
-) -> Result<(), SurvivalError> {
-    let n = age_entry.len();
-    if n == 0 {
-        return Err(SurvivalError::EmptyAgeVector);
-    }
-
-    let dimension_mismatch = age_exit.len() != n
-        || event_target.len() != n
-        || event_competing.len() != n
-        || sample_weight.len() != n
-        || pgs.len() != n
-        || sex.len() != n
-        || pcs.nrows() != n;
-    if dimension_mismatch {
-        return Err(SurvivalError::CovariateDimensionMismatch);
-    }
-
-    for i in 0..n {
-        let entry = age_entry[i];
-        let exit = age_exit[i];
-        if !entry.is_finite() || !exit.is_finite() {
-            return Err(SurvivalError::NonFiniteAge);
+        let n = self.age_entry.len();
+        if n == 0 {
+            return Err(SurvivalError::EmptyAgeVector);
         }
-        if !(entry < exit) {
-            return Err(SurvivalError::InvalidAgeOrder);
+        let dimension_mismatch = self.age_exit.len() != n
+            || self.event_target.len() != n
+            || self.event_competing.len() != n
+            || self.sample_weight.len() != n
+            || self.pgs.len() != n
+            || self.sex.len() != n
+            || self.pcs.nrows() != n;
+        if dimension_mismatch {
+            return Err(SurvivalError::CovariateDimensionMismatch);
         }
 
-        let target = event_target[i];
-        let competing = event_competing[i];
-        if target > 1 || competing > 1 {
-            return Err(SurvivalError::InvalidEventFlag);
-        }
-        if target == 1 && competing == 1 {
-            return Err(SurvivalError::ConflictingEvents);
-        }
+        for i in 0..n {
+            let entry = self.age_entry[i];
+            let exit = self.age_exit[i];
+            if !entry.is_finite() || !exit.is_finite() {
+                return Err(SurvivalError::NonFiniteAge);
+            }
+            if !(entry < exit) {
+                return Err(SurvivalError::InvalidAgeOrder);
+            }
 
-        let weight = sample_weight[i];
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(SurvivalError::InvalidSampleWeight);
-        }
+            let target = self.event_target[i];
+            let competing = self.event_competing[i];
+            if target > 1 || competing > 1 {
+                return Err(SurvivalError::InvalidEventFlag);
+            }
+            if target == 1 && competing == 1 {
+                return Err(SurvivalError::ConflictingEvents);
+            }
 
-        let pgs_value = pgs[i];
-        let sex_value = sex[i];
-        if !pgs_value.is_finite() || !sex_value.is_finite() {
-            return Err(SurvivalError::NonFiniteCovariate);
-        }
+            let weight = self.sample_weight[i];
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(SurvivalError::InvalidSampleWeight);
+            }
 
-        for value in pcs.row(i) {
-            if !value.is_finite() {
+            let pgs = self.pgs[i];
+            let sex = self.sex[i];
+            if !pgs.is_finite() || !sex.is_finite() {
                 return Err(SurvivalError::NonFiniteCovariate);
             }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn validate_survival_inputs(
-    age_entry: ArrayView1<'_, f64>,
-    age_exit: ArrayView1<'_, f64>,
-    event_target: ArrayView1<'_, u8>,
-    event_competing: ArrayView1<'_, u8>,
-    sample_weight: ArrayView1<'_, f64>,
-    pgs: ArrayView1<'_, f64>,
-    sex: ArrayView1<'_, f64>,
-    pcs: ArrayView2<'_, f64>,
-) -> Result<(), SurvivalError> {
-    let n = age_entry.len();
-    if n == 0 {
-        return Err(SurvivalError::EmptyAgeVector);
-    }
-    if age_exit.len() != n
-        || event_target.len() != n
-        || event_competing.len() != n
-        || sample_weight.len() != n
-        || pgs.len() != n
-        || sex.len() != n
-        || pcs.nrows() != n
-    {
-        return Err(SurvivalError::CovariateDimensionMismatch);
-    }
-
-    for idx in 0..n {
-        let entry = age_entry[idx];
-        let exit = age_exit[idx];
-        if !entry.is_finite() || !exit.is_finite() {
-            return Err(SurvivalError::NonFiniteAge);
-        }
-        if !(entry < exit) {
-            return Err(SurvivalError::InvalidAgeOrder);
-        }
-
-        let target = event_target[idx];
-        let competing = event_competing[idx];
-        if target > 1 || competing > 1 {
-            return Err(SurvivalError::InvalidEventFlag);
-        }
-        if target == 1 && competing == 1 {
-            return Err(SurvivalError::ConflictingEvents);
-        }
-
-        let weight = sample_weight[idx];
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(SurvivalError::InvalidSampleWeight);
-        }
-
-        if !pgs[idx].is_finite() || !sex[idx].is_finite() {
-            return Err(SurvivalError::NonFiniteCovariate);
-        }
-
-        for col in 0..pcs.ncols() {
-            let value = pcs[(idx, col)];
-            if !value.is_finite() {
-                return Err(SurvivalError::NonFiniteCovariate);
+            for j in 0..self.pcs.ncols() {
+                if !self.pcs[[i, j]].is_finite() {
+                    return Err(SurvivalError::NonFiniteCovariate);
+                }
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Guard that constrains the baseline spline at the chosen reference point.
@@ -833,6 +753,11 @@ impl WorkingModelSurvival {
         penalty_hessian: &Array2<f64>,
         monotonicity_hessian: Option<&Array2<f64>>,
     ) -> Result<Option<Array2<f64>>, SurvivalError> {
+        let grid_size = self.monotonicity.grid_ages.len();
+        if grid_size <= 1 {
+            return Ok(None);
+        }
+
         let p = beta.len();
         let mut expected = Array2::<f64>::zeros((p, p));
         let baseline_cols = self.layout.baseline_exit.ncols();
@@ -845,14 +770,8 @@ impl WorkingModelSurvival {
         let static_cols = self.layout.static_covariates.ncols();
         let static_offset = baseline_cols + time_cols;
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
-        let mut design_buffer = Array1::<f64>::zeros(p);
-        let quadrature_design = &self.monotonicity.quadrature_design;
-        let quadrature_left = &self.monotonicity.quadrature_left;
-        let quadrature_right = &self.monotonicity.quadrature_right;
-        let has_quadrature = quadrature_design.nrows() > 0;
-
-        let eta_exit_vec = self.layout.combined_exit.dot(beta);
-        let eta_entry_vec = self.layout.combined_entry.dot(beta);
+        let left_bounds = &self.monotonicity.quadrature_left;
+        let right_bounds = &self.monotonicity.quadrature_right;
 
         for i in 0..self.age_entry.len() {
             let weight = self.sample_weight[i];
@@ -865,7 +784,39 @@ impl WorkingModelSurvival {
                 continue;
             }
 
-            let eta_exit = eta_exit_vec[i];
+            let mut design = Array1::<f64>::zeros(p);
+            for j in 0..grid_size {
+                if left_bounds[j] >= exit_age {
+                    break;
+                }
+                if right_bounds[j] <= entry_age {
+                    continue;
+                }
+                let left = left_bounds[j].max(entry_age);
+                let right = right_bounds[j].min(exit_age);
+                if right <= left {
+                    continue;
+                }
+                design.assign(&self.monotonicity.quadrature_design.row(j));
+                if static_cols > 0 {
+                    design
+                        .slice_mut(s![static_offset..static_offset + static_cols])
+                        .assign(&self.layout.static_covariates.row(i));
+                }
+                let eta = design.dot(beta);
+                if !eta.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                let hazard = eta.exp();
+                if !hazard.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                let scale = weight * (right - left) * hazard;
+                accumulate_symmetric_outer(&mut expected, scale, &design);
+            }
+
+            let exit_design = self.layout.combined_exit.row(i);
+            let eta_exit = exit_design.dot(beta);
             if !eta_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
@@ -873,62 +824,6 @@ impl WorkingModelSurvival {
             if !hazard_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
-            let eta_entry = eta_entry_vec[i];
-            if !eta_entry.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-            let hazard_entry = eta_entry.exp();
-            if !hazard_entry.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-
-            if has_quadrature {
-                for j in 0..quadrature_design.nrows() {
-                    if quadrature_left[j] >= exit_age {
-                        break;
-                    }
-                    if quadrature_right[j] <= entry_age {
-                        continue;
-                    }
-                    let left = quadrature_left[j].max(entry_age);
-                    let right = quadrature_right[j].min(exit_age);
-                    if right <= left {
-                        continue;
-                    }
-                    design_buffer.assign(&quadrature_design.row(j));
-                    if static_cols > 0 {
-                        design_buffer
-                            .slice_mut(s![static_offset..static_offset + static_cols])
-                            .assign(&self.layout.static_covariates.row(i));
-                    }
-                    let eta = design_buffer.dot(beta);
-                    if !eta.is_finite() {
-                        return Err(SurvivalError::NonFiniteLinearPredictor);
-                    }
-                    let hazard = eta.exp();
-                    if !hazard.is_finite() {
-                        return Err(SurvivalError::NonFiniteLinearPredictor);
-                    }
-                    let scale = weight * (right - left) * hazard;
-                    accumulate_symmetric_outer(&mut expected, scale, &design_buffer);
-                }
-            } else {
-                let width = exit_age - entry_age;
-                if width <= 0.0 {
-                    continue;
-                }
-                design_buffer.assign(&self.layout.combined_entry.row(i));
-                design_buffer += &self.layout.combined_exit.row(i);
-                design_buffer.mapv_inplace(|value| 0.5 * value);
-                let hazard_mean = 0.5 * (hazard_exit + hazard_entry);
-                if !hazard_mean.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let scale = weight * width * hazard_mean;
-                accumulate_symmetric_outer(&mut expected, scale, &design_buffer);
-            }
-
-            let exit_design = self.layout.combined_exit.row(i);
             let derivative_exit = self.layout.combined_derivative_exit.row(i).dot(beta);
             if !derivative_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
@@ -943,11 +838,7 @@ impl WorkingModelSurvival {
             Zip::from(&mut x_tilde)
                 .and(&self.layout.combined_derivative_exit.row(i))
                 .for_each(|value, &deriv| *value += deriv * scale);
-            let mut delta_hazard = hazard_exit - hazard_entry;
-            if delta_hazard < 0.0 {
-                delta_hazard = 0.0;
-            }
-            let event_scale = weight * delta_hazard;
+            let event_scale = weight * hazard_exit;
             accumulate_symmetric_outer(&mut expected, event_scale, &x_tilde);
         }
 
@@ -960,48 +851,40 @@ impl WorkingModelSurvival {
 
         let mut neg_expected = expected.clone();
         neg_expected.mapv_inplace(|value| -value);
-        let mut total_ridge = 0.0;
-        let diag_scale = neg_expected
-            .diag()
-            .iter()
-            .copied()
-            .map(f64::abs)
-            .fold(0.0, f64::max)
-            .max(1.0);
-        let mut attempt = 0usize;
-        let max_attempts = 12usize;
+        let mut shift = 0.0;
+        let mut attempts = 0usize;
+        let max_attempts = 16usize;
+        let n = neg_expected.nrows();
         loop {
-            match neg_expected.cholesky(Side::Lower) {
-                Ok(_) => {
-                    if total_ridge > 0.0 {
-                        for idx in 0..p {
-                            expected[(idx, idx)] -= total_ridge;
-                        }
-                    }
-                    return Ok(Some(expected));
-                }
-                Err(_) => {
-                    if attempt >= max_attempts {
-                        return Ok(None);
-                    }
-                    let delta = if total_ridge == 0.0 {
-                        diag_scale * 1e-10
-                    } else {
-                        total_ridge * 10.0
-                    };
-                    total_ridge += delta;
-                    for idx in 0..p {
-                        neg_expected[(idx, idx)] += delta;
-                    }
+            let mut shifted = neg_expected.clone();
+            if shift > 0.0 {
+                for idx in 0..n {
+                    shifted[(idx, idx)] += shift;
                 }
             }
-            attempt += 1;
+            match ldlt_rook(&shifted) {
+                Ok((_, _, _, _, _, inertia)) => {
+                    if inertia.1 == 0 && inertia.2 == 0 {
+                        expected = -shifted;
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+            attempts += 1;
+            if attempts >= max_attempts {
+                expected = -shifted;
+                break;
+            }
+            shift = if shift == 0.0 { 1e-8 } else { shift * 10.0 };
         }
+
+        Ok(Some(expected))
     }
 }
 
-impl WorkingModelSurvival {
-    fn update_internal(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+impl WorkingModel for WorkingModelSurvival {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
             return Err(SurvivalError::DesignDimensionMismatch);
@@ -1126,33 +1009,6 @@ impl WorkingModelSurvival {
                 None
             };
 
-        let observed_information = hessian.clone();
-        let observed_factorization = if p > 0 {
-            match ldlt_rook(&observed_information) {
-                Ok((lower, diag, subdiag, perm_fwd, perm_inv, inertia)) => {
-                    Some(HessianFactor::Observed {
-                        factor: LdltFactor {
-                            lower,
-                            diag,
-                            subdiag,
-                        },
-                        permutation: PermutationDescriptor {
-                            forward: perm_fwd,
-                            inverse: perm_inv,
-                        },
-                        inertia,
-                    })
-                }
-                Err(err) => {
-                    warn!("LDLᵀ factorization of observed information failed: {err:?}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let mut hessian_factor = observed_factorization.clone();
-
         if self.spec.use_expected_information {
             if let Some(expected_hessian) = self.build_expected_information_hessian(
                 beta,
@@ -1160,18 +1016,7 @@ impl WorkingModelSurvival {
                 &penalty_hessian,
                 monotonicity_hessian.as_ref(),
             )? {
-                let chol_result = expected_hessian.cholesky(Side::Lower);
-                if let Err(err) = &chol_result {
-                    warn!("Cholesky factorization of expected information failed: {err:?}");
-                }
                 hessian = expected_hessian;
-                if let Ok(cholesky) = chol_result {
-                    hessian_factor = Some(HessianFactor::Expected {
-                        factor: CholeskyFactor {
-                            lower: cholesky.lower_triangular(),
-                        },
-                    });
-                }
             }
         }
 
@@ -1190,15 +1035,7 @@ impl WorkingModelSurvival {
             gradient,
             hessian,
             deviance,
-            hessian_factor,
         })
-    }
-}
-
-impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
-        self.update_internal(beta)
-            .map_err(|err| EstimationError::InvalidSpecification(err.to_string()))
     }
 }
 
@@ -1255,7 +1092,7 @@ fn apply_monotonicity_penalty(
 }
 
 /// Serialized representation of an LDLᵀ factor with Bunch–Kaufman pivoting.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LdltFactor {
     pub lower: Array2<f64>,
     pub diag: Array1<f64>,
@@ -1263,7 +1100,7 @@ pub struct LdltFactor {
 }
 
 /// Serialized permutation metadata captured during factorization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermutationDescriptor {
     pub forward: Vec<usize>,
     pub inverse: Vec<usize>,
@@ -1283,42 +1120,12 @@ pub enum HessianFactor {
 }
 
 /// Serialized Cholesky factor for SPD approximations.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CholeskyFactor {
     pub lower: Array2<f64>,
 }
 
-impl LdltFactor {
-    pub fn reconstruct(&self, permutation: &PermutationDescriptor) -> Array2<f64> {
-        let n = self.lower.nrows();
-        let mut d = Array2::<f64>::zeros((n, n));
-        let mut idx = 0usize;
-        while idx < n {
-            if idx + 1 < n && self.subdiag[idx].abs() > 0.0 {
-                d[(idx, idx)] = self.diag[idx];
-                d[(idx + 1, idx + 1)] = self.diag[idx + 1];
-                d[(idx, idx + 1)] = self.subdiag[idx];
-                d[(idx + 1, idx)] = self.subdiag[idx];
-                idx += 2;
-            } else {
-                d[(idx, idx)] = self.diag[idx];
-                idx += 1;
-            }
-        }
-
-        let ld = self.lower.dot(&d);
-        let permuted = ld.dot(&self.lower.t());
-        let mut restored = Array2::<f64>::zeros((n, n));
-        for (i, &row) in permutation.forward.iter().enumerate() {
-            for (j, &col) in permutation.forward.iter().enumerate() {
-                restored[(row, col)] = permuted[(i, j)];
-            }
-        }
-        restored
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompanionModelHandle {
     pub reference: String,
 }
@@ -1339,139 +1146,13 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
-impl SurvivalModelArtifacts {
-    fn expected_static_dim(&self) -> usize {
-        self.static_covariate_layout.column_names.len()
-    }
-
-    fn validate_covariates(&self, covariates: &CovariateValues<'_>) -> Result<(), SurvivalError> {
-        if covariates.static_covariates.len() != self.expected_static_dim() {
-            return Err(SurvivalError::CovariateDimensionMismatch);
-        }
-        Ok(())
-    }
-
-    fn evaluate_baseline_row(&self, log_age: f64) -> Result<Array1<f64>, SurvivalError> {
-        let age_array = arr1(&[log_age]);
-        let (basis_arc, _) = create_bspline_basis_with_knots(
-            age_array.view(),
-            self.age_basis.knot_vector.view(),
-            self.age_basis.degree,
-        )?;
-        let basis = (*basis_arc).clone();
-        let constrained = self.reference_constraint.apply(&basis);
-        Ok(constrained.row(0).to_owned())
-    }
-
-    fn evaluate_time_varying_row(
-        &self,
-        log_age: f64,
-    ) -> Result<Option<Array1<f64>>, SurvivalError> {
-        if let Some(time_basis) = &self.time_varying_basis {
-            let age_array = arr1(&[log_age]);
-            let (tv_arc, _) = create_bspline_basis_with_knots(
-                age_array.view(),
-                time_basis.knot_vector.view(),
-                time_basis.degree,
-            )?;
-            let tv = self.reference_constraint.apply(&(*tv_arc).clone());
-            Ok(Some(tv.row(0).to_owned()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn assemble_design(
-        &self,
-        baseline: Array1<f64>,
-        time_varying: Option<Array1<f64>>,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<Array1<f64>, SurvivalError> {
-        let mut design = Array1::<f64>::zeros(self.coefficients.len());
-        let mut offset = 0usize;
-        let total_len = design.len();
-        let static_len = covariates.static_covariates.len();
-
-        let baseline_len = baseline.len();
-        if baseline_len > total_len {
-            return Err(SurvivalError::DesignDimensionMismatch);
-        }
-        design
-            .slice_mut(s![offset..offset + baseline_len])
-            .assign(&baseline);
-        offset += baseline_len;
-
-        if let Some(time_row) = time_varying {
-            let len = time_row.len();
-            if offset + len > total_len {
-                return Err(SurvivalError::DesignDimensionMismatch);
-            }
-            design.slice_mut(s![offset..offset + len]).assign(&time_row);
-            offset += len;
-        }
-
-        if offset + static_len > total_len {
-            return Err(SurvivalError::DesignDimensionMismatch);
-        }
-        let available_for_subject_time = total_len - offset - static_len;
-        if let Some(subject_time) = &covariates.time_varying {
-            let len = subject_time.len();
-            if len > available_for_subject_time {
-                return Err(SurvivalError::CovariateDimensionMismatch);
-            }
-            design
-                .slice_mut(s![offset..offset + len])
-                .assign(subject_time);
-            offset += len;
-        }
-
-        design
-            .slice_mut(s![offset..offset + static_len])
-            .assign(&covariates.static_covariates);
-        offset += static_len;
-
-        if offset != total_len {
-            return Err(SurvivalError::DesignDimensionMismatch);
-        }
-        Ok(design)
-    }
-
-    pub fn cumulative_hazard_with_covariates(
-        &self,
-        age: f64,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<f64, SurvivalError> {
-        self.validate_covariates(covariates)?;
-        let log_age = self.age_transform.transform(age)?;
-        let baseline = self.evaluate_baseline_row(log_age)?;
-        let time_varying = self.evaluate_time_varying_row(log_age)?;
-        let design = self.assemble_design(baseline, time_varying, covariates)?;
-        let eta = design.dot(&self.coefficients);
-        Ok(eta.exp())
-    }
-
-    pub fn cumulative_incidence_with_covariates(
-        &self,
-        age: f64,
-        covariates: &CovariateValues<'_>,
-    ) -> Result<f64, SurvivalError> {
-        let hazard = self.cumulative_hazard_with_covariates(age, covariates)?;
-        Ok(1.0 - (-hazard).exp())
-    }
-
-    pub fn conditional_absolute_risk_with_covariates(
-        &self,
-        t0: f64,
-        t1: f64,
-        covariates: &CovariateValues<'_>,
-        cif_competing_t0: f64,
-    ) -> Result<f64, SurvivalError> {
-        let cif0 = self.cumulative_incidence_with_covariates(t0, covariates)?;
-        let cif1 = self.cumulative_incidence_with_covariates(t1, covariates)?;
-        let delta = (cif1 - cif0).max(0.0);
-        let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
-        Ok(delta / denom)
-    }
+/// Borrowed survival covariate slices exposed during scoring.
+#[derive(Debug, Clone)]
+pub struct CovariateViews<'a> {
+    pub pgs: ArrayView1<'a, f64>,
+    pub sex: ArrayView1<'a, f64>,
+    pub pcs: ArrayView2<'a, f64>,
+    pub static_covariates: ArrayView2<'a, f64>,
 }
 
 /// Prediction inputs referencing existing arrays.
@@ -1481,7 +1162,43 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
-    pub covariates: ArrayView2<'a, f64>,
+    pub covariates: CovariateViews<'a>,
+}
+
+/// Resolve a companion survival artifact using the stored reference handle.
+pub fn resolve_companion_model<'a, F>(
+    handle: &CompanionModelHandle,
+    resolver: &mut F,
+) -> Result<&'a SurvivalModelArtifacts, SurvivalError>
+where
+    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
+{
+    resolver(handle.reference.as_str()).ok_or_else(|| SurvivalError::MissingCompanionModel {
+        reference: handle.reference.clone(),
+    })
+}
+
+/// Obtain the competing cumulative incidence at a given age.
+pub fn competing_cif_value<'a, F>(
+    age: f64,
+    covariates: &Array1<f64>,
+    handle: Option<&CompanionModelHandle>,
+    provided: Option<f64>,
+    mut resolver: F,
+) -> Result<f64, SurvivalError>
+where
+    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
+{
+    if let Some(value) = provided {
+        if !value.is_finite() || value < 0.0 || value > 1.0 {
+            return Err(SurvivalError::InvalidCompanionCif { value });
+        }
+        return Ok(value);
+    }
+
+    let handle = handle.ok_or(SurvivalError::MissingCompanionCifData)?;
+    let artifacts = resolve_companion_model(handle, &mut resolver)?;
+    cumulative_incidence(age, covariates, artifacts)
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1490,11 +1207,32 @@ pub fn cumulative_hazard(
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let covariate_values = CovariateValues {
-        static_covariates: covariates.view(),
-        time_varying: None,
-    };
-    artifacts.cumulative_hazard_with_covariates(age, &covariate_values)
+    let expected_covs = artifacts.static_covariate_layout.column_names.len();
+    if covariates.len() != expected_covs {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+    let log_age = artifacts.age_transform.transform(age)?;
+    let (basis_arc, _) = create_bspline_basis_with_knots(
+        array![log_age].view(),
+        artifacts.age_basis.knot_vector.view(),
+        artifacts.age_basis.degree,
+    )?;
+    let basis = (*basis_arc).clone();
+    let constrained = artifacts.reference_constraint.apply(&basis);
+
+    let mut design = constrained.row(0).to_owned();
+    if let Some(time_basis) = &artifacts.time_varying_basis {
+        let (tv_arc, _) = create_bspline_basis_with_knots(
+            array![log_age].view(),
+            time_basis.knot_vector.view(),
+            time_basis.degree,
+        )?;
+        let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
+        design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
+    }
+    design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
+    let eta = design.dot(&artifacts.coefficients);
+    Ok(eta.exp())
 }
 
 pub fn cumulative_incidence(
@@ -1502,11 +1240,8 @@ pub fn cumulative_incidence(
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let covariate_values = CovariateValues {
-        static_covariates: covariates.view(),
-        time_varying: None,
-    };
-    artifacts.cumulative_incidence_with_covariates(age, &covariate_values)
+    let h = cumulative_hazard(age, covariates, artifacts)?;
+    Ok(1.0 - (-h).exp())
 }
 
 pub fn conditional_absolute_risk(
@@ -1516,11 +1251,11 @@ pub fn conditional_absolute_risk(
     cif_competing_t0: f64,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let covariate_values = CovariateValues {
-        static_covariates: covariates.view(),
-        time_varying: None,
-    };
-    artifacts.conditional_absolute_risk_with_covariates(t0, t1, &covariate_values, cif_competing_t0)
+    let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
+    let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
+    let delta = (cif1 - cif0).max(0.0);
+    let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
+    Ok(delta / denom)
 }
 
 /// Calibrator feature extraction for survival predictions.
@@ -1573,6 +1308,7 @@ mod tests {
     use faer::Side;
     use ndarray::array;
     use serde_json;
+    use std::collections::HashMap;
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1736,27 +1472,29 @@ mod tests {
         match (&left.hessian_factor, &right.hessian_factor) {
             (
                 Some(HessianFactor::Observed {
-                    factor: l_factor,
+                    ldlt_factor: l_ldlt,
                     permutation: l_perm,
                     inertia: l_inertia,
                 }),
                 Some(HessianFactor::Observed {
-                    factor: r_factor,
+                    ldlt_factor: r_ldlt,
                     permutation: r_perm,
                     inertia: r_inertia,
                 }),
             ) => {
-                assert_array2_close(&l_factor.lower, &r_factor.lower, 1e-12);
-                assert_array1_close(&l_factor.diag, &r_factor.diag, 1e-12);
-                assert_array1_close(&l_factor.subdiag, &r_factor.subdiag, 1e-12);
+                assert_array2_close(l_ldlt, r_ldlt, 1e-12);
                 assert_eq!(l_perm, r_perm);
                 assert_eq!(l_inertia, r_inertia);
             }
             (
-                Some(HessianFactor::Expected { factor: l_chol }),
-                Some(HessianFactor::Expected { factor: r_chol }),
+                Some(HessianFactor::Expected {
+                    cholesky_factor: l_chol,
+                }),
+                Some(HessianFactor::Expected {
+                    cholesky_factor: r_chol,
+                }),
             ) => {
-                assert_array2_close(&l_chol.lower, &r_chol.lower, 1e-12);
+                assert_array2_close(l_chol, r_chol, 1e-12);
             }
             (None, None) => {}
             _ => panic!("hessian factor mismatch"),
@@ -1805,43 +1543,6 @@ mod tests {
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
         let state = model.update(&beta).unwrap();
         assert!(state.deviance.is_finite());
-        assert!(state.hessian_factor.is_some());
-    }
-
-    #[test]
-    fn observed_information_factor_round_trips() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8).unwrap();
-        let mut model =
-            WorkingModelSurvival::new(layout.clone(), &data, penalty, SurvivalSpec::default())
-                .unwrap();
-        let p = layout.combined_exit.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
-        for idx in 0..p {
-            beta[idx] = 0.01 * (idx as f64 + 1.0);
-        }
-        let state = model.update(&beta).unwrap();
-        let observed = state.hessian.clone();
-        let factor = state
-            .hessian_factor
-            .as_ref()
-            .expect("observed factor should be present");
-        match factor {
-            HessianFactor::Observed {
-                factor: ldlt,
-                permutation,
-                inertia,
-            } => {
-                assert_eq!(inertia.0 + inertia.1 + inertia.2, p);
-                let reconstructed = ldlt.reconstruct(permutation);
-                assert_array2_close(&observed, &reconstructed, 1e-10);
-            }
-            other => panic!("expected observed factor, found {other:?}"),
-        }
     }
 
     #[test]
@@ -1877,6 +1578,61 @@ mod tests {
         assert!(cif1 >= cif0 - 1e-9);
         let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
+    }
+
+    #[test]
+    fn companion_cif_resolves_handles_and_fallbacks() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+        };
+        let handle = CompanionModelHandle {
+            reference: "companion-risk".to_string(),
+        };
+        let mut registry = HashMap::new();
+        registry.insert(handle.reference.clone(), artifacts.clone());
+
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+        let resolved = competing_cif_value(60.0, &covs, Some(&handle), None, |reference| {
+            registry.get(reference)
+        })
+        .expect("resolve cif");
+        let expected = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
+        assert!((resolved - expected).abs() < 1e-12);
+
+        let fallback = competing_cif_value(60.0, &covs, Some(&handle), Some(0.25), |_| {
+            panic!("resolver should not be invoked when values are supplied")
+        })
+        .expect("use fallback");
+        assert_eq!(fallback, 0.25);
+
+        let missing = CompanionModelHandle {
+            reference: "missing".to_string(),
+        };
+        let err = competing_cif_value(60.0, &covs, Some(&missing), None, |_| None)
+            .expect_err("missing companion artifact");
+        assert!(matches!(err, SurvivalError::MissingCompanionModel { .. }));
+
+        let err = competing_cif_value(60.0, &covs, None, None, |_| None).expect_err("missing data");
+        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
+
+        let err = competing_cif_value(60.0, &covs, None, Some(f64::NAN), |_| None)
+            .expect_err("invalid fallback");
+        assert!(matches!(err, SurvivalError::InvalidCompanionCif { .. }));
     }
 
     #[test]
@@ -2193,101 +1949,6 @@ mod tests {
                 value
             );
         }
-
-        match observed_state.hessian_factor {
-            Some(HessianFactor::Observed { .. }) => {}
-            other => panic!("observed state stored unexpected factor {other:?}"),
-        }
-        match expected_state.hessian_factor {
-            Some(HessianFactor::Expected { .. }) => {}
-            other => panic!("expected state stored unexpected factor {other:?}"),
-        }
-    }
-
-    #[test]
-    fn expected_information_matrix_is_spd() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6).unwrap();
-        let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
-        spec.use_expected_information = true;
-        let mut model =
-            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
-
-        let p = layout.combined_exit.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
-        for idx in 0..p {
-            beta[idx] = 0.01 * (idx as f64 + 1.0);
-        }
-
-        let state = model.update(&beta).unwrap();
-        let mut neg_expected = state.hessian.clone();
-        neg_expected.mapv_inplace(|value| -value);
-        let factor = neg_expected
-            .cholesky(Side::Lower)
-            .expect("expected-information matrix should be SPD");
-        for value in factor.diag().iter() {
-            assert!(*value > 0.0);
-        }
-    }
-
-    #[test]
-    fn expected_information_step_progresses() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.8, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.15, 8).unwrap();
-        let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
-        spec.use_expected_information = true;
-
-        let mut base_model =
-            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
-        let p = layout.combined_exit.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
-        for idx in 0..p {
-            beta[idx] = 0.02 * (idx as f64 + 0.5);
-        }
-
-        let base_state = base_model.update(&beta).unwrap();
-        let mut neg_expected = base_state.hessian.clone();
-        neg_expected.mapv_inplace(|value| -value);
-        let factor = neg_expected
-            .cholesky(Side::Lower)
-            .expect("expected-information matrix should be SPD");
-        let step = factor.solve_vec(&base_state.gradient);
-
-        let mut scale = 1.0;
-        let mut improved = None;
-        while scale > 1e-6 {
-            let scaled_step = step.mapv(|v| v * scale);
-            let beta_candidate = &beta - &scaled_step;
-            let mut trial_model =
-                WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec)
-                    .unwrap();
-            match trial_model.update(&beta_candidate) {
-                Ok(candidate_state) => {
-                    if candidate_state.deviance < base_state.deviance {
-                        improved = Some(candidate_state.deviance);
-                        break;
-                    }
-                }
-                Err(SurvivalError::NonFiniteLinearPredictor) => {}
-                Err(other) => panic!("unexpected update failure: {other:?}"),
-            }
-            scale *= 0.5;
-        }
-
-        assert!(
-            improved.is_some(),
-            "expected-information step failed to reduce deviance"
-        );
     }
 
     #[test]
@@ -2571,40 +2232,6 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_hazard_rejects_time_varying_mismatch() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let artifacts = SurvivalModelArtifacts {
-            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
-            age_basis: basis.clone(),
-            time_varying_basis: None,
-            static_covariate_layout: make_covariate_layout(&layout),
-            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            interaction_metadata: Vec::new(),
-            companion_models: Vec::new(),
-            hessian_factor: None,
-        };
-
-        let static_covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
-        let extra_time = array![1.0];
-        let cov_values = CovariateValues {
-            static_covariates: static_covs.view(),
-            time_varying: Some(extra_time.view()),
-        };
-
-        let err = artifacts
-            .cumulative_hazard_with_covariates(60.0, &cov_values)
-            .unwrap_err();
-        assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
-    }
-
-    #[test]
     fn survival_artifacts_round_trip_serialization() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -2638,50 +2265,7 @@ mod tests {
             interaction_metadata: vec![interaction],
             companion_models: vec![companion],
             hessian_factor: Some(HessianFactor::Expected {
-                factor: CholeskyFactor {
-                    lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
-                },
-            }),
-        };
-
-        let serialized = serde_json::to_string(&artifacts).unwrap();
-        let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
-        assert_artifacts_close(&artifacts, &round_trip);
-    }
-
-    #[test]
-    fn survival_artifacts_round_trip_serialization_observed_factor() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let p = layout.combined_exit.ncols();
-        let ldlt = LdltFactor {
-            lower: Array2::<f64>::eye(p),
-            diag: Array1::<f64>::from_elem(p, 1.0),
-            subdiag: Array1::<f64>::zeros(p),
-        };
-        let identity_perm: Vec<usize> = (0..p).collect();
-        let permutation = PermutationDescriptor {
-            forward: identity_perm.clone(),
-            inverse: identity_perm,
-        };
-        let artifacts = SurvivalModelArtifacts {
-            coefficients: Array1::<f64>::zeros(p),
-            age_basis: basis.clone(),
-            time_varying_basis: None,
-            static_covariate_layout: make_covariate_layout(&layout),
-            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            interaction_metadata: Vec::new(),
-            companion_models: Vec::new(),
-            hessian_factor: Some(HessianFactor::Observed {
-                factor: ldlt,
-                permutation,
-                inertia: (p, 0, 0),
+                cholesky_factor: Array2::<f64>::eye(layout.combined_exit.ncols()),
             }),
         };
 
