@@ -6,6 +6,7 @@ use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ops::Range;
 use thiserror::Error;
 
@@ -13,6 +14,7 @@ const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
 const DEFAULT_BARRIER_SCALE: f64 = 1.0;
 const DEFAULT_RISK_EPSILON: f64 = 1e-12;
+const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -45,6 +47,16 @@ pub enum SurvivalError {
     HessianDimensionMismatch,
     #[error("stored Hessian factor is singular")]
     HessianSingular,
+    #[error("competing-risk CIF must be supplied directly or through a companion model")]
+    MissingCompanionCifData,
+    #[error("competing-risk CIF value must be finite and lie in [0, 1], received {value}")]
+    InvalidCompetingCif { value: f64 },
+    #[error("companion model handle '{reference}' is not registered with the survival artifacts")]
+    UnknownCompanionModelHandle { reference: String },
+    #[error("companion model '{reference}' is unavailable during prediction")]
+    CompanionModelUnavailable { reference: String },
+    #[error("companion model '{reference}' does not expose CIF horizon {horizon}")]
+    CompanionModelMissingHorizon { reference: String, horizon: f64 },
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
 }
@@ -1191,6 +1203,8 @@ pub struct CholeskyFactor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompanionModelHandle {
     pub reference: String,
+    #[serde(default)]
+    pub cif_horizons: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1217,6 +1231,62 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
     pub covariates: ArrayView2<'a, f64>,
+}
+
+/// Resolve a companion model declared in the survival artifacts.
+pub fn resolve_companion_model<'a, 'b>(
+    artifacts: &'a SurvivalModelArtifacts,
+    reference: &str,
+    registry: &'b HashMap<String, SurvivalModelArtifacts>,
+) -> Result<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts), SurvivalError> {
+    let handle = artifacts
+        .companion_models
+        .iter()
+        .find(|handle| handle.reference == reference)
+        .ok_or_else(|| SurvivalError::UnknownCompanionModelHandle {
+            reference: reference.to_string(),
+        })?;
+
+    let companion =
+        registry
+            .get(reference)
+            .ok_or_else(|| SurvivalError::CompanionModelUnavailable {
+                reference: reference.to_string(),
+            })?;
+
+    Ok((handle, companion))
+}
+
+/// Determine the competing-risk CIF at a given horizon.
+pub fn competing_cif_value<'a, 'b>(
+    horizon: f64,
+    covariates: &Array1<f64>,
+    explicit: Option<f64>,
+    companion: Option<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts)>,
+) -> Result<f64, SurvivalError> {
+    if let Some(value) = explicit {
+        if !value.is_finite() || value < 0.0 || value > 1.0 {
+            return Err(SurvivalError::InvalidCompetingCif { value });
+        }
+        return Ok(value);
+    }
+
+    if let Some((handle, model)) = companion {
+        if !handle.cif_horizons.is_empty()
+            && handle
+                .cif_horizons
+                .iter()
+                .all(|&candidate| (candidate - horizon).abs() > COMPANION_HORIZON_TOLERANCE)
+        {
+            return Err(SurvivalError::CompanionModelMissingHorizon {
+                reference: handle.reference.clone(),
+                horizon,
+            });
+        }
+        return cumulative_incidence(horizon, covariates, model);
+    }
+
+    Err(SurvivalError::MissingCompanionCifData)
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1262,17 +1332,19 @@ pub fn cumulative_incidence(
     Ok(1.0 - (-h).exp())
 }
 
-pub fn conditional_absolute_risk(
+pub fn conditional_absolute_risk<'a, 'b>(
     t0: f64,
     t1: f64,
     covariates: &Array1<f64>,
-    cif_competing_t0: f64,
+    cif_competing_t0: Option<f64>,
+    companion: Option<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts)>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
     let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
     let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
     let delta = (cif1 - cif0).max(0.0);
-    let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
+    let competing = competing_cif_value(t0, covariates, cif_competing_t0, companion)?;
+    let denom = (1.0 - cif0 - competing).max(DEFAULT_RISK_EPSILON);
     Ok(delta / denom)
 }
 
@@ -1831,8 +1903,125 @@ mod tests {
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
         let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
         assert!(cif1 >= cif0 - 1e-9);
-        let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
+        let risk =
+            conditional_absolute_risk(55.0, 60.0, &covs, Some(0.0), None, &artifacts).unwrap();
         assert!(risk >= -1e-9);
+    }
+
+    #[test]
+    fn competing_cif_helpers_require_available_sources() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts);
+
+        let base_artifacts = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0],
+        }]);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let err = competing_cif_value(55.0, &covs, Some(f64::NAN), None).unwrap_err();
+        assert!(matches!(err, SurvivalError::InvalidCompetingCif { .. }));
+
+        let err = competing_cif_value(55.0, &covs, None, None).unwrap_err();
+        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&base_artifacts, "companion", &registry).unwrap();
+            let explicit = 0.25;
+            let value =
+                competing_cif_value(55.0, &covs, Some(explicit), Some((handle, resolved))).unwrap();
+            assert_abs_diff_eq!(value, explicit, epsilon = 1e-12);
+        }
+
+        let err = resolve_companion_model(&base_artifacts, "missing", &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            SurvivalError::UnknownCompanionModelHandle { .. }
+        ));
+
+        registry.clear();
+        let err = resolve_companion_model(&base_artifacts, "companion", &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            SurvivalError::CompanionModelUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn competing_cif_helpers_validate_horizons() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let missing_horizon = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![60.0],
+        }]);
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&missing_horizon, "companion", &registry).unwrap();
+            let err = competing_cif_value(55.0, &covs, None, Some((handle, resolved))).unwrap_err();
+            assert!(matches!(
+                err,
+                SurvivalError::CompanionModelMissingHorizon { .. }
+            ));
+        }
+
+        let matching_horizon = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0, 65.0],
+        }]);
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&matching_horizon, "companion", &registry).unwrap();
+            let value = competing_cif_value(55.0, &covs, None, Some((handle, resolved))).unwrap();
+            let expected =
+                cumulative_incidence(55.0, &covs, registry.get("companion").unwrap()).unwrap();
+            assert_abs_diff_eq!(value, expected, epsilon = 1e-12);
+        }
     }
 
     #[test]
@@ -2453,6 +2642,7 @@ mod tests {
         };
         let companion = CompanionModelHandle {
             reference: "competing-risk-model".to_string(),
+            cif_horizons: vec![55.0],
         };
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
