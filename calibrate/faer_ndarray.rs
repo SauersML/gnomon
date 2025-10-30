@@ -1,9 +1,10 @@
 use ahash::AHasher;
 use dyn_stack::{MemBuffer, MemStack};
-use faer::diag::{Diag, DiagRef};
+use faer::diag::{Diag, DiagMut, DiagRef};
+use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
 use faer::linalg::solvers::{self, Solve};
 use faer::linalg::svd::{self, ComputeSvdVectors};
-use faer::{Mat, MatMut, MatRef, Side, get_global_parallelism};
+use faer::{Auto, Mat, MatMut, MatRef, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::hash::Hasher;
 use thiserror::Error;
@@ -58,6 +59,115 @@ fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
     let mat = diag.column_vector().as_mat();
     Array1::from_shape_fn(mat.nrows(), |i| mat[(i, 0)])
+}
+
+fn compute_bunch_kaufman_inertia(
+    diag: &Array1<f64>,
+    subdiag: &Array1<f64>,
+) -> (usize, usize, usize) {
+    let mut positive = 0usize;
+    let mut negative = 0usize;
+    let mut zero = 0usize;
+    let n = diag.len();
+    let mut idx = 0usize;
+    while idx < n {
+        if idx + 1 < n && subdiag[idx].abs() > 1e-12 {
+            let a = diag[idx];
+            let b = subdiag[idx];
+            let c = diag[idx + 1];
+            let trace = a + c;
+            let det = a * c - b * b;
+            let discr = (trace * trace / 4.0 - det).max(0.0);
+            let root = discr.sqrt();
+            let eigenvalues = [trace / 2.0 + root, trace / 2.0 - root];
+            for value in eigenvalues.iter() {
+                if *value > 1e-12 {
+                    positive += 1;
+                } else if *value < -1e-12 {
+                    negative += 1;
+                } else {
+                    zero += 1;
+                }
+            }
+            idx += 2;
+        } else {
+            let value = diag[idx];
+            if value > 1e-12 {
+                positive += 1;
+            } else if value < -1e-12 {
+                negative += 1;
+            } else {
+                zero += 1;
+            }
+            idx += 1;
+        }
+    }
+    (positive, negative, zero)
+}
+
+pub fn ldlt_rook(
+    matrix: &Array2<f64>,
+) -> Result<
+    (
+        Array2<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Vec<usize>,
+        Vec<usize>,
+        (usize, usize, usize),
+    ),
+    FaerLinalgError,
+> {
+    let (nrows, ncols) = matrix.dim();
+    if nrows != ncols {
+        return Err(FaerLinalgError::Cholesky(
+            solvers::LltError::NonPositivePivot { index: 0 },
+        ));
+    }
+    let n = nrows;
+    let mut factor = matrix.to_owned();
+    let mut subdiag = Array1::<f64>::zeros(n);
+    let mut perm_fwd = vec![0usize; n];
+    let mut perm_inv = vec![0usize; n];
+
+    let mut faer_mat = array2_to_mat_mut(&mut factor);
+    let subdiag_slice = subdiag
+        .as_slice_memory_order_mut()
+        .expect("1-D array should expose contiguous slice");
+    let mut diag_mut = DiagMut::from_slice_mut(subdiag_slice);
+    let par = get_global_parallelism();
+    let mut params = <LbltParams as Auto<f64>>::auto();
+    params.pivoting = PivotingStrategy::Rook;
+    let params_spec = Spec::new(params);
+    let mut mem = MemBuffer::new(factor::cholesky_in_place_scratch::<usize, f64>(
+        n,
+        par,
+        params_spec,
+    ));
+    let mut stack = MemStack::new(&mut mem);
+
+    factor::cholesky_in_place(
+        faer_mat.as_mut(),
+        diag_mut.as_mut(),
+        &mut perm_fwd,
+        &mut perm_inv,
+        par,
+        &mut stack,
+        params_spec,
+    );
+
+    let mut diag = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        diag[i] = factor[(i, i)];
+        factor[(i, i)] = 1.0;
+        for j in i + 1..n {
+            factor[(i, j)] = 0.0;
+        }
+    }
+
+    let inertia = compute_bunch_kaufman_inertia(&diag, &subdiag);
+
+    Ok((factor, diag, subdiag, perm_fwd, perm_inv, inertia))
 }
 
 pub struct FaerArrayView<'a> {
