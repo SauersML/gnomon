@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::faer_ndarray::FaerSvd;
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView, FaerSvd};
+use faer::Side;
+use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, arr1, concatenate};
@@ -43,6 +45,10 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("delta-method variance computation failed: {0}")]
+    DeltaMethod(String),
+    #[error("calibrator inputs must have {expected} observations, got {provided}")]
+    CalibratorInputLengthMismatch { expected: usize, provided: usize },
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -1116,33 +1122,94 @@ impl<'a> SurvivalPredictionInputs<'a> {
 
 /// Calibrator feature extraction for survival predictions.
 pub fn survival_calibrator_features(
-    predictions: &Array1<f64>,
-    standard_errors: &Array1<f64>,
+    risks: &Array1<f64>,
+    jacobians: &Array2<f64>,
+    hessian_factor: Option<&HessianFactor>,
     leverage: Option<&Array1<f64>>,
-) -> Array2<f64> {
-    let n = predictions.len();
-    let leverage_len_ok = leverage.map_or(true, |l| l.len() == n);
-    assert!(
-        leverage_len_ok,
-        "leverage vector must match prediction length"
-    );
-    let mut features = Array2::<f64>::zeros((n, if leverage.is_some() { 3 } else { 2 }));
-    match leverage {
-        Some(lev) => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-                features[[i, 2]] = lev[i];
-            }
-        }
-        None => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-            }
+) -> Result<Array2<f64>, SurvivalError> {
+    let n = risks.len();
+    if jacobians.nrows() != n {
+        return Err(SurvivalError::CalibratorInputLengthMismatch {
+            expected: n,
+            provided: jacobians.nrows(),
+        });
+    }
+    if let Some(lev) = leverage {
+        if lev.len() != n {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: n,
+                provided: lev.len(),
+            });
         }
     }
-    features
+
+    if let Some(factor) = hessian_factor {
+        let expected_dim = match factor {
+            HessianFactor::Observed { ldlt_factor, .. } => ldlt_factor.nrows(),
+            HessianFactor::Expected { cholesky_factor } => cholesky_factor.nrows(),
+        };
+        if jacobians.ncols() != expected_dim {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: expected_dim,
+                provided: jacobians.ncols(),
+            });
+        }
+    }
+
+    let mut se_logit = Array1::<f64>::zeros(n);
+    if let Some(factor) = hessian_factor {
+        for (row_idx, jac_row) in jacobians.rows().into_iter().enumerate() {
+            let risk = risks[row_idx].clamp(1e-12, 1.0 - 1e-12);
+            let denom = (risk * (1.0 - risk)).max(1e-12);
+            let grad_logit = jac_row.to_owned().mapv(|v| v / denom);
+            let variance = delta_quadratic_form(factor, &grad_logit)?;
+            se_logit[row_idx] = variance.max(0.0).sqrt();
+        }
+    }
+
+    let cols = if leverage.is_some() { 3 } else { 2 };
+    let mut features = Array2::<f64>::zeros((n, cols));
+    for i in 0..n {
+        let risk = risks[i].clamp(1e-12, 1.0 - 1e-12);
+        features[[i, 0]] = risk.logit();
+        features[[i, 1]] = se_logit[i];
+        if let Some(lev) = leverage {
+            features[[i, 2]] = lev[i].clamp(0.0, 0.999);
+        }
+    }
+    Ok(features)
+}
+
+fn delta_quadratic_form(factor: &HessianFactor, grad: &Array1<f64>) -> Result<f64, SurvivalError> {
+    match factor {
+        HessianFactor::Observed { ldlt_factor, .. } => {
+            let view = FaerArrayView::new(ldlt_factor);
+            let solver = FaerLdlt::new(view.as_ref(), Side::Lower)
+                .map_err(|err| SurvivalError::DeltaMethod(format!("LDLT solve failed: {err:?}")))?;
+            let grad_view = FaerColView::new(grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            Ok(accum)
+        }
+        HessianFactor::Expected { cholesky_factor } => {
+            let view = FaerArrayView::new(cholesky_factor);
+            let solver = FaerLlt::new(view.as_ref(), Side::Lower).map_err(|err| {
+                SurvivalError::DeltaMethod(format!("Cholesky solve failed: {err:?}"))
+            })?;
+            let grad_view = FaerColView::new(grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            Ok(accum)
+        }
+    }
 }
 
 trait LogitExt {
@@ -1281,6 +1348,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn conditional_risk_helpers_agree() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -1380,6 +1448,33 @@ mod tests {
             let expected = layout.age_transform.derivative_factor(age).unwrap();
             assert_abs_diff_eq!(guarded.derivative_exit[idx], expected, epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn survival_calibrator_features_compute_logit_and_se() {
+        let risks = array![0.2, 0.7];
+        let jacobians = array![[0.1, 0.0], [0.0, 0.2]];
+        let hessian = HessianFactor::Expected {
+            cholesky_factor: Array2::<f64>::eye(2),
+        };
+        let leverage = array![1.2, -0.5];
+
+        let features =
+            survival_calibrator_features(&risks, &jacobians, Some(&hessian), Some(&leverage))
+                .expect("feature extraction");
+
+        assert_eq!(features.ncols(), 3);
+        assert_eq!(features.nrows(), 2);
+        assert_abs_diff_eq!(features[[0, 0]], risks[0].logit(), epsilon = 1e-12);
+        assert_abs_diff_eq!(features[[1, 0]], risks[1].logit(), epsilon = 1e-12);
+
+        let expected_se0 = 0.1 / (risks[0] * (1.0 - risks[0]));
+        let expected_se1 = 0.2 / (risks[1] * (1.0 - risks[1]));
+        assert_abs_diff_eq!(features[[0, 1]], expected_se0, epsilon = 1e-12);
+        assert_abs_diff_eq!(features[[1, 1]], expected_se1, epsilon = 1e-12);
+
+        assert_abs_diff_eq!(features[[0, 2]], 0.999, epsilon = 1e-12);
+        assert_abs_diff_eq!(features[[1, 2]], 0.0, epsilon = 1e-12);
     }
 
     #[test]
