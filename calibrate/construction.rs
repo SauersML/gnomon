@@ -2386,8 +2386,7 @@ mod tests {
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
         BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
-        PrincipalComponentConfig, internal_construct_design_matrix,
-        internal_flatten_coefficients,
+        PrincipalComponentConfig, internal_construct_design_matrix, internal_flatten_coefficients,
     };
     use approx::assert_abs_diff_eq;
     use ndarray::s;
@@ -2715,6 +2714,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            survival: None,
         }
     }
 
@@ -2820,6 +2820,8 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+
+            survival: None,
         };
 
         (data, config)
@@ -3222,6 +3224,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            survival: None,
         };
 
         let preds_via_predict = model
@@ -3314,6 +3317,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            survival: None,
         }
     }
 

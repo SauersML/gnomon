@@ -13,8 +13,8 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::{train_model, train_survival_model};
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, SurvivalModelConfig,
-    TrainedModel,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily,
+    SurvivalModelConfig, TrainedModel,
 };
 use gnomon::calibrate::survival::SurvivalSpec;
 use gnomon::calibrate::survival_data::load_survival_training_data;
@@ -312,10 +312,9 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     let link_function = match &model.config.model_family {
         ModelFamily::Gam(link) => *link,
         ModelFamily::Survival(_) => {
-            return Err(Box::new(ModelError::UnsupportedModelFamily {
-                family: "survival",
-                operation: "saving predictions",
-            }));
+            return Err(Box::new(ModelError::UnsupportedForSurvival(
+                "saving predictions",
+            )));
         }
     };
 

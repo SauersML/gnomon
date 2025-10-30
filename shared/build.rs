@@ -46,6 +46,19 @@ struct IgnoredTestCollector {
 
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
+fn warnings_enabled() -> bool {
+    static ENABLE_WARNINGS: OnceLock<bool> = OnceLock::new();
+    *ENABLE_WARNINGS.get_or_init(|| match std::env::var("GNOMON_BUILD_VERBOSE") {
+        Ok(value) => {
+            let normalized = value.trim();
+            normalized.eq_ignore_ascii_case("true")
+                || normalized.eq_ignore_ascii_case("yes")
+                || normalized == "1"
+        }
+        Err(_) => false,
+    })
+}
+
 fn update_stage(label: &str) {
     let tracker = CURRENT_STAGE.get_or_init(|| Mutex::new(String::new()));
     if let Ok(mut guard) = tracker.lock() {
@@ -53,13 +66,17 @@ fn update_stage(label: &str) {
         guard.push_str(label);
     }
 
-    println!("cargo:warning=gnomon build stage: {label}");
-    let _ = io::stdout().flush();
+    if warnings_enabled() {
+        println!("cargo:warning=gnomon build stage: {label}");
+        let _ = io::stdout().flush();
+    }
 }
 
 fn emit_stage_detail(detail: &str) {
-    println!("cargo:warning=gnomon build detail: {detail}");
-    let _ = io::stdout().flush();
+    if warnings_enabled() {
+        println!("cargo:warning=gnomon build detail: {detail}");
+        let _ = io::stdout().flush();
+    }
 }
 
 fn install_stage_panic_hook() {
@@ -850,7 +867,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
                 let is_estimate_rs = path
                     .to_str()
                     .is_some_and(|p| p.ends_with("calibrate/estimate.rs"));
-                if is_estimate_rs {
+                if is_estimate_rs && warnings_enabled() {
                     println!(
                         "cargo:warning=Analyzing estimate.rs for underscore-prefixed variables"
                     );
