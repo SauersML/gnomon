@@ -2175,7 +2175,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout = layout_bundle.layout;
         let p = layout.combined_exit.ncols();
 
         let identity_calibrator = CalibratorModel {
@@ -2546,6 +2547,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let cov_cols =
             model.layout.static_covariates.ncols() + model.layout.extra_static_covariates.ncols();
@@ -2565,7 +2567,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2626,7 +2629,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2638,6 +2642,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
+            calibrator: None,
         };
 
         let companion_artifacts = make_artifacts(Vec::new());
@@ -3389,6 +3394,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
 
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
@@ -3430,6 +3436,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
@@ -3443,7 +3450,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),

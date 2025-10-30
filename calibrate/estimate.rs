@@ -1781,6 +1781,246 @@ pub fn train_survival_model(
 
     let hessian_factor = factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
 
+    let calibrator_opt = if !crate::calibrate::model::calibrator_enabled() {
+        eprintln!("[CAL] Calibrator disabled by flag; skipping survival calibration.");
+        None
+    } else {
+        eprintln!("[CAL] Calibrator enabled; extracting survival calibration features...");
+        use crate::calibrate::calibrator as cal;
+
+        let n = bundle.data.age_entry.len();
+        let p = beta.len();
+        let mut risks = Array1::<f64>::zeros(n);
+        let mut logit_design = Array2::<f64>::zeros((n, p));
+
+        for i in 0..n {
+            let design_entry = layout.combined_entry.row(i);
+            let design_exit = layout.combined_exit.row(i);
+
+            let eta_entry = design_entry.dot(&beta);
+            let eta_exit = design_exit.dot(&beta);
+
+            if !eta_entry.is_finite() || !eta_exit.is_finite() {
+                return Err(EstimationError::CalibratorTrainingFailed(
+                    "non-finite linear predictor during calibrator feature extraction".to_string(),
+                ));
+            }
+
+            let h_entry = eta_entry.exp();
+            let h_exit = eta_exit.exp();
+            if !h_entry.is_finite() || !h_exit.is_finite() {
+                return Err(EstimationError::CalibratorTrainingFailed(
+                    "non-finite hazard during calibrator feature extraction".to_string(),
+                ));
+            }
+
+            let exp_neg_entry = (-h_entry).exp();
+            let exp_neg_exit = (-h_exit).exp();
+            let f_entry = 1.0 - exp_neg_entry;
+            let f_exit = 1.0 - exp_neg_exit;
+            let delta_raw = f_exit - f_entry;
+            let denom_raw = 1.0 - f_entry;
+            let delta = delta_raw.max(0.0);
+            let denom = denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
+            let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
+            let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+            risks[i] = risk_clamped;
+
+            let d_f_entry = h_entry * exp_neg_entry;
+            let d_f_exit = h_exit * exp_neg_exit;
+            let dr_deta_exit = if delta_raw > 0.0 {
+                d_f_exit / denom
+            } else {
+                0.0
+            };
+            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+            let dden = -d_f_entry;
+            let dr_deta_entry = if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
+                (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+            } else {
+                0.0
+            };
+
+            let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+            let grad_exit = design_exit
+                .to_owned()
+                .mapv(|v| v * dr_deta_exit * logistic_scale);
+            let grad_entry = design_entry
+                .to_owned()
+                .mapv(|v| v * dr_deta_entry * logistic_scale);
+            let grad_row = grad_exit + grad_entry;
+            logit_design.row_mut(i).assign(&grad_row);
+        }
+
+        let features_matrix = crate::calibrate::survival::survival_calibrator_features(
+            &risks,
+            &logit_design,
+            hessian_factor.as_ref(),
+            None,
+        )
+        .map_err(map_error)?;
+
+        let mut features = cal::CalibratorFeatures {
+            pred: features_matrix.column(0).to_owned(),
+            se: features_matrix.column(1).to_owned(),
+            dist: if features_matrix.ncols() > 2 {
+                features_matrix.column(2).to_owned()
+            } else {
+                Array1::zeros(features_matrix.nrows())
+            },
+            pred_identity: features_matrix.column(0).to_owned(),
+            fisher_weights: bundle.data.sample_weight.clone(),
+        };
+
+        let survival_cfg = config.survival.as_ref().ok_or_else(|| {
+            EstimationError::InvalidSpecification(
+                "Missing survival model configuration in ModelConfig".to_string(),
+            )
+        })?;
+
+        let spec = cal::CalibratorSpec {
+            link: LinkFunction::Logit,
+            pred_basis: crate::calibrate::model::BasisConfig {
+                num_knots: survival_cfg.baseline_basis.num_knots,
+                degree: survival_cfg.baseline_basis.degree,
+            },
+            se_basis: crate::calibrate::model::BasisConfig {
+                num_knots: survival_cfg.baseline_basis.num_knots,
+                degree: survival_cfg.baseline_basis.degree,
+            },
+            dist_basis: crate::calibrate::model::BasisConfig {
+                num_knots: survival_cfg.baseline_basis.num_knots,
+                degree: survival_cfg.baseline_basis.degree,
+            },
+            penalty_order_pred: config.penalty_order,
+            penalty_order_se: config.penalty_order,
+            penalty_order_dist: config.penalty_order,
+            distance_hinge: false,
+            prior_weights: Some(features.fisher_weights.clone()),
+            firth: cal::CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
+        };
+
+        let (x_cal, penalties_cal, schema, offset) = cal::build_calibrator_design(&features, &spec)
+            .map_err(|e| {
+                EstimationError::CalibratorTrainingFailed(format!(
+                    "survival calibrator design build failed: {}",
+                    e
+                ))
+            })?;
+
+        if x_cal.ncols() == 0 {
+            eprintln!("[CAL] Survival calibrator design has zero columns; skipping calibration.",);
+            None
+        } else {
+            eprintln!("[CAL] Fitting survival logit-risk calibrator...");
+            let penalty_nullspace_dims =
+                cal::active_penalty_nullspace_dims(&schema, &penalties_cal);
+            let outcomes = bundle.data.event_target.mapv(|value| f64::from(value));
+            let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
+                outcomes.view(),
+                features.fisher_weights.view(),
+                x_cal.view(),
+                offset.view(),
+                &penalties_cal,
+                &penalty_nullspace_dims,
+                LinkFunction::Logit,
+            )
+            .map_err(|e| {
+                EstimationError::CalibratorTrainingFailed(format!(
+                    "survival calibrator optimizer failed: {}",
+                    e
+                ))
+            })?;
+
+            let mut spec_for_model = spec.clone();
+            spec_for_model.prior_weights = None;
+
+            let model = cal::CalibratorModel {
+                spec: spec_for_model,
+                knots_pred: schema.knots_pred,
+                knots_se: schema.knots_se,
+                knots_dist: schema.knots_dist,
+                pred_constraint_transform: schema.pred_constraint_transform,
+                stz_se: schema.stz_se,
+                stz_dist: schema.stz_dist,
+                penalty_nullspace_dims: schema.penalty_nullspace_dims,
+                standardize_pred: schema.standardize_pred,
+                standardize_se: schema.standardize_se,
+                standardize_dist: schema.standardize_dist,
+                interaction_center_pred: Some(schema.interaction_center_pred),
+                se_wiggle_only_drop: schema.se_wiggle_only_drop,
+                dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
+                lambda_pred: lambdas_cal[0],
+                lambda_pred_param: lambdas_cal[1],
+                lambda_se: lambdas_cal[2],
+                lambda_dist: lambdas_cal[3],
+                coefficients: beta_cal,
+                column_spans: schema.column_spans,
+                pred_param_range: schema.pred_param_range,
+                scale: None,
+                assumes_frequency_weights: true,
+            };
+
+            let deg_pred = spec.pred_basis.degree;
+            let deg_se = spec.se_basis.degree;
+            let deg_dist = spec.dist_basis.degree;
+            let m_pred_int =
+                (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
+            let m_se_int =
+                (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
+            let m_dist_int =
+                (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
+            let rho_pred = model.lambda_pred.ln();
+            let rho_pred_param = model.lambda_pred_param.ln();
+            let rho_se = model.lambda_se.ln();
+            let rho_dist = model.lambda_dist.ln();
+            println!(
+                concat!(
+                    "[CAL][survival] summary:\n",
+                    "  design: n={}, p={}, pred_wiggle_cols={}, pred_param_cols={}, se_cols={}, dist_cols={}\n",
+                    "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
+                    "  penalty: order_pred={}, order_se={}, order_dist={}\n",
+                    "  lambdas: pred={:.3e} (rho={:.3}), pred_param={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
+                    "  edf:     pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
+                    "  opt:     iterations={}, final_grad_norm={:.3e}"
+                ),
+                x_cal.nrows(),
+                x_cal.ncols(),
+                model.column_spans.0.len(),
+                model.pred_param_range.len(),
+                model.column_spans.1.len(),
+                model.column_spans.2.len(),
+                deg_pred,
+                m_pred_int,
+                deg_se,
+                m_se_int,
+                deg_dist,
+                m_dist_int,
+                spec.penalty_order_pred,
+                spec.penalty_order_se,
+                spec.penalty_order_dist,
+                model.lambda_pred,
+                rho_pred,
+                model.lambda_pred_param,
+                rho_pred_param,
+                model.lambda_se,
+                rho_se,
+                model.lambda_dist,
+                rho_dist,
+                edf_pair.0,
+                edf_pair.1,
+                edf_pair.2,
+                edf_pair.3,
+                (edf_pair.0 + edf_pair.1 + edf_pair.2 + edf_pair.3),
+                fit_meta.0,
+                fit_meta.1
+            );
+
+            Some(model)
+        }
+    };
+
     let mut covariate_ranges = compute_value_ranges(&layout.static_covariates);
     covariate_ranges.extend(compute_value_ranges(&layout.extra_static_covariates));
     let static_covariate_layout = CovariateLayout {
@@ -1805,6 +2045,7 @@ pub fn train_survival_model(
         interaction_metadata,
         companion_models: Vec::new(),
         hessian_factor,
+        calibrator: calibrator_opt,
     };
 
     log_basis_cache_stats("train_survival_model");
