@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
+use crate::calibrate::calibrator::{self, CalibratorModel};
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
+use crate::calibrate::model::calibrator_enabled;
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -47,6 +49,8 @@ pub enum SurvivalError {
     HessianSingular,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("calibrator inference failed: {0}")]
+    Calibrator(String),
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -1207,6 +1211,8 @@ pub struct SurvivalModelArtifacts {
     #[serde(default)]
     pub companion_models: Vec<CompanionModelHandle>,
     pub hessian_factor: Option<HessianFactor>,
+    #[serde(default)]
+    pub calibrator: Option<CalibratorModel>,
 }
 
 /// Prediction inputs referencing existing arrays.
@@ -1457,6 +1463,41 @@ pub fn survival_calibrator_features(
     Ok(features)
 }
 
+impl SurvivalModelArtifacts {
+    /// Apply the stored logit-risk calibrator to a batch of survival predictions.
+    ///
+    /// The caller supplies the uncalibrated risks along with the design rows used to
+    /// construct the delta-method standard errors.  When a calibrator is absent or the
+    /// global calibrator toggle is disabled, this function returns the baseline risks.
+    pub fn apply_logit_risk_calibrator(
+        &self,
+        risks: &Array1<f64>,
+        design: &Array2<f64>,
+        leverage: Option<&Array1<f64>>,
+    ) -> Result<Array1<f64>, SurvivalError> {
+        if !calibrator_enabled() {
+            return Ok(risks.clone());
+        }
+
+        let Some(model) = &self.calibrator else {
+            return Ok(risks.clone());
+        };
+
+        let features =
+            survival_calibrator_features(risks, design, self.hessian_factor.as_ref(), leverage)?;
+        let pred = features.column(0).to_owned();
+        let se = features.column(1).to_owned();
+        let dist = if features.ncols() > 2 {
+            features.column(2).to_owned()
+        } else {
+            Array1::zeros(features.nrows())
+        };
+
+        calibrator::predict_calibrator(model, pred.view(), se.view(), dist.view())
+            .map_err(|err| SurvivalError::Calibrator(err.to_string()))
+    }
+}
+
 trait LogitExt {
     fn logit(self) -> f64;
 }
@@ -1471,7 +1512,11 @@ impl LogitExt for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::calibrator::{CalibratorModel, CalibratorSpec};
     use crate::calibrate::faer_ndarray::{FaerEigh, ldlt_rook};
+    use crate::calibrate::model::{
+        BasisConfig, LinkFunction, reset_calibrator_flag, set_calibrator_enabled,
+    };
     use approx::assert_abs_diff_eq;
     use faer::Side;
     use ndarray::array;
@@ -1578,6 +1623,107 @@ mod tests {
             sex: array![0.0, 1.0, 0.0],
             pcs: array![[0.01, -0.02], [0.02, 0.03], [-0.04, 0.05]],
         }
+    }
+
+    #[test]
+    fn apply_logit_risk_calibrator_respects_toggle() {
+        reset_calibrator_flag();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let p = layout.combined_exit.ncols();
+
+        let identity_calibrator = CalibratorModel {
+            spec: CalibratorSpec {
+                link: LinkFunction::Logit,
+                pred_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                se_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                dist_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                penalty_order_pred: 2,
+                penalty_order_se: 2,
+                penalty_order_dist: 2,
+                distance_hinge: false,
+                prior_weights: None,
+                firth: None,
+            },
+            knots_pred: Array1::zeros(0),
+            knots_se: Array1::zeros(0),
+            knots_dist: Array1::zeros(0),
+            pred_constraint_transform: Array2::zeros((0, 0)),
+            stz_se: Array2::zeros((0, 0)),
+            stz_dist: Array2::zeros((0, 0)),
+            penalty_nullspace_dims: (0, 0, 0, 0),
+            standardize_pred: (0.0, 1.0),
+            standardize_se: (0.0, 1.0),
+            standardize_dist: (0.0, 1.0),
+            interaction_center_pred: None,
+            se_wiggle_only_drop: false,
+            dist_wiggle_only_drop: false,
+            lambda_pred: 1.0,
+            lambda_pred_param: 1.0,
+            lambda_se: 1.0,
+            lambda_dist: 1.0,
+            coefficients: Array1::zeros(0),
+            column_spans: (0..0, 0..0, 0..0),
+            pred_param_range: 0..0,
+            scale: None,
+            assumes_frequency_weights: true,
+        };
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(p),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: Some(HessianFactor::Expected {
+                factor: CholeskyFactor {
+                    lower: Array2::<f64>::eye(p),
+                },
+            }),
+            calibrator: Some(identity_calibrator),
+        };
+
+        let risks = array![0.2, 0.8];
+        let mut design = Array2::<f64>::zeros((2, p));
+        if p > 0 {
+            design[[0, 0]] = 1.0;
+        }
+        if p > 1 {
+            design[[1, 1]] = 1.0;
+        }
+
+        let calibrated = artifacts
+            .apply_logit_risk_calibrator(&risks, &design, None)
+            .unwrap();
+        for (cal, base) in calibrated.iter().zip(risks.iter()) {
+            assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
+        }
+
+        set_calibrator_enabled(false);
+        let bypass = artifacts
+            .apply_logit_risk_calibrator(&risks, &design, None)
+            .unwrap();
+        for (cal, base) in bypass.iter().zip(risks.iter()) {
+            assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
+        }
+        reset_calibrator_flag();
     }
 
     fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
@@ -1754,6 +1900,12 @@ mod tests {
             (None, None) => {}
             _ => panic!("hessian factor mismatch"),
         }
+        assert_eq!(left.calibrator.is_some(), right.calibrator.is_some());
+        if let (Some(l), Some(r)) = (&left.calibrator, &right.calibrator) {
+            let left_json = serde_json::to_string(l).unwrap();
+            let right_json = serde_json::to_string(r).unwrap();
+            assert_eq!(left_json, right_json);
+        }
     }
 
     fn evaluate_state(
@@ -1826,6 +1978,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
@@ -1925,6 +2078,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
 
         let eta_exit = layout.combined_exit.dot(&beta);
@@ -2389,6 +2543,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
 
@@ -2425,6 +2580,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
@@ -2469,6 +2625,7 @@ mod tests {
                     lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
                 },
             }),
+            calibrator: None,
         };
 
         let serialized = serde_json::to_string(&artifacts).unwrap();
