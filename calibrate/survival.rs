@@ -240,60 +240,82 @@ pub struct SurvivalTrainingData {
     pub pcs: Array2<f64>,
 }
 
-impl SurvivalTrainingData {
-    pub fn validate(&self) -> Result<(), SurvivalError> {
-        let n = self.age_entry.len();
-        if n == 0 {
-            return Err(SurvivalError::EmptyAgeVector);
+pub(crate) fn validate_survival_inputs(
+    age_entry: ArrayView1<f64>,
+    age_exit: ArrayView1<f64>,
+    event_target: ArrayView1<u8>,
+    event_competing: ArrayView1<u8>,
+    sample_weight: ArrayView1<f64>,
+    pgs: ArrayView1<f64>,
+    sex: ArrayView1<f64>,
+    pcs: ArrayView2<f64>,
+) -> Result<(), SurvivalError> {
+    let n = age_entry.len();
+    if n == 0 {
+        return Err(SurvivalError::EmptyAgeVector);
+    }
+    let dimension_mismatch = age_exit.len() != n
+        || event_target.len() != n
+        || event_competing.len() != n
+        || sample_weight.len() != n
+        || pgs.len() != n
+        || sex.len() != n
+        || pcs.nrows() != n;
+    if dimension_mismatch {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    for i in 0..n {
+        let entry = age_entry[i];
+        let exit = age_exit[i];
+        if !entry.is_finite() || !exit.is_finite() {
+            return Err(SurvivalError::NonFiniteAge);
         }
-        let dimension_mismatch = self.age_exit.len() != n
-            || self.event_target.len() != n
-            || self.event_competing.len() != n
-            || self.sample_weight.len() != n
-            || self.pgs.len() != n
-            || self.sex.len() != n
-            || self.pcs.nrows() != n;
-        if dimension_mismatch {
-            return Err(SurvivalError::CovariateDimensionMismatch);
+        if !(entry < exit) {
+            return Err(SurvivalError::InvalidAgeOrder);
         }
 
-        for i in 0..n {
-            let entry = self.age_entry[i];
-            let exit = self.age_exit[i];
-            if !entry.is_finite() || !exit.is_finite() {
-                return Err(SurvivalError::NonFiniteAge);
-            }
-            if !(entry < exit) {
-                return Err(SurvivalError::InvalidAgeOrder);
-            }
+        let target = event_target[i];
+        let competing = event_competing[i];
+        if target > 1 || competing > 1 {
+            return Err(SurvivalError::InvalidEventFlag);
+        }
+        if target == 1 && competing == 1 {
+            return Err(SurvivalError::ConflictingEvents);
+        }
 
-            let target = self.event_target[i];
-            let competing = self.event_competing[i];
-            if target > 1 || competing > 1 {
-                return Err(SurvivalError::InvalidEventFlag);
-            }
-            if target == 1 && competing == 1 {
-                return Err(SurvivalError::ConflictingEvents);
-            }
+        let weight = sample_weight[i];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(SurvivalError::InvalidSampleWeight);
+        }
 
-            let weight = self.sample_weight[i];
-            if !weight.is_finite() || weight < 0.0 {
-                return Err(SurvivalError::InvalidSampleWeight);
-            }
-
-            let pgs = self.pgs[i];
-            let sex = self.sex[i];
-            if !pgs.is_finite() || !sex.is_finite() {
+        let pgs_value = pgs[i];
+        let sex_value = sex[i];
+        if !pgs_value.is_finite() || !sex_value.is_finite() {
+            return Err(SurvivalError::NonFiniteCovariate);
+        }
+        for j in 0..pcs.ncols() {
+            if !pcs[[i, j]].is_finite() {
                 return Err(SurvivalError::NonFiniteCovariate);
             }
-            for j in 0..self.pcs.ncols() {
-                if !self.pcs[[i, j]].is_finite() {
-                    return Err(SurvivalError::NonFiniteCovariate);
-                }
-            }
         }
+    }
 
-        Ok(())
+    Ok(())
+}
+
+impl SurvivalTrainingData {
+    pub fn validate(&self) -> Result<(), SurvivalError> {
+        validate_survival_inputs(
+            self.age_entry.view(),
+            self.age_exit.view(),
+            self.event_target.view(),
+            self.event_competing.view(),
+            self.sample_weight.view(),
+            self.pgs.view(),
+            self.sex.view(),
+            self.pcs.view(),
+        )
     }
 }
 
@@ -420,14 +442,13 @@ where
 pub fn build_survival_layout(
     data: &SurvivalTrainingData,
     age_basis: &BasisDescriptor,
-    delta: f64,
+    age_transform: AgeTransform,
     baseline_penalty_order: usize,
     baseline_lambda: f64,
     monotonic_grid_size: usize,
 ) -> Result<(SurvivalLayout, MonotonicityPenalty), SurvivalError> {
     data.validate()?;
     let n = data.age_entry.len();
-    let age_transform = AgeTransform::from_training(&data.age_entry, delta)?;
     let log_entry = age_transform.transform_array(&data.age_entry)?;
     let log_exit = age_transform.transform_array(&data.age_exit)?;
 
@@ -1043,7 +1064,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, penalty) =
+            build_survival_layout(&data, &basis, age_transform, 2, 1.0, 10).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
@@ -1058,7 +1081,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, penalty) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 10).unwrap();
         let model = WorkingModelSurvival::new(
             layout.clone(),
             &data,
@@ -1099,7 +1124,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, penalty) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 8).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
@@ -1116,7 +1143,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1154,7 +1183,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 4).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 4).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1211,7 +1242,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -1317,7 +1350,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.2, 6).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.use_expected_information = true;
@@ -1369,7 +1404,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.0, 0).unwrap();
         let mut spec_observed = SurvivalSpec::default();
         spec_observed.barrier_weight = 0.0;
         spec_observed.use_expected_information = false;
@@ -1472,8 +1509,10 @@ mod tests {
             degree: 2,
         };
 
+        let weighted_transform =
+            AgeTransform::from_training(&weighted_data.age_entry, 0.1).unwrap();
         let (layout_weighted, monotonic_weighted) =
-            build_survival_layout(&weighted_data, &basis, 0.1, 2, 0.0, 0).unwrap();
+            build_survival_layout(&weighted_data, &basis, weighted_transform, 2, 0.0, 0).unwrap();
         let replicate_pattern = [0usize, 1, 1];
         let layout_expanded = SurvivalLayout {
             baseline_entry: repeat_rows(&layout_weighted.baseline_entry, &replicate_pattern),
@@ -1564,7 +1603,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.6, 0).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, monotonicity) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.6, 0).unwrap();
         let penalised_layout = layout.clone();
         let mut unpenalised_layout = layout.clone();
         for block in &mut unpenalised_layout.penalties.blocks {
@@ -1619,7 +1660,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, penalty) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.75, 0).unwrap();
         let p = layout.combined_exit.ncols();
         let baseline_cols = layout.baseline_exit.ncols();
         let mut beta = Array1::<f64>::zeros(p);
@@ -1665,7 +1708,9 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, penalty) =
+            build_survival_layout(&data, &basis, age_transform, 2, 0.5, 6).unwrap();
         let static_names: Vec<String> = (0..layout.static_covariates.ncols())
             .map(|idx| format!("cov{idx}"))
             .collect();
@@ -1707,7 +1752,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let age_transform = AgeTransform::from_training(&data.age_entry, 0.1).unwrap();
+        let (layout, _) = build_survival_layout(&data, &basis, age_transform, 2, 0.5, 4).unwrap();
         let static_names: Vec<String> = (0..layout.static_covariates.ncols())
             .map(|idx| format!("cov{idx}"))
             .collect();
