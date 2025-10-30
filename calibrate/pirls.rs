@@ -118,7 +118,9 @@ fn solve_newton_direction_dense(
             }
             Err(err) => {
                 if attempt >= 6 {
-                    return Err(EstimationError::LinearSystemSolveFailed(err));
+                    return Err(EstimationError::LinearSystemSolveFailed(
+                        crate::calibrate::faer_ndarray::FaerLinalgError::Ldlt(err),
+                    ));
                 }
                 let ridge = 10f64.powi((attempt as i32) - 6);
                 for i in 0..matrix.nrows() {

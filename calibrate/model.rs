@@ -1781,13 +1781,23 @@ mod tests {
         let column_names: Vec<String> = (0..layout.static_covariates.ncols())
             .map(|idx| format!("cov{idx}"))
             .collect();
+        let mut ranges = Vec::new();
+        for col_idx in 0..layout.static_covariates.ncols() {
+            let column = layout.static_covariates.column(col_idx);
+            let min_val = column.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_val = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            ranges.push(crate::calibrate::survival::ValueRange {
+                min: min_val,
+                max: max_val,
+            });
+        }
         let artifacts = SurvivalModelArtifacts {
             coefficients: coeffs.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: crate::calibrate::survival::CovariateLayout {
                 column_names,
-                ranges: Vec::new(),
+                ranges,
             },
             penalties: Vec::new(),
             age_transform: layout.age_transform,
