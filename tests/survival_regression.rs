@@ -207,11 +207,13 @@ fn covariate_layout(layout: &gnomon::calibrate::survival::SurvivalLayout) -> Cov
 }
 
 /// Helper to combine static and extra covariates for a single row
-fn combined_covariates_row(layout: &gnomon::calibrate::survival::SurvivalLayout, row_idx: usize) -> Array1<f64> {
+fn combined_covariates_row(
+    layout: &gnomon::calibrate::survival::SurvivalLayout,
+    row_idx: usize,
+) -> Array1<f64> {
     let static_row = layout.static_covariates.row(row_idx);
     let extra_row = layout.extra_static_covariates.row(row_idx);
-    ndarray::concatenate(Axis(0), &[static_row, extra_row])
-        .expect("concatenate covariates")
+    ndarray::concatenate(Axis(0), &[static_row, extra_row]).expect("concatenate covariates")
 }
 
 fn value_ranges(matrix: &Array2<f64>) -> Vec<gnomon::calibrate::survival::ValueRange> {
@@ -303,9 +305,11 @@ fn conditional_risk_monotonic_with_calibration_toggle() {
     let mut base = Vec::new();
     let mut calibrated = Vec::new();
     for &t1 in &horizons {
-        let raw = conditional_absolute_risk(t0, t1, &covs, Some(0.0), None, &trusted.artifacts).unwrap();
+        let raw =
+            conditional_absolute_risk(t0, t1, &covs, Some(0.0), None, &trusted.artifacts).unwrap();
         base.push(raw);
-        let cal = conditional_absolute_risk(t0, t1, &covs, Some(0.12), None, &trusted.artifacts).unwrap();
+        let cal =
+            conditional_absolute_risk(t0, t1, &covs, Some(0.12), None, &trusted.artifacts).unwrap();
         calibrated.push(cal);
     }
     assert!(base.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
