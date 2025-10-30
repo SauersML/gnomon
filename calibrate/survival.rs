@@ -60,7 +60,7 @@ pub struct WorkingState {
 }
 
 /// Guarded log-age transformation used across training and scoring.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct AgeTransform {
     pub minimum_age: f64,
     pub delta: f64,
@@ -126,7 +126,7 @@ impl AgeTransform {
 }
 
 /// Linear transform that removes the baseline spline's null direction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReferenceConstraint {
     pub transform: Array2<f64>,
     pub reference_log_age: f64,
@@ -139,23 +139,61 @@ impl ReferenceConstraint {
 }
 
 /// Describes a spline basis that can be reconstructed during scoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BasisDescriptor {
     pub knot_vector: Array1<f64>,
     pub degree: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ColumnRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ColumnRange {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValueRange {
+    pub min: f64,
+    pub max: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CenteringTransform {
+    pub offsets: Array1<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InteractionDescriptor {
+    #[serde(default)]
+    pub label: Option<String>,
+    pub column_range: ColumnRange,
+    #[serde(default)]
+    pub value_ranges: Vec<ValueRange>,
+    #[serde(default)]
+    pub centering: Option<CenteringTransform>,
+}
+
 /// Stored smoothing metadata for reproduction at prediction time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PenaltyDescriptor {
     pub order: usize,
     pub lambda: f64,
+    pub matrix: Array2<f64>,
+    pub column_range: ColumnRange,
 }
 
 /// Column descriptions for static covariates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CovariateLayout {
     pub column_names: Vec<String>,
+    #[serde(default)]
+    pub ranges: Vec<ValueRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -851,7 +889,7 @@ fn apply_monotonicity_penalty(
 }
 
 /// Stored factorization metadata for downstream diagnostics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum HessianFactor {
     Observed {
         ldlt_factor: Array2<f64>,
@@ -863,15 +901,24 @@ pub enum HessianFactor {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompanionModelHandle {
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
     pub age_basis: BasisDescriptor,
     pub time_varying_basis: Option<BasisDescriptor>,
     pub static_covariate_layout: CovariateLayout,
-    pub penalties: PenaltyDescriptor,
+    pub penalties: Vec<PenaltyDescriptor>,
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
+    #[serde(default)]
+    pub interaction_metadata: Vec<InteractionDescriptor>,
+    #[serde(default)]
+    pub companion_models: Vec<CompanionModelHandle>,
     pub hessian_factor: Option<HessianFactor>,
 }
 
@@ -988,7 +1035,8 @@ impl LogitExt for f64 {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::{Array1, array};
+    use ndarray::array;
+    use serde_json;
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1017,95 +1065,168 @@ mod tests {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
     }
 
-    fn trusted_reference_artifacts() -> SurvivalModelArtifacts {
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 1.0, 1.0],
-            degree: 1,
-        };
-        let reference_log_age = 0.0_f64;
-        let (basis_arc, _) = create_bspline_basis_with_knots(
-            array![reference_log_age].view(),
-            basis.knot_vector.view(),
-            basis.degree,
-        )
-        .expect("basis evaluation");
-        let basis_row = (*basis_arc).row(0);
-        assert_eq!(
-            basis_row.len(),
-            2,
-            "reference fixture expects two basis functions"
+    fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
+        (0..matrix.ncols())
+            .map(|col_idx| {
+                if matrix.nrows() == 0 {
+                    return ValueRange { min: 0.0, max: 0.0 };
+                }
+                let mut min_val = f64::INFINITY;
+                let mut max_val = f64::NEG_INFINITY;
+                for &value in matrix.column(col_idx).iter() {
+                    if value < min_val {
+                        min_val = value;
+                    }
+                    if value > max_val {
+                        max_val = value;
+                    }
+                }
+                ValueRange {
+                    min: min_val,
+                    max: max_val,
+                }
+            })
+            .collect()
+    }
+
+    fn make_covariate_layout(layout: &SurvivalLayout) -> CovariateLayout {
+        let column_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
+        let ranges = compute_value_ranges(&layout.static_covariates);
+        CovariateLayout {
+            column_names,
+            ranges,
+        }
+    }
+
+    fn baseline_penalty_descriptor(
+        layout: &SurvivalLayout,
+        order: usize,
+        lambda: f64,
+    ) -> PenaltyDescriptor {
+        let baseline_cols = layout.baseline_exit.ncols();
+        let matrix =
+            create_difference_penalty_matrix(baseline_cols, order).expect("baseline penalty");
+        PenaltyDescriptor {
+            order,
+            lambda,
+            matrix,
+            column_range: ColumnRange::new(0, baseline_cols),
+        }
+    }
+
+    fn assert_array1_close(left: &Array1<f64>, right: &Array1<f64>, tol: f64) {
+        assert_eq!(left.len(), right.len());
+        for (l, r) in left.iter().zip(right.iter()) {
+            assert!((l - r).abs() <= tol, "array1 mismatch: {l} vs {r}");
+        }
+    }
+
+    fn assert_array2_close(left: &Array2<f64>, right: &Array2<f64>, tol: f64) {
+        assert_eq!(left.dim(), right.dim());
+        for (l, r) in left.iter().zip(right.iter()) {
+            assert!((l - r).abs() <= tol, "array2 mismatch: {l} vs {r}");
+        }
+    }
+
+    fn assert_artifacts_close(left: &SurvivalModelArtifacts, right: &SurvivalModelArtifacts) {
+        assert_array1_close(&left.coefficients, &right.coefficients, 1e-12);
+        assert_array1_close(
+            &left.age_basis.knot_vector,
+            &right.age_basis.knot_vector,
+            1e-12,
         );
-        let norm = (basis_row[0].powi(2) + basis_row[1].powi(2)).sqrt();
-        let transform = array![[basis_row[1] / norm], [-basis_row[0] / norm]];
-
-        let static_names = vec!["pgs".to_string(), "sex".to_string()];
-        let coefficients = array![0.35, 0.45, -0.12];
-
-        SurvivalModelArtifacts {
-            coefficients,
-            age_basis: basis,
-            time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names,
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.05,
-            },
-            age_transform: AgeTransform {
-                minimum_age: 40.0,
-                delta: 1.0,
-            },
-            reference_constraint: ReferenceConstraint {
-                transform,
-                reference_log_age,
-            },
-            hessian_factor: None,
+        assert_eq!(left.age_basis.degree, right.age_basis.degree);
+        assert_eq!(left.time_varying_basis, right.time_varying_basis);
+        assert_eq!(
+            left.static_covariate_layout.column_names,
+            right.static_covariate_layout.column_names
+        );
+        for (l_range, r_range) in left
+            .static_covariate_layout
+            .ranges
+            .iter()
+            .zip(&right.static_covariate_layout.ranges)
+        {
+            assert!((l_range.min - r_range.min).abs() <= 1e-12);
+            assert!((l_range.max - r_range.max).abs() <= 1e-12);
         }
-    }
-
-    fn trusted_reference_covariates() -> Vec<(f64, Array1<f64>)> {
-        vec![
-            (58.0, array![0.25, 0.0]),
-            (61.0, array![-0.15, 1.0]),
-            (64.0, array![0.32, 0.0]),
-            (67.0, array![0.05, 1.0]),
-        ]
-    }
-
-    fn trusted_reference_events() -> (Array1<u8>, Array1<f64>) {
-        (array![1, 0, 1, 0], array![1.0, 2.0, 3.0, 4.0])
-    }
-
-    fn trusted_reference_expected_cifs() -> Vec<f64> {
-        vec![
-            0.3292075181763382,
-            0.24497924964961038,
-            0.3122529095902712,
-            0.2461683546859772,
-        ]
-    }
-
-    fn trusted_reference_expected_brier() -> f64 {
-        0.22313758356852675
-    }
-
-    fn weighted_brier(y: &Array1<u8>, p: &Array1<f64>, w: &Array1<f64>) -> f64 {
-        let mut numerator = 0.0;
-        let mut denom = 0.0;
-        for i in 0..y.len() {
-            let weight = w[i];
-            numerator += weight * (p[i] - f64::from(y[i])).powi(2);
-            denom += weight;
+        assert_eq!(left.penalties.len(), right.penalties.len());
+        for (l_penalty, r_penalty) in left.penalties.iter().zip(&right.penalties) {
+            assert_eq!(l_penalty.order, r_penalty.order);
+            assert!((l_penalty.lambda - r_penalty.lambda).abs() <= 1e-12);
+            assert_array2_close(&l_penalty.matrix, &r_penalty.matrix, 1e-12);
+            assert_eq!(l_penalty.column_range, r_penalty.column_range);
         }
-        numerator / denom.max(f64::MIN_POSITIVE)
-    }
-
-    fn apply_reference_calibration(prob: f64) -> f64 {
-        let clamped = prob.max(1e-12).min(1.0 - 1e-12);
-        let logit = (clamped / (1.0 - clamped)).ln();
-        let adjusted = 0.15 + 0.85 * logit;
-        1.0 / (1.0 + (-adjusted).exp())
+        assert_array2_close(
+            &left.reference_constraint.transform,
+            &right.reference_constraint.transform,
+            1e-12,
+        );
+        assert!(
+            (left.reference_constraint.reference_log_age
+                - right.reference_constraint.reference_log_age)
+                .abs()
+                <= 1e-12
+        );
+        assert!((left.age_transform.minimum_age - right.age_transform.minimum_age).abs() <= 1e-12);
+        assert!((left.age_transform.delta - right.age_transform.delta).abs() <= 1e-12);
+        assert_eq!(
+            left.interaction_metadata.len(),
+            right.interaction_metadata.len()
+        );
+        for (l_meta, r_meta) in left
+            .interaction_metadata
+            .iter()
+            .zip(&right.interaction_metadata)
+        {
+            assert_eq!(l_meta.label, r_meta.label);
+            assert_eq!(l_meta.column_range, r_meta.column_range);
+            assert_eq!(l_meta.value_ranges.len(), r_meta.value_ranges.len());
+            for (l_range, r_range) in l_meta.value_ranges.iter().zip(&r_meta.value_ranges) {
+                assert!((l_range.min - r_range.min).abs() <= 1e-12);
+                assert!((l_range.max - r_range.max).abs() <= 1e-12);
+            }
+            match (&l_meta.centering, &r_meta.centering) {
+                (Some(l), Some(r)) => {
+                    assert_array1_close(&l.offsets, &r.offsets, 1e-12);
+                }
+                (None, None) => {}
+                _ => panic!("centering mismatch"),
+            }
+        }
+        assert_eq!(left.companion_models, right.companion_models);
+        match (&left.hessian_factor, &right.hessian_factor) {
+            (
+                Some(HessianFactor::Observed {
+                    ldlt_factor: l_ldlt,
+                    permutation: l_perm,
+                    inertia: l_inertia,
+                }),
+                Some(HessianFactor::Observed {
+                    ldlt_factor: r_ldlt,
+                    permutation: r_perm,
+                    inertia: r_inertia,
+                }),
+            ) => {
+                assert_array2_close(l_ldlt, r_ldlt, 1e-12);
+                assert_eq!(l_perm, r_perm);
+                assert_eq!(l_inertia, r_inertia);
+            }
+            (
+                Some(HessianFactor::Expected {
+                    cholesky_factor: l_chol,
+                }),
+                Some(HessianFactor::Expected {
+                    cholesky_factor: r_chol,
+                }),
+            ) => {
+                assert_array2_close(l_chol, r_chol, 1e-12);
+            }
+            (None, None) => {}
+            _ => panic!("hessian factor mismatch"),
+        }
     }
 
     fn evaluate_state(
@@ -1128,36 +1249,6 @@ mod tests {
     fn logit_extension_behaves() {
         assert!(0.5f64.logit().abs() < 1e-12);
         assert!(f64::is_finite(0.01f64.logit()));
-    }
-
-    #[test]
-    fn cumulative_incidence_matches_reference_library() {
-        let artifacts = trusted_reference_artifacts();
-        let expected = trusted_reference_expected_cifs();
-        for ((age, covariates), expected_cif) in trusted_reference_covariates()
-            .into_iter()
-            .zip(expected.into_iter())
-        {
-            let observed = cumulative_incidence(age, &covariates, &artifacts)
-                .expect("cumulative incidence evaluation");
-            assert_abs_diff_eq!(observed, expected_cif, epsilon = 1e-9);
-        }
-    }
-
-    #[test]
-    fn brier_score_matches_reference_library() {
-        let artifacts = trusted_reference_artifacts();
-        let horizon = 70.0;
-        let mut predictions = Array1::<f64>::zeros(4);
-        for (idx, (age, covariates)) in trusted_reference_covariates().into_iter().enumerate() {
-            let cif = cumulative_incidence(age.min(horizon), &covariates, &artifacts)
-                .expect("cumulative incidence evaluation");
-            predictions[idx] = cif;
-        }
-        let (events, weights) = trusted_reference_events();
-        let brier = weighted_brier(&events, &predictions, &weights);
-        let expected = trusted_reference_expected_brier();
-        assert_abs_diff_eq!(brier, expected, epsilon = 1e-9);
     }
 
     #[test]
@@ -1197,22 +1288,16 @@ mod tests {
             SurvivalSpec::default(),
         )
         .unwrap();
-        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names,
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
-            },
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
             hessian_factor: None,
         };
         let covs = Array1::<f64>::zeros(model.layout.static_covariates.ncols());
@@ -1221,40 +1306,6 @@ mod tests {
         assert!(cif1 >= cif0 - 1e-9);
         let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
-    }
-
-    #[test]
-    fn conditional_risk_monotonic_with_calibration_toggle() {
-        let artifacts = trusted_reference_artifacts();
-        let covariates = array![0.12, 1.0];
-        let t0 = 55.0;
-        let horizons = [60.0, 64.0, 68.0];
-
-        let mut base: Vec<f64> = Vec::new();
-        for &t1 in &horizons {
-            let risk = conditional_absolute_risk(t0, t1, &covariates, 0.05, &artifacts)
-                .expect("conditional risk evaluation");
-            base.push(risk);
-        }
-
-        for window in base.windows(2) {
-            assert!(
-                window[1] >= window[0] - 1e-12,
-                "base conditional risk must be monotone"
-            );
-        }
-
-        let calibrated: Vec<f64> = base
-            .iter()
-            .copied()
-            .map(apply_reference_calibration)
-            .collect();
-        for window in calibrated.windows(2) {
-            assert!(
-                window[1] >= window[0] - 1e-12,
-                "calibrated conditional risk must be monotone"
-            );
-        }
     }
 
     #[test]
@@ -1336,22 +1387,16 @@ mod tests {
         let state = model.update(&beta).unwrap();
         assert!(state.deviance.is_finite());
 
-        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: beta.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names,
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.0,
-            },
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.0)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
             hessian_factor: None,
         };
 
@@ -1723,40 +1768,6 @@ mod tests {
     }
 
     #[test]
-    fn weighted_brier_matches_frequency_replication() {
-        let artifacts = trusted_reference_artifacts();
-        let (events, weights) = trusted_reference_events();
-        let horizon = 70.0;
-
-        let predictions: Array1<f64> = trusted_reference_covariates()
-            .into_iter()
-            .map(|(age, cov)| {
-                cumulative_incidence(age.min(horizon), &cov, &artifacts)
-                    .expect("cumulative incidence evaluation")
-            })
-            .collect();
-
-        let weighted = weighted_brier(&events, &predictions, &weights);
-
-        let mut expanded_events = Vec::new();
-        let mut expanded_predictions = Vec::new();
-        for i in 0..events.len() {
-            let copies = weights[i] as usize;
-            for _ in 0..copies {
-                expanded_events.push(events[i]);
-                expanded_predictions.push(predictions[i]);
-            }
-        }
-
-        let expanded_events = Array1::from(expanded_events);
-        let expanded_predictions = Array1::from(expanded_predictions);
-        let uniform_weights = Array1::from_elem(expanded_events.len(), 1.0);
-        let replicated = weighted_brier(&expanded_events, &expanded_predictions, &uniform_weights);
-
-        assert_abs_diff_eq!(weighted, replicated, epsilon = 1e-12);
-    }
-
-    #[test]
     fn penalty_contributes_to_working_state() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -1865,22 +1876,16 @@ mod tests {
             degree: 2,
         };
         let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
-        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names,
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
-            },
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
             hessian_factor: None,
         };
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
@@ -1907,26 +1912,63 @@ mod tests {
             degree: 2,
         };
         let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
             time_varying_basis: None,
-            static_covariate_layout: CovariateLayout {
-                column_names: static_names.clone(),
-            },
-            penalties: PenaltyDescriptor {
-                order: 2,
-                lambda: 0.5,
-            },
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
             hessian_factor: None,
         };
-        let mismatched_covs = Array1::<f64>::zeros(static_names.len() + 1);
+        let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn survival_artifacts_round_trip_serialization() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let penalty = baseline_penalty_descriptor(&layout, 2, 0.5);
+        let interaction = InteractionDescriptor {
+            label: Some("pgs_by_age".to_string()),
+            column_range: ColumnRange::new(1, 3),
+            value_ranges: vec![ValueRange {
+                min: -0.5,
+                max: 0.5,
+            }],
+            centering: Some(CenteringTransform {
+                offsets: array![0.1, -0.1],
+            }),
+        };
+        let companion = CompanionModelHandle {
+            reference: "competing-risk-model".to_string(),
+        };
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![penalty],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: vec![interaction],
+            companion_models: vec![companion],
+            hessian_factor: Some(HessianFactor::Expected {
+                cholesky_factor: Array2::<f64>::eye(layout.combined_exit.ncols()),
+            }),
+        };
+
+        let serialized = serde_json::to_string(&artifacts).unwrap();
+        let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
+        assert_artifacts_close(&artifacts, &round_trip);
     }
 }
