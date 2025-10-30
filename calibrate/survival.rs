@@ -1,7 +1,9 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView, FaerSvd};
+use faer::Side;
+use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -43,12 +45,10 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
-    #[error("companion model '{reference}' was requested but no matching artifact was provided")]
-    MissingCompanionModel { reference: String },
-    #[error("competing CIF values must be supplied explicitly or via a companion model")]
-    MissingCompanionCifData,
-    #[error("provided competing CIF value {value} is not finite or falls outside [0, 1]")]
-    InvalidCompanionCif { value: f64 },
+    #[error("delta-method variance computation failed: {0}")]
+    DeltaMethod(String),
+    #[error("calibrator inputs must have {expected} observations, got {provided}")]
+    CalibratorInputLengthMismatch { expected: usize, provided: usize },
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -544,7 +544,6 @@ pub fn build_survival_layout(
     let monotonicity = build_monotonicity_penalty(
         &layout,
         age_basis,
-        &data.age_entry,
         &data.age_exit,
         monotonic_grid_size,
         baseline_lambda * 1e-4,
@@ -586,10 +585,6 @@ fn concatenate_design(
 pub struct MonotonicityPenalty {
     pub lambda: f64,
     pub derivative_design: Array2<f64>,
-    pub quadrature_design: Array2<f64>,
-    pub grid_ages: Array1<f64>,
-    pub quadrature_left: Array1<f64>,
-    pub quadrature_right: Array1<f64>,
 }
 
 /// Configuration controlling guard behaviour and optional softplus barrier.
@@ -615,26 +610,20 @@ impl Default for SurvivalSpec {
 fn build_monotonicity_penalty(
     layout: &SurvivalLayout,
     age_basis: &BasisDescriptor,
-    ages_entry: &Array1<f64>,
     ages_exit: &Array1<f64>,
     grid_size: usize,
     lambda: f64,
 ) -> Result<MonotonicityPenalty, SurvivalError> {
     if grid_size == 0 {
-        let cols = layout.combined_exit.ncols();
         return Ok(MonotonicityPenalty {
             lambda,
-            derivative_design: Array2::<f64>::zeros((0, cols)),
-            quadrature_design: Array2::<f64>::zeros((0, cols)),
-            grid_ages: Array1::<f64>::zeros(0),
-            quadrature_left: Array1::<f64>::zeros(0),
-            quadrature_right: Array1::<f64>::zeros(0),
+            derivative_design: Array2::<f64>::zeros((0, layout.combined_exit.ncols())),
         });
     }
 
     let mut min_age = f64::INFINITY;
     let mut max_age = f64::NEG_INFINITY;
-    for &age in ages_entry.iter().chain(ages_exit.iter()) {
+    for &age in ages_exit.iter() {
         if age < min_age {
             min_age = age;
         }
@@ -643,14 +632,9 @@ fn build_monotonicity_penalty(
         }
     }
     if !min_age.is_finite() || !max_age.is_finite() || min_age >= max_age {
-        let cols = layout.combined_exit.ncols();
         return Ok(MonotonicityPenalty {
             lambda,
-            derivative_design: Array2::<f64>::zeros((0, cols)),
-            quadrature_design: Array2::<f64>::zeros((0, cols)),
-            grid_ages: Array1::<f64>::zeros(0),
-            quadrature_left: Array1::<f64>::zeros(0),
-            quadrature_right: Array1::<f64>::zeros(0),
+            derivative_design: Array2::<f64>::zeros((0, layout.combined_exit.ncols())),
         });
     }
 
@@ -669,8 +653,7 @@ fn build_monotonicity_penalty(
     for (idx, &age) in grid.iter().enumerate() {
         log_grid[idx] = layout.age_transform.transform(age)?;
     }
-    let (basis_grid, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis)?;
-    let constrained_basis_grid = layout.reference_constraint.apply(&basis_grid);
+    let (_, derivative_u) = evaluate_basis_and_derivative(log_grid.view(), age_basis)?;
     let constrained_derivative_u = layout.reference_constraint.apply(&derivative_u);
     let mut derivative_age = constrained_derivative_u;
     for (mut row, &age) in derivative_age.rows_mut().into_iter().zip(grid.iter()) {
@@ -678,41 +661,14 @@ fn build_monotonicity_penalty(
         row *= factor;
     }
 
-    let cols = layout.combined_exit.ncols();
-    let mut combined = Array2::<f64>::zeros((grid_size, cols));
-    let mut quadrature_design = Array2::<f64>::zeros((grid_size, cols));
+    let mut combined = Array2::<f64>::zeros((grid_size, layout.combined_exit.ncols()));
     let baseline_cols = layout.baseline_exit.ncols();
     combined
         .slice_mut(s![.., ..baseline_cols])
         .assign(&derivative_age);
-    quadrature_design
-        .slice_mut(s![.., ..baseline_cols])
-        .assign(&constrained_basis_grid);
-
-    let mut quadrature_left = Array1::<f64>::zeros(grid_size);
-    let mut quadrature_right = Array1::<f64>::zeros(grid_size);
-    for idx in 0..grid_size {
-        let left_bound = if idx == 0 {
-            min_age
-        } else {
-            0.5 * (grid[idx - 1] + grid[idx])
-        };
-        let right_bound = if idx == grid_size - 1 {
-            max_age
-        } else {
-            0.5 * (grid[idx] + grid[idx + 1])
-        };
-        quadrature_left[idx] = left_bound;
-        quadrature_right[idx] = right_bound;
-    }
-
     Ok(MonotonicityPenalty {
         lambda,
         derivative_design: combined,
-        quadrature_design,
-        grid_ages: grid,
-        quadrature_left,
-        quadrature_right,
     })
 }
 
@@ -721,8 +677,6 @@ pub struct WorkingModelSurvival {
     pub layout: SurvivalLayout,
     pub sample_weight: Array1<f64>,
     pub event_target: Array1<u8>,
-    pub age_entry: Array1<f64>,
-    pub age_exit: Array1<f64>,
     pub monotonicity: MonotonicityPenalty,
     pub spec: SurvivalSpec,
 }
@@ -739,147 +693,9 @@ impl WorkingModelSurvival {
             layout,
             sample_weight: data.sample_weight.clone(),
             event_target: data.event_target.clone(),
-            age_entry: data.age_entry.clone(),
-            age_exit: data.age_exit.clone(),
             monotonicity,
             spec,
         })
-    }
-
-    fn build_expected_information_hessian(
-        &self,
-        beta: &Array1<f64>,
-        barrier_hessian: &Array2<f64>,
-        penalty_hessian: &Array2<f64>,
-        monotonicity_hessian: Option<&Array2<f64>>,
-    ) -> Result<Option<Array2<f64>>, SurvivalError> {
-        let grid_size = self.monotonicity.grid_ages.len();
-        if grid_size <= 1 {
-            return Ok(None);
-        }
-
-        let p = beta.len();
-        let mut expected = Array2::<f64>::zeros((p, p));
-        let baseline_cols = self.layout.baseline_exit.ncols();
-        let time_cols = self
-            .layout
-            .time_varying_exit
-            .as_ref()
-            .map(|arr| arr.ncols())
-            .unwrap_or(0);
-        let static_cols = self.layout.static_covariates.ncols();
-        let static_offset = baseline_cols + time_cols;
-        let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
-        let left_bounds = &self.monotonicity.quadrature_left;
-        let right_bounds = &self.monotonicity.quadrature_right;
-
-        for i in 0..self.age_entry.len() {
-            let weight = self.sample_weight[i];
-            if weight == 0.0 {
-                continue;
-            }
-            let entry_age = self.age_entry[i];
-            let exit_age = self.age_exit[i];
-            if !(exit_age > entry_age) {
-                continue;
-            }
-
-            let mut design = Array1::<f64>::zeros(p);
-            for j in 0..grid_size {
-                if left_bounds[j] >= exit_age {
-                    break;
-                }
-                if right_bounds[j] <= entry_age {
-                    continue;
-                }
-                let left = left_bounds[j].max(entry_age);
-                let right = right_bounds[j].min(exit_age);
-                if right <= left {
-                    continue;
-                }
-                design.assign(&self.monotonicity.quadrature_design.row(j));
-                if static_cols > 0 {
-                    design
-                        .slice_mut(s![static_offset..static_offset + static_cols])
-                        .assign(&self.layout.static_covariates.row(i));
-                }
-                let eta = design.dot(beta);
-                if !eta.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let hazard = eta.exp();
-                if !hazard.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let scale = weight * (right - left) * hazard;
-                accumulate_symmetric_outer(&mut expected, scale, &design);
-            }
-
-            let exit_design = self.layout.combined_exit.row(i);
-            let eta_exit = exit_design.dot(beta);
-            if !eta_exit.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-            let hazard_exit = eta_exit.exp();
-            if !hazard_exit.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-            let derivative_exit = self.layout.combined_derivative_exit.row(i).dot(beta);
-            if !derivative_exit.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-            let guarded = if derivative_exit <= guard_threshold {
-                guard_threshold
-            } else {
-                derivative_exit
-            };
-            let scale = 1.0 / guarded;
-            let mut x_tilde = exit_design.to_owned();
-            Zip::from(&mut x_tilde)
-                .and(&self.layout.combined_derivative_exit.row(i))
-                .for_each(|value, &deriv| *value += deriv * scale);
-            let event_scale = weight * hazard_exit;
-            accumulate_symmetric_outer(&mut expected, event_scale, &x_tilde);
-        }
-
-        expected.mapv_inplace(|value| value * -2.0);
-        expected += barrier_hessian;
-        expected += penalty_hessian;
-        if let Some(extra) = monotonicity_hessian {
-            expected += extra;
-        }
-
-        let mut neg_expected = expected.clone();
-        neg_expected.mapv_inplace(|value| -value);
-        let mut shift = 0.0;
-        let mut attempts = 0usize;
-        let max_attempts = 16usize;
-        let n = neg_expected.nrows();
-        loop {
-            let mut shifted = neg_expected.clone();
-            if shift > 0.0 {
-                for idx in 0..n {
-                    shifted[(idx, idx)] += shift;
-                }
-            }
-            match ldlt_rook(&shifted) {
-                Ok((_, _, _, _, _, inertia)) => {
-                    if inertia.1 == 0 && inertia.2 == 0 {
-                        expected = -shifted;
-                        break;
-                    }
-                }
-                Err(_) => {}
-            }
-            attempts += 1;
-            if attempts >= max_attempts {
-                expected = -shifted;
-                break;
-            }
-            shift = if shift == 0.0 { 1e-8 } else { shift * 10.0 };
-        }
-
-        Ok(Some(expected))
     }
 }
 
@@ -964,7 +780,11 @@ impl WorkingModel for WorkingModelSurvival {
             accumulate_symmetric_outer(&mut hessian, weight * h_e, &x_exit);
             accumulate_symmetric_outer(&mut hessian, weight * h_s, &x_entry);
 
-            let event_scale = weight * d;
+            let event_scale = if self.spec.use_expected_information {
+                weight * h_e
+            } else {
+                weight * d
+            };
             if event_scale != 0.0 {
                 accumulate_symmetric_outer(&mut hessian, event_scale, &x_tilde);
             }
@@ -996,28 +816,14 @@ impl WorkingModel for WorkingModelSurvival {
         hessian += &penalty_hessian;
         deviance += self.layout.penalties.deviance(beta);
 
-        let monotonicity_hessian =
-            if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
-                apply_monotonicity_penalty(
-                    &self.monotonicity,
-                    beta,
-                    &mut gradient,
-                    &mut hessian,
-                    &mut deviance,
-                )
-            } else {
-                None
-            };
-
-        if self.spec.use_expected_information {
-            if let Some(expected_hessian) = self.build_expected_information_hessian(
+        if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
+            apply_monotonicity_penalty(
+                &self.monotonicity,
                 beta,
-                &barrier_hessian,
-                &penalty_hessian,
-                monotonicity_hessian.as_ref(),
-            )? {
-                hessian = expected_hessian;
-            }
+                &mut gradient,
+                &mut hessian,
+                &mut deviance,
+            );
         }
 
         if guard_activation_count > 0 {
@@ -1045,17 +851,16 @@ fn apply_monotonicity_penalty(
     gradient: &mut Array1<f64>,
     hessian: &mut Array2<f64>,
     deviance: &mut f64,
-) -> Option<Array2<f64>> {
+) {
     let lambda = penalty.lambda;
     if lambda == 0.0 {
-        return None;
+        return;
     }
     let design = &penalty.derivative_design;
     let values = design.dot(beta);
     let mut penalty_sum = 0.0;
     let mut violation_count = 0usize;
     let mut violation_examples: Vec<f64> = Vec::new();
-    let mut hessian_update = Array2::<f64>::zeros((design.ncols(), design.ncols()));
     for (row, &value) in design.rows().into_iter().zip(values.iter()) {
         let softplus = stable_softplus(-value);
         penalty_sum += softplus;
@@ -1064,7 +869,6 @@ fn apply_monotonicity_penalty(
         accumulate_weighted_vector(gradient, grad_scale, &row);
         let h_scale = 2.0 * lambda * sigma * (1.0 - sigma);
         accumulate_symmetric_outer(hessian, h_scale, &row);
-        accumulate_symmetric_outer(&mut hessian_update, h_scale, &row);
         if value < 0.0 {
             violation_count += 1;
             if violation_examples.len() < 5 {
@@ -1088,49 +892,27 @@ fn apply_monotonicity_penalty(
             );
         }
     }
-    Some(hessian_update)
-}
-
-/// Serialized representation of an LDLᵀ factor with Bunch–Kaufman pivoting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LdltFactor {
-    pub lower: Array2<f64>,
-    pub diag: Array1<f64>,
-    pub subdiag: Array1<f64>,
-}
-
-/// Serialized permutation metadata captured during factorization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermutationDescriptor {
-    pub forward: Vec<usize>,
-    pub inverse: Vec<usize>,
 }
 
 /// Stored factorization metadata for downstream diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum HessianFactor {
     Observed {
-        factor: LdltFactor,
-        permutation: PermutationDescriptor,
+        ldlt_factor: Array2<f64>,
+        permutation: Vec<usize>,
         inertia: (usize, usize, usize),
     },
     Expected {
-        factor: CholeskyFactor,
+        cholesky_factor: Array2<f64>,
     },
 }
 
-/// Serialized Cholesky factor for SPD approximations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CholeskyFactor {
-    pub lower: Array2<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompanionModelHandle {
     pub reference: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SurvivalModelArtifacts {
     pub coefficients: Array1<f64>,
     pub age_basis: BasisDescriptor,
@@ -1146,15 +928,6 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
-/// Borrowed survival covariate slices exposed during scoring.
-#[derive(Debug, Clone)]
-pub struct CovariateViews<'a> {
-    pub pgs: ArrayView1<'a, f64>,
-    pub sex: ArrayView1<'a, f64>,
-    pub pcs: ArrayView2<'a, f64>,
-    pub static_covariates: ArrayView2<'a, f64>,
-}
-
 /// Prediction inputs referencing existing arrays.
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
@@ -1162,43 +935,7 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
-    pub covariates: CovariateViews<'a>,
-}
-
-/// Resolve a companion survival artifact using the stored reference handle.
-pub fn resolve_companion_model<'a, F>(
-    handle: &CompanionModelHandle,
-    resolver: &mut F,
-) -> Result<&'a SurvivalModelArtifacts, SurvivalError>
-where
-    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
-{
-    resolver(handle.reference.as_str()).ok_or_else(|| SurvivalError::MissingCompanionModel {
-        reference: handle.reference.clone(),
-    })
-}
-
-/// Obtain the competing cumulative incidence at a given age.
-pub fn competing_cif_value<'a, F>(
-    age: f64,
-    covariates: &Array1<f64>,
-    handle: Option<&CompanionModelHandle>,
-    provided: Option<f64>,
-    mut resolver: F,
-) -> Result<f64, SurvivalError>
-where
-    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
-{
-    if let Some(value) = provided {
-        if !value.is_finite() || value < 0.0 || value > 1.0 {
-            return Err(SurvivalError::InvalidCompanionCif { value });
-        }
-        return Ok(value);
-    }
-
-    let handle = handle.ok_or(SurvivalError::MissingCompanionCifData)?;
-    let artifacts = resolve_companion_model(handle, &mut resolver)?;
-    cumulative_incidence(age, covariates, artifacts)
+    pub covariates: ArrayView2<'a, f64>,
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1260,33 +997,136 @@ pub fn conditional_absolute_risk(
 
 /// Calibrator feature extraction for survival predictions.
 pub fn survival_calibrator_features(
-    predictions: &Array1<f64>,
-    standard_errors: &Array1<f64>,
+    risks: &Array1<f64>,
+    jacobians: &Array2<f64>,
+    hessian_factor: Option<&HessianFactor>,
     leverage: Option<&Array1<f64>>,
-) -> Array2<f64> {
-    let n = predictions.len();
-    let leverage_len_ok = leverage.map_or(true, |l| l.len() == n);
-    assert!(
-        leverage_len_ok,
-        "leverage vector must match prediction length"
-    );
-    let mut features = Array2::<f64>::zeros((n, if leverage.is_some() { 3 } else { 2 }));
-    match leverage {
-        Some(lev) => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-                features[[i, 2]] = lev[i];
-            }
-        }
-        None => {
-            for i in 0..n {
-                features[[i, 0]] = predictions[i].logit();
-                features[[i, 1]] = standard_errors[i];
-            }
+) -> Result<Array2<f64>, SurvivalError> {
+    let n = risks.len();
+    if jacobians.nrows() != n {
+        return Err(SurvivalError::CalibratorInputLengthMismatch {
+            expected: n,
+            provided: jacobians.nrows(),
+        });
+    }
+    if let Some(lev) = leverage {
+        if lev.len() != n {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: n,
+                provided: lev.len(),
+            });
         }
     }
-    features
+
+    if let Some(factor) = hessian_factor {
+        let expected_dim = match factor {
+            HessianFactor::Observed { ldlt_factor, .. } => ldlt_factor.nrows(),
+            HessianFactor::Expected { cholesky_factor } => cholesky_factor.nrows(),
+        };
+        if jacobians.ncols() != expected_dim {
+            return Err(SurvivalError::CalibratorInputLengthMismatch {
+                expected: expected_dim,
+                provided: jacobians.ncols(),
+            });
+        }
+    }
+
+    let mut se_logit = Array1::<f64>::zeros(n);
+    if let Some(factor) = hessian_factor {
+        for (row_idx, jac_row) in jacobians.rows().into_iter().enumerate() {
+            let risk = risks[row_idx].clamp(1e-12, 1.0 - 1e-12);
+            let denom = (risk * (1.0 - risk)).max(1e-12);
+            let grad_logit = jac_row.to_owned().mapv(|v| v / denom);
+            let variance = delta_quadratic_form(factor, &grad_logit)?;
+            se_logit[row_idx] = variance.max(0.0).sqrt();
+        }
+    }
+
+    let cols = if leverage.is_some() { 3 } else { 2 };
+    let mut features = Array2::<f64>::zeros((n, cols));
+    for i in 0..n {
+        let risk = risks[i].clamp(1e-12, 1.0 - 1e-12);
+        features[[i, 0]] = risk.logit();
+        features[[i, 1]] = se_logit[i];
+        if let Some(lev) = leverage {
+            features[[i, 2]] = lev[i].clamp(0.0, 0.999);
+        }
+    }
+    Ok(features)
+}
+
+fn delta_quadratic_form(factor: &HessianFactor, grad: &Array1<f64>) -> Result<f64, SurvivalError> {
+    match factor {
+        HessianFactor::Observed {
+            ldlt_factor,
+            permutation,
+            ..
+        } => {
+            let dim = ldlt_factor.nrows();
+            if ldlt_factor.ncols() != dim || permutation.len() != dim || grad.len() != dim {
+                return Err(SurvivalError::DeltaMethod(
+                    "observed Hessian factor dimension mismatch".to_string(),
+                ));
+            }
+
+            let view = FaerArrayView::new(ldlt_factor);
+            let solver = FaerLdlt::new(view.as_ref(), Side::Lower)
+                .map_err(|err| SurvivalError::DeltaMethod(format!("LDLT solve failed: {err:?}")))?;
+
+            let mut permuted_grad = vec![0.0; dim];
+            for (i, &perm_idx) in permutation.iter().enumerate() {
+                if perm_idx >= dim {
+                    return Err(SurvivalError::DeltaMethod(
+                        "permutation index out of range".to_string(),
+                    ));
+                }
+                permuted_grad[i] = grad[perm_idx];
+            }
+
+            let permuted_grad = Array1::from(permuted_grad);
+            let grad_view = FaerColView::new(&permuted_grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+
+            let mut solved_vec = vec![0.0; dim];
+            for i in 0..dim {
+                solved_vec[i] = solved_view[(i, 0)];
+            }
+
+            let mut solved_unpermuted = vec![0.0; dim];
+            for (i, &perm_idx) in permutation.iter().enumerate() {
+                solved_unpermuted[perm_idx] = solved_vec[i];
+            }
+
+            let accum = grad
+                .iter()
+                .zip(solved_unpermuted.iter())
+                .map(|(g, s)| g * s)
+                .sum();
+            Ok(accum)
+        }
+        HessianFactor::Expected { cholesky_factor } => {
+            let dim = cholesky_factor.nrows();
+            if cholesky_factor.ncols() != dim || grad.len() != dim {
+                return Err(SurvivalError::DeltaMethod(
+                    "expected Hessian factor dimension mismatch".to_string(),
+                ));
+            }
+
+            let view = FaerArrayView::new(cholesky_factor);
+            let solver = FaerLlt::new(view.as_ref(), Side::Lower).map_err(|err| {
+                SurvivalError::DeltaMethod(format!("Cholesky solve failed: {err:?}"))
+            })?;
+            let grad_view = FaerColView::new(grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            Ok(accum)
+        }
+    }
 }
 
 trait LogitExt {
@@ -1303,12 +1143,12 @@ impl LogitExt for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::faer_ndarray::FaerEigh;
+    use crate::calibrate::faer_ndarray::{FaerArrayView, FaerColView};
     use approx::assert_abs_diff_eq;
     use faer::Side;
-    use ndarray::array;
+    use faer::linalg::solvers::Llt as FaerLlt;
+    use ndarray::{Array2, array};
     use serde_json;
-    use std::collections::HashMap;
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1335,6 +1175,48 @@ mod tests {
 
     fn repeat_optional(matrix: &Option<Array2<f64>>, pattern: &[usize]) -> Option<Array2<f64>> {
         matrix.as_ref().map(|array| repeat_rows(array, pattern))
+    }
+
+    fn permute_symmetric(matrix: &Array2<f64>, permutation: &[usize]) -> Array2<f64> {
+        let n = permutation.len();
+        let mut result = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            for j in 0..n {
+                result[[i, j]] = matrix[[permutation[i], permutation[j]]];
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn delta_quadratic_form_respects_permutation() {
+        let h = array![[5.0, 2.0, 1.0], [2.0, 6.0, 1.5], [1.0, 1.5, 4.0],];
+        let permutation = vec![2, 0, 1];
+        let h_permuted = permute_symmetric(&h, &permutation);
+
+        let factor = HessianFactor::Observed {
+            ldlt_factor: h_permuted,
+            permutation: permutation.clone(),
+            inertia: (3, 0, 0),
+        };
+
+        let grad = array![0.5, -1.0, 2.0];
+
+        let expected = {
+            let view = FaerArrayView::new(&h);
+            let solver = FaerLlt::new(view.as_ref(), Side::Lower).expect("LLT should succeed");
+            let grad_view = FaerColView::new(&grad);
+            let solved = solver.solve(grad_view.as_ref());
+            let solved_view = solved.as_ref();
+            let mut accum = 0.0;
+            for (idx, value) in grad.iter().enumerate() {
+                accum += value * solved_view[(idx, 0)];
+            }
+            accum
+        };
+
+        let observed = delta_quadratic_form(&factor, &grad).expect("delta quadratic form");
+        assert_abs_diff_eq!(observed, expected, epsilon = 1e-12);
     }
 
     fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
@@ -1581,61 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn companion_cif_resolves_handles_and_fallbacks() {
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
-        let artifacts = SurvivalModelArtifacts {
-            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
-            age_basis: basis.clone(),
-            time_varying_basis: None,
-            static_covariate_layout: make_covariate_layout(&layout),
-            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            interaction_metadata: Vec::new(),
-            companion_models: Vec::new(),
-            hessian_factor: None,
-        };
-        let handle = CompanionModelHandle {
-            reference: "companion-risk".to_string(),
-        };
-        let mut registry = HashMap::new();
-        registry.insert(handle.reference.clone(), artifacts.clone());
-
-        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
-        let resolved = competing_cif_value(60.0, &covs, Some(&handle), None, |reference| {
-            registry.get(reference)
-        })
-        .expect("resolve cif");
-        let expected = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
-        assert!((resolved - expected).abs() < 1e-12);
-
-        let fallback = competing_cif_value(60.0, &covs, Some(&handle), Some(0.25), |_| {
-            panic!("resolver should not be invoked when values are supplied")
-        })
-        .expect("use fallback");
-        assert_eq!(fallback, 0.25);
-
-        let missing = CompanionModelHandle {
-            reference: "missing".to_string(),
-        };
-        let err = competing_cif_value(60.0, &covs, Some(&missing), None, |_| None)
-            .expect_err("missing companion artifact");
-        assert!(matches!(err, SurvivalError::MissingCompanionModel { .. }));
-
-        let err = competing_cif_value(60.0, &covs, None, None, |_| None).expect_err("missing data");
-        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
-
-        let err = competing_cif_value(60.0, &covs, None, Some(f64::NAN), |_| None)
-            .expect_err("invalid fallback");
-        assert!(matches!(err, SurvivalError::InvalidCompanionCif { .. }));
-    }
-
-    #[test]
     fn working_state_shapes() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -1822,7 +1649,11 @@ mod tests {
                 -2.0 * weight * h_entry[i],
                 &x_entry_row,
             );
-            let event_scale = weight * d;
+            let event_scale = if spec.use_expected_information {
+                weight * h_exit[i]
+            } else {
+                weight * d
+            };
             if event_scale != 0.0 {
                 accumulate_symmetric_outer(&mut manual_hessian, -2.0 * event_scale, &x_tilde);
             }
@@ -1902,7 +1733,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 6).unwrap();
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0).unwrap();
         let mut spec_observed = SurvivalSpec::default();
         spec_observed.barrier_weight = 0.0;
         spec_observed.use_expected_information = false;
@@ -1933,20 +1764,45 @@ mod tests {
             assert_abs_diff_eq!(*obs, *exp, epsilon = 1e-10);
         }
 
-        let diff = &expected_state.hessian - &observed_state.hessian;
-        let diff_norm: f64 = diff.iter().map(|v| v.abs()).sum();
-        assert!(diff_norm > 1e-8);
+        let guard = spec_observed.derivative_guard.max(f64::EPSILON);
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        let mut expected_diff = Array2::<f64>::zeros((p, p));
+        for i in 0..data.age_entry.len() {
+            let weight = data.sample_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let h_exit = eta_exit[i].exp();
+            let d = f64::from(data.event_target[i]);
+            let raw_derivative = derivative_exit[i];
+            let guard_applied = raw_derivative <= guard;
+            let guarded = if guard_applied { guard } else { raw_derivative };
+            let scale = 1.0 / guarded;
+            let mut x_tilde = layout.combined_exit.row(i).to_owned();
+            Zip::from(&mut x_tilde)
+                .and(&layout.combined_derivative_exit.row(i))
+                .for_each(|value, &deriv| *value += deriv * scale);
+            let diff_scale = -2.0 * weight * (h_exit - d);
+            if diff_scale == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                for k in 0..p {
+                    expected_diff[[j, k]] += diff_scale * x_tilde[j] * x_tilde[k];
+                }
+            }
+        }
 
-        let mut neg_expected = expected_state.hessian.clone();
-        neg_expected.mapv_inplace(|value| -value);
-        let (eigenvalues, _) = neg_expected
-            .eigh(Side::Lower)
-            .expect("eigendecomposition should succeed for SPD approximation");
-        for value in eigenvalues.iter() {
+        let diff = &expected_state.hessian - &observed_state.hessian;
+        for (observed, expected) in diff.iter().zip(expected_diff.iter()) {
+            let tolerance = 1e-12 * expected.abs().max(1.0);
             assert!(
-                *value >= -1e-9,
-                "expected-information Hessian not SPD: eigenvalue {}",
-                value
+                (*observed - *expected).abs() < tolerance,
+                "expected-information difference mismatch: observed={}, expected={}, tolerance={}",
+                observed,
+                expected,
+                tolerance
             );
         }
     }
@@ -2082,10 +1938,6 @@ mod tests {
         let zero_monotonicity = MonotonicityPenalty {
             lambda: 0.0,
             derivative_design: monotonicity.derivative_design.clone(),
-            quadrature_design: monotonicity.quadrature_design.clone(),
-            grid_ages: monotonicity.grid_ages.clone(),
-            quadrature_left: monotonicity.quadrature_left.clone(),
-            quadrature_right: monotonicity.quadrature_right.clone(),
         };
 
         let mut beta = Array1::<f64>::zeros(penalised_layout.combined_exit.ncols());
