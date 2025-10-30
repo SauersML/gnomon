@@ -723,11 +723,7 @@ impl WorkingModel for WorkingModelSurvival {
             accumulate_weighted_vector(&mut gradient, -weight * h_e, &x_exit);
             accumulate_weighted_vector(&mut gradient, weight * h_s, &x_entry);
 
-            let scale = if guard_applied {
-                0.0
-            } else {
-                1.0 / guarded_derivative
-            };
+            let scale = 1.0 / guarded_derivative;
             let mut x_tilde = x_exit.to_owned();
             Zip::from(&mut x_tilde)
                 .and(&d_exit)
@@ -1212,7 +1208,7 @@ mod tests {
             } else {
                 raw_derivative
             };
-            let scale = if guard_applied { 0.0 } else { 1.0 / guarded };
+            let scale = 1.0 / guarded;
             let mut x_tilde = x_exit_row.to_owned();
             Zip::from(&mut x_tilde)
                 .and(&d_exit_row)
@@ -1311,7 +1307,7 @@ mod tests {
             let raw_derivative = derivative_exit[i];
             let guard_applied = raw_derivative <= guard;
             let guarded = if guard_applied { guard } else { raw_derivative };
-            let scale = if guard_applied { 0.0 } else { 1.0 / guarded };
+            let scale = 1.0 / guarded;
             let mut x_tilde = layout.combined_exit.row(i).to_owned();
             Zip::from(&mut x_tilde)
                 .and(&layout.combined_derivative_exit.row(i))
