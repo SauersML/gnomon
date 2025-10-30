@@ -159,7 +159,11 @@ struct SurvivalArrays {
 
 fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, SurvivalDataError> {
     let df = read_tabular(path)?;
-    let name_map = build_case_insensitive_map(df.get_column_names());
+    let name_map = build_case_insensitive_map(
+        df.get_column_names()
+            .into_iter()
+            .map(|name| name.as_str().to_string()),
+    );
 
     let age_entry = extract_f64_column(&df, &name_map, "age_entry")?;
     let age_exit = extract_f64_column(&df, &name_map, "age_exit")?;
@@ -234,19 +238,25 @@ fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
         }
         _ => {
             let file = File::open(path)?;
-            CsvReader::new(file)
+            CsvReadOptions::default()
                 .with_has_header(true)
-                .with_separator(b'\t')
+                .map_parse_options(|options| options.with_separator(b'\t'))
+                .into_reader_with_file_handle(file)
                 .finish()
                 .map_err(SurvivalDataError::from)
         }
     }
 }
 
-fn build_case_insensitive_map(names: Vec<String>) -> HashMap<String, String> {
-    let mut map = HashMap::with_capacity(names.len());
+fn build_case_insensitive_map<I, S>(names: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut map = HashMap::new();
     for name in names {
-        map.insert(name.to_ascii_lowercase(), name);
+        let original = name.as_ref().to_string();
+        map.insert(original.to_ascii_lowercase(), original);
     }
     map
 }
@@ -293,22 +303,29 @@ fn extract_u8_column(
         .column(actual)
         .map_err(|_| SurvivalDataError::ColumnNotFound(actual.clone()))?;
     let dtype = series.dtype().clone();
-    let series = if dtype != DataType::UInt8 {
-        series
-            .cast(&DataType::UInt8)
-            .map_err(|_| SurvivalDataError::ColumnWrongType {
-                column_name: actual.clone(),
-                expected_type: "integer",
-                found_type: dtype.to_string(),
-            })?
-    } else {
-        series.clone()
-    };
-    let values = series.u8().expect("casted to u8");
+    let casted = series
+        .cast(&DataType::Int64)
+        .map_err(|_| SurvivalDataError::ColumnWrongType {
+            column_name: actual.clone(),
+            expected_type: "integer",
+            found_type: dtype.to_string(),
+        })?;
+    let values = casted.i64().expect("casted to i64");
     if values.null_count() > 0 {
         return Err(SurvivalDataError::MissingValues(actual.clone()));
     }
-    Ok(Array1::from_iter(values.into_no_null_iter()))
+    let mut result = Array1::<u8>::zeros(values.len());
+    for (idx, value) in values.into_no_null_iter().enumerate() {
+        if value < 0 || value > u8::MAX as i64 {
+            return Err(SurvivalDataError::ColumnWrongType {
+                column_name: actual.clone(),
+                expected_type: "integer",
+                found_type: dtype.to_string(),
+            });
+        }
+        result[idx] = value as u8;
+    }
+    Ok(result)
 }
 
 fn assemble_covariate_matrix(
@@ -330,38 +347,40 @@ fn assemble_covariate_matrix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::{CsvWriter, DataFrame, ParquetWriter, SerWriter, Series, df};
-    use tempfile::NamedTempFile;
+    use polars::prelude::{CsvWriter, DataFrame, ParquetWriter, SerWriter, Series};
+    use tempfile::{Builder, NamedTempFile};
 
     fn sample_dataframe() -> DataFrame {
-        df! {
-            "age_entry" => &[50.0, 60.0, 70.0],
-            "age_exit" => &[55.0, 65.0, 75.0],
-            "event_target" => &[1u8, 0, 0],
-            "event_competing" => &[0u8, 1, 0],
-            "sample_weight" => &[1.0, 2.0, 3.0],
-            "pgs" => &[0.1, 0.2, 0.3],
-            "sex" => &[0.0, 1.0, 0.0],
-            "pc1" => &[0.5, 0.6, 0.7],
-            "pc2" => &[1.5, 1.6, 1.7]
-        }
+        DataFrame::new(vec![
+            Series::new("age_entry".into(), vec![50.0, 60.0, 70.0]).into(),
+            Series::new("age_exit".into(), vec![55.0, 65.0, 75.0]).into(),
+            Series::new("event_target".into(), vec![1i32, 0, 0]).into(),
+            Series::new("event_competing".into(), vec![0i32, 1, 0]).into(),
+            Series::new("sample_weight".into(), vec![1.0, 2.0, 3.0]).into(),
+            Series::new("pgs".into(), vec![0.1, 0.2, 0.3]).into(),
+            Series::new("sex".into(), vec![0.0, 1.0, 0.0]).into(),
+            Series::new("pc1".into(), vec![0.5, 0.6, 0.7]).into(),
+            Series::new("pc2".into(), vec![1.5, 1.6, 1.7]).into(),
+        ])
         .expect("construct sample dataframe")
     }
 
     fn write_tsv(df: &DataFrame) -> NamedTempFile {
-        let mut file = NamedTempFile::new().expect("tempfile");
-        let mut writer = CsvWriter::new(file.as_file_mut());
-        writer
-            .with_delimiter(b'\t')
-            .finish(df.clone())
-            .expect("write tsv");
+        let mut file = Builder::new().suffix(".tsv").tempfile().expect("tempfile");
+        let mut writer = CsvWriter::new(file.as_file_mut()).with_separator(b'\t');
+        let mut clone = df.clone();
+        writer.finish(&mut clone).expect("write tsv");
         file
     }
 
     fn write_parquet(df: &DataFrame) -> NamedTempFile {
-        let mut file = NamedTempFile::new().expect("tempfile");
-        let mut writer = ParquetWriter::new(file.as_file_mut());
-        writer.finish(df.clone()).expect("write parquet");
+        let mut file = Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .expect("tempfile");
+        let writer = ParquetWriter::new(file.as_file_mut());
+        let mut clone = df.clone();
+        writer.finish(&mut clone).expect("write parquet");
         file
     }
 
@@ -406,8 +425,7 @@ mod tests {
     #[test]
     fn loader_rejects_conflicting_events() {
         let mut df = sample_dataframe();
-        df = df
-            .with_column(Series::new("event_target", &[1u8, 1, 0]))
+        df.with_column(Series::new("event_target".into(), vec![1i32, 1, 0]))
             .unwrap();
         let file = write_tsv(&df);
         let err = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)

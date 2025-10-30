@@ -4,7 +4,7 @@ use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, array1_to_col_mat_mut, array2_to_mat_mut,
     hash_array2,
 };
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
+use crate::calibrate::model::{LinkFunction, ModelConfig};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
@@ -2497,7 +2497,9 @@ mod tests {
         build_design_and_penalty_matrices, compute_penalty_square_roots,
     };
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, map_coefficients};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, ModelFamily, map_coefficients,
+    };
     use approx::assert_abs_diff_eq;
     use ndarray::{Array1, Array2, arr1, arr2};
     use rand::rngs::StdRng;

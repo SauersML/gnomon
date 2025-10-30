@@ -38,7 +38,7 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
 fn log_basis_cache_stats(context: &str) {
@@ -3982,7 +3982,7 @@ pub mod internal {
         use super::*;
         use crate::calibrate::construction::{ModelLayout, TermType};
         use crate::calibrate::model::{
-            BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig,
+            BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
         };
         use ndarray::{Array, Array1, Array2};
         use rand::seq::SliceRandom;
@@ -4834,7 +4834,7 @@ pub mod internal {
             use crate::calibrate::construction::build_design_and_penalty_matrices;
             use crate::calibrate::data::TrainingData;
             use crate::calibrate::model::{
-                BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig,
+                BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
                 PrincipalComponentConfig,
             };
 
@@ -7391,7 +7391,7 @@ pub mod internal {
         /// Tests that the design matrix is correctly built using pure pre-centering for the interaction terms.
         #[test]
         fn test_pure_precentering_interaction() {
-            use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind};
+            use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, ModelFamily};
             use approx::assert_abs_diff_eq;
             // Create a minimal test dataset
             // Using n_samples=150 to avoid over-parameterization
@@ -8301,7 +8301,7 @@ pub mod internal {
 
 #[test]
 fn test_train_model_fails_gracefully_on_perfect_separation() {
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind};
+    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, ModelFamily};
     use std::collections::HashMap;
 
     // Stage: Create a perfectly separated dataset
@@ -8375,7 +8375,9 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
 #[test]
 fn test_indefinite_hessian_detection_and_retreat() {
     use crate::calibrate::estimate::internal::RemlState;
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+    };
     use ndarray::{Array1, Array2};
 
     println!("=== TESTING INDEFINITE HESSIAN DETECTION FUNCTIONALITY ===");
@@ -8549,7 +8551,9 @@ mod test_helpers {
 mod optimizer_progress_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
+    };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -8605,7 +8609,7 @@ mod optimizer_progress_tests {
 
         // Stage: Configure a simple, stable model that includes penalties for PC1, PGS, and the interaction
         let config = ModelConfig {
-            link_function,
+            model_family: ModelFamily::Gam(link_function),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 150,
@@ -8695,7 +8699,9 @@ mod reparam_consistency_tests {
     use super::*;
     use crate::calibrate::construction::build_design_and_penalty_matrices;
     use crate::calibrate::data::TrainingData;
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+    };
     use ndarray::{Array1, Array2};
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -8853,7 +8859,9 @@ mod reparam_consistency_tests {
 mod gradient_validation_tests {
     use super::test_helpers;
     use super::*;
-    use crate::calibrate::model::{BasisConfig, InteractionPenaltyKind, PrincipalComponentConfig};
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
+    };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 

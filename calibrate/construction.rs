@@ -2,7 +2,7 @@ use crate::calibrate::basis::{self, create_bspline_basis};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily};
+use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::Zip;
@@ -2385,8 +2385,9 @@ mod tests {
     use crate::calibrate::data::TrainingData;
     use crate::calibrate::estimate::train_model;
     use crate::calibrate::model::{
-        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, PrincipalComponentConfig,
-        internal_construct_design_matrix, internal_flatten_coefficients,
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+        PrincipalComponentConfig, internal_construct_design_matrix,
+        internal_flatten_coefficients,
     };
     use approx::assert_abs_diff_eq;
     use ndarray::s;
