@@ -1,7 +1,8 @@
 use crate::calibrate::basis::{
     BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
 };
-use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
+use crate::calibrate::faer_ndarray::{FaerCholesky, FaerSvd};
+use faer::Side;
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Zip, arr1, concatenate};
@@ -779,11 +780,6 @@ impl WorkingModelSurvival {
         penalty_hessian: &Array2<f64>,
         monotonicity_hessian: Option<&Array2<f64>>,
     ) -> Result<Option<Array2<f64>>, SurvivalError> {
-        let grid_size = self.monotonicity.grid_ages.len();
-        if grid_size <= 1 {
-            return Ok(None);
-        }
-
         let p = beta.len();
         let mut expected = Array2::<f64>::zeros((p, p));
         let baseline_cols = self.layout.baseline_exit.ncols();
@@ -796,8 +792,14 @@ impl WorkingModelSurvival {
         let static_cols = self.layout.static_covariates.ncols();
         let static_offset = baseline_cols + time_cols;
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
-        let left_bounds = &self.monotonicity.quadrature_left;
-        let right_bounds = &self.monotonicity.quadrature_right;
+        let mut design_buffer = Array1::<f64>::zeros(p);
+        let quadrature_design = &self.monotonicity.quadrature_design;
+        let quadrature_left = &self.monotonicity.quadrature_left;
+        let quadrature_right = &self.monotonicity.quadrature_right;
+        let has_quadrature = quadrature_design.nrows() > 0;
+
+        let eta_exit_vec = self.layout.combined_exit.dot(beta);
+        let eta_entry_vec = self.layout.combined_entry.dot(beta);
 
         for i in 0..self.age_entry.len() {
             let weight = self.sample_weight[i];
@@ -810,39 +812,7 @@ impl WorkingModelSurvival {
                 continue;
             }
 
-            let mut design = Array1::<f64>::zeros(p);
-            for j in 0..grid_size {
-                if left_bounds[j] >= exit_age {
-                    break;
-                }
-                if right_bounds[j] <= entry_age {
-                    continue;
-                }
-                let left = left_bounds[j].max(entry_age);
-                let right = right_bounds[j].min(exit_age);
-                if right <= left {
-                    continue;
-                }
-                design.assign(&self.monotonicity.quadrature_design.row(j));
-                if static_cols > 0 {
-                    design
-                        .slice_mut(s![static_offset..static_offset + static_cols])
-                        .assign(&self.layout.static_covariates.row(i));
-                }
-                let eta = design.dot(beta);
-                if !eta.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let hazard = eta.exp();
-                if !hazard.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let scale = weight * (right - left) * hazard;
-                accumulate_symmetric_outer(&mut expected, scale, &design);
-            }
-
-            let exit_design = self.layout.combined_exit.row(i);
-            let eta_exit = exit_design.dot(beta);
+            let eta_exit = eta_exit_vec[i];
             if !eta_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
@@ -850,6 +820,62 @@ impl WorkingModelSurvival {
             if !hazard_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
+            let eta_entry = eta_entry_vec[i];
+            if !eta_entry.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            let hazard_entry = eta_entry.exp();
+            if !hazard_entry.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+
+            if has_quadrature {
+                for j in 0..quadrature_design.nrows() {
+                    if quadrature_left[j] >= exit_age {
+                        break;
+                    }
+                    if quadrature_right[j] <= entry_age {
+                        continue;
+                    }
+                    let left = quadrature_left[j].max(entry_age);
+                    let right = quadrature_right[j].min(exit_age);
+                    if right <= left {
+                        continue;
+                    }
+                    design_buffer.assign(&quadrature_design.row(j));
+                    if static_cols > 0 {
+                        design_buffer
+                            .slice_mut(s![static_offset..static_offset + static_cols])
+                            .assign(&self.layout.static_covariates.row(i));
+                    }
+                    let eta = design_buffer.dot(beta);
+                    if !eta.is_finite() {
+                        return Err(SurvivalError::NonFiniteLinearPredictor);
+                    }
+                    let hazard = eta.exp();
+                    if !hazard.is_finite() {
+                        return Err(SurvivalError::NonFiniteLinearPredictor);
+                    }
+                    let scale = weight * (right - left) * hazard;
+                    accumulate_symmetric_outer(&mut expected, scale, &design_buffer);
+                }
+            } else {
+                let width = exit_age - entry_age;
+                if width <= 0.0 {
+                    continue;
+                }
+                design_buffer.assign(&self.layout.combined_entry.row(i));
+                design_buffer += &self.layout.combined_exit.row(i);
+                design_buffer.mapv_inplace(|value| 0.5 * value);
+                let hazard_mean = 0.5 * (hazard_exit + hazard_entry);
+                if !hazard_mean.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                let scale = weight * width * hazard_mean;
+                accumulate_symmetric_outer(&mut expected, scale, &design_buffer);
+            }
+
+            let exit_design = self.layout.combined_exit.row(i);
             let derivative_exit = self.layout.combined_derivative_exit.row(i).dot(beta);
             if !derivative_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
@@ -864,7 +890,11 @@ impl WorkingModelSurvival {
             Zip::from(&mut x_tilde)
                 .and(&self.layout.combined_derivative_exit.row(i))
                 .for_each(|value, &deriv| *value += deriv * scale);
-            let event_scale = weight * hazard_exit;
+            let mut delta_hazard = hazard_exit - hazard_entry;
+            if delta_hazard < 0.0 {
+                delta_hazard = 0.0;
+            }
+            let event_scale = weight * delta_hazard;
             accumulate_symmetric_outer(&mut expected, event_scale, &x_tilde);
         }
 
@@ -877,35 +907,43 @@ impl WorkingModelSurvival {
 
         let mut neg_expected = expected.clone();
         neg_expected.mapv_inplace(|value| -value);
-        let mut shift = 0.0;
-        let mut attempts = 0usize;
-        let max_attempts = 16usize;
-        let n = neg_expected.nrows();
+        let mut total_ridge = 0.0;
+        let diag_scale = neg_expected
+            .diag()
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0, f64::max)
+            .max(1.0);
+        let mut attempt = 0usize;
+        let max_attempts = 12usize;
         loop {
-            let mut shifted = neg_expected.clone();
-            if shift > 0.0 {
-                for idx in 0..n {
-                    shifted[(idx, idx)] += shift;
+            match neg_expected.cholesky(Side::Lower) {
+                Ok(_) => {
+                    if total_ridge > 0.0 {
+                        for idx in 0..p {
+                            expected[(idx, idx)] -= total_ridge;
+                        }
+                    }
+                    return Ok(Some(expected));
                 }
-            }
-            match ldlt_rook(&shifted) {
-                Ok((_, _, _, _, _, inertia)) => {
-                    if inertia.1 == 0 && inertia.2 == 0 {
-                        expected = -shifted;
-                        break;
+                Err(_) => {
+                    if attempt >= max_attempts {
+                        return Ok(None);
+                    }
+                    let delta = if total_ridge == 0.0 {
+                        diag_scale * 1e-10
+                    } else {
+                        total_ridge * 10.0
+                    };
+                    total_ridge += delta;
+                    for idx in 0..p {
+                        neg_expected[(idx, idx)] += delta;
                     }
                 }
-                Err(_) => {}
             }
-            attempts += 1;
-            if attempts >= max_attempts {
-                expected = -shifted;
-                break;
-            }
-            shift = if shift == 0.0 { 1e-8 } else { shift * 10.0 };
+            attempt += 1;
         }
-
-        Ok(Some(expected))
     }
 }
 
@@ -1991,6 +2029,92 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn expected_information_matrix_is_spd() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.use_expected_information = true;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.01 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update(&beta).unwrap();
+        let mut neg_expected = state.hessian.clone();
+        neg_expected.mapv_inplace(|value| -value);
+        let factor = neg_expected
+            .cholesky(Side::Lower)
+            .expect("expected-information matrix should be SPD");
+        for value in factor.diag().iter() {
+            assert!(*value > 0.0);
+        }
+    }
+
+    #[test]
+    fn expected_information_step_progresses() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.8, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.15, 8).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.use_expected_information = true;
+
+        let mut base_model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.02 * (idx as f64 + 0.5);
+        }
+
+        let base_state = base_model.update(&beta).unwrap();
+        let mut neg_expected = base_state.hessian.clone();
+        neg_expected.mapv_inplace(|value| -value);
+        let factor = neg_expected
+            .cholesky(Side::Lower)
+            .expect("expected-information matrix should be SPD");
+        let step = factor.solve_vec(&base_state.gradient);
+
+        let mut scale = 1.0;
+        let mut improved = None;
+        while scale > 1e-6 {
+            let scaled_step = step.mapv(|v| v * scale);
+            let beta_candidate = &beta - &scaled_step;
+            let mut trial_model =
+                WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec)
+                    .unwrap();
+            match trial_model.update(&beta_candidate) {
+                Ok(candidate_state) => {
+                    if candidate_state.deviance < base_state.deviance {
+                        improved = Some(candidate_state.deviance);
+                        break;
+                    }
+                }
+                Err(SurvivalError::NonFiniteLinearPredictor) => {}
+                Err(other) => panic!("unexpected update failure: {other:?}"),
+            }
+            scale *= 0.5;
+        }
+
+        assert!(
+            improved.is_some(),
+            "expected-information step failed to reduce deviance"
+        );
     }
 
     #[test]
