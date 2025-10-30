@@ -35,7 +35,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
 Expect TSV/Parquet columns (names fixed):
 - `age_entry`, `age_exit` (years, `age_entry < age_exit`),
 - `event_target`, `event_competing` (0/1 integers, mutually exclusive, both zero for censoring),
-- `sample_weight` (optional, defaults to 1.0). We interpret this strictly as a frequency weight that scales each subject's likelihood contribution. Inverse-probability sampling weights are out of scope until we implement robust variance estimation and diagnostics for extreme weights.
+- `sample_weight` (optional, defaults to 1.0). We interpret this strictly as a frequency weight that scales each subject's likelihood contribution. Inverse-probability sampling weights should not be implemented.
 - covariates: `pgs`, `sex`, `pc1..pcK`, plus optional additional columns already supported by the GAM path.
 
 ### 3.2 Training and scoring bundles
@@ -212,8 +212,7 @@ fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_comp
 ## 8. Calibration
 - Calibrate on the logit of the conditional absolute risk (or CIF at a fixed horizon).
 - Features: base prediction, delta-method standard error derived from the stored Hessian factor, optional bounded leverage score.
-- Use out-of-fold predictions during training to avoid optimism.
-- Remove age-hull or KM-based diagnostics from calibrator features.
+- Do not use out-of-fold predictions during training to avoid optimism (use something better and more principled).
 - Calibration routines inherit the same frequency-weight assumption as the core likelihood. We do not provide robust calibrators for inverse-probability weighting; extreme weights should be addressed upstream or by extending the model with sandwich variance reporting.
 
 ## 9. Testing and diagnostics
