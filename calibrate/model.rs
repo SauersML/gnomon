@@ -3,11 +3,7 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::survival::{
-    self,
-    SurvivalError,
-    SurvivalModelArtifacts,
-    SurvivalSpec,
-    DEFAULT_RISK_EPSILON,
+    self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
@@ -481,8 +477,7 @@ impl TrainedModel {
     }
 
     fn survival_artifacts(&self) -> Result<&SurvivalModelArtifacts, ModelError> {
-        self
-            .survival
+        self.survival
             .as_ref()
             .ok_or(ModelError::MissingSurvivalArtifacts)
     }
@@ -917,9 +912,12 @@ impl TrainedModel {
         cif_competing_entry: Option<ArrayView1<f64>>,
     ) -> Result<Array1<f64>, ModelError> {
         if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
-            return Err(ModelError::UnsupportedForSurvival("predict_survival_calibrated"));
+            return Err(ModelError::UnsupportedForSurvival(
+                "predict_survival_calibrated",
+            ));
         }
-        if self.calibrator.is_none() {
+        let artifacts = self.survival_artifacts()?;
+        if artifacts.calibrator.is_none() {
             return Err(ModelError::CalibratorMissing);
         }
 
@@ -931,30 +929,13 @@ impl TrainedModel {
             pcs_new,
             cif_competing_entry,
         )?;
-        let artifacts = self.survival_artifacts()?;
-        let factor = artifacts.hessian_factor.as_ref();
-        let features = survival::survival_calibrator_features(
-            &baseline.conditional_risk,
-            &baseline.logit_risk_design,
-            factor,
-            None,
-        )?;
-
-        let pred_in = features.column(0).to_owned();
-        let se_in = features.column(1).to_owned();
-        let dist_in = if features.ncols() > 2 {
-            features.column(2).to_owned()
-        } else {
-            Array1::<f64>::zeros(features.nrows())
-        };
-        let cal = self.calibrator.as_ref().unwrap();
-        let preds = crate::calibrate::calibrator::predict_calibrator(
-            cal,
-            pred_in.view(),
-            se_in.view(),
-            dist_in.view(),
-        )?;
-        Ok(preds)
+        artifacts
+            .apply_logit_risk_calibrator(
+                &baseline.conditional_risk,
+                &baseline.logit_risk_design,
+                None,
+            )
+            .map_err(ModelError::from)
     }
 
     /// Saves the trained model to a file in a human-readable TOML format.
@@ -1773,12 +1754,8 @@ mod tests {
     #[test]
     fn survival_prediction_produces_risk_and_se() {
         use crate::calibrate::survival::{
-            build_survival_layout,
-            BasisDescriptor,
-            CholeskyFactor,
-            HessianFactor,
-            SurvivalModelArtifacts,
-            SurvivalTrainingData,
+            BasisDescriptor, CholeskyFactor, HessianFactor, SurvivalModelArtifacts,
+            SurvivalTrainingData, build_survival_layout,
         };
 
         let data = SurvivalTrainingData {
@@ -1790,23 +1767,37 @@ mod tests {
             pgs: array![0.2, -0.1],
             sex: array![0.0, 1.0],
             pcs: Array2::<f64>::zeros((2, 0)),
+            extra_static_covariates: Array2::<f64>::zeros((2, 0)),
+            extra_static_names: Vec::new(),
         };
         let basis = BasisDescriptor {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout = layout_bundle.layout;
         let coeffs = Array1::from_elem(layout.combined_exit.ncols(), 0.1);
 
-        let column_names: Vec<String> =
-            (0..layout.static_covariates.ncols()).map(|idx| format!("cov{idx}")).collect();
+        let column_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
+        let mut ranges = Vec::new();
+        for col_idx in 0..layout.static_covariates.ncols() {
+            let column = layout.static_covariates.column(col_idx);
+            let min_val = column.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_val = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            ranges.push(crate::calibrate::survival::ValueRange {
+                min: min_val,
+                max: max_val,
+            });
+        }
         let artifacts = SurvivalModelArtifacts {
             coefficients: coeffs.clone(),
             age_basis: basis.clone(),
             time_varying_basis: None,
             static_covariate_layout: crate::calibrate::survival::CovariateLayout {
                 column_names,
-                ranges: Vec::new(),
+                ranges,
             },
             penalties: Vec::new(),
             age_transform: layout.age_transform,
@@ -1818,6 +1809,7 @@ mod tests {
                     lower: Array2::eye(layout.combined_exit.ncols()),
                 },
             }),
+            calibrator: None,
         };
 
         let config = ModelConfig {
@@ -1877,10 +1869,12 @@ mod tests {
             .expect("survival prediction succeeded");
 
         assert_eq!(result.conditional_risk.len(), 2);
-        assert!(result
-            .conditional_risk
-            .iter()
-            .all(|value| value.is_finite()));
+        assert!(
+            result
+                .conditional_risk
+                .iter()
+                .all(|value| value.is_finite())
+        );
         let se = result.logit_risk_se.expect("delta-method se available");
         assert_eq!(se.len(), 2);
         for i in 0..se.len() {

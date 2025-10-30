@@ -3,8 +3,10 @@ use crate::calibrate::basis::{
     null_range_whiten,
 };
 use crate::calibrate::calibrator::{self, CalibratorModel};
+use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use crate::calibrate::model::calibrator_enabled;
+use crate::calibrate::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -105,19 +107,7 @@ pub enum SurvivalError {
     Calibrator(String),
 }
 
-/// Working model abstraction shared between GAM and survival implementations.
-pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
-}
-
-/// Aggregated state returned by [`WorkingModel::update`].
-#[derive(Debug, Clone)]
-pub struct WorkingState {
-    pub eta: Array1<f64>,
-    pub gradient: Array1<f64>,
-    pub hessian: Array2<f64>,
-    pub deviance: f64,
-}
+pub use crate::calibrate::pirls::WorkingModel;
 
 /// Guarded log-age transformation used across training and scoring.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -676,8 +666,7 @@ pub fn build_survival_layout(
     let static_covariate_names = assemble_static_covariate_names(data);
 
     let baseline_cols = constrained_exit.ncols();
-    let penalty_matrix =
-        create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
+    let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
@@ -1293,8 +1282,8 @@ impl WorkingModelSurvival {
     }
 }
 
-impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+impl WorkingModelSurvival {
+    pub fn update_state(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
             return Err(SurvivalError::DesignDimensionMismatch);
@@ -1446,6 +1435,13 @@ impl WorkingModel for WorkingModelSurvival {
             hessian,
             deviance,
         })
+    }
+}
+
+impl PirlsWorkingModel for WorkingModelSurvival {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        self.update_state(beta)
+            .map_err(|err| EstimationError::InvalidSpecification(err.to_string()))
     }
 }
 
@@ -2179,7 +2175,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout = layout_bundle.layout;
         let p = layout.combined_exit.ncols();
 
         let identity_calibrator = CalibratorModel {
@@ -2481,7 +2478,7 @@ mod tests {
             SurvivalSpec::default(),
         )
         .unwrap();
-        model.update(beta).unwrap()
+        model.update_state(beta).unwrap()
     }
 
     #[test]
@@ -2513,7 +2510,7 @@ mod tests {
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
                 .unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
-        let state = model.update(&beta).unwrap();
+        let state = model.update_state(&beta).unwrap();
         assert!(state.deviance.is_finite());
     }
 
@@ -2550,6 +2547,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let cov_cols =
             model.layout.static_covariates.ncols() + model.layout.extra_static_covariates.ncols();
@@ -2569,7 +2567,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2630,7 +2629,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2642,6 +2642,7 @@ mod tests {
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
+            calibrator: None,
         };
 
         let companion_artifacts = make_artifacts(Vec::new());
@@ -2695,7 +2696,7 @@ mod tests {
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
                 .unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
-        let state = model.update(&beta).unwrap();
+        let state = model.update_state(&beta).unwrap();
         assert_eq!(state.gradient.len(), beta.len());
         assert_eq!(state.hessian.nrows(), beta.len());
         assert_eq!(state.hessian.ncols(), beta.len());
@@ -2724,7 +2725,7 @@ mod tests {
             *value = 0.01 * (idx as f64 + 1.0);
         }
 
-        let state = model.update(&beta).unwrap();
+        let state = model.update_state(&beta).unwrap();
         let eta_exit = layout.combined_exit.dot(&beta);
         let eta_entry = layout.combined_entry.dot(&beta);
         let derivative_exit = layout.combined_derivative_exit.dot(&beta);
@@ -2770,7 +2771,7 @@ mod tests {
             beta[idx] = 0.05 * (idx as f64 + 1.0);
         }
 
-        let state = model.update(&beta).unwrap();
+        let state = model.update_state(&beta).unwrap();
         assert!(state.deviance.is_finite());
 
         let artifacts = SurvivalModelArtifacts {
@@ -2837,7 +2838,7 @@ mod tests {
             }
         }
 
-        let base_state = model.update(&beta).unwrap();
+        let base_state = model.update_state(&beta).unwrap();
         let eta_exit = layout.combined_exit.dot(&beta);
         let eta_entry = layout.combined_entry.dot(&beta);
         let derivative_vector = layout.combined_derivative_exit.dot(&beta);
@@ -2931,13 +2932,13 @@ mod tests {
             beta[idx] = 0.02 * (idx as f64 + 1.0);
         }
 
-        let state_initial = model.update(&beta).unwrap();
+        let state_initial = model.update_state(&beta).unwrap();
         let mut step = 1e-3;
         let mut beta_next = beta.clone();
         let mut state_next = state_initial.clone();
         loop {
             beta_next = &beta - &(state_initial.gradient.mapv(|g| step * g));
-            match model.update(&beta_next) {
+            match model.update_state(&beta_next) {
                 Ok(next) => {
                     state_next = next;
                     if state_next.deviance < state_initial.deviance {
@@ -2994,8 +2995,8 @@ mod tests {
             beta[idx] = 0.015 * (idx as f64 + 1.0);
         }
 
-        let observed_state = observed_model.update(&beta).unwrap();
-        let expected_state = expected_model.update(&beta).unwrap();
+        let observed_state = observed_model.update_state(&beta).unwrap();
+        let expected_state = expected_model.update_state(&beta).unwrap();
 
         for (obs, exp) in observed_state
             .gradient
@@ -3125,8 +3126,8 @@ mod tests {
             beta[idx] = 0.03 * (idx as f64 + 1.0);
         }
 
-        let state_weighted = weighted_model.update(&beta).unwrap();
-        let state_expanded = expanded_model.update(&beta).unwrap();
+        let state_weighted = weighted_model.update_state(&beta).unwrap();
+        let state_expanded = expanded_model.update_state(&beta).unwrap();
 
         assert_abs_diff_eq!(
             state_weighted.deviance,
@@ -3364,10 +3365,7 @@ mod tests {
         for (raw, offset) in raw_means.iter().zip(offsets.iter()) {
             assert_abs_diff_eq!(raw, offset, epsilon = 1e-10);
         }
-        for (mut column, &offset) in pgs_basis_matrix
-            .axis_iter_mut(Axis(1))
-            .zip(offsets.iter())
-        {
+        for (mut column, &offset) in pgs_basis_matrix.axis_iter_mut(Axis(1)).zip(offsets.iter()) {
             column.mapv_inplace(|value| value - offset);
         }
         let centered_means = compute_weighted_column_means(&pgs_basis_matrix, &data.sample_weight);
@@ -3396,6 +3394,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
 
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
@@ -3408,7 +3407,7 @@ mod tests {
             SurvivalSpec::default(),
         )
         .unwrap();
-        let state = model.update(&artifacts.coefficients).unwrap();
+        let state = model.update_state(&artifacts.coefficients).unwrap();
         assert!(state.deviance.is_finite());
     }
 
@@ -3437,6 +3436,7 @@ mod tests {
             interaction_metadata,
             companion_models: Vec::new(),
             hessian_factor: None,
+            calibrator: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
@@ -3450,7 +3450,8 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
