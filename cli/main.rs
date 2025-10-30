@@ -16,13 +16,17 @@ use gnomon::calibrate::estimate::train_survival_model;
 use gnomon::calibrate::model::BasisConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalModelConfig;
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::model::SurvivalPrediction;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, TrainedModel,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
 };
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival::SurvivalSpec;
 #[cfg(feature = "survival-data")]
-use gnomon::calibrate::survival_data::load_survival_training_data;
+use gnomon::calibrate::survival_data::{
+    SurvivalPredictionData, load_survival_prediction_data, load_survival_training_data,
+};
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
 use std::collections::HashMap;
@@ -302,61 +306,115 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load trained model
     let model = TrainedModel::load(&args.model)?;
-    if matches!(model.config.model_family, ModelFamily::Survival(_)) {
-        println!("Loaded survival model. CLI inference for survival models is not yet supported.");
-        return Ok(());
-    }
     let num_pcs = model.config.pc_configs.len();
-
     println!("Model expects {num_pcs} PCs");
 
-    // Load test data
-    println!("Loading test data from: {}", args.test_data);
-    let data = load_prediction_data(&args.test_data, num_pcs)?;
-    println!("Loaded {} samples for prediction", data.p.len());
+    match &model.config.model_family {
+        ModelFamily::Gam(link_function) => {
+            // Load test data
+            println!("Loading test data from: {}", args.test_data);
+            let data = load_prediction_data(&args.test_data, num_pcs)?;
+            println!("Loaded {} samples for prediction", data.p.len());
 
-    // Make detailed predictions
-    println!("Generating predictions with diagnostics...");
-    let (eta, mean, signed_dist, se_eta_opt) =
-        model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
+            // Make detailed predictions
+            println!("Generating predictions with diagnostics...");
+            let (eta, mean, signed_dist, se_eta_opt) =
+                model.predict_detailed(data.p.view(), data.sex.view(), data.pcs.view())?;
 
-    let link_function = match &model.config.model_family {
-        ModelFamily::Gam(link) => *link,
+            // Check if calibrator is available
+            let calibrated_mean_opt = if args.no_calibration {
+                println!("Skipping calibration via --no-calibration flag.");
+                None
+            } else if model.calibrator.is_some() {
+                println!("Calibrator detected. Generating calibrated predictions.");
+                // Get calibrated predictions but don't error if calibrator is missing
+                match model.predict_calibrated(data.p.view(), data.sex.view(), data.pcs.view()) {
+                    Ok(calibrated) => Some(calibrated),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            // Save predictions with required columns to hardcoded output path
+            let output_path = "predictions.tsv";
+            save_predictions_detailed(
+                &data.sample_ids,
+                &signed_dist,
+                &eta,
+                &mean,
+                se_eta_opt.as_ref(),
+                *link_function,
+                calibrated_mean_opt.as_ref(),
+                output_path,
+            )?;
+            println!("Predictions saved to: {output_path}");
+        }
         ModelFamily::Survival(_) => {
-            return Err(Box::new(ModelError::UnsupportedForSurvival(
-                "saving predictions",
-            )));
-        }
-    };
+            #[cfg(not(feature = "survival-data"))]
+            {
+                println!(
+                    "Loaded survival model, but CLI was built without 'survival-data' feature. \
+                     Rebuild with '--features survival-data' to enable survival inference."
+                );
+                return Ok(());
+            }
 
-    // Check if calibrator is available
-    let calibrated_mean_opt = if args.no_calibration {
-        println!("Skipping calibration via --no-calibration flag.");
-        None
-    } else if model.calibrator.is_some() {
-        println!("Calibrator detected. Generating calibrated predictions.");
-        // Get calibrated predictions but don't error if calibrator is missing
-        match model.predict_calibrated(data.p.view(), data.sex.view(), data.pcs.view()) {
-            Ok(calibrated) => Some(calibrated),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+            #[cfg(feature = "survival-data")]
+            {
+                println!("Loading survival prediction data from: {}", args.test_data);
+                let data = load_survival_prediction_data(&args.test_data, num_pcs)?;
+                println!(
+                    "Loaded {} samples for survival prediction",
+                    data.age_entry.len()
+                );
 
-    // Save predictions with required columns to hardcoded output path
-    let output_path = "predictions.tsv";
-    save_predictions_detailed(
-        &data.sample_ids,
-        &signed_dist,
-        &eta,
-        &mean,
-        se_eta_opt.as_ref(),
-        link_function,
-        calibrated_mean_opt.as_ref(),
-        output_path,
-    )?;
-    println!("Predictions saved to: {output_path}");
+                println!("Generating survival predictions with diagnostics...");
+                let prediction = model.predict_survival(
+                    data.age_entry.view(),
+                    data.age_exit.view(),
+                    data.pgs.view(),
+                    data.sex.view(),
+                    data.pcs.view(),
+                    None,
+                )?;
+
+                let calibrated_risk = if args.no_calibration {
+                    println!("Skipping calibration via --no-calibration flag.");
+                    None
+                } else if model
+                    .survival
+                    .as_ref()
+                    .and_then(|artifacts| artifacts.calibrator.as_ref())
+                    .is_some()
+                {
+                    println!("Calibrator detected. Generating calibrated survival predictions.");
+                    match model.predict_survival_calibrated(
+                        data.age_entry.view(),
+                        data.age_exit.view(),
+                        data.pgs.view(),
+                        data.sex.view(),
+                        data.pcs.view(),
+                        None,
+                    ) {
+                        Ok(calibrated) => Some(calibrated),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let output_path = "predictions.tsv";
+                save_survival_predictions(
+                    output_path,
+                    &data,
+                    &prediction,
+                    calibrated_risk.as_ref(),
+                )?;
+                println!("Predictions saved to: {output_path}");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -493,6 +551,80 @@ fn save_predictions_detailed(
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "survival-data")]
+fn save_survival_predictions(
+    output_path: &str,
+    data: &SurvivalPredictionData,
+    prediction: &SurvivalPrediction,
+    calibrated_risk: Option<&Array1<f64>>,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(output_path)?;
+    if calibrated_risk.is_some() {
+        writeln!(
+            file,
+            "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error\tcalibrated_risk"
+        )?;
+    } else {
+        writeln!(
+            file,
+            "sample_id\tage_entry\tage_exit\tcumulative_hazard_entry\tcumulative_hazard_exit\tcumulative_incidence_entry\tcumulative_incidence_exit\tconditional_risk\tlogit_risk\tlogit_risk_standard_error"
+        )?;
+    }
+
+    let count = prediction.conditional_risk.len();
+    for idx in 0..count {
+        let sample_id = (idx + 1).to_string();
+        let hazard_entry = prediction.cumulative_hazard_entry[idx];
+        let hazard_exit = prediction.cumulative_hazard_exit[idx];
+        let incidence_entry = prediction.cumulative_incidence_entry[idx];
+        let incidence_exit = prediction.cumulative_incidence_exit[idx];
+        let conditional_risk = prediction.conditional_risk[idx];
+        let logit_risk = prediction.logit_risk[idx];
+        let se = prediction
+            .logit_risk_se
+            .as_ref()
+            .map(|array| array[idx].to_string())
+            .unwrap_or_else(|| "NA".to_string());
+
+        if let Some(calibrated) = calibrated_risk {
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sample_id,
+                data.age_entry[idx],
+                data.age_exit[idx],
+                hazard_entry,
+                hazard_exit,
+                incidence_entry,
+                incidence_exit,
+                conditional_risk,
+                logit_risk,
+                se,
+                calibrated[idx]
+            )?;
+        } else {
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sample_id,
+                data.age_entry[idx],
+                data.age_exit[idx],
+                hazard_entry,
+                hazard_exit,
+                incidence_entry,
+                incidence_exit,
+                conditional_risk,
+                logit_risk,
+                se
+            )?;
+        }
+    }
+
     Ok(())
 }
 
