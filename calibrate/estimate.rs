@@ -1561,9 +1561,8 @@ pub fn train_survival_model(
 ) -> Result<TrainedModel, EstimationError> {
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
-        AgeTransform, BasisDescriptor, ColumnRange, CovariateLayout, HessianFactor,
-        PenaltyDescriptor, SurvivalError, SurvivalLayout, SurvivalModelArtifacts, SurvivalSpec,
-        ValueRange, WorkingModelSurvival,
+        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, SurvivalError,
+        SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange, WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
 
@@ -1598,45 +1597,26 @@ pub fn train_survival_model(
         Ok((log_entry, min_val, max_val))
     }
 
-    fn build_covariate_layout(static_covariates: &Array2<f64>) -> CovariateLayout {
-        let column_names = (0..static_covariates.ncols())
-            .map(|idx| format!("cov{idx}"))
-            .collect();
-        let ranges = (0..static_covariates.ncols())
+    fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
+        (0..matrix.ncols())
             .map(|col_idx| {
-                let column = static_covariates.column(col_idx);
+                if matrix.nrows() == 0 {
+                    return ValueRange { min: 0.0, max: 0.0 };
+                }
                 let mut min_val = f64::INFINITY;
                 let mut max_val = f64::NEG_INFINITY;
-                for &value in column.iter() {
-                    min_val = min_val.min(value);
-                    max_val = max_val.max(value);
-                }
-                if !min_val.is_finite() || !max_val.is_finite() {
-                    min_val = 0.0;
-                    max_val = 0.0;
+                for &value in matrix.column(col_idx).iter() {
+                    if value < min_val {
+                        min_val = value;
+                    }
+                    if value > max_val {
+                        max_val = value;
+                    }
                 }
                 ValueRange {
                     min: min_val,
                     max: max_val,
                 }
-            })
-            .collect();
-        CovariateLayout {
-            column_names,
-            ranges,
-        }
-    }
-
-    fn describe_penalties(layout: &SurvivalLayout, penalty_order: usize) -> Vec<PenaltyDescriptor> {
-        layout
-            .penalties
-            .blocks
-            .iter()
-            .map(|block| PenaltyDescriptor {
-                order: penalty_order,
-                lambda: block.lambda,
-                matrix: block.matrix.clone(),
-                column_range: ColumnRange::new(block.range.start, block.range.end),
             })
             .collect()
     }
@@ -1748,7 +1728,13 @@ pub fn train_survival_model(
         degree: survival_cfg.baseline_basis.degree,
     };
 
-    let (layout, monotonicity) = crate::calibrate::survival::build_survival_layout(
+    let SurvivalLayoutBundle {
+        layout,
+        monotonicity,
+        penalty_descriptors,
+        interaction_metadata,
+        time_varying_basis,
+    } = crate::calibrate::survival::build_survival_layout(
         &bundle.data,
         &age_basis,
         survival_cfg.guard_delta,
@@ -1842,8 +1828,12 @@ pub fn train_survival_model(
 
     let hessian_factor = factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
 
-    let penalties = describe_penalties(&layout, config.penalty_order);
-    let static_covariate_layout = build_covariate_layout(&layout.static_covariates);
+    let mut covariate_ranges = compute_value_ranges(&layout.static_covariates);
+    covariate_ranges.extend(compute_value_ranges(&layout.extra_static_covariates));
+    let static_covariate_layout = CovariateLayout {
+        column_names: layout.static_covariate_names.clone(),
+        ranges: covariate_ranges,
+    };
     let lambdas: Vec<f64> = layout
         .penalties
         .blocks
@@ -1854,24 +1844,35 @@ pub fn train_survival_model(
     let artifacts = SurvivalModelArtifacts {
         coefficients: beta.clone(),
         age_basis,
-        time_varying_basis: None,
+        time_varying_basis,
         static_covariate_layout,
-        penalties,
+        penalties: penalty_descriptors,
         age_transform: layout.age_transform,
         reference_constraint: layout.reference_constraint.clone(),
-        interaction_metadata: Vec::new(),
+        interaction_metadata,
         companion_models: Vec::new(),
         hessian_factor,
     };
 
     log_basis_cache_stats("train_survival_model");
 
+    let mut mapped_coefficients = crate::calibrate::model::MappedCoefficients::default();
+    mapped_coefficients
+        .interaction_effects
+        .insert("survival::raw_coefficients".to_string(), beta.to_vec());
+
+    let penalized_hessian = if final_state.hessian.is_empty() {
+        None
+    } else {
+        Some(final_state.hessian.clone())
+    };
+
     Ok(TrainedModel {
         config: config.clone(),
-        coefficients: Default::default(),
+        coefficients: mapped_coefficients,
         lambdas,
         hull: None,
-        penalized_hessian: None,
+        penalized_hessian,
         scale: None,
         calibrator: None,
         survival: Some(artifacts),
