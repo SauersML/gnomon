@@ -2,6 +2,7 @@ use crate::calibrate::basis::{self};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
+use crate::calibrate::survival::SurvivalSpec;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +44,13 @@ pub enum LinkFunction {
     Logit,
     /// The identity link, for continuous outcomes (e.g., Gaussian regression).
     Identity,
+}
+
+/// Enumerates the supported working model families.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ModelFamily {
+    Gam(LinkFunction),
+    Survival(SurvivalSpec),
 }
 
 /// Configuration toggle for tensor-product interaction penalties.
@@ -92,8 +100,9 @@ pub fn default_reml_parallel_threshold() -> usize {
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ModelConfigSerde", into = "ModelConfigSerde")]
 pub struct ModelConfig {
-    pub link_function: LinkFunction,
+    pub model_family: ModelFamily,
     pub penalty_order: usize,
     pub convergence_tolerance: f64,
     pub max_iterations: usize,
@@ -142,7 +151,7 @@ impl ModelConfig {
         firth_bias_reduction: bool,
     ) -> Self {
         ModelConfig {
-            link_function: link,
+            model_family: ModelFamily::Gam(link),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 50,
@@ -163,6 +172,152 @@ impl ModelConfig {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
+        }
+    }
+
+    pub fn link_function(&self) -> LinkFunction {
+        match &self.model_family {
+            ModelFamily::Gam(link) => *link,
+            ModelFamily::Survival(_) => {
+                panic!("link_function requested for survival model family")
+            }
+        }
+    }
+
+    pub fn survival_spec(&self) -> Option<&SurvivalSpec> {
+        match &self.model_family {
+            ModelFamily::Gam(_) => None,
+            ModelFamily::Survival(spec) => Some(spec),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelConfigSerde {
+    #[serde(default)]
+    model_family: Option<ModelFamily>,
+    #[serde(default)]
+    link_function: Option<LinkFunction>,
+    penalty_order: usize,
+    convergence_tolerance: f64,
+    max_iterations: usize,
+    reml_convergence_tolerance: f64,
+    reml_max_iterations: u64,
+    #[serde(default)]
+    firth_bias_reduction: bool,
+    #[serde(default = "default_reml_parallel_threshold")]
+    reml_parallel_threshold: usize,
+    pgs_basis_config: BasisConfig,
+    pc_configs: Vec<PrincipalComponentConfig>,
+    pgs_range: (f64, f64),
+    interaction_penalty: InteractionPenaltyKind,
+    sum_to_zero_constraints: HashMap<String, Array2<f64>>,
+    knot_vectors: HashMap<String, Array1<f64>>,
+    range_transforms: HashMap<String, Array2<f64>>,
+    interaction_centering_means: HashMap<String, Array1<f64>>,
+    interaction_orth_alpha: HashMap<String, Array2<f64>>,
+    pc_null_transforms: HashMap<String, Array2<f64>>,
+}
+
+impl From<ModelConfigSerde> for ModelConfig {
+    fn from(helper: ModelConfigSerde) -> Self {
+        let ModelConfigSerde {
+            model_family,
+            link_function,
+            penalty_order,
+            convergence_tolerance,
+            max_iterations,
+            reml_convergence_tolerance,
+            reml_max_iterations,
+            firth_bias_reduction,
+            reml_parallel_threshold,
+            pgs_basis_config,
+            pc_configs,
+            pgs_range,
+            interaction_penalty,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+            pc_null_transforms,
+        } = helper;
+
+        let model_family = model_family
+            .or_else(|| link_function.map(ModelFamily::Gam))
+            .unwrap_or(ModelFamily::Gam(LinkFunction::Logit));
+
+        ModelConfig {
+            model_family,
+            penalty_order,
+            convergence_tolerance,
+            max_iterations,
+            reml_convergence_tolerance,
+            reml_max_iterations,
+            firth_bias_reduction,
+            reml_parallel_threshold,
+            pgs_basis_config,
+            pc_configs,
+            pgs_range,
+            interaction_penalty,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+            pc_null_transforms,
+        }
+    }
+}
+
+impl From<ModelConfig> for ModelConfigSerde {
+    fn from(config: ModelConfig) -> Self {
+        let ModelConfig {
+            model_family,
+            penalty_order,
+            convergence_tolerance,
+            max_iterations,
+            reml_convergence_tolerance,
+            reml_max_iterations,
+            firth_bias_reduction,
+            reml_parallel_threshold,
+            pgs_basis_config,
+            pc_configs,
+            pgs_range,
+            interaction_penalty,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+            pc_null_transforms,
+        } = config;
+
+        let legacy_link = match &model_family {
+            ModelFamily::Gam(link) => Some(*link),
+            ModelFamily::Survival(_) => None,
+        };
+
+        ModelConfigSerde {
+            model_family: Some(model_family),
+            link_function: legacy_link,
+            penalty_order,
+            convergence_tolerance,
+            max_iterations,
+            reml_convergence_tolerance,
+            reml_max_iterations,
+            firth_bias_reduction,
+            reml_parallel_threshold,
+            pgs_basis_config,
+            pc_configs,
+            pgs_range,
+            interaction_penalty,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+            pc_null_transforms,
         }
     }
 }
@@ -301,7 +456,7 @@ impl TrainedModel {
 
         // --- Linear predictor and mean ---
         let eta = x_new.dot(&beta);
-        let mean = match self.config.link_function {
+        let mean = match self.config.link_function() {
             LinkFunction::Logit => {
                 let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
                 let mut probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
@@ -328,7 +483,7 @@ impl TrainedModel {
                     // Solve H v = x^T for v (1D)
                     let v = chol.solve_vec(&x_row);
                     let var_i = x_row.dot(&v);
-                    vars[i] = if self.config.link_function == LinkFunction::Identity {
+                    vars[i] = if self.config.link_function() == LinkFunction::Identity {
                         // For Gaussian identity, scale variance if scale present
                         if let Some(scale) = self.scale {
                             var_i * scale
@@ -391,7 +546,7 @@ impl TrainedModel {
         // Stage: Retrieve eta, signed distance, and se(eta) via the detailed path
         let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
-        let pred_in = match self.config.link_function {
+        let pred_in = match self.config.link_function() {
             LinkFunction::Logit => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };
@@ -1171,7 +1326,7 @@ mod tests {
 
         let model = TrainedModel {
             config: ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -1263,7 +1418,7 @@ mod tests {
     fn test_trained_model_predict_invalid_input() {
         let model = TrainedModel {
             config: ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -1362,7 +1517,7 @@ mod tests {
 
         // Create a simple model config for testing
         let config = ModelConfig {
-            link_function: LinkFunction::Identity,
+            model_family: ModelFamily::Gam(LinkFunction::Identity),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
@@ -1465,7 +1620,7 @@ mod tests {
 
         // Create a ModelConfig to use for both generation and testing
         let model_config = ModelConfig {
-            link_function: LinkFunction::Logit,
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
@@ -1527,7 +1682,7 @@ mod tests {
         // Now we can create a test model with the correct structure
         let original_model = TrainedModel {
             config: ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -1636,8 +1791,8 @@ mod tests {
 
         // Stage: Check model configuration
         assert_eq!(
-            loaded_model.config.link_function,
-            original_model.config.link_function
+            loaded_model.config.link_function(),
+            original_model.config.link_function()
         );
         assert_eq!(
             loaded_model.config.penalty_order,
