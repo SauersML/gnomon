@@ -1639,6 +1639,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            survival: None,
         };
 
         // Use the internal flatten_coefficients function
@@ -1726,6 +1727,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            survival: None,
         };
 
         // Create a dummy dataset for generating the correct model structure

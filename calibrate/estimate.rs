@@ -1548,6 +1548,23 @@ pub fn train_model(
     Ok(trained_model)
 }
 
+/// Placeholder entry point for survival model training.
+///
+/// The survival family is under active development and end-to-end training
+/// has not been wired into the estimation module yet. For now we surface a
+/// clear error explaining that the functionality is unavailable instead of
+/// leaving the call site undefined.
+pub fn train_survival_model(
+    bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
+    config: &ModelConfig,
+) -> Result<TrainedModel, EstimationError> {
+    // Suppress unused parameter warnings until the full implementation lands.
+    let _ = (bundle, config);
+    Err(EstimationError::InvalidSpecification(
+        "Survival model training is not yet implemented".to_string(),
+    ))
+}
+
 // ===== External optimizer facade for arbitrary designs (e.g., calibrator) =====
 
 #[derive(Clone)]
@@ -4134,6 +4151,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             RealWorldTestFixture {
@@ -4591,6 +4610,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             let mut model_for_pd = train_model(&data, &config)
@@ -4789,6 +4810,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             let trained_model = train_model(&train_data, &config)
@@ -4884,6 +4907,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             let (x, s_list, layout, ..) =
@@ -5162,6 +5187,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             let (x, s_list, layout, _, _, _, _, _, _, _) =
@@ -5274,6 +5301,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             let (x, s_list, layout, _, _, _, _, _, _, _) =
@@ -6417,6 +6446,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // --- Train model ---
@@ -6535,6 +6566,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // --- Build model structure ---
@@ -6748,6 +6781,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
             // Clear PC configurations
             config.pc_configs.clear();
@@ -6880,6 +6915,8 @@ pub mod internal {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+
+                survival: None,
             };
 
             // Test with extreme lambda values that might cause issues
@@ -7018,6 +7055,8 @@ pub mod internal {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+
+                survival: None,
             };
 
             // Test that we can at least compute cost without getting infinity
@@ -7205,6 +7244,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
             // This creates way too many parameters for 30 data points
 
@@ -7326,6 +7367,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             println!(
@@ -7442,6 +7485,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // Build design and penalty matrices
@@ -7590,6 +7635,8 @@ pub mod internal {
                     pc_null_transforms: std::collections::HashMap::new(),
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
+
+                    survival: None,
                 };
                 simple_config.model_family = ModelFamily::Gam(link_function);
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
@@ -7734,6 +7781,8 @@ pub mod internal {
                     pc_null_transforms: std::collections::HashMap::new(),
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
+
+                    survival: None,
                 };
 
                 // Use a simple basis with fewer knots to reduce complexity
@@ -7913,6 +7962,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // Create data with non-collinear predictors to avoid perfect collinearity
@@ -8105,6 +8156,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // Stage: Generate consistent structures using the canonical function
@@ -8228,6 +8281,8 @@ pub mod internal {
                 pc_null_transforms: std::collections::HashMap::new(),
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
+
+                survival: None,
             };
 
             // Stage: Generate consistent structures using the canonical function
@@ -8342,6 +8397,8 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         pc_null_transforms: HashMap::new(),
         interaction_centering_means: HashMap::new(),
         interaction_orth_alpha: HashMap::new(),
+
+        survival: None,
     };
 
     // Stage: Train the model and expect an error
@@ -8427,6 +8484,8 @@ fn test_indefinite_hessian_detection_and_retreat() {
         pc_null_transforms: std::collections::HashMap::new(),
         interaction_centering_means: std::collections::HashMap::new(),
         interaction_orth_alpha: std::collections::HashMap::new(),
+
+        survival: None,
     };
 
     // Try to build the matrices - if this fails, the test is still valid
@@ -8639,6 +8698,8 @@ mod optimizer_progress_tests {
             pc_null_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
+
+            survival: None,
         };
 
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
@@ -8750,6 +8811,8 @@ mod reparam_consistency_tests {
             pc_null_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
+
+            survival: None,
         };
 
         let (x, s_list, layout, ..) =
@@ -8918,6 +8981,8 @@ mod gradient_validation_tests {
             pc_null_transforms: std::collections::HashMap::new(),
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
+
+            survival: None,
         };
 
         let (x, s_list, layout, _, _, _, _, _, _, _) =

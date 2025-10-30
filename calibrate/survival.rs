@@ -6,7 +6,7 @@ use crate::calibrate::construction::kronecker_product;
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use log::warn;
 use ndarray::prelude::*;
-use ndarray::{ArrayBase, Data, Ix1, Zip, Axis, concatenate};
+use ndarray::{ArrayBase, Axis, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -572,7 +572,11 @@ where
 }
 
 fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    assert_eq!(a.nrows(), b.nrows(), "tensor product requires matching rows");
+    assert_eq!(
+        a.nrows(),
+        b.nrows(),
+        "tensor product requires matching rows"
+    );
     let rows = a.nrows();
     let cols = a.ncols() * b.ncols();
     if rows == 0 || cols == 0 {
@@ -687,14 +691,12 @@ pub fn build_survival_layout(
         )?;
         let pgs_basis = (*pgs_basis_arc).clone();
 
-        let mut interaction_entry =
-            row_wise_tensor_product(&pgs_basis, &constrained_entry);
+        let mut interaction_entry = row_wise_tensor_product(&pgs_basis, &constrained_entry);
         let mut interaction_exit = row_wise_tensor_product(&pgs_basis, &constrained_exit);
         let mut interaction_derivative =
             row_wise_tensor_product(&pgs_basis, &baseline_derivative_exit);
 
-        let centering_offsets =
-            weighted_column_means(&interaction_exit, &data.sample_weight);
+        let centering_offsets = weighted_column_means(&interaction_exit, &data.sample_weight);
         apply_centering_offsets(&mut interaction_entry, &centering_offsets);
         apply_centering_offsets(&mut interaction_exit, &centering_offsets);
         apply_centering_offsets(&mut interaction_derivative, &centering_offsets);
@@ -1487,8 +1489,7 @@ pub fn cumulative_hazard(
             if let Some(centering) = &descriptor.centering {
                 tensor -= &centering.offsets;
             }
-            design = concatenate(Axis(0), &[design.view(), tensor.view()])
-                .expect("time concat");
+            design = concatenate(Axis(0), &[design.view(), tensor.view()]).expect("time concat");
         }
     }
     design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
@@ -1864,8 +1865,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8, None).unwrap();
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8, None).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, penalty, SurvivalSpec::default()).unwrap();
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
@@ -1892,16 +1892,9 @@ mod tests {
             label: Some("pgs_by_age".to_string()),
         };
 
-        let (layout, _) = build_survival_layout(
-            &data,
-            &age_basis,
-            0.1,
-            2,
-            0.5,
-            5,
-            Some(&interaction_config),
-        )
-        .unwrap();
+        let (layout, _) =
+            build_survival_layout(&data, &age_basis, 0.1, 2, 0.5, 5, Some(&interaction_config))
+                .unwrap();
 
         let entry = layout
             .time_varying_entry
@@ -1933,14 +1926,20 @@ mod tests {
         let denom = data.sample_weight.sum();
         let means = exit.t().dot(&data.sample_weight) / denom;
         for mean in means.iter() {
-            assert!(mean.abs() <= 1e-12, "interaction columns not centered: {mean}");
+            assert!(
+                mean.abs() <= 1e-12,
+                "interaction columns not centered: {mean}"
+            );
         }
 
         let (pgs_min, pgs_max) = min_max(&data.pgs);
         assert_eq!(metadata.value_ranges.len(), 2);
         assert!((metadata.value_ranges[0].min - pgs_min).abs() <= 1e-12);
         assert!((metadata.value_ranges[0].max - pgs_max).abs() <= 1e-12);
-        assert_eq!(metadata.label.as_deref(), interaction_config.label.as_deref());
+        assert_eq!(
+            metadata.label.as_deref(),
+            interaction_config.label.as_deref()
+        );
 
         assert_eq!(descriptor.modifier, pgs_basis);
         assert_eq!(descriptor.age, age_basis);
@@ -2348,9 +2347,7 @@ mod tests {
                 &layout_weighted.time_varying_derivative_exit,
                 &replicate_pattern,
             ),
-            time_varying_basis_descriptor: layout_weighted
-                .time_varying_basis_descriptor
-                .clone(),
+            time_varying_basis_descriptor: layout_weighted.time_varying_basis_descriptor.clone(),
             time_varying_metadata: layout_weighted.time_varying_metadata.clone(),
             static_covariates: repeat_rows(&layout_weighted.static_covariates, &replicate_pattern),
             age_transform: layout_weighted.age_transform,
@@ -2529,8 +2526,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, penalty) =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2566,8 +2562,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -2592,8 +2587,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let (layout, _) =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
         let penalties = collect_penalty_descriptors(&layout);
         let interaction = InteractionDescriptor {
             label: Some("pgs_by_age".to_string()),
