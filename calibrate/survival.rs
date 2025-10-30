@@ -43,6 +43,12 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
+    #[error("companion model '{reference}' was requested but no matching artifact was provided")]
+    MissingCompanionModel { reference: String },
+    #[error("competing CIF values must be supplied explicitly or via a companion model")]
+    MissingCompanionCifData,
+    #[error("provided competing CIF value {value} is not finite or falls outside [0, 1]")]
+    InvalidCompanionCif { value: f64 },
 }
 
 /// Working model abstraction shared between GAM and survival implementations.
@@ -1140,6 +1146,15 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
+/// Borrowed survival covariate slices exposed during scoring.
+#[derive(Debug, Clone)]
+pub struct CovariateViews<'a> {
+    pub pgs: ArrayView1<'a, f64>,
+    pub sex: ArrayView1<'a, f64>,
+    pub pcs: ArrayView2<'a, f64>,
+    pub static_covariates: ArrayView2<'a, f64>,
+}
+
 /// Prediction inputs referencing existing arrays.
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
@@ -1147,7 +1162,43 @@ pub struct SurvivalPredictionInputs<'a> {
     pub event_target: ArrayView1<'a, u8>,
     pub event_competing: ArrayView1<'a, u8>,
     pub sample_weight: ArrayView1<'a, f64>,
-    pub covariates: ArrayView2<'a, f64>,
+    pub covariates: CovariateViews<'a>,
+}
+
+/// Resolve a companion survival artifact using the stored reference handle.
+pub fn resolve_companion_model<'a, F>(
+    handle: &CompanionModelHandle,
+    resolver: &mut F,
+) -> Result<&'a SurvivalModelArtifacts, SurvivalError>
+where
+    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
+{
+    resolver(handle.reference.as_str()).ok_or_else(|| SurvivalError::MissingCompanionModel {
+        reference: handle.reference.clone(),
+    })
+}
+
+/// Obtain the competing cumulative incidence at a given age.
+pub fn competing_cif_value<'a, F>(
+    age: f64,
+    covariates: &Array1<f64>,
+    handle: Option<&CompanionModelHandle>,
+    provided: Option<f64>,
+    mut resolver: F,
+) -> Result<f64, SurvivalError>
+where
+    F: FnMut(&str) -> Option<&'a SurvivalModelArtifacts>,
+{
+    if let Some(value) = provided {
+        if !value.is_finite() || value < 0.0 || value > 1.0 {
+            return Err(SurvivalError::InvalidCompanionCif { value });
+        }
+        return Ok(value);
+    }
+
+    let handle = handle.ok_or(SurvivalError::MissingCompanionCifData)?;
+    let artifacts = resolve_companion_model(handle, &mut resolver)?;
+    cumulative_incidence(age, covariates, artifacts)
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1257,6 +1308,7 @@ mod tests {
     use faer::Side;
     use ndarray::array;
     use serde_json;
+    use std::collections::HashMap;
 
     fn toy_training_data() -> SurvivalTrainingData {
         SurvivalTrainingData {
@@ -1526,6 +1578,61 @@ mod tests {
         assert!(cif1 >= cif0 - 1e-9);
         let risk = conditional_absolute_risk(55.0, 60.0, &covs, 0.0, &artifacts).unwrap();
         assert!(risk >= -1e-9);
+    }
+
+    #[test]
+    fn companion_cif_resolves_handles_and_fallbacks() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+        };
+        let handle = CompanionModelHandle {
+            reference: "companion-risk".to_string(),
+        };
+        let mut registry = HashMap::new();
+        registry.insert(handle.reference.clone(), artifacts.clone());
+
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+        let resolved = competing_cif_value(60.0, &covs, Some(&handle), None, |reference| {
+            registry.get(reference)
+        })
+        .expect("resolve cif");
+        let expected = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
+        assert!((resolved - expected).abs() < 1e-12);
+
+        let fallback = competing_cif_value(60.0, &covs, Some(&handle), Some(0.25), |_| {
+            panic!("resolver should not be invoked when values are supplied")
+        })
+        .expect("use fallback");
+        assert_eq!(fallback, 0.25);
+
+        let missing = CompanionModelHandle {
+            reference: "missing".to_string(),
+        };
+        let err = competing_cif_value(60.0, &covs, Some(&missing), None, |_| None)
+            .expect_err("missing companion artifact");
+        assert!(matches!(err, SurvivalError::MissingCompanionModel { .. }));
+
+        let err = competing_cif_value(60.0, &covs, None, None, |_| None).expect_err("missing data");
+        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
+
+        let err = competing_cif_value(60.0, &covs, None, Some(f64::NAN), |_| None)
+            .expect_err("invalid fallback");
+        assert!(matches!(err, SurvivalError::InvalidCompanionCif { .. }));
     }
 
     #[test]

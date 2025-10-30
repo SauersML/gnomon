@@ -1,5 +1,5 @@
 use crate::calibrate::survival::{
-    AgeTransform, SurvivalError, SurvivalPredictionInputs, SurvivalTrainingData,
+    AgeTransform, CovariateViews, SurvivalError, SurvivalPredictionInputs, SurvivalTrainingData,
     validate_survival_inputs,
 };
 use ndarray::{Array1, Array2};
@@ -70,7 +70,12 @@ impl SurvivalPredictionData {
             event_target: self.event_target.view(),
             event_competing: self.event_competing.view(),
             sample_weight: self.sample_weight.view(),
-            covariates: self.covariates.view(),
+            covariates: CovariateViews {
+                pgs: self.pgs.view(),
+                sex: self.sex.view(),
+                pcs: self.pcs.view(),
+                static_covariates: self.covariates.view(),
+            },
         }
     }
 }
@@ -399,7 +404,8 @@ mod tests {
         let prediction = load_survival_prediction_data(file.path().to_str().unwrap(), 2)
             .expect("load prediction");
         let inputs = prediction.as_inputs();
-        assert_eq!(inputs.covariates.ncols(), 4);
+        assert_eq!(inputs.covariates.static_covariates.ncols(), 4);
+        assert_eq!(inputs.covariates.pcs.ncols(), 2);
         assert_eq!(inputs.age_exit.len(), 3);
     }
 

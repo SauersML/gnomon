@@ -63,6 +63,15 @@ pub struct SurvivalPredictionInputs<'a> {
     pub covariates: CovariateViews<'a>,
 }
 ```
+
+```rust
+pub struct CovariateViews<'a> {
+    pub pgs: ArrayView1<'a, f64>,
+    pub sex: ArrayView1<'a, f64>,
+    pub pcs: ArrayView2<'a, f64>,
+    pub static_covariates: ArrayView2<'a, f64>,
+}
+```
 - Loaders validate ordering, exclusivity, and finiteness. There is no construction of inverse-probability weights or risk-set slices.
 
 ## 4. Basis, transforms, and constraints
@@ -178,6 +187,7 @@ CIF_target(t) = 1 - exp(-H(t)).
 ΔF = CIF_target(t1) - CIF_target(t0).
 F_competing_t0` supplied externally (see below).
 conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
+- Guard the denominator with `ε` and raise an error if neither explicit competing CIF values nor a resolvable companion model are available.
 ```
 - Default `ε = 1e-12` to maintain numeric stability.
 - No quadrature or Gauss–Kronrod rules are invoked; endpoint evaluation is exact under RP.
@@ -186,6 +196,7 @@ conditional_risk = ΔF / max(ε, 1 - CIF_target(t0) - F_competing_t0).
 - Encourage fitting companion RP models for key competing causes. Scoring accepts either:
   - a handle to another `SurvivalModelArtifacts` providing `CIF_competing(t)`; or
   - user-supplied competing CIF values for the cohort.
+- Helper functions `resolve_companion_model` and `competing_cif_value` return competing CIFs, preferring explicit user values and surfacing `MissingCompanionCifData` when neither source is available.
 - Document that without individualized competing CIFs the denominator is cohort-level and may lose calibration.
 - Remove any suggestion of Kaplan–Meier proxies.
 
