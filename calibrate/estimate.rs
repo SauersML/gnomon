@@ -1621,40 +1621,6 @@ pub fn train_survival_model(
             .collect()
     }
 
-    fn solve_newton_direction(
-        hessian: &Array2<f64>,
-        gradient: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        use crate::calibrate::faer_ndarray::{FaerArrayView, array1_to_col_mat_mut};
-        use faer::Side;
-        use faer::linalg::solvers::{Ldlt as FaerLdlt, Solve as FaerSolve};
-
-        let mut matrix = hessian.clone();
-        let mut rhs = gradient.mapv(|v| -v);
-        let mut attempt = 0usize;
-        loop {
-            match FaerLdlt::new(FaerArrayView::new(&matrix).as_ref(), Side::Lower) {
-                Ok(factor) => {
-                    {
-                        let mut rhs_mat = array1_to_col_mat_mut(&mut rhs);
-                        factor.solve_in_place(rhs_mat.as_mut());
-                    }
-                    return Ok(rhs);
-                }
-                Err(err) => {
-                    if attempt >= 6 {
-                        return Err(EstimationError::LinearSystemSolveFailed(err));
-                    }
-                    let ridge = 10f64.powi((attempt as i32) - 6);
-                    for i in 0..matrix.nrows() {
-                        matrix[[i, i]] += ridge;
-                    }
-                    attempt += 1;
-                }
-            }
-        }
-    }
-
     fn factor_hessian(
         hessian: &Array2<f64>,
         use_expected: bool,
@@ -1763,68 +1729,55 @@ pub fn train_survival_model(
             .map_err(map_error)?;
 
     let p = layout.combined_exit.ncols();
-    let mut beta = Array1::<f64>::zeros(p);
-    let mut last_deviance = f64::INFINITY;
-    let mut final_state = None;
+    let options = crate::calibrate::pirls::WorkingModelPirlsOptions {
+        max_iterations: config.max_iterations,
+        convergence_tolerance: config.convergence_tolerance,
+        max_step_halving: 20,
+        min_step_size: 1e-6,
+    };
 
-    for iter in 1..=config.max_iterations {
-        let state = model.update(&beta).map_err(map_error)?;
-        let grad_norm = state.gradient.mapv(|v| v * v).sum().sqrt();
-        let delta = solve_newton_direction(&state.hessian, &state.gradient)?;
+    let pirls_outcome = crate::calibrate::pirls::run_working_model_pirls(
+        &mut model,
+        Array1::<f64>::zeros(p),
+        &options,
+        |info: &crate::calibrate::pirls::WorkingModelIterationInfo| {
+            let halving_note = if info.step_halving > 0 {
+                format!(" (halved {}x)", info.step_halving)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "  [Iter {:>3}] deviance = {:.6e}, |grad| = {:.3e}, step = {:.3e}{}",
+                info.iteration, info.deviance, info.gradient_norm, info.step_size, halving_note
+            );
+        },
+    )?;
 
-        let mut step = 1.0;
-        let mut accepted = false;
-        let mut candidate_beta = beta.clone();
-        let mut candidate_state = state.clone();
-        for _ in 0..20 {
-            candidate_beta = &beta + &(delta.mapv(|v| step * v));
-            match model.update(&candidate_beta).map_err(map_error) {
-                Ok(updated) => {
-                    if updated.deviance <= state.deviance || !updated.deviance.is_finite() {
-                        candidate_state = updated;
-                        accepted = true;
-                        break;
-                    }
-                    step *= 0.5;
-                }
-                Err(err) => {
-                    if step <= 1e-6 {
-                        return Err(err);
-                    }
-                    step *= 0.5;
-                }
-            }
-        }
-
-        if !accepted {
+    let status = pirls_outcome.status.clone();
+    match status {
+        crate::calibrate::pirls::PirlsStatus::Converged
+        | crate::calibrate::pirls::PirlsStatus::StalledAtValidMinimum => {}
+        crate::calibrate::pirls::PirlsStatus::MaxIterationsReached
+        | crate::calibrate::pirls::PirlsStatus::Unstable => {
             return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: iter,
-                last_change: grad_norm,
+                max_iterations: config.max_iterations,
+                last_change: pirls_outcome.last_gradient_norm,
             });
-        }
-
-        let deviance_change = last_deviance - candidate_state.deviance;
-        beta = candidate_beta;
-        last_deviance = candidate_state.deviance;
-        final_state = Some(candidate_state);
-
-        eprintln!(
-            "  [Iter {:>3}] deviance = {:.6e}, |grad| = {:.3e}, step = {:.3e}",
-            iter, last_deviance, grad_norm, step
-        );
-
-        if grad_norm < config.convergence_tolerance {
-            break;
-        }
-        if deviance_change.abs() < config.convergence_tolerance {
-            break;
         }
     }
 
-    let final_state = final_state.ok_or_else(|| EstimationError::PirlsDidNotConverge {
-        max_iterations: config.max_iterations,
-        last_change: 0.0,
-    })?;
+    if let crate::calibrate::pirls::PirlsStatus::StalledAtValidMinimum = status {
+        eprintln!(
+            "  [Info] PIRLS stalled with small gradient after {} iterations (ΔD = {:.3e}).",
+            pirls_outcome.iterations, pirls_outcome.last_deviance_change
+        );
+    }
+
+    let crate::calibrate::pirls::WorkingModelPirlsResult {
+        beta,
+        state: final_state,
+        ..
+    } = pirls_outcome;
 
     let hessian_factor = factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
 
