@@ -11,6 +11,8 @@ use std::process;
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::estimate::train_survival_model;
 use gnomon::calibrate::model::BasisConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalModelConfig;
@@ -281,8 +283,9 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("Training survival model...");
-            eprintln!("Error: Survival model training not yet implemented in CLI");
-            std::process::exit(1);
+            let trained_model = train_survival_model(&bundle, &config)?;
+            trained_model.save("model.toml")?;
+            println!("Model saved to: model.toml");
         }
         #[cfg(not(feature = "survival-data"))]
         ModelFamilyCli::Survival => {
