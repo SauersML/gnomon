@@ -934,9 +934,9 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
             // This is more portable and robust.
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok()) // Ignore any errors during directory traversal.
-                .filter(|e| !is_in_target_directory(e.path())) // Exclude any target directories.
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok()) // Ignore any errors during directory traversal.
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude any target directories.
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             // Keep only .rs files.
             {
                 let path = entry.path();
@@ -999,9 +999,9 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path()))
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1061,10 +1061,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
-                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1095,10 +1095,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
-                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1130,10 +1130,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path()))
-                .filter(|e| e.file_name() != "build.rs")
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1163,10 +1163,10 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path()))
-                .filter(|e| e.file_name() != "build.rs")
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1202,10 +1202,10 @@ fn scan_for_allow_dead_code() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
-                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 
@@ -1255,10 +1255,10 @@ fn scan_for_ignored_tests() -> Vec<String> {
 
             for entry in WalkDir::new(".")
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !is_in_target_directory(e.path())) // Exclude target directory
-                .filter(|e| e.file_name() != "build.rs") // Exclude the build script itself
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
 

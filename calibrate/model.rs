@@ -2,7 +2,13 @@ use crate::calibrate::basis::{self};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::survival::{SurvivalModelArtifacts, SurvivalSpec};
+use crate::calibrate::survival::{
+    self,
+    SurvivalError,
+    SurvivalModelArtifacts,
+    SurvivalSpec,
+    DEFAULT_RISK_EPSILON,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -410,6 +416,18 @@ pub struct TrainedModel {
     pub survival: Option<SurvivalModelArtifacts>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SurvivalPrediction {
+    pub cumulative_hazard_entry: Array1<f64>,
+    pub cumulative_hazard_exit: Array1<f64>,
+    pub cumulative_incidence_entry: Array1<f64>,
+    pub cumulative_incidence_exit: Array1<f64>,
+    pub conditional_risk: Array1<f64>,
+    pub logit_risk: Array1<f64>,
+    pub logit_risk_se: Option<Array1<f64>>,
+    logit_risk_design: Array2<f64>,
+}
+
 /// Custom error type for model loading, saving, and prediction.
 #[derive(Error, Debug)]
 pub enum ModelError {
@@ -444,6 +462,12 @@ pub enum ModelError {
     #[error("Estimation error: {0}")]
     EstimationError(#[from] crate::calibrate::estimate::EstimationError),
 
+    #[error("Survival prediction error: {0}")]
+    SurvivalPrediction(#[from] SurvivalError),
+
+    #[error("Survival artifacts are missing from the trained model.")]
+    MissingSurvivalArtifacts,
+
     #[error("Operation '{0}' is not supported for survival model family.")]
     UnsupportedForSurvival(&'static str),
 }
@@ -454,6 +478,64 @@ impl TrainedModel {
             ModelFamily::Gam(link) => Ok(*link),
             ModelFamily::Survival(_) => Err(ModelError::UnsupportedForSurvival(operation)),
         }
+    }
+
+    fn survival_artifacts(&self) -> Result<&SurvivalModelArtifacts, ModelError> {
+        self
+            .survival
+            .as_ref()
+            .ok_or(ModelError::MissingSurvivalArtifacts)
+    }
+
+    fn assemble_survival_covariates(
+        &self,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+        artifacts: &SurvivalModelArtifacts,
+    ) -> Result<Array2<f64>, ModelError> {
+        let n = p_new.len();
+        if sex_new.len() != n {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Sample count mismatch: p_new has {} samples but sex_new has {}",
+                n,
+                sex_new.len()
+            )));
+        }
+        if pcs_new.nrows() != n {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Sample count mismatch: pcs_new has {} rows but p_new has {} samples",
+                pcs_new.nrows(),
+                n
+            )));
+        }
+        if pcs_new.ncols() != self.config.pc_configs.len() {
+            return Err(ModelError::MismatchedPcCount {
+                found: pcs_new.ncols(),
+                expected: self.config.pc_configs.len(),
+            });
+        }
+
+        let expected_cols = artifacts.static_covariate_layout.column_names.len();
+        let required_cols = 2 + pcs_new.ncols();
+        if expected_cols != required_cols {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Survival covariate width mismatch: artifacts expect {} columns but received {} (2 + {} PCs)",
+                expected_cols,
+                required_cols,
+                pcs_new.ncols()
+            )));
+        }
+
+        let mut matrix = Array2::<f64>::zeros((n, expected_cols));
+        for i in 0..n {
+            matrix[[i, 0]] = p_new[i];
+            matrix[[i, 1]] = sex_new[i];
+            for j in 0..pcs_new.ncols() {
+                matrix[[i, 2 + j]] = pcs_new[[i, j]];
+            }
+        }
+        Ok(matrix)
     }
 
     /// Detailed predictions including linear predictor, mean response, signed distance
@@ -680,6 +762,199 @@ impl TrainedModel {
         }
 
         Ok(x_new.dot(&flattened_coeffs))
+    }
+
+    pub fn predict_survival(
+        &self,
+        age_entry: ArrayView1<f64>,
+        age_exit: ArrayView1<f64>,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+        cif_competing_entry: Option<ArrayView1<f64>>,
+    ) -> Result<SurvivalPrediction, ModelError> {
+        if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_survival"));
+        }
+
+        let n = age_entry.len();
+        if age_exit.len() != n {
+            return Err(ModelError::DimensionMismatch(format!(
+                "age_exit has {} elements but age_entry has {}",
+                age_exit.len(),
+                n
+            )));
+        }
+        if p_new.len() != n {
+            return Err(ModelError::DimensionMismatch(format!(
+                "p_new has {} elements but age_entry has {}",
+                p_new.len(),
+                n
+            )));
+        }
+
+        let artifacts = self.survival_artifacts()?;
+        let covariates = self.assemble_survival_covariates(p_new, sex_new, pcs_new, artifacts)?;
+        let cif_competing_owned = cif_competing_entry.map(|vals| vals.to_owned());
+        if let Some(ref cif) = cif_competing_owned {
+            if cif.len() != n {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "cif_competing_entry has {} elements but age_entry has {}",
+                    cif.len(),
+                    n
+                )));
+            }
+        }
+
+        let coeffs = &artifacts.coefficients;
+        let design_width = coeffs.len();
+        let mut hazard_entry = Array1::<f64>::zeros(n);
+        let mut hazard_exit = Array1::<f64>::zeros(n);
+        let mut cif_entry = Array1::<f64>::zeros(n);
+        let mut cif_exit = Array1::<f64>::zeros(n);
+        let mut conditional_risk = Array1::<f64>::zeros(n);
+        let mut logit_risk = Array1::<f64>::zeros(n);
+        let mut gradient = Array2::<f64>::zeros((n, design_width));
+
+        for i in 0..n {
+            let cov_row = covariates.row(i).to_owned();
+            let entry_age = age_entry[i];
+            let exit_age = age_exit[i];
+            let cif_competing = cif_competing_owned.as_ref().map_or(0.0, |arr| arr[i]);
+
+            let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row, artifacts)?;
+            let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row, artifacts)?;
+            hazard_entry[i] = hazard_entry_val;
+            hazard_exit[i] = hazard_exit_val;
+
+            let cif_entry_val = survival::cumulative_incidence(entry_age, &cov_row, artifacts)?;
+            let cif_exit_val = survival::cumulative_incidence(exit_age, &cov_row, artifacts)?;
+            cif_entry[i] = cif_entry_val;
+            cif_exit[i] = cif_exit_val;
+
+            let risk_val = survival::conditional_absolute_risk(
+                entry_age,
+                exit_age,
+                &cov_row,
+                Some(cif_competing),
+                None,
+                artifacts,
+            )?;
+            conditional_risk[i] = risk_val;
+
+            let design_entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
+            let design_exit = survival::design_row_at_age(exit_age, cov_row.view(), artifacts)?;
+            if design_entry.len() != design_width || design_exit.len() != design_width {
+                return Err(ModelError::DimensionMismatch(
+                    "Survival design reconstruction mismatch".to_string(),
+                ));
+            }
+
+            let eta_entry = design_entry.dot(coeffs);
+            let eta_exit = design_exit.dot(coeffs);
+            let h_entry = eta_entry.exp();
+            let h_exit = eta_exit.exp();
+            let exp_neg_entry = (-h_entry).exp();
+            let exp_neg_exit = (-h_exit).exp();
+            let f_entry = 1.0 - exp_neg_entry;
+            let f_exit = 1.0 - exp_neg_exit;
+            let delta_raw = f_exit - f_entry;
+            let denom_raw = 1.0 - f_entry - cif_competing;
+            let delta = delta_raw.max(0.0);
+            let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
+
+            let d_f_entry = h_entry * exp_neg_entry;
+            let d_f_exit = h_exit * exp_neg_exit;
+            let dr_deta_exit = if delta_raw > 0.0 {
+                d_f_exit / denom
+            } else {
+                0.0
+            };
+            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+            let dden = -d_f_entry;
+            let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+                (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+            } else {
+                0.0
+            };
+
+            let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+            logit_risk[i] = (risk_clamped / (1.0 - risk_clamped)).ln();
+            let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+
+            let grad_exit = design_exit.mapv(|v| v * dr_deta_exit * logistic_scale);
+            let grad_entry = design_entry.mapv(|v| v * dr_deta_entry * logistic_scale);
+            let grad_row = grad_exit + grad_entry;
+            gradient.row_mut(i).assign(&grad_row);
+        }
+
+        let logit_risk_se = if let Some(factor) = artifacts.hessian_factor.as_ref() {
+            Some(survival::delta_method_standard_errors(factor, &gradient)?)
+        } else {
+            None
+        };
+
+        Ok(SurvivalPrediction {
+            cumulative_hazard_entry: hazard_entry,
+            cumulative_hazard_exit: hazard_exit,
+            cumulative_incidence_entry: cif_entry,
+            cumulative_incidence_exit: cif_exit,
+            conditional_risk,
+            logit_risk,
+            logit_risk_se,
+            logit_risk_design: gradient,
+        })
+    }
+
+    pub fn predict_survival_calibrated(
+        &self,
+        age_entry: ArrayView1<f64>,
+        age_exit: ArrayView1<f64>,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+        cif_competing_entry: Option<ArrayView1<f64>>,
+    ) -> Result<Array1<f64>, ModelError> {
+        if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_survival_calibrated"));
+        }
+        if self.calibrator.is_none() {
+            return Err(ModelError::CalibratorMissing);
+        }
+
+        let baseline = self.predict_survival(
+            age_entry,
+            age_exit,
+            p_new,
+            sex_new,
+            pcs_new,
+            cif_competing_entry,
+        )?;
+        let artifacts = self.survival_artifacts()?;
+        let factor = artifacts.hessian_factor.as_ref();
+        let features = survival::survival_calibrator_features(
+            &baseline.conditional_risk,
+            &baseline.logit_risk_design,
+            factor,
+            None,
+        )?;
+
+        let pred_in = features.column(0).to_owned();
+        let se_in = features.column(1).to_owned();
+        let dist_in = if features.ncols() > 2 {
+            features.column(2).to_owned()
+        } else {
+            Array1::<f64>::zeros(features.nrows())
+        };
+        let cal = self.calibrator.as_ref().unwrap();
+        let preds = crate::calibrate::calibrator::predict_calibrator(
+            cal,
+            pred_in.view(),
+            se_in.view(),
+            dist_in.view(),
+        )?;
+        Ok(preds)
     }
 
     /// Saves the trained model to a file in a human-readable TOML format.
@@ -1493,6 +1768,126 @@ mod tests {
             expected_values.as_slice().unwrap(),
             epsilon = 1e-10
         );
+    }
+
+    #[test]
+    fn survival_prediction_produces_risk_and_se() {
+        use crate::calibrate::survival::{
+            build_survival_layout,
+            BasisDescriptor,
+            CholeskyFactor,
+            HessianFactor,
+            SurvivalModelArtifacts,
+            SurvivalTrainingData,
+        };
+
+        let data = SurvivalTrainingData {
+            age_entry: array![50.0, 55.0],
+            age_exit: array![55.0, 60.0],
+            event_target: array![1, 0],
+            event_competing: array![0, 0],
+            sample_weight: array![1.0, 1.0],
+            pgs: array![0.2, -0.1],
+            sex: array![0.0, 1.0],
+            pcs: Array2::<f64>::zeros((2, 0)),
+        };
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let coeffs = Array1::from_elem(layout.combined_exit.ncols(), 0.1);
+
+        let column_names: Vec<String> =
+            (0..layout.static_covariates.ncols()).map(|idx| format!("cov{idx}")).collect();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: coeffs.clone(),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: crate::calibrate::survival::CovariateLayout {
+                column_names,
+                ranges: Vec::new(),
+            },
+            penalties: Vec::new(),
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: Some(HessianFactor::Expected {
+                factor: CholeskyFactor {
+                    lower: Array2::eye(layout.combined_exit.ncols()),
+                },
+            }),
+        };
+
+        let config = ModelConfig {
+            model_family: ModelFamily::Survival(SurvivalSpec::default()),
+            penalty_order: 2,
+            convergence_tolerance: 1e-6,
+            max_iterations: 20,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 20,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: default_reml_parallel_threshold(),
+            pgs_basis_config: BasisConfig {
+                num_knots: 0,
+                degree: 0,
+            },
+            pc_configs: Vec::new(),
+            pgs_range: (0.0, 1.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
+            sum_to_zero_constraints: HashMap::new(),
+            knot_vectors: HashMap::new(),
+            range_transforms: HashMap::new(),
+            interaction_centering_means: HashMap::new(),
+            interaction_orth_alpha: HashMap::new(),
+            pc_null_transforms: HashMap::new(),
+            survival: Some(SurvivalModelConfig {
+                baseline_basis: BasisConfig {
+                    num_knots: basis.knot_vector.len(),
+                    degree: basis.degree,
+                },
+                guard_delta: 0.1,
+                initial_lambda: 0.5,
+                monotonic_grid_size: 4,
+                monotonic_lambda: 0.5,
+            }),
+        };
+
+        let model = TrainedModel {
+            config,
+            coefficients: MappedCoefficients::default(),
+            lambdas: Vec::new(),
+            hull: None,
+            penalized_hessian: None,
+            scale: None,
+            calibrator: None,
+            survival: Some(artifacts),
+        };
+
+        let result = model
+            .predict_survival(
+                data.age_entry.view(),
+                data.age_exit.view(),
+                data.pgs.view(),
+                data.sex.view(),
+                data.pcs.view(),
+                None,
+            )
+            .expect("survival prediction succeeded");
+
+        assert_eq!(result.conditional_risk.len(), 2);
+        assert!(result
+            .conditional_risk
+            .iter()
+            .all(|value| value.is_finite()));
+        let se = result.logit_risk_se.expect("delta-method se available");
+        assert_eq!(se.len(), 2);
+        for i in 0..se.len() {
+            let grad = result.logit_risk_design.row(i);
+            let expected = grad.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!((se[i] - expected).abs() < 1e-9);
+        }
     }
 
     /// Tests that the prediction fails appropriately with invalid input dimensions.
