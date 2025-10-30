@@ -417,4 +417,49 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
     }
+
+    #[test]
+    fn loader_rejects_invalid_age_order() {
+        let mut df = sample_dataframe();
+        df = df
+            .with_column(Series::new("age_exit", &[50.0, 65.0, 75.0]))
+            .unwrap();
+        let file = write_tsv(&df);
+        let err = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+            .expect_err("invalid age order");
+        match err {
+            SurvivalDataError::Validation(SurvivalError::InvalidAgeOrder) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loader_rejects_negative_weights() {
+        let mut df = sample_dataframe();
+        df = df
+            .with_column(Series::new("sample_weight", &[1.0, -1.0, 3.0]))
+            .unwrap();
+        let file = write_tsv(&df);
+        let err = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+            .expect_err("negative weight");
+        match err {
+            SurvivalDataError::Validation(SurvivalError::InvalidSampleWeight) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loader_rejects_non_finite_covariates() {
+        let mut df = sample_dataframe();
+        df = df
+            .with_column(Series::new("pgs", &[0.1, f64::NAN, 0.3]))
+            .unwrap();
+        let file = write_tsv(&df);
+        let err = load_survival_training_data(file.path().to_str().unwrap(), 2, 0.1)
+            .expect_err("non finite covariate");
+        match err {
+            SurvivalDataError::Validation(SurvivalError::NonFiniteCovariate) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

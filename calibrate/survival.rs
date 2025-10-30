@@ -4,7 +4,7 @@ use crate::calibrate::basis::{
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use log::warn;
 use ndarray::prelude::*;
-use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
+use ndarray::{ArrayBase, ArrayView1, ArrayView2, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -292,59 +292,84 @@ pub struct SurvivalTrainingData {
 
 impl SurvivalTrainingData {
     pub fn validate(&self) -> Result<(), SurvivalError> {
-        let n = self.age_entry.len();
-        if n == 0 {
-            return Err(SurvivalError::EmptyAgeVector);
+        validate_survival_inputs(
+            self.age_entry.view(),
+            self.age_exit.view(),
+            self.event_target.view(),
+            self.event_competing.view(),
+            self.sample_weight.view(),
+            self.pgs.view(),
+            self.sex.view(),
+            self.pcs.view(),
+        )
+    }
+}
+
+/// Validate the shared survival training and prediction arrays.
+pub fn validate_survival_inputs(
+    age_entry: ArrayView1<'_, f64>,
+    age_exit: ArrayView1<'_, f64>,
+    event_target: ArrayView1<'_, u8>,
+    event_competing: ArrayView1<'_, u8>,
+    sample_weight: ArrayView1<'_, f64>,
+    pgs: ArrayView1<'_, f64>,
+    sex: ArrayView1<'_, f64>,
+    pcs: ArrayView2<'_, f64>,
+) -> Result<(), SurvivalError> {
+    let n = age_entry.len();
+    if n == 0 {
+        return Err(SurvivalError::EmptyAgeVector);
+    }
+
+    let dimension_mismatch = age_exit.len() != n
+        || event_target.len() != n
+        || event_competing.len() != n
+        || sample_weight.len() != n
+        || pgs.len() != n
+        || sex.len() != n
+        || pcs.nrows() != n;
+    if dimension_mismatch {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    for i in 0..n {
+        let entry = age_entry[i];
+        let exit = age_exit[i];
+        if !entry.is_finite() || !exit.is_finite() {
+            return Err(SurvivalError::NonFiniteAge);
         }
-        let dimension_mismatch = self.age_exit.len() != n
-            || self.event_target.len() != n
-            || self.event_competing.len() != n
-            || self.sample_weight.len() != n
-            || self.pgs.len() != n
-            || self.sex.len() != n
-            || self.pcs.nrows() != n;
-        if dimension_mismatch {
-            return Err(SurvivalError::CovariateDimensionMismatch);
+        if !(entry < exit) {
+            return Err(SurvivalError::InvalidAgeOrder);
         }
 
-        for i in 0..n {
-            let entry = self.age_entry[i];
-            let exit = self.age_exit[i];
-            if !entry.is_finite() || !exit.is_finite() {
-                return Err(SurvivalError::NonFiniteAge);
-            }
-            if !(entry < exit) {
-                return Err(SurvivalError::InvalidAgeOrder);
-            }
+        let target = event_target[i];
+        let competing = event_competing[i];
+        if target > 1 || competing > 1 {
+            return Err(SurvivalError::InvalidEventFlag);
+        }
+        if target == 1 && competing == 1 {
+            return Err(SurvivalError::ConflictingEvents);
+        }
 
-            let target = self.event_target[i];
-            let competing = self.event_competing[i];
-            if target > 1 || competing > 1 {
-                return Err(SurvivalError::InvalidEventFlag);
-            }
-            if target == 1 && competing == 1 {
-                return Err(SurvivalError::ConflictingEvents);
-            }
+        let weight = sample_weight[i];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(SurvivalError::InvalidSampleWeight);
+        }
 
-            let weight = self.sample_weight[i];
-            if !weight.is_finite() || weight < 0.0 {
-                return Err(SurvivalError::InvalidSampleWeight);
-            }
+        let pgs_value = pgs[i];
+        let sex_value = sex[i];
+        if !pgs_value.is_finite() || !sex_value.is_finite() {
+            return Err(SurvivalError::NonFiniteCovariate);
+        }
 
-            let pgs = self.pgs[i];
-            let sex = self.sex[i];
-            if !pgs.is_finite() || !sex.is_finite() {
+        for value in pcs.row(i) {
+            if !value.is_finite() {
                 return Err(SurvivalError::NonFiniteCovariate);
             }
-            for j in 0..self.pcs.ncols() {
-                if !self.pcs[[i, j]].is_finite() {
-                    return Err(SurvivalError::NonFiniteCovariate);
-                }
-            }
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 /// Guard that constrains the baseline spline at the chosen reference point.
