@@ -4,7 +4,7 @@ use crate::calibrate::basis::{
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use log::warn;
 use ndarray::prelude::*;
-use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
+use ndarray::{ArrayBase, Data, Ix1, Zip, arr1, concatenate};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
@@ -194,6 +194,13 @@ pub struct CovariateLayout {
     pub column_names: Vec<String>,
     #[serde(default)]
     pub ranges: Vec<ValueRange>,
+}
+
+/// Borrowed per-subject covariate values used during scoring.
+#[derive(Debug, Clone)]
+pub struct CovariateValues<'a> {
+    pub static_covariates: ArrayView1<'a, f64>,
+    pub time_varying: Option<ArrayView1<'a, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1140,6 +1147,141 @@ pub struct SurvivalModelArtifacts {
     pub hessian_factor: Option<HessianFactor>,
 }
 
+impl SurvivalModelArtifacts {
+    fn expected_static_dim(&self) -> usize {
+        self.static_covariate_layout.column_names.len()
+    }
+
+    fn validate_covariates(&self, covariates: &CovariateValues<'_>) -> Result<(), SurvivalError> {
+        if covariates.static_covariates.len() != self.expected_static_dim() {
+            return Err(SurvivalError::CovariateDimensionMismatch);
+        }
+        Ok(())
+    }
+
+    fn evaluate_baseline_row(&self, log_age: f64) -> Result<Array1<f64>, SurvivalError> {
+        let age_array = arr1(&[log_age]);
+        let (basis_arc, _) = create_bspline_basis_with_knots(
+            age_array.view(),
+            self.age_basis.knot_vector.view(),
+            self.age_basis.degree,
+        )?;
+        let basis = (*basis_arc).clone();
+        let constrained = self.reference_constraint.apply(&basis);
+        Ok(constrained.row(0).to_owned())
+    }
+
+    fn evaluate_time_varying_row(
+        &self,
+        log_age: f64,
+    ) -> Result<Option<Array1<f64>>, SurvivalError> {
+        if let Some(time_basis) = &self.time_varying_basis {
+            let age_array = arr1(&[log_age]);
+            let (tv_arc, _) = create_bspline_basis_with_knots(
+                age_array.view(),
+                time_basis.knot_vector.view(),
+                time_basis.degree,
+            )?;
+            let tv = self.reference_constraint.apply(&(*tv_arc).clone());
+            Ok(Some(tv.row(0).to_owned()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn assemble_design(
+        &self,
+        baseline: Array1<f64>,
+        time_varying: Option<Array1<f64>>,
+        covariates: &CovariateValues<'_>,
+    ) -> Result<Array1<f64>, SurvivalError> {
+        let mut design = Array1::<f64>::zeros(self.coefficients.len());
+        let mut offset = 0usize;
+        let total_len = design.len();
+        let static_len = covariates.static_covariates.len();
+
+        let baseline_len = baseline.len();
+        if baseline_len > total_len {
+            return Err(SurvivalError::DesignDimensionMismatch);
+        }
+        design
+            .slice_mut(s![offset..offset + baseline_len])
+            .assign(&baseline);
+        offset += baseline_len;
+
+        if let Some(time_row) = time_varying {
+            let len = time_row.len();
+            if offset + len > total_len {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            design.slice_mut(s![offset..offset + len]).assign(&time_row);
+            offset += len;
+        }
+
+        if offset + static_len > total_len {
+            return Err(SurvivalError::DesignDimensionMismatch);
+        }
+        let available_for_subject_time = total_len - offset - static_len;
+        if let Some(subject_time) = &covariates.time_varying {
+            let len = subject_time.len();
+            if len > available_for_subject_time {
+                return Err(SurvivalError::CovariateDimensionMismatch);
+            }
+            design
+                .slice_mut(s![offset..offset + len])
+                .assign(subject_time);
+            offset += len;
+        }
+
+        design
+            .slice_mut(s![offset..offset + static_len])
+            .assign(&covariates.static_covariates);
+        offset += static_len;
+
+        if offset != total_len {
+            return Err(SurvivalError::DesignDimensionMismatch);
+        }
+        Ok(design)
+    }
+
+    pub fn cumulative_hazard_with_covariates(
+        &self,
+        age: f64,
+        covariates: &CovariateValues<'_>,
+    ) -> Result<f64, SurvivalError> {
+        self.validate_covariates(covariates)?;
+        let log_age = self.age_transform.transform(age)?;
+        let baseline = self.evaluate_baseline_row(log_age)?;
+        let time_varying = self.evaluate_time_varying_row(log_age)?;
+        let design = self.assemble_design(baseline, time_varying, covariates)?;
+        let eta = design.dot(&self.coefficients);
+        Ok(eta.exp())
+    }
+
+    pub fn cumulative_incidence_with_covariates(
+        &self,
+        age: f64,
+        covariates: &CovariateValues<'_>,
+    ) -> Result<f64, SurvivalError> {
+        let hazard = self.cumulative_hazard_with_covariates(age, covariates)?;
+        Ok(1.0 - (-hazard).exp())
+    }
+
+    pub fn conditional_absolute_risk_with_covariates(
+        &self,
+        t0: f64,
+        t1: f64,
+        covariates: &CovariateValues<'_>,
+        cif_competing_t0: f64,
+    ) -> Result<f64, SurvivalError> {
+        let cif0 = self.cumulative_incidence_with_covariates(t0, covariates)?;
+        let cif1 = self.cumulative_incidence_with_covariates(t1, covariates)?;
+        let delta = (cif1 - cif0).max(0.0);
+        let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
+        Ok(delta / denom)
+    }
+}
+
 /// Prediction inputs referencing existing arrays.
 pub struct SurvivalPredictionInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
@@ -1156,32 +1298,11 @@ pub fn cumulative_hazard(
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let expected_covs = artifacts.static_covariate_layout.column_names.len();
-    if covariates.len() != expected_covs {
-        return Err(SurvivalError::CovariateDimensionMismatch);
-    }
-    let log_age = artifacts.age_transform.transform(age)?;
-    let (basis_arc, _) = create_bspline_basis_with_knots(
-        array![log_age].view(),
-        artifacts.age_basis.knot_vector.view(),
-        artifacts.age_basis.degree,
-    )?;
-    let basis = (*basis_arc).clone();
-    let constrained = artifacts.reference_constraint.apply(&basis);
-
-    let mut design = constrained.row(0).to_owned();
-    if let Some(time_basis) = &artifacts.time_varying_basis {
-        let (tv_arc, _) = create_bspline_basis_with_knots(
-            array![log_age].view(),
-            time_basis.knot_vector.view(),
-            time_basis.degree,
-        )?;
-        let tv = artifacts.reference_constraint.apply(&(*tv_arc).clone());
-        design = concatenate(Axis(0), &[design.view(), tv.row(0)]).expect("time concat");
-    }
-    design = concatenate(Axis(0), &[design.view(), covariates.view()]).expect("cov concat");
-    let eta = design.dot(&artifacts.coefficients);
-    Ok(eta.exp())
+    let covariate_values = CovariateValues {
+        static_covariates: covariates.view(),
+        time_varying: None,
+    };
+    artifacts.cumulative_hazard_with_covariates(age, &covariate_values)
 }
 
 pub fn cumulative_incidence(
@@ -1189,8 +1310,11 @@ pub fn cumulative_incidence(
     covariates: &Array1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let h = cumulative_hazard(age, covariates, artifacts)?;
-    Ok(1.0 - (-h).exp())
+    let covariate_values = CovariateValues {
+        static_covariates: covariates.view(),
+        time_varying: None,
+    };
+    artifacts.cumulative_incidence_with_covariates(age, &covariate_values)
 }
 
 pub fn conditional_absolute_risk(
@@ -1200,11 +1324,11 @@ pub fn conditional_absolute_risk(
     cif_competing_t0: f64,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
-    let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
-    let delta = (cif1 - cif0).max(0.0);
-    let denom = (1.0 - cif0 - cif_competing_t0).max(DEFAULT_RISK_EPSILON);
-    Ok(delta / denom)
+    let covariate_values = CovariateValues {
+        static_covariates: covariates.view(),
+        time_varying: None,
+    };
+    artifacts.conditional_absolute_risk_with_covariates(t0, t1, &covariate_values, cif_competing_t0)
 }
 
 /// Calibrator feature extraction for survival predictions.
@@ -2121,6 +2245,40 @@ mod tests {
         };
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_time_varying_mismatch() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+        };
+
+        let static_covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+        let extra_time = array![1.0];
+        let cov_values = CovariateValues {
+            static_covariates: static_covs.view(),
+            time_varying: Some(extra_time.view()),
+        };
+
+        let err = artifacts
+            .cumulative_hazard_with_covariates(60.0, &cov_values)
+            .unwrap_err();
         assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
     }
 
