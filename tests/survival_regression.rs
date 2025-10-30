@@ -57,9 +57,10 @@ fn trusted_reference_data() -> SurvivalTrainingData {
     let event_target = array![1, 0, 1, 0, 0, 1, 0, 1];
     let event_competing = Array1::zeros(age_entry.len());
     let sample_weight = array![1.0, 2.0, 3.0, 4.0, 1.0, 1.0, 1.0, 1.0];
-    let pgs = Array1::zeros(age_entry.len());
-    let sex = Array1::zeros(age_entry.len());
-    let pcs = Array2::zeros((age_entry.len(), 0));
+    let n = age_entry.len();
+    let pgs = Array1::zeros(n);
+    let sex = Array1::zeros(n);
+    let pcs = Array2::zeros((n, 0));
 
     SurvivalTrainingData {
         age_entry,
@@ -70,7 +71,7 @@ fn trusted_reference_data() -> SurvivalTrainingData {
         pgs,
         sex,
         pcs,
-        extra_static_covariates: Array2::zeros((age_exit.len(), 0)),
+        extra_static_covariates: Array2::zeros((n, 0)),
         extra_static_names: Vec::new(),
     }
 }
