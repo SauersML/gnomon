@@ -1561,8 +1561,8 @@ pub fn train_survival_model(
 ) -> Result<TrainedModel, EstimationError> {
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
-        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, SurvivalError,
-        SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
+        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
+        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
         WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
@@ -1719,10 +1719,283 @@ pub fn train_survival_model(
         layout.penalties.blocks.len(),
     );
 
-    eprintln!(
-        "\n[STAGE 2/3] Smoothing parameter optimisation for survival models is not yet automated; using initial λ = {:.3e}.",
-        survival_cfg.initial_lambda
-    );
+    let options = crate::calibrate::pirls::WorkingModelPirlsOptions {
+        max_iterations: config.max_iterations,
+        convergence_tolerance: config.convergence_tolerance,
+        max_step_halving: 20,
+        min_step_size: 1e-6,
+    };
+
+    eprintln!("\n[STAGE 2/3] Optimizing survival smoothing parameters via BFGS...");
+
+    struct SurvivalLambdaOptimizer<'a> {
+        base_layout: SurvivalLayout,
+        monotonicity: MonotonicityPenalty,
+        data: &'a crate::calibrate::survival::SurvivalTrainingData,
+        spec: SurvivalSpec,
+        options: crate::calibrate::pirls::WorkingModelPirlsOptions,
+        cache: std::cell::RefCell<
+            std::collections::HashMap<
+                Vec<u64>,
+                (f64, crate::calibrate::pirls::WorkingModelPirlsResult),
+            >,
+        >,
+        eval_counter: std::cell::RefCell<u64>,
+        last_error: std::cell::RefCell<Option<EstimationError>>,
+        log_prefix: String,
+    }
+
+    impl<'a> SurvivalLambdaOptimizer<'a> {
+        fn new(
+            layout: SurvivalLayout,
+            monotonicity: MonotonicityPenalty,
+            data: &'a crate::calibrate::survival::SurvivalTrainingData,
+            spec: SurvivalSpec,
+            options: crate::calibrate::pirls::WorkingModelPirlsOptions,
+            log_prefix: String,
+        ) -> Self {
+            Self {
+                base_layout: layout,
+                monotonicity,
+                data,
+                spec,
+                options,
+                cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+                eval_counter: std::cell::RefCell::new(0),
+                last_error: std::cell::RefCell::new(None),
+                log_prefix,
+            }
+        }
+
+        fn eval_key(z: &Array1<f64>) -> Vec<u64> {
+            z.iter()
+                .map(|v| {
+                    if *v == 0.0 {
+                        0.0f64.to_bits()
+                    } else {
+                        v.to_bits()
+                    }
+                })
+                .collect()
+        }
+
+        fn evaluate(
+            &self,
+            z: &Array1<f64>,
+            log_eval: bool,
+        ) -> Result<(f64, crate::calibrate::pirls::WorkingModelPirlsResult), EstimationError>
+        {
+            if z.len() == 0 {
+                return Ok((
+                    0.0,
+                    crate::calibrate::pirls::WorkingModelPirlsResult {
+                        beta: Array1::zeros(0),
+                        state: crate::calibrate::pirls::WorkingState {
+                            eta: Array1::zeros(0),
+                            gradient: Array1::zeros(0),
+                            hessian: Array2::zeros((0, 0)),
+                            deviance: 0.0,
+                        },
+                        status: crate::calibrate::pirls::PirlsStatus::Converged,
+                        iterations: 0,
+                        last_gradient_norm: 0.0,
+                        last_deviance_change: 0.0,
+                        last_step_size: 0.0,
+                        last_step_halving: 0,
+                        max_abs_eta: 0.0,
+                    },
+                ));
+            }
+
+            let key = Self::eval_key(z);
+            if let Some((cost, result)) = self.cache.borrow().get(&key) {
+                if log_eval {
+                    let eval_id = {
+                        let mut counter = self.eval_counter.borrow_mut();
+                        *counter += 1;
+                        *counter
+                    };
+                    eprintln!(
+                        "{} eval #{eval_id}: reused cached cost {:.6e}",
+                        self.log_prefix, cost
+                    );
+                }
+                return Ok((*cost, result.clone()));
+            }
+
+            let rho = to_rho_from_z(z);
+            let lambdas = rho.mapv(f64::exp);
+
+            let mut layout = self.base_layout.clone();
+            for (block, &lambda) in layout.penalties.blocks.iter_mut().zip(lambdas.iter()) {
+                block.lambda = lambda;
+            }
+
+            let monotonicity = self.monotonicity.clone();
+            let mut model = WorkingModelSurvival::new(layout, self.data, monotonicity, self.spec)
+                .map_err(map_error)?;
+            let p = model.layout.combined_exit.ncols();
+            let beta0 = Array1::<f64>::zeros(p);
+            let result = crate::calibrate::pirls::run_working_model_pirls(
+                &mut model,
+                beta0,
+                &self.options,
+                |_info| {},
+            )?;
+            let cost = result.state.deviance;
+
+            if log_eval {
+                let eval_id = {
+                    let mut counter = self.eval_counter.borrow_mut();
+                    *counter += 1;
+                    *counter
+                };
+                eprintln!(
+                    "{} eval #{eval_id}: cost {:.6e} (|β|={:.3e})",
+                    self.log_prefix,
+                    cost,
+                    result.beta.iter().map(|v| v * v).sum::<f64>().sqrt()
+                );
+            }
+
+            self.cache.borrow_mut().insert(key, (cost, result.clone()));
+
+            Ok((cost, result))
+        }
+
+        fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+            match self.evaluate(z, true) {
+                Ok((base_cost, _)) => {
+                    let len = z.len();
+                    if len == 0 {
+                        return (base_cost, Array1::zeros(0));
+                    }
+                    let mut grad = Array1::<f64>::zeros(len);
+                    let step = 1e-3_f64;
+                    for i in 0..len {
+                        let mut zp = z.clone();
+                        zp[i] += step;
+                        let fp = self
+                            .evaluate(&zp, false)
+                            .map(|(val, _)| val)
+                            .unwrap_or(f64::INFINITY);
+                        let mut zm = z.clone();
+                        zm[i] -= step;
+                        let fm = self
+                            .evaluate(&zm, false)
+                            .map(|(val, _)| val)
+                            .unwrap_or(f64::INFINITY);
+                        if fp.is_finite() && fm.is_finite() {
+                            grad[i] = (fp - fm) / (2.0 * step);
+                        } else {
+                            grad[i] = 0.0;
+                            *self.last_error.borrow_mut() = Some(EstimationError::RemlOptimizationFailed(
+                                "Failed to compute finite-difference gradient for survival optimizer".to_string(),
+                            ));
+                        }
+                    }
+                    (base_cost, grad)
+                }
+                Err(err) => {
+                    *self.last_error.borrow_mut() = Some(err.clone());
+                    (f64::INFINITY, Array1::zeros(z.len()))
+                }
+            }
+        }
+
+        fn take_last_error(&self) -> Option<EstimationError> {
+            self.last_error.borrow_mut().take()
+        }
+
+        fn eval_count(&self) -> u64 {
+            *self.eval_counter.borrow()
+        }
+    }
+
+    if layout.penalties.blocks.is_empty() {
+        eprintln!("[STAGE 2/3] No penalties detected; skipping optimization.");
+    } else {
+        let initial_lambda = Array1::<f64>::from_vec(
+            layout
+                .penalties
+                .blocks
+                .iter()
+                .map(|block| block.lambda)
+                .collect(),
+        );
+        let initial_rho = initial_lambda.mapv(|lambda| (lambda.max(1e-12)).ln());
+        let initial_z = to_z_from_rho(&initial_rho);
+        let optimizer = std::rc::Rc::new(SurvivalLambdaOptimizer::new(
+            layout.clone(),
+            monotonicity.clone(),
+            &bundle.data,
+            survival_spec,
+            options.clone(),
+            "  [Stage2]".to_string(),
+        ));
+        let optimizer_for_bfgs = std::rc::Rc::clone(&optimizer);
+        let solver = Bfgs::new(initial_z.clone(), move |z| {
+            optimizer_for_bfgs.cost_and_grad(z)
+        })
+        .with_tolerance(config.reml_convergence_tolerance)
+        .with_max_iterations(config.reml_max_iterations as usize)
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0xDEC0DED_u64);
+        let solution = match solver.run() {
+            Ok(sol) => sol,
+            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
+                eprintln!(
+                    "[Stage2] Line search failed; falling back to best-known parameters after {} iterations.",
+                    last_solution.iterations
+                );
+                last_solution
+            }
+            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
+                eprintln!(
+                    "[Stage2] Maximum iterations reached; using best-known parameters ({} iterations).",
+                    last_solution.iterations
+                );
+                last_solution
+            }
+            Err(err) => {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "Survival smoothing optimizer failed: {err:?}"
+                )));
+            }
+        };
+
+        if let Some(err) = optimizer.take_last_error() {
+            return Err(err);
+        }
+
+        let final_rho = to_rho_from_z(&solution.final_point);
+        let final_lambda = final_rho.mapv(f64::exp);
+
+        for (block, &lambda) in layout.penalties.blocks.iter_mut().zip(final_lambda.iter()) {
+            block.lambda = lambda;
+        }
+        for (descriptor, &lambda) in penalty_descriptors.iter_mut().zip(final_lambda.iter()) {
+            descriptor.lambda = lambda;
+        }
+
+        let lambda_summary: Vec<f64> = final_lambda.iter().copied().collect();
+        eprintln!(
+            "[Stage2] Completed in {} iterations ({} evaluations). Final cost {:.6e}, |∇z| = {:.3e}",
+            solution.iterations,
+            optimizer.eval_count(),
+            solution.final_value,
+            solution.final_gradient_norm
+        );
+        eprintln!(
+            "[Stage2] Optimized λ values: {}",
+            lambda_summary
+                .iter()
+                .map(|v| format!("{:.3e}", v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     eprintln!("\n[STAGE 3/3] Fitting survival model via penalized Newton iterations...");
 
@@ -1731,12 +2004,6 @@ pub fn train_survival_model(
             .map_err(map_error)?;
 
     let p = layout.combined_exit.ncols();
-    let options = crate::calibrate::pirls::WorkingModelPirlsOptions {
-        max_iterations: config.max_iterations,
-        convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: 20,
-        min_step_size: 1e-6,
-    };
 
     let pirls_outcome = crate::calibrate::pirls::run_working_model_pirls(
         &mut model,
