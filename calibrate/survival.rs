@@ -1061,6 +1061,33 @@ impl WorkingModelSurvival {
                 None
             };
 
+        let observed_information = hessian.clone();
+        let observed_factorization = if p > 0 {
+            match ldlt_rook(&observed_information) {
+                Ok((lower, diag, subdiag, perm_fwd, perm_inv, inertia)) => {
+                    Some(HessianFactor::Observed {
+                        factor: LdltFactor {
+                            lower,
+                            diag,
+                            subdiag,
+                        },
+                        permutation: PermutationDescriptor {
+                            forward: perm_fwd,
+                            inverse: perm_inv,
+                        },
+                        inertia,
+                    })
+                }
+                Err(err) => {
+                    warn!("LDLᵀ factorization of observed information failed: {err:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut hessian_factor = observed_factorization.clone();
+
         if self.spec.use_expected_information {
             if let Some(expected_hessian) = self.build_expected_information_hessian(
                 beta,
@@ -1068,7 +1095,18 @@ impl WorkingModelSurvival {
                 &penalty_hessian,
                 monotonicity_hessian.as_ref(),
             )? {
+                let chol_result = expected_hessian.cholesky(Side::Lower);
+                if let Err(err) = &chol_result {
+                    warn!("Cholesky factorization of expected information failed: {err:?}");
+                }
                 hessian = expected_hessian;
+                if let Ok(cholesky) = chol_result {
+                    hessian_factor = Some(HessianFactor::Expected {
+                        factor: CholeskyFactor {
+                            lower: cholesky.lower_triangular(),
+                        },
+                    });
+                }
             }
         }
 
@@ -1087,6 +1125,7 @@ impl WorkingModelSurvival {
             gradient,
             hessian,
             deviance,
+            hessian_factor,
         })
     }
 }
@@ -1151,7 +1190,7 @@ fn apply_monotonicity_penalty(
 }
 
 /// Serialized representation of an LDLᵀ factor with Bunch–Kaufman pivoting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LdltFactor {
     pub lower: Array2<f64>,
     pub diag: Array1<f64>,
@@ -1159,7 +1198,7 @@ pub struct LdltFactor {
 }
 
 /// Serialized permutation metadata captured during factorization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PermutationDescriptor {
     pub forward: Vec<usize>,
     pub inverse: Vec<usize>,
@@ -1179,12 +1218,42 @@ pub enum HessianFactor {
 }
 
 /// Serialized Cholesky factor for SPD approximations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CholeskyFactor {
     pub lower: Array2<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl LdltFactor {
+    pub fn reconstruct(&self, permutation: &PermutationDescriptor) -> Array2<f64> {
+        let n = self.lower.nrows();
+        let mut d = Array2::<f64>::zeros((n, n));
+        let mut idx = 0usize;
+        while idx < n {
+            if idx + 1 < n && self.subdiag[idx].abs() > 0.0 {
+                d[(idx, idx)] = self.diag[idx];
+                d[(idx + 1, idx + 1)] = self.diag[idx + 1];
+                d[(idx, idx + 1)] = self.subdiag[idx];
+                d[(idx + 1, idx)] = self.subdiag[idx];
+                idx += 2;
+            } else {
+                d[(idx, idx)] = self.diag[idx];
+                idx += 1;
+            }
+        }
+
+        let ld = self.lower.dot(&d);
+        let permuted = ld.dot(&self.lower.t());
+        let mut restored = Array2::<f64>::zeros((n, n));
+        for (i, &row) in permutation.forward.iter().enumerate() {
+            for (j, &col) in permutation.forward.iter().enumerate() {
+                restored[(row, col)] = permuted[(i, j)];
+            }
+        }
+        restored
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompanionModelHandle {
     pub reference: String,
 }
@@ -1602,29 +1671,27 @@ mod tests {
         match (&left.hessian_factor, &right.hessian_factor) {
             (
                 Some(HessianFactor::Observed {
-                    ldlt_factor: l_ldlt,
+                    factor: l_factor,
                     permutation: l_perm,
                     inertia: l_inertia,
                 }),
                 Some(HessianFactor::Observed {
-                    ldlt_factor: r_ldlt,
+                    factor: r_factor,
                     permutation: r_perm,
                     inertia: r_inertia,
                 }),
             ) => {
-                assert_array2_close(l_ldlt, r_ldlt, 1e-12);
+                assert_array2_close(&l_factor.lower, &r_factor.lower, 1e-12);
+                assert_array1_close(&l_factor.diag, &r_factor.diag, 1e-12);
+                assert_array1_close(&l_factor.subdiag, &r_factor.subdiag, 1e-12);
                 assert_eq!(l_perm, r_perm);
                 assert_eq!(l_inertia, r_inertia);
             }
             (
-                Some(HessianFactor::Expected {
-                    cholesky_factor: l_chol,
-                }),
-                Some(HessianFactor::Expected {
-                    cholesky_factor: r_chol,
-                }),
+                Some(HessianFactor::Expected { factor: l_chol }),
+                Some(HessianFactor::Expected { factor: r_chol }),
             ) => {
-                assert_array2_close(l_chol, r_chol, 1e-12);
+                assert_array2_close(&l_chol.lower, &r_chol.lower, 1e-12);
             }
             (None, None) => {}
             _ => panic!("hessian factor mismatch"),
@@ -1673,6 +1740,43 @@ mod tests {
         let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
         let state = model.update(&beta).unwrap();
         assert!(state.deviance.is_finite());
+        assert!(state.hessian_factor.is_some());
+    }
+
+    #[test]
+    fn observed_information_factor_round_trips() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, penalty) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8).unwrap();
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, penalty, SurvivalSpec::default())
+                .unwrap();
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.01 * (idx as f64 + 1.0);
+        }
+        let state = model.update(&beta).unwrap();
+        let observed = state.hessian.clone();
+        let factor = state
+            .hessian_factor
+            .as_ref()
+            .expect("observed factor should be present");
+        match factor {
+            HessianFactor::Observed {
+                factor: ldlt,
+                permutation,
+                inertia,
+            } => {
+                assert_eq!(inertia.0 + inertia.1 + inertia.2, p);
+                let reconstructed = ldlt.reconstruct(permutation);
+                assert_array2_close(&observed, &reconstructed, 1e-10);
+            }
+            other => panic!("expected observed factor, found {other:?}"),
+        }
     }
 
     #[test]
@@ -2023,6 +2127,15 @@ mod tests {
                 "expected-information Hessian not SPD: eigenvalue {}",
                 value
             );
+        }
+
+        match observed_state.hessian_factor {
+            Some(HessianFactor::Observed { .. }) => {}
+            other => panic!("observed state stored unexpected factor {other:?}"),
+        }
+        match expected_state.hessian_factor {
+            Some(HessianFactor::Expected { .. }) => {}
+            other => panic!("expected state stored unexpected factor {other:?}"),
         }
     }
 
@@ -2460,7 +2573,50 @@ mod tests {
             interaction_metadata: vec![interaction],
             companion_models: vec![companion],
             hessian_factor: Some(HessianFactor::Expected {
-                cholesky_factor: Array2::<f64>::eye(layout.combined_exit.ncols()),
+                factor: CholeskyFactor {
+                    lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
+                },
+            }),
+        };
+
+        let serialized = serde_json::to_string(&artifacts).unwrap();
+        let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
+        assert_artifacts_close(&artifacts, &round_trip);
+    }
+
+    #[test]
+    fn survival_artifacts_round_trip_serialization_observed_factor() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, _) = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4).unwrap();
+        let p = layout.combined_exit.ncols();
+        let ldlt = LdltFactor {
+            lower: Array2::<f64>::eye(p),
+            diag: Array1::<f64>::from_elem(p, 1.0),
+            subdiag: Array1::<f64>::zeros(p),
+        };
+        let identity_perm: Vec<usize> = (0..p).collect();
+        let permutation = PermutationDescriptor {
+            forward: identity_perm.clone(),
+            inverse: identity_perm,
+        };
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(p),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: Some(HessianFactor::Observed {
+                factor: ldlt,
+                permutation,
+                inertia: (p, 0, 0),
             }),
         };
 
