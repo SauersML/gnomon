@@ -38,8 +38,17 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
-use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
+use crate::calibrate::model::{
+    LinkFunction, MappedCoefficients, ModelConfig, ModelFamily, TrainedModel,
+};
 use crate::calibrate::pirls::{self, PirlsResult};
+use crate::calibrate::survival::WorkingModel;
+use crate::calibrate::survival::{
+    BasisDescriptor, ColumnRange, CovariateLayout, HessianFactor, LdltFactor, PenaltyDescriptor,
+    PermutationDescriptor, SurvivalLayout, SurvivalModelArtifacts, SurvivalTrainingData,
+    ValueRange, WorkingModelSurvival, WorkingState, build_survival_layout,
+};
+use crate::calibrate::survival_data::SurvivalTrainingBundle;
 
 fn log_basis_cache_stats(context: &str) {
     let stats = basis::basis_cache_stats();
@@ -61,7 +70,9 @@ fn log_basis_cache_stats(context: &str) {
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{
+    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, ldlt_rook,
+};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -631,6 +642,9 @@ pub enum EstimationError {
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] crate::calibrate::basis::BasisError),
 
+    #[error("Survival working model error: {0}")]
+    Survival(#[from] crate::calibrate::survival::SurvivalError),
+
     #[error("A linear system solve failed. The penalized Hessian may be singular. Error: {0}")]
     LinearSystemSolveFailed(FaerLinalgError),
 
@@ -883,6 +897,7 @@ pub fn train_model(
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
             calibrator: None,
+            survival: None,
         };
 
         trained_model
@@ -1548,6 +1563,7 @@ pub fn train_model(
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
         calibrator: calibrator_opt,
+        survival: None,
     };
 
     trained_model
@@ -8511,6 +8527,304 @@ fn test_indefinite_hessian_detection_and_retreat() {
     }
 
     println!("=== INDEFINITE HESSIAN DETECTION TEST COMPLETED ===");
+}
+
+fn compute_log_range(log_entry: &Array1<f64>, log_exit: &Array1<f64>) -> (f64, f64) {
+    let mut min_val = f64::INFINITY;
+    let mut max_val = f64::NEG_INFINITY;
+    for &value in log_entry.iter().chain(log_exit.iter()) {
+        if value < min_val {
+            min_val = value;
+        }
+        if value > max_val {
+            max_val = value;
+        }
+    }
+    if !min_val.is_finite() || !max_val.is_finite() {
+        (0.0, 0.0)
+    } else {
+        (min_val, max_val)
+    }
+}
+
+fn compute_value_range(values: ArrayView1<'_, f64>) -> ValueRange {
+    if values.is_empty() {
+        return ValueRange { min: 0.0, max: 0.0 };
+    }
+    let mut min_val = f64::INFINITY;
+    let mut max_val = f64::NEG_INFINITY;
+    for &value in values.iter() {
+        if value < min_val {
+            min_val = value;
+        }
+        if value > max_val {
+            max_val = value;
+        }
+    }
+    if !min_val.is_finite() || !max_val.is_finite() {
+        ValueRange { min: 0.0, max: 0.0 }
+    } else {
+        ValueRange {
+            min: min_val,
+            max: max_val,
+        }
+    }
+}
+
+fn covariate_layout_from_data(data: &SurvivalTrainingData) -> CovariateLayout {
+    let mut column_names = Vec::with_capacity(2 + data.pcs.ncols());
+    column_names.push("pgs".to_string());
+    column_names.push("sex".to_string());
+    for idx in 0..data.pcs.ncols() {
+        column_names.push(format!("pc{}", idx + 1));
+    }
+
+    let mut ranges = Vec::with_capacity(column_names.len());
+    ranges.push(compute_value_range(data.pgs.view()));
+    ranges.push(compute_value_range(data.sex.view()));
+    for idx in 0..data.pcs.ncols() {
+        ranges.push(compute_value_range(data.pcs.column(idx)));
+    }
+
+    CovariateLayout {
+        column_names,
+        ranges,
+    }
+}
+
+fn penalty_descriptors_from_layout(
+    layout: &SurvivalLayout,
+    order: usize,
+) -> Vec<PenaltyDescriptor> {
+    layout
+        .penalties
+        .blocks
+        .iter()
+        .map(|block| PenaltyDescriptor {
+            order,
+            lambda: block.lambda,
+            matrix: block.matrix.clone(),
+            column_range: ColumnRange::new(block.range.start, block.range.end),
+        })
+        .collect()
+}
+
+fn make_hessian_factor(hessian: &Array2<f64>) -> Option<HessianFactor> {
+    match ldlt_rook(hessian) {
+        Ok((lower, diag, subdiag, forward, inverse, inertia)) => Some(HessianFactor::Observed {
+            factor: LdltFactor {
+                lower,
+                diag,
+                subdiag,
+            },
+            permutation: PermutationDescriptor { forward, inverse },
+            inertia,
+        }),
+        Err(_) => None,
+    }
+}
+
+fn build_survival_artifacts(
+    layout: &SurvivalLayout,
+    beta: &Array1<f64>,
+    data: &SurvivalTrainingData,
+    basis: &BasisDescriptor,
+    penalty_order: usize,
+    hessian: &Array2<f64>,
+) -> SurvivalModelArtifacts {
+    SurvivalModelArtifacts {
+        coefficients: beta.clone(),
+        age_basis: basis.clone(),
+        time_varying_basis: None,
+        static_covariate_layout: covariate_layout_from_data(data),
+        penalties: penalty_descriptors_from_layout(layout, penalty_order),
+        age_transform: layout.age_transform,
+        reference_constraint: layout.reference_constraint.clone(),
+        interaction_metadata: Vec::new(),
+        companion_models: Vec::new(),
+        hessian_factor: make_hessian_factor(hessian),
+    }
+}
+
+fn fit_survival_newton(
+    model: &mut WorkingModelSurvival,
+    max_iterations: usize,
+    tolerance: f64,
+) -> Result<(Array1<f64>, Array2<f64>, WorkingState), EstimationError> {
+    let p = model.layout.combined_exit.ncols();
+    let mut beta = Array1::<f64>::zeros(p);
+    let mut state = model.update(&beta)?;
+    let mut iteration = 0usize;
+    let tol = tolerance.max(1e-12);
+
+    enum SolverFactor {
+        Llt(FaerLlt<f64>),
+        Ldlt(FaerLdlt<f64>),
+    }
+
+    impl SolverFactor {
+        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+            match self {
+                SolverFactor::Llt(f) => f.solve(rhs),
+                SolverFactor::Ldlt(f) => f.solve(rhs),
+            }
+        }
+    }
+
+    loop {
+        let grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if grad_norm <= tol {
+            break;
+        }
+
+        if iteration >= max_iterations {
+            return Err(EstimationError::PirlsDidNotConverge {
+                max_iterations,
+                last_change: grad_norm,
+            });
+        }
+
+        let h_view = FaerArrayView::new(&state.hessian);
+        let solver = if let Ok(factor) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+            SolverFactor::Llt(factor)
+        } else {
+            let ldlt = FaerLdlt::new(h_view.as_ref(), Side::Lower)
+                .map_err(|err| EstimationError::LinearSystemSolveFailed(FaerLinalgError::Ldlt(err)))?;
+            SolverFactor::Ldlt(ldlt)
+        };
+
+        let grad_view = FaerColView::new(&state.gradient);
+        let delta_mat = solver.solve(grad_view.as_ref());
+        let mut delta = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            delta[i] = delta_mat[(i, 0)];
+        }
+
+        let mut step_scale = 1.0;
+        let mut accepted_state = None;
+        let mut candidate_beta = beta.clone();
+        for _ in 0..16 {
+            let scaled = delta.mapv(|v| v * step_scale);
+            candidate_beta = beta.clone() - &scaled;
+            match model.update(&candidate_beta) {
+                Ok(next_state) => {
+                    if next_state.deviance <= state.deviance + 1e-9 {
+                        accepted_state = Some(next_state);
+                        break;
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+            step_scale *= 0.5;
+        }
+
+        let Some(next_state) = accepted_state else {
+            return Err(EstimationError::PirlsDidNotConverge {
+                max_iterations,
+                last_change: grad_norm,
+            });
+        };
+
+        beta = candidate_beta;
+        state = next_state;
+        iteration += 1;
+    }
+
+    let final_hessian = state.hessian.clone();
+    Ok((beta, final_hessian, state))
+}
+
+pub fn train_survival_model(
+    bundle: &SurvivalTrainingBundle,
+    config: &ModelConfig,
+) -> Result<TrainedModel, EstimationError> {
+    basis::clear_basis_cache();
+
+    let spec = match &config.model_family {
+        ModelFamily::Survival(spec) => spec.clone(),
+        _ => {
+            return Err(EstimationError::InvalidSpecification(
+                "train_survival_model requires ModelFamily::Survival".to_string(),
+            ));
+        }
+    };
+
+    let survival_cfg = config.survival.as_ref().ok_or_else(|| {
+        EstimationError::InvalidSpecification(
+            "survival configuration missing baseline settings".to_string(),
+        )
+    })?;
+
+    let log_entry = bundle
+        .age_transform
+        .transform_array(&bundle.data.age_entry)?;
+    let log_exit = bundle
+        .age_transform
+        .transform_array(&bundle.data.age_exit)?;
+    let (log_min, mut log_max) = compute_log_range(&log_entry, &log_exit);
+    if (log_max - log_min).abs() < 1e-8 {
+        log_max = log_min + 1e-3;
+    }
+
+    let (_, knot_vector) = basis::create_bspline_basis(
+        log_exit.view(),
+        (log_min, log_max),
+        survival_cfg.baseline_basis.num_knots,
+        survival_cfg.baseline_basis.degree,
+    )?;
+    let basis_descriptor = BasisDescriptor {
+        knot_vector,
+        degree: survival_cfg.baseline_basis.degree,
+    };
+
+    let (layout, mut monotonicity) = build_survival_layout(
+        &bundle.data,
+        &basis_descriptor,
+        survival_cfg.guard_delta,
+        config.penalty_order,
+        survival_cfg.initial_lambda,
+        survival_cfg.monotonic_grid_size,
+    )?;
+    monotonicity.lambda = survival_cfg.monotonic_lambda;
+
+    let mut working_model = WorkingModelSurvival::new(layout, &bundle.data, monotonicity, spec)?;
+
+    let (beta, hessian, _) = fit_survival_newton(
+        &mut working_model,
+        config.max_iterations,
+        config.convergence_tolerance,
+    )?;
+    let artifacts = build_survival_artifacts(
+        &working_model.layout,
+        &beta,
+        &bundle.data,
+        &basis_descriptor,
+        config.penalty_order,
+        &hessian,
+    );
+
+    let lambdas: Vec<f64> = working_model
+        .layout
+        .penalties
+        .blocks
+        .iter()
+        .map(|block| block.lambda)
+        .collect();
+
+    let trained = TrainedModel {
+        config: config.clone(),
+        coefficients: MappedCoefficients::default(),
+        lambdas,
+        hull: None,
+        penalized_hessian: Some(hessian),
+        scale: None,
+        calibrator: None,
+        survival: Some(artifacts),
+    };
+
+    log_basis_cache_stats("train_survival_model");
+
+    Ok(trained)
 }
 
 // Implement From<EstimationError> for String to allow using ? in functions returning Result<_, String>

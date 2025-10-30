@@ -2,7 +2,7 @@ use crate::calibrate::basis::{self};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
-use crate::calibrate::survival::SurvivalSpec;
+use crate::calibrate::survival::{SurvivalModelArtifacts, SurvivalSpec};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -85,6 +85,15 @@ pub struct PrincipalComponentConfig {
     pub range: (f64, f64),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalModelConfig {
+    pub baseline_basis: BasisConfig,
+    pub guard_delta: f64,
+    pub initial_lambda: f64,
+    pub monotonic_grid_size: usize,
+    pub monotonic_lambda: f64,
+}
+
 /// Holds the transformation matrix for a sum-to-zero constraint.
 /// This is serializable so it can be saved to the TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +148,8 @@ pub struct ModelConfig {
     /// Null-space transformation matrices for PC main effects (unpenalized part).
     /// Maps PC name to Z_null (columns span the penalty null space after dropping intercept).
     pub pc_null_transforms: HashMap<String, Array2<f64>>,
+    #[serde(default)]
+    pub survival: Option<SurvivalModelConfig>,
 }
 
 impl ModelConfig {
@@ -172,6 +183,7 @@ impl ModelConfig {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
+            survival: None,
         }
     }
 
@@ -217,6 +229,8 @@ struct ModelConfigSerde {
     interaction_centering_means: HashMap<String, Array1<f64>>,
     interaction_orth_alpha: HashMap<String, Array2<f64>>,
     pc_null_transforms: HashMap<String, Array2<f64>>,
+    #[serde(default)]
+    survival: Option<SurvivalModelConfig>,
 }
 
 impl From<ModelConfigSerde> for ModelConfig {
@@ -241,6 +255,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            survival,
         } = helper;
 
         let model_family = model_family
@@ -266,6 +281,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            survival,
         }
     }
 }
@@ -291,6 +307,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            survival,
         } = config;
 
         let legacy_link = match &model_family {
@@ -318,6 +335,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            survival,
         }
     }
 }
@@ -334,6 +352,16 @@ pub struct MappedCoefficients {
     pub interaction_effects: HashMap<String, Vec<f64>>,
 }
 
+impl Default for MappedCoefficients {
+    fn default() -> Self {
+        Self {
+            intercept: 0.0,
+            main_effects: MainEffects::default(),
+            interaction_effects: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainEffects {
     /// Coefficient for the main effect of sex (binary indicator).
@@ -345,11 +373,22 @@ pub struct MainEffects {
     pub pcs: HashMap<String, Vec<f64>>,
 }
 
+impl Default for MainEffects {
+    fn default() -> Self {
+        Self {
+            sex: 0.0,
+            pgs: Vec::new(),
+            pcs: HashMap::new(),
+        }
+    }
+}
+
 /// The top-level, self-contained, trained model artifact.
 /// This is the structure that gets saved to and loaded from a file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrainedModel {
     pub config: ModelConfig,
+    #[serde(default)]
     pub coefficients: MappedCoefficients,
     /// Estimated smoothing parameters from REML
     pub lambdas: Vec<f64>,
@@ -366,6 +405,9 @@ pub struct TrainedModel {
     /// Optional post-fit calibrator model
     #[serde(default)]
     pub calibrator: Option<crate::calibrate::calibrator::CalibratorModel>,
+    /// Optional survival-specific artifacts (present when training survival models).
+    #[serde(default)]
+    pub survival: Option<SurvivalModelArtifacts>,
 }
 
 /// Custom error type for model loading, saving, and prediction.
@@ -402,20 +444,15 @@ pub enum ModelError {
     #[error("Estimation error: {0}")]
     EstimationError(#[from] crate::calibrate::estimate::EstimationError),
 
-    #[error("Model family '{family}' is not supported for {operation}.")]
-    UnsupportedModelFamily {
-        family: &'static str,
-        operation: &'static str,
-    },
+    #[error("Operation '{0}' is not supported for survival model family.")]
+    UnsupportedForSurvival(&'static str),
 }
 
 impl TrainedModel {
     fn ensure_gam_link(&self, operation: &'static str) -> Result<LinkFunction, ModelError> {
         match &self.config.model_family {
             ModelFamily::Gam(link) => Ok(*link),
-            ModelFamily::Survival(_) => Err(ModelError::UnsupportedModelFamily {
-                family: "survival",
-                operation,
+            ModelFamily::Survival(_) => Err(ModelError::UnsupportedForSurvival(operation)),
             }),
         }
     }
@@ -436,6 +473,9 @@ impl TrainedModel {
         ),
         ModelError,
     > {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_detailed"));
+        }
         // --- Validate inputs ---
         if pcs_new.ncols() != self.config.pc_configs.len() {
             return Err(ModelError::MismatchedPcCount {
@@ -542,6 +582,9 @@ impl TrainedModel {
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict"));
+        }
         // Restore original behavior via detailed path: PHC -> design rebuild -> inverse link
         let (_, mean, _, _) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         Ok(mean)
@@ -555,6 +598,9 @@ impl TrainedModel {
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_calibrated"));
+        }
         // Stage: Compute baseline predictions
         let link_function = self.ensure_gam_link("calibrated prediction")?;
 
@@ -593,6 +639,9 @@ impl TrainedModel {
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_linear"));
+        }
         if pcs_new.ncols() != self.config.pc_configs.len() {
             return Err(ModelError::MismatchedPcCount {
                 found: pcs_new.ncols(),
@@ -651,6 +700,11 @@ impl TrainedModel {
     }
 
     fn rebuild_layout_from_config(&self) -> Result<ModelLayout, ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival(
+                "rebuild_layout_from_config",
+            ));
+        }
         let mut pc_null_ncols = Vec::with_capacity(self.config.pc_configs.len());
         let mut pc_range_ncols = Vec::with_capacity(self.config.pc_configs.len());
         let mut pc_int_ncols = Vec::with_capacity(self.config.pc_configs.len());
@@ -714,6 +768,9 @@ impl TrainedModel {
     }
 
     fn assert_layout_consistency_from_config(&self) -> Result<(), ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Ok(());
+        }
         let layout = self.rebuild_layout_from_config()?;
         self.assert_layout_consistency_with_layout(&layout)?;
         Ok(())
@@ -723,6 +780,9 @@ impl TrainedModel {
         &self,
         layout: &ModelLayout,
     ) -> Result<(), ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Ok(());
+        }
         assert_eq!(
             self.lambdas.len(),
             layout.num_penalties,
@@ -1376,6 +1436,7 @@ mod tests {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+                survival: None,
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5, // Added an intercept for a more complete test
@@ -1392,6 +1453,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            survival: None,
         };
 
         // --- Define Test Points ---
@@ -1467,6 +1529,7 @@ mod tests {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+                survival: None,
             },
             coefficients: MappedCoefficients {
                 intercept: 0.0,
@@ -1482,6 +1545,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            survival: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -1725,6 +1789,7 @@ mod tests {
                 pc_null_transforms: pc_null_transforms.clone(),
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
+                survival: None,
             },
             coefficients: MappedCoefficients {
                 intercept: 0.5,
@@ -1793,6 +1858,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            survival: None,
         };
 
         // Create a temporary file for testing

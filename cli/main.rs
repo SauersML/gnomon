@@ -3,23 +3,36 @@
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ndarray::{Array1, ArrayView1};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process;
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
-use gnomon::calibrate::estimate::train_model;
+use gnomon::calibrate::estimate::{train_model, train_survival_model};
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, TrainedModel,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, SurvivalModelConfig,
+    TrainedModel,
 };
+use gnomon::calibrate::survival::SurvivalSpec;
+use gnomon::calibrate::survival_data::load_survival_training_data;
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
+use std::collections::HashMap;
+
+#[derive(Clone, ValueEnum)]
+pub enum ModelFamilyCli {
+    Gam,
+    Survival,
+}
 
 #[derive(Args)]
 pub struct TrainArgs {
+    #[arg(long, value_enum, default_value_t = ModelFamilyCli::Gam)]
+    pub model_family: ModelFamilyCli,
+
     /// Path to training TSV file with phenotype,score,PC1,PC2,... columns
     pub training_data: String,
 
@@ -66,6 +79,46 @@ pub struct TrainArgs {
     /// Disable the optional post-process calibration layer (enabled by default)
     #[arg(long)]
     pub no_calibration: bool,
+
+    /// Guard delta for the survival age transform
+    #[arg(long, default_value = "0.1")]
+    pub survival_guard_delta: f64,
+
+    /// Number of internal knots for the survival baseline spline
+    #[arg(long, default_value = "6")]
+    pub survival_baseline_knots: usize,
+
+    /// Degree for the survival baseline spline
+    #[arg(long, default_value = "3")]
+    pub survival_baseline_degree: usize,
+
+    /// Initial smoothing parameter for the survival baseline spline
+    #[arg(long, default_value = "1.0")]
+    pub survival_initial_lambda: f64,
+
+    /// Grid size for the survival monotonicity penalty
+    #[arg(long, default_value = "64")]
+    pub survival_monotonic_grid: usize,
+
+    /// Weight of the survival monotonicity barrier
+    #[arg(long, default_value = "0.0001")]
+    pub survival_monotonic_lambda: f64,
+
+    /// Derivative guard threshold used inside the survival likelihood
+    #[arg(long, default_value = "1e-8")]
+    pub survival_derivative_guard: f64,
+
+    /// Soft barrier weight discouraging negative derivatives in survival models
+    #[arg(long, default_value = "0.0001")]
+    pub survival_barrier_weight: f64,
+
+    /// Soft barrier scale controlling derivative penalties in survival models
+    #[arg(long, default_value = "1.0")]
+    pub survival_barrier_scale: f64,
+
+    /// Use expected information instead of observed Hessian when fitting survival models
+    #[arg(long)]
+    pub survival_expected_information: bool,
 }
 
 #[derive(Args)]
@@ -83,8 +136,6 @@ pub struct InferArgs {
 }
 
 pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Loading training data from: {}", args.training_data);
-
     gnomon::calibrate::model::set_calibrator_enabled(!args.no_calibration);
     if args.no_calibration {
         println!("Post-process calibration disabled via --no-calibration flag.");
@@ -92,86 +143,145 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("Post-process calibration enabled (default).");
     }
 
-    // Load training data
-    let data = load_training_data(&args.training_data, args.num_pcs)?;
-    println!(
-        "Loaded {} samples with {} PCs",
-        data.y.len(),
-        data.pcs.ncols()
-    );
+    match args.model_family {
+        ModelFamilyCli::Gam => {
+            println!("Loading training data from: {}", args.training_data);
+            let data = load_training_data(&args.training_data, args.num_pcs)?;
+            println!(
+                "Loaded {} samples with {} PCs",
+                data.y.len(),
+                data.pcs.ncols()
+            );
 
-    // Auto-detect link function based on phenotype
-    let link_function = detect_link_function(&data.y);
-    println!("Auto-detected link function: {link_function:?}");
+            let link_function = detect_link_function(&data.y);
+            println!("Auto-detected link function: {link_function:?}");
 
-    // Calculate data ranges for basis construction
-    let pgs_range = calculate_range(data.p.view());
-    let pc_ranges: Vec<(f64, f64)> = (0..data.pcs.ncols())
-        .map(|i| calculate_range(data.pcs.column(i)))
-        .collect();
+            let pgs_range = calculate_range(data.p.view());
+            let pc_ranges: Vec<(f64, f64)> = (0..data.pcs.ncols())
+                .map(|i| calculate_range(data.pcs.column(i)))
+                .collect();
 
-    println!("PGS range: ({:.3}, {:.3})", pgs_range.0, pgs_range.1);
-    println!(
-        "PC ranges: {}",
-        pc_ranges
-            .iter()
-            .enumerate()
-            .map(|(i, &(min, max))| format!("PC{}: ({:.3}, {:.3})", i + 1, min, max))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+            println!("PGS range: ({:.3}, {:.3})", pgs_range.0, pgs_range.1);
+            println!(
+                "PC ranges: {}",
+                pc_ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(min, max))| format!("PC{}: ({:.3}, {:.3})", i + 1, min, max))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
 
-    // Create basis configurations
-    let pgs_basis_config = BasisConfig {
-        num_knots: args.pgs_knots,
-        degree: args.pgs_degree,
-    };
+            let pgs_basis_config = BasisConfig {
+                num_knots: args.pgs_knots,
+                degree: args.pgs_degree,
+            };
 
-    // Create PC configs with names, ranges, and basis configs
-    let pc_configs = (0..args.num_pcs)
-        .map(|i| gnomon::calibrate::model::PrincipalComponentConfig {
-            name: format!("PC{}", i + 1),
-            basis_config: BasisConfig {
-                num_knots: args.pc_knots,
-                degree: args.pc_degree,
-            },
-            range: pc_ranges[i],
-        })
-        .collect();
+            let pc_configs = (0..args.num_pcs)
+                .map(|i| gnomon::calibrate::model::PrincipalComponentConfig {
+                    name: format!("PC{}", i + 1),
+                    basis_config: BasisConfig {
+                        num_knots: args.pc_knots,
+                        degree: args.pc_degree,
+                    },
+                    range: pc_ranges[i],
+                })
+                .collect();
 
-    // Lambda values are now estimated automatically via REML
-    println!("Training model with REML estimation of smoothing parameters");
+            println!("Training model with REML estimation of smoothing parameters");
+            let config = ModelConfig {
+                model_family: ModelFamily::Gam(link_function),
+                penalty_order: args.penalty_order,
+                convergence_tolerance: args.convergence_tolerance,
+                max_iterations: args.max_iterations,
+                reml_convergence_tolerance: args.reml_convergence_tolerance,
+                reml_max_iterations: args.reml_max_iterations,
+                firth_bias_reduction: false,
+                reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(
+                ),
+                pgs_basis_config,
+                pc_configs,
+                pgs_range,
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: HashMap::new(),
+                knot_vectors: HashMap::new(),
+                range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
+                interaction_orth_alpha: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
+                survival: None,
+            };
 
-    // Create final model configuration
-    let config = ModelConfig {
-        model_family: ModelFamily::Gam(link_function),
-        penalty_order: args.penalty_order,
-        convergence_tolerance: args.convergence_tolerance,
-        max_iterations: args.max_iterations,
-        reml_convergence_tolerance: args.reml_convergence_tolerance,
-        reml_max_iterations: args.reml_max_iterations,
-        firth_bias_reduction: false,
-        reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(),
-        pgs_basis_config,
-        pc_configs,
-        pgs_range,
-        interaction_penalty: InteractionPenaltyKind::Anisotropic,
-        sum_to_zero_constraints: std::collections::HashMap::new(),
-        knot_vectors: std::collections::HashMap::new(),
-        range_transforms: std::collections::HashMap::new(),
-        interaction_centering_means: std::collections::HashMap::new(),
-        interaction_orth_alpha: std::collections::HashMap::new(),
-        pc_null_transforms: std::collections::HashMap::new(),
-    };
+            println!("Training final model...");
+            let trained_model = train_model(&data, &config)?;
+            trained_model.save("model.toml")?;
+            println!("Model saved to: model.toml");
+        }
+        ModelFamilyCli::Survival => {
+            println!(
+                "Loading survival training data from: {}",
+                args.training_data
+            );
+            let bundle = load_survival_training_data(
+                &args.training_data,
+                args.num_pcs,
+                args.survival_guard_delta,
+            )?;
+            println!(
+                "Loaded {} samples with {} PCs",
+                bundle.data.age_entry.len(),
+                bundle.data.pcs.ncols()
+            );
 
-    // Train the final model
-    println!("Training final model...");
-    let trained_model = train_model(&data, &config)?;
+            let mut spec = SurvivalSpec::default();
+            spec.derivative_guard = args.survival_derivative_guard;
+            spec.barrier_weight = args.survival_barrier_weight;
+            spec.barrier_scale = args.survival_barrier_scale;
+            spec.use_expected_information = args.survival_expected_information;
 
-    // Save model to hardcoded output path
-    let output_path = "model.toml";
-    trained_model.save(output_path)?;
-    println!("Model saved to: {output_path}");
+            let survival_config = SurvivalModelConfig {
+                baseline_basis: BasisConfig {
+                    num_knots: args.survival_baseline_knots,
+                    degree: args.survival_baseline_degree,
+                },
+                guard_delta: args.survival_guard_delta,
+                initial_lambda: args.survival_initial_lambda,
+                monotonic_grid_size: args.survival_monotonic_grid,
+                monotonic_lambda: args.survival_monotonic_lambda,
+            };
+
+            let config = ModelConfig {
+                model_family: ModelFamily::Survival(spec),
+                penalty_order: args.penalty_order,
+                convergence_tolerance: args.convergence_tolerance,
+                max_iterations: args.max_iterations,
+                reml_convergence_tolerance: args.reml_convergence_tolerance,
+                reml_max_iterations: args.reml_max_iterations,
+                firth_bias_reduction: false,
+                reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(
+                ),
+                pgs_basis_config: BasisConfig {
+                    num_knots: 0,
+                    degree: 0,
+                },
+                pc_configs: Vec::new(),
+                pgs_range: (0.0, 0.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: HashMap::new(),
+                knot_vectors: HashMap::new(),
+                range_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
+                interaction_orth_alpha: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
+                survival: Some(survival_config),
+            };
+
+            println!("Training survival model...");
+            let trained_model = train_survival_model(&bundle, &config)?;
+            trained_model.save("model.toml")?;
+            println!("Model saved to: model.toml");
+        }
+    }
 
     Ok(())
 }
@@ -181,6 +291,10 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load trained model
     let model = TrainedModel::load(&args.model)?;
+    if matches!(model.config.model_family, ModelFamily::Survival(_)) {
+        println!("Loaded survival model. CLI inference for survival models is not yet supported.");
+        return Ok(());
+    }
     let num_pcs = model.config.pc_configs.len();
 
     println!("Model expects {num_pcs} PCs");

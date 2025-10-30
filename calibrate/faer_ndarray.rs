@@ -17,6 +17,8 @@ pub enum FaerLinalgError {
     SelfAdjointEigen(solvers::EvdError),
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
+    #[error("LDLT factorization failed: {0:?}")]
+    Ldlt(solvers::LdltError),
 }
 
 #[inline]

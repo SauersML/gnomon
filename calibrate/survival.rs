@@ -368,6 +368,71 @@ pub fn validate_survival_inputs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn validate_survival_inputs(
+    age_entry: ArrayView1<'_, f64>,
+    age_exit: ArrayView1<'_, f64>,
+    event_target: ArrayView1<'_, u8>,
+    event_competing: ArrayView1<'_, u8>,
+    sample_weight: ArrayView1<'_, f64>,
+    pgs: ArrayView1<'_, f64>,
+    sex: ArrayView1<'_, f64>,
+    pcs: ArrayView2<'_, f64>,
+) -> Result<(), SurvivalError> {
+    let n = age_entry.len();
+    if n == 0 {
+        return Err(SurvivalError::EmptyAgeVector);
+    }
+    if age_exit.len() != n
+        || event_target.len() != n
+        || event_competing.len() != n
+        || sample_weight.len() != n
+        || pgs.len() != n
+        || sex.len() != n
+        || pcs.nrows() != n
+    {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    for idx in 0..n {
+        let entry = age_entry[idx];
+        let exit = age_exit[idx];
+        if !entry.is_finite() || !exit.is_finite() {
+            return Err(SurvivalError::NonFiniteAge);
+        }
+        if !(entry < exit) {
+            return Err(SurvivalError::InvalidAgeOrder);
+        }
+
+        let target = event_target[idx];
+        let competing = event_competing[idx];
+        if target > 1 || competing > 1 {
+            return Err(SurvivalError::InvalidEventFlag);
+        }
+        if target == 1 && competing == 1 {
+            return Err(SurvivalError::ConflictingEvents);
+        }
+
+        let weight = sample_weight[idx];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(SurvivalError::InvalidSampleWeight);
+        }
+
+        if !pgs[idx].is_finite() || !sex[idx].is_finite() {
+            return Err(SurvivalError::NonFiniteCovariate);
+        }
+
+        for col in 0..pcs.ncols() {
+            let value = pcs[(idx, col)];
+            if !value.is_finite() {
+                return Err(SurvivalError::NonFiniteCovariate);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Guard that constrains the baseline spline at the chosen reference point.
 fn make_reference_constraint(
     knot_vector: ArrayView1<f64>,
