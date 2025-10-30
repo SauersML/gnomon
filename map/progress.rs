@@ -48,8 +48,7 @@ pub trait FitProgressObserver: Send + Sync {
     fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
         let _ = (stage, total_variants);
     }
-    fn on_stage_finish(&self, _: FitProgressStage) {
-    }
+    fn on_stage_finish(&self, _: FitProgressStage) {}
     fn on_stage_bytes(
         &self,
         stage: FitProgressStage,
@@ -140,8 +139,7 @@ pub trait ProjectionProgressObserver: Send + Sync {
     fn on_stage_total(&self, stage: ProjectionProgressStage, total_variants: usize) {
         let _ = (stage, total_variants);
     }
-    fn on_stage_finish(&self, _: ProjectionProgressStage) {
-    }
+    fn on_stage_finish(&self, _: ProjectionProgressStage) {}
 }
 
 #[derive(Default)]

@@ -12,11 +12,11 @@ use std::process;
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::model::SurvivalModelConfig;
 use gnomon::calibrate::model::{
     InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, TrainedModel,
 };
-#[cfg(feature = "survival-data")]
-use gnomon::calibrate::model::SurvivalModelConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival::SurvivalSpec;
 #[cfg(feature = "survival-data")]
