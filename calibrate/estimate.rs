@@ -1840,7 +1840,10 @@ pub fn train_survival_model(
                 &mut model,
                 beta0,
                 &self.options,
-                |_info| {},
+                |info: &crate::calibrate::pirls::WorkingModelIterationInfo| {
+                    let deviance = info.deviance;
+                    drop(deviance);
+                },
             )?;
             let cost = result.state.deviance;
 
