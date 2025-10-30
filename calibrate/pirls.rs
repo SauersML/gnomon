@@ -72,6 +72,204 @@ impl PirlsWorkspace {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkingModelPirlsOptions {
+    pub max_iterations: usize,
+    pub convergence_tolerance: f64,
+    pub max_step_halving: usize,
+    pub min_step_size: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkingModelIterationInfo {
+    pub iteration: usize,
+    pub deviance: f64,
+    pub gradient_norm: f64,
+    pub step_size: f64,
+    pub step_halving: usize,
+}
+
+#[derive(Clone)]
+pub struct WorkingModelPirlsResult {
+    pub beta: Array1<f64>,
+    pub state: WorkingState,
+    pub status: PirlsStatus,
+    pub iterations: usize,
+    pub last_gradient_norm: f64,
+    pub last_deviance_change: f64,
+    pub last_step_size: f64,
+    pub last_step_halving: usize,
+    pub max_abs_eta: f64,
+}
+
+fn solve_newton_direction_dense(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    let mut matrix = hessian.clone();
+    let mut rhs = gradient.mapv(|v| -v);
+    let mut attempt = 0usize;
+    loop {
+        match FaerLdlt::new(FaerArrayView::new(&matrix).as_ref(), Side::Lower) {
+            Ok(factor) => {
+                let mut rhs_mat = array1_to_col_mat_mut(&mut rhs);
+                factor.solve_in_place(rhs_mat.as_mut());
+                return Ok(rhs);
+            }
+            Err(err) => {
+                if attempt >= 6 {
+                    return Err(EstimationError::LinearSystemSolveFailed(err));
+                }
+                let ridge = 10f64.powi((attempt as i32) - 6);
+                for i in 0..matrix.nrows() {
+                    matrix[[i, i]] += ridge;
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+pub fn run_working_model_pirls<M, F>(
+    model: &mut M,
+    mut beta: Array1<f64>,
+    options: &WorkingModelPirlsOptions,
+    mut iteration_callback: F,
+) -> Result<WorkingModelPirlsResult, EstimationError>
+where
+    M: WorkingModel,
+    F: FnMut(&WorkingModelIterationInfo),
+{
+    let mut last_deviance = f64::INFINITY;
+    let mut last_gradient_norm = f64::INFINITY;
+    let mut last_deviance_change = f64::INFINITY;
+    let mut last_step_size = 0.0;
+    let mut last_step_halving = 0usize;
+    let mut max_abs_eta = 0.0;
+    let mut status = PirlsStatus::MaxIterationsReached;
+    let mut iterations = 0usize;
+    let mut final_state: Option<WorkingState> = None;
+
+    for iter in 1..=options.max_iterations {
+        iterations = iter;
+        let state = model.update(&beta)?;
+        let state_grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
+        let mut step = 1.0;
+        let mut step_halving = 0usize;
+        let mut candidate_beta = beta.clone();
+        let mut candidate_state_opt: Option<WorkingState> = None;
+        let mut last_error: Option<EstimationError> = None;
+
+        loop {
+            candidate_beta = &beta + &(direction.mapv(|v| step * v));
+            match model.update(&candidate_beta) {
+                Ok(candidate_state) => {
+                    if candidate_state.deviance <= state.deviance
+                        || !candidate_state.deviance.is_finite()
+                    {
+                        candidate_state_opt = Some(candidate_state);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            }
+
+            if step_halving >= options.max_step_halving || step * 0.5 < options.min_step_size {
+                if let Some(err) = last_error {
+                    return Err(err);
+                }
+                return Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: iter,
+                    last_change: state_grad_norm,
+                });
+            }
+
+            step *= 0.5;
+            step_halving += 1;
+        }
+
+        let candidate_state = candidate_state_opt.expect("accepted state");
+        let candidate_grad_norm = candidate_state
+            .gradient
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let deviance_change = last_deviance - candidate_state.deviance;
+
+        iteration_callback(&WorkingModelIterationInfo {
+            iteration: iter,
+            deviance: candidate_state.deviance,
+            gradient_norm: candidate_grad_norm,
+            step_size: step,
+            step_halving,
+        });
+
+        beta = candidate_beta;
+        last_deviance = candidate_state.deviance;
+        last_gradient_norm = candidate_grad_norm;
+        last_deviance_change = deviance_change;
+        last_step_size = step;
+        last_step_halving = step_halving;
+        max_abs_eta = candidate_state
+            .eta
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0, f64::max);
+
+        if !last_deviance.is_finite() || !last_gradient_norm.is_finite() {
+            status = PirlsStatus::Unstable;
+            final_state = Some(candidate_state);
+            break;
+        }
+
+        if candidate_grad_norm < options.convergence_tolerance {
+            status = if deviance_change.abs() < options.convergence_tolerance {
+                PirlsStatus::Converged
+            } else {
+                PirlsStatus::StalledAtValidMinimum
+            };
+            final_state = Some(candidate_state);
+            break;
+        }
+
+        if deviance_change.abs() < options.convergence_tolerance {
+            status = PirlsStatus::Converged;
+            final_state = Some(candidate_state);
+            break;
+        }
+
+        final_state = Some(candidate_state);
+    }
+
+    let state = final_state.ok_or_else(|| EstimationError::PirlsDidNotConverge {
+        max_iterations: options.max_iterations,
+        last_change: last_gradient_norm,
+    })?;
+
+    if matches!(status, PirlsStatus::MaxIterationsReached)
+        && last_gradient_norm < options.convergence_tolerance
+    {
+        status = PirlsStatus::StalledAtValidMinimum;
+    }
+
+    Ok(WorkingModelPirlsResult {
+        beta,
+        state,
+        status,
+        iterations,
+        last_gradient_norm,
+        last_deviance_change,
+        last_step_size,
+        last_step_halving,
+        max_abs_eta,
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
