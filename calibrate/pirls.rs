@@ -15,9 +15,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
 
 pub trait WorkingModel {
-    type Error;
-
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, Self::Error>;
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError>;
 }
 
 #[derive(Debug, Clone)]
