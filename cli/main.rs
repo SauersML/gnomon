@@ -13,10 +13,13 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily,
-    SurvivalModelConfig, TrainedModel,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, TrainedModel,
 };
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::model::SurvivalModelConfig;
+#[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival::SurvivalSpec;
+#[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival_data::load_survival_training_data;
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
@@ -217,6 +220,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             trained_model.save("model.toml")?;
             println!("Model saved to: model.toml");
         }
+        #[cfg(feature = "survival-data")]
         ModelFamilyCli::Survival => {
             println!(
                 "Loading survival training data from: {}",
@@ -278,6 +282,11 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Training survival model...");
             eprintln!("Error: Survival model training not yet implemented in CLI");
+            std::process::exit(1);
+        }
+        #[cfg(not(feature = "survival-data"))]
+        ModelFamilyCli::Survival => {
+            eprintln!("Error: Survival model support requires the 'survival-data' feature");
             std::process::exit(1);
         }
     }

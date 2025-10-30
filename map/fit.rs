@@ -377,12 +377,10 @@ pub trait VariantBlockSource {
     ) -> Result<usize, Self::Error>;
 
     fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
-        let _ = self;
         None
     }
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
-        let _ = self;
         None
     }
 }
@@ -1516,9 +1514,8 @@ impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
         mut out: MatMut<'_, f64>,
         rhs: MatRef<'_, f64>,
         par: Par,
-        stack: &mut MemStack,
+        _: &mut MemStack,
     ) {
-        let _ = stack;
         matmul(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0, par);
     }
 
@@ -1664,8 +1661,7 @@ where
     S::Error: Error + Send + Sync + 'static,
     P: FitProgressObserver + Send + Sync + 'static,
 {
-    fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        let _ = par;
+    fn apply_scratch(&self, rhs_ncols: usize, _: Par) -> StackReq {
         let block_len = self.n_samples * self.block_capacity;
         let block_req = StackReq::new::<f64>(block_len);
         let proj_req = temp_mat_scratch::<f64>(self.block_capacity, rhs_ncols);

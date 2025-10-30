@@ -39,9 +39,6 @@ use crate::calibrate::construction::{
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
-
-#[cfg(test)]
-use crate::calibrate::model::ModelFamily;
 use crate::calibrate::pirls::{self, PirlsResult};
 
 fn log_basis_cache_stats(context: &str) {
@@ -1557,12 +1554,12 @@ pub fn train_model(
 /// has not been wired into the estimation module yet. For now we surface a
 /// clear error explaining that the functionality is unavailable instead of
 /// leaving the call site undefined.
+#[cfg(feature = "survival-data")]
 pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    // Suppress unused parameter warnings until the full implementation lands.
-    let _ = (bundle, config);
+    drop((bundle, config));
     Err(EstimationError::InvalidSpecification(
         "Survival model training is not yet implemented".to_string(),
     ))
@@ -3872,7 +3869,7 @@ pub mod internal {
                 let big = gradient_snapshot
                     .iter()
                     .map(|x| x.abs())
-                    .fold(0. / 0., f64::max);
+                    .fold(f64::NAN, f64::max);
                 if !big.is_finite() || big > 1e6 {
                     eprintln!(
                         "[WARN] gradient exploded: max|g|={:.3e} (ρ={:?})",

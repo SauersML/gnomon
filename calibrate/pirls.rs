@@ -5,9 +5,6 @@ use crate::calibrate::faer_ndarray::{
     hash_array2,
 };
 use crate::calibrate::model::{LinkFunction, ModelConfig};
-
-#[cfg(test)]
-use crate::calibrate::model::ModelFamily;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,

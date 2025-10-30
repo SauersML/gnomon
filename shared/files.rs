@@ -1944,7 +1944,7 @@ mod tests {
         // Ensure the credentials are exercised in the same way as the CLI, which
         // constructs a storage client after loading ADC credentials without an
         // existing runtime.
-        let _ = storage_control;
+        drop(storage_control);
 
         drop(adc_guard);
         drop(env_lock);
