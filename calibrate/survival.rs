@@ -750,18 +750,12 @@ impl WorkingModel for WorkingModelSurvival {
                 let softplus = stable_softplus(scaled);
                 barrier_deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
                 let sigmoid = stable_sigmoid(scaled);
-                let barrier_grad_coeff = 2.0
-                    * self.spec.barrier_weight
-                    * weight
-                    * sigmoid
-                    / self.spec.barrier_scale;
+                let barrier_grad_coeff =
+                    2.0 * self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
                 accumulate_weighted_vector(&mut barrier_gradient, -barrier_grad_coeff, &d_exit);
-                let barrier_hess_coeff = 2.0
-                    * self.spec.barrier_weight
-                    * weight
-                    * sigmoid
-                    * (1.0 - sigmoid)
-                    / (self.spec.barrier_scale * self.spec.barrier_scale);
+                let barrier_hess_coeff =
+                    2.0 * self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
+                        / (self.spec.barrier_scale * self.spec.barrier_scale);
                 accumulate_symmetric_outer(&mut barrier_hessian, barrier_hess_coeff, &d_exit);
             }
         }
@@ -1009,6 +1003,20 @@ mod tests {
         }
     }
 
+    fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
+        let cols = matrix.ncols();
+        let mut result = Array2::<f64>::zeros((pattern.len(), cols));
+        for (row_idx, &source_idx) in pattern.iter().enumerate() {
+            assert!(source_idx < matrix.nrows());
+            result.row_mut(row_idx).assign(&matrix.row(source_idx));
+        }
+        result
+    }
+
+    fn repeat_optional(matrix: &Option<Array2<f64>>, pattern: &[usize]) -> Option<Array2<f64>> {
+        matrix.as_ref().map(|array| repeat_rows(array, pattern))
+    }
+
     fn evaluate_state(
         layout: &SurvivalLayout,
         penalty: &MonotonicityPenalty,
@@ -1150,6 +1158,63 @@ mod tests {
     }
 
     #[test]
+    fn left_truncation_matches_scoring_difference() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 4).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let baseline_cols = layout.baseline_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..baseline_cols {
+            beta[idx] = 0.05 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update(&beta).unwrap();
+        assert!(state.deviance.is_finite());
+
+        let static_names: Vec<String> = (0..layout.static_covariates.ncols())
+            .map(|idx| format!("cov{idx}"))
+            .collect();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: beta.clone(),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: CovariateLayout {
+                column_names: static_names,
+            },
+            penalties: PenaltyDescriptor {
+                order: 2,
+                lambda: 0.0,
+            },
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            hessian_factor: None,
+        };
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+
+        for i in 0..data.age_entry.len() {
+            let covariates = layout.static_covariates.row(i).to_owned();
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_entry =
+                cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
+            let delta_scoring = hazard_exit - hazard_entry;
+            let delta_training = eta_exit[i].exp() - eta_entry[i].exp();
+            assert_abs_diff_eq!(delta_scoring, delta_training, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
     fn gradient_and_hessian_match_numeric() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -1256,6 +1321,58 @@ mod tests {
     }
 
     #[test]
+    fn deviance_decreases_with_expected_newton_step() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let (layout, monotonicity) = build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6).unwrap();
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.use_expected_information = true;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.02 * (idx as f64 + 1.0);
+        }
+
+        let state_initial = model.update(&beta).unwrap();
+        let mut step = 1e-3;
+        let mut beta_next = beta.clone();
+        let mut state_next = state_initial.clone();
+        loop {
+            beta_next = &beta - &(state_initial.gradient.mapv(|g| step * g));
+            match model.update(&beta_next) {
+                Ok(next) => {
+                    state_next = next;
+                    if state_next.deviance < state_initial.deviance {
+                        break;
+                    }
+                }
+                Err(SurvivalError::NonFiniteLinearPredictor) => {
+                    step *= 0.5;
+                    assert!(
+                        step > 1e-8,
+                        "unable to reduce deviance via gradient descent"
+                    );
+                    continue;
+                }
+                Err(other) => panic!("unexpected update failure: {other:?}"),
+            }
+            step *= 0.5;
+            assert!(
+                step > 1e-8,
+                "unable to reduce deviance via gradient descent"
+            );
+        }
+        assert!(state_next.deviance < state_initial.deviance);
+    }
+
+    #[test]
     fn expected_information_adjusts_hessian() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -1333,6 +1450,120 @@ mod tests {
                 expected,
                 tolerance
             );
+        }
+    }
+
+    #[test]
+    fn frequency_weights_match_replication() {
+        let weighted_data = SurvivalTrainingData {
+            age_entry: array![50.0, 55.0],
+            age_exit: array![55.0, 60.0],
+            event_target: array![1, 0],
+            event_competing: array![0, 0],
+            sample_weight: array![1.0, 2.0],
+            pgs: array![0.1, -0.3],
+            sex: array![0.0, 1.0],
+            pcs: array![[0.01, -0.02], [0.02, 0.03]],
+        };
+
+        let expanded_data = SurvivalTrainingData {
+            age_entry: array![50.0, 55.0, 55.0],
+            age_exit: array![55.0, 60.0, 60.0],
+            event_target: array![1, 0, 0],
+            event_competing: array![0, 0, 0],
+            sample_weight: array![1.0, 1.0, 1.0],
+            pgs: array![0.1, -0.3, -0.3],
+            sex: array![0.0, 1.0, 1.0],
+            pcs: array![[0.01, -0.02], [0.02, 0.03], [0.02, 0.03]],
+        };
+
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+
+        let (layout_weighted, monotonic_weighted) =
+            build_survival_layout(&weighted_data, &basis, 0.1, 2, 0.0, 0).unwrap();
+        let replicate_pattern = [0usize, 1, 1];
+        let layout_expanded = SurvivalLayout {
+            baseline_entry: repeat_rows(&layout_weighted.baseline_entry, &replicate_pattern),
+            baseline_exit: repeat_rows(&layout_weighted.baseline_exit, &replicate_pattern),
+            baseline_derivative_exit: repeat_rows(
+                &layout_weighted.baseline_derivative_exit,
+                &replicate_pattern,
+            ),
+            time_varying_entry: repeat_optional(
+                &layout_weighted.time_varying_entry,
+                &replicate_pattern,
+            ),
+            time_varying_exit: repeat_optional(
+                &layout_weighted.time_varying_exit,
+                &replicate_pattern,
+            ),
+            time_varying_derivative_exit: repeat_optional(
+                &layout_weighted.time_varying_derivative_exit,
+                &replicate_pattern,
+            ),
+            static_covariates: repeat_rows(&layout_weighted.static_covariates, &replicate_pattern),
+            age_transform: layout_weighted.age_transform,
+            reference_constraint: layout_weighted.reference_constraint.clone(),
+            penalties: layout_weighted.penalties.clone(),
+            combined_entry: repeat_rows(&layout_weighted.combined_entry, &replicate_pattern),
+            combined_exit: repeat_rows(&layout_weighted.combined_exit, &replicate_pattern),
+            combined_derivative_exit: repeat_rows(
+                &layout_weighted.combined_derivative_exit,
+                &replicate_pattern,
+            ),
+        };
+        let monotonic_expanded = monotonic_weighted.clone();
+
+        let mut spec = SurvivalSpec::default();
+        spec.barrier_weight = 0.0;
+        spec.derivative_guard = 1e-12;
+
+        let mut weighted_model = WorkingModelSurvival::new(
+            layout_weighted.clone(),
+            &weighted_data,
+            monotonic_weighted.clone(),
+            spec,
+        )
+        .unwrap();
+        let mut expanded_model = WorkingModelSurvival::new(
+            layout_expanded.clone(),
+            &expanded_data,
+            monotonic_expanded,
+            spec,
+        )
+        .unwrap();
+
+        let p = layout_weighted.combined_exit.ncols();
+        assert_eq!(p, layout_expanded.combined_exit.ncols());
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.03 * (idx as f64 + 1.0);
+        }
+
+        let state_weighted = weighted_model.update(&beta).unwrap();
+        let state_expanded = expanded_model.update(&beta).unwrap();
+
+        assert_abs_diff_eq!(
+            state_weighted.deviance,
+            state_expanded.deviance,
+            epsilon = 1e-4
+        );
+        for (g_weighted, g_expanded) in state_weighted
+            .gradient
+            .iter()
+            .zip(state_expanded.gradient.iter())
+        {
+            assert_abs_diff_eq!(*g_weighted, *g_expanded, epsilon = 1e-4);
+        }
+        for (h_weighted, h_expanded) in state_weighted
+            .hessian
+            .iter()
+            .zip(state_expanded.hessian.iter())
+        {
+            assert_abs_diff_eq!(*h_weighted, *h_expanded, epsilon = 1e-4);
         }
     }
 
