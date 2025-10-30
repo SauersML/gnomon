@@ -38,7 +38,7 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
-use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
+use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
 fn log_basis_cache_stats(context: &str) {
@@ -744,7 +744,7 @@ pub fn train_model(
         layout.total_coeffs, layout.num_penalties
     );
 
-    if matches!(config.link_function, LinkFunction::Identity) {
+    if matches!(config.link_function(), LinkFunction::Identity) {
         let design_condition = calculate_condition_number(&x_matrix)
             .map_err(EstimationError::EigendecompositionFailed)?;
         if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
@@ -815,7 +815,7 @@ pub fn train_model(
             .dot(&final_fit.penalized_hessian_transformed)
             .dot(&qs.t());
         // Compute scale for Identity; 1.0 for Logit
-        let scale_val = match config.link_function {
+        let scale_val = match config.link_function() {
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
                 // Weighted RSS over residuals divided by (n - edf)
@@ -1262,7 +1262,7 @@ pub fn train_model(
         .dot(&final_fit.penalized_hessian_transformed)
         .dot(&qs.t());
     // Compute scale for Identity; 1.0 for Logit
-    let scale_val = match config.link_function {
+    let scale_val = match config.link_function() {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
             let mut fitted = reml_state.offset().to_owned();
@@ -1279,7 +1279,7 @@ pub fn train_model(
         }
     };
 
-    if let LinkFunction::Identity = config.link_function {
+    if let LinkFunction::Identity = config.link_function() {
         let dp = final_fit.deviance + final_fit.stable_penalty_term;
         let (dp_c, _) = smooth_floor_dp(dp);
         let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
@@ -1349,7 +1349,7 @@ pub fn train_model(
             reml_state.y(),
             x_raw.view(),
             hull_opt.as_ref(),
-            config.link_function,
+            config.link_function(),
         )
         .map_err(|e| {
             EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
@@ -1367,7 +1367,7 @@ pub fn train_model(
         );
 
         let spec = cal::CalibratorSpec {
-            link: config.link_function,
+            link: config.link_function(),
             // Use identical parameters for all three calibrator smooths
             pred_basis: crate::calibrate::model::BasisConfig {
                 num_knots: base_num_knots,
@@ -1386,7 +1386,7 @@ pub fn train_model(
             penalty_order_dist: base_penalty_order,
             distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
-            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function),
+            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function()),
         };
 
         // Build design and penalties for calibrator
@@ -1411,7 +1411,7 @@ pub fn train_model(
                 offset.view(),
                 &penalties_cal,
                 &penalty_nullspace_dims,
-                config.link_function,
+                config.link_function(),
             )
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
@@ -1427,7 +1427,7 @@ pub fn train_model(
                 edf_pair.1,
                 edf_pair.2,
                 edf_pair.3,
-                if config.link_function == LinkFunction::Identity {
+                if config.link_function() == LinkFunction::Identity {
                     format!("; scale={:.3e}", scale_cal)
                 } else {
                     String::new()
@@ -1459,7 +1459,7 @@ pub fn train_model(
                 coefficients: beta_cal,
                 column_spans: schema.column_spans,
                 pred_param_range: schema.pred_param_range.clone(),
-                scale: if config.link_function == LinkFunction::Identity {
+                scale: if config.link_function() == LinkFunction::Identity {
                     Some(scale_cal)
                 } else {
                     None
@@ -2604,7 +2604,7 @@ pub mod internal {
             let layout = self.layout;
             let config = self.config;
             let firth_bias = config.firth_bias_reduction;
-            let link_is_logit = matches!(config.link_function, LinkFunction::Logit);
+            let link_is_logit = matches!(config.link_function(), LinkFunction::Logit);
             let balanced_root = &self.balanced_penalty_root;
 
             // Run a fresh PIRLS solve for each perturbed smoothing vector.  We avoid the
@@ -2959,7 +2959,7 @@ pub mod internal {
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
-            match self.config.link_function {
+            match self.config.link_function() {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
                     // From Wood (2017), Chapter 6, Eq. 6.24:
@@ -3066,7 +3066,7 @@ pub mod internal {
                     let penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                     if self.config.firth_bias_reduction
-                        && matches!(self.config.link_function, LinkFunction::Logit)
+                        && matches!(self.config.link_function(), LinkFunction::Logit)
                     {
                         // Ignore the Firth log-determinant contribution when assembling
                         // the outer objective; it only stabilizes the coefficient solve.
@@ -3530,7 +3530,7 @@ pub mod internal {
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
-            match self.config.link_function {
+            match self.config.link_function() {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
@@ -4103,7 +4103,7 @@ pub mod internal {
             let sex = Array1::from_iter((0..n_samples).map(|i| (i % 2) as f64));
 
             let base_config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -4560,7 +4560,7 @@ pub mod internal {
 
             // Train the model
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -4758,7 +4758,7 @@ pub mod internal {
 
             // Train model only on training data
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -4853,7 +4853,7 @@ pub mod internal {
             };
 
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -5121,7 +5121,7 @@ pub mod internal {
 
             // Keep interactions - we'll just focus our test on main effects
             let config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -5233,7 +5233,7 @@ pub mod internal {
 
             // Keep interactions - we'll just focus our test on main effects
             let config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -6368,7 +6368,7 @@ pub mod internal {
                 weights: Array1::<f64>::ones(p.len()),
             };
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -6494,7 +6494,7 @@ pub mod internal {
 
             // --- Model configuration ---
             let config = ModelConfig {
-                link_function: LinkFunction::Identity, // More stable
+                model_family: ModelFamily::Gam(LinkFunction::Identity), // More stable
                 penalty_order: 2,
                 convergence_tolerance: 1e-4, // Relaxed tolerance for better convergence
                 max_iterations: 100,         // Reasonable number of iterations
@@ -6724,7 +6724,7 @@ pub mod internal {
 
             // --- Model configuration ---
             let mut config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -6849,7 +6849,7 @@ pub mod internal {
             };
 
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-7, // Keep strict tolerance
                 max_iterations: 150,         // Generous iterations for complex models
@@ -6987,7 +6987,7 @@ pub mod internal {
 
             // Use the same config but smaller basis to speed up
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-7, // Keep strict tolerance
                 max_iterations: 150,         // Generous iterations for complex models
@@ -7115,7 +7115,7 @@ pub mod internal {
 
             // Over-parameterized model: many knots and PCs for small dataset
             let config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -7295,7 +7295,7 @@ pub mod internal {
 
             // Create massively over-parameterized model
             let config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -7411,7 +7411,7 @@ pub mod internal {
 
             // Create a minimal model config
             let config = ModelConfig {
-                link_function: LinkFunction::Logit,
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -7565,7 +7565,7 @@ pub mod internal {
 
                 // Stage: Define a simple configuration for a model with only a PGS term
                 let mut simple_config = ModelConfig {
-                    link_function: LinkFunction::Logit,
+                    model_family: ModelFamily::Gam(LinkFunction::Logit),
                     penalty_order: 2,
                     convergence_tolerance: 1e-6,
                     max_iterations: 100,
@@ -7588,7 +7588,7 @@ pub mod internal {
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
                 };
-                simple_config.link_function = link_function;
+                simple_config.model_family = ModelFamily::Gam(link_function);
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
 
                 // Stage: Build guaranteed-consistent structures for this simple model
@@ -7676,7 +7676,7 @@ pub mod internal {
                 use rand::SeedableRng;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(42); // Fixed seed for reproducibility
 
-                // Stage: Set up a well-posed, non-trivial problem
+                // Stage: Set up a well-posed), non-trivial problem
                 let n_samples = 600;
 
                 // Use random jitter to prevent perfect separation and improve numerical stability
@@ -7709,7 +7709,7 @@ pub mod internal {
 
                 // Stage: Define a simple model configuration for a PGS-only model
                 let mut simple_config = ModelConfig {
-                    link_function: link_function,
+                    model_family: ModelFamily::Gam(link_function),
                     penalty_order: 2,
                     convergence_tolerance: 1e-6,
                     max_iterations: 100,
@@ -7882,7 +7882,7 @@ pub mod internal {
 
             // Stage: Define a simple model configuration for the test
             let simple_config = ModelConfig {
-                link_function: LinkFunction::Identity, // Use Identity for simpler test
+                model_family: ModelFamily::Gam(LinkFunction::Identity), // Use Identity for simpler test
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -8081,7 +8081,7 @@ pub mod internal {
 
             // Stage: Define a simple model configuration for a PGS-only model
             let simple_config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -8204,7 +8204,7 @@ pub mod internal {
 
             // Stage: Define a simple model configuration for a PGS-only model
             let simple_config = ModelConfig {
-                link_function: LinkFunction::Identity,
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,
                 convergence_tolerance: 1e-6,
                 max_iterations: 100,
@@ -8318,7 +8318,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
 
     // Stage: Configure a logit model
     let config = ModelConfig {
-        link_function: LinkFunction::Logit,
+        model_family: ModelFamily::Gam(LinkFunction::Logit),
         penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 100,
@@ -8394,7 +8394,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
 
     // Create a basic config
     let config = ModelConfig {
-        link_function: LinkFunction::Identity,
+        model_family: ModelFamily::Gam(LinkFunction::Identity),
         penalty_order: 2,
         convergence_tolerance: 1e-6,
         max_iterations: 50,
@@ -8720,7 +8720,7 @@ mod reparam_consistency_tests {
         };
 
         let config = ModelConfig {
-            link_function: LinkFunction::Identity,
+            model_family: ModelFamily::Gam(LinkFunction::Identity),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
@@ -8879,7 +8879,7 @@ mod gradient_validation_tests {
         };
 
         let config = ModelConfig {
-            link_function: LinkFunction::Logit,
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,

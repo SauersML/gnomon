@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use thiserror::Error;
 
+use crate::calibrate::pirls::{WorkingModel, WorkingState};
+
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
 const DEFAULT_BARRIER_SCALE: f64 = 1.0;
@@ -43,20 +45,6 @@ pub enum SurvivalError {
     DesignDimensionMismatch,
     #[error("basis evaluation failed: {0}")]
     Basis(#[from] BasisError),
-}
-
-/// Working model abstraction shared between GAM and survival implementations.
-pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError>;
-}
-
-/// Aggregated state returned by [`WorkingModel::update`].
-#[derive(Debug, Clone)]
-pub struct WorkingState {
-    pub eta: Array1<f64>,
-    pub gradient: Array1<f64>,
-    pub hessian: Array2<f64>,
-    pub deviance: f64,
 }
 
 /// Guarded log-age transformation used across training and scoring.
@@ -656,7 +644,9 @@ impl WorkingModelSurvival {
 }
 
 impl WorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+    type Error = SurvivalError;
+
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, Self::Error> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
             return Err(SurvivalError::DesignDimensionMismatch);

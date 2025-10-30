@@ -12,7 +12,9 @@ use std::process;
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
-use gnomon::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, TrainedModel};
+use gnomon::calibrate::model::{
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
+};
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
 
@@ -142,7 +144,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create final model configuration
     let config = ModelConfig {
-        link_function,
+        model_family: ModelFamily::Gam(link_function),
         penalty_order: args.penalty_order,
         convergence_tolerance: args.convergence_tolerance,
         max_iterations: args.max_iterations,
@@ -216,7 +218,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
         &eta,
         &mean,
         se_eta_opt.as_ref(),
-        model.config.link_function,
+        model.config.link_function(),
         calibrated_mean_opt.as_ref(),
         output_path,
     )?;

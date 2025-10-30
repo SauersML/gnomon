@@ -4,7 +4,7 @@ use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, array1_to_col_mat_mut, array2_to_mat_mut,
     hash_array2,
 };
-use crate::calibrate::model::{LinkFunction, ModelConfig};
+use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
@@ -13,6 +13,20 @@ use faer::{Accum, Side, get_global_parallelism};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::time::{Duration, Instant};
+
+pub trait WorkingModel {
+    type Error;
+
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, Self::Error>;
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkingState {
+    pub eta: Array1<f64>,
+    pub gradient: Array1<f64>,
+    pub hessian: Array2<f64>,
+    pub deviance: f64,
+}
 
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
@@ -322,8 +336,8 @@ pub fn fit_model_for_fixed_rho(
     let mut eta = offset.to_owned();
     eta += &x_transformed.dot(&beta_transformed);
     let (mut mu, mut weights, mut z) =
-        update_glm_vectors(y, &eta, config.link_function, prior_weights);
-    let mut last_deviance = calculate_deviance(y, &mu, config.link_function, prior_weights);
+        update_glm_vectors(y, &eta, config.link_function(), prior_weights);
+    let mut last_deviance = calculate_deviance(y, &mu, config.link_function(), prior_weights);
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
 
@@ -347,7 +361,7 @@ pub fn fit_model_for_fixed_rho(
     );
 
     // Add minimum iterations based on link function
-    let min_iterations = match config.link_function {
+    let min_iterations = match config.link_function() {
         LinkFunction::Logit => 3, // Ensure at least some refinement for non-Gaussian
         LinkFunction::Identity => 1, // Gaussian may converge faster
     };
@@ -366,7 +380,7 @@ pub fn fit_model_for_fixed_rho(
     let mut last_gradient_tol = f64::NAN;
     let mut last_step_halving = 0usize;
     let firth_active =
-        config.firth_bias_reduction && matches!(config.link_function, LinkFunction::Logit);
+        config.firth_bias_reduction && matches!(config.link_function(), LinkFunction::Logit);
     let mut firth_log_det_value: Option<f64> = None;
 
     for iter in 1..=config.max_iterations {
@@ -442,7 +456,7 @@ pub fn fit_model_for_fixed_rho(
             &s_from_e_precomputed, // Precomputed S = EᵀE
             &mut workspace,  // Preallocated buffers (Suggestion #6)
             y.view(),        // Pass original response
-            config.link_function, // Pass link function for correct scale calculation
+            config.link_function(), // Pass link function for correct scale calculation
         )?;
 
         // Save the most recent stable result to avoid redundant computation at the end
@@ -471,9 +485,9 @@ pub fn fit_model_for_fixed_rho(
         loop {
             // Candidate eta for current α (avoid forming beta_candidate until accept)
             let eta_trial = &eta + &(alpha * &workspace.delta_eta);
-            let mu_trial = mu_only(&eta_trial, config.link_function);
+            let mu_trial = mu_only(&eta_trial, config.link_function());
             let deviance_trial =
-                calculate_deviance(y, &mu_trial, config.link_function, prior_weights);
+                calculate_deviance(y, &mu_trial, config.link_function(), prior_weights);
 
             // First, check if the trial step resulted in a numerically valid state.
             // This is the most important check.
@@ -505,7 +519,7 @@ pub fn fit_model_for_fixed_rho(
                     eta = eta_trial;
                     last_deviance = deviance_trial;
                     (mu, weights, z) =
-                        update_glm_vectors(y, &eta, config.link_function, prior_weights);
+                        update_glm_vectors(y, &eta, config.link_function(), prior_weights);
 
                     if step_halving_count > 0 {
                         println!(
@@ -544,7 +558,7 @@ pub fn fit_model_for_fixed_rho(
 
         // Check for separation - this is a modern feature we'll keep
         const ETA_STABILITY_THRESHOLD: f64 = 100.0;
-        if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function == LinkFunction::Logit {
+        if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function() == LinkFunction::Logit {
             log::warn!(
                 "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
             );
@@ -566,7 +580,7 @@ pub fn fit_model_for_fixed_rho(
                     &s_from_e_precomputed,
                     &mut workspace,
                     y.view(),
-                    config.link_function,
+                    config.link_function(),
                 )?;
                 log::trace!("Fallback solve rank: {}", rank);
                 result.penalized_hessian
@@ -611,7 +625,7 @@ pub fn fit_model_for_fixed_rho(
 
         // Additional robust separation checks for unpenalized logistic models
         let no_penalty = eb_transformed.nrows() == 0 && e_transformed.nrows() == 0;
-        if config.link_function == LinkFunction::Logit && no_penalty {
+        if config.link_function() == LinkFunction::Logit && no_penalty {
             let eta_soft_threshold = 30.0; // softer threshold than 100 for unpenalized cases
             let eps_sat = 1e-3;
             let sat_frac = {
@@ -691,7 +705,7 @@ pub fn fit_model_for_fixed_rho(
                             &s_from_e_precomputed,
                             &mut workspace,
                             y.view(),
-                            config.link_function,
+                            config.link_function(),
                         )?;
                         log::trace!("Fallback solve rank: {}", rank);
                         result.penalized_hessian
@@ -737,7 +751,7 @@ pub fn fit_model_for_fixed_rho(
         let penalized_deviance_new = last_deviance + penalty_new;
 
         // Set scale parameter based on link function
-        let scale = match config.link_function {
+        let scale = match config.link_function() {
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
                 // For Gaussian, use WEIGHTED residual variance consistent with objective
@@ -835,7 +849,7 @@ pub fn fit_model_for_fixed_rho(
                             &s_from_e_precomputed,
                             &mut workspace,
                             y.view(),
-                            config.link_function,
+                            config.link_function(),
                         )?;
                         result.penalized_hessian
                     };
@@ -922,7 +936,7 @@ pub fn fit_model_for_fixed_rho(
             &s_from_e_precomputed,
             &mut workspace,
             y.view(),
-            config.link_function,
+            config.link_function(),
         )?;
         log::trace!("Final solve rank: {}", rank);
         result.penalized_hessian
@@ -951,7 +965,7 @@ pub fn fit_model_for_fixed_rho(
     // Build a scale-consistent tolerance similar to the inner loop
     let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
     let penalized_deviance_new = last_deviance + penalty_new;
-    let scale_term = match config.link_function {
+    let scale_term = match config.link_function() {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
             let residuals = &y.view() - &mu;
@@ -2562,7 +2576,7 @@ mod tests {
 
         // --- Model configuration ---
         let config = ModelConfig {
-            link_function,
+            model_family: ModelFamily::Gam(link_function),
             penalty_order: 2,
             convergence_tolerance: 1e-7,
             max_iterations: 150,
@@ -2963,9 +2977,9 @@ mod tests {
 
         // Create a simple config with values known to lead to convergence
         let config = ModelConfig {
-            link_function: LinkFunction::Identity, // Simple linear model for stability
-            max_iterations: 100,                   // Increased for stability
-            convergence_tolerance: 1e-6,           // Less strict for test stability
+            model_family: ModelFamily::Gam(LinkFunction::Identity), // Simple linear model for stability
+            max_iterations: 100,                                    // Increased for stability
+            convergence_tolerance: 1e-6, // Less strict for test stability
             penalty_order: 2,
             reml_convergence_tolerance: 1e-6,
             reml_max_iterations: 50,
@@ -3094,7 +3108,7 @@ mod tests {
 
         // === PHASE 3: Configure a simple, stable model ===
         let config = ModelConfig {
-            link_function: LinkFunction::Logit,
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
             penalty_order: 2,
             convergence_tolerance: 1e-7,
             max_iterations: 150,
@@ -3227,7 +3241,7 @@ mod tests {
 
         // === Use same stable model configuration ===
         let config = ModelConfig {
-            link_function: LinkFunction::Logit,
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
             penalty_order: 2,
             convergence_tolerance: 1e-7,
             max_iterations: 150,

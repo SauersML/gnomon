@@ -2,7 +2,7 @@ use crate::calibrate::basis::{self, create_bspline_basis};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
+use crate::calibrate::model::{InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use ndarray::Zip;
@@ -2692,7 +2692,7 @@ mod tests {
         };
 
         ModelConfig {
-            link_function: LinkFunction::Logit,
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 15,
@@ -2801,7 +2801,7 @@ mod tests {
             .collect();
 
         let config = ModelConfig {
-            link_function: LinkFunction::Identity,
+            model_family: ModelFamily::Gam(LinkFunction::Identity),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
@@ -3295,7 +3295,7 @@ mod tests {
             basis_config: pc_basis,
         };
         ModelConfig {
-            link_function: LinkFunction::Identity,
+            model_family: ModelFamily::Gam(LinkFunction::Identity),
             penalty_order,
             convergence_tolerance: 1e-6,
             max_iterations: 100,
