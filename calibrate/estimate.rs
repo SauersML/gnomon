@@ -870,6 +870,7 @@ pub fn train_model(
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
             calibrator: None,
+            survival: None,
         };
 
         trained_model
@@ -1535,6 +1536,7 @@ pub fn train_model(
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
         calibrator: calibrator_opt,
+        survival: None,
     };
 
     trained_model

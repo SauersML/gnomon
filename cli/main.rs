@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::process;
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
-use gnomon::calibrate::estimate::{train_model, train_survival_model};
+use gnomon::calibrate::estimate::train_model;
 use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
-    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, SurvivalModelConfig,
+    InteractionPenaltyKind, LinkFunction, ModelConfig, ModelError, ModelFamily, SurvivalModelConfig,
     TrainedModel,
 };
 use gnomon::calibrate::survival::SurvivalSpec;
@@ -277,9 +277,8 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("Training survival model...");
-            let trained_model = train_survival_model(&bundle, &config)?;
-            trained_model.save("model.toml")?;
-            println!("Model saved to: model.toml");
+            eprintln!("Error: Survival model training not yet implemented in CLI");
+            std::process::exit(1);
         }
     }
 
@@ -312,10 +311,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
     let link_function = match &model.config.model_family {
         ModelFamily::Gam(link) => *link,
         ModelFamily::Survival(_) => {
-            return Err(Box::new(ModelError::UnsupportedModelFamily {
-                family: "survival",
-                operation: "saving predictions",
-            }));
+            return Err(Box::new(ModelError::UnsupportedForSurvival("saving predictions")));
         }
     };
 
