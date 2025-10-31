@@ -16,11 +16,9 @@ use std::ops::Range;
 use thiserror::Error;
 
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
-const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
-const DEFAULT_BARRIER_SCALE: f64 = 1.0;
-const BARRIER_ACTIVATION_WARN_THRESHOLD: f64 = 0.05;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
+const MONOTONICITY_TOLERANCE: f64 = -1e-12;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -106,6 +104,10 @@ pub enum SurvivalError {
     Basis(#[from] BasisError),
     #[error("calibrator inference failed: {0}")]
     Calibrator(String),
+    #[error(
+        "monotonicity violation: derivative {derivative} at age {age} fell below zero on the cached grid"
+    )]
+    MonotonicityViolation { age: f64, derivative: f64 },
 }
 
 pub use crate::calibrate::pirls::WorkingModel;
@@ -571,27 +573,6 @@ fn evaluate_basis_and_derivative(
     Ok((basis, derivative))
 }
 
-fn stable_softplus(x: f64) -> f64 {
-    if x.is_infinite() {
-        if x.is_sign_positive() { x } else { 0.0 }
-    } else if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        x.exp().ln_1p()
-    } else {
-        (1.0 + x.exp()).ln()
-    }
-}
-
-fn stable_sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let exp_x = x.exp();
-        exp_x / (1.0 + exp_x)
-    }
-}
-
 fn accumulate_weighted_vector<S>(target: &mut Array1<f64>, scale: f64, values: &ArrayBase<S, Ix1>)
 where
     S: Data<Elem = f64>,
@@ -650,35 +631,6 @@ pub fn baseline_lambda_seed(age_basis: &BasisDescriptor, penalty_order: usize) -
     let normalized_span = (span / (span + 1.0)).max(1e-3);
     let lambda = 0.5 * (order / (degree + 1.0)) / normalized_span;
     lambda.clamp(1e-6, 1e3)
-}
-
-fn seed_monotonic_lambda(data: &SurvivalTrainingData, grid_size: usize) -> f64 {
-    if grid_size == 0 {
-        return 0.0;
-    }
-
-    let mut min_age = f64::INFINITY;
-    let mut max_age = f64::NEG_INFINITY;
-    for &value in data.age_entry.iter().chain(data.age_exit.iter()) {
-        if !value.is_finite() {
-            continue;
-        }
-        if value < min_age {
-            min_age = value;
-        }
-        if value > max_age {
-            max_age = value;
-        }
-    }
-
-    let span = if min_age.is_finite() && max_age.is_finite() && max_age > min_age {
-        max_age - min_age
-    } else {
-        1.0
-    };
-    let grid = grid_size.max(1) as f64;
-    let lambda = 5e-5 * (grid / 4.0).sqrt() * span.max(1.0);
-    lambda.clamp(0.0, 1e2)
 }
 
 pub fn build_survival_layout(
@@ -901,14 +853,12 @@ pub fn build_survival_layout(
         monotonicity: empty_monotonicity_constraint(),
     };
 
-    let monotonic_lambda = seed_monotonic_lambda(data, monotonic_grid_size);
     let monotonicity = build_monotonicity_penalty(
         &layout,
         age_basis,
         &data.age_entry,
         &data.age_exit,
         monotonic_grid_size,
-        monotonic_lambda,
     )?;
     layout.monotonicity = monotonicity.clone();
 
@@ -1033,10 +983,9 @@ fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
     matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
-/// Deterministic projector guaranteeing non-negative exit derivatives.
+/// Cached derivative designs used to enforce monotonicity during optimization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonotonicityPenalty {
-    pub lambda: f64,
     pub derivative_design: Array2<f64>,
     pub quadrature_design: Array2<f64>,
     pub grid_ages: Array1<f64>,
@@ -1046,7 +995,6 @@ pub struct MonotonicityPenalty {
 
 fn empty_monotonicity_constraint() -> MonotonicityPenalty {
     MonotonicityPenalty {
-        lambda: 0.0,
         derivative_design: Array2::<f64>::zeros((0, 0)),
         quadrature_design: Array2::<f64>::zeros((0, 0)),
         grid_ages: Array1::<f64>::zeros(0),
@@ -1055,12 +1003,10 @@ fn empty_monotonicity_constraint() -> MonotonicityPenalty {
     }
 }
 
-/// Configuration controlling guard behaviour and optional softplus barrier.
+/// Configuration controlling guard behaviour and Hessian construction.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SurvivalSpec {
     pub derivative_guard: f64,
-    pub barrier_weight: f64,
-    pub barrier_scale: f64,
     pub use_expected_information: bool,
 }
 
@@ -1068,8 +1014,6 @@ impl Default for SurvivalSpec {
     fn default() -> Self {
         Self {
             derivative_guard: DEFAULT_DERIVATIVE_GUARD,
-            barrier_weight: DEFAULT_BARRIER_WEIGHT,
-            barrier_scale: DEFAULT_BARRIER_SCALE,
             use_expected_information: false,
         }
     }
@@ -1081,12 +1025,10 @@ fn build_monotonicity_penalty(
     ages_entry: &Array1<f64>,
     ages_exit: &Array1<f64>,
     grid_size: usize,
-    lambda: f64,
 ) -> Result<MonotonicityPenalty, SurvivalError> {
     if grid_size == 0 {
         let cols = layout.combined_exit.ncols();
         return Ok(MonotonicityPenalty {
-            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1108,7 +1050,6 @@ fn build_monotonicity_penalty(
     if !min_age.is_finite() || !max_age.is_finite() || min_age >= max_age {
         let cols = layout.combined_exit.ncols();
         return Ok(MonotonicityPenalty {
-            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1170,7 +1111,6 @@ fn build_monotonicity_penalty(
     }
 
     Ok(MonotonicityPenalty {
-        lambda,
         derivative_design: combined,
         quadrature_design,
         grid_ages: grid,
@@ -1212,9 +1152,7 @@ impl WorkingModelSurvival {
     fn build_expected_information_hessian(
         &self,
         beta: &Array1<f64>,
-        barrier_hessian: &Array2<f64>,
         penalty_hessian: &Array2<f64>,
-        monotonic_hessian: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, SurvivalError> {
         let grid_size = self.monotonicity.grid_ages.len();
         if grid_size <= 1 {
@@ -1313,9 +1251,7 @@ impl WorkingModelSurvival {
         }
 
         expected.mapv_inplace(|value| value * -2.0);
-        expected += barrier_hessian;
         expected += penalty_hessian;
-        expected += monotonic_hessian;
         let mut neg_expected = expected.clone();
         neg_expected.mapv_inplace(|value| -value);
         let mut shift = 0.0;
@@ -1366,33 +1302,35 @@ impl WorkingModelSurvival {
         let mut gradient = Array1::<f64>::zeros(p);
         let mut hessian = Array2::<f64>::zeros((p, p));
         let mut log_likelihood = 0.0;
-        let mut barrier_deviance = 0.0;
-        let mut barrier_gradient = Array1::<f64>::zeros(p);
-        let mut barrier_hessian = Array2::<f64>::zeros((p, p));
-        let mut monotonic_deviance = 0.0;
-        let mut monotonic_gradient = Array1::<f64>::zeros(p);
-        let mut monotonic_hessian = Array2::<f64>::zeros((p, p));
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
-        let (barrier_hits, barrier_total, barrier_source_label) =
-            if self.monotonicity.derivative_design.nrows() > 0 {
-                let grid_derivatives = self.monotonicity.derivative_design.dot(beta);
-                let hits = grid_derivatives
-                    .iter()
-                    .filter(|&&value| value <= guard_threshold)
-                    .count();
-                (hits, grid_derivatives.len(), "monotonicity grid")
-            } else {
-                let hits = derivative_raw
-                    .iter()
-                    .filter(|&&value| value <= guard_threshold)
-                    .count();
-                (hits, derivative_raw.len(), "exit derivatives")
-            };
-        let barrier_activation_fraction = if barrier_total > 0 {
-            Some(barrier_hits as f64 / barrier_total as f64)
-        } else {
-            None
-        };
+        if self.monotonicity.derivative_design.nrows() > 0 {
+            if self.monotonicity.derivative_design.ncols() != p
+                || self.monotonicity.quadrature_design.ncols() != p
+            {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            if self.monotonicity.quadrature_design.nrows()
+                != self.monotonicity.derivative_design.nrows()
+            {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            if self.monotonicity.grid_ages.len() != self.monotonicity.derivative_design.nrows() {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            let derivative_grid = self.monotonicity.derivative_design.dot(beta);
+            for (idx, slope) in derivative_grid.iter().enumerate() {
+                if !slope.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                if *slope < MONOTONICITY_TOLERANCE {
+                    let age = self.monotonicity.grid_ages[idx];
+                    return Err(SurvivalError::MonotonicityViolation {
+                        age,
+                        derivative: *slope,
+                    });
+                }
+            }
+        }
         let h_exit = eta_exit.mapv(f64::exp);
         let h_entry = eta_entry.mapv(f64::exp);
         let mut log_derivative = Array1::<f64>::zeros(n);
@@ -1401,6 +1339,12 @@ impl WorkingModelSurvival {
             let value = derivative_raw[i];
             if !value.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            if value < MONOTONICITY_TOLERANCE {
+                return Err(SurvivalError::MonotonicityViolation {
+                    age: self.age_exit[i],
+                    derivative: value,
+                });
             }
             if value <= guard_threshold {
                 log_derivative[i] = guard_threshold.ln();
@@ -1450,71 +1394,11 @@ impl WorkingModelSurvival {
             if event_scale != 0.0 {
                 accumulate_symmetric_outer(&mut hessian, event_scale, &x_tilde);
             }
-
-            if self.spec.barrier_weight > 0.0 {
-                let d_eta_exit = derivative_raw[i];
-                let scaled = -d_eta_exit / self.spec.barrier_scale;
-                let softplus = stable_softplus(scaled);
-                barrier_deviance += 2.0 * self.spec.barrier_weight * weight * softplus;
-                let sigmoid = stable_sigmoid(scaled);
-                let barrier_grad_coeff =
-                    2.0 * self.spec.barrier_weight * weight * sigmoid / self.spec.barrier_scale;
-                accumulate_weighted_vector(&mut barrier_gradient, -barrier_grad_coeff, &d_exit);
-                let barrier_hess_coeff =
-                    2.0 * self.spec.barrier_weight * weight * sigmoid * (1.0 - sigmoid)
-                        / (self.spec.barrier_scale * self.spec.barrier_scale);
-                accumulate_symmetric_outer(&mut barrier_hessian, barrier_hess_coeff, &d_exit);
-            }
-        }
-
-        if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
-            if self.monotonicity.derivative_design.ncols() != p
-                || self.monotonicity.quadrature_design.ncols() != p
-            {
-                return Err(SurvivalError::DesignDimensionMismatch);
-            }
-            let derivative_grid = self.monotonicity.derivative_design.dot(beta);
-            if self.monotonicity.quadrature_design.nrows() != derivative_grid.len() {
-                return Err(SurvivalError::DesignDimensionMismatch);
-            }
-            for (idx, slope) in derivative_grid.iter().enumerate() {
-                if !slope.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let eta_grid = self.monotonicity.quadrature_design.row(idx).dot(beta);
-                if !eta_grid.is_finite() {
-                    return Err(SurvivalError::NonFiniteLinearPredictor);
-                }
-                let left = self.monotonicity.quadrature_left[idx];
-                let right = self.monotonicity.quadrature_right[idx];
-                let width = right - left;
-                if width <= 0.0 {
-                    continue;
-                }
-                let weight = self.monotonicity.lambda * width;
-                if weight == 0.0 {
-                    continue;
-                }
-                let scaled = -*slope;
-                let softplus = stable_softplus(scaled);
-                monotonic_deviance += 2.0 * weight * softplus;
-                let sigmoid = stable_sigmoid(scaled);
-                let grad_scale = -2.0 * weight * sigmoid;
-                let design = self.monotonicity.derivative_design.row(idx);
-                accumulate_weighted_vector(&mut monotonic_gradient, grad_scale, &design);
-                let hess_scale = 2.0 * weight * sigmoid * (1.0 - sigmoid);
-                accumulate_symmetric_outer(&mut monotonic_hessian, hess_scale, &design);
-            }
         }
 
         gradient.mapv_inplace(|value| value * -2.0);
         hessian.mapv_inplace(|value| value * -2.0);
-        gradient += &barrier_gradient;
-        hessian += &barrier_hessian;
-        gradient += &monotonic_gradient;
-        hessian += &monotonic_hessian;
-        let mut deviance = -2.0 * log_likelihood + barrier_deviance;
-        deviance += monotonic_deviance;
+        let mut deviance = -2.0 * log_likelihood;
 
         let penalty_gradient = self.layout.penalties.gradient(beta);
         gradient += &penalty_gradient;
@@ -1523,23 +1407,10 @@ impl WorkingModelSurvival {
         deviance += self.layout.penalties.deviance(beta);
 
         if self.spec.use_expected_information {
-            if let Some(expected_hessian) = self.build_expected_information_hessian(
-                beta,
-                &barrier_hessian,
-                &penalty_hessian,
-                &monotonic_hessian,
-            )? {
+            if let Some(expected_hessian) =
+                self.build_expected_information_hessian(beta, &penalty_hessian)?
+            {
                 hessian = expected_hessian;
-            }
-        }
-
-        if let Some(fraction) = barrier_activation_fraction {
-            if fraction > BARRIER_ACTIVATION_WARN_THRESHOLD {
-                warn!(
-                    "Monotonicity barrier active on {:.1}% of {} entries; consider increasing the monotonicity knot count or smoothing weight.",
-                    fraction * 100.0,
-                    barrier_source_label
-                );
             }
         }
 
@@ -2159,18 +2030,6 @@ mod tests {
     use ndarray::array;
     use serde_json;
 
-    fn start_test_logger() -> logtest::Logger {
-        use std::sync::Once;
-
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = logtest::Logger::start();
-        });
-        let mut logger = logtest::Logger {};
-        while logger.pop().is_some() {}
-        logger
-    }
-
     fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
         let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];
         array![
@@ -2618,8 +2477,6 @@ mod tests {
         } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
         let spec = SurvivalSpec::default();
         let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
-        let mut monotonicity = monotonicity;
-        monotonicity.lambda = 0.0;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
@@ -2654,83 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_activation_warning_triggers_when_fraction_exceeds_threshold() {
-        let mut logger = start_test_logger();
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let SurvivalLayoutBundle { layout, .. } =
-            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
-        let p = layout.combined_exit.ncols();
-        let grid_size = 10;
-        let mut monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            derivative_design: Array2::<f64>::zeros((grid_size, p)),
-            quadrature_design: Array2::<f64>::zeros((grid_size, p)),
-            grid_ages: Array1::<f64>::zeros(grid_size),
-            quadrature_left: Array1::<f64>::zeros(grid_size),
-            quadrature_right: Array1::<f64>::zeros(grid_size),
-        };
-        for mut row in monotonicity.derivative_design.rows_mut().into_iter() {
-            row[0] = 1.0;
-        }
-        let mut model =
-            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
-                .unwrap();
-        let mut beta = Array1::<f64>::zeros(p);
-        beta[0] = -1.0;
-        model.update_state(&beta).unwrap();
-        assert!(logger.any(|record| {
-            record.level() == log::Level::Warn
-                && record
-                    .args()
-                    .to_string()
-                    .contains("Monotonicity barrier active")
-        }));
-    }
-
-    #[test]
-    fn barrier_activation_warning_silent_when_fraction_below_threshold() {
-        let mut logger = start_test_logger();
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let SurvivalLayoutBundle { layout, .. } =
-            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
-        let p = layout.combined_exit.ncols();
-        let grid_size = 10;
-        let mut monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
-            derivative_design: Array2::<f64>::zeros((grid_size, p)),
-            quadrature_design: Array2::<f64>::zeros((grid_size, p)),
-            grid_ages: Array1::<f64>::zeros(grid_size),
-            quadrature_left: Array1::<f64>::zeros(grid_size),
-            quadrature_right: Array1::<f64>::zeros(grid_size),
-        };
-        for mut row in monotonicity.derivative_design.rows_mut().into_iter() {
-            row[0] = 1.0;
-        }
-        let mut model =
-            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
-                .unwrap();
-        let mut beta = Array1::<f64>::zeros(p);
-        beta[0] = 1.0;
-        model.update_state(&beta).unwrap();
-        assert!(!logger.any(|record| {
-            record.level() == log::Level::Warn
-                && record
-                    .args()
-                    .to_string()
-                    .contains("Monotonicity barrier active")
-        }));
-    }
-
-    #[test]
-    fn monotonic_penalty_triggers_for_negative_slopes() {
+    fn monotonic_constraint_rejects_negative_slopes() {
         let mut data = toy_training_data();
         data.sample_weight.fill(0.0);
         let basis = BasisDescriptor {
@@ -2738,96 +2519,32 @@ mod tests {
             degree: 2,
         };
         let SurvivalLayoutBundle {
-            mut layout,
+            layout,
             monotonicity,
             ..
         } = build_survival_layout(&data, &basis, 0.1, 2, 12, None).unwrap();
-        for block in &mut layout.penalties.blocks {
-            block.lambda = 0.0;
-        }
+        assert!(monotonicity.derivative_design.nrows() > 0);
 
-        let mut penalty = monotonicity.clone();
-        penalty.lambda = 1.0;
-        let mut zero_penalty = penalty.clone();
-        zero_penalty.lambda = 0.0;
-
-        let mut beta = penalty.derivative_design.row(0).to_owned();
-        beta.mapv_inplace(|value| -value);
-        let derivative_grid = penalty.derivative_design.dot(&beta);
-        assert!(derivative_grid.iter().any(|value| *value < -1e-8));
-
-        let penalised_state = {
-            let mut model = WorkingModelSurvival::new(
-                layout.clone(),
-                &data,
-                penalty.clone(),
-                SurvivalSpec::default(),
-            )
-            .unwrap();
-            model.update_state(&beta).unwrap()
-        };
-
-        let unpenalised_state = {
-            let mut model = WorkingModelSurvival::new(
-                layout.clone(),
-                &data,
-                zero_penalty.clone(),
-                SurvivalSpec::default(),
-            )
-            .unwrap();
-            model.update_state(&beta).unwrap()
-        };
-
-        assert!(penalised_state.deviance > unpenalised_state.deviance);
-
-        let mut expected_deviance = 0.0;
-        let mut expected_gradient = Array1::<f64>::zeros(beta.len());
-        let mut expected_hessian = Array2::<f64>::zeros((beta.len(), beta.len()));
-        for idx in 0..derivative_grid.len() {
-            let left = penalty.quadrature_left[idx];
-            let right = penalty.quadrature_right[idx];
-            let width = right - left;
-            if width <= 0.0 {
-                continue;
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let mut found = false;
+        for row in monotonicity.derivative_design.rows() {
+            if row.iter().any(|value| value.abs() > 1e-12) {
+                beta.assign(&row);
+                beta.mapv_inplace(|value| -value);
+                found = true;
+                break;
             }
-            let slope = derivative_grid[idx];
-            let scaled = -slope;
-            let weight = penalty.lambda * width;
-            if weight == 0.0 {
-                continue;
-            }
-            let softplus = stable_softplus(scaled);
-            expected_deviance += 2.0 * weight * softplus;
-            let sigmoid = stable_sigmoid(scaled);
-            let grad_scale = -2.0 * weight * sigmoid;
-            let design = penalty.derivative_design.row(idx);
-            accumulate_weighted_vector(&mut expected_gradient, grad_scale, &design);
-            let hess_scale = 2.0 * weight * sigmoid * (1.0 - sigmoid);
-            accumulate_symmetric_outer(&mut expected_hessian, hess_scale, &design);
         }
+        assert!(found, "monotonicity grid returned only zero rows");
 
-        assert_abs_diff_eq!(
-            penalised_state.deviance,
-            unpenalised_state.deviance + expected_deviance,
-            epsilon = 1e-9
-        );
-        let expected_gradient_total = &unpenalised_state.gradient + &expected_gradient;
-        for (observed, expected) in penalised_state
-            .gradient
-            .iter()
-            .zip(expected_gradient_total.iter())
-        {
-            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-9);
-        }
+        let slopes = monotonicity.derivative_design.dot(&beta);
+        assert!(slopes.iter().any(|value| *value < 0.0));
 
-        let expected_hessian_total = &unpenalised_state.hessian + &expected_hessian;
-        for (observed, expected) in penalised_state
-            .hessian
-            .iter()
-            .zip(expected_hessian_total.iter())
-        {
-            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-8);
-        }
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
+                .unwrap();
+        let err = model.update_state(&beta).unwrap_err();
+        assert!(matches!(err, SurvivalError::MonotonicityViolation { .. }));
     }
 
     #[test]
@@ -3118,11 +2835,9 @@ mod tests {
             .penalty_descriptors
             .iter_mut()
             .for_each(|descriptor| descriptor.lambda = 0.0);
-        bundle.monotonicity.lambda = 0.0;
         let layout = bundle.layout.clone();
         let monotonicity = bundle.monotonicity.clone();
         let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
@@ -3173,14 +2888,12 @@ mod tests {
             .penalty_descriptors
             .iter_mut()
             .for_each(|descriptor| descriptor.lambda = 0.0);
-        bundle.monotonicity.lambda = 0.0;
         let layout = bundle.layout.clone();
         let monotonicity = bundle.monotonicity.clone();
         let penalty_descriptors = bundle.penalty_descriptors.clone();
         let interaction_metadata = bundle.interaction_metadata.clone();
         let time_varying_basis = bundle.time_varying_basis.clone();
         let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
@@ -3242,11 +2955,9 @@ mod tests {
             .penalty_descriptors
             .iter_mut()
             .for_each(|descriptor| descriptor.lambda = 0.0);
-        bundle.monotonicity.lambda = 0.0;
         let layout = bundle.layout.clone();
         let monotonicity = bundle.monotonicity.clone();
         let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
@@ -3351,7 +3062,6 @@ mod tests {
             ..
         } = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
         spec.use_expected_information = true;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
@@ -3412,11 +3122,9 @@ mod tests {
             .penalty_descriptors
             .iter_mut()
             .for_each(|descriptor| descriptor.lambda = 0.0);
-        bundle.monotonicity.lambda = 0.0;
         let layout = bundle.layout.clone();
         let monotonicity = bundle.monotonicity.clone();
         let mut spec_observed = SurvivalSpec::default();
-        spec_observed.barrier_weight = 0.0;
         spec_observed.use_expected_information = false;
         let mut spec_expected = spec_observed;
         spec_expected.use_expected_information = true;
@@ -3507,7 +3215,6 @@ mod tests {
             .penalty_descriptors
             .iter_mut()
             .for_each(|descriptor| descriptor.lambda = 0.0);
-        bundle.monotonicity.lambda = 0.0;
         let layout_weighted = bundle.layout.clone();
         let monotonic_weighted = bundle.monotonicity.clone();
         let replicate_pattern = [0usize, 1, 1];
@@ -3549,7 +3256,6 @@ mod tests {
         };
 
         let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
 
         let mut weighted_model = WorkingModelSurvival::new(
@@ -3617,7 +3323,6 @@ mod tests {
         }
 
         let zero_monotonicity = MonotonicityPenalty {
-            lambda: 0.0,
             derivative_design: monotonicity.derivative_design.clone(),
             quadrature_design: monotonicity.quadrature_design.clone(),
             grid_ages: monotonicity.grid_ages.clone(),
