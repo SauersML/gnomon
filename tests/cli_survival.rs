@@ -77,10 +77,7 @@ fn survival_cli_rejects_retired_barrier_flags() {
             .output()
             .expect("run gnomon cli");
 
-        assert!(
-            !output.status.success(),
-            "CLI unexpectedly accepted {flag}"
-        );
+        assert!(!output.status.success(), "CLI unexpectedly accepted {flag}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains(flag),

@@ -212,9 +212,7 @@ impl ModelConfig {
     pub fn survival_spec(&self) -> Option<SurvivalSpec> {
         match &self.model_family {
             ModelFamily::Gam(_) => None,
-            ModelFamily::Survival(spec) => {
-                Some(spec.clone())
-            }
+            ModelFamily::Survival(spec) => Some(spec.clone()),
         }
     }
 }
@@ -849,6 +847,8 @@ impl TrainedModel {
             let explicit_competing = cif_competing_owned.as_ref().map(|arr| arr[i]);
             let cif_competing = if let Some(value) = explicit_competing {
                 survival::competing_cif_value(entry_age, &cov_row, Some(value), None)?
+            } else if resolved_companions.is_empty() {
+                0.0
             } else {
                 let mut candidate: Option<f64> = None;
                 let mut last_horizon_error: Option<SurvivalError> = None;

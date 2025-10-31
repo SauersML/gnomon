@@ -1679,9 +1679,7 @@ pub fn train_survival_model(
         )
     })?;
 
-    let survival_spec = config
-        .survival_spec()
-        .unwrap_or_else(SurvivalSpec::default);
+    let survival_spec = config.survival_spec().unwrap_or_else(SurvivalSpec::default);
 
     let (log_entry, log_min, log_max) =
         compute_log_age_extents(&bundle.age_transform, &bundle.data)?;

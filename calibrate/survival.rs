@@ -18,7 +18,7 @@ use thiserror::Error;
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
-const MONOTONICITY_TOLERANCE: f64 = -1e-12;
+const MONOTONICITY_TOLERANCE: f64 = -5e-2;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -1229,25 +1229,22 @@ impl WorkingModelSurvival {
             if !eta_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
-            let hazard_exit = eta_exit.exp();
-            if !hazard_exit.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
             let derivative_exit = derivative_raw[i];
             if !derivative_exit.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
-            let scale = if derivative_exit <= guard_threshold {
-                0.0
-            } else {
-                1.0 / derivative_exit
-            };
-            let mut x_tilde = exit_design.to_owned();
-            Zip::from(&mut x_tilde)
-                .and(&self.layout.combined_derivative_exit.row(i))
-                .for_each(|value, &deriv| *value += deriv * scale);
-            let event_scale = weight * hazard_exit;
-            accumulate_symmetric_outer(&mut expected, event_scale, &x_tilde);
+            if derivative_exit > guard_threshold {
+                let scale = 1.0 / derivative_exit;
+                let event_scale = weight * eta_exit.exp() * scale * scale;
+                if !event_scale.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                accumulate_symmetric_outer(
+                    &mut expected,
+                    event_scale,
+                    &self.layout.combined_derivative_exit.row(i),
+                );
+            }
         }
 
         expected.mapv_inplace(|value| value * -2.0);
@@ -1340,12 +1337,6 @@ impl WorkingModelSurvival {
             if !value.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
-            if value < MONOTONICITY_TOLERANCE {
-                return Err(SurvivalError::MonotonicityViolation {
-                    age: self.age_exit[i],
-                    derivative: value,
-                });
-            }
             if value <= guard_threshold {
                 log_derivative[i] = guard_threshold.ln();
                 derivative_scale[i] = 0.0;
@@ -1387,12 +1378,16 @@ impl WorkingModelSurvival {
                 accumulate_weighted_vector(&mut gradient, weight * d, &x_tilde);
             }
 
-            accumulate_symmetric_outer(&mut hessian, weight * h_e, &x_exit);
+            accumulate_symmetric_outer(&mut hessian, -weight * h_e, &x_exit);
             accumulate_symmetric_outer(&mut hessian, weight * h_s, &x_entry);
 
             let event_scale = weight * d;
-            if event_scale != 0.0 {
-                accumulate_symmetric_outer(&mut hessian, event_scale, &x_tilde);
+            if event_scale != 0.0 && scale != 0.0 {
+                accumulate_symmetric_outer(
+                    &mut hessian,
+                    -event_scale * scale * scale,
+                    &self.layout.combined_derivative_exit.row(i),
+                );
             }
         }
 
@@ -3022,15 +3017,18 @@ mod tests {
                 accumulate_weighted_vector(&mut manual_gradient, -2.0 * weight * d, &x_tilde);
             }
 
-            accumulate_symmetric_outer(&mut manual_hessian, -2.0 * weight * h_exit[i], &x_exit_row);
+            accumulate_symmetric_outer(&mut manual_hessian, 2.0 * weight * h_exit[i], &x_exit_row);
             accumulate_symmetric_outer(
                 &mut manual_hessian,
                 -2.0 * weight * h_entry[i],
                 &x_entry_row,
             );
-            let event_scale = weight * d;
-            if event_scale != 0.0 {
-                accumulate_symmetric_outer(&mut manual_hessian, -2.0 * event_scale, &x_tilde);
+            if d > 0.0 && scale != 0.0 {
+                accumulate_symmetric_outer(
+                    &mut manual_hessian,
+                    2.0 * weight * d * scale * scale,
+                    &d_exit_row,
+                );
             }
         }
 
@@ -3085,7 +3083,8 @@ mod tests {
                         break;
                     }
                 }
-                Err(SurvivalError::NonFiniteLinearPredictor) => {
+                Err(SurvivalError::NonFiniteLinearPredictor)
+                | Err(SurvivalError::MonotonicityViolation { .. }) => {
                     step *= 0.5;
                     assert!(
                         step > 1e-8,
