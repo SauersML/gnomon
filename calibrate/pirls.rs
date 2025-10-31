@@ -1,8 +1,8 @@
 use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, array1_to_col_mat_mut, array2_to_mat_mut,
-    hash_array2,
+    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
+    array2_to_mat_mut, hash_array2, ldlt_rook,
 };
 use crate::calibrate::model::{LinkFunction, ModelConfig};
 use faer::linalg::matmul::matmul;
@@ -106,30 +106,79 @@ fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let mut matrix = hessian.clone();
-    let mut rhs = gradient.mapv(|v| -v);
-    let mut attempt = 0usize;
-    loop {
-        match FaerLdlt::new(FaerArrayView::new(&matrix).as_ref(), Side::Lower) {
-            Ok(factor) => {
-                let mut rhs_mat = array1_to_col_mat_mut(&mut rhs);
-                factor.solve_in_place(rhs_mat.as_mut());
-                return Ok(rhs);
+    // Use the shared rook-pivoted LDLᵀ factorization plan; if it fails we bubble the
+    // error so callers can surface a single fallback message instead of ridge loops.
+    let (lower, diag, subdiag, perm_fwd, perm_inv, _) =
+        ldlt_rook(hessian).map_err(EstimationError::LinearSystemSolveFailed)?;
+
+    let rhs = gradient.mapv(|v| -v);
+    let n = rhs.len();
+
+    let mut permuted = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        permuted[i] = rhs[perm_inv[i]];
+    }
+
+    let mut y = permuted;
+    for i in 0..n {
+        let mut sum = y[i];
+        for j in 0..i {
+            sum -= lower[[i, j]] * y[j];
+        }
+        y[i] = sum;
+    }
+
+    let mut z = Array1::<f64>::zeros(n);
+    let mut idx = 0usize;
+    while idx < n {
+        if idx + 1 < n && subdiag[idx].abs() > 1e-12 {
+            let a = diag[idx];
+            let b = subdiag[idx];
+            let c = diag[idx + 1];
+            let det = a * c - b * b;
+            if det.abs() <= 1e-18 {
+                return Err(EstimationError::LinearSystemSolveFailed(
+                    FaerLinalgError::Ldlt(faer::linalg::solvers::LdltError::ZeroPivot {
+                        index: idx,
+                    }),
+                ));
             }
-            Err(err) => {
-                if attempt >= 6 {
-                    return Err(EstimationError::LinearSystemSolveFailed(
-                        crate::calibrate::faer_ndarray::FaerLinalgError::Ldlt(err),
-                    ));
-                }
-                let ridge = 10f64.powi((attempt as i32) - 6);
-                for i in 0..matrix.nrows() {
-                    matrix[[i, i]] += ridge;
-                }
-                attempt += 1;
+            let y0 = y[idx];
+            let y1 = y[idx + 1];
+            z[idx] = (c * y0 - b * y1) / det;
+            z[idx + 1] = (-b * y0 + a * y1) / det;
+            idx += 2;
+        } else {
+            let d = diag[idx];
+            if d.abs() <= 1e-18 {
+                return Err(EstimationError::LinearSystemSolveFailed(
+                    FaerLinalgError::Ldlt(faer::linalg::solvers::LdltError::ZeroPivot {
+                        index: idx,
+                    }),
+                ));
             }
+            z[idx] = y[idx] / d;
+            idx += 1;
         }
     }
+
+    let mut x_perm = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = z[i];
+        for j in i + 1..n {
+            sum -= lower[[j, i]] * x_perm[j];
+        }
+        x_perm[i] = sum;
+    }
+
+    let mut solution = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        solution[perm_fwd[i]] = x_perm[i];
+    }
+
+    // The rook-pivoted factorization returns permutation vectors that record the pivot order.
+    // We respect that structure so downstream consumers can reason about the stored plan.
+    Ok(solution)
 }
 
 pub fn run_working_model_pirls<M, F>(
