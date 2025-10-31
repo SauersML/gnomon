@@ -1170,8 +1170,8 @@ fn build_monotonicity_penalty(
     }
 
     Ok(MonotonicityPenalty {
-            lambda,
-            derivative_design: combined,
+        lambda,
+        derivative_design: combined,
         quadrature_design,
         grid_ages: grid,
         quadrature_left,
@@ -1214,6 +1214,7 @@ impl WorkingModelSurvival {
         beta: &Array1<f64>,
         barrier_hessian: &Array2<f64>,
         penalty_hessian: &Array2<f64>,
+        monotonic_hessian: &Array2<f64>,
     ) -> Result<Option<Array2<f64>>, SurvivalError> {
         let grid_size = self.monotonicity.grid_ages.len();
         if grid_size <= 1 {
@@ -1314,6 +1315,7 @@ impl WorkingModelSurvival {
         expected.mapv_inplace(|value| value * -2.0);
         expected += barrier_hessian;
         expected += penalty_hessian;
+        expected += monotonic_hessian;
         let mut neg_expected = expected.clone();
         neg_expected.mapv_inplace(|value| -value);
         let mut shift = 0.0;
@@ -1367,6 +1369,9 @@ impl WorkingModelSurvival {
         let mut barrier_deviance = 0.0;
         let mut barrier_gradient = Array1::<f64>::zeros(p);
         let mut barrier_hessian = Array2::<f64>::zeros((p, p));
+        let mut monotonic_deviance = 0.0;
+        let mut monotonic_gradient = Array1::<f64>::zeros(p);
+        let mut monotonic_hessian = Array2::<f64>::zeros((p, p));
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
         let h_exit = eta_exit.mapv(f64::exp);
         let h_entry = eta_entry.mapv(f64::exp);
@@ -1442,11 +1447,54 @@ impl WorkingModelSurvival {
             }
         }
 
+        if self.monotonicity.lambda > 0.0 && self.monotonicity.derivative_design.nrows() > 0 {
+            if self.monotonicity.derivative_design.ncols() != p
+                || self.monotonicity.quadrature_design.ncols() != p
+            {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            let derivative_grid = self.monotonicity.derivative_design.dot(beta);
+            if self.monotonicity.quadrature_design.nrows() != derivative_grid.len() {
+                return Err(SurvivalError::DesignDimensionMismatch);
+            }
+            for (idx, slope) in derivative_grid.iter().enumerate() {
+                if !slope.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                let eta_grid = self.monotonicity.quadrature_design.row(idx).dot(beta);
+                if !eta_grid.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                let left = self.monotonicity.quadrature_left[idx];
+                let right = self.monotonicity.quadrature_right[idx];
+                let width = right - left;
+                if width <= 0.0 {
+                    continue;
+                }
+                let weight = self.monotonicity.lambda * width;
+                if weight == 0.0 {
+                    continue;
+                }
+                let scaled = -*slope;
+                let softplus = stable_softplus(scaled);
+                monotonic_deviance += 2.0 * weight * softplus;
+                let sigmoid = stable_sigmoid(scaled);
+                let grad_scale = -2.0 * weight * sigmoid;
+                let design = self.monotonicity.derivative_design.row(idx);
+                accumulate_weighted_vector(&mut monotonic_gradient, grad_scale, &design);
+                let hess_scale = 2.0 * weight * sigmoid * (1.0 - sigmoid);
+                accumulate_symmetric_outer(&mut monotonic_hessian, hess_scale, &design);
+            }
+        }
+
         gradient.mapv_inplace(|value| value * -2.0);
         hessian.mapv_inplace(|value| value * -2.0);
         gradient += &barrier_gradient;
         hessian += &barrier_hessian;
+        gradient += &monotonic_gradient;
+        hessian += &monotonic_hessian;
         let mut deviance = -2.0 * log_likelihood + barrier_deviance;
+        deviance += monotonic_deviance;
 
         let penalty_gradient = self.layout.penalties.gradient(beta);
         gradient += &penalty_gradient;
@@ -1455,9 +1503,12 @@ impl WorkingModelSurvival {
         deviance += self.layout.penalties.deviance(beta);
 
         if self.spec.use_expected_information {
-            if let Some(expected_hessian) =
-                self.build_expected_information_hessian(beta, &barrier_hessian, &penalty_hessian)?
-            {
+            if let Some(expected_hessian) = self.build_expected_information_hessian(
+                beta,
+                &barrier_hessian,
+                &penalty_hessian,
+                &monotonic_hessian,
+            )? {
                 hessian = expected_hessian;
             }
         }
@@ -2525,6 +2576,8 @@ mod tests {
         } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
         let spec = SurvivalSpec::default();
         let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let mut monotonicity = monotonicity;
+        monotonicity.lambda = 0.0;
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
@@ -2556,6 +2609,107 @@ mod tests {
         let penalty = layout.penalties.deviance(&beta);
         let manual_deviance = -2.0 * log_likelihood + penalty;
         assert_abs_diff_eq!(state.deviance, manual_deviance, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn monotonic_penalty_triggers_for_negative_slopes() {
+        let mut data = toy_training_data();
+        data.sample_weight.fill(0.0);
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            mut layout,
+            monotonicity,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 12, None).unwrap();
+        for block in &mut layout.penalties.blocks {
+            block.lambda = 0.0;
+        }
+
+        let mut penalty = monotonicity.clone();
+        penalty.lambda = 1.0;
+        let mut zero_penalty = penalty.clone();
+        zero_penalty.lambda = 0.0;
+
+        let mut beta = penalty.derivative_design.row(0).to_owned();
+        beta.mapv_inplace(|value| -value);
+        let derivative_grid = penalty.derivative_design.dot(&beta);
+        assert!(derivative_grid.iter().any(|value| *value < -1e-8));
+
+        let penalised_state = {
+            let mut model = WorkingModelSurvival::new(
+                layout.clone(),
+                &data,
+                penalty.clone(),
+                SurvivalSpec::default(),
+            )
+            .unwrap();
+            model.update_state(&beta).unwrap()
+        };
+
+        let unpenalised_state = {
+            let mut model = WorkingModelSurvival::new(
+                layout.clone(),
+                &data,
+                zero_penalty.clone(),
+                SurvivalSpec::default(),
+            )
+            .unwrap();
+            model.update_state(&beta).unwrap()
+        };
+
+        assert!(penalised_state.deviance > unpenalised_state.deviance);
+
+        let mut expected_deviance = 0.0;
+        let mut expected_gradient = Array1::<f64>::zeros(beta.len());
+        let mut expected_hessian = Array2::<f64>::zeros((beta.len(), beta.len()));
+        for idx in 0..derivative_grid.len() {
+            let left = penalty.quadrature_left[idx];
+            let right = penalty.quadrature_right[idx];
+            let width = right - left;
+            if width <= 0.0 {
+                continue;
+            }
+            let slope = derivative_grid[idx];
+            let scaled = -slope;
+            let weight = penalty.lambda * width;
+            if weight == 0.0 {
+                continue;
+            }
+            let softplus = stable_softplus(scaled);
+            expected_deviance += 2.0 * weight * softplus;
+            let sigmoid = stable_sigmoid(scaled);
+            let grad_scale = -2.0 * weight * sigmoid;
+            let design = penalty.derivative_design.row(idx);
+            accumulate_weighted_vector(&mut expected_gradient, grad_scale, &design);
+            let hess_scale = 2.0 * weight * sigmoid * (1.0 - sigmoid);
+            accumulate_symmetric_outer(&mut expected_hessian, hess_scale, &design);
+        }
+
+        assert_abs_diff_eq!(
+            penalised_state.deviance,
+            unpenalised_state.deviance + expected_deviance,
+            epsilon = 1e-9
+        );
+        let expected_gradient_total = &unpenalised_state.gradient + &expected_gradient;
+        for (observed, expected) in penalised_state
+            .gradient
+            .iter()
+            .zip(expected_gradient_total.iter())
+        {
+            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-9);
+        }
+
+        let expected_hessian_total = &unpenalised_state.hessian + &expected_hessian;
+        for (observed, expected) in penalised_state
+            .hessian
+            .iter()
+            .zip(expected_hessian_total.iter())
+        {
+            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-8);
+        }
     }
 
     #[test]
@@ -2675,8 +2829,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
