@@ -1563,7 +1563,7 @@ pub fn train_survival_model(
 ) -> Result<TrainedModel, EstimationError> {
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
-        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
+        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityConstraint,
         SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
         WorkingModelSurvival,
     };
@@ -1709,7 +1709,6 @@ pub fn train_survival_model(
         survival_cfg.guard_delta,
         config.penalty_order,
         survival_cfg.initial_lambda,
-        survival_cfg.monotonic_lambda,
         survival_cfg.monotonic_grid_size,
     )
     .map_err(map_error)?;
@@ -1732,7 +1731,7 @@ pub fn train_survival_model(
 
     struct SurvivalLambdaOptimizer<'a> {
         base_layout: SurvivalLayout,
-        monotonicity: MonotonicityPenalty,
+        monotonicity: MonotonicityConstraint,
         data: &'a crate::calibrate::survival::SurvivalTrainingData,
         spec: SurvivalSpec,
         options: crate::calibrate::pirls::WorkingModelPirlsOptions,
@@ -1750,7 +1749,7 @@ pub fn train_survival_model(
     impl<'a> SurvivalLambdaOptimizer<'a> {
         fn new(
             layout: SurvivalLayout,
-            monotonicity: MonotonicityPenalty,
+            monotonicity: MonotonicityConstraint,
             data: &'a crate::calibrate::survival::SurvivalTrainingData,
             spec: SurvivalSpec,
             options: crate::calibrate::pirls::WorkingModelPirlsOptions,
@@ -2316,6 +2315,7 @@ pub fn train_survival_model(
         penalties: penalty_descriptors,
         age_transform: layout.age_transform,
         reference_constraint: layout.reference_constraint.clone(),
+        monotonicity: layout.monotonicity.clone(),
         interaction_metadata,
         companion_models: Vec::new(),
         hessian_factor,
