@@ -33,10 +33,9 @@ struct TrustedReferenceFixture {
 
 impl TrustedReference {
     fn load() -> Self {
-        let raw: TrustedReferenceFixture = serde_json::from_str(include_str!(
-            "trusted_reference_artifacts.json"
-        ))
-        .expect("trusted reference fixture");
+        let raw: TrustedReferenceFixture =
+            serde_json::from_str(include_str!("trusted_reference_artifacts.json"))
+                .expect("trusted reference fixture");
 
         let static_covariates = rows_to_array(&raw.static_covariates);
         let extra_static_covariates = rows_to_array(&raw.extra_static_covariates);
@@ -89,7 +88,6 @@ fn rows_to_array(rows: &[Vec<f64>]) -> Array2<f64> {
     Array2::from_shape_vec((rows_len, cols), data).expect("reshape rows into matrix")
 }
 
-
 fn weighted_brier(weights: &Array1<f64>, outcomes: &Array1<f64>, predictions: &Array1<f64>) -> f64 {
     let total_weight: f64 = weights.sum();
     let mut score = 0.0;
@@ -121,7 +119,7 @@ fn replicated_brier(
 #[test]
 fn cumulative_incidence_matches_reference_library() {
     let trusted = TrustedReference::load();
-    
+
     // Compute CIF values using our implementation
     let mut computed_cif = Vec::new();
     for (idx, exit_age) in trusted.data.age_exit.iter().enumerate().take(4) {
@@ -129,35 +127,42 @@ fn cumulative_incidence_matches_reference_library() {
         let cif = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
         computed_cif.push(cif);
     }
-    
+
     // Compare computed values against lifelines reference
     let expected = &trusted.lifelines_cif[..4];
     assert_eq!(computed_cif.len(), expected.len());
     for (computed, expected) in computed_cif.iter().zip(expected.iter()) {
-        assert!((computed - expected).abs() <= 1e-10, 
-            "CIF mismatch: computed={}, expected={}", computed, expected);
+        assert!(
+            (computed - expected).abs() <= 1e-10,
+            "CIF mismatch: computed={}, expected={}",
+            computed,
+            expected
+        );
     }
 }
 
 #[test]
 fn brier_score_matches_reference_library() {
     let trusted = TrustedReference::load();
-    
+
     // Compute predictions using our model
     let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
     for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
         let cov = trusted.covariates_row(idx);
         preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
     }
-    
+
     // Compute weighted Brier score
     let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
     let computed_brier = weighted_brier(&trusted.data.sample_weight, &outcomes, &preds);
-    
+
     // Compare against lifelines reference
-    assert!((computed_brier - trusted.lifelines_weighted_brier).abs() <= 1e-10,
-        "Brier score mismatch: computed={}, expected={}", 
-        computed_brier, trusted.lifelines_weighted_brier);
+    assert!(
+        (computed_brier - trusted.lifelines_weighted_brier).abs() <= 1e-10,
+        "Brier score mismatch: computed={}, expected={}",
+        computed_brier,
+        trusted.lifelines_weighted_brier
+    );
 }
 
 #[test]
