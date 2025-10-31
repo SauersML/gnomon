@@ -410,6 +410,9 @@ pub struct TrainedModel {
     /// Optional survival-specific artifacts (present when training survival models).
     #[serde(default)]
     pub survival: Option<SurvivalModelArtifacts>,
+    /// Optional registry of companion survival models keyed by handle reference.
+    #[serde(default)]
+    pub survival_companions: HashMap<String, SurvivalModelArtifacts>,
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +770,7 @@ impl TrainedModel {
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
         cif_competing_entry: Option<ArrayView1<f64>>,
+        companion_registry: Option<&HashMap<String, SurvivalModelArtifacts>>,
     ) -> Result<SurvivalPrediction, ModelError> {
         if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival("predict_survival"));
@@ -801,6 +805,20 @@ impl TrainedModel {
             }
         }
 
+        let registry = companion_registry.unwrap_or(&self.survival_companions);
+        let resolved_companions: Vec<(&survival::CompanionModelHandle, &SurvivalModelArtifacts)> =
+            if cif_competing_owned.is_none() && !artifacts.companion_models.is_empty() {
+                let mut resolved = Vec::with_capacity(artifacts.companion_models.len());
+                for handle in &artifacts.companion_models {
+                    let (resolved_handle, companion) =
+                        survival::resolve_companion_model(artifacts, &handle.reference, registry)?;
+                    resolved.push((resolved_handle, companion));
+                }
+                resolved
+            } else {
+                Vec::new()
+            };
+
         let coeffs = &artifacts.coefficients;
         let design_width = coeffs.len();
         let mut hazard_entry = Array1::<f64>::zeros(n);
@@ -815,7 +833,40 @@ impl TrainedModel {
             let cov_row = covariates.row(i).to_owned();
             let entry_age = age_entry[i];
             let exit_age = age_exit[i];
-            let cif_competing = cif_competing_owned.as_ref().map_or(0.0, |arr| arr[i]);
+            let explicit_competing = cif_competing_owned.as_ref().map(|arr| arr[i]);
+            let cif_competing = if let Some(value) = explicit_competing {
+                survival::competing_cif_value(entry_age, &cov_row, Some(value), None)?
+            } else {
+                let mut candidate: Option<f64> = None;
+                let mut last_horizon_error: Option<SurvivalError> = None;
+                for &(handle, companion) in &resolved_companions {
+                    match survival::competing_cif_value(
+                        entry_age,
+                        &cov_row,
+                        None,
+                        Some((handle, companion)),
+                    ) {
+                        Ok(value) => {
+                            candidate = Some(value);
+                            break;
+                        }
+                        Err(err @ SurvivalError::CompanionModelMissingHorizon { .. }) => {
+                            last_horizon_error = Some(err);
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+
+                match candidate {
+                    Some(value) => value,
+                    None => {
+                        if let Some(err) = last_horizon_error {
+                            return Err(err.into());
+                        }
+                        return Err(SurvivalError::MissingCompanionCifData.into());
+                    }
+                }
+            };
 
             let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row, artifacts)?;
             let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row, artifacts)?;
@@ -910,6 +961,7 @@ impl TrainedModel {
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
         cif_competing_entry: Option<ArrayView1<f64>>,
+        companion_registry: Option<&HashMap<String, SurvivalModelArtifacts>>,
     ) -> Result<Array1<f64>, ModelError> {
         if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival(
@@ -928,6 +980,7 @@ impl TrainedModel {
             sex_new,
             pcs_new,
             cif_competing_entry,
+            companion_registry,
         )?;
         artifacts
             .apply_logit_risk_calibrator(
@@ -1709,6 +1762,7 @@ mod tests {
             scale: None,
             calibrator: None,
             survival: None,
+            survival_companions: HashMap::new(),
         };
 
         // --- Define Test Points ---
@@ -1856,6 +1910,7 @@ mod tests {
             scale: None,
             calibrator: None,
             survival: Some(artifacts),
+            survival_companions: HashMap::new(),
         };
 
         let result = model
@@ -1865,6 +1920,7 @@ mod tests {
                 data.pgs.view(),
                 data.sex.view(),
                 data.pcs.view(),
+                None,
                 None,
             )
             .expect("survival prediction succeeded");
@@ -1935,6 +1991,7 @@ mod tests {
             scale: None,
             calibrator: None,
             survival: None,
+            survival_companions: HashMap::new(),
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -2250,6 +2307,7 @@ mod tests {
             scale: None,
             calibrator: None,
             survival: None,
+            survival_companions: HashMap::new(),
         };
 
         // Create a temporary file for testing

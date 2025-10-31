@@ -3225,6 +3225,7 @@ mod tests {
             scale: None,
             calibrator: None,
             survival: None,
+            survival_companions: HashMap::new(),
         };
 
         let preds_via_predict = model

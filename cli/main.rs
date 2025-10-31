@@ -377,6 +377,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                     data.sex.view(),
                     data.pcs.view(),
                     None,
+                    Some(&model.survival_companions),
                 )?;
 
                 let calibrated_risk = if args.no_calibration {
@@ -396,6 +397,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                         data.sex.view(),
                         data.pcs.view(),
                         None,
+                        Some(&model.survival_companions),
                     ) {
                         Ok(calibrated) => Some(calibrated),
                         Err(_) => None,
