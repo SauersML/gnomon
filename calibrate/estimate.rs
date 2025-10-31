@@ -1681,7 +1681,6 @@ pub fn train_survival_model(
 
     let survival_spec = config
         .survival_spec()
-        .cloned()
         .unwrap_or_else(SurvivalSpec::default);
 
     let (log_entry, log_min, log_max) =

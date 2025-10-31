@@ -109,14 +109,6 @@ pub struct TrainArgs {
     #[arg(long, default_value = "1e-8")]
     pub survival_derivative_guard: f64,
 
-    /// Soft barrier weight discouraging negative derivatives in survival models
-    #[arg(long, default_value = "0.0001")]
-    pub survival_barrier_weight: f64,
-
-    /// Soft barrier scale controlling derivative penalties in survival models
-    #[arg(long, default_value = "1.0")]
-    pub survival_barrier_scale: f64,
-
     /// Use expected information instead of observed Hessian when fitting survival models
     #[arg(long)]
     pub survival_expected_information: bool,
@@ -253,8 +245,6 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             let mut spec = SurvivalSpec::default();
             spec.derivative_guard = args.survival_derivative_guard;
-            spec.barrier_weight = args.survival_barrier_weight;
-            spec.barrier_scale = args.survival_barrier_scale;
             spec.use_expected_information = args.survival_expected_information;
 
             let time_varying = if args.survival_enable_time_varying {
