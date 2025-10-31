@@ -623,9 +623,8 @@ where
     }
 }
 
-/// Construct the cached survival layout for PIRLS updates.
-#[allow(clippy::too_many_arguments)]
-fn seed_baseline_lambda(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
+/// Compute the initial smoothing weight for the survival baseline spline.
+pub fn baseline_lambda_seed(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
     let mut min_knot = f64::INFINITY;
     let mut max_knot = f64::NEG_INFINITY;
     for &value in age_basis.knot_vector.iter() {
@@ -723,7 +722,7 @@ pub fn build_survival_layout(
 
     let baseline_cols = constrained_exit.ncols();
     let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
-    let baseline_lambda = seed_baseline_lambda(age_basis, baseline_penalty_order);
+    let baseline_lambda = baseline_lambda_seed(age_basis, baseline_penalty_order);
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
@@ -1170,8 +1169,8 @@ fn build_monotonicity_penalty(
     }
 
     Ok(MonotonicityPenalty {
-            lambda,
-            derivative_design: combined,
+        lambda,
+        derivative_design: combined,
         quadrature_design,
         grid_ages: grid,
         quadrature_left,
@@ -2675,8 +2674,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
