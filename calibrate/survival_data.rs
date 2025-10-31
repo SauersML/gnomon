@@ -247,31 +247,32 @@ fn read_survival_arrays(path: &str, num_pcs: usize) -> Result<SurvivalArrays, Su
     let mut extra_names = Vec::new();
     let mut extra_columns = Vec::new();
     for original in df.get_column_names() {
-        if used_columns.contains(original) {
+        let original_str = original.as_ref();
+        if used_columns.contains(original_str) {
             continue;
         }
         let series = df
-            .column(original)
-            .map_err(|_| SurvivalDataError::ColumnNotFound(original.clone()))?;
+            .column(original_str)
+            .map_err(|_| SurvivalDataError::ColumnNotFound(original_str.to_string()))?;
         let casted = match series.cast(&DataType::Float64) {
             Ok(values) => values,
             Err(_) => continue,
         };
         let values = casted.f64().expect("casted to f64");
         if values.null_count() > 0 {
-            return Err(SurvivalDataError::MissingValues(original.clone()));
+            return Err(SurvivalDataError::MissingValues(original_str.to_string()));
         }
         if values.len() != n {
             return Err(SurvivalDataError::LengthMismatch {
-                column_name: original.clone(),
+                column_name: original_str.to_string(),
                 expected: n,
                 found: values.len(),
             });
         }
         let column = Array1::from_iter(values.into_no_null_iter());
-        extra_names.push(original.clone());
+        extra_names.push(original_str.to_string());
         extra_columns.push(column);
-        used_columns.insert(original.clone());
+        used_columns.insert(original_str.to_string());
     }
 
     let extra_width = extra_columns.len();
