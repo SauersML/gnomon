@@ -17,7 +17,7 @@ use gnomon::calibrate::estimate::train_survival_model;
 use gnomon::calibrate::model::SurvivalModelConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalPrediction;
-use gnomon::calibrate::model::{BasisConfig, SurvivalTimeVaryingConfig};
+use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::{
     InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
 };
