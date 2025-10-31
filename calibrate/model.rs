@@ -91,9 +91,7 @@ pub struct PrincipalComponentConfig {
 pub struct SurvivalModelConfig {
     pub baseline_basis: BasisConfig,
     pub guard_delta: f64,
-    pub initial_lambda: f64,
     pub monotonic_grid_size: usize,
-    pub monotonic_lambda: f64,
 }
 
 /// Holds the transformation matrix for a sum-to-zero constraint.
@@ -1774,8 +1772,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 4, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
         let layout = layout_bundle.layout;
         let coeffs = Array1::from_elem(layout.combined_exit.ncols(), 0.1);
 
@@ -1841,9 +1838,7 @@ mod tests {
                     degree: basis.degree,
                 },
                 guard_delta: 0.1,
-                initial_lambda: 0.5,
                 monotonic_grid_size: 4,
-                monotonic_lambda: 0.5,
             }),
         };
 

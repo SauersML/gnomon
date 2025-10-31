@@ -1706,11 +1706,22 @@ pub fn train_survival_model(
         &age_basis,
         survival_cfg.guard_delta,
         config.penalty_order,
-        survival_cfg.initial_lambda,
-        survival_cfg.monotonic_lambda,
         survival_cfg.monotonic_grid_size,
+        None,
     )
     .map_err(map_error)?;
+
+    if let Some(block) = layout.penalties.blocks.first() {
+        eprintln!(
+            "[STAGE 1/3] Baseline λ seed (auto): {:.3e}; monotonic weight: {:.3e}",
+            block.lambda, monotonicity.lambda,
+        );
+    } else {
+        eprintln!(
+            "[STAGE 1/3] No baseline penalty detected; monotonic weight: {:.3e}",
+            monotonicity.lambda,
+        );
+    }
 
     eprintln!(
         "[STAGE 1/3] Layout ready. Coefficients: {} (baseline columns: {}), penalties: {}",
@@ -1726,7 +1737,9 @@ pub fn train_survival_model(
         min_step_size: 1e-6,
     };
 
-    eprintln!("\n[STAGE 2/3] Optimizing survival smoothing parameters via BFGS...");
+    eprintln!(
+        "\n[STAGE 2/3] Optimizing survival smoothing parameters via REML/BFGS (automatic λ selection)..."
+    );
 
     struct SurvivalLambdaOptimizer<'a> {
         base_layout: SurvivalLayout,
