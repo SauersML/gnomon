@@ -89,6 +89,10 @@ pub struct CovariateViews<'a> {
 ### 4.3 Time-varying effects
 - Optional tensor-product smooth for `PGS × age` reuses the same log-age marginal and includes anisotropic penalties.
 - Center the interaction to prevent leakage into main effects; cache and serialize the centering transform.
+- The CLI exposes `--survival-enable-time-varying` alongside `--survival-time-varying-pgs-knots`,
+  `--survival-time-varying-pgs-degree`, and `--survival-time-varying-pgs-penalty-order` to toggle this interaction without
+  requiring users to tune smoothing magnitudes manually. Initial anisotropic lambdas reuse the baseline value internally and
+  remain subject to REML updates.
 
 ### 4.4 Stored layout pieces
 `SurvivalLayout` aggregates the cached designs:

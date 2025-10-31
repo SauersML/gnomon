@@ -88,12 +88,25 @@ pub struct PrincipalComponentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurvivalTimeVaryingConfig {
+    #[serde(default)]
+    pub label: Option<String>,
+    pub pgs_basis: BasisConfig,
+    pub pgs_penalty_order: usize,
+    pub lambda_age: f64,
+    pub lambda_pgs: f64,
+    pub lambda_null: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurvivalModelConfig {
     pub baseline_basis: BasisConfig,
     pub guard_delta: f64,
     pub initial_lambda: f64,
     pub monotonic_grid_size: usize,
     pub monotonic_lambda: f64,
+    #[serde(default)]
+    pub time_varying: Option<SurvivalTimeVaryingConfig>,
 }
 
 /// Holds the transformation matrix for a sum-to-zero constraint.
@@ -1898,6 +1911,7 @@ mod tests {
                 initial_lambda: 0.5,
                 monotonic_grid_size: 4,
                 monotonic_lambda: 0.5,
+                time_varying: None,
             }),
         };
 

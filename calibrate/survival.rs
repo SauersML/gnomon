@@ -1670,6 +1670,39 @@ pub fn design_row_at_age(
             .ok_or(SurvivalError::MissingPgsCovariate)?;
         let pgs_value = covariates[pgs_idx];
 
+        let pgs_range = descriptor
+            .value_ranges
+            .first()
+            .ok_or(SurvivalError::MissingInteractionMetadata)?;
+        if pgs_range.min.is_finite() && pgs_value < pgs_range.min {
+            let column = artifacts
+                .static_covariate_layout
+                .column_names
+                .get(pgs_idx)
+                .cloned()
+                .unwrap_or_else(|| "pgs".to_string());
+            return Err(SurvivalError::CovariateBelowRange {
+                column,
+                index: pgs_idx,
+                value: pgs_value,
+                minimum: pgs_range.min,
+            });
+        }
+        if pgs_range.max.is_finite() && pgs_value > pgs_range.max {
+            let column = artifacts
+                .static_covariate_layout
+                .column_names
+                .get(pgs_idx)
+                .cloned()
+                .unwrap_or_else(|| "pgs".to_string());
+            return Err(SurvivalError::CovariateAboveRange {
+                column,
+                index: pgs_idx,
+                value: pgs_value,
+                maximum: pgs_range.max,
+            });
+        }
+
         let (pgs_arc, _) = create_bspline_basis_with_knots(
             array![pgs_value].view(),
             time_basis.knot_vector.view(),
@@ -3454,6 +3487,27 @@ mod tests {
 
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
         assert_abs_diff_eq!(hazard, eta_exit[0].exp(), epsilon = 1e-10);
+
+        let pgs_idx = artifacts
+            .static_covariate_layout
+            .column_names
+            .iter()
+            .position(|name| name == "pgs")
+            .expect("pgs column present");
+        let mut covariates_high = covariates.clone();
+        covariates_high[pgs_idx] = metadata.value_ranges[0].max + 0.5;
+        let err_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts)
+            .expect_err("pgs above range should error");
+        assert!(matches!(
+            err_high,
+            SurvivalError::CovariateAboveRange { .. }
+        ));
+
+        let mut covariates_low = covariates;
+        covariates_low[pgs_idx] = metadata.value_ranges[0].min - 0.5;
+        let err_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts)
+            .expect_err("pgs below range should error");
+        assert!(matches!(err_low, SurvivalError::CovariateBelowRange { .. }));
 
         let mut model = WorkingModelSurvival::new(
             layout.clone(),
