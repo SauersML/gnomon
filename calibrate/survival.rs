@@ -325,7 +325,7 @@ impl PenaltyBlocks {
 #[derive(Debug, Clone)]
 pub struct SurvivalLayoutBundle {
     pub layout: SurvivalLayout,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     pub penalty_descriptors: Vec<PenaltyDescriptor>,
     pub interaction_metadata: Vec<InteractionDescriptor>,
     pub time_varying_basis: Option<BasisDescriptor>,
@@ -349,7 +349,7 @@ pub struct SurvivalLayout {
     pub combined_entry: Array2<f64>,
     pub combined_exit: Array2<f64>,
     pub combined_derivative_exit: Array2<f64>,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
 }
 
 /// Frequency-weighted survival training data bundle.
@@ -908,6 +908,7 @@ pub fn build_survival_layout(
         &data.age_entry,
         &data.age_exit,
         monotonic_grid_size,
+        monotonic_lambda,
     )?;
     layout.monotonicity = monotonicity.clone();
 
@@ -1034,7 +1035,8 @@ fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
 
 /// Deterministic projector guaranteeing non-negative exit derivatives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonotonicityConstraint {
+pub struct MonotonicityPenalty {
+    pub lambda: f64,
     pub derivative_design: Array2<f64>,
     pub quadrature_design: Array2<f64>,
     pub grid_ages: Array1<f64>,
@@ -1042,8 +1044,9 @@ pub struct MonotonicityConstraint {
     pub quadrature_right: Array1<f64>,
 }
 
-fn empty_monotonicity_constraint() -> MonotonicityConstraint {
-    MonotonicityConstraint {
+fn empty_monotonicity_constraint() -> MonotonicityPenalty {
+    MonotonicityPenalty {
+        lambda: 0.0,
         derivative_design: Array2::<f64>::zeros((0, 0)),
         quadrature_design: Array2::<f64>::zeros((0, 0)),
         grid_ages: Array1::<f64>::zeros(0),
@@ -1072,16 +1075,18 @@ impl Default for SurvivalSpec {
     }
 }
 
-fn build_monotonicity_constraint(
+fn build_monotonicity_penalty(
     layout: &SurvivalLayout,
     age_basis: &BasisDescriptor,
     ages_entry: &Array1<f64>,
     ages_exit: &Array1<f64>,
     grid_size: usize,
-) -> Result<MonotonicityConstraint, SurvivalError> {
+    lambda: f64,
+) -> Result<MonotonicityPenalty, SurvivalError> {
     if grid_size == 0 {
         let cols = layout.combined_exit.ncols();
-        return Ok(MonotonicityConstraint {
+        return Ok(MonotonicityPenalty {
+            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1102,7 +1107,8 @@ fn build_monotonicity_constraint(
     }
     if !min_age.is_finite() || !max_age.is_finite() || min_age >= max_age {
         let cols = layout.combined_exit.ncols();
-        return Ok(MonotonicityConstraint {
+        return Ok(MonotonicityPenalty {
+            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1163,8 +1169,9 @@ fn build_monotonicity_constraint(
         quadrature_right[idx] = right_bound;
     }
 
-    Ok(MonotonicityConstraint {
-        derivative_design: combined,
+    Ok(MonotonicityPenalty {
+            lambda,
+            derivative_design: combined,
         quadrature_design,
         grid_ages: grid,
         quadrature_left,
@@ -1179,7 +1186,7 @@ pub struct WorkingModelSurvival {
     pub event_target: Array1<u8>,
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     pub spec: SurvivalSpec,
 }
 
@@ -1187,7 +1194,7 @@ impl WorkingModelSurvival {
     pub fn new(
         layout: SurvivalLayout,
         data: &SurvivalTrainingData,
-        monotonicity: MonotonicityConstraint,
+        monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
         data.validate()?;
@@ -1522,7 +1529,7 @@ pub struct SurvivalModelArtifacts {
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
     #[serde(default = "empty_monotonicity_constraint")]
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     #[serde(default)]
     pub interaction_metadata: Vec<InteractionDescriptor>,
     #[serde(default)]
@@ -2477,7 +2484,7 @@ mod tests {
 
     fn evaluate_state(
         layout: &SurvivalLayout,
-        penalty: &MonotonicityConstraint,
+        penalty: &MonotonicityPenalty,
         data: &SurvivalTrainingData,
         beta: &Array1<f64>,
     ) -> WorkingState {
@@ -3334,7 +3341,8 @@ mod tests {
             block.lambda = 0.0;
         }
 
-        let zero_monotonicity = MonotonicityConstraint {
+        let zero_monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
             derivative_design: monotonicity.derivative_design.clone(),
             quadrature_design: monotonicity.quadrature_design.clone(),
             grid_ages: monotonicity.grid_ages.clone(),
