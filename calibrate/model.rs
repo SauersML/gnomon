@@ -209,10 +209,16 @@ impl ModelConfig {
         }
     }
 
-    pub fn survival_spec(&self) -> Option<&SurvivalSpec> {
+    pub fn survival_spec(&self) -> Option<SurvivalSpec> {
         match &self.model_family {
             ModelFamily::Gam(_) => None,
-            ModelFamily::Survival(spec) => Some(spec),
+            ModelFamily::Survival(spec) => {
+                let defaults = SurvivalSpec::default();
+                let mut sanitized = spec.clone();
+                sanitized.barrier_weight = defaults.barrier_weight;
+                sanitized.barrier_scale = defaults.barrier_scale;
+                Some(sanitized)
+            }
         }
     }
 }
