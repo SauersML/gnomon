@@ -2727,6 +2727,9 @@ mod tests {
                     .to_string()
                     .contains("Monotonicity barrier active")
         }));
+    }
+
+    #[test]
     fn monotonic_penalty_triggers_for_negative_slopes() {
         let mut data = toy_training_data();
         data.sample_weight.fill(0.0);
