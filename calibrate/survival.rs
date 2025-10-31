@@ -325,7 +325,7 @@ impl PenaltyBlocks {
 #[derive(Debug, Clone)]
 pub struct SurvivalLayoutBundle {
     pub layout: SurvivalLayout,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     pub penalty_descriptors: Vec<PenaltyDescriptor>,
     pub interaction_metadata: Vec<InteractionDescriptor>,
     pub time_varying_basis: Option<BasisDescriptor>,
@@ -349,7 +349,7 @@ pub struct SurvivalLayout {
     pub combined_entry: Array2<f64>,
     pub combined_exit: Array2<f64>,
     pub combined_derivative_exit: Array2<f64>,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
 }
 
 /// Frequency-weighted survival training data bundle.
@@ -625,12 +625,67 @@ where
 
 /// Construct the cached survival layout for PIRLS updates.
 #[allow(clippy::too_many_arguments)]
+fn seed_baseline_lambda(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
+    let mut min_knot = f64::INFINITY;
+    let mut max_knot = f64::NEG_INFINITY;
+    for &value in age_basis.knot_vector.iter() {
+        if !value.is_finite() {
+            continue;
+        }
+        if value < min_knot {
+            min_knot = value;
+        }
+        if value > max_knot {
+            max_knot = value;
+        }
+    }
+
+    let span = if min_knot.is_finite() && max_knot.is_finite() && max_knot > min_knot {
+        max_knot - min_knot
+    } else {
+        1.0
+    };
+    let order = penalty_order.max(1) as f64;
+    let degree = age_basis.degree.max(1) as f64;
+    let normalized_span = (span / (span + 1.0)).max(1e-3);
+    let lambda = 0.5 * (order / (degree + 1.0)) / normalized_span;
+    lambda.clamp(1e-6, 1e3)
+}
+
+fn seed_monotonic_lambda(data: &SurvivalTrainingData, grid_size: usize) -> f64 {
+    if grid_size == 0 {
+        return 0.0;
+    }
+
+    let mut min_age = f64::INFINITY;
+    let mut max_age = f64::NEG_INFINITY;
+    for &value in data.age_entry.iter().chain(data.age_exit.iter()) {
+        if !value.is_finite() {
+            continue;
+        }
+        if value < min_age {
+            min_age = value;
+        }
+        if value > max_age {
+            max_age = value;
+        }
+    }
+
+    let span = if min_age.is_finite() && max_age.is_finite() && max_age > min_age {
+        max_age - min_age
+    } else {
+        1.0
+    };
+    let grid = grid_size.max(1) as f64;
+    let lambda = 5e-5 * (grid / 4.0).sqrt() * span.max(1.0);
+    lambda.clamp(0.0, 1e2)
+}
+
 pub fn build_survival_layout(
     data: &SurvivalTrainingData,
     age_basis: &BasisDescriptor,
     delta: f64,
     baseline_penalty_order: usize,
-    baseline_lambda: f64,
     monotonic_grid_size: usize,
     time_varying: Option<&TensorProductConfig>,
 ) -> Result<SurvivalLayoutBundle, SurvivalError> {
@@ -668,6 +723,7 @@ pub fn build_survival_layout(
 
     let baseline_cols = constrained_exit.ncols();
     let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
+    let baseline_lambda = seed_baseline_lambda(age_basis, baseline_penalty_order);
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
@@ -845,12 +901,14 @@ pub fn build_survival_layout(
         monotonicity: empty_monotonicity_constraint(),
     };
 
-    let monotonicity = build_monotonicity_constraint(
+    let monotonic_lambda = seed_monotonic_lambda(data, monotonic_grid_size);
+    let monotonicity = build_monotonicity_penalty(
         &layout,
         age_basis,
         &data.age_entry,
         &data.age_exit,
         monotonic_grid_size,
+        monotonic_lambda,
     )?;
     layout.monotonicity = monotonicity.clone();
 
@@ -977,7 +1035,8 @@ fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
 
 /// Deterministic projector guaranteeing non-negative exit derivatives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonotonicityConstraint {
+pub struct MonotonicityPenalty {
+    pub lambda: f64,
     pub derivative_design: Array2<f64>,
     pub quadrature_design: Array2<f64>,
     pub grid_ages: Array1<f64>,
@@ -985,8 +1044,9 @@ pub struct MonotonicityConstraint {
     pub quadrature_right: Array1<f64>,
 }
 
-fn empty_monotonicity_constraint() -> MonotonicityConstraint {
-    MonotonicityConstraint {
+fn empty_monotonicity_constraint() -> MonotonicityPenalty {
+    MonotonicityPenalty {
+        lambda: 0.0,
         derivative_design: Array2::<f64>::zeros((0, 0)),
         quadrature_design: Array2::<f64>::zeros((0, 0)),
         grid_ages: Array1::<f64>::zeros(0),
@@ -1015,16 +1075,18 @@ impl Default for SurvivalSpec {
     }
 }
 
-fn build_monotonicity_constraint(
+fn build_monotonicity_penalty(
     layout: &SurvivalLayout,
     age_basis: &BasisDescriptor,
     ages_entry: &Array1<f64>,
     ages_exit: &Array1<f64>,
     grid_size: usize,
-) -> Result<MonotonicityConstraint, SurvivalError> {
+    lambda: f64,
+) -> Result<MonotonicityPenalty, SurvivalError> {
     if grid_size == 0 {
         let cols = layout.combined_exit.ncols();
-        return Ok(MonotonicityConstraint {
+        return Ok(MonotonicityPenalty {
+            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1045,7 +1107,8 @@ fn build_monotonicity_constraint(
     }
     if !min_age.is_finite() || !max_age.is_finite() || min_age >= max_age {
         let cols = layout.combined_exit.ncols();
-        return Ok(MonotonicityConstraint {
+        return Ok(MonotonicityPenalty {
+            lambda,
             derivative_design: Array2::<f64>::zeros((0, cols)),
             quadrature_design: Array2::<f64>::zeros((0, cols)),
             grid_ages: Array1::<f64>::zeros(0),
@@ -1106,8 +1169,9 @@ fn build_monotonicity_constraint(
         quadrature_right[idx] = right_bound;
     }
 
-    Ok(MonotonicityConstraint {
-        derivative_design: combined,
+    Ok(MonotonicityPenalty {
+            lambda,
+            derivative_design: combined,
         quadrature_design,
         grid_ages: grid,
         quadrature_left,
@@ -1122,7 +1186,7 @@ pub struct WorkingModelSurvival {
     pub event_target: Array1<u8>,
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     pub spec: SurvivalSpec,
 }
 
@@ -1130,7 +1194,7 @@ impl WorkingModelSurvival {
     pub fn new(
         layout: SurvivalLayout,
         data: &SurvivalTrainingData,
-        monotonicity: MonotonicityConstraint,
+        monotonicity: MonotonicityPenalty,
         spec: SurvivalSpec,
     ) -> Result<Self, SurvivalError> {
         data.validate()?;
@@ -1465,7 +1529,7 @@ pub struct SurvivalModelArtifacts {
     pub age_transform: AgeTransform,
     pub reference_constraint: ReferenceConstraint,
     #[serde(default = "empty_monotonicity_constraint")]
-    pub monotonicity: MonotonicityConstraint,
+    pub monotonicity: MonotonicityPenalty,
     #[serde(default)]
     pub interaction_metadata: Vec<InteractionDescriptor>,
     #[serde(default)]
@@ -1669,6 +1733,39 @@ pub fn design_row_at_age(
             .position(|name| name == "pgs")
             .ok_or(SurvivalError::MissingPgsCovariate)?;
         let pgs_value = covariates[pgs_idx];
+
+        let pgs_range = descriptor
+            .value_ranges
+            .first()
+            .ok_or(SurvivalError::MissingInteractionMetadata)?;
+        if pgs_range.min.is_finite() && pgs_value < pgs_range.min {
+            let column = artifacts
+                .static_covariate_layout
+                .column_names
+                .get(pgs_idx)
+                .cloned()
+                .unwrap_or_else(|| "pgs".to_string());
+            return Err(SurvivalError::CovariateBelowRange {
+                column,
+                index: pgs_idx,
+                value: pgs_value,
+                minimum: pgs_range.min,
+            });
+        }
+        if pgs_range.max.is_finite() && pgs_value > pgs_range.max {
+            let column = artifacts
+                .static_covariate_layout
+                .column_names
+                .get(pgs_idx)
+                .cloned()
+                .unwrap_or_else(|| "pgs".to_string());
+            return Err(SurvivalError::CovariateAboveRange {
+                column,
+                index: pgs_idx,
+                value: pgs_value,
+                maximum: pgs_range.max,
+            });
+        }
 
         let (pgs_arc, _) = create_bspline_basis_with_knots(
             array![pgs_value].view(),
@@ -2094,7 +2191,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
         let layout = layout_bundle.layout;
         let p = layout.combined_exit.ncols();
 
@@ -2387,7 +2484,7 @@ mod tests {
 
     fn evaluate_state(
         layout: &SurvivalLayout,
-        penalty: &MonotonicityConstraint,
+        penalty: &MonotonicityPenalty,
         data: &SurvivalTrainingData,
         beta: &Array1<f64>,
     ) -> WorkingState {
@@ -2425,30 +2522,9 @@ mod tests {
             layout,
             monotonicity,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 1.0, 10, None).unwrap();
-        let mut spec = SurvivalSpec::default();
-        spec.barrier_weight = 0.0;
-        let p = layout.combined_exit.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
-        for (idx, value) in beta.iter_mut().enumerate() {
-            *value = if idx % 2 == 0 {
-                -0.05 * (idx as f64 + 1.0)
-            } else {
-                0.02
-            };
-        }
-
-        let derivative_raw = layout.combined_derivative_exit.dot(&beta);
-        let guard = derivative_raw
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max)
-            .max(0.0)
-            + 1.0;
-        spec.derivative_guard = guard;
-        let guard = spec.derivative_guard.max(f64::EPSILON);
-        assert!(derivative_raw.iter().any(|value| *value <= guard));
-
+        } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let spec = SurvivalSpec::default();
+        let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
@@ -2495,7 +2571,7 @@ mod tests {
             penalty_descriptors,
             interaction_metadata,
             time_varying_basis,
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 10, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
         let layout = layout;
         let model = WorkingModelSurvival::new(
             layout.clone(),
@@ -2536,7 +2612,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2600,7 +2676,7 @@ mod tests {
             degree: 2,
         };
         let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 6, None).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2610,6 +2686,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
@@ -2627,8 +2704,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2638,6 +2714,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
@@ -2678,7 +2755,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2688,7 +2765,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
-            monotonicity: layout.monotonicity.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
@@ -2741,7 +2818,7 @@ mod tests {
             layout,
             monotonicity,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 8, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 8, None).unwrap();
         let mut model =
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
                 .unwrap();
@@ -2759,11 +2836,20 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let SurvivalLayoutBundle {
-            layout,
-            monotonicity,
-            ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        bundle.monotonicity.lambda = 0.0;
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -2805,13 +2891,23 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.7, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let SurvivalLayoutBundle {
-            layout,
-            monotonicity,
-            penalty_descriptors,
-            interaction_metadata,
-            time_varying_basis,
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 4, None).unwrap();
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        bundle.monotonicity.lambda = 0.0;
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let penalty_descriptors = bundle.penalty_descriptors.clone();
+        let interaction_metadata = bundle.interaction_metadata.clone();
+        let time_varying_basis = bundle.time_varying_basis.clone();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -2864,11 +2960,20 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let SurvivalLayoutBundle {
-            layout,
-            monotonicity,
-            ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        bundle.monotonicity.lambda = 0.0;
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.derivative_guard = 1e-12;
@@ -2973,7 +3078,7 @@ mod tests {
             layout,
             monotonicity,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.2, 6, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let mut spec = SurvivalSpec::default();
         spec.barrier_weight = 0.0;
         spec.use_expected_information = true;
@@ -3025,11 +3130,20 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.75, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let SurvivalLayoutBundle {
-            layout,
-            monotonicity,
-            ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.0, 6, None).unwrap();
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        bundle.monotonicity.lambda = 0.0;
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
         let mut spec_observed = SurvivalSpec::default();
         spec_observed.barrier_weight = 0.0;
         spec_observed.use_expected_information = false;
@@ -3111,11 +3225,20 @@ mod tests {
             degree: 2,
         };
 
-        let SurvivalLayoutBundle {
-            layout: layout_weighted,
-            monotonicity: monotonic_weighted,
-            ..
-        } = build_survival_layout(&weighted_data, &basis, 0.1, 2, 0.0, 0, None).unwrap();
+        let mut bundle = build_survival_layout(&weighted_data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        bundle.monotonicity.lambda = 0.0;
+        let layout_weighted = bundle.layout.clone();
+        let monotonic_weighted = bundle.monotonicity.clone();
         let replicate_pattern = [0usize, 1, 1];
         let layout_expanded = SurvivalLayout {
             baseline_entry: repeat_rows(&layout_weighted.baseline_entry, &replicate_pattern),
@@ -3215,14 +3338,15 @@ mod tests {
             layout,
             monotonicity,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.6, 0, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
         let penalised_layout = layout.clone();
         let mut unpenalised_layout = layout.clone();
         for block in &mut unpenalised_layout.penalties.blocks {
             block.lambda = 0.0;
         }
 
-        let zero_monotonicity = MonotonicityConstraint {
+        let zero_monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
             derivative_design: monotonicity.derivative_design.clone(),
             quadrature_design: monotonicity.quadrature_design.clone(),
             grid_ages: monotonicity.grid_ages.clone(),
@@ -3277,7 +3401,7 @@ mod tests {
             layout,
             monotonicity: penalty,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.75, 0, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
         let p = layout.combined_exit.ncols();
         let baseline_cols = layout.baseline_exit.ncols();
         let mut beta = Array1::<f64>::zeros(p);
@@ -3329,7 +3453,7 @@ mod tests {
             penalty_descriptors,
             interaction_metadata,
             time_varying_basis,
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -3388,7 +3512,7 @@ mod tests {
             penalty_descriptors,
             interaction_metadata,
             time_varying_basis,
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.4, 4, Some(&tensor_config)).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, Some(&tensor_config)).unwrap();
 
         assert!(layout.time_varying_exit.is_some());
         assert_eq!(time_varying_basis, Some(pgs_basis.clone()));
@@ -3446,7 +3570,7 @@ mod tests {
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             monotonicity: layout.monotonicity.clone(),
-            interaction_metadata,
+            interaction_metadata: interaction_metadata.clone(),
             companion_models: Vec::new(),
             hessian_factor: None,
             calibrator: None,
@@ -3454,6 +3578,27 @@ mod tests {
 
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
         assert_abs_diff_eq!(hazard, eta_exit[0].exp(), epsilon = 1e-10);
+
+        let pgs_idx = artifacts
+            .static_covariate_layout
+            .column_names
+            .iter()
+            .position(|name| name == "pgs")
+            .expect("pgs column present");
+        let mut covariates_high = covariates.clone();
+        covariates_high[pgs_idx] = metadata.value_ranges[0].max + 0.5;
+        let err_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts)
+            .expect_err("pgs above range should error");
+        assert!(matches!(
+            err_high,
+            SurvivalError::CovariateAboveRange { .. }
+        ));
+
+        let mut covariates_low = covariates;
+        covariates_low[pgs_idx] = metadata.value_ranges[0].min - 0.5;
+        let err_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts)
+            .expect_err("pgs below range should error");
+        assert!(matches!(err_low, SurvivalError::CovariateBelowRange { .. }));
 
         let mut model = WorkingModelSurvival::new(
             layout.clone(),
@@ -3479,7 +3624,7 @@ mod tests {
             interaction_metadata,
             time_varying_basis,
             ..
-        } = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
             age_basis: basis.clone(),
@@ -3506,7 +3651,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
         let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -3537,7 +3682,7 @@ mod tests {
             degree: 2,
         };
         let SurvivalLayoutBundle { layout, .. } =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 4, None).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
         let penalty = baseline_penalty_descriptor(&layout, 2, 0.5);
         let interaction = InteractionDescriptor {
             label: Some("pgs_by_age".to_string()),

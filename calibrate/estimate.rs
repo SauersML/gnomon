@@ -1563,9 +1563,9 @@ pub fn train_survival_model(
 ) -> Result<TrainedModel, EstimationError> {
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
-        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityConstraint,
-        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
-        WorkingModelSurvival,
+        AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
+        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
+        TensorProductConfig, ValueRange, WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
 
@@ -1697,6 +1697,54 @@ pub fn train_survival_model(
         degree: survival_cfg.baseline_basis.degree,
     };
 
+    let time_varying_config = if let Some(settings) = survival_cfg.time_varying.as_ref() {
+        let mut min_pgs = f64::INFINITY;
+        let mut max_pgs = f64::NEG_INFINITY;
+        for &value in bundle.data.pgs.iter() {
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidSpecification(
+                    "PGS covariate contains non-finite values".to_string(),
+                ));
+            }
+            if value < min_pgs {
+                min_pgs = value;
+            }
+            if value > max_pgs {
+                max_pgs = value;
+            }
+        }
+
+        if !min_pgs.is_finite() || !max_pgs.is_finite() || (max_pgs - min_pgs).abs() < 1e-12 {
+            log::warn!(
+                "PGS covariate lacks sufficient variation; disabling time-varying interaction"
+            );
+            None
+        } else {
+            let (pgs_basis_arc, pgs_knots) = create_bspline_basis(
+                bundle.data.pgs.view(),
+                (min_pgs, max_pgs),
+                settings.pgs_basis.num_knots,
+                settings.pgs_basis.degree,
+            )
+            .map_err(map_error)?;
+            drop(pgs_basis_arc);
+
+            Some(TensorProductConfig {
+                label: settings.label.clone(),
+                pgs_basis: BasisDescriptor {
+                    knot_vector: pgs_knots,
+                    degree: settings.pgs_basis.degree,
+                },
+                pgs_penalty_order: settings.pgs_penalty_order,
+                lambda_age: settings.lambda_age,
+                lambda_pgs: settings.lambda_pgs,
+                lambda_null: settings.lambda_null,
+            })
+        }
+    } else {
+        None
+    };
+
     let SurvivalLayoutBundle {
         layout,
         monotonicity,
@@ -1708,10 +1756,22 @@ pub fn train_survival_model(
         &age_basis,
         survival_cfg.guard_delta,
         config.penalty_order,
-        survival_cfg.initial_lambda,
         survival_cfg.monotonic_grid_size,
+        time_varying_config.as_ref(),
     )
     .map_err(map_error)?;
+
+    if let Some(block) = layout.penalties.blocks.first() {
+        eprintln!(
+            "[STAGE 1/3] Baseline λ seed (auto): {:.3e}; monotonic weight: {:.3e}",
+            block.lambda, monotonicity.lambda,
+        );
+    } else {
+        eprintln!(
+            "[STAGE 1/3] No baseline penalty detected; monotonic weight: {:.3e}",
+            monotonicity.lambda,
+        );
+    }
 
     eprintln!(
         "[STAGE 1/3] Layout ready. Coefficients: {} (baseline columns: {}), penalties: {}",
@@ -1727,11 +1787,13 @@ pub fn train_survival_model(
         min_step_size: 1e-6,
     };
 
-    eprintln!("\n[STAGE 2/3] Optimizing survival smoothing parameters via BFGS...");
+    eprintln!(
+        "\n[STAGE 2/3] Optimizing survival smoothing parameters via REML/BFGS (automatic λ selection)..."
+    );
 
     struct SurvivalLambdaOptimizer<'a> {
         base_layout: SurvivalLayout,
-        monotonicity: MonotonicityConstraint,
+        monotonicity: MonotonicityPenalty,
         data: &'a crate::calibrate::survival::SurvivalTrainingData,
         spec: SurvivalSpec,
         options: crate::calibrate::pirls::WorkingModelPirlsOptions,
@@ -1749,7 +1811,7 @@ pub fn train_survival_model(
     impl<'a> SurvivalLambdaOptimizer<'a> {
         fn new(
             layout: SurvivalLayout,
-            monotonicity: MonotonicityConstraint,
+            monotonicity: MonotonicityPenalty,
             data: &'a crate::calibrate::survival::SurvivalTrainingData,
             spec: SurvivalSpec,
             options: crate::calibrate::pirls::WorkingModelPirlsOptions,
