@@ -13,11 +13,11 @@ use gnomon::calibrate::data::{load_prediction_data, load_training_data};
 use gnomon::calibrate::estimate::train_model;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::estimate::train_survival_model;
-use gnomon::calibrate::model::BasisConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalModelConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalPrediction;
+use gnomon::calibrate::model::{BasisConfig, SurvivalTimeVaryingConfig};
 use gnomon::calibrate::model::{
     InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
 };
@@ -128,6 +128,22 @@ pub struct TrainArgs {
     /// Use expected information instead of observed Hessian when fitting survival models
     #[arg(long)]
     pub survival_expected_information: bool,
+
+    /// Enable the optional time-varying PGS × age interaction
+    #[arg(long)]
+    pub survival_enable_time_varying: bool,
+
+    /// Number of internal knots for the time-varying PGS spline
+    #[arg(long, default_value = "5")]
+    pub survival_time_varying_pgs_knots: usize,
+
+    /// Degree for the time-varying PGS spline
+    #[arg(long, default_value = "3")]
+    pub survival_time_varying_pgs_degree: usize,
+
+    /// Difference-penalty order for the time-varying PGS spline
+    #[arg(long, default_value = "2")]
+    pub survival_time_varying_pgs_penalty_order: usize,
 }
 
 #[derive(Args)]
@@ -249,6 +265,34 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             spec.barrier_scale = args.survival_barrier_scale;
             spec.use_expected_information = args.survival_expected_information;
 
+            let time_varying = if args.survival_enable_time_varying {
+                let lambda_age = args.survival_initial_lambda;
+                let lambda_pgs = args.survival_initial_lambda;
+                let lambda_null = args.survival_initial_lambda * 0.1;
+                Some(SurvivalTimeVaryingConfig {
+                    label: Some("pgs_by_age".to_string()),
+                    pgs_basis: BasisConfig {
+                        num_knots: args.survival_time_varying_pgs_knots,
+                        degree: args.survival_time_varying_pgs_degree,
+                    },
+                    pgs_penalty_order: args.survival_time_varying_pgs_penalty_order,
+                    lambda_age,
+                    lambda_pgs,
+                    lambda_null,
+                })
+            } else {
+                None
+            };
+
+            if let Some(settings) = &time_varying {
+                println!(
+                    "Enabling time-varying PGS × age interaction (knots={}, degree={}, penalty order={})",
+                    settings.pgs_basis.num_knots,
+                    settings.pgs_basis.degree,
+                    settings.pgs_penalty_order
+                );
+            }
+
             let survival_config = SurvivalModelConfig {
                 baseline_basis: BasisConfig {
                     num_knots: args.survival_baseline_knots,
@@ -258,6 +302,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 initial_lambda: args.survival_initial_lambda,
                 monotonic_grid_size: args.survival_monotonic_grid,
                 monotonic_lambda: args.survival_monotonic_lambda,
+                time_varying,
             };
 
             let config = ModelConfig {

@@ -1562,8 +1562,8 @@ pub fn train_survival_model(
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
-        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec, ValueRange,
-        WorkingModelSurvival,
+        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
+        TensorProductConfig, ValueRange, WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
 
@@ -1695,6 +1695,54 @@ pub fn train_survival_model(
         degree: survival_cfg.baseline_basis.degree,
     };
 
+    let time_varying_config = if let Some(settings) = survival_cfg.time_varying.as_ref() {
+        let mut min_pgs = f64::INFINITY;
+        let mut max_pgs = f64::NEG_INFINITY;
+        for &value in bundle.data.pgs.iter() {
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidSpecification(
+                    "PGS covariate contains non-finite values".to_string(),
+                ));
+            }
+            if value < min_pgs {
+                min_pgs = value;
+            }
+            if value > max_pgs {
+                max_pgs = value;
+            }
+        }
+
+        if !min_pgs.is_finite() || !max_pgs.is_finite() || (max_pgs - min_pgs).abs() < 1e-12 {
+            log::warn!(
+                "PGS covariate lacks sufficient variation; disabling time-varying interaction"
+            );
+            None
+        } else {
+            let (pgs_basis_arc, pgs_knots) = create_bspline_basis(
+                bundle.data.pgs.view(),
+                (min_pgs, max_pgs),
+                settings.pgs_basis.num_knots,
+                settings.pgs_basis.degree,
+            )
+            .map_err(map_error)?;
+            drop(pgs_basis_arc);
+
+            Some(TensorProductConfig {
+                label: settings.label.clone(),
+                pgs_basis: BasisDescriptor {
+                    knot_vector: pgs_knots,
+                    degree: settings.pgs_basis.degree,
+                },
+                pgs_penalty_order: settings.pgs_penalty_order,
+                lambda_age: settings.lambda_age,
+                lambda_pgs: settings.lambda_pgs,
+                lambda_null: settings.lambda_null,
+            })
+        }
+    } else {
+        None
+    };
+
     let SurvivalLayoutBundle {
         layout,
         monotonicity,
@@ -1709,6 +1757,7 @@ pub fn train_survival_model(
         survival_cfg.initial_lambda,
         survival_cfg.monotonic_lambda,
         survival_cfg.monotonic_grid_size,
+        time_varying_config.as_ref(),
     )
     .map_err(map_error)?;
 
