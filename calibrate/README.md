@@ -126,7 +126,10 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
 3. **Optimize smoothing parameters** – With the design in place, the REML
    optimizer in `estimate.rs` alternates between P-IRLS solves (via `pirls.rs`)
    and BFGS updates over log-smoothing parameters until convergence or until it
-   detects degeneracy (separation, rank deficiency, etc.).
+   detects degeneracy (separation, rank deficiency, etc.). Survival models seed
+   their baseline and monotonic penalties from basis metadata and age ranges,
+   but the final smoothing strengths are still chosen automatically by the
+   REML/BFGS loop.
 4. **Capture geometric guards** – During training the optimizer builds a peeled
    hull from the polygenic score and principal components. The hull and its
    signed-distance function inform both the calibrator and future prediction

@@ -101,17 +101,9 @@ pub struct TrainArgs {
     #[arg(long, default_value = "3")]
     pub survival_baseline_degree: usize,
 
-    /// Initial smoothing parameter for the survival baseline spline
-    #[arg(long, default_value = "1.0")]
-    pub survival_initial_lambda: f64,
-
     /// Grid size for the survival monotonicity penalty
     #[arg(long, default_value = "64")]
     pub survival_monotonic_grid: usize,
-
-    /// Weight of the survival monotonicity barrier
-    #[arg(long, default_value = "0.0001")]
-    pub survival_monotonic_lambda: f64,
 
     /// Derivative guard threshold used inside the survival likelihood
     #[arg(long, default_value = "1e-8")]
@@ -299,9 +291,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                     degree: args.survival_baseline_degree,
                 },
                 guard_delta: args.survival_guard_delta,
-                initial_lambda: args.survival_initial_lambda,
                 monotonic_grid_size: args.survival_monotonic_grid,
-                monotonic_lambda: args.survival_monotonic_lambda,
                 time_varying,
             };
 
