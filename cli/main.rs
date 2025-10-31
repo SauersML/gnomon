@@ -258,9 +258,6 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             spec.use_expected_information = args.survival_expected_information;
 
             let time_varying = if args.survival_enable_time_varying {
-                let lambda_age = args.survival_initial_lambda;
-                let lambda_pgs = args.survival_initial_lambda;
-                let lambda_null = args.survival_initial_lambda * 0.1;
                 Some(SurvivalTimeVaryingConfig {
                     label: Some("pgs_by_age".to_string()),
                     pgs_basis: BasisConfig {
@@ -268,9 +265,9 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                         degree: args.survival_time_varying_pgs_degree,
                     },
                     pgs_penalty_order: args.survival_time_varying_pgs_penalty_order,
-                    lambda_age,
-                    lambda_pgs,
-                    lambda_null,
+                    lambda_age: 0.0,
+                    lambda_pgs: 0.0,
+                    lambda_null: 0.0,
                 })
             } else {
                 None

@@ -1559,13 +1559,13 @@ pub fn train_model(
 #[cfg(feature = "survival-data")]
 pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
-    config: &ModelConfig,
+    base_config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
     use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
-        SurvivalError, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
-        TensorProductConfig, ValueRange, WorkingModelSurvival,
+        SurvivalError, SurvivalLayout, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
+        TensorProductConfig, ValueRange, WorkingModelSurvival, baseline_lambda_seed,
     };
     use ndarray::{Array1, Array2};
 
@@ -1666,12 +1666,14 @@ pub fn train_survival_model(
         }))
     }
 
+    let mut config = base_config.clone();
+
     clear_basis_cache();
 
     log::info!("Starting survival model training via penalized Newton updates.");
     eprintln!("\n[STAGE 1/3] Constructing survival layout...");
 
-    let survival_cfg = config.survival.as_ref().ok_or_else(|| {
+    let survival_cfg_owned = config.survival.clone().ok_or_else(|| {
         EstimationError::InvalidSpecification(
             "Missing survival model configuration in ModelConfig".to_string(),
         )
@@ -1688,16 +1690,30 @@ pub fn train_survival_model(
     let (basis_arc, knot_vector) = create_bspline_basis(
         log_entry.view(),
         (log_min, log_max),
-        survival_cfg.baseline_basis.num_knots,
-        survival_cfg.baseline_basis.degree,
+        survival_cfg_owned.baseline_basis.num_knots,
+        survival_cfg_owned.baseline_basis.degree,
     )?;
     drop(basis_arc);
     let age_basis = BasisDescriptor {
         knot_vector,
-        degree: survival_cfg.baseline_basis.degree,
+        degree: survival_cfg_owned.baseline_basis.degree,
     };
 
-    let time_varying_config = if let Some(settings) = survival_cfg.time_varying.as_ref() {
+    let baseline_lambda = baseline_lambda_seed(&age_basis, config.penalty_order);
+
+    if let Some(survival_cfg_mut) = config.survival.as_mut() {
+        if let Some(time_varying) = survival_cfg_mut.time_varying.as_mut() {
+            time_varying.lambda_age = baseline_lambda;
+            time_varying.lambda_pgs = baseline_lambda;
+            time_varying.lambda_null = baseline_lambda;
+        }
+    }
+
+    let time_varying_config = if let Some(settings) = config
+        .survival
+        .as_ref()
+        .and_then(|cfg| cfg.time_varying.as_ref())
+    {
         let mut min_pgs = f64::INFINITY;
         let mut max_pgs = f64::NEG_INFINITY;
         for &value in bundle.data.pgs.iter() {
@@ -1726,7 +1742,7 @@ pub fn train_survival_model(
                 settings.pgs_basis.num_knots,
                 settings.pgs_basis.degree,
             )
-            .map_err(map_error)?;
+            .map_err(|err| map_error(err.into()))?;
             drop(pgs_basis_arc);
 
             Some(TensorProductConfig {
@@ -1746,17 +1762,17 @@ pub fn train_survival_model(
     };
 
     let SurvivalLayoutBundle {
-        layout,
+        mut layout,
         monotonicity,
-        penalty_descriptors,
+        mut penalty_descriptors,
         interaction_metadata,
         time_varying_basis,
     } = crate::calibrate::survival::build_survival_layout(
         &bundle.data,
         &age_basis,
-        survival_cfg.guard_delta,
+        survival_cfg_owned.guard_delta,
         config.penalty_order,
-        survival_cfg.monotonic_grid_size,
+        survival_cfg_owned.monotonic_grid_size,
         time_varying_config.as_ref(),
     )
     .map_err(map_error)?;
@@ -1770,6 +1786,17 @@ pub fn train_survival_model(
         eprintln!(
             "[STAGE 1/3] No baseline penalty detected; monotonic weight: {:.3e}",
             monotonicity.lambda,
+        );
+    }
+
+    if let Some(settings) = config
+        .survival
+        .as_ref()
+        .and_then(|cfg| cfg.time_varying.as_ref())
+    {
+        eprintln!(
+            "[STAGE 1/3] Time-varying λ seeds (auto): age={:.3e}, pgs={:.3e}, null={:.3e}",
+            settings.lambda_age, settings.lambda_pgs, settings.lambda_null
         );
     }
 
@@ -1903,10 +1930,7 @@ pub fn train_survival_model(
                 &mut model,
                 beta0,
                 &self.options,
-                |info: &crate::calibrate::pirls::WorkingModelIterationInfo| {
-                    let deviance = info.deviance;
-                    drop(deviance);
-                },
+                |_| {},
             )?;
             let cost = result.state.deviance;
 
@@ -1963,7 +1987,7 @@ pub fn train_survival_model(
                     (base_cost, grad)
                 }
                 Err(err) => {
-                    *self.last_error.borrow_mut() = Some(err.clone());
+                    *self.last_error.borrow_mut() = Some(err);
                     (f64::INFINITY, Array1::zeros(z.len()))
                 }
             }
@@ -2015,14 +2039,14 @@ pub fn train_survival_model(
                     "[Stage2] Line search failed; falling back to best-known parameters after {} iterations.",
                     last_solution.iterations
                 );
-                last_solution
+                *last_solution
             }
             Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
                 eprintln!(
                     "[Stage2] Maximum iterations reached; using best-known parameters ({} iterations).",
                     last_solution.iterations
                 );
-                last_solution
+                *last_solution
             }
             Err(err) => {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -2196,7 +2220,7 @@ pub fn train_survival_model(
         )
         .map_err(map_error)?;
 
-        let mut features = cal::CalibratorFeatures {
+        let features = cal::CalibratorFeatures {
             pred: features_matrix.column(0).to_owned(),
             se: features_matrix.column(1).to_owned(),
             dist: if features_matrix.ncols() > 2 {
@@ -2252,7 +2276,7 @@ pub fn train_survival_model(
             let penalty_nullspace_dims =
                 cal::active_penalty_nullspace_dims(&schema, &penalties_cal);
             let outcomes = bundle.data.event_target.mapv(|value| f64::from(value));
-            let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
+            let (beta_cal, lambdas_cal, _, edf_pair, fit_meta) = cal::fit_calibrator(
                 outcomes.view(),
                 features.fisher_weights.view(),
                 x_cal.view(),
@@ -2398,7 +2422,7 @@ pub fn train_survival_model(
     };
 
     Ok(TrainedModel {
-        config: config.clone(),
+        config,
         coefficients: mapped_coefficients,
         lambdas,
         hull: None,

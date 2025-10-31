@@ -623,9 +623,8 @@ where
     }
 }
 
-/// Construct the cached survival layout for PIRLS updates.
-#[allow(clippy::too_many_arguments)]
-fn seed_baseline_lambda(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
+/// Compute the initial smoothing weight for the survival baseline spline.
+pub fn baseline_lambda_seed(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
     let mut min_knot = f64::INFINITY;
     let mut max_knot = f64::NEG_INFINITY;
     for &value in age_basis.knot_vector.iter() {
@@ -723,7 +722,7 @@ pub fn build_survival_layout(
 
     let baseline_cols = constrained_exit.ncols();
     let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
-    let baseline_lambda = seed_baseline_lambda(age_basis, baseline_penalty_order);
+    let baseline_lambda = baseline_lambda_seed(age_basis, baseline_penalty_order);
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
