@@ -18,6 +18,7 @@ use thiserror::Error;
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 const DEFAULT_BARRIER_WEIGHT: f64 = 1e-4;
 const DEFAULT_BARRIER_SCALE: f64 = 1.0;
+const BARRIER_ACTIVATION_WARN_THRESHOLD: f64 = 0.05;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
 
@@ -1372,6 +1373,26 @@ impl WorkingModelSurvival {
         let mut monotonic_gradient = Array1::<f64>::zeros(p);
         let mut monotonic_hessian = Array2::<f64>::zeros((p, p));
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
+        let (barrier_hits, barrier_total, barrier_source_label) =
+            if self.monotonicity.derivative_design.nrows() > 0 {
+                let grid_derivatives = self.monotonicity.derivative_design.dot(beta);
+                let hits = grid_derivatives
+                    .iter()
+                    .filter(|&&value| value <= guard_threshold)
+                    .count();
+                (hits, grid_derivatives.len(), "monotonicity grid")
+            } else {
+                let hits = derivative_raw
+                    .iter()
+                    .filter(|&&value| value <= guard_threshold)
+                    .count();
+                (hits, derivative_raw.len(), "exit derivatives")
+            };
+        let barrier_activation_fraction = if barrier_total > 0 {
+            Some(barrier_hits as f64 / barrier_total as f64)
+        } else {
+            None
+        };
         let h_exit = eta_exit.mapv(f64::exp);
         let h_entry = eta_entry.mapv(f64::exp);
         let mut log_derivative = Array1::<f64>::zeros(n);
@@ -1509,6 +1530,16 @@ impl WorkingModelSurvival {
                 &monotonic_hessian,
             )? {
                 hessian = expected_hessian;
+            }
+        }
+
+        if let Some(fraction) = barrier_activation_fraction {
+            if fraction > BARRIER_ACTIVATION_WARN_THRESHOLD {
+                warn!(
+                    "Monotonicity barrier active on {:.1}% of {} entries; consider increasing the monotonicity knot count or smoothing weight.",
+                    fraction * 100.0,
+                    barrier_source_label
+                );
             }
         }
 
@@ -2128,6 +2159,18 @@ mod tests {
     use ndarray::array;
     use serde_json;
 
+    fn start_test_logger() -> logtest::Logger {
+        use std::sync::Once;
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = logtest::Logger::start();
+        });
+        let mut logger = logtest::Logger {};
+        while logger.pop().is_some() {}
+        logger
+    }
+
     fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
         let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];
         array![
@@ -2611,6 +2654,79 @@ mod tests {
     }
 
     #[test]
+    fn barrier_activation_warning_triggers_when_fraction_exceeds_threshold() {
+        let mut logger = start_test_logger();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle { layout, .. } =
+            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let p = layout.combined_exit.ncols();
+        let grid_size = 10;
+        let mut monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            derivative_design: Array2::<f64>::zeros((grid_size, p)),
+            quadrature_design: Array2::<f64>::zeros((grid_size, p)),
+            grid_ages: Array1::<f64>::zeros(grid_size),
+            quadrature_left: Array1::<f64>::zeros(grid_size),
+            quadrature_right: Array1::<f64>::zeros(grid_size),
+        };
+        for mut row in monotonicity.derivative_design.rows_mut().into_iter() {
+            row[0] = 1.0;
+        }
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
+                .unwrap();
+        let mut beta = Array1::<f64>::zeros(p);
+        beta[0] = -1.0;
+        model.update_state(&beta).unwrap();
+        assert!(logger.any(|record| {
+            record.level() == log::Level::Warn
+                && record
+                    .args()
+                    .to_string()
+                    .contains("Monotonicity barrier active")
+        }));
+    }
+
+    #[test]
+    fn barrier_activation_warning_silent_when_fraction_below_threshold() {
+        let mut logger = start_test_logger();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle { layout, .. } =
+            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let p = layout.combined_exit.ncols();
+        let grid_size = 10;
+        let mut monotonicity = MonotonicityPenalty {
+            lambda: 0.0,
+            derivative_design: Array2::<f64>::zeros((grid_size, p)),
+            quadrature_design: Array2::<f64>::zeros((grid_size, p)),
+            grid_ages: Array1::<f64>::zeros(grid_size),
+            quadrature_left: Array1::<f64>::zeros(grid_size),
+            quadrature_right: Array1::<f64>::zeros(grid_size),
+        };
+        for mut row in monotonicity.derivative_design.rows_mut().into_iter() {
+            row[0] = 1.0;
+        }
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
+                .unwrap();
+        let mut beta = Array1::<f64>::zeros(p);
+        beta[0] = 1.0;
+        model.update_state(&beta).unwrap();
+        assert!(!logger.any(|record| {
+            record.level() == log::Level::Warn
+                && record
+                    .args()
+                    .to_string()
+                    .contains("Monotonicity barrier active")
+        }));
     fn monotonic_penalty_triggers_for_negative_slopes() {
         let mut data = toy_training_data();
         data.sample_weight.fill(0.0);
