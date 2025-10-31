@@ -2523,6 +2523,8 @@ mod tests {
             monotonicity,
             ..
         } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let spec = SurvivalSpec::default();
+        let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
@@ -2674,7 +2676,7 @@ mod tests {
             degree: 2,
         };
         let layout_bundle =
-            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 6, None).unwrap();
+            build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let artifacts = SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2684,6 +2686,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models: Vec::new(),
             hessian_factor: None,
@@ -2711,6 +2714,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
@@ -2751,7 +2755,7 @@ mod tests {
             knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
             degree: 2,
         };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 0.5, 6, None).unwrap();
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
         let layout = layout_bundle.layout;
         let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
             coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
@@ -2761,7 +2765,7 @@ mod tests {
             penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
-            monotonicity: layout.monotonicity.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
             interaction_metadata: Vec::new(),
             companion_models,
             hessian_factor: None,
@@ -3566,7 +3570,7 @@ mod tests {
             age_transform: layout.age_transform,
             reference_constraint: layout.reference_constraint.clone(),
             monotonicity: layout.monotonicity.clone(),
-            interaction_metadata,
+            interaction_metadata: interaction_metadata.clone(),
             companion_models: Vec::new(),
             hessian_factor: None,
             calibrator: None,
