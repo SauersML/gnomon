@@ -871,6 +871,7 @@ pub fn train_model(
             scale: Some(scale_val),
             calibrator: None,
             survival: None,
+            survival_companions: HashMap::new(),
         };
 
         trained_model
@@ -1537,6 +1538,7 @@ pub fn train_model(
         scale: Some(scale_val),
         calibrator: calibrator_opt,
         survival: None,
+        survival_companions: HashMap::new(),
     };
 
     trained_model
@@ -2342,6 +2344,7 @@ pub fn train_survival_model(
         scale: None,
         calibrator: None,
         survival: Some(artifacts),
+        survival_companions: HashMap::new(),
     })
 }
 

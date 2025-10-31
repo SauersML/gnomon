@@ -2626,6 +2626,85 @@ mod tests {
     }
 
     #[test]
+    fn conditional_risk_requires_companion_inputs() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle =
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 6, None).unwrap();
+        let layout = layout_bundle.layout;
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+        let err = conditional_absolute_risk(55.0, 60.0, &covs, None, None, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
+    }
+
+    #[test]
+    fn conditional_risk_uses_resolved_companion_model() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle =
+            build_survival_layout(&data, &basis, 0.1, 2, 0.5, 0.5 * 1e-4, 6, None).unwrap();
+        let layout = layout_bundle.layout;
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts.clone());
+        let base_artifacts = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0, 60.0],
+        }]);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let (handle, resolved) =
+            resolve_companion_model(&base_artifacts, "companion", &registry).unwrap();
+        let explicit = cumulative_incidence(55.0, &covs, &registry["companion"]).unwrap();
+        let expected =
+            conditional_absolute_risk(55.0, 60.0, &covs, Some(explicit), None, &base_artifacts)
+                .unwrap();
+        let via_companion = conditional_absolute_risk(
+            55.0,
+            60.0,
+            &covs,
+            None,
+            Some((handle, resolved)),
+            &base_artifacts,
+        )
+        .unwrap();
+        assert_abs_diff_eq!(via_companion, expected, epsilon = 1e-12);
+    }
+
+    #[test]
     fn competing_cif_helpers_validate_horizons() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
