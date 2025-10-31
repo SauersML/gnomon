@@ -146,6 +146,7 @@ H += w_i [ d_i x̃_exit^T x̃_exit + H_exit_i x_exit^T x_exit + H_entry_i x_entr
 - Add a soft inequality penalty to discourage negative `dη_exit`. Evaluate `dη` on a dense grid of ages (e.g., 200 points across training support). Accumulate `penalty += λ_soft Σ softplus(-dη_grid)` with a small weight (`λ_soft ≈ 1e-4`).
 - The softplus barrier coexists with the `max(dη_exit, ε)` guard: the guard prevents catastrophic likelihood explosions, while the barrier still sees the unguarded derivative and nudges it positive.
 - Add the barrier Hessian/gradient to the working state like any other smoothness penalty.
+- Penalty strength and scale are computed internally from deterministic defaults; the CLI must not expose user-tunable overrides for these values.
 
 ## 6. REML / smoothing integration
 - The outer REML loop is unchanged. It now receives `WorkingState` with dense Hessians when the survival family is active.

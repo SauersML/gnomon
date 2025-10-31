@@ -1681,7 +1681,6 @@ pub fn train_survival_model(
 
     let survival_spec = config
         .survival_spec()
-        .cloned()
         .unwrap_or_else(SurvivalSpec::default);
 
     let (log_entry, log_min, log_max) =
@@ -1777,15 +1776,16 @@ pub fn train_survival_model(
     )
     .map_err(map_error)?;
 
+    let monotonic_points = monotonicity.derivative_design.nrows();
     if let Some(block) = layout.penalties.blocks.first() {
         eprintln!(
-            "[STAGE 1/3] Baseline λ seed (auto): {:.3e}; monotonic weight: {:.3e}",
-            block.lambda, monotonicity.lambda,
+            "[STAGE 1/3] Baseline λ seed (auto): {:.3e}; monotonic grid points: {}",
+            block.lambda, monotonic_points,
         );
     } else {
         eprintln!(
-            "[STAGE 1/3] No baseline penalty detected; monotonic weight: {:.3e}",
-            monotonicity.lambda,
+            "[STAGE 1/3] No baseline penalty detected; monotonic grid points: {}",
+            monotonic_points,
         );
     }
 
