@@ -2290,7 +2290,7 @@ mod tests {
     fn eval_laml_breakdown_binom<'a>(
         y: ArrayView1<'a, f64>,
         w_prior: ArrayView1<'a, f64>,
-        x: ArrayView2<f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
@@ -2340,7 +2340,7 @@ mod tests {
     fn eval_laml_fixed_rho_binom<'a>(
         y: ArrayView1<'a, f64>,
         w_prior: ArrayView1<'a, f64>,
-        x: ArrayView2<f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
@@ -2353,7 +2353,7 @@ mod tests {
     fn eval_laml_fixed_rho_gaussian<'a>(
         y: ArrayView1<'a, f64>,
         w_prior: ArrayView1<'a, f64>,
-        x: ArrayView2<f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
