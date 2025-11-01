@@ -19,6 +19,12 @@ struct DisallowedLetCollector {
     file_path: PathBuf,
 }
 
+// A collector for tuple destructuring patterns that discard values using `_`
+struct TupleWildcardCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 // A collector for forbidden comment content
 struct ForbiddenCommentCollector {
     violations: Vec<String>,
@@ -162,6 +168,41 @@ impl DisallowedLetCollector {
         );
         error_msg.push_str(
             "   Handle the result explicitly or restructure the code to avoid silent ignores.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl TupleWildcardCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} tuple destructuring patterns discarding values in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Using '_' placeholders inside tuple destructuring is forbidden in this project.\n",
+        );
+        error_msg.push_str(
+            "   Bind every value explicitly or restructure the code so nothing is silently ignored.\n",
         );
 
         Some(error_msg)
@@ -417,6 +458,172 @@ impl Sink for DisallowedLetCollector {
     }
 }
 
+impl Sink for TupleWildcardCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 && part.contains("_") {
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+
+        if is_pure_comment || is_in_string {
+            return Ok(true);
+        }
+
+        if tuple_pattern_is_fully_ignored(line_text) {
+            self.violations.push(format!("{line_number}:{line_text}"));
+        }
+
+        Ok(true)
+    }
+}
+
+fn tuple_pattern_is_fully_ignored(line_text: &str) -> bool {
+    let Some(pattern) = extract_tuple_pattern(line_text) else {
+        return false;
+    };
+
+    let components = split_top_level_components(pattern);
+    if components.is_empty() {
+        return false;
+    }
+
+    components
+        .into_iter()
+        .all(|component| is_component_ignored(component))
+}
+
+fn extract_tuple_pattern(line_text: &str) -> Option<&str> {
+    let let_pos = line_text.find("let")?;
+    let after_let = &line_text[let_pos + 3..];
+    let paren_start_rel = after_let.find('(')?;
+    let paren_start = let_pos + 3 + paren_start_rel;
+
+    let mut depth = 0usize;
+    let mut paren_end = None;
+    for (offset, ch) in line_text[paren_start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(paren_start + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = paren_end?;
+    Some(&line_text[paren_start + 1..end])
+}
+
+fn split_top_level_components(pattern: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+
+    for (idx, ch) in pattern.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                components.push(pattern[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start <= pattern.len() {
+        components.push(pattern[start..].trim());
+    }
+
+    components.retain(|component| !component.is_empty());
+    components
+}
+
+fn is_component_ignored(component: &str) -> bool {
+    let trimmed = component.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let inner_components = split_top_level_components(inner);
+        return !inner_components.is_empty()
+            && inner_components
+                .into_iter()
+                .all(|inner_component| is_component_ignored(inner_component));
+    }
+
+    if trimmed.contains('@') {
+        return false;
+    }
+
+    let mut candidate = trimmed;
+    loop {
+        let stripped = candidate.trim_start();
+        if let Some(rest) = stripped.strip_prefix('&') {
+            candidate = rest;
+            continue;
+        }
+        if let Some(rest) = stripped.strip_prefix("mut ") {
+            candidate = rest;
+            continue;
+        }
+        if let Some(rest) = stripped.strip_prefix("ref ") {
+            candidate = rest;
+            continue;
+        }
+        candidate = stripped;
+        break;
+    }
+
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+
+    if candidate == "_" {
+        return true;
+    }
+
+    if candidate.starts_with('_')
+        && candidate
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return true;
+    }
+
+    false
+}
+
 // Implement the Sink trait for the forbidden comment collector
 impl Sink for ForbiddenCommentCollector {
     type Error = std::io::Error;
@@ -612,6 +819,16 @@ fn main() {
     );
     emit_stage_detail(&disallowed_let_report);
     all_violations.extend(disallowed_let_violations);
+
+    // Scan Rust source files for tuple destructuring patterns that discard values
+    update_stage("scan tuple destructuring ignores");
+    let tuple_wildcard_violations = scan_for_tuple_wildcard_patterns();
+    let tuple_wildcard_report = format!(
+        "tuple destructuring ignore scan identified {} violation groups",
+        tuple_wildcard_violations.len()
+    );
+    emit_stage_detail(&tuple_wildcard_report);
+    all_violations.extend(tuple_wildcard_violations);
 
     // Scan Rust source files for forbidden comment patterns
     update_stage("scan forbidden comment patterns");
@@ -1026,6 +1243,51 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
         Err(e) => {
             all_violations.push(format!(
                 "Error creating regex matcher for disallowed let patterns: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
+    let pattern = r"\blet\s*\([^)]*\b_\b[^)]*\)\s*(?::[^=]*)?=";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = TupleWildcardCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating regex matcher for tuple wildcard patterns: {}",
                 e
             ));
         }
