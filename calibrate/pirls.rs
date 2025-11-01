@@ -26,6 +26,82 @@ pub struct WorkingState {
     pub deviance: f64,
 }
 
+/// Working model for Gaussian GAMs with an identity link.
+///
+/// This implementation mirrors the survival working-model contract by
+/// returning the full gradient, Hessian, and deviance with respect to the
+/// current linear predictor while retaining the algebra specific to the
+/// Gaussian identity link. The Hessian is diagonal for this family, but the
+/// diagonal is materialized as a dense matrix so downstream PIRLS code does
+/// not need link-specific branching.
+pub struct GamIdentityWorkingModel<'a> {
+    y: ArrayView1<'a, f64>,
+    weights: Array1<f64>,
+    working_response: Array1<f64>,
+    gradient_buffer: Array1<f64>,
+    hessian_buffer: Array2<f64>,
+}
+
+impl<'a> GamIdentityWorkingModel<'a> {
+    pub fn new(y: ArrayView1<'a, f64>, prior_weights: ArrayView1<'a, f64>) -> Self {
+        let n = y.len();
+        let weights = prior_weights.to_owned();
+        let working_response = y.to_owned();
+        let gradient_buffer = Array1::<f64>::zeros(n);
+        let hessian_buffer = Array2::<f64>::zeros((n, n));
+
+        Self {
+            y,
+            weights,
+            working_response,
+            gradient_buffer,
+            hessian_buffer,
+        }
+    }
+
+    pub fn weights(&self) -> &Array1<f64> {
+        &self.weights
+    }
+
+    pub fn working_response(&self) -> &Array1<f64> {
+        &self.working_response
+    }
+}
+
+impl<'a> WorkingModel for GamIdentityWorkingModel<'a> {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        if beta.len() != self.y.len() {
+            return Err(EstimationError::InvalidSpecification(
+                "GamIdentityWorkingModel dimension mismatch".to_string(),
+            ));
+        }
+
+        self.gradient_buffer.assign(beta);
+        self.gradient_buffer -= &self.y;
+        for (grad, &weight) in self.gradient_buffer.iter_mut().zip(self.weights.iter()) {
+            *grad *= weight;
+        }
+
+        self.hessian_buffer.fill(0.0);
+        for (idx, &weight) in self.weights.iter().enumerate() {
+            self.hessian_buffer[(idx, idx)] = weight;
+        }
+
+        let mut deviance = 0.0;
+        for ((&weight, &beta_i), &y_i) in self.weights.iter().zip(beta.iter()).zip(self.y.iter()) {
+            let residual = y_i - beta_i;
+            deviance += weight * residual * residual;
+        }
+
+        Ok(WorkingState {
+            eta: beta.clone(),
+            gradient: self.gradient_buffer.clone(),
+            hessian: self.hessian_buffer.clone(),
+            deviance,
+        })
+    }
+}
+
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
@@ -1601,11 +1677,15 @@ pub fn update_glm_vectors(
             (mu, weights, z)
         }
         LinkFunction::Identity => {
-            let mu = eta.clone();
-            // For Gaussian models with Identity link, the iterative weights ARE the prior weights
-            let weights = prior_weights.to_owned();
-            let z = y.to_owned();
-            (mu, weights, z)
+            let mut model = GamIdentityWorkingModel::new(y, prior_weights);
+            let state = model
+                .update(eta)
+                .expect("GamIdentityWorkingModel::update should not fail");
+            (
+                state.eta,
+                model.weights().to_owned(),
+                model.working_response().to_owned(),
+            )
         }
     }
 }
