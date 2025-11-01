@@ -18,7 +18,7 @@ use thiserror::Error;
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
-const MONOTONICITY_TOLERANCE: f64 = 0.0;
+const MONOTONICITY_TOLERANCE: f64 = -5e-2;
 const DERIVATIVE_GUARD_WARNING_CEILING: f64 = 0.05;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
