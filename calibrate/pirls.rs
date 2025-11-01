@@ -26,6 +26,115 @@ pub struct WorkingState {
     pub deviance: f64,
 }
 
+pub struct GamLogitWorkingModel<'a> {
+    design: ArrayView2<'a, f64>,
+    offset: Array1<f64>,
+    response: Array1<f64>,
+    prior_weights: Array1<f64>,
+    penalty: Array2<f64>,
+    mu: Array1<f64>,
+    weights: Array1<f64>,
+    working_response: Array1<f64>,
+}
+
+impl<'a> GamLogitWorkingModel<'a> {
+    pub fn new(
+        design: ArrayView2<'a, f64>,
+        offset: ArrayView1<f64>,
+        response: ArrayView1<f64>,
+        prior_weights: ArrayView1<f64>,
+        penalty: &Array2<f64>,
+    ) -> Self {
+        let n = design.nrows();
+        Self {
+            design,
+            offset: offset.to_owned(),
+            response: response.to_owned(),
+            prior_weights: prior_weights.to_owned(),
+            penalty: penalty.to_owned(),
+            mu: Array1::zeros(n),
+            weights: Array1::zeros(n),
+            working_response: Array1::zeros(n),
+        }
+    }
+
+    pub fn mu(&self) -> ArrayView1<'_, f64> {
+        self.mu.view()
+    }
+
+    pub fn weights(&self) -> ArrayView1<'_, f64> {
+        self.weights.view()
+    }
+
+    pub fn working_response(&self) -> ArrayView1<'_, f64> {
+        self.working_response.view()
+    }
+
+    fn update_state(&mut self, beta: &Array1<f64>) -> WorkingState {
+        let mut eta = self.offset.clone();
+        eta += &self.design.dot(beta);
+
+        const MIN_WEIGHT: f64 = 1e-12;
+        const MIN_D_FOR_Z: f64 = 1e-6;
+        const PROB_EPS: f64 = 1e-8;
+
+        let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+        self.mu
+            .assign(&eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp())));
+        self.mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
+
+        let dmu_deta = &self.mu * &(1.0 - &self.mu);
+        self.weights.assign(&dmu_deta.mapv(|v| v.max(MIN_WEIGHT)));
+        self.weights *= &self.prior_weights;
+
+        let denom_z = dmu_deta.mapv(|v| v.max(MIN_D_FOR_Z));
+        self.working_response
+            .assign(&(&eta_clamped + &((&self.response - &self.mu) / &denom_z)));
+
+        let working_residual = &eta - &self.working_response;
+        let weighted_residual = &self.weights * &working_residual;
+        let grad_data = self.design.t().dot(&weighted_residual);
+        let grad_penalty = self.penalty.dot(beta);
+        let gradient = &grad_data + &grad_penalty;
+
+        let p = beta.len();
+        let mut hessian = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let mut acc = 0.0f64;
+            let column = self.design.column(j);
+            for (&w, &xij) in self.weights.iter().zip(column.iter()) {
+                acc += w * xij * xij;
+            }
+            let penalty_diag = if j < self.penalty.nrows() && j < self.penalty.ncols() {
+                self.penalty[[j, j]]
+            } else {
+                0.0
+            };
+            hessian[[j, j]] = acc + penalty_diag;
+        }
+
+        let deviance = calculate_deviance(
+            self.response.view(),
+            &self.mu,
+            LinkFunction::Logit,
+            self.prior_weights.view(),
+        );
+
+        WorkingState {
+            eta,
+            gradient,
+            hessian,
+            deviance,
+        }
+    }
+}
+
+impl<'a> WorkingModel for GamLogitWorkingModel<'a> {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        Ok(self.update_state(beta))
+    }
+}
+
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
@@ -608,11 +717,46 @@ pub fn fit_model_for_fixed_rho(
 
     // Stage: Initialize P-IRLS state variables in the transformed basis
     let mut beta_transformed = Array1::zeros(layout.total_coeffs);
-    let mut eta = offset.to_owned();
-    eta += &x_transformed.dot(&beta_transformed);
-    let (mut mu, mut weights, mut z) =
-        update_glm_vectors(y, &eta, config.link_function(), prior_weights);
-    let mut last_deviance = calculate_deviance(y, &mu, config.link_function(), prior_weights);
+
+    let mut logit_working_model = if config.link_function() == LinkFunction::Logit {
+        Some(GamLogitWorkingModel::new(
+            x_transformed.view(),
+            offset.view(),
+            y,
+            prior_weights,
+            s_transformed,
+        ))
+    } else {
+        None
+    };
+
+    let (mut eta, mut mu, mut weights, mut z, mut last_deviance) = match config.link_function() {
+        LinkFunction::Logit => {
+            let state = logit_working_model
+                .as_mut()
+                .expect("logit working model")
+                .update(&beta_transformed)?;
+            (
+                state.eta.clone(),
+                logit_working_model.as_ref().unwrap().mu().to_owned(),
+                logit_working_model.as_ref().unwrap().weights().to_owned(),
+                logit_working_model
+                    .as_ref()
+                    .unwrap()
+                    .working_response()
+                    .to_owned(),
+                state.deviance,
+            )
+        }
+        LinkFunction::Identity => {
+            let mut eta = offset.to_owned();
+            eta += &x_transformed.dot(&beta_transformed);
+            let (mu, weights, z) =
+                update_glm_vectors(y, &eta, config.link_function(), prior_weights);
+            let dev = calculate_deviance(y, &mu, config.link_function(), prior_weights);
+            (eta, mu, weights, z, dev)
+        }
+    };
     let mut max_abs_eta = 0.0;
     let mut last_iter = 0;
 
@@ -794,10 +938,30 @@ pub fn fit_model_for_fixed_rho(
                     // SUCCESS: The step is valid and improves the fit.
                     // Update the main state variables and exit the step-halving loop.
                     beta_transformed = &beta_current + &(alpha * &beta_update);
-                    eta = eta_trial;
-                    last_deviance = deviance_trial;
-                    (mu, weights, z) =
-                        update_glm_vectors(y, &eta, config.link_function(), prior_weights);
+
+                    match config.link_function() {
+                        LinkFunction::Logit => {
+                            let state = logit_working_model
+                                .as_mut()
+                                .expect("logit working model")
+                                .update(&beta_transformed)?;
+                            eta = state.eta.clone();
+                            mu = logit_working_model.as_ref().unwrap().mu().to_owned();
+                            weights = logit_working_model.as_ref().unwrap().weights().to_owned();
+                            z = logit_working_model
+                                .as_ref()
+                                .unwrap()
+                                .working_response()
+                                .to_owned();
+                            last_deviance = state.deviance;
+                        }
+                        LinkFunction::Identity => {
+                            eta = eta_trial;
+                            last_deviance = deviance_trial;
+                            (mu, weights, z) =
+                                update_glm_vectors(y, &eta, config.link_function(), prior_weights);
+                        }
+                    }
 
                     if step_halving_count > 0 {
                         println!(
@@ -996,6 +1160,8 @@ pub fn fit_model_for_fixed_rho(
                     "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
                     iter, max_abs_eta
                 );
+                let _ = logit_working_model.take();
+                let _ = logit_working_model.take();
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
@@ -1141,6 +1307,7 @@ pub fn fit_model_for_fixed_rho(
                 ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
                 // Populate the new PirlsResult struct with stable, transformed quantities
+                let _ = logit_working_model.take();
                 return Ok(PirlsResult {
                     beta_transformed: beta_transformed.clone(),
                     penalized_hessian_transformed,
@@ -1276,6 +1443,7 @@ pub fn fit_model_for_fixed_rho(
         PirlsStatus::MaxIterationsReached
     };
 
+    let _ = logit_working_model.take();
     Ok(PirlsResult {
         beta_transformed,
         penalized_hessian_transformed,
