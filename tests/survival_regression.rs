@@ -5,6 +5,11 @@ use gnomon::calibrate::survival::{
 use ndarray::{Array1, Array2, Axis};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+
+use tempfile::TempDir;
 
 struct TrustedReference {
     artifacts: SurvivalModelArtifacts,
@@ -13,6 +18,58 @@ struct TrustedReference {
     extra_static_covariates: Array2<f64>,
     lifelines_cif: Vec<f64>,
     lifelines_weighted_brier: f64,
+}
+
+struct GeneratedReference {
+    temp_dir: TempDir,
+    reference: TrustedReference,
+}
+
+impl GeneratedReference {
+    fn new() -> Result<Self, String> {
+        let temp_dir = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
+        let json_path = temp_dir.path().join("trusted_reference_artifacts.json");
+        generate_reference_fixture(&json_path)?;
+
+        let raw_json = std::fs::read_to_string(&json_path)
+            .map_err(|e| format!("read trusted reference: {e}"))?;
+        let fixture: TrustedReferenceFixture = serde_json::from_str(&raw_json)
+            .map_err(|e| format!("parse trusted reference: {e}"))?;
+
+        Ok(Self {
+            reference: TrustedReference::from_fixture(fixture),
+            temp_dir,
+        })
+    }
+}
+
+fn generate_reference_fixture(output_path: &Path) -> Result<(), String> {
+    let script_path = generator_script_path();
+    std::fs::create_dir_all(
+        output_path
+            .parent()
+            .ok_or_else(|| "missing parent directory".to_string())?,
+    )
+    .map_err(|e| format!("create output dir: {e}"))?;
+
+    let status = Command::new("python3")
+        .arg(script_path)
+        .arg(output_path)
+        .status()
+        .map_err(|e| format!("failed to spawn generator: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("generator exited with status {status}"))
+    }
+}
+
+fn generator_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("calibrate")
+        .join("tests")
+        .join("generate_survival_reference.py")
 }
 
 #[derive(Deserialize)]
@@ -34,11 +91,15 @@ struct TrustedReferenceFixture {
 }
 
 impl TrustedReference {
-    fn load() -> Self {
-        let raw: TrustedReferenceFixture =
-            serde_json::from_str(include_str!("trusted_reference_artifacts.json"))
-                .expect("trusted reference fixture");
+    fn load() -> &'static Self {
+        static REFERENCE: OnceLock<GeneratedReference> = OnceLock::new();
+        let generated = REFERENCE
+            .get_or_init(|| GeneratedReference::new().expect("trusted reference"));
+        debug_assert!(generated.temp_dir.path().exists());
+        &generated.reference
+    }
 
+    fn from_fixture(raw: TrustedReferenceFixture) -> Self {
         let static_covariates = rows_to_array(&raw.static_covariates);
         let extra_static_covariates = rows_to_array(&raw.extra_static_covariates);
         let pcs = rows_to_array(&raw.pcs);
@@ -121,10 +182,11 @@ fn replicated_brier(
 #[test]
 fn cumulative_incidence_matches_reference_library() {
     let trusted = TrustedReference::load();
+    let data = &trusted.data;
 
     // Compute CIF values using our implementation
     let mut computed_cif = Vec::new();
-    for (idx, exit_age) in trusted.data.age_exit.iter().enumerate().take(4) {
+    for (idx, exit_age) in data.age_exit.iter().enumerate().take(4) {
         let cov = trusted.covariates_row(idx);
         let cif = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
         computed_cif.push(cif);
@@ -146,17 +208,18 @@ fn cumulative_incidence_matches_reference_library() {
 #[test]
 fn brier_score_matches_reference_library() {
     let trusted = TrustedReference::load();
+    let data = &trusted.data;
 
     // Compute predictions using our model
-    let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
-    for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
+    let mut preds = Array1::<f64>::zeros(data.age_exit.len());
+    for (idx, exit_age) in data.age_exit.iter().enumerate() {
         let cov = trusted.covariates_row(idx);
         preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
     }
 
     // Compute weighted Brier score
-    let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
-    let computed_brier = weighted_brier(&trusted.data.sample_weight, &outcomes, &preds);
+    let outcomes = data.event_target.map(|v| f64::from(*v));
+    let computed_brier = weighted_brier(&data.sample_weight, &outcomes, &preds);
 
     // Compare against lifelines reference
     assert!(
@@ -220,13 +283,14 @@ fn conditional_risk_matches_companion_reference() {
 #[test]
 fn weighted_brier_matches_frequency_replication() {
     let trusted = TrustedReference::load();
-    let mut preds = Array1::<f64>::zeros(trusted.data.age_exit.len());
-    for (idx, exit_age) in trusted.data.age_exit.iter().enumerate() {
+    let data = &trusted.data;
+    let mut preds = Array1::<f64>::zeros(data.age_exit.len());
+    for (idx, exit_age) in data.age_exit.iter().enumerate() {
         let cov = trusted.covariates_row(idx);
         preds[idx] = cumulative_incidence(*exit_age, &cov, &trusted.artifacts).unwrap();
     }
-    let outcomes = trusted.data.event_target.map(|v| f64::from(*v));
-    let weighted = weighted_brier(&trusted.data.sample_weight, &outcomes, &preds);
-    let replicated = replicated_brier(&trusted.data.sample_weight, &outcomes, &preds);
+    let outcomes = data.event_target.map(|v| f64::from(*v));
+    let weighted = weighted_brier(&data.sample_weight, &outcomes, &preds);
+    let replicated = replicated_brier(&data.sample_weight, &outcomes, &preds);
     assert!((weighted - replicated).abs() <= 1e-12);
 }
