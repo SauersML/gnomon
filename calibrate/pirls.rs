@@ -649,12 +649,12 @@ pub struct PirlsResult {
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.  
-pub fn fit_model_for_fixed_rho(
+pub fn fit_model_for_fixed_rho<'a>(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     offset: ArrayView1<f64>,
-    y: ArrayView1<f64>,
-    prior_weights: ArrayView1<f64>, // Prior weights vector
+    y: ArrayView1<'a, f64>,
+    prior_weights: ArrayView1<'a, f64>, // Prior weights vector
     rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
     balanced_penalty_root: Option<&Array2<f64>>, // Optional cached lambda-independent root
     layout: &ModelLayout,
@@ -1769,11 +1769,11 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
     }
 }
 
-pub fn update_glm_vectors(
-    y: ArrayView1<f64>,
+pub fn update_glm_vectors<'a>(
+    y: ArrayView1<'a, f64>,
     eta: &Array1<f64>,
     link: LinkFunction,
-    prior_weights: ArrayView1<f64>,
+    prior_weights: ArrayView1<'a, f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     // Smaller floor for Fisher weights to preserve geometry; slightly larger floor for z denom
     const MIN_WEIGHT: f64 = 1e-12;
