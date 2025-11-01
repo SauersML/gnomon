@@ -19,6 +19,7 @@ const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
 const MONOTONICITY_TOLERANCE: f64 = 0.0;
+const DERIVATIVE_GUARD_WARNING_CEILING: f64 = 0.05;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -695,6 +696,22 @@ pub fn build_survival_layout(
     let mut time_varying_basis_descriptor: Option<BasisDescriptor> = None;
 
     if let Some(config) = time_varying {
+        let lambda_age = if config.lambda_age == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_age
+        };
+        let lambda_pgs = if config.lambda_pgs == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_pgs
+        };
+        let lambda_null = if config.lambda_null == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_null
+        };
+
         let (pgs_basis_full, _) = create_bspline_basis_with_knots(
             data.pgs.view(),
             config.pgs_basis.knot_vector.view(),
@@ -739,24 +756,24 @@ pub fn build_survival_layout(
 
                 penalty_blocks.push(PenaltyBlock {
                     matrix: kron_age_normed.clone(),
-                    lambda: config.lambda_age,
+                    lambda: lambda_age,
                     range: time_range.clone(),
                 });
                 penalty_descriptors.push(PenaltyDescriptor {
                     order: baseline_penalty_order,
-                    lambda: config.lambda_age,
+                    lambda: lambda_age,
                     matrix: kron_age_normed.clone(),
                     column_range: ColumnRange::new(time_range.start, time_range.end),
                 });
 
                 penalty_blocks.push(PenaltyBlock {
                     matrix: kron_pgs_normed.clone(),
-                    lambda: config.lambda_pgs,
+                    lambda: lambda_pgs,
                     range: time_range.clone(),
                 });
                 penalty_descriptors.push(PenaltyDescriptor {
                     order: config.pgs_penalty_order,
-                    lambda: config.lambda_pgs,
+                    lambda: lambda_pgs,
                     matrix: kron_pgs_normed.clone(),
                     column_range: ColumnRange::new(time_range.start, time_range.end),
                 });
@@ -773,12 +790,12 @@ pub fn build_survival_layout(
                         let kron_null_normed = kron_null.mapv(|v| v / norm_null);
                         penalty_blocks.push(PenaltyBlock {
                             matrix: kron_null_normed.clone(),
-                            lambda: config.lambda_null,
+                            lambda: lambda_null,
                             range: time_range.clone(),
                         });
                         penalty_descriptors.push(PenaltyDescriptor {
                             order: 0,
-                            lambda: config.lambda_null,
+                            lambda: lambda_null,
                             matrix: kron_null_normed,
                             column_range: ColumnRange::new(time_range.start, time_range.end),
                         });
@@ -1332,6 +1349,7 @@ impl WorkingModelSurvival {
         let h_entry = eta_entry.mapv(f64::exp);
         let mut log_derivative = Array1::<f64>::zeros(n);
         let mut derivative_scale = Array1::<f64>::zeros(n);
+        let mut guarded_derivative_count = 0usize;
         for i in 0..n {
             let value = derivative_raw[i];
             if !value.is_finite() {
@@ -1340,9 +1358,24 @@ impl WorkingModelSurvival {
             if value <= guard_threshold {
                 log_derivative[i] = guard_threshold.ln();
                 derivative_scale[i] = 0.0;
+                guarded_derivative_count += 1;
             } else {
                 log_derivative[i] = value.ln();
                 derivative_scale[i] = 1.0 / value;
+            }
+        }
+
+        if guarded_derivative_count > 0 {
+            let total_grid = self.monotonicity.derivative_design.nrows();
+            if total_grid > 0 {
+                let ratio = guarded_derivative_count as f64 / total_grid as f64;
+                if ratio > DERIVATIVE_GUARD_WARNING_CEILING {
+                    warn!(
+                        "derivative guard activated for {ratio:.2}% of exit derivatives (threshold {guard_threshold:.3e}); consider adding more knots or stronger smoothing",
+                        ratio = ratio * 100.0,
+                        guard_threshold = guard_threshold,
+                    );
+                }
             }
         }
 
@@ -2022,6 +2055,8 @@ mod tests {
     };
     use approx::assert_abs_diff_eq;
     use faer::Side;
+    use log::Level;
+    use logtest::Logger;
     use ndarray::array;
     use serde_json;
 
@@ -2031,6 +2066,33 @@ mod tests {
             [matrix[[1, 1]] / det, -matrix[[0, 1]] / det],
             [-matrix[[1, 0]] / det, matrix[[0, 0]] / det]
         ]
+    }
+
+    fn finite_difference_derivatives(
+        model: &mut WorkingModelSurvival,
+        beta: &Array1<f64>,
+        epsilon: f64,
+    ) -> Result<(Array1<f64>, Array2<f64>), SurvivalError> {
+        let p = beta.len();
+        let mut gradient = Array1::<f64>::zeros(p);
+        let mut hessian = Array2::<f64>::zeros((p, p));
+
+        for column in 0..p {
+            let mut beta_plus = beta.to_owned();
+            beta_plus[column] += epsilon;
+            let plus_state = model.update_state(&beta_plus)?;
+
+            let mut beta_minus = beta.to_owned();
+            beta_minus[column] -= epsilon;
+            let minus_state = model.update_state(&beta_minus)?;
+
+            gradient[column] = (plus_state.deviance - minus_state.deviance) / (2.0 * epsilon);
+
+            let diff = (&plus_state.gradient - &minus_state.gradient) * (0.5 / epsilon);
+            hessian.column_mut(column).assign(&diff);
+        }
+
+        Ok((gradient, hessian))
     }
 
     #[test]
@@ -2231,6 +2293,39 @@ mod tests {
             assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
         }
         reset_calibrator_flag();
+    }
+
+    #[test]
+    fn update_state_warns_when_derivative_guard_is_common() {
+        let mut logger = Logger::start();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let mut model = WorkingModelSurvival::new(
+            layout_bundle.layout.clone(),
+            &data,
+            layout_bundle.monotonicity.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
+
+        model.update_state(&beta).unwrap();
+
+        let mut matches = 0usize;
+        while let Some(record) = logger.pop() {
+            if record.level() == Level::Warn
+                && record
+                    .args()
+                    .contains("derivative guard activated for")
+            {
+                matches += 1;
+            }
+        }
+        assert_eq!(matches, 1, "expected exactly one derivative guard warning");
     }
 
     fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
@@ -3671,6 +3766,47 @@ mod tests {
     }
 
     #[test]
+    fn time_varying_penalty_defaults_to_baseline_lambda() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let pgs_basis = BasisDescriptor {
+            knot_vector: array![-0.6, -0.6, -0.6, -0.3, -0.1, 0.1, 0.3, 0.6, 0.6, 0.6,],
+            degree: 2,
+        };
+        let tensor_config = TensorProductConfig {
+            label: None,
+            pgs_basis: pgs_basis.clone(),
+            pgs_penalty_order: 2,
+            lambda_age: 0.0,
+            lambda_pgs: 0.0,
+            lambda_null: 0.0,
+        };
+
+        let expected_lambda = baseline_lambda_seed(&basis, 2);
+
+        let SurvivalLayoutBundle {
+            layout,
+            penalty_descriptors,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, Some(&tensor_config)).unwrap();
+
+        assert!(layout.time_varying_exit.is_some());
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_penalties: Vec<&PenaltyDescriptor> = penalty_descriptors
+            .iter()
+            .filter(|descriptor| descriptor.column_range.start >= baseline_cols)
+            .collect();
+
+        assert!(!time_penalties.is_empty());
+        for descriptor in time_penalties {
+            assert_abs_diff_eq!(descriptor.lambda, expected_lambda, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
     fn cumulative_hazard_rejects_covariate_mismatch() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
@@ -3780,5 +3916,87 @@ mod tests {
         let serialized = serde_json::to_string(&artifacts).unwrap();
         let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
         assert_artifacts_close(&artifacts, &round_trip);
+    }
+
+    #[test]
+    fn survival_gradient_and_hessian_match_finite_difference() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_cols = layout
+            .time_varying_exit
+            .as_ref()
+            .map(|matrix| matrix.ncols())
+            .unwrap_or(0);
+        let static_cols = layout.static_covariates.ncols();
+        let extra_cols = layout.extra_static_covariates.ncols();
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let weights = Array1::from_elem(layout.baseline_derivative_exit.nrows(), 0.5);
+        let baseline_beta = layout.baseline_derivative_exit.t().dot(&weights);
+        beta.slice_mut(s![..baseline_cols]).assign(&baseline_beta);
+
+        let static_offset = baseline_cols + time_cols;
+        if static_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![static_offset..static_offset + static_cols])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = -0.1 + 0.05 * (idx as f64);
+            }
+        }
+        if extra_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![
+                    static_offset + static_cols..static_offset + static_cols + extra_cols
+                ])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = 0.02 * (idx as f64 + 1.0);
+            }
+        }
+
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        assert!(
+            derivative_exit
+                .iter()
+                .all(|value| *value > spec.derivative_guard)
+        );
+
+        let epsilon = 1e-6;
+        let (numeric_gradient, numeric_hessian) =
+            finite_difference_derivatives(&mut model, &beta, epsilon).unwrap();
+
+        let analytic_state = model.update_state(&beta).unwrap();
+
+        for (numeric, analytic) in numeric_gradient.iter().zip(analytic_state.gradient.iter()) {
+            assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-7);
+        }
+
+        for (numeric_row, analytic_row) in numeric_hessian
+            .rows()
+            .into_iter()
+            .zip(analytic_state.hessian.rows())
+        {
+            for (numeric, analytic) in numeric_row.iter().zip(analytic_row.iter()) {
+                assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-6);
+            }
+        }
     }
 }
