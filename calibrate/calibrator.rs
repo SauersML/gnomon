@@ -2287,9 +2287,9 @@ mod tests {
     /// This helper returns the full breakdown so that diagnostic tests can
     /// inspect the contribution of each term without copying the rather large
     /// derivation in multiple places.
-    fn eval_laml_breakdown_binom(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
+    fn eval_laml_breakdown_binom<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
         x: ArrayView2<f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
@@ -2337,9 +2337,9 @@ mod tests {
         }
     }
 
-    fn eval_laml_fixed_rho_binom(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
+    fn eval_laml_fixed_rho_binom<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
         x: ArrayView2<f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
@@ -2350,9 +2350,9 @@ mod tests {
 
     /// Evaluates the LAML objective at a fixed rho for Gaussian/identity regression.
     /// This test-only function is used to verify the optimizer's solution.
-    fn eval_laml_fixed_rho_gaussian(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
+    fn eval_laml_fixed_rho_gaussian<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
         x: ArrayView2<f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
