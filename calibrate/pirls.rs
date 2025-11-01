@@ -480,7 +480,7 @@ pub fn run_working_model_pirls<M, F>(
     mut iteration_callback: F,
 ) -> Result<WorkingModelPirlsResult, EstimationError>
 where
-    M: WorkingModel,
+    M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
     let mut last_deviance = f64::INFINITY;
@@ -2787,7 +2787,7 @@ mod tests {
         };
         let mut deviance_trace = Vec::new();
         let result = run_working_model_pirls(
-            model.as_mut(),
+            &mut *model,
             Array1::zeros(x.ncols()),
             &options,
             |info| deviance_trace.push(info.deviance),
@@ -2798,8 +2798,27 @@ mod tests {
             expected_identity_state(&result.beta, link, &x, &y, &weights);
         assert_abs_diff_eq!(expected_deviance, result.state.deviance, epsilon = 1e-9);
         assert_diagonal(&result.state.hessian);
-        assert_abs_diff_eq!(expected_hessian, result.state.hessian, epsilon = 1e-9);
-        assert_abs_diff_eq!(expected_gradient, result.state.gradient, epsilon = 1e-9);
+        // Compare Hessian element-wise
+        for i in 0..expected_hessian.nrows() {
+            for j in 0..expected_hessian.ncols() {
+                assert!(
+                    (expected_hessian[[i, j]] - result.state.hessian[[i, j]]).abs() < 1e-9,
+                    "Hessian mismatch at [{i},{j}]: expected {}, got {}",
+                    expected_hessian[[i, j]],
+                    result.state.hessian[[i, j]]
+                );
+            }
+        }
+        // Compare gradient element-wise
+        for i in 0..expected_gradient.len() {
+            assert!(
+                (expected_gradient[i] - result.state.gradient[i]).abs() < 1e-9,
+                "Gradient mismatch at [{}]: expected {}, got {}",
+                i,
+                expected_gradient[i],
+                result.state.gradient[i]
+            );
+        }
         result
     }
 

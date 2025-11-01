@@ -323,9 +323,9 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     (dp_c, sigma)
 }
 
-fn run_gradient_check<'a>(
+fn run_gradient_check(
     label: &str,
-    reml_state: &'a RemlState<'a>,
+    reml_state: &RemlState<'_>,
     rho: &Array1<f64>,
 ) -> Result<(), EstimationError> {
     eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy for candidate {label}");
@@ -496,9 +496,9 @@ fn run_gradient_check<'a>(
     Ok(())
 }
 
-fn check_rho_gradient_stationarity<'a>(
+fn check_rho_gradient_stationarity(
     label: &str,
-    reml_state: &'a RemlState<'a>,
+    reml_state: &RemlState<'_>,
     final_z: &Array1<f64>,
     tol_z: f64,
 ) -> Result<(f64, bool), EstimationError> {
@@ -555,9 +555,9 @@ fn check_rho_gradient_stationarity<'a>(
     Ok((grad_norm_rho, is_stationary))
 }
 
-fn run_bfgs_for_candidate<'a>(
+fn run_bfgs_for_candidate(
     label: &str,
-    reml_state: &'a RemlState<'a>,
+    reml_state: &RemlState<'_>,
     config: &ModelConfig,
     initial_z: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
@@ -2685,8 +2685,8 @@ pub fn optimize_external_design(
 }
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
-fn compute_fd_gradient<'a>(
-    reml_state: &'a internal::RemlState<'a>,
+fn compute_fd_gradient(
+    reml_state: &internal::RemlState,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     let mut fd_grad = Array1::zeros(rho.len());
@@ -3284,7 +3284,7 @@ pub mod internal {
         }
 
         fn prepare_eval_bundle_with_key(
-            &'a self,
+            &self,
             rho: &Array1<f64>,
             key: Option<Vec<u64>>,
         ) -> Result<EvalShared, EstimationError> {
@@ -3298,7 +3298,7 @@ pub mod internal {
             })
         }
 
-        fn obtain_eval_bundle(&'a self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
+        fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
             let key = self.rho_key_sanitized(rho);
             if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
                 if existing.matches(&key) {
@@ -3474,7 +3474,7 @@ pub mod internal {
         }
 
         fn numeric_penalised_ll_grad_with_workspace(
-            &'a self,
+            &self,
             rho: &Array1<f64>,
             workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
@@ -3561,7 +3561,7 @@ pub mod internal {
         }
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
-        fn half_logh_at(&'a self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
             let (h_eff, _) = self.effective_hessian(&pr)?;
             let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -3581,7 +3581,7 @@ pub mod internal {
 
         /// Numerical gradient of 0.5 * log|H_eff(rho)| with respect to rho via central differences.
         fn numeric_half_logh_grad_with_workspace(
-            &'a self,
+            &self,
             rho: &Array1<f64>,
             workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
@@ -3647,7 +3647,7 @@ pub mod internal {
 
         /// Runs the inner P-IRLS loop, caching the result.
         fn execute_pirls_if_needed(
-            &'a self,
+            &self,
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
@@ -3672,7 +3672,7 @@ pub mod internal {
             // The returned result will include the transformation matrix qs
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
-                self.x.view(),
+                self.x,
                 self.offset.view(),
                 self.y,
                 self.weights,
@@ -3723,7 +3723,7 @@ pub mod internal {
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
-        pub fn compute_cost(&'a self, p: &Array1<f64>) -> Result<f64, EstimationError> {
+        pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             println!(
                 "[GNOMON COST] ==> Received rho from optimizer: {:?}",
                 p.to_vec()
@@ -4071,7 +4071,7 @@ pub mod internal {
 
         /// The state-aware closure method for the BFGS optimizer.
         /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND * tanh(z / RHO_BOUND)`.
-        pub fn cost_and_grad(&'a self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+        pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
             let eval_num = {
                 let mut count = self.eval_count.borrow_mut();
                 *count += 1;
@@ -4316,7 +4316,7 @@ pub mod internal {
         // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
-        pub fn compute_gradient(&'a self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
@@ -4338,7 +4338,7 @@ pub mod internal {
         /// Helper function that computes gradient using a shared evaluation bundle
         /// so cost and gradient reuse the identical stabilized Hessian and PIRLS state.
         fn compute_gradient_with_bundle(
-            &'a self,
+            &self,
             p: &Array1<f64>,
             bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
