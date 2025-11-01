@@ -3092,6 +3092,108 @@ mod tests {
         );
     }
 
+    fn identity_layout(link: LinkFunction) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+        let x = Array2::<f64>::eye(3);
+        let y = match link {
+            LinkFunction::Logit => arr1(&[0.0, 1.0, 0.0]),
+            LinkFunction::Identity => arr1(&[1.0, -1.0, 0.5]),
+        };
+        let weights = Array1::from_elem(y.len(), 1.0);
+        (x, y, weights)
+    }
+
+    fn build_identity_gam_working_model(
+        link: LinkFunction,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Box<dyn WorkingModel>, &'static str> {
+        let _ = (link, x, y, weights);
+        Err("GAM working model still uses legacy PIRLS path")
+    }
+
+    fn expected_identity_state(
+        beta: &Array1<f64>,
+        link: LinkFunction,
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+    ) -> (Array1<f64>, Array2<f64>, f64) {
+        let eta = x.dot(beta);
+        let (mu, fisher_weights, z) = update_glm_vectors(y.view(), &eta, link, weights.view());
+        let working_gradient = x.t().dot(&(&fisher_weights * (&eta - &z)));
+
+        let mut w_matrix = Array2::<f64>::zeros((x.nrows(), x.nrows()));
+        for (i, w) in fisher_weights.iter().enumerate() {
+            w_matrix[[i, i]] = *w;
+        }
+        let hessian = x.t().dot(&w_matrix.dot(x));
+        let deviance = calculate_deviance(y.view(), &mu, link, weights.view());
+        (working_gradient, hessian, deviance)
+    }
+
+    fn assert_monotone(trace: &[f64]) {
+        for window in trace.windows(2) {
+            assert!(
+                window[1] <= window[0] + 1e-12,
+                "deviance must be non-increasing: {:?}",
+                trace
+            );
+        }
+    }
+
+    fn assert_diagonal(matrix: &Array2<f64>) {
+        for i in 0..matrix.nrows() {
+            for j in 0..matrix.ncols() {
+                if i != j {
+                    assert!(
+                        matrix[[i, j]].abs() < 1e-9,
+                        "expected diagonal Hessian, got {:?}",
+                        matrix
+                    );
+                }
+            }
+        }
+    }
+
+    fn run_identity_gam_test(link: LinkFunction) -> WorkingModelPirlsResult {
+        let (x, y, weights) = identity_layout(link);
+        let mut model = build_identity_gam_working_model(link, &x, &y, &weights)
+            .expect("GAM WorkingModel must be provided for identity layout tests");
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 8,
+            convergence_tolerance: 1e-10,
+            max_step_halving: 4,
+            min_step_size: 1e-6,
+        };
+        let mut deviance_trace = Vec::new();
+        let result = run_working_model_pirls(
+            model.as_mut(),
+            Array1::zeros(x.ncols()),
+            &options,
+            |info| deviance_trace.push(info.deviance),
+        )
+        .expect("PIRLS should converge on identity layout");
+        assert_monotone(&deviance_trace);
+        let (expected_gradient, expected_hessian, expected_deviance) =
+            expected_identity_state(&result.beta, link, &x, &y, &weights);
+        assert_abs_diff_eq!(expected_deviance, result.state.deviance, epsilon = 1e-9);
+        assert_diagonal(&result.state.hessian);
+        assert_abs_diff_eq!(expected_hessian, result.state.hessian, epsilon = 1e-9);
+        assert_abs_diff_eq!(expected_gradient, result.state.gradient, epsilon = 1e-9);
+        result
+    }
+
+    #[test]
+    fn logistic_identity_layout_monotone_and_diagonal() {
+        run_identity_gam_test(LinkFunction::Logit);
+    }
+
+    #[test]
+    fn gaussian_identity_layout_monotone_and_diagonal() {
+        run_identity_gam_test(LinkFunction::Identity);
+    }
+
     #[test]
     fn pirls_penalized_deviance_is_monotone() {
         let (result, trace) = super::capture_pirls_penalized_deviance(|| {
