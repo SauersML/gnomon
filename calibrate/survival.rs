@@ -2934,6 +2934,89 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_hazard_matches_update_state_with_delayed_entry() {
+        let data = SurvivalTrainingData {
+            age_entry: array![45.0, 60.0, 58.0],
+            age_exit: array![50.0, 66.0, 65.0],
+            event_target: array![1, 0, 1],
+            event_competing: array![0, 0, 0],
+            sample_weight: array![1.0, 1.0, 1.0],
+            pgs: array![0.05, -0.1, 0.2],
+            sex: array![0.0, 1.0, 0.0],
+            pcs: array![[0.01, -0.02], [0.03, 0.04], [-0.05, 0.06]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
+        };
+
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let penalty_descriptors = bundle.penalty_descriptors.clone();
+        let interaction_metadata = bundle.interaction_metadata.clone();
+        let time_varying_basis = bundle.time_varying_basis.clone();
+
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.02 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update_state(&beta).unwrap();
+        assert!(state.deviance.is_finite());
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let h_exit = eta_exit.mapv(f64::exp);
+        let h_entry = eta_entry.mapv(f64::exp);
+        let delta_training = &h_exit - &h_entry;
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: beta.clone(),
+            age_basis: basis.clone(),
+            time_varying_basis,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata,
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        for i in 0..data.age_entry.len() {
+            let covariates = combined_static_row(&layout, i);
+            let hazard_exit =
+                cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_entry =
+                cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
+            let delta_scoring = hazard_exit - hazard_entry;
+            assert_abs_diff_eq!(delta_scoring, delta_training[i], epsilon = 1e-10);
+        }
+    }
+
+    #[test]
     fn gradient_and_hessian_match_numeric() {
         let data = toy_training_data();
         let basis = BasisDescriptor {
