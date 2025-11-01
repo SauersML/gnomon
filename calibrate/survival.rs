@@ -18,7 +18,7 @@ use thiserror::Error;
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
-const MONOTONICITY_TOLERANCE: f64 = -5e-2;
+const MONOTONICITY_TOLERANCE: f64 = 0.0;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -2525,7 +2525,8 @@ mod tests {
         for row in monotonicity.derivative_design.rows() {
             if row.iter().any(|value| value.abs() > 1e-12) {
                 beta.assign(&row);
-                beta.mapv_inplace(|value| -value);
+                // Scale the row so the induced slopes are only infinitesimally negative.
+                beta.mapv_inplace(|value| -1e-8 * value);
                 found = true;
                 break;
             }
@@ -2533,7 +2534,7 @@ mod tests {
         assert!(found, "monotonicity grid returned only zero rows");
 
         let slopes = monotonicity.derivative_design.dot(&beta);
-        assert!(slopes.iter().any(|value| *value < 0.0));
+        assert!(slopes.iter().any(|value| *value < 0.0 && value.abs() < 1e-6));
 
         let mut model =
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
