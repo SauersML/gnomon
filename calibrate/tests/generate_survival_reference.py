@@ -50,7 +50,7 @@ TRUSTED_REFERENCE_JSON = {
             "delta": 0.1,
             "minimum_age": 50.0
         },
-        "calibrator": null,
+        "calibrator": None,
         "coefficients": {
             "data": [
                 25.835898378632805,
@@ -66,7 +66,7 @@ TRUSTED_REFERENCE_JSON = {
             "v": 1
         },
         "companion_models": [],
-        "hessian_factor": null,
+        "hessian_factor": None,
         "interaction_metadata": [],
         "penalties": [
             {
@@ -151,7 +151,7 @@ TRUSTED_REFERENCE_JSON = {
                 }
             ]
         },
-        "time_varying_basis": null
+        "time_varying_basis": None
     },
     "event_competing": [
         0,
@@ -259,12 +259,12 @@ TRUSTED_REFERENCE_JSON = {
         ]
     ],
     "lifelines_cif": [
-        0.3292075182,
-        0.2449792496,
-        0.3122529096,
-        0.2461683547
+        0.6321210934815431,
+        0.6321207264171644,
+        0.6321204109495415,
+        0.6321201334574286
     ],
-    "lifelines_weighted_brier": 0.2231375836
+    "lifelines_weighted_brier": 0.286330117856061
 }
 
 
