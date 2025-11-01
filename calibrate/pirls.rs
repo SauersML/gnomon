@@ -24,6 +24,7 @@ pub struct WorkingState {
     pub gradient: Array1<f64>,
     pub hessian: Array2<f64>,
     pub deviance: f64,
+    pub penalty_term: f64,
 }
 
 /// Lightweight helper for Gaussian GAMs with an identity link.
@@ -154,11 +155,14 @@ impl<'a> GamLogitWorkingModel<'a> {
             self.prior_weights.view(),
         );
 
+        let penalty_term = beta.dot(&grad_penalty);
+
         WorkingState {
             eta,
             gradient,
             hessian,
             deviance,
+            penalty_term,
         }
     }
 }
@@ -221,6 +225,7 @@ pub struct WorkingModelPirlsOptions {
     pub convergence_tolerance: f64,
     pub max_step_halving: usize,
     pub min_step_size: f64,
+    pub firth_bias_reduction: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -324,8 +329,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut eta = self.offset.clone();
         eta += &self.x_transformed.dot(beta);
 
-        let (mu, weights, mut z) =
-            update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
+        let (mu, weights, mut z) = update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
 
         if self.firth_bias_reduction {
             let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
@@ -390,6 +394,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             gradient,
             hessian: penalized_hessian,
             deviance,
+            penalty_term,
         })
     }
 }
@@ -483,7 +488,6 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
-    let mut last_deviance = f64::INFINITY;
     let mut last_gradient_norm = f64::INFINITY;
     let mut last_deviance_change = f64::INFINITY;
     let mut last_step_size = 0.0;
@@ -496,22 +500,30 @@ where
     for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
+        let current_penalized = state.deviance + state.penalty_term;
         let state_grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
         let mut step = 1.0;
         let mut step_halving = 0usize;
         let mut candidate_beta = beta.clone();
-        let mut candidate_state_opt: Option<WorkingState> = None;
+        let mut candidate_state_opt: Option<(WorkingState, f64)> = None;
         let mut last_error: Option<EstimationError> = None;
 
         loop {
             candidate_beta = &beta + &(direction.mapv(|v| step * v));
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
-                    if candidate_state.deviance <= state.deviance
-                        || !candidate_state.deviance.is_finite()
-                    {
-                        candidate_state_opt = Some(candidate_state);
+                    let candidate_penalized =
+                        candidate_state.deviance + candidate_state.penalty_term;
+                    let accept_step = if options.firth_bias_reduction {
+                        true
+                    } else {
+                        candidate_penalized <= current_penalized * (1.0 + 1e-12)
+                            || (current_penalized - candidate_penalized).abs() < 1e-12
+                            || !candidate_penalized.is_finite()
+                    };
+                    if accept_step {
+                        candidate_state_opt = Some((candidate_state, candidate_penalized));
                         break;
                     }
                 }
@@ -534,14 +546,14 @@ where
             step_halving += 1;
         }
 
-        let candidate_state = candidate_state_opt.expect("accepted state");
+        let (candidate_state, candidate_penalized) = candidate_state_opt.expect("accepted state");
         let candidate_grad_norm = candidate_state
             .gradient
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let deviance_change = last_deviance - candidate_state.deviance;
+        let deviance_change = current_penalized - candidate_penalized;
 
         iteration_callback(&WorkingModelIterationInfo {
             iteration: iter,
@@ -552,7 +564,6 @@ where
         });
 
         beta = candidate_beta;
-        last_deviance = candidate_state.deviance;
         last_gradient_norm = candidate_grad_norm;
         last_deviance_change = deviance_change;
         last_step_size = step;
@@ -564,7 +575,10 @@ where
             .map(f64::abs)
             .fold(0.0, f64::max);
 
-        if !last_deviance.is_finite() || !last_gradient_norm.is_finite() {
+        if !candidate_state.deviance.is_finite()
+            || !candidate_penalized.is_finite()
+            || !candidate_grad_norm.is_finite()
+        {
             status = PirlsStatus::Unstable;
             final_state = Some(candidate_state);
             break;
@@ -868,6 +882,8 @@ pub fn fit_model_for_fixed_rho<'a>(
         convergence_tolerance: config.convergence_tolerance,
         max_step_halving: 30,
         min_step_size: 1e-6,
+        firth_bias_reduction: config.firth_bias_reduction
+            && matches!(link_function, LinkFunction::Logit),
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -2784,15 +2800,14 @@ mod tests {
             convergence_tolerance: 1e-10,
             max_step_halving: 4,
             min_step_size: 1e-6,
+            firth_bias_reduction: false,
         };
         let mut deviance_trace = Vec::new();
-        let result = run_working_model_pirls(
-            &mut *model,
-            Array1::zeros(x.ncols()),
-            &options,
-            |info| deviance_trace.push(info.deviance),
-        )
-        .expect("PIRLS should converge on identity layout");
+        let result =
+            run_working_model_pirls(&mut *model, Array1::zeros(x.ncols()), &options, |info| {
+                deviance_trace.push(info.deviance)
+            })
+            .expect("PIRLS should converge on identity layout");
         assert_monotone(&deviance_trace);
         let (expected_gradient, expected_hessian, expected_deviance) =
             expected_identity_state(&result.beta, link, &x, &y, &weights);
