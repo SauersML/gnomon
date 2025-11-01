@@ -323,9 +323,9 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     (dp_c, sigma)
 }
 
-fn run_gradient_check(
+fn run_gradient_check<'a>(
     label: &str,
-    reml_state: &RemlState<'_>,
+    reml_state: &'a RemlState<'a>,
     rho: &Array1<f64>,
 ) -> Result<(), EstimationError> {
     eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy for candidate {label}");
@@ -496,9 +496,9 @@ fn run_gradient_check(
     Ok(())
 }
 
-fn check_rho_gradient_stationarity(
+fn check_rho_gradient_stationarity<'a>(
     label: &str,
-    reml_state: &RemlState<'_>,
+    reml_state: &'a RemlState<'a>,
     final_z: &Array1<f64>,
     tol_z: f64,
 ) -> Result<(f64, bool), EstimationError> {
@@ -555,9 +555,9 @@ fn check_rho_gradient_stationarity(
     Ok((grad_norm_rho, is_stationary))
 }
 
-fn run_bfgs_for_candidate(
+fn run_bfgs_for_candidate<'a>(
     label: &str,
-    reml_state: &RemlState<'_>,
+    reml_state: &'a RemlState<'a>,
     config: &ModelConfig,
     initial_z: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
@@ -778,7 +778,7 @@ pub fn train_model(
         eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
 
         let zero_rho = Array1::<f64>::zeros(0);
-        let final_fit = pirls::fit_model_for_fixed_rho(
+        let (final_fit, _) = pirls::fit_model_for_fixed_rho(
             zero_rho.view(),
             reml_state.x(),
             reml_state.offset(),
@@ -1240,7 +1240,7 @@ pub fn train_model(
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
-    let final_fit = pirls::fit_model_for_fixed_rho(
+    let (final_fit, _) = pirls::fit_model_for_fixed_rho(
         final_rho_clamped.view(),
         reml_state.x(), // Use original X
         reml_state.offset(),
@@ -2533,7 +2533,7 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let pirls_res = pirls::fit_model_for_fixed_rho(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
@@ -2685,8 +2685,8 @@ pub fn optimize_external_design(
 }
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
-fn compute_fd_gradient(
-    reml_state: &internal::RemlState,
+fn compute_fd_gradient<'a>(
+    reml_state: &'a internal::RemlState<'a>,
     rho: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     let mut fd_grad = Array1::zeros(rho.len());
@@ -3284,7 +3284,7 @@ pub mod internal {
         }
 
         fn prepare_eval_bundle_with_key(
-            &self,
+            &'a self,
             rho: &Array1<f64>,
             key: Option<Vec<u64>>,
         ) -> Result<EvalShared, EstimationError> {
@@ -3298,7 +3298,7 @@ pub mod internal {
             })
         }
 
-        fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
+        fn obtain_eval_bundle(&'a self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
             let key = self.rho_key_sanitized(rho);
             if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
                 if existing.matches(&key) {
@@ -3474,7 +3474,7 @@ pub mod internal {
         }
 
         fn numeric_penalised_ll_grad_with_workspace(
-            &self,
+            &'a self,
             rho: &Array1<f64>,
             workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
@@ -3499,7 +3499,7 @@ pub mod internal {
             // and never reuse the same ρ, so the cache would not help and would require
             // synchronization across threads.
             let evaluate_penalised_ll = |rho_vec: &Array1<f64>| -> Result<f64, EstimationError> {
-                let pirls_result = pirls::fit_model_for_fixed_rho(
+                let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
                     rho_vec.view(),
                     x,
                     offset_view,
@@ -3561,7 +3561,7 @@ pub mod internal {
         }
 
         /// Compute 0.5 * log|H_eff(rho)| using the SAME stabilized Hessian and logdet path as compute_cost.
-        fn half_logh_at(&self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        fn half_logh_at(&'a self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
             let pr = self.execute_pirls_if_needed(rho)?;
             let (h_eff, _) = self.effective_hessian(&pr)?;
             let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
@@ -3581,7 +3581,7 @@ pub mod internal {
 
         /// Numerical gradient of 0.5 * log|H_eff(rho)| with respect to rho via central differences.
         fn numeric_half_logh_grad_with_workspace(
-            &self,
+            &'a self,
             rho: &Array1<f64>,
             workspace: &mut RemlWorkspace,
         ) -> Result<Array1<f64>, EstimationError> {
@@ -3647,7 +3647,7 @@ pub mod internal {
 
         /// Runs the inner P-IRLS loop, caching the result.
         fn execute_pirls_if_needed(
-            &self,
+            &'a self,
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
@@ -3686,7 +3686,8 @@ pub mod internal {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
             }
 
-            let pirls_result = Arc::new(pirls_result?); // Propagate error if it occurred
+            let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
+            let pirls_result = Arc::new(pirls_result);
 
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
@@ -3718,11 +3719,11 @@ pub mod internal {
         }
     }
 
-    impl RemlState<'_> {
+    impl<'a> RemlState<'a> {
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
-        pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
+        pub fn compute_cost(&'a self, p: &Array1<f64>) -> Result<f64, EstimationError> {
             println!(
                 "[GNOMON COST] ==> Received rho from optimizer: {:?}",
                 p.to_vec()
@@ -4070,7 +4071,7 @@ pub mod internal {
 
         /// The state-aware closure method for the BFGS optimizer.
         /// Accepts unconstrained parameters `z`, maps to bounded `rho = RHO_BOUND * tanh(z / RHO_BOUND)`.
-        pub fn cost_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+        pub fn cost_and_grad(&'a self, z: &Array1<f64>) -> (f64, Array1<f64>) {
             let eval_num = {
                 let mut count = self.eval_count.borrow_mut();
                 *count += 1;
@@ -4315,7 +4316,7 @@ pub mod internal {
         // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
         //     direct quadratic pieces are exact negatives, which is what the algebra requires.
-        pub fn compute_gradient(&self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        pub fn compute_gradient(&'a self, p: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
             // Get the converged P-IRLS result for the current rho (`p`)
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
@@ -4337,7 +4338,7 @@ pub mod internal {
         /// Helper function that computes gradient using a shared evaluation bundle
         /// so cost and gradient reuse the identical stabilized Hessian and PIRLS state.
         fn compute_gradient_with_bundle(
-            &self,
+            &'a self,
             p: &Array1<f64>,
             bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
@@ -6468,18 +6469,19 @@ pub mod internal {
                         create_balanced_penalty_root(&s_list, layout.total_coeffs).expect("eb");
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
-                    let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
-                        rho.view(),
-                        x_tr.view(),
-                        offset.view(),
-                        data_train.y.view(),
-                        data_train.weights.view(),
-                        &rs_list,
-                        Some(&balanced_root),
-                        &layout,
-                        &trained.config,
-                    )
-                    .expect("pirls refit");
+                    let (pirls_res, _) =
+                        crate::calibrate::pirls::fit_model_for_fixed_rho(
+                            rho.view(),
+                            x_tr.view(),
+                            offset.view(),
+                            data_train.y.view(),
+                            data_train.weights.view(),
+                            &rs_list,
+                            Some(&balanced_root),
+                            &layout,
+                            &trained.config,
+                        )
+                        .expect("pirls refit");
 
                     total_edfs.push(pirls_res.edf);
                     println!("[CV]   Complexity: edf={:.2}", pirls_res.edf);
@@ -7815,7 +7817,7 @@ pub mod internal {
             );
 
             match result {
-                Ok(pirls_result) => {
+                Ok((pirls_result, _)) => {
                     println!("P-IRLS converged successfully");
                     assert!(
                         pirls_result.deviance.is_finite(),

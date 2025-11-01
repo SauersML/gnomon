@@ -2318,9 +2318,7 @@ mod tests {
         let mut matches = 0usize;
         while let Some(record) = logger.pop() {
             if record.level() == Level::Warn
-                && record
-                    .args()
-                    .contains("derivative guard activated for")
+                && record.args().contains("derivative guard activated for")
             {
                 matches += 1;
             }
@@ -2629,7 +2627,11 @@ mod tests {
         assert!(found, "monotonicity grid returned only zero rows");
 
         let slopes = monotonicity.derivative_design.dot(&beta);
-        assert!(slopes.iter().any(|value| *value < 0.0 && value.abs() < 1e-6));
+        assert!(
+            slopes
+                .iter()
+                .any(|value| *value < 0.0 && value.abs() < 1e-6)
+        );
 
         let mut model =
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
@@ -3102,8 +3104,7 @@ mod tests {
 
         for i in 0..data.age_entry.len() {
             let covariates = combined_static_row(&layout, i);
-            let hazard_exit =
-                cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
             let hazard_entry =
                 cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
             let delta_scoring = hazard_exit - hazard_entry;
