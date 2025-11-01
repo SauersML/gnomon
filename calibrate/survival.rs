@@ -2033,6 +2033,33 @@ mod tests {
         ]
     }
 
+    fn finite_difference_derivatives(
+        model: &mut WorkingModelSurvival,
+        beta: &Array1<f64>,
+        epsilon: f64,
+    ) -> Result<(Array1<f64>, Array2<f64>), SurvivalError> {
+        let p = beta.len();
+        let mut gradient = Array1::<f64>::zeros(p);
+        let mut hessian = Array2::<f64>::zeros((p, p));
+
+        for column in 0..p {
+            let mut beta_plus = beta.to_owned();
+            beta_plus[column] += epsilon;
+            let plus_state = model.update_state(&beta_plus)?;
+
+            let mut beta_minus = beta.to_owned();
+            beta_minus[column] -= epsilon;
+            let minus_state = model.update_state(&beta_minus)?;
+
+            gradient[column] = (plus_state.deviance - minus_state.deviance) / (2.0 * epsilon);
+
+            let diff = (&plus_state.gradient - &minus_state.gradient) * (0.5 / epsilon);
+            hessian.column_mut(column).assign(&diff);
+        }
+
+        Ok((gradient, hessian))
+    }
+
     #[test]
     fn delta_method_expected_factor_matches_manual_inverse() {
         let hessian = array![[4.0, 1.0], [1.0, 3.0]];
@@ -3696,5 +3723,87 @@ mod tests {
         let serialized = serde_json::to_string(&artifacts).unwrap();
         let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
         assert_artifacts_close(&artifacts, &round_trip);
+    }
+
+    #[test]
+    fn survival_gradient_and_hessian_match_finite_difference() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_cols = layout
+            .time_varying_exit
+            .as_ref()
+            .map(|matrix| matrix.ncols())
+            .unwrap_or(0);
+        let static_cols = layout.static_covariates.ncols();
+        let extra_cols = layout.extra_static_covariates.ncols();
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let weights = Array1::from_elem(layout.baseline_derivative_exit.nrows(), 0.5);
+        let baseline_beta = layout.baseline_derivative_exit.t().dot(&weights);
+        beta.slice_mut(s![..baseline_cols]).assign(&baseline_beta);
+
+        let static_offset = baseline_cols + time_cols;
+        if static_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![static_offset..static_offset + static_cols])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = -0.1 + 0.05 * (idx as f64);
+            }
+        }
+        if extra_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![
+                    static_offset + static_cols..static_offset + static_cols + extra_cols
+                ])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = 0.02 * (idx as f64 + 1.0);
+            }
+        }
+
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        assert!(
+            derivative_exit
+                .iter()
+                .all(|value| *value > spec.derivative_guard)
+        );
+
+        let epsilon = 1e-6;
+        let (numeric_gradient, numeric_hessian) =
+            finite_difference_derivatives(&mut model, &beta, epsilon).unwrap();
+
+        let analytic_state = model.update_state(&beta).unwrap();
+
+        for (numeric, analytic) in numeric_gradient.iter().zip(analytic_state.gradient.iter()) {
+            assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-7);
+        }
+
+        for (numeric_row, analytic_row) in numeric_hessian
+            .rows()
+            .into_iter()
+            .zip(analytic_state.hessian.rows())
+        {
+            for (numeric, analytic) in numeric_row.iter().zip(analytic_row.iter()) {
+                assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-6);
+            }
+        }
     }
 }
