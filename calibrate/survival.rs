@@ -19,6 +19,7 @@ const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
 const MONOTONICITY_TOLERANCE: f64 = 0.0;
+const DERIVATIVE_GUARD_WARNING_CEILING: f64 = 0.05;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
 #[derive(Debug, Error)]
@@ -1332,6 +1333,7 @@ impl WorkingModelSurvival {
         let h_entry = eta_entry.mapv(f64::exp);
         let mut log_derivative = Array1::<f64>::zeros(n);
         let mut derivative_scale = Array1::<f64>::zeros(n);
+        let mut guarded_derivative_count = 0usize;
         for i in 0..n {
             let value = derivative_raw[i];
             if !value.is_finite() {
@@ -1340,9 +1342,24 @@ impl WorkingModelSurvival {
             if value <= guard_threshold {
                 log_derivative[i] = guard_threshold.ln();
                 derivative_scale[i] = 0.0;
+                guarded_derivative_count += 1;
             } else {
                 log_derivative[i] = value.ln();
                 derivative_scale[i] = 1.0 / value;
+            }
+        }
+
+        if guarded_derivative_count > 0 {
+            let total_grid = self.monotonicity.derivative_design.nrows();
+            if total_grid > 0 {
+                let ratio = guarded_derivative_count as f64 / total_grid as f64;
+                if ratio > DERIVATIVE_GUARD_WARNING_CEILING {
+                    warn!(
+                        "derivative guard activated for {ratio:.2}% of exit derivatives (threshold {guard_threshold:.3e}); consider adding more knots or stronger smoothing",
+                        ratio = ratio * 100.0,
+                        guard_threshold = guard_threshold,
+                    );
+                }
             }
         }
 
@@ -2022,6 +2039,8 @@ mod tests {
     };
     use approx::assert_abs_diff_eq;
     use faer::Side;
+    use log::Level;
+    use logtest::Logger;
     use ndarray::array;
     use serde_json;
 
@@ -2231,6 +2250,39 @@ mod tests {
             assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
         }
         reset_calibrator_flag();
+    }
+
+    #[test]
+    fn update_state_warns_when_derivative_guard_is_common() {
+        let mut logger = Logger::start();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let mut model = WorkingModelSurvival::new(
+            layout_bundle.layout.clone(),
+            &data,
+            layout_bundle.monotonicity.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
+
+        model.update_state(&beta).unwrap();
+
+        let mut matches = 0usize;
+        while let Some(record) = logger.pop() {
+            if record.level() == Level::Warn
+                && record
+                    .args()
+                    .contains("derivative guard activated for")
+            {
+                matches += 1;
+            }
+        }
+        assert_eq!(matches, 1, "expected exactly one derivative guard warning");
     }
 
     fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
