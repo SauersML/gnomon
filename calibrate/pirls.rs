@@ -4,7 +4,7 @@ use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
     array2_to_mat_mut, hash_array2, ldlt_rook,
 };
-use crate::calibrate::model::{LinkFunction, ModelConfig};
+use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
@@ -243,6 +243,155 @@ pub struct WorkingModelPirlsResult {
     pub last_step_size: f64,
     pub last_step_halving: usize,
     pub max_abs_eta: f64,
+}
+
+struct GamWorkingModel<'a> {
+    x_transformed: Array2<f64>,
+    x_original: ArrayView2<'a, f64>,
+    offset: Array1<f64>,
+    y: ArrayView1<'a, f64>,
+    prior_weights: ArrayView1<'a, f64>,
+    s_transformed: Array2<f64>,
+    e_transformed: Array2<f64>,
+    workspace: PirlsWorkspace,
+    link: LinkFunction,
+    firth_bias_reduction: bool,
+    firth_log_det: Option<f64>,
+    last_mu: Array1<f64>,
+    last_weights: Array1<f64>,
+    last_z: Array1<f64>,
+    last_penalty_term: f64,
+}
+
+struct GamModelFinalState {
+    x_transformed: Array2<f64>,
+    e_transformed: Array2<f64>,
+    final_mu: Array1<f64>,
+    final_weights: Array1<f64>,
+    final_z: Array1<f64>,
+    firth_log_det: Option<f64>,
+    penalty_term: f64,
+}
+
+impl<'a> GamWorkingModel<'a> {
+    fn new(
+        x_transformed: Array2<f64>,
+        x_original: ArrayView2<'a, f64>,
+        offset: ArrayView1<'a, f64>,
+        y: ArrayView1<'a, f64>,
+        prior_weights: ArrayView1<'a, f64>,
+        s_transformed: Array2<f64>,
+        e_transformed: Array2<f64>,
+        workspace: PirlsWorkspace,
+        link: LinkFunction,
+        firth_bias_reduction: bool,
+    ) -> Self {
+        let n = x_transformed.nrows();
+        GamWorkingModel {
+            x_transformed,
+            x_original,
+            offset: offset.to_owned(),
+            y,
+            prior_weights,
+            s_transformed,
+            e_transformed,
+            workspace,
+            link,
+            firth_bias_reduction,
+            firth_log_det: None,
+            last_mu: Array1::zeros(n),
+            last_weights: Array1::zeros(n),
+            last_z: Array1::zeros(n),
+            last_penalty_term: 0.0,
+        }
+    }
+
+    fn into_final_state(self) -> GamModelFinalState {
+        GamModelFinalState {
+            x_transformed: self.x_transformed,
+            e_transformed: self.e_transformed,
+            final_mu: self.last_mu,
+            final_weights: self.last_weights,
+            final_z: self.last_z,
+            firth_log_det: self.firth_log_det,
+            penalty_term: self.last_penalty_term,
+        }
+    }
+}
+
+impl<'a> WorkingModel for GamWorkingModel<'a> {
+    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        let mut eta = self.offset.clone();
+        eta += &self.x_transformed.dot(beta);
+
+        let (mut mu, mut weights, mut z) =
+            update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
+
+        if self.firth_bias_reduction {
+            let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
+                self.x_transformed.view(),
+                self.x_original,
+                weights.view(),
+                &self.s_transformed,
+                &mut self.workspace,
+            )?;
+            self.firth_log_det = Some(half_log_det);
+            for i in 0..z.len() {
+                let wi = weights[i];
+                if wi > 0.0 {
+                    z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
+                }
+            }
+        } else {
+            self.firth_log_det = None;
+        }
+
+        self.workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+        let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
+        if self.workspace.wx.dim() != self.x_transformed.dim() {
+            self.workspace.wx = Array2::zeros(self.x_transformed.dim());
+        }
+        self.workspace.wx.assign(&self.x_transformed);
+        self.workspace.wx *= &sqrt_w_col;
+        let xtwx = self.workspace.wx.t().dot(&self.workspace.wx);
+        let mut penalized_hessian = xtwx + &self.s_transformed;
+        for i in 0..penalized_hessian.nrows() {
+            for j in 0..i {
+                let val = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+                penalized_hessian[[i, j]] = val;
+                penalized_hessian[[j, i]] = val;
+            }
+        }
+
+        let mut eta_minus_z = eta.clone();
+        eta_minus_z -= &z;
+        self.workspace.weighted_residual.assign(&eta_minus_z);
+        self.workspace.weighted_residual *= &weights;
+        let mut gradient = self
+            .x_transformed
+            .t()
+            .dot(&self.workspace.weighted_residual);
+        let s_beta = self.s_transformed.dot(beta);
+        gradient += &s_beta;
+
+        let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
+
+        let penalty_term = beta.dot(&s_beta);
+        #[cfg(test)]
+        record_penalized_deviance(deviance + penalty_term);
+
+        self.last_mu = mu;
+        self.last_weights = weights;
+        self.last_z = z;
+        self.last_penalty_term = penalty_term;
+
+        Ok(WorkingState {
+            eta,
+            gradient,
+            hessian: penalized_hessian,
+            deviance,
+        })
+    }
 }
 
 fn solve_newton_direction_dense(
@@ -649,41 +798,30 @@ pub struct PirlsResult {
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.  
+
 pub fn fit_model_for_fixed_rho<'a>(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<f64>,
     offset: ArrayView1<f64>,
     y: ArrayView1<'a, f64>,
-    prior_weights: ArrayView1<'a, f64>, // Prior weights vector
-    rs_original: &[Array2<f64>],    // Original, untransformed penalty square roots
-    balanced_penalty_root: Option<&Array2<f64>>, // Optional cached lambda-independent root
+    prior_weights: ArrayView1<'a, f64>,
+    rs_original: &[Array2<f64>],
+    balanced_penalty_root: Option<&Array2<f64>>,
     layout: &ModelLayout,
     config: &ModelConfig,
-) -> Result<PirlsResult, EstimationError> {
-    // No test-specific hacks - the properly implemented algorithm should handle all cases
-    // Stage: Convert rho (log smoothing parameters) to lambda (actual smoothing parameters)
+) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
 
-    log::info!(
-        "Starting P-IRLS fitting with {} smoothing parameters",
-        lambdas.len()
-    );
-    println!(
-        "P-IRLS input dimensions: x: {:?}, y: {}, rs_original: {}",
-        x.shape(),
-        y.len(),
-        rs_original.len()
-    );
-    if !lambdas.is_empty() {
-        println!("Lambdas: {:?}", lambdas);
-    }
-
-    // Stage: Obtain the lambda-independent balanced penalty root for stable rank detection.
-    // Callers can supply a cached copy (preferred) to avoid redundant decompositions.
-    log::info!("Preparing lambda-independent balanced penalty root for stable rank detection");
+    let link_function = match config.model_family {
+        ModelFamily::Gam(link) => link,
+        _ => {
+            return Err(EstimationError::InvalidSpecification(
+                "fit_model_for_fixed_rho expects a GAM model".to_string(),
+            ));
+        }
+    };
 
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
-    let p = x.ncols();
 
     let mut eb_storage: Option<Array2<f64>> = None;
     let eb: &Array2<f64> = if let Some(precomputed) = balanced_penalty_root {
@@ -693,814 +831,106 @@ pub fn fit_model_for_fixed_rho<'a>(
         for rs in rs_original {
             s_list_full.push(rs.t().dot(rs));
         }
-        eb_storage = Some(create_balanced_penalty_root(&s_list_full, p)?);
+        eb_storage = Some(create_balanced_penalty_root(
+            &s_list_full,
+            layout.total_coeffs,
+        )?);
         eb_storage.as_ref().unwrap()
     };
 
-    println!(
-        "[Balanced Penalty] Using lambda-independent eb with shape: {:?}",
-        eb.shape()
-    );
-
-    // Stage: Perform the stable reparameterization exactly once before the P-IRLS loop
-    log::info!("Computing stable reparameterization for numerical stability");
-    println!("[Reparam] ==> Entering stable_reparameterization...");
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
-    println!("[Reparam] <== Exited stable_reparameterization successfully.");
-
-    println!(
-        "[Reparam Result Check] qs_sum: {:.4e}, s_transformed_sum: {:.4e}, log_det_s: {:.4e}",
-        reparam_result.qs.sum(),
-        reparam_result.s_transformed.sum(),
-        reparam_result.log_det
-    );
-
-    println!(
-        "[Matrix Multiply] ==> Performing x.dot(qs) | x.shape: {:?}, qs.shape: {:?}",
-        x.shape(),
-        reparam_result.qs.shape()
-    );
-
-    // Stage: Transform the design matrix into the stable basis
     let x_transformed = x.dot(&reparam_result.qs);
 
-    println!(
-        "[Matrix Multiply] <== x.dot(qs) complete. x_transformed_sum: {:.4e}",
-        x_transformed.sum()
-    );
-
-    // Transform eb to the same stable basis
-    // As per mgcv (Eb <- Eb%*%T), transform eb into the same stable basis as x_transformed.
-    // The transformation for a penalty root R (shape k x p) is R_new = R * Q.
-    // Here, eb is `rank x p` and qs is `p x p`, so the result is `rank x p`.
-    let eb_transformed = eb.dot(&reparam_result.qs);
-    println!(
-        "[Basis Fix] Transformed eb from original to stable basis. eb_transformed_sum: {:.4e}",
-        eb_transformed.sum()
-    );
-
-    // Stage: Extract penalty matrices using the truly lambda-independent eb
-    // Note: eb is computed from unweighted penalties and never changes with lambda
-    let s_transformed = &reparam_result.s_transformed;
-    // eb is already computed above as lambda-INDEPENDENT
-    let e_transformed = &reparam_result.e_transformed; // Lambda-DEPENDENT for penalty application
-
-    // Suggestion #4/#12: Precompute S = EᵀE once per rho and cache Xᵀ
-    let s_from_e_precomputed = e_transformed.t().dot(e_transformed);
-    let x_transformed_t = x_transformed.t().to_owned();
-
-    // Stage: Initialize P-IRLS state variables in the transformed basis
-    let mut beta_transformed = Array1::zeros(layout.total_coeffs);
-
-    let mut logit_working_model = if config.link_function() == LinkFunction::Logit {
-        Some(GamLogitWorkingModel::new(
-            x_transformed.view(),
-            offset.view(),
-            y,
-            prior_weights,
-            s_transformed,
-        ))
-    } else {
-        None
-    };
-
-    let (mut eta, mut mu, mut weights, mut z, mut last_deviance) = match config.link_function() {
-        LinkFunction::Logit => {
-            let state = logit_working_model
-                .as_mut()
-                .expect("logit working model")
-                .update(&beta_transformed)?;
-            (
-                state.eta.clone(),
-                logit_working_model.as_ref().unwrap().mu().to_owned(),
-                logit_working_model.as_ref().unwrap().weights().to_owned(),
-                logit_working_model
-                    .as_ref()
-                    .unwrap()
-                    .working_response()
-                    .to_owned(),
-                state.deviance,
-            )
-        }
-        LinkFunction::Identity => {
-            let mut eta = offset.to_owned();
-            eta += &x_transformed.dot(&beta_transformed);
-            let (mu, weights, z) =
-                update_glm_vectors(y, &eta, config.link_function(), prior_weights);
-            let dev = calculate_deviance(y, &mu, config.link_function(), prior_weights);
-            (eta, mu, weights, z, dev)
-        }
-    };
-    let mut max_abs_eta = 0.0;
-    let mut last_iter = 0;
-
-    // Preallocate workspace once (Suggestion #6)
-    let mut workspace = PirlsWorkspace::new(
+    let eb_rows = eb.nrows();
+    let e_rows = reparam_result.e_transformed.nrows();
+    let workspace = PirlsWorkspace::new(
         x_transformed.nrows(),
         x_transformed.ncols(),
-        eb_transformed.nrows(),
-        e_transformed.nrows(),
+        eb_rows,
+        e_rows,
     );
 
-    // Save the most recent stable result to avoid redundant computation
-    let mut last_stable_result: Option<(StablePLSResult, usize)> = None;
-    let mut last_mu_solve = mu.clone();
-
-    // Validate dimensions
-    assert_eq!(
-        x_transformed.ncols(),
-        layout.total_coeffs,
-        "X_transformed matrix columns must match total coefficients"
+    let mut working_model = GamWorkingModel::new(
+        x_transformed,
+        x,
+        offset,
+        y,
+        prior_weights,
+        reparam_result.s_transformed.clone(),
+        reparam_result.e_transformed.clone(),
+        workspace,
+        link_function,
+        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
     );
 
-    // Add minimum iterations based on link function
-    let min_iterations = match config.link_function() {
-        LinkFunction::Logit => 3, // Ensure at least some refinement for non-Gaussian
-        LinkFunction::Identity => 1, // Gaussian may converge faster
+    let options = WorkingModelPirlsOptions {
+        max_iterations: config.max_iterations,
+        convergence_tolerance: config.convergence_tolerance,
+        max_step_halving: 30,
+        min_step_size: 1e-6,
     };
 
-    log::info!("Reparameterization complete. Starting P-IRLS loop in transformed basis...");
-
-    // Track the last linear system weights/working response used in the solve
-    let mut last_weights_solve = weights.clone();
-    let mut last_z_solve = z.clone();
-    // Track coefficient norm growth to detect divergence in unpenalized logistic fits
-    let mut prev_beta_norm: f64 = 0.0;
-
-    let mut last_deviance_change = f64::NAN;
-    let mut last_penalized_deviance = f64::NAN;
-    let mut last_gradient_norm = f64::NAN;
-    let mut last_gradient_tol = f64::NAN;
-    let mut last_step_halving = 0usize;
-    let firth_active =
-        config.firth_bias_reduction && matches!(config.link_function(), LinkFunction::Logit);
-    let mut firth_log_det_value: Option<f64> = None;
-
-    for iter in 1..=config.max_iterations {
-        last_iter = iter; // Update on every iteration
-
-        // --- Store the state from the START of the iteration ---
-        let beta_current = beta_transformed.clone();
-        let deviance_current = last_deviance;
-
-        last_mu_solve = mu.clone();
-
-        // Calculate the penalty for the current beta using the transformed total penalty matrix
-        let penalty_current = beta_current.dot(&s_transformed.dot(&beta_current));
-
-        // This is the true objective function value at the start of the iteration
-        let penalized_deviance_current = deviance_current + penalty_current;
-
-        #[cfg(test)]
-        record_penalized_deviance(penalized_deviance_current);
-
-        // Check for non-finite values - this safety check is kept from modern version
-        if !eta.iter().all(|x| x.is_finite())
-            || !mu.iter().all(|x| x.is_finite())
-            || !weights.iter().all(|x| x.is_finite())
-            || !z.iter().all(|x| x.is_finite())
-        {
-            return Err(EstimationError::PirlsDidNotConverge {
-                max_iterations: config.max_iterations,
-                last_change: f64::NAN,
-            });
-        }
-
-        if firth_active {
-            let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
-                x_transformed.view(),
-                x.view(),
-                weights.view(),
-                s_transformed,
-                &mut workspace,
-            )?;
-            firth_log_det_value = Some(half_log_det);
-
-            for i in 0..z.len() {
-                let wi = weights[i];
-                if wi > 0.0 {
-                    let adjustment = hat_diag[i] * (0.5 - mu[i]);
-                    z[i] += adjustment / wi;
-                }
-            }
-        }
-
-        // CRITICAL: Cache the weights and working response actually used in the WLS solve
-        let weights_solve = weights.clone();
-        let z_solve = z.clone();
-        last_weights_solve = weights_solve.clone();
-        last_z_solve = z_solve.clone();
-
-        // The penalized least squares solver computes coefficient updates using a rank-revealing
-        // QR decomposition with careful handling of potential rank deficiencies in the weighted
-        // design matrix. It applies 5-stage numerical stability techniques following Wood (2011).
-        let penalty_info = if !lambdas.is_empty() {
-            format!(" | λ={:.4e}", lambdas[0])
-        } else {
-            String::new()
-        };
-
-        // Use our robust solver that handles rank deficiency correctly
-        // Note: Pass both penalty matrices for proper separation of concerns
-        let stable_result = solve_penalized_least_squares(
-            x_transformed.view(), // Pass transformed x
-            z.view(),
-            weights.view(),
-            offset.view(),
-            &eb_transformed, // Lambda-INDEPENDENT balanced penalty root for rank detection (NOW IN STABLE BASIS)
-            e_transformed,   // Lambda-DEPENDENT penalty root for penalty application
-            &s_from_e_precomputed, // Precomputed S = EᵀE
-            &mut workspace,  // Preallocated buffers (Suggestion #6)
-            y.view(),        // Pass original response
-            config.link_function(), // Pass link function for correct scale calculation
-        )?;
-
-        // Save the most recent stable result to avoid redundant computation at the end
-        last_stable_result = Some(stable_result.clone());
-
-        // Capture the EDF from the solver for correct scale calculation
-        let edf_from_solver = stable_result.0.edf;
-
-        let beta_trial_initial = stable_result.0.beta.clone();
-        let mut step_halving_count = 0;
-        let mut last_halving_change: f64 = f64::NAN;
-        const MAX_STEP_HALVING: usize = 30;
-
-        // Use a robust loop for step-halving that prioritizes numerical stability.
-        // Reuse XΔβ step direction in step-halving
-        let beta_update = &beta_trial_initial - &beta_current; // Δβ
-        // Reuse workspace for XΔβ
-        workspace.delta_eta = x_transformed.dot(&beta_update);
-        // Quadratic form reuse for penalty(β + αΔ)
-        let s_beta_current = s_transformed.dot(&beta_current);
-        let penalty_current_cached = beta_current.dot(&s_beta_current);
-        let s_delta = s_transformed.dot(&beta_update);
-        let cross = s_beta_current.dot(&beta_update);
-        let quad = beta_update.dot(&s_delta);
-        let mut alpha = 1.0;
-        loop {
-            // Candidate eta for current α (avoid forming beta_candidate until accept)
-            let eta_trial = &eta + &(alpha * &workspace.delta_eta);
-            let mu_trial = mu_only(&eta_trial, config.link_function());
-            let deviance_trial =
-                calculate_deviance(y, &mu_trial, config.link_function(), prior_weights);
-
-            // First, check if the trial step resulted in a numerically valid state.
-            // This is the most important check.
-            let is_numerically_valid = eta_trial.iter().all(|v| v.is_finite())
-                && mu_trial.iter().all(|v| v.is_finite())
-                && deviance_trial.is_finite();
-
-            if is_numerically_valid {
-                // penalty(β + αΔ) = penalty(β) + 2α (Sβ·Δ) + α² (Δ·SΔ)
-                let penalty_trial =
-                    penalty_current_cached + 2.0 * alpha * cross + alpha * alpha * quad;
-                let penalized_deviance_trial = deviance_trial + penalty_trial;
-                // Track the last attempted change for diagnostics
-                last_halving_change = (penalized_deviance_trial - penalized_deviance_current).abs();
-
-                // If it's valid, NOW check if the penalized deviance has decreased.
-                // Use epsilon tolerance to handle numerical precision issues in Gaussian models
-                let accept_step = if firth_active {
-                    true
-                } else {
-                    penalized_deviance_trial <= penalized_deviance_current * (1.0 + 1e-12)
-                        || (penalized_deviance_current - penalized_deviance_trial).abs() < 1e-12
-                };
-
-                if accept_step {
-                    // SUCCESS: The step is valid and improves the fit.
-                    // Update the main state variables and exit the step-halving loop.
-                    beta_transformed = &beta_current + &(alpha * &beta_update);
-
-                    match config.link_function() {
-                        LinkFunction::Logit => {
-                            let state = logit_working_model
-                                .as_mut()
-                                .expect("logit working model")
-                                .update(&beta_transformed)?;
-                            eta = state.eta.clone();
-                            mu = logit_working_model.as_ref().unwrap().mu().to_owned();
-                            weights = logit_working_model.as_ref().unwrap().weights().to_owned();
-                            z = logit_working_model
-                                .as_ref()
-                                .unwrap()
-                                .working_response()
-                                .to_owned();
-                            last_deviance = state.deviance;
-                        }
-                        LinkFunction::Identity => {
-                            eta = eta_trial;
-                            last_deviance = deviance_trial;
-                            (mu, weights, z) =
-                                update_glm_vectors(y, &eta, config.link_function(), prior_weights);
-                        }
-                    }
-
-                    if step_halving_count > 0 {
-                        println!(
-                            "Step halving successful after {} attempts",
-                            step_halving_count
-                        );
-                    }
-                    break; // Exit the loop
-                }
-            }
-            // If we reach here, it's because the step was either invalid or increased the deviance.
-            step_halving_count += 1;
-            if step_halving_count >= MAX_STEP_HALVING {
-                log::warn!(
-                    "P-IRLS failed to find a valid step after {} halvings. This often indicates model instability.",
-                    MAX_STEP_HALVING
-                );
-                return Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: config.max_iterations,
-                    last_change: if last_halving_change.is_finite() {
-                        last_halving_change
-                    } else {
-                        penalized_deviance_current.abs()
-                    },
-                });
-            }
-            // Halve α and try again
-            alpha *= 0.5;
-        }
-
-        // Monitor maximum eta value (to detect separation)
-        max_abs_eta = eta
-            .iter()
-            .map(|v| v.abs())
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        // Check for separation - this is a modern feature we'll keep
-        const ETA_STABILITY_THRESHOLD: f64 = 100.0;
-        if max_abs_eta > ETA_STABILITY_THRESHOLD && config.link_function() == LinkFunction::Logit {
-            log::warn!(
-                "P-IRLS instability detected at iteration {iter}: max|eta| = {max_abs_eta:.2e}. Likely perfect separation."
-            );
-
-            // Return with instability status using the saved stable result
-            let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
-                // Use the Hessian from the last stable solve
-                result.penalized_hessian.clone()
-            } else {
-                // This should never happen, but as a fallback, compute the Hessian
-                log::warn!("No stable result saved, computing Hessian as fallback");
-                let (result, rank) = solve_penalized_least_squares(
-                    x_transformed.view(),
-                    z.view(),
-                    weights.view(),
-                    offset.view(),
-                    &eb_transformed,
-                    e_transformed,
-                    &s_from_e_precomputed,
-                    &mut workspace,
-                    y.view(),
-                    config.link_function(),
-                )?;
-                log::trace!("Fallback solve rank: {}", rank);
-                result.penalized_hessian
-            };
-
-            // Calculate the stable penalty term using the transformed quantities
-            let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-
-            // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
-            let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-            ensure_positive_definite(&mut stabilized_hessian_transformed)?;
-
-            // Populate the new PirlsResult struct with stable, transformed quantities
-            println!(
-                "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
-                iter, max_abs_eta
-            );
-            return Ok(PirlsResult {
-                beta_transformed: beta_transformed.clone(),
-                penalized_hessian_transformed,
-                stabilized_hessian_transformed,
-                deviance: last_deviance,
-                edf: if let Some((ref result, _)) = last_stable_result {
-                    result.edf
-                } else {
-                    0.0
-                },
-                stable_penalty_term,
-                firth_log_det: firth_log_det_value,
-                final_weights: weights.clone(),
-                final_mu: mu.clone(),
-                solve_weights: last_weights_solve.clone(),
-                solve_working_response: last_z_solve.clone(),
-                solve_mu: last_mu_solve.clone(),
-                status: PirlsStatus::Unstable,
-                iteration: iter,
-                max_abs_eta,
-                reparam_result: reparam_result.clone(),
-                x_transformed: x_transformed.clone(),
-            });
-        }
-
-        // Additional robust separation checks for unpenalized logistic models
-        let no_penalty = eb_transformed.nrows() == 0 && e_transformed.nrows() == 0;
-        if config.link_function() == LinkFunction::Logit && no_penalty {
-            let eta_soft_threshold = 30.0; // softer threshold than 100 for unpenalized cases
-            let eps_sat = 1e-3;
-            let sat_frac = {
-                let n = mu.len() as f64;
-                let k = mu
-                    .iter()
-                    .filter(|&&m| m <= eps_sat || m >= 1.0 - eps_sat)
-                    .count() as f64;
-                if n > 0.0 { k / n } else { 0.0 }
-            };
-            // Beta divergence: large absolute norm or rapid growth
-            let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
-            let beta_grew_fast = prev_beta_norm > 0.0 && beta_norm > prev_beta_norm * 2.5;
-            let beta_too_large = beta_norm > 1e3;
-            let eta_too_large = max_abs_eta > eta_soft_threshold;
-            let probs_saturated = sat_frac > 0.95;
-            // Extremely low deviance per sample indicates near-perfect separation
-            let n_samples = y.len() as f64;
-            let dev_per_sample = if n_samples > 0.0 {
-                last_deviance / n_samples
-            } else {
-                last_deviance
-            };
-            let dev_tiny = dev_per_sample < 1e-2; // e.g., < 0.01 per sample
-
-            // Direct separation-by-order check: all positives have higher η than all negatives
-            let mut min_eta_pos = f64::INFINITY;
-            let mut max_eta_neg = f64::NEG_INFINITY;
-            let mut has_pos = false;
-            let mut has_neg = false;
-            for (i, &yi) in y.iter().enumerate() {
-                if yi > 0.5 {
-                    has_pos = true;
-                    let v = eta[i];
-                    if v < min_eta_pos {
-                        min_eta_pos = v;
-                    }
-                } else {
-                    has_neg = true;
-                    let v = eta[i];
-                    if v > max_eta_neg {
-                        max_eta_neg = v;
-                    }
-                }
-            }
-            let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
-
-            if eta_too_large
-                || probs_saturated
-                || dev_tiny
-                || order_separated
-                || (iter >= 3 && (beta_grew_fast || beta_too_large))
-            {
-                log::warn!(
-                    "P-IRLS instability (unpenalized Logit) at iter {}: max|eta|={:.2e}, sat_frac={:.3}, dev/n={:.3e}, order_sep={}, ||beta||={:.2e} (prev {:.2e})",
-                    iter,
-                    max_abs_eta,
-                    sat_frac,
-                    dev_per_sample,
-                    order_separated,
-                    beta_norm,
-                    prev_beta_norm
-                );
-
-                let penalized_hessian_transformed =
-                    if let Some((ref result, _)) = last_stable_result {
-                        result.penalized_hessian.clone()
-                    } else {
-                        log::warn!("No stable result saved, computing Hessian as fallback");
-                        let (result, rank) = solve_penalized_least_squares(
-                            x_transformed.view(),
-                            z.view(),
-                            weights.view(),
-                            offset.view(),
-                            &eb_transformed,
-                            e_transformed,
-                            &s_from_e_precomputed,
-                            &mut workspace,
-                            y.view(),
-                            config.link_function(),
-                        )?;
-                        log::trace!("Fallback solve rank: {}", rank);
-                        result.penalized_hessian
-                    };
-                let stable_penalty_term =
-                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-                let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-                ensure_positive_definite(&mut stabilized_hessian_transformed)?;
-                println!(
-                    "[P-IRLS] Terminated at iteration {} due to instability | max|eta|: {:.3e}",
-                    iter, max_abs_eta
-                );
-                let _ = logit_working_model.take();
-                let _ = logit_working_model.take();
-                return Ok(PirlsResult {
-                    beta_transformed: beta_transformed.clone(),
-                    penalized_hessian_transformed,
-                    stabilized_hessian_transformed,
-                    deviance: last_deviance,
-                    edf: if let Some((ref result, _)) = last_stable_result {
-                        result.edf
-                    } else {
-                        0.0
-                    },
-                    stable_penalty_term,
-                    firth_log_det: firth_log_det_value,
-                    final_weights: weights.clone(),
-                    final_mu: mu.clone(),
-                    solve_weights: last_weights_solve.clone(),
-                    solve_working_response: last_z_solve.clone(),
-                    solve_mu: last_mu_solve.clone(),
-                    status: PirlsStatus::Unstable,
-                    iteration: iter,
-                    max_abs_eta,
-                    reparam_result: reparam_result.clone(),
-                    x_transformed: x_transformed.clone(),
-                });
-            }
-            // Update previous beta norm for next iteration
-            prev_beta_norm = beta_norm;
-        }
-
-        // Calculate the penalized deviance using the transformed penalty matrix
-        let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-        let penalized_deviance_new = last_deviance + penalty_new;
-
-        // Set scale parameter based on link function
-        let scale = match config.link_function() {
-            LinkFunction::Logit => 1.0,
-            LinkFunction::Identity => {
-                // For Gaussian, use WEIGHTED residual variance consistent with objective
-                let residuals = &y.view() - &mu;
-                let weighted_rss: f64 = prior_weights
-                    .iter()
-                    .zip(residuals.iter())
-                    .map(|(&w, &r)| w * r * r)
-                    .sum();
-                // Use the EDF from the solver: df = n - edf
-                let df = (x_transformed.nrows() as f64 - edf_from_solver).max(1.0);
-                weighted_rss / df
-            }
-        };
-
-        // This scaling factor is the key to mgcv's numerical stability.
-        // It prevents the tolerance from collapsing when the deviance is small.
-        let convergence_scale = scale.abs() + penalized_deviance_new.abs();
-        let deviance_change_scaled = (penalized_deviance_current - penalized_deviance_new).abs();
-
-        // Log iteration info
-        let step_halving_info = if step_halving_count > 0 {
-            format!(" | Step Halving: {} attempts", step_halving_count)
-        } else {
-            String::new()
-        };
-        last_deviance_change = deviance_change_scaled;
-        last_penalized_deviance = penalized_deviance_new;
-        last_step_halving = step_halving_count;
-
-        // First convergence check: has the change in deviance become negligible relative to the scale of the problem?
-        if deviance_change_scaled < config.convergence_tolerance * (0.1 + convergence_scale) {
-            // Check gradient with the SAME (W, z) used in the last WLS solve
-            // The solver solved: X'W_solve(Xβ - z_solve) + Sβ = 0
-            // So we must check stationarity with respect to those same W_solve, z_solve
-
-            // Use the cached weights and working response from the solve
-            // Suggestion #3: Compute gradient without building WX and WZ
-            // grad_data_part = Xᵀ W (Xβ - z); reuse workspace buffers
-            let tmp_eta = {
-                let mut eta = offset.to_owned();
-                eta += &x_transformed.dot(&beta_transformed);
-                eta
-            };
-            workspace.working_residual = &tmp_eta - &z_solve; // (offset + Xβ) - z
-            workspace.weighted_residual = &weights_solve * &workspace.working_residual; // W (Xβ - z)
-            let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
-            let grad_penalty_part = s_transformed.dot(&beta_transformed);
-            // Drop the 2x factor to match the objective we actually minimize
-            let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
-
-            let gradient_norm = gradient_wrt_solve
-                .iter()
-                .map(|&x| x.abs())
-                .fold(0.0, f64::max);
-
-            // This is the ROBUST gradient tolerance from mgcv. It's scaled by the same factor
-            // and uses the user's epsilon, not machine epsilon.
-            let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
-
-            last_gradient_norm = gradient_norm;
-            last_gradient_tol = gradient_tol;
-
-            if gradient_norm < gradient_tol && iter >= min_iterations {
-                // SUCCESS: Both deviance and gradient have converged.
-                log::info!(
-                    "P-IRLS Converged with deviance change {:.2e} and gradient norm {:.2e}.",
-                    deviance_change_scaled,
-                    gradient_norm
-                );
-
-                let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
-                println!(
-                    "[P-IRLS] Converged in {} iterations | Δ: {:.3e} | ∥grad∥∞: {:.3e} | β-norm: {:.3e} | Dev: {:.6e}{}{}",
-                    iter,
-                    deviance_change_scaled,
-                    gradient_norm,
-                    beta_norm,
-                    penalized_deviance_new,
-                    step_halving_info,
-                    penalty_info
-                );
-
-                let penalized_hessian_transformed =
-                    if let Some((ref result, _)) = last_stable_result {
-                        result.penalized_hessian.clone()
-                    } else {
-                        let (result, _) = solve_penalized_least_squares(
-                            x_transformed.view(),
-                            z.view(),
-                            weights.view(),
-                            offset.view(),
-                            &eb_transformed,
-                            e_transformed,
-                            &s_from_e_precomputed,
-                            &mut workspace,
-                            y.view(),
-                            config.link_function(),
-                        )?;
-                        result.penalized_hessian
-                    };
-
-                // Calculate the stable penalty term using the transformed quantities
-                let stable_penalty_term =
-                    beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-
-                // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
-                let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-                ensure_positive_definite(&mut stabilized_hessian_transformed)?;
-
-                // Populate the new PirlsResult struct with stable, transformed quantities
-                let _ = logit_working_model.take();
-                return Ok(PirlsResult {
-                    beta_transformed: beta_transformed.clone(),
-                    penalized_hessian_transformed,
-                    stabilized_hessian_transformed,
-                    deviance: last_deviance,
-                    edf: edf_from_solver,
-                    stable_penalty_term,
-                    firth_log_det: firth_log_det_value,
-                    final_weights: weights.clone(),
-                    final_mu: mu.clone(),
-                    solve_weights: last_weights_solve.clone(),
-                    solve_working_response: last_z_solve.clone(),
-                    solve_mu: last_mu_solve.clone(),
-                    status: PirlsStatus::Converged,
-                    iteration: iter,
-                    max_abs_eta,
-                    reparam_result: reparam_result.clone(),
-                    x_transformed: x_transformed.clone(),
-                });
-            }
-        }
-    }
-
-    // If we reach here, we've hit max iterations without converging
-    log::warn!("P-IRLS FAILED to converge after {} iterations.", last_iter);
-
-    let beta_norm = beta_transformed.dot(&beta_transformed).sqrt();
-    let grad_display = if last_gradient_norm.is_finite() {
-        format!("{:.3e}", last_gradient_norm)
-    } else {
-        "n/a".to_string()
-    };
-    let tol_display = if last_gradient_tol.is_finite() {
-        format!("{:.3e}", last_gradient_tol)
-    } else {
-        "n/a".to_string()
-    };
-    let step_info = if last_step_halving > 0 {
-        format!(" | Step Halving: {}", last_step_halving)
-    } else {
-        String::new()
-    };
-    println!(
-        "[P-IRLS] Exited after {} iterations | Δ: {:.3e} | ∥grad∥∞: {} | tol: {} | β-norm: {:.3e} | Dev: {:.6e}{}",
-        last_iter,
-        last_deviance_change,
-        grad_display,
-        tol_display,
-        beta_norm,
-        last_penalized_deviance,
-        step_info
-    );
-
-    // Before returning, perform a final stationarity check using the SAME (W, z) as the last solve.
-    // If the gradient is small, we can report a valid stalled minimum for the outer loop to accept.
-
-    // Use the saved stable result to avoid redundant computation
-    let penalized_hessian_transformed = if let Some((ref result, _)) = last_stable_result {
-        // Use the Hessian from the last stable solve
-        result.penalized_hessian.clone()
-    } else {
-        // This should never happen, but as a fallback, compute the Hessian
-        log::warn!("No stable result saved, computing Hessian as fallback");
-        let (result, rank) = solve_penalized_least_squares(
-            x_transformed.view(),
-            z.view(),
-            weights.view(),
-            offset.view(),
-            &eb_transformed,
-            e_transformed,
-            &s_from_e_precomputed,
-            &mut workspace,
-            y.view(),
-            config.link_function(),
-        )?;
-        log::trace!("Final solve rank: {}", rank);
-        result.penalized_hessian
+    let mut iteration_logger = |info: &WorkingModelIterationInfo| {
+        log::debug!(
+            "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
+            info.iteration,
+            info.deviance,
+            info.gradient_norm,
+            info.step_size,
+            info.step_halving
+        );
     };
 
-    // Calculate the stable penalty term using the transformed quantities
-    let stable_penalty_term = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
+    let working_summary = run_working_model_pirls(
+        &mut working_model,
+        Array1::<f64>::zeros(layout.total_coeffs),
+        &options,
+        &mut iteration_logger,
+    )?;
 
-    // Compute a final gradient check w.r.t the last W_solve and z_solve
-    let x_transformed_t = x_transformed.t().to_owned();
-    let tmp_eta = {
-        let mut eta = offset.to_owned();
-        eta += &x_transformed.dot(&beta_transformed);
-        eta
-    };
-    workspace.working_residual = &tmp_eta - &last_z_solve; // Xβ - z_solve
-    workspace.weighted_residual = &last_weights_solve * &workspace.working_residual; // W_solve (Xβ - z_solve)
-    let grad_data_part = x_transformed_t.dot(&workspace.weighted_residual);
-    let grad_penalty_part = s_transformed.dot(&beta_transformed);
-    let gradient_wrt_solve = &grad_data_part + &grad_penalty_part;
-    let gradient_norm = gradient_wrt_solve
-        .iter()
-        .map(|&v| v.abs())
-        .fold(0.0, f64::max);
+    let final_state = working_model.into_final_state();
+    let GamModelFinalState {
+        x_transformed,
+        e_transformed,
+        final_mu,
+        final_weights,
+        final_z,
+        firth_log_det,
+        penalty_term,
+    } = final_state;
 
-    // Build a scale-consistent tolerance similar to the inner loop
-    let penalty_new = beta_transformed.dot(&s_transformed.dot(&beta_transformed));
-    let penalized_deviance_new = last_deviance + penalty_new;
-    let scale_term = match config.link_function() {
-        LinkFunction::Logit => 1.0,
-        LinkFunction::Identity => {
-            let residuals = &y.view() - &mu;
-            let weighted_rss: f64 = prior_weights
-                .iter()
-                .zip(residuals.iter())
-                .map(|(&w, &r)| w * r * r)
-                .sum();
-            // EDF from last stable result if available
-            let edf_here = if let Some((ref result, _)) = last_stable_result {
-                result.edf
-            } else {
-                0.0
-            };
-            let df = (x_transformed.nrows() as f64 - edf_here).max(1.0);
-            weighted_rss / df
-        }
-    };
-    let convergence_scale = scale_term.abs() + penalized_deviance_new.abs();
-    let gradient_tol = config.convergence_tolerance * (0.1 + convergence_scale);
-
-    // CRITICAL: Create single stabilized Hessian for consistent cost/gradient computation
+    let mut penalized_hessian_transformed = working_summary.state.hessian.clone();
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
     ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
-    // If stationarity is met, return a stalled-but-valid minimum for acceptance
-    let final_status = if gradient_norm < gradient_tol {
-        PirlsStatus::StalledAtValidMinimum
-    } else {
-        PirlsStatus::MaxIterationsReached
-    };
+    let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
+    if !edf.is_finite() || edf.is_nan() {
+        let p = penalized_hessian_transformed.ncols() as f64;
+        let r = e_transformed.nrows() as f64;
+        edf = (p - r).max(0.0);
+    }
 
-    let _ = logit_working_model.take();
-    Ok(PirlsResult {
-        beta_transformed,
+    let pirls_result = PirlsResult {
+        beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
-        deviance: last_deviance,
-        edf: if let Some((ref result, _)) = last_stable_result {
-            result.edf
-        } else {
-            0.0
-        },
-        stable_penalty_term,
-        firth_log_det: firth_log_det_value,
-        final_weights: weights.clone(),
-        final_mu: mu.clone(),
-        solve_weights: last_weights_solve.clone(),
-        solve_working_response: last_z_solve.clone(),
-        solve_mu: last_mu_solve.clone(),
-        status: final_status,
-        iteration: last_iter,
-        max_abs_eta,
+        deviance: working_summary.state.deviance,
+        edf,
+        stable_penalty_term: penalty_term,
+        firth_log_det,
+        final_weights: final_weights.clone(),
+        final_mu: final_mu.clone(),
+        solve_weights: final_weights.clone(),
+        solve_working_response: final_z.clone(),
+        solve_mu: final_mu.clone(),
+        status: working_summary.status.clone(),
+        iteration: working_summary.iterations,
+        max_abs_eta: working_summary.max_abs_eta,
         reparam_result,
         x_transformed,
-    })
+    };
+
+    Ok((pirls_result, working_summary))
 }
 
 /// Port of the `R_cond` function from mgcv, which implements the CMSW
@@ -3087,7 +2517,7 @@ mod tests {
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         let offset = Array1::<f64>::zeros(data.y.len());
-        let pirls_result = fit_model_for_fixed_rho(
+        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),
@@ -3529,7 +2959,7 @@ mod tests {
 
         // Call the function with first rho vector
         let offset = Array1::<f64>::zeros(n_samples);
-        let result1 = super::fit_model_for_fixed_rho(
+        let (result1, _pirls_working1) = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
             x.view(),
             offset.view(),
@@ -3543,7 +2973,7 @@ mod tests {
         .expect("First fit should converge for this stable test case");
 
         // Call the function with second rho vector
-        let result2 = super::fit_model_for_fixed_rho(
+        let (result2, _pirls_working2) = super::fit_model_for_fixed_rho(
             rho_vec2.view(),
             x.view(),
             offset.view(),
@@ -3657,7 +3087,7 @@ mod tests {
 
         // === PHASE 5: Execute the target function ===
         let offset = Array1::<f64>::zeros(data.y.len());
-        let pirls_result = fit_model_for_fixed_rho(
+        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),
@@ -3789,7 +3219,7 @@ mod tests {
 
         // === Execute P-IRLS ===
         let offset = Array1::<f64>::zeros(data.y.len());
-        let pirls_result = fit_model_for_fixed_rho(
+        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),

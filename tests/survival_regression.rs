@@ -33,8 +33,8 @@ impl GeneratedReference {
 
         let raw_json = std::fs::read_to_string(&json_path)
             .map_err(|e| format!("read trusted reference: {e}"))?;
-        let fixture: TrustedReferenceFixture = serde_json::from_str(&raw_json)
-            .map_err(|e| format!("parse trusted reference: {e}"))?;
+        let fixture: TrustedReferenceFixture =
+            serde_json::from_str(&raw_json).map_err(|e| format!("parse trusted reference: {e}"))?;
 
         Ok(Self {
             reference: TrustedReference::from_fixture(fixture),
@@ -93,8 +93,8 @@ struct TrustedReferenceFixture {
 impl TrustedReference {
     fn load() -> &'static Self {
         static REFERENCE: OnceLock<GeneratedReference> = OnceLock::new();
-        let generated = REFERENCE
-            .get_or_init(|| GeneratedReference::new().expect("trusted reference"));
+        let generated =
+            REFERENCE.get_or_init(|| GeneratedReference::new().expect("trusted reference"));
         debug_assert!(generated.temp_dir.path().exists());
         &generated.reference
     }
