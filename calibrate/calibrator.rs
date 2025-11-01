@@ -2305,7 +2305,7 @@ mod tests {
         let cfg = ModelConfig::external(LinkFunction::Logit, 1e-3, 75, firth_active);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
-        let (pirls, _pirls_working) = pirls::fit_model_for_fixed_rho(
+        let (pirls, _) = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
             x,
             offset,
@@ -2367,7 +2367,7 @@ mod tests {
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
-        let (pirls, _pirls_working) = pirls::fit_model_for_fixed_rho(
+        let (pirls, _) = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
             x,
             offset,
@@ -2824,7 +2824,7 @@ mod tests {
         let layout = ModelLayout::external(p, 0);
         let cfg = ModelConfig::external(link, 1e-10, 100, matches!(link, LinkFunction::Logit));
 
-        let (pirls_result, _pirls_working) = pirls::fit_model_for_fixed_rho(
+        let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
             rho.view(),
             x.view(),
             offset.view(),
@@ -4030,7 +4030,7 @@ mod tests {
         let rho_low = Array1::from_elem(penalties_with_ridge.len(), -15.0);
         let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
 
-        let (fit_low, _pirls_working_low) = pirls::fit_model_for_fixed_rho(
+        let (fit_low, _) = pirls::fit_model_for_fixed_rho(
             rho_low.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),
@@ -4042,7 +4042,7 @@ mod tests {
             &cfg,
         )
         .expect("fixed-rho PIRLS (low)");
-        let (fit_high, _pirls_working_high) = pirls::fit_model_for_fixed_rho(
+        let (fit_high, _) = pirls::fit_model_for_fixed_rho(
             rho_high.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),

@@ -277,7 +277,7 @@ impl<'a> GamWorkingModel<'a> {
     fn new(
         x_transformed: Array2<f64>,
         x_original: ArrayView2<'a, f64>,
-        offset: ArrayView1<'a, f64>,
+        offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
         prior_weights: ArrayView1<'a, f64>,
         s_transformed: Array2<f64>,
@@ -324,7 +324,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut eta = self.offset.clone();
         eta += &self.x_transformed.dot(beta);
 
-        let (mut mu, mut weights, mut z) =
+        let (mu, weights, mut z) =
             update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
 
         if self.firth_bias_reduction {
@@ -801,7 +801,7 @@ pub struct PirlsResult {
 
 pub fn fit_model_for_fixed_rho<'a>(
     rho_vec: ArrayView1<f64>,
-    x: ArrayView2<f64>,
+    x: ArrayView2<'a, f64>,
     offset: ArrayView1<f64>,
     y: ArrayView1<'a, f64>,
     prior_weights: ArrayView1<'a, f64>,
@@ -899,7 +899,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         penalty_term,
     } = final_state;
 
-    let mut penalized_hessian_transformed = working_summary.state.hessian.clone();
+    let penalized_hessian_transformed = working_summary.state.hessian.clone();
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
     ensure_positive_definite(&mut stabilized_hessian_transformed)?;
 
@@ -1243,19 +1243,6 @@ pub fn update_glm_vectors<'a>(
 }
 
 #[inline]
-fn mu_only(eta: &Array1<f64>, link: LinkFunction) -> Array1<f64> {
-    match link {
-        LinkFunction::Logit => {
-            // Clamp eta to prevent overflow and clamp probabilities away from 0/1
-            let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-            let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-            mu.mapv_inplace(|v| v.clamp(1e-8, 1.0 - 1e-8));
-            mu
-        }
-        LinkFunction::Identity => eta.clone(),
-    }
-}
-
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -2517,7 +2504,7 @@ mod tests {
         let rho_vec = Array1::<f64>::zeros(rs_original.len()); // Size to match penalties
 
         let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
+        let (pirls_result, _) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),
@@ -3061,7 +3048,7 @@ mod tests {
 
         // Call the function with first rho vector
         let offset = Array1::<f64>::zeros(n_samples);
-        let (result1, _pirls_working1) = super::fit_model_for_fixed_rho(
+        let (result1, _) = super::fit_model_for_fixed_rho(
             rho_vec1.view(),
             x.view(),
             offset.view(),
@@ -3075,7 +3062,7 @@ mod tests {
         .expect("First fit should converge for this stable test case");
 
         // Call the function with second rho vector
-        let (result2, _pirls_working2) = super::fit_model_for_fixed_rho(
+        let (result2, _) = super::fit_model_for_fixed_rho(
             rho_vec2.view(),
             x.view(),
             offset.view(),
@@ -3189,7 +3176,7 @@ mod tests {
 
         // === PHASE 5: Execute the target function ===
         let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
+        let (pirls_result, _) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),
@@ -3321,7 +3308,7 @@ mod tests {
 
         // === Execute P-IRLS ===
         let offset = Array1::<f64>::zeros(data.y.len());
-        let (pirls_result, _pirls_working) = fit_model_for_fixed_rho(
+        let (pirls_result, _) = fit_model_for_fixed_rho(
             rho_vec.view(),
             x_matrix.view(),
             offset.view(),
