@@ -695,6 +695,22 @@ pub fn build_survival_layout(
     let mut time_varying_basis_descriptor: Option<BasisDescriptor> = None;
 
     if let Some(config) = time_varying {
+        let lambda_age = if config.lambda_age == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_age
+        };
+        let lambda_pgs = if config.lambda_pgs == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_pgs
+        };
+        let lambda_null = if config.lambda_null == 0.0 {
+            baseline_lambda
+        } else {
+            config.lambda_null
+        };
+
         let (pgs_basis_full, _) = create_bspline_basis_with_knots(
             data.pgs.view(),
             config.pgs_basis.knot_vector.view(),
@@ -739,24 +755,24 @@ pub fn build_survival_layout(
 
                 penalty_blocks.push(PenaltyBlock {
                     matrix: kron_age_normed.clone(),
-                    lambda: config.lambda_age,
+                    lambda: lambda_age,
                     range: time_range.clone(),
                 });
                 penalty_descriptors.push(PenaltyDescriptor {
                     order: baseline_penalty_order,
-                    lambda: config.lambda_age,
+                    lambda: lambda_age,
                     matrix: kron_age_normed.clone(),
                     column_range: ColumnRange::new(time_range.start, time_range.end),
                 });
 
                 penalty_blocks.push(PenaltyBlock {
                     matrix: kron_pgs_normed.clone(),
-                    lambda: config.lambda_pgs,
+                    lambda: lambda_pgs,
                     range: time_range.clone(),
                 });
                 penalty_descriptors.push(PenaltyDescriptor {
                     order: config.pgs_penalty_order,
-                    lambda: config.lambda_pgs,
+                    lambda: lambda_pgs,
                     matrix: kron_pgs_normed.clone(),
                     column_range: ColumnRange::new(time_range.start, time_range.end),
                 });
@@ -773,12 +789,12 @@ pub fn build_survival_layout(
                         let kron_null_normed = kron_null.mapv(|v| v / norm_null);
                         penalty_blocks.push(PenaltyBlock {
                             matrix: kron_null_normed.clone(),
-                            lambda: config.lambda_null,
+                            lambda: lambda_null,
                             range: time_range.clone(),
                         });
                         penalty_descriptors.push(PenaltyDescriptor {
                             order: 0,
-                            lambda: config.lambda_null,
+                            lambda: lambda_null,
                             matrix: kron_null_normed,
                             column_range: ColumnRange::new(time_range.start, time_range.end),
                         });
@@ -3584,6 +3600,47 @@ mod tests {
         .unwrap();
         let state = model.update_state(&artifacts.coefficients).unwrap();
         assert!(state.deviance.is_finite());
+    }
+
+    #[test]
+    fn time_varying_penalty_defaults_to_baseline_lambda() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let pgs_basis = BasisDescriptor {
+            knot_vector: array![-0.6, -0.6, -0.6, -0.3, -0.1, 0.1, 0.3, 0.6, 0.6, 0.6,],
+            degree: 2,
+        };
+        let tensor_config = TensorProductConfig {
+            label: None,
+            pgs_basis: pgs_basis.clone(),
+            pgs_penalty_order: 2,
+            lambda_age: 0.0,
+            lambda_pgs: 0.0,
+            lambda_null: 0.0,
+        };
+
+        let expected_lambda = baseline_lambda_seed(&basis, 2);
+
+        let SurvivalLayoutBundle {
+            layout,
+            penalty_descriptors,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, Some(&tensor_config)).unwrap();
+
+        assert!(layout.time_varying_exit.is_some());
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_penalties: Vec<&PenaltyDescriptor> = penalty_descriptors
+            .iter()
+            .filter(|descriptor| descriptor.column_range.start >= baseline_cols)
+            .collect();
+
+        assert!(!time_penalties.is_empty());
+        for descriptor in time_penalties {
+            assert_abs_diff_eq!(descriptor.lambda, expected_lambda, epsilon = 1e-12);
+        }
     }
 
     #[test]
