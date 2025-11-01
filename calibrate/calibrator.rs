@@ -2287,10 +2287,10 @@ mod tests {
     /// This helper returns the full breakdown so that diagnostic tests can
     /// inspect the contribution of each term without copying the rather large
     /// derivation in multiple places.
-    fn eval_laml_breakdown_binom(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
-        x: ArrayView2<f64>,
+    fn eval_laml_breakdown_binom<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
@@ -2305,7 +2305,7 @@ mod tests {
         let cfg = ModelConfig::external(LinkFunction::Logit, 1e-3, 75, firth_active);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
-        let pirls = pirls::fit_model_for_fixed_rho(
+        let (pirls, _) = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
             x,
             offset,
@@ -2337,10 +2337,10 @@ mod tests {
         }
     }
 
-    fn eval_laml_fixed_rho_binom(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
-        x: ArrayView2<f64>,
+    fn eval_laml_fixed_rho_binom<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
@@ -2350,10 +2350,10 @@ mod tests {
 
     /// Evaluates the LAML objective at a fixed rho for Gaussian/identity regression.
     /// This test-only function is used to verify the optimizer's solution.
-    fn eval_laml_fixed_rho_gaussian(
-        y: ArrayView1<f64>,
-        w_prior: ArrayView1<f64>,
-        x: ArrayView2<f64>,
+    fn eval_laml_fixed_rho_gaussian<'a>(
+        y: ArrayView1<'a, f64>,
+        w_prior: ArrayView1<'a, f64>,
+        x: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         rs_blocks: &[Array2<f64>],
         rho: &[f64],
@@ -2367,7 +2367,7 @@ mod tests {
         let cfg = ModelConfig::external(LinkFunction::Identity, 1e-3, 75, false);
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
-        let pirls = pirls::fit_model_for_fixed_rho(
+        let (pirls, _) = pirls::fit_model_for_fixed_rho(
             rho_arr.view(),
             x,
             offset,
@@ -2824,7 +2824,7 @@ mod tests {
         let layout = ModelLayout::external(p, 0);
         let cfg = ModelConfig::external(link, 1e-10, 100, matches!(link, LinkFunction::Logit));
 
-        pirls::fit_model_for_fixed_rho(
+        let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
             rho.view(),
             x.view(),
             offset.view(),
@@ -2835,7 +2835,8 @@ mod tests {
             &layout,
             &cfg,
         )
-        .expect("real PIRLS fit failed")
+        .expect("real PIRLS fit failed");
+        pirls_result
     }
 
     #[cfg(test)]
@@ -4029,7 +4030,7 @@ mod tests {
         let rho_low = Array1::from_elem(penalties_with_ridge.len(), -15.0);
         let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
 
-        let fit_low = pirls::fit_model_for_fixed_rho(
+        let (fit_low, _) = pirls::fit_model_for_fixed_rho(
             rho_low.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),
@@ -4041,7 +4042,7 @@ mod tests {
             &cfg,
         )
         .expect("fixed-rho PIRLS (low)");
-        let fit_high = pirls::fit_model_for_fixed_rho(
+        let (fit_high, _) = pirls::fit_model_for_fixed_rho(
             rho_high.view(),
             x_with_ridge.view(),
             offset_with_ridge.view(),

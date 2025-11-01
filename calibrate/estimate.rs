@@ -778,7 +778,7 @@ pub fn train_model(
         eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
 
         let zero_rho = Array1::<f64>::zeros(0);
-        let final_fit = pirls::fit_model_for_fixed_rho(
+        let (final_fit, _) = pirls::fit_model_for_fixed_rho(
             zero_rho.view(),
             reml_state.x(),
             reml_state.offset(),
@@ -1240,7 +1240,7 @@ pub fn train_model(
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
-    let final_fit = pirls::fit_model_for_fixed_rho(
+    let (final_fit, _) = pirls::fit_model_for_fixed_rho(
         final_rho_clamped.view(),
         reml_state.x(), // Use original X
         reml_state.offset(),
@@ -2533,7 +2533,7 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let pirls_res = pirls::fit_model_for_fixed_rho(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
         final_rho.view(),
         x_o.view(),
         offset_o.view(),
@@ -3499,7 +3499,7 @@ pub mod internal {
             // and never reuse the same ρ, so the cache would not help and would require
             // synchronization across threads.
             let evaluate_penalised_ll = |rho_vec: &Array1<f64>| -> Result<f64, EstimationError> {
-                let pirls_result = pirls::fit_model_for_fixed_rho(
+                let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
                     rho_vec.view(),
                     x,
                     offset_view,
@@ -3672,7 +3672,7 @@ pub mod internal {
             // The returned result will include the transformation matrix qs
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
-                self.x.view(),
+                self.x,
                 self.offset.view(),
                 self.y,
                 self.weights,
@@ -3686,7 +3686,8 @@ pub mod internal {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
             }
 
-            let pirls_result = Arc::new(pirls_result?); // Propagate error if it occurred
+            let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
+            let pirls_result = Arc::new(pirls_result);
 
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
@@ -3718,7 +3719,7 @@ pub mod internal {
         }
     }
 
-    impl RemlState<'_> {
+    impl<'a> RemlState<'a> {
         /// Compute the objective function for BFGS optimization.
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
@@ -6468,18 +6469,19 @@ pub mod internal {
                         create_balanced_penalty_root(&s_list, layout.total_coeffs).expect("eb");
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
-                    let pirls_res = crate::calibrate::pirls::fit_model_for_fixed_rho(
-                        rho.view(),
-                        x_tr.view(),
-                        offset.view(),
-                        data_train.y.view(),
-                        data_train.weights.view(),
-                        &rs_list,
-                        Some(&balanced_root),
-                        &layout,
-                        &trained.config,
-                    )
-                    .expect("pirls refit");
+                    let (pirls_res, _) =
+                        crate::calibrate::pirls::fit_model_for_fixed_rho(
+                            rho.view(),
+                            x_tr.view(),
+                            offset.view(),
+                            data_train.y.view(),
+                            data_train.weights.view(),
+                            &rs_list,
+                            Some(&balanced_root),
+                            &layout,
+                            &trained.config,
+                        )
+                        .expect("pirls refit");
 
                     total_edfs.push(pirls_res.edf);
                     println!("[CV]   Complexity: edf={:.2}", pirls_res.edf);
@@ -7815,7 +7817,7 @@ pub mod internal {
             );
 
             match result {
-                Ok(pirls_result) => {
+                Ok((pirls_result, _)) => {
                     println!("P-IRLS converged successfully");
                     assert!(
                         pirls_result.deviance.is_finite(),

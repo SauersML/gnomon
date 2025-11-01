@@ -23,7 +23,7 @@ Deliver a first-class survival model family built on the Royston–Parmar (RP) p
       pub deviance: f64,
   }
   ```
-- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions.
+- Logistic and Gaussian models continue to supply diagonal Hessians through this trait. The RP survival model returns a dense Hessian and its own deviance. `pirls::run_pirls` consumes `WorkingState` without branching on link functions. The non-survival logit vs. identity link is fine, though
 
 ### 2.2 Survival working model
 - Implement `WorkingModel` for `WorkingModelSurvival`, which reads a `SurvivalLayout` and produces `η`, score, Hessian, and deviance each iteration.
@@ -268,3 +268,4 @@ With this plan the survival implementation is unified, risk-set-free, and fully 
 - Users must never be able to give penalty strengths: they should be chosen via REML instead.
 - The endpoint is "ever had disease X by time t” (has been diagnosed). Therefore, monotonicity should be a hard requirement, not a soft penalty.
 - Penalty strengths (e.g. setting lambda to some specific number) should not be hard-coded except to promote numerical stability, as REML should generally be used for tuning instead.
+- MONOTONICITY_TOLERANCE should be zero or within machine tolerance from zero.
