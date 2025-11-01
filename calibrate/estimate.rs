@@ -1810,6 +1810,11 @@ pub fn train_survival_model(
         convergence_tolerance: config.convergence_tolerance,
         max_step_halving: 20,
         min_step_size: 1e-6,
+        firth_bias_reduction: config.firth_bias_reduction
+            && matches!(
+                config.model_family,
+                crate::calibrate::model::ModelFamily::Gam(LinkFunction::Logit)
+            ),
     };
 
     eprintln!(
@@ -1883,6 +1888,7 @@ pub fn train_survival_model(
                             gradient: Array1::zeros(0),
                             hessian: Array2::zeros((0, 0)),
                             deviance: 0.0,
+                            penalty_term: 0.0,
                         },
                         status: crate::calibrate::pirls::PirlsStatus::Converged,
                         iterations: 0,
@@ -6469,19 +6475,18 @@ pub mod internal {
                         create_balanced_penalty_root(&s_list, layout.total_coeffs).expect("eb");
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
-                    let (pirls_res, _) =
-                        crate::calibrate::pirls::fit_model_for_fixed_rho(
-                            rho.view(),
-                            x_tr.view(),
-                            offset.view(),
-                            data_train.y.view(),
-                            data_train.weights.view(),
-                            &rs_list,
-                            Some(&balanced_root),
-                            &layout,
-                            &trained.config,
-                        )
-                        .expect("pirls refit");
+                    let (pirls_res, _) = crate::calibrate::pirls::fit_model_for_fixed_rho(
+                        rho.view(),
+                        x_tr.view(),
+                        offset.view(),
+                        data_train.y.view(),
+                        data_train.weights.view(),
+                        &rs_list,
+                        Some(&balanced_root),
+                        &layout,
+                        &trained.config,
+                    )
+                    .expect("pirls refit");
 
                     total_edfs.push(pirls_res.edf);
                     println!("[CV]   Complexity: edf={:.2}", pirls_res.edf);

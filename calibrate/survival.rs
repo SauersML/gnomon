@@ -1432,7 +1432,8 @@ impl WorkingModelSurvival {
         gradient += &penalty_gradient;
         let penalty_hessian = self.layout.penalties.hessian(beta.len());
         hessian += &penalty_hessian;
-        deviance += self.layout.penalties.deviance(beta);
+        let penalty_term = self.layout.penalties.deviance(beta);
+        deviance += penalty_term;
 
         if self.spec.use_expected_information {
             if let Some(expected_hessian) =
@@ -1447,6 +1448,7 @@ impl WorkingModelSurvival {
             gradient,
             hessian,
             deviance,
+            penalty_term,
         })
     }
 }
@@ -2318,14 +2320,16 @@ mod tests {
         let mut matches = 0usize;
         while let Some(record) = logger.pop() {
             if record.level() == Level::Warn
-                && record
-                    .args()
-                    .contains("derivative guard activated for")
+                && record.args().contains("derivative guard activated for")
             {
                 matches += 1;
             }
         }
-        assert!(matches >= 1, "expected at least one derivative guard warning, got {}", matches);
+        assert!(
+            matches >= 1,
+            "expected at least one derivative guard warning, got {}",
+            matches
+        );
     }
 
     fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
@@ -3102,8 +3106,7 @@ mod tests {
 
         for i in 0..data.age_entry.len() {
             let covariates = combined_static_row(&layout, i);
-            let hazard_exit =
-                cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
             let hazard_entry =
                 cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
             let delta_scoring = hazard_exit - hazard_entry;
