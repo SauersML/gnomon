@@ -26,6 +26,32 @@ pub struct WorkingState {
     pub deviance: f64,
 }
 
+/// Lightweight helper for Gaussian GAMs with an identity link.
+///
+/// For the identity link, the working response equals the observed response (y),
+/// and the weights equal the prior weights. This struct avoids the O(n²) Hessian
+/// allocation that would be required by the full WorkingModel trait, since the
+/// identity-link path in update_glm_vectors only needs weights and working_response.
+pub struct GamIdentityWorkingModel<'a> {
+    y: ArrayView1<'a, f64>,
+    weights: Array1<f64>,
+}
+
+impl<'a> GamIdentityWorkingModel<'a> {
+    pub fn new(y: ArrayView1<'a, f64>, prior_weights: ArrayView1<'a, f64>) -> Self {
+        let weights = prior_weights.to_owned();
+        Self { y, weights }
+    }
+
+    pub fn weights(&self) -> &Array1<f64> {
+        &self.weights
+    }
+
+    pub fn working_response(&self) -> ArrayView1<'a, f64> {
+        self.y
+    }
+}
+
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers (n, p sizes)
@@ -1601,10 +1627,10 @@ pub fn update_glm_vectors(
             (mu, weights, z)
         }
         LinkFunction::Identity => {
+            let model = GamIdentityWorkingModel::new(y, prior_weights);
             let mu = eta.clone();
-            // For Gaussian models with Identity link, the iterative weights ARE the prior weights
-            let weights = prior_weights.to_owned();
-            let z = y.to_owned();
+            let weights = model.weights().to_owned();
+            let z = model.working_response().to_owned();
             (mu, weights, z)
         }
     }
