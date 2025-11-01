@@ -12,7 +12,10 @@ use faer::linalg::solvers::{
 use faer::{Accum, Side, get_global_parallelism};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 pub trait WorkingModel {
     fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError>;
@@ -505,12 +508,10 @@ where
         let direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
         let mut step = 1.0;
         let mut step_halving = 0usize;
-        let mut candidate_beta = beta.clone();
-        let mut candidate_state_opt: Option<(WorkingState, f64)> = None;
         let mut last_error: Option<EstimationError> = None;
 
-        loop {
-            candidate_beta = &beta + &(direction.mapv(|v| step * v));
+        let (candidate_beta, candidate_state, candidate_penalized) = loop {
+            let candidate_beta = &beta + &(direction.mapv(|v| step * v));
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized =
@@ -523,8 +524,7 @@ where
                             || !candidate_penalized.is_finite()
                     };
                     if accept_step {
-                        candidate_state_opt = Some((candidate_state, candidate_penalized));
-                        break;
+                        break (candidate_beta, candidate_state, candidate_penalized);
                     }
                 }
                 Err(err) => {
@@ -544,9 +544,7 @@ where
 
             step *= 0.5;
             step_halving += 1;
-        }
-
-        let (candidate_state, candidate_penalized) = candidate_state_opt.expect("accepted state");
+        };
         let candidate_grad_norm = candidate_state
             .gradient
             .iter()
@@ -837,20 +835,19 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
 
-    let mut eb_storage: Option<Array2<f64>> = None;
-    let eb: &Array2<f64> = if let Some(precomputed) = balanced_penalty_root {
-        precomputed
+    let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = balanced_penalty_root {
+        Cow::Borrowed(precomputed)
     } else {
         let mut s_list_full = Vec::with_capacity(rs_original.len());
         for rs in rs_original {
             s_list_full.push(rs.t().dot(rs));
         }
-        eb_storage = Some(create_balanced_penalty_root(
+        Cow::Owned(create_balanced_penalty_root(
             &s_list_full,
             layout.total_coeffs,
-        )?);
-        eb_storage.as_ref().unwrap()
+        )?)
     };
+    let eb: &Array2<f64> = eb_cow.as_ref();
 
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
     let x_transformed = x.dot(&reparam_result.qs);

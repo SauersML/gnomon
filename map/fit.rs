@@ -808,6 +808,12 @@ enum SimdLaneSelection {
     Lanes2,
 }
 
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+const _: () = {
+    // Ensure the two-lane variant stays in use on targets that never select it at runtime.
+    let _ = SimdLaneSelection::Lanes2;
+};
+
 #[inline(always)]
 fn record_simd_lane_diagnostic(
     stage: &'static str,
