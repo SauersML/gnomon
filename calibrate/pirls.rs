@@ -384,8 +384,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
 
         let penalty_term = beta.dot(&s_beta);
-        #[cfg(test)]
-        record_penalized_deviance(deviance + penalty_term);
 
         self.last_mu = mu;
         self.last_weights = weights;
@@ -504,6 +502,8 @@ where
         iterations = iter;
         let state = model.update(&beta)?;
         let current_penalized = state.deviance + state.penalty_term;
+        #[cfg(test)]
+        record_penalized_deviance(current_penalized);
         let state_grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
         let mut step = 1.0;
@@ -552,6 +552,8 @@ where
             .sum::<f64>()
             .sqrt();
         let deviance_change = current_penalized - candidate_penalized;
+        #[cfg(test)]
+        record_penalized_deviance(candidate_penalized);
 
         iteration_callback(&WorkingModelIterationInfo {
             iteration: iter,
@@ -796,6 +798,62 @@ pub struct PirlsResult {
     pub x_transformed: Array2<f64>,
 }
 
+fn detect_unpenalized_logit_instability(
+    link: LinkFunction,
+    has_penalty: bool,
+    firth_active: bool,
+    summary: &WorkingModelPirlsResult,
+    final_mu: &Array1<f64>,
+    y: ArrayView1<'_, f64>,
+) -> bool {
+    if link != LinkFunction::Logit || has_penalty || firth_active {
+        return false;
+    }
+
+    let n = y.len() as f64;
+    if n == 0.0 {
+        return false;
+    }
+
+    let max_abs_eta = summary.max_abs_eta;
+    let sat_fraction = {
+        const SAT_EPS: f64 = 1e-3;
+        final_mu
+            .iter()
+            .filter(|&&m| m <= SAT_EPS || m >= 1.0 - SAT_EPS)
+            .count() as f64
+            / n
+    };
+
+    let beta_norm = summary.beta.dot(&summary.beta).sqrt();
+    let dev_per_sample = summary.state.deviance / n;
+
+    let mut has_pos = false;
+    let mut has_neg = false;
+    let mut min_eta_pos = f64::INFINITY;
+    let mut max_eta_neg = f64::NEG_INFINITY;
+    for (eta_i, &yi) in summary.state.eta.iter().zip(y.iter()) {
+        if yi > 0.5 {
+            has_pos = true;
+            if *eta_i < min_eta_pos {
+                min_eta_pos = *eta_i;
+            }
+        } else {
+            has_neg = true;
+            if *eta_i > max_eta_neg {
+                max_eta_neg = *eta_i;
+            }
+        }
+    }
+    let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
+
+    max_abs_eta > 30.0
+        || sat_fraction > 0.98
+        || dev_per_sample < 1e-3
+        || beta_norm > 1e4
+        || order_separated
+}
+
 /// P-IRLS solver that follows mgcv's architecture exactly
 ///
 /// This function implements the complete algorithm from mgcv's gam.fit3 function
@@ -894,7 +952,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         );
     };
 
-    let working_summary = run_working_model_pirls(
+    let mut working_summary = run_working_model_pirls(
         &mut working_model,
         Array1::<f64>::zeros(layout.total_coeffs),
         &options,
@@ -923,6 +981,21 @@ pub fn fit_model_for_fixed_rho<'a>(
         edf = (p - r).max(0.0);
     }
 
+    let mut status = working_summary.status.clone();
+    let has_penalty = e_transformed.nrows() > 0;
+    let firth_active = options.firth_bias_reduction;
+    if detect_unpenalized_logit_instability(
+        link_function,
+        has_penalty,
+        firth_active,
+        &working_summary,
+        &final_mu,
+        y,
+    ) {
+        status = PirlsStatus::Unstable;
+        working_summary.status = status.clone();
+    }
+
     let pirls_result = PirlsResult {
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
@@ -936,7 +1009,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         solve_weights: final_weights.clone(),
         solve_working_response: final_z.clone(),
         solve_mu: final_mu.clone(),
-        status: working_summary.status.clone(),
+        status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
         reparam_result,
@@ -2734,14 +2807,78 @@ mod tests {
         (x, y, weights)
     }
 
+    struct IdentityGamWorkingModel {
+        link: LinkFunction,
+        design: Array2<f64>,
+        response: Array1<f64>,
+        prior_weights: Array1<f64>,
+    }
+
+    impl IdentityGamWorkingModel {
+        fn new(
+            link: LinkFunction,
+            design: &Array2<f64>,
+            response: &Array1<f64>,
+            prior_weights: &Array1<f64>,
+        ) -> Self {
+            Self {
+                link,
+                design: design.to_owned(),
+                response: response.to_owned(),
+                prior_weights: prior_weights.to_owned(),
+            }
+        }
+    }
+
+    impl WorkingModel for IdentityGamWorkingModel {
+        fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+            let eta = self.design.dot(beta);
+            let (mu, weights, z) = update_glm_vectors(
+                self.response.view(),
+                &eta,
+                self.link,
+                self.prior_weights.view(),
+            );
+
+            let eta_minus_z = &eta - &z;
+            let weighted_residual = &weights * &eta_minus_z;
+            let gradient = self.design.t().dot(&weighted_residual);
+
+            let mut hessian = Array2::<f64>::zeros((self.design.ncols(), self.design.ncols()));
+            for (i, row) in self.design.rows().into_iter().enumerate() {
+                let w = weights[i];
+                for j in 0..hessian.nrows() {
+                    let xj = row[j];
+                    for k in 0..hessian.ncols() {
+                        hessian[[j, k]] += w * xj * row[k];
+                    }
+                }
+            }
+
+            let deviance = calculate_deviance(
+                self.response.view(),
+                &mu,
+                self.link,
+                self.prior_weights.view(),
+            );
+
+            Ok(WorkingState {
+                eta,
+                gradient,
+                hessian,
+                deviance,
+                penalty_term: 0.0,
+            })
+        }
+    }
+
     fn build_identity_gam_working_model(
         link: LinkFunction,
         x: &Array2<f64>,
         y: &Array1<f64>,
         weights: &Array1<f64>,
     ) -> Result<Box<dyn WorkingModel>, &'static str> {
-        let _ = (link, x, y, weights);
-        Err("GAM working model still uses legacy PIRLS path")
+        Ok(Box::new(IdentityGamWorkingModel::new(link, x, y, weights)))
     }
 
     fn expected_identity_state(
