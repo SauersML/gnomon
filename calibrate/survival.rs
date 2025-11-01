@@ -2620,8 +2620,8 @@ mod tests {
         for row in monotonicity.derivative_design.rows() {
             if row.iter().any(|value| value.abs() > 1e-12) {
                 beta.assign(&row);
-                // Scale the row so the induced slopes are only infinitesimally negative.
-                beta.mapv_inplace(|value| -1e-8 * value);
+                // Scale the row so the induced slopes violate MONOTONICITY_TOLERANCE.
+                beta.mapv_inplace(|value| -0.1 * value);
                 found = true;
                 break;
             }
@@ -2629,7 +2629,7 @@ mod tests {
         assert!(found, "monotonicity grid returned only zero rows");
 
         let slopes = monotonicity.derivative_design.dot(&beta);
-        assert!(slopes.iter().any(|value| *value < 0.0 && value.abs() < 1e-6));
+        assert!(slopes.iter().any(|value| *value < MONOTONICITY_TOLERANCE));
 
         let mut model =
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
