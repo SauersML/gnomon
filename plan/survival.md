@@ -268,3 +268,4 @@ With this plan the survival implementation is unified, risk-set-free, and fully 
 - Users must never be able to give penalty strengths: they should be chosen via REML instead.
 - The endpoint is "ever had disease X by time t” (has been diagnosed). Therefore, monotonicity should be a hard requirement, not a soft penalty.
 - Penalty strengths (e.g. setting lambda to some specific number) should not be hard-coded except to promote numerical stability, as REML should generally be used for tuning instead.
+- MONOTONICITY_TOLERANCE should be zero or within machine tolerance from zero.
