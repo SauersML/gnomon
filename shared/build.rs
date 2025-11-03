@@ -143,6 +143,7 @@ fn configure_linker_for_low_memory() {
         Some(total) if total < TEN_GIB => {
             println!("cargo:rustc-link-arg=-Wl,--no-keep-memory");
             println!("cargo:rustc-link-arg=-Wl,--reduce-memory-overheads");
+            configure_rustc_parallelism_for_low_memory(total);
             if warnings_enabled() {
                 println!(
                     "cargo:warning=linker configured for low-memory host (detected {} bytes)",
@@ -165,6 +166,21 @@ fn configure_linker_for_low_memory() {
                 );
             }
         }
+    }
+}
+
+fn configure_rustc_parallelism_for_low_memory(total_memory_bytes: u64) {
+    println!("cargo:rustc-flags=-Ccodegen-units=1");
+    println!(
+        "cargo:rustc-env=GNOMON_LOW_MEMORY_TOTAL_MEMORY_BYTES={}",
+        total_memory_bytes
+    );
+    println!("cargo:rustc-env=GNOMON_LOW_MEMORY_SERIAL_BUILD=1");
+    println!("cargo:rustc-cfg=gnomon_low_memory_serial_build");
+    if warnings_enabled() {
+        println!(
+            "cargo:warning=forcing single rustc codegen unit (approx cargo -j1) for low-memory host"
+        );
     }
 }
 
