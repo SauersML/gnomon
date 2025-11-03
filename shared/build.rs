@@ -103,6 +103,71 @@ fn install_stage_panic_hook() {
     }));
 }
 
+fn detect_total_memory_bytes() -> Option<u64> {
+    if let Ok(forced) = std::env::var("GNOMON_FORCE_TOTAL_MEMORY_BYTES") {
+        if let Ok(parsed) = forced.trim().parse::<u64>() {
+            return Some(parsed);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let mut parts = rest.split_whitespace();
+                    if let Some(raw_value) = parts.next() {
+                        if let Ok(kib) = raw_value.parse::<u64>() {
+                            return Some(kib.saturating_mul(1024));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn configure_linker_for_low_memory() {
+    if let Ok(value) = std::env::var("GNOMON_DISABLE_LOW_MEM_WORKAROUND") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "1" | "true" | "yes") {
+            return;
+        }
+    }
+
+    const TEN_GIB: u64 = 10u64 * 1024 * 1024 * 1024;
+
+    match detect_total_memory_bytes() {
+        Some(total) if total < TEN_GIB => {
+            println!("cargo:rustc-link-arg=-Wl,--no-keep-memory");
+            println!("cargo:rustc-link-arg=-Wl,--reduce-memory-overheads");
+            if warnings_enabled() {
+                println!(
+                    "cargo:warning=linker configured for low-memory host (detected {} bytes)",
+                    total
+                );
+            }
+        }
+        Some(total) => {
+            if warnings_enabled() {
+                println!(
+                    "cargo:warning=total system memory {} bytes >= 10 GiB, using default linker settings",
+                    total
+                );
+            }
+        }
+        None => {
+            if warnings_enabled() {
+                println!(
+                    "cargo:warning=unable to detect total system memory; using default linker settings"
+                );
+            }
+        }
+    }
+}
+
 impl ViolationCollector {
     fn new(file_path: &Path) -> Self {
         Self {
@@ -788,6 +853,7 @@ impl Sink for IgnoredTestCollector {
 
 fn main() {
     install_stage_panic_hook();
+    configure_linker_for_low_memory();
 
     // Always rerun this script if the build script itself changes.
     update_stage("initialization");
