@@ -535,3 +535,87 @@ Sex chromosome ploidy is relevant to understanding colorectal cancer risk:
 
 <img width="690" height="440" alt="image" src="https://github.com/user-attachments/assets/17f9eac5-b3c1-433b-9aac-80ffa3f7550f" />
 
+Let's prepare training and testing data for sex calibration:
+```
+import numpy as np
+import pandas as pd
+
+score_col = "PGS003852_AVG"
+phenotype_src = "case"
+sex_ploidy_col = "dragen_sex_ploidy"
+
+if "df" not in globals():
+    raise RuntimeError("df is not defined; run the merge/AUC construction cell first.")
+if score_col not in df.columns:
+    raise RuntimeError(f"{score_col} not found in df.")
+if phenotype_src not in df.columns:
+    raise RuntimeError(f"{phenotype_src} not found in df.")
+if sex_ploidy_col not in df.columns:
+    raise RuntimeError(f"{sex_ploidy_col} not found in df.")
+
+# Resolve sample_id column
+if "iid_col" in globals():
+    sample_id_col = iid_col
+elif "#IID" in df.columns:
+    sample_id_col = "#IID"
+elif "IID" in df.columns:
+    sample_id_col = "IID"
+else:
+    sample_id_col = df.columns[0]
+
+base = df[[sample_id_col, score_col, phenotype_src, sex_ploidy_col]].copy()
+base = base.rename(columns={sample_id_col: "sample_id"})
+
+is_binary_sex = base[sex_ploidy_col].isin(["XX", "XY"])
+nonmissing = base[score_col].notna() & base[phenotype_src].notna()
+model = base[is_binary_sex & nonmissing].copy()
+
+sex_map = {"XX": 0, "XY": 1}
+model["sex"] = model[sex_ploidy_col].map(sex_map).astype("int8")
+model["phenotype"] = model[phenotype_src].astype("int8")
+
+model = model.rename(columns={score_col: "score"})
+model = model[["sample_id", "phenotype", "score", "sex"]]
+
+model = model.replace([np.inf, -np.inf], np.nan).dropna()
+
+rng = np.random.RandomState(20251108)
+
+case_idx = model.index[model["phenotype"] == 1]
+ctrl_idx = model.index[model["phenotype"] == 0]
+
+test_case_size = int(0.2 * len(case_idx))
+test_ctrl_size = int(0.2 * len(ctrl_idx))
+
+if test_case_size == 0 or test_ctrl_size == 0:
+    raise RuntimeError("Insufficient cases or controls for an 80/20 stratified split.")
+
+test_cases = rng.choice(case_idx, size=test_case_size, replace=False)
+test_ctrls = rng.choice(ctrl_idx, size=test_ctrl_size, replace=False)
+test_idx = np.concatenate([test_cases, test_ctrls])
+
+train_idx = model.index.difference(test_idx)
+
+train = model.loc[train_idx].copy()
+test = model.loc[test_idx].copy()
+
+expected_cols = ["sample_id", "phenotype", "score", "sex"]
+if list(train.columns) != expected_cols or list(test.columns) != expected_cols:
+    raise RuntimeError("Column mismatch in prepared data.")
+
+train_path = "../../gnomon_train_PGS003852.tsv"
+test_path = "../../gnomon_test_PGS003852.tsv"
+
+train.to_csv(train_path, sep="\t", index=False)
+test.to_csv(test_path, sep="\t", index=False)
+
+print("Wrote:")
+print(f"  {train_path}: {len(train)} rows")
+print(f"  {test_path}: {len(test)} rows")
+print("Train prevalence:", train["phenotype"].mean())
+print("Test prevalence:", test["phenotype"].mean())
+print("Train score summary:")
+print(train["score"].describe())
+print("Test score summary:")
+print(test["score"].describe())
+```
