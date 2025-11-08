@@ -257,6 +257,79 @@ There is no large visible bias, which is good.
 
 <img width="589" height="455" alt="image" src="https://github.com/user-attachments/assets/18b7f98a-e80d-4858-8b1b-bc61edeefec2" />
 
+Let's define colorectal cancer cases:
+```
+import os
+import numpy as np
+import pandas as pd
+from google.cloud import bigquery as bq
+from sklearn.metrics import roc_auc_score
+
+# Case definition: CRC diagnosis codes plus personal-history codes (incl. Z85.038, Z85.04x)
+cdr_id = os.environ["WORKSPACE_CDR"]
+
+cond_codes = (
+    [f"C18.{i}" for i in range(10)]
+    + ["C19", "C20"]
+    + [f"153.{i}" for i in range(10)]
+    + ["154.0", "154.1"]
+)
+cond_codes = [c.upper() for c in cond_codes]
+cond_codes_n = sorted({c.replace(".", "") for c in cond_codes})
+
+obs_codes_exact = ["Z85.038", "V10.05"]
+obs_codes_exact = [c.upper() for c in obs_codes_exact]
+obs_codes_n = sorted({c.replace(".", "") for c in obs_codes_exact})
+
+sql = f"""
+WITH cond_raw AS (
+  SELECT DISTINCT CAST(person_id AS STRING) AS person_id,
+         REGEXP_REPLACE(UPPER(TRIM(condition_source_value)), '[^A-Z0-9]', '') AS code_n
+  FROM `{cdr_id}.condition_occurrence`
+  WHERE condition_source_value IS NOT NULL
+),
+cond AS (
+  SELECT DISTINCT person_id
+  FROM cond_raw
+  WHERE code_n IN UNNEST(@cond_codes_n)
+),
+obs_raw AS (
+  SELECT DISTINCT CAST(person_id AS STRING) AS person_id,
+         REGEXP_REPLACE(UPPER(TRIM(observation_source_value)), '[^A-Z0-9]', '') AS code_n
+  FROM `{cdr_id}.observation`
+  WHERE observation_source_value IS NOT NULL
+),
+obs AS (
+  SELECT DISTINCT person_id
+  FROM obs_raw
+  WHERE code_n IN UNNEST(@obs_codes_n)
+     OR STARTS_WITH(code_n, 'Z8504')  -- Z85.04x personal history codes
+),
+cases AS (
+  SELECT person_id FROM cond
+  UNION DISTINCT
+  SELECT person_id FROM obs
+)
+SELECT person_id FROM cases
+"""
+
+cases = (
+    bq.Client()
+    .query(
+        sql,
+        job_config=bq.QueryJobConfig(
+            query_parameters=[
+                bq.ArrayQueryParameter("cond_codes_n", "STRING", cond_codes_n),
+                bq.ArrayQueryParameter("obs_codes_n", "STRING", obs_codes_n),
+            ]
+        ),
+    )
+    .to_dataframe()["person_id"]
+    .astype(str)
+)
+case_set = set(cases)
+```
+
 Let's check AUC:
 ```
 import pandas as pd
