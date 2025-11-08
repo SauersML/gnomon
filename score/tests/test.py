@@ -251,14 +251,23 @@ def analyze_pgs_results(pgs_id: str, pgs_run_results: list) -> dict:
                     raise KeyError(f"Gnomon _MISSING_PCT column not found")
                 df_proc[f'MISSING_PCT_{tool_name}'] = pd.to_numeric(df_raw[missing_col_name], errors='coerce')
             else:
-                # For plink2/pylink, calculate missingness from ALLELE_CT and total variants from logs
+                # For plink2/pylink, calculate missingness based on the available allele counts
                 total_variants = _extract_variants_processed(res['stdout'], res['tool'])
-                if total_variants > 0 and 'ALLELE_CT' in df_raw.columns:
-                    # Missingness % = (1 - (variants_observed / variants_total)) * 100
-                    # variants_observed = ALLELE_CT / 2 (since ALLELE_CT is count of alleles, not loci)
-                    df_proc[f'MISSING_PCT_{tool_name}'] = (1 - (pd.to_numeric(df_raw['ALLELE_CT'], errors='coerce') / 2) / total_variants) * 100.0
+                if total_variants > 0:
+                    if 'ALLELE_CT' in df_raw.columns:
+                        # Missingness % = (1 - (variants_observed / variants_total)) * 100
+                        # variants_observed = ALLELE_CT / 2 (since ALLELE_CT is count of alleles, not loci)
+                        observed_variants = pd.to_numeric(df_raw['ALLELE_CT'], errors='coerce') / 2
+                        df_proc[f'MISSING_PCT_{tool_name}'] = (1 - (observed_variants / total_variants)) * 100.0
+                    elif 'NMISS_ALLELE_CT' in df_raw.columns:
+                        # PyLink reports the number of non-missing alleles.
+                        # Convert to observed variants (divide by two) before normalising.
+                        observed_variants = pd.to_numeric(df_raw['NMISS_ALLELE_CT'], errors='coerce') / 2
+                        df_proc[f'MISSING_PCT_{tool_name}'] = (1 - (observed_variants / total_variants)) * 100.0
+                    else:
+                        df_proc[f'MISSING_PCT_{tool_name}'] = np.nan
                 else:
-                    # If information is not available, fill with Not a Number
+                    # If we cannot determine how many variants were processed, mark as unavailable.
                     df_proc[f'MISSING_PCT_{tool_name}'] = np.nan
             
             all_dfs.append(df_proc)
