@@ -359,3 +359,100 @@ Other: 259 / 33941 (0.763%)
 XX: 2089 / 252079 (0.829%)
 XY: 1713 / 161258 (1.062%)
 
+Let's check the age distribution in each group:
+```
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+
+data = df_age.copy()
+
+def classify_sex(x):
+    if pd.isna(x):
+        return "Missing"
+    if x == "XX":
+        return "XX"
+    if x == "XY":
+        return "XY"
+    return "Other"
+
+data["sex_group4"] = data["dragen_sex_ploidy"].map(classify_sex)
+
+valid = data[data["age"].notna()]
+age_min = float(valid["age"].min())
+age_max = float(valid["age"].max())
+xs = np.linspace(age_min, age_max, 400)
+
+plt.figure(figsize=(8, 5))
+
+for grp in ["XX", "XY", "Other", "Missing"]:
+    sub = valid.loc[valid["sex_group4"] == grp, "age"]
+    if len(sub) < 2:
+        continue
+    kde = gaussian_kde(sub.to_numpy())
+    ys = kde(xs)
+    plt.plot(xs, ys, linewidth=2, label=f"{grp} (n={len(sub)})")
+    mean_age = sub.mean()
+    plt.axvline(mean_age, linestyle="--", linewidth=1)
+
+plt.xlabel("Age (years)")
+plt.ylabel("Density")
+plt.title("Age distribution by genetic sex group")
+plt.legend()
+plt.tight_layout()
+plt.show()
+```
+
+
+<img width="790" height="490" alt="image" src="https://github.com/user-attachments/assets/344ee484-9d95-4b6d-93b0-347c8bae6f8e" />
+
+
+This is interesting. Why do people with non-XY and non-XX ploidy have a much higher mean age?
+
+```
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+
+# Specific non-XX/XY ploidy categories to display (including literal "nan" value, excluding true missing)
+ploidy_labels = ["X0", "XO", "XXX", "XXY", "XYY", "nan"]
+allowed = {p.lower() for p in ploidy_labels}
+
+ploidy = df_age["dragen_sex_ploidy"]
+age = df_age["age"]
+
+is_missing_ploidy = ploidy.isna()
+ploidy_str = ploidy.astype(str)
+mask = age.notna() & (~is_missing_ploidy) & (ploidy_str.str.lower().isin(allowed))
+
+sub = df_age.loc[mask].copy()
+sub["ploidy_str"] = sub["dragen_sex_ploidy"].astype(str)
+
+if not sub.empty:
+    age_min = float(sub["age"].min())
+    age_max = float(sub["age"].max())
+    xs = np.linspace(age_min, age_max, 400)
+
+    plt.figure(figsize=(8, 5))
+
+    for p in ploidy_labels:
+        grp = sub[sub["ploidy_str"].str.lower() == p.lower()]["age"].dropna()
+        if len(grp) < 2:
+            continue
+        kde = gaussian_kde(grp.to_numpy())
+        ys = kde(xs)
+        plt.plot(xs, ys, linewidth=2, label=f"{p} (n={len(grp)})")
+        mean_age = grp.mean()
+        plt.axvline(mean_age, linestyle="--", linewidth=1)
+
+    plt.xlabel("Age (years)")
+    plt.ylabel("Density")
+    plt.title("Age distribution by specific non-XX/XY ploidy (excluding missing)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+```
+
+
+XO and X0 individuals are driving this trend, with a mean age of around 80.
