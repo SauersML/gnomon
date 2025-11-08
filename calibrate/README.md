@@ -158,5 +158,48 @@ models add the calibrator's correction in linear space. Distance-to-hull checks
 run in the same order as training, ensuring extrapolation handling remains
 consistent.
 
+## Expected data format
+
+Training and inference both operate on tab-separated value (TSV) files with a
+header row and strictly named columns. The loader surfaces actionable errors if
+any of the schema requirements below are violated.
+
+### Training inputs
+
+`data::load_training_data` expects the following columns when fitting the base
+model (and optional calibrator):
+
+- `phenotype` – numeric response (0/1 for logistic fits, real-valued for
+  Gaussian fits). Missing values are not permitted.
+- `score` – the standardized polygenic score used as the primary smooth.
+- `sex` – binary indicator encoded as 0/1. Other encodings are rejected during
+  type coercion.
+- `PC1`, `PC2`, …, `PCk` – one column per requested principal component. The
+  number of PCs must match the `num_pcs` configuration supplied to the CLI or
+  library entry point. Columns are required even if they are all zeros.
+- `weights` (optional) – positive prior weights. When omitted, the loader
+  supplies a length-`n` vector of ones so unweighted fits do not require a
+  synthetic column.
+- `sample_id` (optional) – string identifiers passed through to the serialized
+  model for auditing. Absent IDs are replaced with deterministic `1`, `2`, …
+  labels.
+
+All required columns must be finite, and at least 20 rows are recommended for a
+stable fit. The loader prints the resolved schema so callers can confirm the
+exact set of covariates that entered the design.
+
+### Inference inputs
+
+`data::load_prediction_data` enforces the same structure for prediction-time
+files, minus the response column:
+
+- `score`, `sex`, and the `PC*` columns must be present and numeric.
+- Optional `sample_id` values are used to label rows in the prediction outputs
+  (filling with `1`, `2`, … when absent).
+
+Weights and phenotypes are ignored during inference. Prediction data is
+validated with the same finite-value checks as training data, ensuring that
+the deployed spline bases receive well-formed covariates.
+
 ## TODO
 Implement the survival model in plan/survival.md.
