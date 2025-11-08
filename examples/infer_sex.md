@@ -167,3 +167,195 @@ Let's run a polygenic score for colorectal cancer:
 !../../gnomon/target/release/gnomon score "PGS003852" ../../arrays
 ```
 
+Check missingness by sex chromosome ploidy:
+```
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+SEX_COL = "dragen_sex_ploidy"
+SCORE_COL = "PGS003852_AVG"
+MISS_COL = "PGS003852_MISSING_PCT"
+SSCORE_PATH = os.path.join("..", "..", "arrays.sscore")
+
+if "sex_df" not in globals():
+    raise RuntimeError("sex_df is not defined; run the genetic sex load cell first.")
+
+sscore_df = pd.read_csv(SSCORE_PATH, delim_whitespace=True)
+sscore_df = sscore_df.rename(columns={"#IID": "IID"})
+sscore_df["IID"] = sscore_df["IID"].astype(str)
+
+id_candidates = [
+    "person_id",
+    "participant_id",
+    "aou_participant_id",
+    "research_id",
+    "sample_id",
+]
+id_col = None
+for c in id_candidates:
+    if c in sex_df.columns:
+        id_col = c
+        break
+
+if id_col is None:
+    raise ValueError(
+        "No suitable participant ID column found in sex_df; "
+        f"checked {id_candidates}"
+    )
+
+sex_df[id_col] = sex_df[id_col].astype(str)
+
+merged = sscore_df.merge(
+    sex_df[[id_col, SEX_COL]],
+    left_on="IID",
+    right_on=id_col,
+    how="left",
+)
+
+merged["sex_group"] = merged[SEX_COL].where(
+    merged[SEX_COL].isin(["XX", "XY"]),
+    "Other",
+)
+
+positive_missing = merged[MISS_COL] > 0
+merged.loc[positive_missing, "log_missing"] = np.log(
+    merged.loc[positive_missing, MISS_COL]
+)
+
+plt.figure()
+for sex, sub in merged.groupby("sex_group"):
+    plt.hist(
+        sub["log_missing"].dropna(),
+        bins=50,
+        alpha=0.5,
+        label=sex,
+    )
+plt.xlabel("log(PGS003852_MISSING_PCT)")
+plt.ylabel("Count")
+plt.title("Distribution of log(missingness) by genetic sex")
+plt.legend()
+plt.show()
+
+plt.figure()
+for sex, sub in merged.groupby("sex_group"):
+    plt.hist(
+        sub[SCORE_COL].dropna(),
+        bins=50,
+        alpha=0.5,
+        label=sex,
+    )
+plt.xlabel("PGS003852_AVG")
+plt.ylabel("Count")
+plt.title("Distribution of PGS003852_AVG by genetic sex")
+plt.legend()
+plt.show()
+```
+
+There is no large visible bias, which is good.
+
+<img width="589" height="455" alt="image" src="https://github.com/user-attachments/assets/18b7f98a-e80d-4858-8b1b-bc61edeefec2" />
+
+Let's check AUC:
+```
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
+if "sex_df" not in globals():
+    raise RuntimeError("sex_df is not defined; load the genetic sex table in a previous cell.")
+if "cases" not in globals():
+    raise RuntimeError("cases is not defined; construct the colorectal cancer case set (incl. Z85.038, Z85.04x) first.")
+
+sscore = pd.read_csv("../../arrays.sscore", sep="\t")
+iid_col = sscore.columns[0]
+sscore[iid_col] = sscore[iid_col].astype(str)
+
+if "PGS003852_AVG" not in sscore.columns:
+    raise RuntimeError("PGS003852_AVG not found in ../../arrays.sscore.")
+
+id_candidates = [
+    "person_id",
+    "participant_id",
+    "aou_participant_id",
+    "research_id",
+    "sample_id",
+    "person_id_src",
+]
+iid_values = set(sscore[iid_col])
+best_id = None
+best_overlap = -1
+for c in id_candidates:
+    if c in sex_df.columns:
+        ids = set(sex_df[c].astype(str))
+        ov = len(iid_values & ids)
+        if ov > best_overlap:
+            best_overlap = ov
+            best_id = c
+
+if best_id is None or best_overlap == 0:
+    raise RuntimeError("Could not match IIDs in arrays.sscore to any ID column in sex_df.")
+
+sex_use = sex_df[[best_id, "dragen_sex_ploidy"]].copy()
+sex_use[best_id] = sex_use[best_id].astype(str)
+sex_use = sex_use.rename(columns={best_id: iid_col})
+
+df = sscore.merge(sex_use, on=iid_col, how="left")
+
+case_set = set(pd.Series(cases, dtype=str))
+df["case"] = df[iid_col].isin(case_set).astype("i1")
+
+df["sex_group"] = df["dragen_sex_ploidy"].where(
+    df["dragen_sex_ploidy"].isin(["XX", "XY"]),
+    "Other",
+)
+
+rows = []
+for g in ["XX", "XY", "Other"]:
+    sub = df[(df["sex_group"] == g) & df["PGS003852_AVG"].notna()]
+    n = len(sub)
+    n_cases = int(sub["case"].sum())
+    n_ctrl = n - n_cases
+    if n_cases > 0 and n_ctrl > 0:
+        auc = float(roc_auc_score(sub["case"], sub["PGS003852_AVG"]))
+    else:
+        auc = np.nan
+    rows.append(
+        {
+            "sex_group": g,
+            "n": n,
+            "cases": n_cases,
+            "controls": n_ctrl,
+            "AUC_PGS003852": auc,
+        }
+    )
+
+print(pd.DataFrame(rows))
+```
+
+AUC looks about the same in each group (0.566504 in XX, 0.563028 in XY).
+
+Let's check prevalence per-group:
+```
+import pandas as pd
+import numpy as np
+
+g = (
+    df.groupby("sex_group")["case"]
+      .agg(cases="sum", n="count")
+      .assign(prevalence_pct=lambda x: 100 * x["cases"] / x["n"])
+      .reset_index()
+)
+
+for _, row in g.iterrows():
+    print(
+        f"{row['sex_group']}: "
+        f"{row['cases']} / {int(row['n'])} "
+        f"({row['prevalence_pct']:.3f}%)"
+    )
+```
+Other: 259 / 33941 (0.763%)
+XX: 2089 / 252079 (0.829%)
+XY: 1713 / 161258 (1.062%)
+
