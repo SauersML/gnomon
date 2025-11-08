@@ -188,3 +188,336 @@ fn classify_chromosome(label: &str) -> Option<Chromosome> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct VariantSpec {
+        chrom: &'static str,
+        pos: u64,
+        genotypes: Vec<u8>,
+    }
+
+    impl VariantSpec {
+        fn new(chrom: &'static str, pos: u64, female_code: u8, male_code: u8) -> Self {
+            Self {
+                chrom,
+                pos,
+                genotypes: vec![female_code, male_code],
+            }
+        }
+    }
+
+    fn encode_variant(codes: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; (codes.len() + 3) / 4];
+        for (idx, &code) in codes.iter().enumerate() {
+            let byte_idx = idx / 4;
+            let shift = (idx % 4) * 2;
+            bytes[byte_idx] |= (code & 0b11) << shift;
+        }
+        bytes
+    }
+
+    fn write_plink_dataset(
+        dir: &Path,
+        stem: &str,
+        variants: &[VariantSpec],
+    ) -> std::io::Result<std::path::PathBuf> {
+        let bed_path = dir.join(format!("{stem}.bed"));
+        let bim_path = dir.join(format!("{stem}.bim"));
+        let fam_path = dir.join(format!("{stem}.fam"));
+
+        let mut bed_bytes = Vec::with_capacity(3 + variants.len());
+        bed_bytes.extend_from_slice(&[0x6c, 0x1b, 0x01]);
+        for variant in variants {
+            let encoded = encode_variant(&variant.genotypes);
+            bed_bytes.extend_from_slice(&encoded);
+        }
+        fs::write(&bed_path, bed_bytes)?;
+
+        let mut bim_lines = String::new();
+        for (idx, variant) in variants.iter().enumerate() {
+            bim_lines.push_str(&format!(
+                "{}\tvar{}\t0\t{}\tA\tG
+",
+                variant.chrom,
+                idx + 1,
+                variant.pos
+            ));
+        }
+        fs::write(&bim_path, bim_lines)?;
+
+        let fam_contents = "FAM1\tF1\t0\t0\t2\t-9
+FAM2\tM1\t0\t0\t1\t-9
+";
+        fs::write(&fam_path, fam_contents)?;
+
+        Ok(bed_path)
+    }
+
+    #[test]
+    fn classify_chromosome_recognizes_xy_labels() {
+        assert_eq!(classify_chromosome("X"), Some(Chromosome::X));
+        assert_eq!(classify_chromosome("x"), Some(Chromosome::X));
+        assert_eq!(classify_chromosome("23"), Some(Chromosome::X));
+        assert_eq!(classify_chromosome("Y"), Some(Chromosome::Y));
+        assert_eq!(classify_chromosome("y"), Some(Chromosome::Y));
+        assert_eq!(classify_chromosome("24"), Some(Chromosome::Y));
+        assert_eq!(classify_chromosome("chr1"), None);
+    }
+
+    #[test]
+    fn infer_build_from_keys_detects_build_thresholds() {
+        let keys = vec![VariantKey::new("chrX", 155_800_000)];
+        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build38);
+
+        let keys = vec![VariantKey::new("X", 155_000_000)];
+        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build37);
+
+        let keys: Vec<VariantKey> = Vec::new();
+        assert_eq!(infer_build_from_keys(&keys), GenomeBuild::Build38);
+    }
+
+    #[test]
+    fn synthetic_plink_dataset_produces_expected_calls() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let mut variants = Vec::new();
+
+        for i in 0..10u64 {
+            let female_code = if i < 8 { 2 } else { 0 };
+            variants.push(VariantSpec::new("X", 20_000 + i, female_code, 0));
+        }
+
+        let non_par_total = 990u64;
+        for i in 0..non_par_total {
+            let pos = if i == non_par_total - 1 {
+                155_800_000
+            } else {
+                3_000_000 + i
+            };
+            let female_code = if i < 791 || i == non_par_total - 1 {
+                2
+            } else {
+                0
+            };
+            variants.push(VariantSpec::new("X", pos, female_code, 0));
+        }
+
+        for i in 0..9u64 {
+            variants.push(VariantSpec::new("Y", 50_000 + i, 1, 0));
+        }
+        variants.push(VariantSpec::new("Y", 2_655_000, 1, 3));
+
+        for i in 0..55u64 {
+            variants.push(VariantSpec::new("Y", 3_000_000 + i, 1, 0));
+        }
+
+        let bed_path = write_plink_dataset(dir.path(), "synthetic", &variants)?;
+
+        let output_path = infer_sex_to_tsv(&bed_path)?;
+        let tsv_contents = fs::read_to_string(&output_path)?;
+
+        let mut calls = HashMap::new();
+        for line in tsv_contents.lines().skip(1) {
+            let mut parts = line.split('\t');
+            let iid = parts.next().unwrap().to_string();
+            let sex = parts.next().unwrap().to_string();
+            calls.insert(iid, sex);
+        }
+
+        assert_eq!(calls.get("F1").map(String::as_str), Some("female"));
+        assert_eq!(calls.get("M1").map(String::as_str), Some("male"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn inference_report_includes_expected_evidence_votes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempdir()?;
+        let mut variants = Vec::new();
+
+        for i in 0..200u64 {
+            let female_code = if i < 160 { 2 } else { 0 };
+            variants.push(VariantSpec::new("X", 20_000 + i, female_code, 0));
+        }
+        for i in 0..1_000u64 {
+            let female_code = if i < 800 { 2 } else { 0 };
+            variants.push(VariantSpec::new("X", 3_000_000 + i, female_code, 0));
+        }
+        for i in 0..50u64 {
+            variants.push(VariantSpec::new("Y", 20_000 + i, 0, 0));
+        }
+        for i in 0..60u64 {
+            variants.push(VariantSpec::new("Y", 3_000_000 + i, 1, 0));
+        }
+        variants.push(VariantSpec::new("Y", 2_655_000, 1, 3));
+
+        let bed_path = write_plink_dataset(dir.path(), "evidence", &variants)?;
+
+        let dataset = GenotypeDataset::open(&bed_path)?;
+        let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        let records = collect_inference(&dataset, &keys)?;
+
+        let female = records
+            .iter()
+            .find(|record| record.individual_id == "F1")
+            .unwrap();
+        assert_eq!(female.inference.final_call, InferredSex::Female);
+        let (x_ratio, x_vote) = female
+            .inference
+            .report
+            .x_heterozygosity_check
+            .expect("female sample should have X heterozygosity evidence");
+        assert!((x_ratio - 0.8).abs() < 1e-9);
+        assert_eq!(x_vote, InferredSex::Female);
+        let (non_par_y, par_y, y_vote) = female
+            .inference
+            .report
+            .y_presence_check
+            .expect("female sample should have Y presence report");
+        assert_eq!((non_par_y, par_y, y_vote), (0, 50, InferredSex::Female));
+        assert!(female.inference.report.sry_presence_check.is_none());
+        let (ratio, vote) = female
+            .inference
+            .report
+            .par_non_par_het_check
+            .expect("female sample should have PAR/non-PAR heterozygosity evidence");
+        assert!((ratio - 1.0).abs() < 1e-9);
+        assert_eq!(vote, InferredSex::Female);
+        assert_eq!(female.inference.report.final_female_votes, 3);
+        assert_eq!(female.inference.report.final_male_votes, 0);
+
+        let male = records
+            .iter()
+            .find(|record| record.individual_id == "M1")
+            .unwrap();
+        assert_eq!(male.inference.final_call, InferredSex::Male);
+        let (male_ratio, male_vote) = male
+            .inference
+            .report
+            .x_heterozygosity_check
+            .expect("male sample should have X heterozygosity report");
+        assert_eq!(male_ratio, 0.0);
+        assert_eq!(male_vote, InferredSex::Male);
+        let (male_non_par_y, male_par_y, male_y_vote) = male
+            .inference
+            .report
+            .y_presence_check
+            .expect("male sample should have Y presence report");
+        assert_eq!(male_non_par_y, 60);
+        assert_eq!(male_par_y, 51);
+        assert_eq!(male_y_vote, InferredSex::Male);
+        assert_eq!(
+            male.inference.report.sry_presence_check,
+            Some(InferredSex::Male)
+        );
+        let (male_ratio, male_par_vote) = male
+            .inference
+            .report
+            .par_non_par_het_check
+            .expect("male sample should have PAR/non-PAR ratio");
+        assert_eq!(male_ratio, -1.0);
+        assert_eq!(male_par_vote, InferredSex::Male);
+        assert_eq!(male.inference.report.final_male_votes, 4);
+        assert_eq!(male.inference.report.final_female_votes, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn heterozygosity_vote_requires_minimum_x_variants() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let mut variants = Vec::new();
+
+        for i in 0..999u64 {
+            variants.push(VariantSpec::new("X", 3_000_000 + i, 2, 0));
+        }
+        for i in 0..50u64 {
+            variants.push(VariantSpec::new("Y", 20_000 + i, 0, 1));
+        }
+        for i in 0..60u64 {
+            variants.push(VariantSpec::new("Y", 3_000_000 + i, 1, 0));
+        }
+        variants.push(VariantSpec::new("Y", 2_655_000, 1, 3));
+
+        let bed_path = write_plink_dataset(dir.path(), "min_threshold", &variants)?;
+
+        let dataset = GenotypeDataset::open(&bed_path)?;
+        let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        let records = collect_inference(&dataset, &keys)?;
+
+        let female = records
+            .iter()
+            .find(|record| record.individual_id == "F1")
+            .unwrap();
+        assert_eq!(female.inference.final_call, InferredSex::Female);
+        assert!(female.inference.report.x_heterozygosity_check.is_none());
+        let (non_par_y, par_y, y_vote) = female
+            .inference
+            .report
+            .y_presence_check
+            .expect("female sample should have a Y presence report");
+        assert_eq!((non_par_y, par_y, y_vote), (0, 50, InferredSex::Female));
+        assert!(female.inference.report.par_non_par_het_check.is_none());
+
+        let male = records
+            .iter()
+            .find(|record| record.individual_id == "M1")
+            .unwrap();
+        assert_eq!(male.inference.final_call, InferredSex::Male);
+        assert!(male.inference.report.x_heterozygosity_check.is_none());
+        let (male_non_par_y, male_par_y, male_y_vote) = male
+            .inference
+            .report
+            .y_presence_check
+            .expect("male sample should have a Y presence report");
+        assert_eq!(male_non_par_y, 60);
+        assert_eq!(male_par_y, 1);
+        assert_eq!(male_y_vote, InferredSex::Male);
+        assert_eq!(
+            male.inference.report.sry_presence_check,
+            Some(InferredSex::Male)
+        );
+        let (male_ratio, male_vote) = male
+            .inference
+            .report
+            .par_non_par_het_check
+            .expect("male sample should have a PAR/non-PAR report");
+        assert_eq!(male_ratio, -1.0);
+        assert_eq!(male_vote, InferredSex::Male);
+
+        Ok(())
+    }
+
+    #[test]
+    fn inference_defaults_to_male_without_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let variants = vec![VariantSpec::new("X", 20_000, 1, 1)];
+        let bed_path = write_plink_dataset(dir.path(), "empty", &variants)?;
+
+        let dataset = GenotypeDataset::open(&bed_path)?;
+        let keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
+        assert_eq!(keys.len(), 1);
+        let records = collect_inference(&dataset, &keys)?;
+
+        for record in records {
+            assert_eq!(record.inference.final_call, InferredSex::Male);
+            assert_eq!(record.inference.report.final_male_votes, 0);
+            assert_eq!(record.inference.report.final_female_votes, 0);
+            assert!(record.inference.report.x_heterozygosity_check.is_none());
+            assert!(record.inference.report.y_presence_check.is_none());
+            assert!(record.inference.report.sry_presence_check.is_none());
+            assert!(record.inference.report.par_non_par_het_check.is_none());
+        }
+
+        Ok(())
+    }
+}
