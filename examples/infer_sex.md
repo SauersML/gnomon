@@ -162,3 +162,8 @@ print("\nBreakdown of 'Other' among participants with microarray data:")
 print(array_other.value_counts().sort_index())
 ```
 
+Let's run a polygenic score for colorectal cancer:
+```
+!../../gnomon/target/release/gnomon score "PGS003852" ../../arrays
+```
+
