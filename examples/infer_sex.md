@@ -432,6 +432,44 @@ Other: 259 / 33941 (0.763%)
 XX: 2089 / 252079 (0.829%)
 XY: 1713 / 161258 (1.062%)
 
+Let's define age:
+```
+import os
+import pandas as pd
+from google.cloud import bigquery as bq
+
+cdr_id = os.environ["WORKSPACE_CDR"]
+iid_col = next(c for c in ["#IID", "IID", "person_id", "research_id", "sample_id", "ID"] if c in df.columns)
+
+client = bq.Client()
+
+yob = client.query(
+    f"SELECT person_id, year_of_birth FROM `{cdr_id}.person`"
+).to_dataframe()
+yob["person_id"] = yob["person_id"].astype(str)
+
+obs = client.query(
+    f"""
+    SELECT person_id,
+           EXTRACT(YEAR FROM MAX(observation_period_end_date)) AS obs_end_year
+    FROM `{cdr_id}.observation_period`
+    GROUP BY person_id
+    """
+).to_dataframe()
+obs["person_id"] = obs["person_id"].astype(str)
+
+demo = yob.merge(obs, on="person_id", how="inner")
+demo["year_of_birth"] = pd.to_numeric(demo["year_of_birth"], errors="coerce")
+demo["AGE"] = (demo["obs_end_year"] - demo["year_of_birth"]).clip(lower=0, upper=120)
+
+df_age = df.merge(
+    demo[["person_id", "AGE"]],
+    left_on=iid_col,
+    right_on="person_id",
+    how="left"
+).rename(columns={"AGE": "age"})
+```
+
 Let's check the age distribution in each group:
 ```
 import pandas as pd
