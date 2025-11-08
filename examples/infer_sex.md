@@ -530,3 +530,8 @@ print(res.assign(prevalence_pct=lambda d: d["prevalence"] * 100)[
     ["group", "n", "cases", "prevalence_pct", "ci_low", "ci_high"]
 ])
 ```
+
+Sex chromosome ploidy is relevant to understanding colorectal cancer risk:
+
+<img width="690" height="440" alt="image" src="https://github.com/user-attachments/assets/17f9eac5-b3c1-433b-9aac-80ffa3f7550f" />
+
