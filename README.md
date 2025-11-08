@@ -19,11 +19,14 @@ Gnomon is a high-performance Rust engine for computing and calibrating polygenic
 
 ## Quick Start
 
-```bash
+```
 # Install Rust nightly
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
+```
 
+Run some commands:
+```
 # Build gnomon
 git clone https://github.com/SauersML/gnomon.git
 cd gnomon
