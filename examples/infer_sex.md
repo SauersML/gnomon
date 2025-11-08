@@ -455,4 +455,78 @@ if not sub.empty:
 ```
 
 
-XO and X0 individuals are driving this trend, with a mean age of around 80.
+XO and X0 individuals are driving this trend, with a mean age of around 80. Mosaic loss of X is at a fairly high prevalence in women over 70 years old, and similarly in men for mosaic loss of the Y chromosome. I believe that this trend is due to somatic mosaicism. This ploidy data is from short-read WGS, which includes samples using blood-derived DNA.
+
+Let's check colorectal cancer prevalences: 
+```
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def wilson_ci(k, n, z=1.96):
+    if n == 0:
+        return (np.nan, np.nan)
+    p = k / n
+    denom = 1 + (z**2) / n
+    center = (p + (z**2) / (2 * n)) / denom
+    margin = z * np.sqrt(p * (1 - p) / n + (z**2) / (4 * n**2)) / denom
+    return center - margin, center + margin
+
+rows = []
+
+x0_xo_mask = df["dragen_sex_ploidy"].isin(["X0", "XO"])
+for label, mask in [
+    ("X0/XO", x0_xo_mask),
+    ("XXX", df["dragen_sex_ploidy"] == "XXX"),
+    ("XXY", df["dragen_sex_ploidy"] == "XXY"),
+    ("XYY", df["dragen_sex_ploidy"] == "XYY"),
+    ("XY", df["dragen_sex_ploidy"] == "XY"),
+    ("XX", df["dragen_sex_ploidy"] == "XX"),
+]:
+    sub = df[mask]
+    n = int(len(sub))
+    k = int(sub["case"].sum()) if n > 0 else 0
+    p = (k / n) if n > 0 else np.nan
+    lo, hi = wilson_ci(k, n)
+    rows.append(
+        {
+            "group": label,
+            "n": n,
+            "cases": k,
+            "prevalence": p,
+            "ci_low": lo,
+            "ci_high": hi,
+        }
+    )
+
+res = pd.DataFrame(rows)
+
+x = np.arange(len(res))
+y = res["prevalence"].to_numpy()
+yerr = np.vstack(
+    [
+        y - res["ci_low"].to_numpy(),
+        res["ci_high"].to_numpy() - y,
+    ]
+)
+
+plt.figure(figsize=(8, 5))
+plt.bar(x, y * 100)
+plt.errorbar(
+    x,
+    y * 100,
+    yerr=yerr * 100,
+    fmt="none",
+    capsize=4,
+    linewidth=1,
+)
+plt.xticks(x, res["group"])
+plt.ylabel("Prevalence (%)")
+plt.title("Colorectal cancer prevalence with 95% CI by genetic sex/ploidy group")
+plt.tight_layout()
+plt.show()
+
+print(res.assign(prevalence_pct=lambda d: d["prevalence"] * 100)[
+    ["group", "n", "cases", "prevalence_pct", "ci_low", "ci_high"]
+])
+```
