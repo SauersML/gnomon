@@ -15,6 +15,9 @@ pub mod adapt_plink2;
 #[path = "../score/mod.rs"]
 pub mod score;
 
+#[path = "../terms/mod.rs"]
+pub mod terms;
+
 pub mod batch {
     pub use crate::score::batch::*;
 }

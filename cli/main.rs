@@ -29,6 +29,7 @@ use gnomon::calibrate::survival_data::{
 };
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
+use gnomon::terms::infer_sex_to_tsv;
 use std::collections::HashMap;
 
 #[derive(Clone, ValueEnum)]
@@ -142,6 +143,17 @@ pub struct InferArgs {
     /// Disable applying the post-process calibration layer (enabled by default)
     #[arg(long)]
     pub no_calibration: bool,
+}
+
+#[derive(Args)]
+pub struct TermsArgs {
+    /// Path to genotype dataset (PLINK .bed/.bim/.fam prefix or VCF/BCF file)
+    #[arg(value_name = "GENOTYPE_PATH")]
+    pub genotype_path: PathBuf,
+
+    /// Run sex inference on the provided genotype dataset
+    #[arg(long)]
+    pub sex: bool,
 }
 
 pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -732,6 +744,10 @@ enum Commands {
         genotype_path: PathBuf,
     },
 
+    /// Infer sample-level terms from genotype data
+    #[command(about = "Infer sample metadata terms (outputs: sex.tsv)")]
+    Terms(TermsArgs),
+
     /// Train a GAM calibration model from training data
     #[command(about = "Train GAM calibration model (outputs: model.toml)")]
     Train(TrainArgs),
@@ -763,6 +779,7 @@ fn main() {
             bp_window,
         }) => run_map_fit(genotype_path, list, components, ld, sites_window, bp_window),
         Some(Commands::Project { genotype_path }) => run_map_project(genotype_path),
+        Some(Commands::Terms(args)) => run_terms(args),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
         None => {
@@ -821,6 +838,20 @@ fn run_map_fit(
 fn run_map_project(genotype_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     map_cli::run(map_cli::MapCommand::Project { genotype_path })
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.sex {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "No term inference selected. Use --sex to run sex inference.",
+        )));
+    }
+
+    let output_path = infer_sex_to_tsv(&args.genotype_path)
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
+    println!("Sex inference results written to {}", output_path.display());
+    Ok(())
 }
 
 fn run_score(
