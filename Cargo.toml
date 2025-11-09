@@ -106,3 +106,7 @@ grep = "0.3.2"
 name = "path_benchmark"
 harness = false
 
+[[test]]
+name = "calibrate"
+path = "calibrate/tests/mod.rs"
+
