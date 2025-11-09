@@ -949,15 +949,11 @@ pub fn fit_model_for_fixed_rho<'a>(
     );
 
     if matches!(link_function, LinkFunction::Identity) {
-        let weights = prior_weights.to_owned();
-        let working_response = y.to_owned();
-        let offset_vec = offset.to_owned();
-
         let (pls_result, _) = solve_penalized_least_squares(
             x_transformed.view(),
-            working_response.view(),
-            weights.view(),
-            offset_vec.view(),
+            y,
+            prior_weights,
+            offset.view(),
             eb,
             &reparam_result.e_transformed,
             &reparam_result.s_transformed,
@@ -966,44 +962,37 @@ pub fn fit_model_for_fixed_rho<'a>(
             link_function,
         )?;
 
-        let beta_transformed = pls_result.beta.clone();
+        let beta_transformed = pls_result.beta;
+        let penalized_hessian = pls_result.penalized_hessian;
+        let edf = pls_result.edf;
 
-        let mut eta = offset_vec;
+        let prior_weights_owned = prior_weights.to_owned();
+        let mut eta = offset.to_owned();
         eta += &x_transformed.dot(&beta_transformed);
-        let mu = eta.clone();
+        let final_mu = eta.clone();
+        let final_z = y.to_owned();
 
-        let mut weighted_residual = eta.clone();
-        weighted_residual -= &working_response;
-        weighted_residual *= &weights;
-        let mut gradient = x_transformed.t().dot(&weighted_residual);
+        let mut weighted_residual = final_mu.clone();
+        weighted_residual -= &final_z;
+        weighted_residual *= &prior_weights_owned;
+        let gradient_data = x_transformed.t().dot(&weighted_residual);
         let s_beta = reparam_result.s_transformed.dot(&beta_transformed);
+        let mut gradient = gradient_data;
         gradient += &s_beta;
+        let penalty_term = beta_transformed.dot(&s_beta);
+        let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
+        let mut stabilized_hessian = penalized_hessian.clone();
+        ensure_positive_definite(&mut stabilized_hessian)?;
+
         let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-
-        let penalized_hessian_transformed = pls_result.penalized_hessian.clone();
-        let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-        ensure_positive_definite(&mut stabilized_hessian_transformed)?;
-
-        let mut edf = calculate_edf(
-            &penalized_hessian_transformed,
-            &reparam_result.e_transformed,
-        )?;
-        if !edf.is_finite() || edf.is_nan() {
-            let p = penalized_hessian_transformed.ncols() as f64;
-            let r = reparam_result.e_transformed.nrows() as f64;
-            edf = (p - r).max(0.0);
-        }
-
-        let stable_penalty_term = beta_transformed.dot(&s_beta);
-        let deviance = calculate_deviance(y, &mu, link_function, prior_weights);
-        let max_abs_eta = eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let max_abs_eta = final_mu.iter().copied().map(f64::abs).fold(0.0, f64::max);
 
         let working_state = WorkingState {
-            eta: eta.clone(),
+            eta: final_mu.clone(),
             gradient: gradient.clone(),
-            hessian: penalized_hessian_transformed.clone(),
+            hessian: penalized_hessian.clone(),
             deviance,
-            penalty_term: stable_penalty_term,
+            penalty_term,
         };
 
         let working_summary = WorkingModelPirlsResult {
@@ -1013,24 +1002,24 @@ pub fn fit_model_for_fixed_rho<'a>(
             iterations: 1,
             last_gradient_norm: gradient_norm,
             last_deviance_change: 0.0,
-            last_step_size: 0.0,
+            last_step_size: 1.0,
             last_step_halving: 0,
             max_abs_eta,
         };
 
         let pirls_result = PirlsResult {
             beta_transformed,
-            penalized_hessian_transformed,
-            stabilized_hessian_transformed,
+            penalized_hessian_transformed: penalized_hessian,
+            stabilized_hessian_transformed: stabilized_hessian,
             deviance,
             edf,
-            stable_penalty_term,
+            stable_penalty_term: penalty_term,
             firth_log_det: None,
-            final_weights: weights.clone(),
-            final_mu: mu.clone(),
-            solve_weights: weights,
-            solve_working_response: working_response.clone(),
-            solve_mu: mu,
+            final_weights: prior_weights_owned.clone(),
+            final_mu: final_mu.clone(),
+            solve_weights: prior_weights_owned,
+            solve_working_response: final_z.clone(),
+            solve_mu: final_mu.clone(),
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
