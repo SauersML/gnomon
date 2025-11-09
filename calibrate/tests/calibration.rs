@@ -431,3 +431,135 @@ fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::e
 
     Ok(())
 }
+
+#[test]
+fn cli_train_small_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
+    const TOTAL_ROWS: usize = 3_300;
+    const MALE_ROWS: usize = 1_980;
+    const FEMALE_ROWS: usize = 1_320;
+    const MALE_CASES: usize = 21;
+    const FEMALE_CASES: usize = 10;
+    const TARGET_PREVALENCE: f64 = 31.0 / 3_300.0;
+    const MALE_TO_FEMALE_RATIO: f64 = 1.4;
+    const SCORE_EFFECT: f64 = 0.9;
+
+    let mut rng = StdRng::seed_from_u64(7_316_511);
+
+    let male_samples = simulate_cohort(&mut rng, 1.0, MALE_ROWS, MALE_CASES, SCORE_EFFECT);
+    let female_samples = simulate_cohort(&mut rng, 0.0, FEMALE_ROWS, FEMALE_CASES, SCORE_EFFECT);
+
+    assert_eq!(male_samples.len(), MALE_ROWS);
+    assert_eq!(female_samples.len(), FEMALE_ROWS);
+
+    let male_case_count = male_samples
+        .iter()
+        .filter(|sample| sample.phenotype == 1.0)
+        .count();
+    let female_case_count = female_samples
+        .iter()
+        .filter(|sample| sample.phenotype == 1.0)
+        .count();
+    assert_eq!(male_case_count, MALE_CASES);
+    assert_eq!(female_case_count, FEMALE_CASES);
+
+    let male_mean_score =
+        male_samples.iter().map(|sample| sample.score).sum::<f64>() / (MALE_ROWS as f64);
+    let female_mean_score = female_samples
+        .iter()
+        .map(|sample| sample.score)
+        .sum::<f64>()
+        / (FEMALE_ROWS as f64);
+    assert!(
+        (male_mean_score - female_mean_score).abs() < 1.0e-12,
+        "sex-specific score means diverged: male={male_mean_score}, female={female_mean_score}"
+    );
+
+    let male_prevalence = (male_case_count as f64) / (MALE_ROWS as f64);
+    let female_prevalence = (female_case_count as f64) / (FEMALE_ROWS as f64);
+    let prevalence_ratio = male_prevalence / female_prevalence;
+    assert!(
+        (prevalence_ratio - MALE_TO_FEMALE_RATIO).abs() < 2.0e-3,
+        "prevalence ratio deviates: {prevalence_ratio}"
+    );
+    let overall_prevalence = (male_case_count + female_case_count) as f64 / (TOTAL_ROWS as f64);
+    assert!(
+        (overall_prevalence - TARGET_PREVALENCE).abs() < 1.0e-12,
+        "overall prevalence mismatch: {overall_prevalence}"
+    );
+
+    let tmp = tempdir()?;
+    let training_path = tmp.path().join("small_train.tsv");
+
+    let mut samples = male_samples;
+    samples.extend(female_samples);
+    assert_eq!(samples.len(), TOTAL_ROWS);
+    write_training_file(training_path.as_path(), &samples)?;
+
+    let exe = env!("CARGO_BIN_EXE_gnomon");
+    let output = Command::new(exe)
+        .current_dir(tmp.path())
+        .args([
+            "train",
+            training_path
+                .to_str()
+                .expect("training path should be valid UTF-8"),
+            "--num-pcs",
+            "0",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "gnomon CLI failed: status={:?}\nstdout:{}\nstderr:{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let model_path = tmp.path().join("model.toml");
+    assert!(model_path.exists(), "expected model.toml to be created");
+    let metadata = fs::metadata(&model_path)?;
+    assert!(metadata.len() > 0, "model.toml should not be empty");
+
+    let prediction_input_path = tmp.path().join("small_predict.tsv");
+    write_prediction_file(prediction_input_path.as_path(), &samples)?;
+
+    let infer_output = Command::new(exe)
+        .current_dir(tmp.path())
+        .args([
+            "infer",
+            prediction_input_path
+                .to_str()
+                .expect("prediction path should be valid UTF-8"),
+            "--model",
+            model_path
+                .to_str()
+                .expect("model path should be valid UTF-8"),
+        ])
+        .output()?;
+
+    assert!(
+        infer_output.status.success(),
+        "gnomon CLI inference failed: status={:?}\nstdout:{}\nstderr:{}",
+        infer_output.status,
+        String::from_utf8_lossy(&infer_output.stdout),
+        String::from_utf8_lossy(&infer_output.stderr)
+    );
+
+    let predictions_path = tmp.path().join("predictions.tsv");
+    assert!(
+        predictions_path.exists(),
+        "expected predictions.tsv to be created"
+    );
+
+    let predictions = extract_predictions(predictions_path.as_path(), TOTAL_ROWS)?;
+    let observed = Array1::from_vec(samples.iter().map(|sample| sample.phenotype).collect());
+    let predicted = Array1::from_vec(predictions);
+    let auc_value = auc(&observed, &predicted);
+    assert!(
+        auc_value > 0.5,
+        "expected inference AUC to exceed 0.5, got {auc_value}"
+    );
+
+    Ok(())
+}
