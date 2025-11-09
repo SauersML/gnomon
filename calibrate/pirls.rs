@@ -608,12 +608,15 @@ where
             break;
         }
 
-        if candidate_grad_norm < options.convergence_tolerance {
-            status = if deviance_change.abs() < options.convergence_tolerance {
-                PirlsStatus::Converged
-            } else {
-                PirlsStatus::StalledAtValidMinimum
-            };
+        // Only treat the iteration as converged once both the gradient norm and
+        // the change in penalized deviance are simultaneously within tolerance.
+        // This preserves the conservative mgcv-style stopping rule while
+        // allowing the loop to take an additional iteration when a Newton step
+        // makes a large deviance improvement that still leaves a tiny gradient.
+        if candidate_grad_norm < options.convergence_tolerance
+            && deviance_change.abs() < options.convergence_tolerance
+        {
+            status = PirlsStatus::Converged;
             final_state = Some(candidate_state);
             break;
         }
