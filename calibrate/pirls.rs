@@ -576,6 +576,11 @@ where
             .sum::<f64>()
             .sqrt();
         let deviance_change = current_penalized - candidate_penalized;
+        let deviance_scale = current_penalized
+            .abs()
+            .max(candidate_penalized.abs())
+            .max(1.0);
+        let deviance_tolerance = options.convergence_tolerance * deviance_scale;
         #[cfg(test)]
         record_penalized_deviance(candidate_penalized);
 
@@ -609,7 +614,7 @@ where
         }
 
         if candidate_grad_norm < options.convergence_tolerance {
-            status = if deviance_change.abs() < options.convergence_tolerance {
+            status = if deviance_change.abs() < deviance_tolerance {
                 PirlsStatus::Converged
             } else {
                 PirlsStatus::StalledAtValidMinimum
@@ -618,7 +623,7 @@ where
             break;
         }
 
-        if deviance_change.abs() < options.convergence_tolerance {
+        if deviance_change.abs() < deviance_tolerance {
             status = PirlsStatus::Converged;
             final_state = Some(candidate_state);
             break;
