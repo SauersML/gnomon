@@ -941,12 +941,94 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
-    let workspace = PirlsWorkspace::new(
+    let mut workspace = PirlsWorkspace::new(
         x_transformed.nrows(),
         x_transformed.ncols(),
         eb_rows,
         e_rows,
     );
+
+    if matches!(link_function, LinkFunction::Identity) {
+        let (pls_result, _) = solve_penalized_least_squares(
+            x_transformed.view(),
+            y,
+            prior_weights,
+            offset.view(),
+            eb,
+            &reparam_result.e_transformed,
+            &reparam_result.s_transformed,
+            &mut workspace,
+            y,
+            link_function,
+        )?;
+
+        let beta_transformed = pls_result.beta;
+        let penalized_hessian = pls_result.penalized_hessian;
+        let edf = pls_result.edf;
+
+        let prior_weights_owned = prior_weights.to_owned();
+        let mut eta = offset.to_owned();
+        eta += &x_transformed.dot(&beta_transformed);
+        let final_mu = eta.clone();
+        let final_z = y.to_owned();
+
+        let mut weighted_residual = final_mu.clone();
+        weighted_residual -= &final_z;
+        weighted_residual *= &prior_weights_owned;
+        let gradient_data = x_transformed.t().dot(&weighted_residual);
+        let s_beta = reparam_result.s_transformed.dot(&beta_transformed);
+        let mut gradient = gradient_data;
+        gradient += &s_beta;
+        let penalty_term = beta_transformed.dot(&s_beta);
+        let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
+        let mut stabilized_hessian = penalized_hessian.clone();
+        ensure_positive_definite(&mut stabilized_hessian)?;
+
+        let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let max_abs_eta = final_mu.iter().copied().map(f64::abs).fold(0.0, f64::max);
+
+        let working_state = WorkingState {
+            eta: final_mu.clone(),
+            gradient: gradient.clone(),
+            hessian: penalized_hessian.clone(),
+            deviance,
+            penalty_term,
+        };
+
+        let working_summary = WorkingModelPirlsResult {
+            beta: beta_transformed.clone(),
+            state: working_state,
+            status: PirlsStatus::Converged,
+            iterations: 1,
+            last_gradient_norm: gradient_norm,
+            last_deviance_change: 0.0,
+            last_step_size: 1.0,
+            last_step_halving: 0,
+            max_abs_eta,
+        };
+
+        let pirls_result = PirlsResult {
+            beta_transformed,
+            penalized_hessian_transformed: penalized_hessian,
+            stabilized_hessian_transformed: stabilized_hessian,
+            deviance,
+            edf,
+            stable_penalty_term: penalty_term,
+            firth_log_det: None,
+            final_weights: prior_weights_owned.clone(),
+            final_mu: final_mu.clone(),
+            solve_weights: prior_weights_owned,
+            solve_working_response: final_z.clone(),
+            solve_mu: final_mu.clone(),
+            status: PirlsStatus::Converged,
+            iteration: 1,
+            max_abs_eta,
+            reparam_result,
+            x_transformed,
+        };
+
+        return Ok((pirls_result, working_summary));
+    }
 
     let mut working_model = GamWorkingModel::new(
         x_transformed,
