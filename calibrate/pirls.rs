@@ -827,15 +827,16 @@ pub struct PirlsResult {
     pub x_transformed: Array2<f64>,
 }
 
-fn detect_unpenalized_logit_instability(
+fn detect_logit_instability(
     link: LinkFunction,
     has_penalty: bool,
     firth_active: bool,
     summary: &WorkingModelPirlsResult,
     final_mu: &Array1<f64>,
+    final_weights: &Array1<f64>,
     y: ArrayView1<'_, f64>,
 ) -> bool {
-    if link != LinkFunction::Logit || has_penalty || firth_active {
+    if link != LinkFunction::Logit || firth_active {
         return false;
     }
 
@@ -850,6 +851,15 @@ fn detect_unpenalized_logit_instability(
         final_mu
             .iter()
             .filter(|&&m| m <= SAT_EPS || m >= 1.0 - SAT_EPS)
+            .count() as f64
+            / n
+    };
+
+    let weight_collapse_fraction = {
+        const WEIGHT_EPS: f64 = 1e-8;
+        final_weights
+            .iter()
+            .filter(|&&w| w <= WEIGHT_EPS || !w.is_finite())
             .count() as f64
             / n
     };
@@ -876,11 +886,18 @@ fn detect_unpenalized_logit_instability(
     }
     let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
 
-    max_abs_eta > 30.0
-        || sat_fraction > 0.98
-        || dev_per_sample < 1e-3
-        || beta_norm > 1e4
-        || order_separated
+    let classic_signals =
+        max_abs_eta > 30.0 || sat_fraction > 0.98 || dev_per_sample < 1e-3 || beta_norm > 1e4;
+
+    if !has_penalty {
+        return classic_signals || order_separated;
+    }
+
+    let severe_saturation = sat_fraction > 0.995 && max_abs_eta > 30.0;
+    let weights_collapsed = weight_collapse_fraction > 0.98;
+    let dev_extremely_small = dev_per_sample < 1e-6;
+
+    order_separated || severe_saturation || weights_collapsed || dev_extremely_small
 }
 
 /// P-IRLS solver that follows mgcv's architecture exactly
@@ -1095,12 +1112,13 @@ pub fn fit_model_for_fixed_rho<'a>(
     let mut status = working_summary.status.clone();
     let has_penalty = e_transformed.nrows() > 0;
     let firth_active = options.firth_bias_reduction;
-    if detect_unpenalized_logit_instability(
+    if detect_logit_instability(
         link_function,
         has_penalty,
         firth_active,
         &working_summary,
         &final_mu,
+        &final_weights,
         y,
     ) {
         status = PirlsStatus::Unstable;
