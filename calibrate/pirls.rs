@@ -1018,7 +1018,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     let penalty_effective = has_penalty
         && lambdas
             .iter()
-            .any(|&lambda| lambda > EFFECTIVE_PENALTY_LAMBDA_THRESHOLD);
+            .all(|&lambda| lambda > EFFECTIVE_PENALTY_LAMBDA_THRESHOLD);
     let firth_active = options.firth_bias_reduction;
     if detect_unpenalized_logit_instability(
         link_function,
