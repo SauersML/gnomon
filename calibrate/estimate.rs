@@ -2539,154 +2539,202 @@ pub fn optimize_external_design(
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
-        final_rho.view(),
-        x_o.view(),
-        offset_o.view(),
-        y_o.view(),
-        w_o.view(),
-        &rs_list,
-        Some(reml_state.balanced_penalty_root()),
-        &layout,
-        &cfg,
-    )?;
 
-    // Map beta back to original basis
-    let beta_orig = pirls_res.reparam_result.qs.dot(&pirls_res.beta_transformed);
-
-    // Weighted residual sum of squares for Gaussian models
-    let n = y_o.len() as f64;
-    let weighted_rss = if matches!(opts.link, LinkFunction::Identity) {
-        let fitted = {
-            let mut eta = offset_o.clone();
-            eta += &x_o.dot(&beta_orig);
-            eta
-        };
-        let resid = y_o.to_owned() - &fitted;
-        w_o.iter()
-            .zip(resid.iter())
-            .map(|(&wi, &ri)| wi * ri * ri)
-            .sum()
-    } else {
-        0.0
-    };
-
-    // EDF by block using stabilized H and penalty roots in transformed basis
-    let lambdas = final_rho.mapv(f64::exp);
-    let h = &pirls_res.stabilized_hessian_transformed;
-    let h_view = FaerArrayView::new(h);
-    enum Fact {
-        Llt(FaerLlt<f64>),
-        Ldlt(FaerLdlt<f64>),
-        Lblt(FaerLblt<f64>),
+    struct CandidateSummary {
+        beta: Array1<f64>,
+        lambdas: Array1<f64>,
+        scale: f64,
+        edf_by_block: Vec<f64>,
+        edf_total: f64,
+        cost: f64,
+        grad_norm: f64,
     }
-    impl Fact {
-        fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
-            match self {
-                Fact::Llt(f) => f.solve(rhs),
-                Fact::Ldlt(f) => f.solve(rhs),
-                Fact::Lblt(f) => f.solve(rhs),
-            }
-        }
-    }
-    let mut planner = RidgePlanner::new(h);
-    let cond_display = planner
-        .cond_estimate()
-        .map(|c| format!("{c:.2e}"))
-        .unwrap_or_else(|| "unavailable".to_string());
-    let fact = loop {
-        let ridge = planner.ridge();
-        if ridge > 0.0 {
-            let regularized = add_ridge(h, ridge);
-            let view = FaerArrayView::new(&regularized);
-            if let Ok(ch) = FaerLlt::new(view.as_ref(), Side::Lower) {
-                log::warn!(
-                    "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                break Fact::Llt(ch);
-            }
-            if let Ok(ld) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-                log::warn!(
-                    "LLᵀ failed; LDLᵀ succeeded with ridge {:.3e} (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                break Fact::Ldlt(ld);
-            }
-            if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                log::warn!(
-                    "LLᵀ/LDLᵀ failed even after ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
-                    ridge,
-                    cond_display
-                );
-                let f = FaerLblt::new(view.as_ref(), Side::Lower);
-                break Fact::Lblt(f);
-            }
+
+    let evaluate_candidate = |rho: &Array1<f64>| -> Result<CandidateSummary, EstimationError> {
+        let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
+            rho.view(),
+            x_o.view(),
+            offset_o.view(),
+            y_o.view(),
+            w_o.view(),
+            &rs_list,
+            Some(reml_state.balanced_penalty_root()),
+            &layout,
+            &cfg,
+        )?;
+
+        let beta_orig = pirls_res.reparam_result.qs.dot(&pirls_res.beta_transformed);
+        let lambdas = rho.mapv(f64::exp);
+
+        let n = y_o.len() as f64;
+        let weighted_rss = if matches!(opts.link, LinkFunction::Identity) {
+            let fitted = {
+                let mut eta = offset_o.clone();
+                eta += &x_o.dot(&beta_orig);
+                eta
+            };
+            let resid = y_o.to_owned() - &fitted;
+            w_o.iter()
+                .zip(resid.iter())
+                .map(|(&wi, &ri)| wi * ri * ri)
+                .sum()
         } else {
-            if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                break Fact::Llt(ch);
+            0.0
+        };
+
+        let h = &pirls_res.stabilized_hessian_transformed;
+        let h_view = FaerArrayView::new(h);
+        enum Fact {
+            Llt(FaerLlt<f64>),
+            Ldlt(FaerLdlt<f64>),
+            Lblt(FaerLblt<f64>),
+        }
+        impl Fact {
+            fn solve(&self, rhs: faer::MatRef<'_, f64>) -> FaerMat<f64> {
+                match self {
+                    Fact::Llt(f) => f.solve(rhs),
+                    Fact::Ldlt(f) => f.solve(rhs),
+                    Fact::Lblt(f) => f.solve(rhs),
+                }
             }
-            if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                log::warn!(
-                    "LLᵀ failed for Hessian (cond ≈ {}); using LDLᵀ without ridge",
-                    cond_display
+        }
+        let mut planner = RidgePlanner::new(h);
+        let cond_display = planner
+            .cond_estimate()
+            .map(|c| format!("{c:.2e}"))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let fact = loop {
+            let ridge = planner.ridge();
+            if ridge > 0.0 {
+                let regularized = add_ridge(h, ridge);
+                let view = FaerArrayView::new(&regularized);
+                if let Ok(ch) = FaerLlt::new(view.as_ref(), Side::Lower) {
+                    log::warn!(
+                        "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
+                        ridge,
+                        cond_display
+                    );
+                    break Fact::Llt(ch);
+                }
+                if let Ok(ld) = FaerLdlt::new(view.as_ref(), Side::Lower) {
+                    log::warn!(
+                        "LLᵀ failed; LDLᵀ succeeded with ridge {:.3e} (cond ≈ {})",
+                        ridge,
+                        cond_display
+                    );
+                    break Fact::Ldlt(ld);
+                }
+                if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
+                    log::warn!(
+                        "LLᵀ/LDLᵀ failed even after ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
+                        ridge,
+                        cond_display
+                    );
+                    let f = FaerLblt::new(view.as_ref(), Side::Lower);
+                    break Fact::Lblt(f);
+                }
+            } else {
+                if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                    break Fact::Llt(ch);
+                }
+                if let Ok(ld) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                    log::warn!(
+                        "LLᵀ failed for Hessian (cond ≈ {}); using LDLᵀ without ridge",
+                        cond_display
+                    );
+                    break Fact::Ldlt(ld);
+                }
+            }
+            planner.bump();
+        };
+
+        let mut traces = vec![0.0f64; k];
+        for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+            let ekt_arr = rs.t().to_owned();
+            let ekt_view = FaerArrayView::new(&ekt_arr);
+            let x_sol = fact.solve(ekt_view.as_ref());
+            let frob = faer_frob_inner(x_sol.as_ref(), ekt_view.as_ref());
+            traces[kk] = lambdas[kk] * frob;
+        }
+        let p_dim = pirls_res.beta_transformed.len();
+        let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
+        let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
+        let edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
+        let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
+        for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
+            let p_k = rs_k.nrows() as f64;
+            let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
+            edf_by_block.push(edf_k);
+        }
+
+        let scale = match opts.link {
+            LinkFunction::Identity => {
+                let denom = (n - edf_total).max(1.0);
+                weighted_rss / denom
+            }
+            LinkFunction::Logit => 1.0,
+        };
+
+        let cost = reml_state.compute_cost(rho)?;
+        let grad = reml_state
+            .compute_gradient(rho)
+            .unwrap_or_else(|_| Array1::from_elem(rho.len(), f64::NAN));
+        let grad_norm = {
+            let norm_sq = grad.dot(&grad);
+            let norm = norm_sq.sqrt();
+            if norm.is_finite() {
+                norm
+            } else {
+                grad_norm_reported
+            }
+        };
+
+        Ok(CandidateSummary {
+            beta: beta_orig,
+            lambdas,
+            scale,
+            edf_by_block,
+            edf_total,
+            cost,
+            grad_norm,
+        })
+    };
+
+    let mut best_rho = final_rho.clone();
+    let mut best_summary = evaluate_candidate(&best_rho)?;
+
+    if !rs_list.is_empty() {
+        let identity_rho_value = (1e6_f64).ln();
+        for (axis, rs) in rs_list.iter().enumerate() {
+            if rs.nrows() == 0 {
+                continue;
+            }
+            let mut candidate_rho = best_rho.clone();
+            if candidate_rho[axis] >= identity_rho_value {
+                continue;
+            }
+            candidate_rho[axis] = identity_rho_value;
+            let candidate_summary = evaluate_candidate(&candidate_rho)?;
+            if candidate_summary.cost + 1e-6 < best_summary.cost {
+                log::info!(
+                    "External REML optimizer falling back to high-λ identity on axis {axis} (cost {:.6} < {:.6})",
+                    candidate_summary.cost,
+                    best_summary.cost
                 );
-                break Fact::Ldlt(ld);
+                best_summary = candidate_summary;
+                best_rho = candidate_rho;
             }
         }
-        planner.bump();
-    };
-    let mut traces = vec![0.0f64; k];
-    for (kk, rs) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-        let ekt_arr = rs.t().to_owned();
-        let ekt_view = FaerArrayView::new(&ekt_arr);
-        let x_sol = fact.solve(ekt_view.as_ref());
-        let frob = faer_frob_inner(x_sol.as_ref(), ekt_view.as_ref());
-        traces[kk] = lambdas[kk] * frob;
     }
-    let p_dim = pirls_res.beta_transformed.len();
-    let penalty_rank = pirls_res.reparam_result.e_transformed.nrows();
-    let mp = (p_dim as f64 - penalty_rank as f64).max(0.0);
-    let edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
-    // Per-block EDF: use block range dimension (rank of R_k) minus λ tr(H^{-1} S_k)
-    // This better reflects penalized coefficients in the transformed basis
-    let mut edf_by_block: Vec<f64> = Vec::with_capacity(k);
-    for (kk, rs_k) in pirls_res.reparam_result.rs_transformed.iter().enumerate() {
-        let p_k = rs_k.nrows() as f64;
-        let edf_k = (p_k - traces[kk]).clamp(0.0, p_k);
-        edf_by_block.push(edf_k);
-    }
-
-    // Persist residual-based scale for Gaussian identity models
-    let scale = match opts.link {
-        LinkFunction::Identity => {
-            let denom = (n - edf_total).max(1.0);
-            weighted_rss / denom
-        }
-        LinkFunction::Logit => 1.0,
-    };
-
-    // Compute gradient norm at final rho for reporting
-    let final_grad = reml_state
-        .compute_gradient(&final_rho)
-        .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
-    let final_grad_norm_rho = final_grad.dot(&final_grad).sqrt();
-    let final_grad_norm = if final_grad_norm_rho.is_finite() {
-        final_grad_norm_rho
-    } else {
-        grad_norm_reported
-    };
 
     Ok(ExternalOptimResult {
-        beta: beta_orig,
-        lambdas: lambdas.to_owned(),
-        scale,
-        edf_by_block,
-        edf_total,
+        beta: best_summary.beta,
+        lambdas: best_summary.lambdas,
+        scale: best_summary.scale,
+        edf_by_block: best_summary.edf_by_block,
+        edf_total: best_summary.edf_total,
         iterations: iters,
-        final_grad_norm,
+        final_grad_norm: best_summary.grad_norm,
     })
 }
 
