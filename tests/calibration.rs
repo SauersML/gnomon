@@ -1,6 +1,6 @@
 use gnomon::calibrate::calibrator::{
-    CalibratorFeatures, CalibratorModel, CalibratorSpec, build_calibrator_design, fit_calibrator,
-    predict_calibrator,
+    CalibratorFeatures, CalibratorModel, CalibratorSpec, auc, build_calibrator_design,
+    fit_calibrator, predict_calibrator,
 };
 use gnomon::calibrate::model::{
     BasisConfig, LinkFunction, calibrator_enabled, reset_calibrator_flag, set_calibrator_enabled,
@@ -9,6 +9,15 @@ use gnomon::calibrate::survival::{
     CholeskyFactor, HessianFactor, delta_method_standard_errors, survival_calibrator_features,
 };
 use ndarray::{Array1, Array2, array};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
+use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::process::Command;
+use tempfile::tempdir;
 
 #[test]
 fn calibration_toggle_round_trip() {
@@ -169,4 +178,256 @@ fn logit_risk_calibration_improves_log_loss() {
         / (predictions.len() as f64);
 
     assert!(calibrated_loss < base_loss);
+}
+
+struct SimulatedSample {
+    phenotype: f64,
+    score: f64,
+    sex: f64,
+}
+
+fn simulate_cohort(
+    rng: &mut StdRng,
+    sex_value: f64,
+    n_samples: usize,
+    case_count: usize,
+    score_effect: f64,
+) -> Vec<SimulatedSample> {
+    let mut scores = Vec::with_capacity(n_samples);
+    for _ in 0..n_samples {
+        let draw: f64 = rng.sample(StandardNormal);
+        scores.push(draw);
+    }
+
+    let mean = scores.iter().sum::<f64>() / (n_samples as f64);
+    for value in &mut scores {
+        *value -= mean;
+    }
+
+    let mut liabilities = Vec::with_capacity(n_samples);
+    for &score in &scores {
+        let noise: f64 = rng.sample(StandardNormal);
+        liabilities.push(score_effect * score + noise);
+    }
+
+    let mut indices: Vec<usize> = (0..n_samples).collect();
+    indices.sort_unstable_by(|&a, &b| liabilities[b].total_cmp(&liabilities[a]));
+
+    let mut phenotypes = vec![0.0; n_samples];
+    for index in indices.into_iter().take(case_count) {
+        phenotypes[index] = 1.0;
+    }
+
+    scores
+        .into_iter()
+        .zip(phenotypes.into_iter())
+        .map(|(score, phenotype)| SimulatedSample {
+            phenotype,
+            score,
+            sex: sex_value,
+        })
+        .collect()
+}
+
+fn write_training_file(path: &Path, samples: &[SimulatedSample]) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "phenotype\tscore\tsex")?;
+    for sample in samples {
+        writeln!(
+            writer,
+            "{}\t{}\t{}",
+            sample.phenotype, sample.score, sample.sex
+        )?;
+    }
+    writer.flush()
+}
+
+fn write_prediction_file(path: &Path, samples: &[SimulatedSample]) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "sample_id\tscore\tsex")?;
+    for (index, sample) in samples.iter().enumerate() {
+        writeln!(writer, "{}\t{}\t{}", index + 1, sample.score, sample.sex)?;
+    }
+    writer.flush()
+}
+
+fn extract_predictions(
+    path: &Path,
+    expected_len: usize,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "prediction file missing header".to_string())?;
+    let columns: Vec<&str> = header.split('\t').collect();
+    let prediction_index = columns
+        .iter()
+        .position(|&column| column == "prediction")
+        .ok_or_else(|| "prediction column missing from predictions.tsv".to_string())?;
+
+    let mut predictions = Vec::with_capacity(expected_len);
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if prediction_index >= fields.len() {
+            return Err(format!(
+                "prediction column index {prediction_index} out of bounds for line: {line}"
+            )
+            .into());
+        }
+        let value: f64 = fields[prediction_index].parse().map_err(|e| {
+            format!(
+                "invalid prediction value '{}': {e}",
+                fields[prediction_index]
+            )
+        })?;
+        predictions.push(value);
+    }
+
+    if predictions.len() != expected_len {
+        return Err(format!(
+            "expected {expected_len} predictions but found {}",
+            predictions.len()
+        )
+        .into());
+    }
+
+    Ok(predictions)
+}
+
+#[test]
+fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
+    const TOTAL_ROWS: usize = 330_000;
+    const MALE_ROWS: usize = 198_000;
+    const FEMALE_ROWS: usize = 132_000;
+    const MALE_CASES: usize = 2_057;
+    const FEMALE_CASES: usize = 979;
+    const TARGET_PREVALENCE: f64 = 0.0092;
+    const MALE_TO_FEMALE_RATIO: f64 = 1.4;
+    const SCORE_EFFECT: f64 = 0.9;
+
+    let mut rng = StdRng::seed_from_u64(7_316_511);
+
+    let male_samples = simulate_cohort(&mut rng, 1.0, MALE_ROWS, MALE_CASES, SCORE_EFFECT);
+    let female_samples = simulate_cohort(&mut rng, 0.0, FEMALE_ROWS, FEMALE_CASES, SCORE_EFFECT);
+
+    assert_eq!(male_samples.len(), MALE_ROWS);
+    assert_eq!(female_samples.len(), FEMALE_ROWS);
+
+    let male_case_count = male_samples
+        .iter()
+        .filter(|sample| sample.phenotype == 1.0)
+        .count();
+    let female_case_count = female_samples
+        .iter()
+        .filter(|sample| sample.phenotype == 1.0)
+        .count();
+    assert_eq!(male_case_count, MALE_CASES);
+    assert_eq!(female_case_count, FEMALE_CASES);
+
+    let male_mean_score =
+        male_samples.iter().map(|sample| sample.score).sum::<f64>() / (MALE_ROWS as f64);
+    let female_mean_score = female_samples
+        .iter()
+        .map(|sample| sample.score)
+        .sum::<f64>()
+        / (FEMALE_ROWS as f64);
+    assert!(
+        (male_mean_score - female_mean_score).abs() < 1.0e-12,
+        "sex-specific score means diverged: male={male_mean_score}, female={female_mean_score}"
+    );
+
+    let male_prevalence = (male_case_count as f64) / (MALE_ROWS as f64);
+    let female_prevalence = (female_case_count as f64) / (FEMALE_ROWS as f64);
+    let prevalence_ratio = male_prevalence / female_prevalence;
+    assert!(
+        (prevalence_ratio - MALE_TO_FEMALE_RATIO).abs() < 2.0e-3,
+        "prevalence ratio deviates: {prevalence_ratio}"
+    );
+    let overall_prevalence = (male_case_count + female_case_count) as f64 / (TOTAL_ROWS as f64);
+    assert!(
+        (overall_prevalence - TARGET_PREVALENCE).abs() < 1.0e-12,
+        "overall prevalence mismatch: {overall_prevalence}"
+    );
+
+    let tmp = tempdir()?;
+    let training_path = tmp.path().join("large_train.tsv");
+
+    let mut samples = male_samples;
+    samples.extend(female_samples);
+    assert_eq!(samples.len(), TOTAL_ROWS);
+    write_training_file(training_path.as_path(), &samples)?;
+
+    let exe = env!("CARGO_BIN_EXE_gnomon");
+    let output = Command::new(exe)
+        .current_dir(tmp.path())
+        .args([
+            "train",
+            training_path
+                .to_str()
+                .expect("training path should be valid UTF-8"),
+            "--num-pcs",
+            "0",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "gnomon CLI failed: status={:?}\nstdout:{}\nstderr:{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let model_path = tmp.path().join("model.toml");
+    assert!(model_path.exists(), "expected model.toml to be created");
+    let metadata = fs::metadata(model_path)?;
+    assert!(metadata.len() > 0, "model.toml should not be empty");
+
+    let prediction_input_path = tmp.path().join("large_predict.tsv");
+    write_prediction_file(prediction_input_path.as_path(), &samples)?;
+
+    let infer_output = Command::new(exe)
+        .current_dir(tmp.path())
+        .args([
+            "infer",
+            prediction_input_path
+                .to_str()
+                .expect("prediction path should be valid UTF-8"),
+            "--model",
+            model_path
+                .to_str()
+                .expect("model path should be valid UTF-8"),
+        ])
+        .output()?;
+
+    assert!(
+        infer_output.status.success(),
+        "gnomon CLI inference failed: status={:?}\nstdout:{}\nstderr:{}",
+        infer_output.status,
+        String::from_utf8_lossy(&infer_output.stdout),
+        String::from_utf8_lossy(&infer_output.stderr)
+    );
+
+    let predictions_path = tmp.path().join("predictions.tsv");
+    assert!(
+        predictions_path.exists(),
+        "expected predictions.tsv to be created"
+    );
+
+    let predictions = extract_predictions(predictions_path.as_path(), TOTAL_ROWS)?;
+    let observed = Array1::from_vec(samples.iter().map(|sample| sample.phenotype).collect());
+    let predicted = Array1::from_vec(predictions);
+    let auc_value = auc(&observed, &predicted);
+    assert!(
+        auc_value > 0.5,
+        "expected inference AUC to exceed 0.5, got {auc_value}"
+    );
+
+    Ok(())
 }
