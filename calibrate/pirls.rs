@@ -104,8 +104,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         let mut eta = self.offset.clone();
         eta += &self.design.dot(beta);
 
-        const MIN_WEIGHT: f64 = 1e-12;
-        const MIN_D_FOR_Z: f64 = 1e-6;
+        const MIN_DMU_DETA: f64 = 1e-6;
         const PROB_EPS: f64 = 1e-8;
 
         let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
@@ -114,14 +113,13 @@ impl<'a> GamLogitWorkingModel<'a> {
         self.mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
 
         let dmu_deta = &self.mu * &(1.0 - &self.mu);
-        self.weights.assign(&dmu_deta.mapv(|v| v.max(MIN_WEIGHT)));
-        self.weights *= &self.prior_weights;
+        let stabilized = dmu_deta.mapv(|v| v.max(MIN_DMU_DETA));
+        self.weights.assign(&(&stabilized * &self.prior_weights));
 
-        let denom_z = dmu_deta.mapv(|v| v.max(MIN_D_FOR_Z));
         self.working_response
-            .assign(&(&eta_clamped + &((&self.response - &self.mu) / &denom_z)));
+            .assign(&(&eta_clamped + &((&self.response - &self.mu) / &stabilized)));
 
-        let working_residual = &eta - &self.working_response;
+        let working_residual = &eta_clamped - &self.working_response;
         let weighted_residual = &self.weights * &working_residual;
         let grad_data = self.design.t().dot(&weighted_residual);
         let grad_penalty = self.penalty.dot(beta);
@@ -141,13 +139,19 @@ impl<'a> GamLogitWorkingModel<'a> {
         }
 
         // Compute X^T W X = (sqrt(W) * X)^T * (sqrt(W) * X)
-        let xtwx = weighted_design.t().dot(&weighted_design);
+        let mut hessian = weighted_design.t().dot(&weighted_design);
 
-        // Add penalty matrix: H = X^T W X + S
-        let mut hessian = xtwx;
         for j in 0..p.min(self.penalty.nrows()) {
             for k in 0..p.min(self.penalty.ncols()) {
                 hessian[[j, k]] += self.penalty[[j, k]];
+            }
+        }
+        let dim = hessian.nrows();
+        for i in 0..dim {
+            for j in 0..i {
+                let avg = 0.5 * (hessian[[i, j]] + hessian[[j, i]]);
+                hessian[[i, j]] = avg;
+                hessian[[j, i]] = avg;
             }
         }
 
@@ -161,7 +165,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         let penalty_term = beta.dot(&grad_penalty);
 
         WorkingState {
-            eta,
+            eta: eta_clamped,
             gradient,
             hessian,
             deviance,
@@ -505,7 +509,27 @@ where
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
         let state_grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
+        let mut direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
+        let mut descent = state.gradient.dot(&direction);
+        if !(descent.is_nan() || descent < 0.0) {
+            let dim = state.hessian.nrows();
+            let mut ridge = 1e-8;
+            loop {
+                let mut regularized = state.hessian.clone();
+                for i in 0..dim {
+                    regularized[[i, i]] += ridge;
+                }
+                direction = solve_newton_direction_dense(&regularized, &state.gradient)?;
+                descent = state.gradient.dot(&direction);
+                if descent.is_nan() || descent < 0.0 || ridge >= 1.0 {
+                    break;
+                }
+                ridge *= 10.0;
+            }
+            if !(descent.is_nan() || descent < 0.0) {
+                direction = state.gradient.mapv(|g| -g);
+            }
+        }
         let mut step = 1.0;
         let mut step_halving = 0usize;
         let mut last_error: Option<EstimationError> = None;
@@ -519,9 +543,9 @@ where
                     let accept_step = if options.firth_bias_reduction {
                         true
                     } else {
-                        candidate_penalized <= current_penalized * (1.0 + 1e-12)
-                            || (current_penalized - candidate_penalized).abs() < 1e-12
-                            || !candidate_penalized.is_finite()
+                        candidate_penalized.is_finite()
+                            && (candidate_penalized <= current_penalized * (1.0 + 1e-12)
+                                || (current_penalized - candidate_penalized).abs() < 1e-12)
                     };
                     if accept_step {
                         break (candidate_beta, candidate_state, candidate_penalized);
