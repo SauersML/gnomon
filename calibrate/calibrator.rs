@@ -126,6 +126,121 @@ pub struct CalibratorModel {
     pub assumes_frequency_weights: bool,
 }
 
+pub mod metrics {
+    use ndarray::Array1;
+
+    /// Reliability Binning - Groups predictions and calculates calibration metrics
+    pub fn reliability_bins(
+        y: &Array1<f64>,
+        p: &Array1<f64>,
+        n_bins: usize,
+    ) -> (Vec<usize>, Vec<f64>, Vec<f64>) {
+        assert_eq!(y.len(), p.len());
+
+        let mut bin_counts = vec![0; n_bins];
+        let mut mean_pred = vec![0.0; n_bins];
+        let mut mean_emp = vec![0.0; n_bins];
+
+        for i in 0..y.len() {
+            let bin = ((p[i].clamp(0.0, 1.0) * n_bins as f64).floor() as usize).min(n_bins - 1);
+            bin_counts[bin] += 1;
+            mean_pred[bin] += p[i];
+            mean_emp[bin] += y[i];
+        }
+
+        for i in 0..n_bins {
+            if bin_counts[i] > 0 {
+                let count = bin_counts[i] as f64;
+                mean_pred[i] /= count;
+                mean_emp[i] /= count;
+            }
+        }
+
+        (bin_counts, mean_pred, mean_emp)
+    }
+
+    /// Expected Calibration Error (ECE) - Measures calibration quality
+    pub fn ece(y: &Array1<f64>, p: &Array1<f64>, n_bins: usize) -> f64 {
+        let (bin_counts, mean_pred, mean_emp) = reliability_bins(y, p, n_bins);
+
+        let n = y.len() as f64;
+        let mut ece_sum = 0.0;
+        for i in 0..n_bins {
+            if bin_counts[i] > 0 {
+                let bin_weight = bin_counts[i] as f64 / n;
+                ece_sum += bin_weight * (mean_pred[i] - mean_emp[i]).abs();
+            }
+        }
+        ece_sum
+    }
+
+    /// Maximum Calibration Error (MCE) - Worst case calibration error
+    pub fn mce(y: &Array1<f64>, p: &Array1<f64>, n_bins: usize) -> f64 {
+        let (bin_counts, mean_pred, mean_emp) = reliability_bins(y, p, n_bins);
+
+        let mut max_ce: f64 = 0.0;
+        for i in 0..n_bins {
+            if bin_counts[i] > 0 {
+                let ce = (mean_pred[i] - mean_emp[i]).abs();
+                max_ce = max_ce.max(ce);
+            }
+        }
+        max_ce
+    }
+
+    /// Brier Score - Proper scoring rule for binary classification
+    pub fn brier(y: &Array1<f64>, p: &Array1<f64>) -> f64 {
+        assert_eq!(y.len(), p.len());
+        let n = y.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            let diff = p[i] - y[i];
+            sum += diff * diff;
+        }
+        sum / n as f64
+    }
+
+    /// Area Under ROC Curve (AUC) - Mann-Whitney implementation
+    pub fn auc(y: &Array1<f64>, p: &Array1<f64>) -> f64 {
+        assert_eq!(y.len(), p.len());
+        let n = y.len();
+        let n_pos = y.iter().filter(|&&t| t > 0.5).count() as f64;
+        let n_neg = n as f64 - n_pos;
+        if n_pos == 0.0 || n_neg == 0.0 {
+            return 0.5;
+        }
+
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&i, &j| p[i].partial_cmp(&p[j]).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut ranks = vec![0.0; n];
+        let mut i = 0;
+        while i < n {
+            let mut j = i + 1;
+            while j < n && (p[idx[j]] - p[idx[i]]).abs() < 1e-10 {
+                j += 1;
+            }
+
+            let avg_rank = (i + j - 1) as f64 / 2.0 + 1.0;
+            for k in i..j {
+                ranks[idx[k]] = avg_rank;
+            }
+            i = j;
+        }
+
+        let mut sum_ranks_pos = 0.0;
+        for i in 0..n {
+            if y[i] > 0.5 {
+                sum_ranks_pos += ranks[i];
+            }
+        }
+
+        (sum_ranks_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
+    }
+}
+
+pub use metrics::{auc, brier, ece, mce, reliability_bins};
+
 fn default_true() -> bool {
     true
 }

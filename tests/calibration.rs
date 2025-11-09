@@ -386,7 +386,7 @@ fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::e
 
     let model_path = tmp.path().join("model.toml");
     assert!(model_path.exists(), "expected model.toml to be created");
-    let metadata = fs::metadata(model_path)?;
+    let metadata = fs::metadata(&model_path)?;
     assert!(metadata.len() > 0, "model.toml should not be empty");
 
     let prediction_input_path = tmp.path().join("large_predict.tsv");
