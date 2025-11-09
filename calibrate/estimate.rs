@@ -1414,6 +1414,7 @@ pub fn train_model(
                 &penalties_cal,
                 &penalty_nullspace_dims,
                 config.link_function(),
+                spec.firth.clone(),
             )
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
@@ -2288,6 +2289,7 @@ pub fn train_survival_model(
                 &penalties_cal,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                spec.firth.clone(),
             )
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!(

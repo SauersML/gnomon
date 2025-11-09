@@ -117,6 +117,7 @@ fn logit_risk_calibration_improves_log_loss() {
         &penalties,
         &null_dims,
         LinkFunction::Logit,
+        spec.firth.clone(),
     )
     .expect("fit calibrator");
 

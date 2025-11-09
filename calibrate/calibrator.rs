@@ -2117,6 +2117,7 @@ pub fn fit_calibrator(
     penalties: &[Array2<f64>],
     penalty_nullspace_dims: &[usize],
     link: LinkFunction,
+    firth_override: Option<FirthSpec>,
 ) -> Result<
     (
         Array1<f64>,
@@ -2195,7 +2196,7 @@ pub fn fit_calibrator(
         )));
     }
 
-    let firth = CalibratorSpec::firth_default_for_link(link);
+    let firth = firth_override;
     if matches!(link, LinkFunction::Logit) {
         if let Some(ref firth_spec) = firth {
             if firth_spec.enabled {
@@ -4278,6 +4279,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
 
         // The fit should succeed without error
@@ -4471,7 +4473,7 @@ mod tests {
         };
 
         // Create calibrator spec
-        let spec = CalibratorSpec {
+        let mut spec = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
                 degree: 3,
@@ -4492,6 +4494,7 @@ mod tests {
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
+        spec.firth = None;
 
         // Build design
         let (x, penalties, schema, offset) = build_calibrator_design(&features, &spec).unwrap();
@@ -4508,6 +4511,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
 
         // Should converge successfully
@@ -4627,6 +4631,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
 
         // The fit with correct shape should succeed or at least not fail due to shape mismatch
@@ -4648,6 +4653,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
 
         // The fit should fail due to shape mismatch
@@ -4737,7 +4743,7 @@ mod tests {
         alo_features.pred_identity = eta_base.clone();
 
         // Create calibrator spec
-        let spec = CalibratorSpec {
+        let mut spec = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
                 degree: 3,
@@ -4758,6 +4764,7 @@ mod tests {
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
+        spec.firth = None;
 
         // Build design
         let (x_cal, penalties, schema, offset) =
@@ -4773,6 +4780,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, _, _, _), _) = fit_result;
@@ -4941,6 +4949,7 @@ mod tests {
                 &penalties,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                spec.firth.clone(),
             )
             .unwrap();
 
@@ -5107,6 +5116,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -5231,7 +5241,7 @@ mod tests {
             compute_alo_features(&base_fit, y.view(), x.view(), None, LinkFunction::Logit).unwrap();
 
         // Create calibrator spec
-        let spec = CalibratorSpec {
+        let mut spec = CalibratorSpec {
             link: LinkFunction::Logit,
             pred_basis: BasisConfig {
                 degree: 3,
@@ -5252,6 +5262,7 @@ mod tests {
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
         };
+        spec.firth = None;
 
         // Build design
         let (x_cal, penalties, schema, offset) =
@@ -5267,6 +5278,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, _, edf_se, edf_dist), _) = fit_result;
@@ -5503,6 +5515,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (_, lambdas_opt, _, _, _) = fit_result;
@@ -5630,6 +5643,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Identity,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, scale, (edf_pred, _, edf_se, edf_dist), (iters, grad_norm)) =
@@ -5810,6 +5824,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
     }
@@ -5926,6 +5941,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -6036,6 +6052,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -6260,6 +6277,7 @@ mod tests {
             &rs_blocks,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
 
@@ -6574,6 +6592,7 @@ mod tests {
             &rs_blocks,
             &penalty_nullspace_dims,
             LinkFunction::Identity,
+            spec.firth.clone(),
         )
         .unwrap();
 
@@ -6805,6 +6824,7 @@ mod tests {
                 &penalties,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                spec.firth.clone(),
             )
             .unwrap();
             let (beta, lambdas, _, _, _) = fit_result;
@@ -6968,6 +6988,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
         let fit_time = fit_start.elapsed();
@@ -7098,6 +7119,7 @@ mod tests {
             &extreme_penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
 
         match result {
@@ -7221,6 +7243,7 @@ mod tests {
             &large_penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         );
         // The fit should succeed with large lambdas
         assert!(
@@ -7334,6 +7357,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            spec.firth.clone(),
         )
         .unwrap();
 
@@ -7844,6 +7868,7 @@ mod tests {
             &penalties_uniform,
             &penalty_nullspace_dims_uniform,
             LinkFunction::Logit,
+            spec_uniform.firth.clone(),
         )
         .unwrap();
 
@@ -7861,6 +7886,7 @@ mod tests {
             &penalties_nonuniform,
             &penalty_nullspace_dims_nonuniform,
             LinkFunction::Logit,
+            spec_nonuniform.firth.clone(),
         )
         .unwrap();
 
