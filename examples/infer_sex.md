@@ -713,7 +713,7 @@ test = model.loc[test_idx].copy()
 expected_cols = ["sample_id", "phenotype", "score", "sex"]
 if list(train.columns) != expected_cols or list(test.columns) != expected_cols:
     raise RuntimeError("Column mismatch in prepared data.")
-
+\]
 train_path = "../../gnomon_train_PGS003852.tsv"
 test_path = "../../gnomon_test_PGS003852.tsv"
 
@@ -730,3 +730,172 @@ print(train["score"].describe())
 print("Test score summary:")
 print(test["score"].describe())
 ```
+
+Let's train with gnomon:
+```
+!../../gnomon/target/release/gnomon train ../../gnomon_train_PGS003852.tsv --num-pcs 0
+```
+
+Let's train some other models:
+```
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, brier_score_loss
+import xgboost as xgb
+
+# Number of bins for the nonparametric bin model (per sex)
+N_BINS = 20
+
+train_path = "../../gnomon_train_PGS003852.tsv"
+test_path = "../../gnomon_test_PGS003852.tsv"
+
+if "train" in globals() and "test" in globals():
+    train_df = train.copy()
+    test_df = test.copy()
+else:
+    train_df = pd.read_csv(train_path, sep="\t")
+    test_df = pd.read_csv(test_path, sep="\t")
+
+required_cols = ["sample_id", "phenotype", "score", "sex"]
+for name, df_ in [("train", train_df), ("test", test_df)]:
+    missing = set(required_cols) - set(df_.columns)
+    if missing:
+        raise RuntimeError(f"{name} is missing columns: {missing}")
+
+X_train_basic = train_df[["score", "sex"]].to_numpy()
+y_train = train_df["phenotype"].astype(int).to_numpy()
+
+X_test_basic = test_df[["score", "sex"]].to_numpy()
+y_test = test_df["phenotype"].astype(int).to_numpy()
+
+# Model 1: Logistic regression with score + sex
+logit_main = LogisticRegression(
+    penalty=None,
+    solver="lbfgs",
+    max_iter=1000,
+)
+logit_main.fit(X_train_basic, y_train)
+
+# Model 2: Logistic regression with score + sex + score*sex
+train_df_int = train_df.copy()
+test_df_int = test_df.copy()
+train_df_int["sex_score"] = train_df_int["sex"] * train_df_int["score"]
+test_df_int["sex_score"] = test_df_int["sex"] * test_df_int["score"]
+
+X_train_int = train_df_int[["score", "sex", "sex_score"]].to_numpy()
+X_test_int = test_df_int[["score", "sex", "sex_score"]].to_numpy()
+
+logit_int = LogisticRegression(
+    penalty=None,
+    solver="lbfgs",
+    max_iter=1000,
+)
+logit_int.fit(X_train_int, y_train)
+
+# Model 3: Sex-specific N_BINS-bin model
+def make_bin_edges(scores, n_bins):
+    lo = float(scores.min())
+    hi = float(scores.max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise RuntimeError("Non-finite score bounds in training.")
+    if lo == hi:
+        return np.array([lo, hi])
+    return np.linspace(lo, hi, n_bins + 1)
+
+edges = {}
+bin_prevalence = {}
+
+for sex_val in [0, 1]:
+    mask = train_df["sex"] == sex_val
+    s = train_df.loc[mask, "score"].to_numpy()
+    y = train_df.loc[mask, "phenotype"].to_numpy()
+    if len(s) == 0:
+        raise RuntimeError(f"No training samples for sex={sex_val}.")
+    e = make_bin_edges(s, N_BINS)
+    edges[sex_val] = e
+
+    idx = np.clip(
+        np.searchsorted(e, s, side="right") - 1,
+        0,
+        len(e) - 2,
+    )
+
+    sex_mean = y.mean()
+    preds = {}
+    for b in range(len(e) - 1):
+        in_bin = idx == b
+        if in_bin.any():
+            preds[b] = float(y[in_bin].mean())
+        else:
+            preds[b] = float(sex_mean)
+    bin_prevalence[sex_val] = preds
+
+def bin_model_predict(df, edges_dict, bin_prev_dict):
+    out = np.zeros(len(df), dtype=float)
+    for sex_val in [0, 1]:
+        mask = df["sex"] == sex_val
+        if not mask.any():
+            continue
+        s = df.loc[mask, "score"].to_numpy()
+        e = edges_dict[sex_val]
+        idx = np.clip(
+            np.searchsorted(e, s, side="right") - 1,
+            0,
+            len(e) - 2,
+        )
+        preds_map = bin_prev_dict[sex_val]
+        out[mask.to_numpy()] = [preds_map[b] for b in idx]
+    return out
+
+# Model 4: XGBoost with score + sex
+xgb_model = xgb.XGBClassifier(
+    max_depth=2,
+    n_estimators=200,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=1.0,
+    reg_lambda=1.0,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    nthread=4,
+)
+xgb_model.fit(X_train_basic, y_train)
+
+# Test-set predictions
+proba_logit_main = logit_main.predict_proba(X_test_basic)[:, 1]
+proba_logit_int = logit_int.predict_proba(X_test_int)[:, 1]
+proba_bin = bin_model_predict(test_df, edges, bin_prevalence)
+proba_xgb = xgb_model.predict_proba(X_test_basic)[:, 1]
+
+def summarize(name, y_true, y_prob):
+    auc = roc_auc_score(y_true, y_prob)
+    brier = brier_score_loss(y_true, y_prob)
+    return name, auc, brier
+
+rows = []
+for name, proba in [
+    ("Logistic: score + sex", proba_logit_main),
+    ("Logistic: + interaction", proba_logit_int),
+    (f"{N_BINS}-bin model", proba_bin),
+    ("XGBoost", proba_xgb),
+]:
+    rows.append(summarize(name, y_test, proba))
+
+results_df = pd.DataFrame(rows, columns=["Model", "AUC", "Brier"])
+results_df["AUC"] = results_df["AUC"].map("{:.4f}".format)
+results_df["Brier"] = results_df["Brier"].map("{:.4f}".format)
+
+print("\nTest-set performance")
+print(results_df.to_string(index=False))
+```
+
+Test-set performance
+                  Model    AUC  Brier
+  Logistic: score + sex 0.5711 0.0091
+Logistic: + interaction 0.5707 0.0091
+           20-bin model 0.5705 0.0091
+                XGBoost 0.5686 0.0091
+
+The interaction doesn't help. All are decently calibrated. Adding sex improved the AUC a bit.
+
