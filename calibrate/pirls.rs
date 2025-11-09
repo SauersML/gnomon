@@ -822,15 +822,17 @@ pub struct PirlsResult {
     pub x_transformed: Array2<f64>,
 }
 
+const EFFECTIVE_PENALTY_LAMBDA_THRESHOLD: f64 = 1e-6;
+
 fn detect_unpenalized_logit_instability(
     link: LinkFunction,
-    has_penalty: bool,
+    penalty_effective: bool,
     firth_active: bool,
     summary: &WorkingModelPirlsResult,
     final_mu: &Array1<f64>,
     y: ArrayView1<'_, f64>,
 ) -> bool {
-    if link != LinkFunction::Logit || has_penalty || firth_active {
+    if link != LinkFunction::Logit || firth_active {
         return false;
     }
 
@@ -852,6 +854,12 @@ fn detect_unpenalized_logit_instability(
     let beta_norm = summary.beta.dot(&summary.beta).sqrt();
     let dev_per_sample = summary.state.deviance / n;
 
+    let (eta_threshold, sat_threshold, beta_threshold) = if penalty_effective {
+        (40.0, 0.995, 5.0e4)
+    } else {
+        (30.0, 0.98, 1.0e4)
+    };
+
     let mut has_pos = false;
     let mut has_neg = false;
     let mut min_eta_pos = f64::INFINITY;
@@ -871,10 +879,10 @@ fn detect_unpenalized_logit_instability(
     }
     let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
 
-    max_abs_eta > 30.0
-        || sat_fraction > 0.98
+    max_abs_eta > eta_threshold
+        || sat_fraction > sat_threshold
         || dev_per_sample < 1e-3
-        || beta_norm > 1e4
+        || beta_norm > beta_threshold
         || order_separated
 }
 
@@ -1007,10 +1015,14 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let mut status = working_summary.status.clone();
     let has_penalty = e_transformed.nrows() > 0;
+    let penalty_effective = has_penalty
+        && lambdas
+            .iter()
+            .any(|&lambda| lambda > EFFECTIVE_PENALTY_LAMBDA_THRESHOLD);
     let firth_active = options.firth_bias_reduction;
     if detect_unpenalized_logit_instability(
         link_function,
-        has_penalty,
+        penalty_effective,
         firth_active,
         &working_summary,
         &final_mu,
