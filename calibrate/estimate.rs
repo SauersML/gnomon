@@ -940,7 +940,7 @@ pub fn train_model(
             coarse_rhos.push(-clipped);
         }
         coarse_rhos.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        coarse_rhos.dedup_by(|a, b| (a - b).abs() < f64::EPSILON);
+        coarse_rhos.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
 
         for rho in coarse_rhos {
             evaluate_single_penalty_candidate(
