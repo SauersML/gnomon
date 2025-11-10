@@ -564,14 +564,12 @@ fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
 
 mod calibrate {
     #[test]
-    fn cli_train_large_zero_pc_dataset_produces_model(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
         super::cli_train_large_zero_pc_dataset_produces_model_impl()
     }
 
     #[test]
-    fn cli_train_small_zero_pc_dataset_produces_model(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cli_train_small_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
         super::cli_train_small_zero_pc_dataset_produces_model_impl()
     }
 }
