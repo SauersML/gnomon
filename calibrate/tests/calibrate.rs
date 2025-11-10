@@ -300,8 +300,7 @@ fn extract_predictions(
     Ok(predictions)
 }
 
-#[test]
-fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
+fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn std::error::Error>> {
     const TOTAL_ROWS: usize = 330_000;
     const MALE_ROWS: usize = 198_000;
     const FEMALE_ROWS: usize = 132_000;
@@ -432,8 +431,7 @@ fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-#[test]
-fn cli_train_small_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
+fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn std::error::Error>> {
     const TOTAL_ROWS: usize = 3_300;
     const MALE_ROWS: usize = 1_980;
     const FEMALE_ROWS: usize = 1_320;
@@ -562,4 +560,20 @@ fn cli_train_small_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::e
     );
 
     Ok(())
+}
+
+mod calibrate {
+    use super::*;
+
+    #[test]
+    fn cli_train_large_zero_pc_dataset_produces_model(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::cli_train_large_zero_pc_dataset_produces_model_impl()
+    }
+
+    #[test]
+    fn cli_train_small_zero_pc_dataset_produces_model(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::cli_train_small_zero_pc_dataset_produces_model_impl()
+    }
 }
