@@ -929,7 +929,20 @@ pub fn train_model(
 
         let mut best: Option<(Array1<f64>, f64)> = None;
 
-        for rho in [-8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0] {
+        let mut coarse_rhos = vec![0.0];
+        let magnitudes = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 18.0, 24.0, RHO_BOUND];
+        for &mag in &magnitudes {
+            if mag <= 0.0 {
+                continue;
+            }
+            let clipped = mag.min(RHO_BOUND);
+            coarse_rhos.push(clipped);
+            coarse_rhos.push(-clipped);
+        }
+        coarse_rhos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        coarse_rhos.dedup_by(|a, b| (a - b).abs() < f64::EPSILON);
+
+        for rho in coarse_rhos {
             evaluate_single_penalty_candidate(
                 &mut best,
                 &reml_state,
@@ -942,7 +955,7 @@ pub fn train_model(
         if let Some(best_rho_value) = best.as_ref().map(|(rho_vec, _)| rho_vec[0]) {
             let step = 1.5_f64;
             for offset in [-step, step] {
-                let candidate = (best_rho_value + offset).clamp(-12.0, 12.0);
+                let candidate = (best_rho_value + offset).clamp(-RHO_BOUND, RHO_BOUND);
                 evaluate_single_penalty_candidate(
                     &mut best,
                     &reml_state,
