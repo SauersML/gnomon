@@ -300,6 +300,7 @@ fn evaluate_single_penalty(
     last_success: &mut Option<f64>,
     too_small_floor: &mut Option<f64>,
     evaluated: &mut HashSet<u64>,
+    fatal_error: &mut Option<EstimationError>,
     best_cost: &mut f64,
     best_rho: &mut Option<f64>,
     eval_index: &mut usize,
@@ -344,7 +345,7 @@ fn evaluate_single_penalty(
         }
         Err(e) => {
             if matches!(
-                e,
+                &e,
                 EstimationError::PirlsDidNotConverge { .. }
                     | EstimationError::PerfectSeparationDetected { .. }
             ) {
@@ -357,8 +358,13 @@ fn evaluate_single_penalty(
             }
             eprintln!(
                 "[Seed {}] rho = {:?} -> failed ({:?})",
-                eval_index, &formatted_seed, e
+                eval_index, &formatted_seed, &e
             );
+            if matches!(&e, EstimationError::PerfectSeparationDetected { .. }) {
+                *fatal_error = Some(e);
+            } else if fatal_error.is_none() {
+                *fatal_error = Some(e);
+            }
         }
     }
 
@@ -372,6 +378,7 @@ fn optimize_single_penalty(
     let mut last_success: Option<f64> = None;
     let mut too_small_floor: Option<f64> = None;
     let mut evaluated: HashSet<u64> = HashSet::new();
+    let mut fatal_error: Option<EstimationError> = None;
     let mut best_cost = f64::INFINITY;
     let mut best_rho: Option<f64> = None;
     let mut eval_index: usize = 0;
@@ -384,6 +391,7 @@ fn optimize_single_penalty(
             &mut last_success,
             &mut too_small_floor,
             &mut evaluated,
+            &mut fatal_error,
             &mut best_cost,
             &mut best_rho,
             &mut eval_index,
@@ -401,6 +409,7 @@ fn optimize_single_penalty(
                     &mut last_success,
                     &mut too_small_floor,
                     &mut evaluated,
+                    &mut fatal_error,
                     &mut best_cost,
                     &mut best_rho,
                     &mut eval_index,
@@ -413,11 +422,17 @@ fn optimize_single_penalty(
         }
     }
 
-    let final_rho = best_rho.ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "Single-penalty optimizer could not find a valid smoothing parameter".to_string(),
-        )
-    })?;
+    let final_rho = match best_rho {
+        Some(value) => value,
+        None => {
+            if let Some(err) = fatal_error {
+                return Err(err);
+            }
+            return Err(EstimationError::RemlOptimizationFailed(
+                "Single-penalty optimizer could not find a valid smoothing parameter".to_string(),
+            ));
+        }
+    };
 
     Ok((Array1::from_elem(1, final_rho), best_cost))
 }
