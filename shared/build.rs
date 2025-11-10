@@ -170,7 +170,8 @@ fn configure_linker_for_low_memory() {
 }
 
 fn configure_rustc_parallelism_for_low_memory(total_memory_bytes: u64) {
-    println!("cargo:rustc-flags=-Ccodegen-units=1");
+    // Build scripts are no longer permitted to emit arbitrary rustc flags; we rely on
+    // Cargo profiles (see Cargo.toml) to set codegen-units instead.
     println!(
         "cargo:rustc-env=GNOMON_LOW_MEMORY_TOTAL_MEMORY_BYTES={}",
         total_memory_bytes
@@ -179,7 +180,7 @@ fn configure_rustc_parallelism_for_low_memory(total_memory_bytes: u64) {
     println!("cargo:rustc-cfg=gnomon_low_memory_serial_build");
     if warnings_enabled() {
         println!(
-            "cargo:warning=forcing single rustc codegen unit (approx cargo -j1) for low-memory host"
+            "cargo:warning=low-memory host detected; consider forcing single rustc codegen unit via Cargo profile overrides if builds still fail"
         );
     }
 }
