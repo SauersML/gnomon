@@ -251,6 +251,7 @@ fn to_z_from_rho(rho: &Array1<f64>) -> Array1<f64> {
         } else {
             ratio
         };
+
         let z = RHO_BOUND * stable_atanh(xr);
         z.clamp(-1e6, 1e6)
     })
@@ -281,6 +282,42 @@ fn project_rho_gradient(rho: &Array1<f64>, grad: &mut Array1<f64>) {
         }
         if rho[i] >= RHO_BOUND - tol && grad[i] < 0.0 {
             grad[i] = 0.0;
+        }
+    }
+}
+
+fn evaluate_single_penalty_candidate(
+    best: &mut Option<(Array1<f64>, f64)>,
+    reml_state: &RemlState<'_>,
+    num_penalties: usize,
+    rho_val: f64,
+    label: &str,
+) {
+    let rho_vec = Array1::from_elem(num_penalties, rho_val);
+    match reml_state.compute_cost(&rho_vec) {
+        Ok(cost) if cost.is_finite() => {
+            eprintln!(
+                "[Single {label}] rho = [{:.2}] -> cost = {:.6}",
+                rho_val, cost
+            );
+            let replace = best
+                .as_ref()
+                .map_or(true, |(_, best_cost)| cost < *best_cost);
+            if replace {
+                *best = Some((rho_vec, cost));
+            }
+        }
+        Ok(_) => {
+            eprintln!(
+                "[Single {label}] rho = [{:.2}] -> +inf cost (skipping)",
+                rho_val
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "[Single {label}] rho = [{:.2}] -> failed ({err:?})",
+                rho_val
+            );
         }
     }
 }
@@ -883,358 +920,445 @@ pub fn train_model(
         return Ok(trained_model);
     }
 
-    // Multi-start seeding with asymmetric perturbations to break symmetry
-    // This prevents the optimizer from getting trapped when PC penalties are identical
-    let mut seed_candidates = Vec::new();
+    let single_penalty = layout.num_penalties == 1;
 
-    // Symmetric base seeds
-    // Include genuinely small-λ and large-λ seeds to explore a broader landscape
-    let base_values: &[f64] = &[
-        12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0,
-    ];
-    for &val in base_values {
-        seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
-    }
-
-    // Ensure each penalty index is explored individually (useful when only one needs extreme smoothing)
-    for idx in 0..layout.num_penalties {
-        for &val in &[12.0, 4.0, -4.0, -12.0] {
-            let mut seed = Array1::zeros(layout.num_penalties);
-            seed[idx] = val;
-            seed_candidates.push(seed);
-        }
-    }
-
-    // Pairwise asymmetric seeds to break symmetry between every pair of penalties
-    if layout.num_penalties >= 2 {
-        let pair_templates: &[(f64, f64)] = &[(12.0, 0.0), (8.0, -4.0), (6.0, -2.0)];
-
-        for i in 0..layout.num_penalties {
-            for j in (i + 1)..layout.num_penalties {
-                for &(hi, lo) in pair_templates {
-                    let mut seed_ij = Array1::zeros(layout.num_penalties);
-                    seed_ij[i] = hi;
-                    seed_ij[j] = lo;
-                    seed_candidates.push(seed_ij);
-
-                    let mut seed_ji = Array1::zeros(layout.num_penalties);
-                    seed_ji[i] = lo;
-                    seed_ji[j] = hi;
-                    seed_candidates.push(seed_ji);
-                }
-            }
-        }
-    }
-    // Extend shorter seeds to match layout.num_penalties
-    for seed in &mut seed_candidates {
-        // Convert to Vec, resize, then back to Array1
-        let mut vec_seed = seed.to_vec();
-        vec_seed.resize(layout.num_penalties, 0.0); // Fill/trim to exact length
-        *seed = Array1::from_vec(vec_seed);
-    }
-
-    // Deduplicate seeds to avoid redundant evaluations and noisy diagnostics
-    {
-        use std::collections::HashSet;
-        let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        let mut unique: Vec<Array1<f64>> = Vec::with_capacity(seed_candidates.len());
-        for s in seed_candidates.into_iter() {
-            let key: Vec<u64> = s.iter().map(|&v| v.to_bits()).collect();
-            if seen.insert(key) {
-                unique.push(s);
-            }
-        }
-        seed_candidates = unique;
-    }
-
-    // Evaluate all seeds, separating symmetric from asymmetric candidates
-    let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-    let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-
-    // We'll do a single mandatory gradient check after we select the initial point
-
-    for (i, seed) in seed_candidates.iter().enumerate() {
-        // We'll do the gradient check after selecting the initial point, not here
-        let cost = match reml_state.compute_cost(seed) {
-            Ok(c) if c.is_finite() => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> cost = {:.6}",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    c
-                );
-                c
-            }
-            Ok(_) => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> +inf cost",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>()
-                );
-                continue;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> failed ({:?})",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        // Check if seed is symmetric (all penalties equal within tiny tolerance)
-        let is_symmetric = if seed.len() < 2 {
-            true
-        } else {
-            let first_val = seed[0];
-            seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
-        };
-
-        if is_symmetric {
-            if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-                best_symmetric_seed = Some((seed.clone(), cost, i));
-                eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
-            }
-        } else {
-            if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-                best_asymmetric_seed = Some((seed.clone(), cost, i));
-                eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
-            }
-        }
-    }
-
-    // Robust asymmetric preference to avoid symmetry trap
-    let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
-        (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
-            // Prefer asymmetric unless symmetric is significantly better (> 0.1% + small absolute margin)
-            *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => false,
-    };
-
-    let asym_candidate = best_asymmetric_seed;
-    let sym_candidate = best_symmetric_seed;
-    let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = Vec::new();
-
-    if pick_asym {
-        if let Some((rho, cost, idx)) = asym_candidate {
-            eprintln!(
-                "[Init] Using best asymmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = sym_candidate {
-            eprintln!(
-                "[Init] Also queueing best symmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-    } else {
-        if let Some((rho, cost, idx)) = sym_candidate {
-            eprintln!("[Init] Using symmetric seed #{} (cost = {:.6})", idx, cost);
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = asym_candidate {
-            eprintln!(
-                "[Init] Also queueing best asymmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-    }
-
-    if candidate_plans.is_empty() {
-        eprintln!("[Init] All seeds failed; using ramped asymmetric fallback.");
-        candidate_plans.push((
-            "fallback-asymmetric".to_string(),
-            build_asymmetric_fallback(layout.num_penalties),
-            None,
-            None,
-        ));
-    }
-
-    eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
-
-    let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)> =
-        Vec::new();
-    let mut last_error: Option<EstimationError> = None;
-
-    for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
-        eprintln!("\n[Candidate {label}] Evaluating seed");
-        if let Some(idx) = seed_index {
-            eprintln!("  -> Seed index: {idx}");
-        }
-        if let Some(cost) = seed_cost {
-            eprintln!("  -> Seed cost: {cost:.6}");
-        }
-
-        reml_state.reset_optimizer_tracking();
-        let initial_z = to_z_from_rho(&rho);
-        let initial_rho = to_rho_from_z(&initial_z);
-
-        if let Err(err) = run_gradient_check(&label, &reml_state, &initial_rho) {
-            eprintln!("[Candidate {label}] Gradient check failed: {err}");
-            last_error = Some(err);
-            continue;
-        }
-
-        match run_bfgs_for_candidate(&label, &reml_state, config, initial_z) {
-            Ok((solution, grad_norm_rho, is_stationary)) => {
-                eprintln!(
-                    "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
-                    solution.iterations, solution.final_value
-                );
-                successful_runs.push((
-                    label,
-                    seed_index,
-                    seed_cost,
-                    solution,
-                    grad_norm_rho,
-                    is_stationary,
-                ));
-                continue;
-            }
-            Err(err) => {
-                eprintln!("[Candidate {label}] BFGS failed: {err}");
-                last_error = Some(err);
-            }
-        }
-    }
-
-    if successful_runs.is_empty() {
+    let (final_rho_clamped, final_lambda) = if single_penalty {
         eprintln!(
-            "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
+            "\n[STAGE 2/3] Optimizing smoothing parameter via coarse grid (single-penalty fast path)..."
         );
-        reml_state.reset_optimizer_tracking();
-        let fallback_rho = build_asymmetric_fallback(layout.num_penalties);
-        let fallback_z = to_z_from_rho(&fallback_rho);
-        let fallback_rho_checked = to_rho_from_z(&fallback_z);
-        let fallback_label = "fallback-retry".to_string();
 
-        match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
-            Ok(()) => {
-                match run_bfgs_for_candidate(&fallback_label, &reml_state, config, fallback_z) {
-                    Ok((solution, grad_norm_rho, is_stationary)) => {
-                        eprintln!(
-                            "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
-                            solution.iterations, solution.final_value
-                        );
-                        successful_runs.push((
-                            fallback_label,
-                            None,
-                            None,
-                            solution,
-                            grad_norm_rho,
-                            is_stationary,
-                        ));
-                    }
-                    Err(err) => {
-                        eprintln!("[Fallback] BFGS failed: {err}");
-                        last_error = Some(err);
+        let mut best: Option<(Array1<f64>, f64)> = None;
+
+        for rho in [-8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0] {
+            evaluate_single_penalty_candidate(
+                &mut best,
+                &reml_state,
+                layout.num_penalties,
+                rho,
+                "grid",
+            );
+        }
+
+        if let Some(best_rho_value) = best.as_ref().map(|(rho_vec, _)| rho_vec[0]) {
+            let step = 1.5_f64;
+            for offset in [-step, step] {
+                let candidate = (best_rho_value + offset).clamp(-12.0, 12.0);
+                evaluate_single_penalty_candidate(
+                    &mut best,
+                    &reml_state,
+                    layout.num_penalties,
+                    candidate,
+                    "refine",
+                );
+            }
+        }
+
+        let (best_rho_vec, best_cost) = best.unwrap_or_else(|| {
+            eprintln!("[Single] All coarse grid evaluations failed; defaulting to rho = [0.0].");
+            (Array1::zeros(layout.num_penalties), f64::INFINITY)
+        });
+
+        let final_rho_clamped = best_rho_vec.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
+        let final_lambda = final_rho_clamped.mapv(f64::exp);
+        eprintln!(
+            "\n[Winner] Single-penalty search selected rho = [{:.4}] (lambda = {:.3e}, cost = {:.6})",
+            final_rho_clamped[0], final_lambda[0], best_cost
+        );
+        log::info!(
+            "Single-penalty smoothing parameter selected: lambda = {:?}",
+            &final_lambda.to_vec()
+        );
+
+        (final_rho_clamped, final_lambda)
+    } else {
+        let mut successful_runs: Vec<(
+            String,
+            Option<usize>,
+            Option<f64>,
+            BfgsSolution,
+            f64,
+            bool,
+        )> = Vec::new();
+        let mut last_error: Option<EstimationError> = None;
+
+        let candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = {
+            // Multi-start seeding with asymmetric perturbations to break symmetry
+            // This prevents the optimizer from getting trapped when PC penalties are identical
+            let mut seed_candidates = Vec::new();
+
+            // Symmetric base seeds
+            // Include genuinely small-λ and large-λ seeds to explore a broader landscape
+            let base_values: &[f64] = &[
+                12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0,
+            ];
+            for &val in base_values {
+                seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
+            }
+
+            // Ensure each penalty index is explored individually (useful when only one needs extreme smoothing)
+            for idx in 0..layout.num_penalties {
+                for &val in &[12.0, 4.0, -4.0, -12.0] {
+                    let mut seed = Array1::zeros(layout.num_penalties);
+                    seed[idx] = val;
+                    seed_candidates.push(seed);
+                }
+            }
+
+            // Pairwise asymmetric seeds to break symmetry between every pair of penalties
+            if layout.num_penalties >= 2 {
+                let pair_templates: &[(f64, f64)] = &[(12.0, 0.0), (8.0, -4.0), (6.0, -2.0)];
+
+                for i in 0..layout.num_penalties {
+                    for j in (i + 1)..layout.num_penalties {
+                        for &(hi, lo) in pair_templates {
+                            let mut seed_ij = Array1::zeros(layout.num_penalties);
+                            seed_ij[i] = hi;
+                            seed_ij[j] = lo;
+                            seed_candidates.push(seed_ij);
+
+                            let mut seed_ji = Array1::zeros(layout.num_penalties);
+                            seed_ji[i] = lo;
+                            seed_ji[j] = hi;
+                            seed_candidates.push(seed_ji);
+                        }
                     }
                 }
             }
-            Err(err) => {
-                eprintln!("[Fallback] Gradient check failed: {err}");
+            // Extend shorter seeds to match layout.num_penalties
+            for seed in &mut seed_candidates {
+                // Convert to Vec, resize, then back to Array1
+                let mut vec_seed = seed.to_vec();
+                vec_seed.resize(layout.num_penalties, 0.0); // Fill/trim to exact length
+                *seed = Array1::from_vec(vec_seed);
+            }
+
+            // Deduplicate seeds to avoid redundant evaluations and noisy diagnostics
+            {
+                use std::collections::HashSet;
+                let mut seen: HashSet<Vec<u64>> = HashSet::new();
+                let mut unique: Vec<Array1<f64>> = Vec::with_capacity(seed_candidates.len());
+                for s in seed_candidates.into_iter() {
+                    let key: Vec<u64> = s.iter().map(|&v| v.to_bits()).collect();
+                    if seen.insert(key) {
+                        unique.push(s);
+                    }
+                }
+                seed_candidates = unique;
+            }
+
+            // Evaluate all seeds, separating symmetric from asymmetric candidates
+            let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+            let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+
+            // We'll do a single mandatory gradient check after we select the initial point
+
+            for (i, seed) in seed_candidates.iter().enumerate() {
+                // We'll do the gradient check after selecting the initial point, not here
+                let cost = match reml_state.compute_cost(seed) {
+                    Ok(c) if c.is_finite() => {
+                        eprintln!(
+                            "[Seed {}] rho = {:?} -> cost = {:.6}",
+                            i,
+                            seed.iter()
+                                .map(|&x| format!("{:.1}", x))
+                                .collect::<Vec<_>>(),
+                            c
+                        );
+                        c
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "[Seed {}] rho = {:?} -> +inf cost",
+                            i,
+                            seed.iter()
+                                .map(|&x| format!("{:.1}", x))
+                                .collect::<Vec<_>>()
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[Seed {}] rho = {:?} -> failed ({:?})",
+                            i,
+                            seed.iter()
+                                .map(|&x| format!("{:.1}", x))
+                                .collect::<Vec<_>>(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                // Check if seed is symmetric (all penalties equal within tiny tolerance)
+                let is_symmetric = if seed.len() < 2 {
+                    true
+                } else {
+                    let first_val = seed[0];
+                    seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
+                };
+
+                if is_symmetric {
+                    if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                        best_symmetric_seed = Some((seed.clone(), cost, i));
+                        eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
+                    }
+                } else {
+                    if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                        best_asymmetric_seed = Some((seed.clone(), cost, i));
+                        eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
+                    }
+                }
+            }
+
+            // Robust asymmetric preference to avoid symmetry trap
+            let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
+                (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
+                    // Prefer asymmetric unless symmetric is significantly better (> 0.1% + small absolute margin)
+                    *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => false,
+            };
+
+            let asym_candidate = best_asymmetric_seed;
+            let sym_candidate = best_symmetric_seed;
+            let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> =
+                Vec::new();
+
+            if pick_asym {
+                if let Some((rho, cost, idx)) = asym_candidate {
+                    eprintln!(
+                        "[Init] Using best asymmetric seed #{} (cost = {:.6})",
+                        idx, cost
+                    );
+                    candidate_plans.push((
+                        "best-asymmetric".to_string(),
+                        rho,
+                        Some(idx),
+                        Some(cost),
+                    ));
+                }
+                if let Some((rho, cost, idx)) = sym_candidate {
+                    eprintln!(
+                        "[Init] Also queueing best symmetric seed #{} (cost = {:.6})",
+                        idx, cost
+                    );
+                    candidate_plans.push((
+                        "best-symmetric".to_string(),
+                        rho,
+                        Some(idx),
+                        Some(cost),
+                    ));
+                }
+            } else {
+                if let Some((rho, cost, idx)) = sym_candidate {
+                    eprintln!("[Init] Using symmetric seed #{} (cost = {:.6})", idx, cost);
+                    candidate_plans.push((
+                        "best-symmetric".to_string(),
+                        rho,
+                        Some(idx),
+                        Some(cost),
+                    ));
+                }
+                if let Some((rho, cost, idx)) = asym_candidate {
+                    eprintln!(
+                        "[Init] Also queueing best asymmetric seed #{} (cost = {:.6})",
+                        idx, cost
+                    );
+                    candidate_plans.push((
+                        "best-asymmetric".to_string(),
+                        rho,
+                        Some(idx),
+                        Some(cost),
+                    ));
+                }
+            }
+
+            if candidate_plans.is_empty() {
+                eprintln!("[Init] All seeds failed; using ramped asymmetric fallback.");
+                candidate_plans.push((
+                    "fallback-asymmetric".to_string(),
+                    build_asymmetric_fallback(layout.num_penalties),
+                    None,
+                    None,
+                ));
+            }
+
+            eprintln!(
+                "\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)..."
+            );
+
+            candidate_plans
+        };
+
+        for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+            eprintln!("\n[Candidate {label}] Evaluating seed");
+            if let Some(idx) = seed_index {
+                eprintln!("  -> Seed index: {idx}");
+            }
+            if let Some(cost) = seed_cost {
+                eprintln!("  -> Seed cost: {cost:.6}");
+            }
+
+            reml_state.reset_optimizer_tracking();
+            let initial_z = to_z_from_rho(&rho);
+            let initial_rho = to_rho_from_z(&initial_z);
+
+            if let Err(err) = run_gradient_check(&label, &reml_state, &initial_rho) {
+                eprintln!("[Candidate {label}] Gradient check failed: {err}");
                 last_error = Some(err);
+                continue;
+            }
+
+            match run_bfgs_for_candidate(&label, &reml_state, config, initial_z) {
+                Ok((solution, grad_norm_rho, is_stationary)) => {
+                    eprintln!(
+                        "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
+                        solution.iterations, solution.final_value
+                    );
+                    successful_runs.push((
+                        label,
+                        seed_index,
+                        seed_cost,
+                        solution,
+                        grad_norm_rho,
+                        is_stationary,
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("[Candidate {label}] BFGS failed: {err}");
+                    last_error = Some(err);
+                }
             }
         }
 
         if successful_runs.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "All candidate seeds failed, including fallback retry.".to_string(),
-                )
-            }));
+            eprintln!(
+                "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
+            );
+            reml_state.reset_optimizer_tracking();
+            let fallback_rho = build_asymmetric_fallback(layout.num_penalties);
+            let fallback_z = to_z_from_rho(&fallback_rho);
+            let fallback_rho_checked = to_rho_from_z(&fallback_z);
+            let fallback_label = "fallback-retry".to_string();
+
+            match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
+                Ok(()) => {
+                    match run_bfgs_for_candidate(&fallback_label, &reml_state, config, fallback_z) {
+                        Ok((solution, grad_norm_rho, is_stationary)) => {
+                            eprintln!(
+                                "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
+                                solution.iterations, solution.final_value
+                            );
+                            successful_runs.push((
+                                fallback_label,
+                                None,
+                                None,
+                                solution,
+                                grad_norm_rho,
+                                is_stationary,
+                            ));
+                        }
+                        Err(err) => {
+                            eprintln!("[Fallback] BFGS failed: {err}");
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[Fallback] Gradient check failed: {err}");
+                    last_error = Some(err);
+                }
+            }
+
+            if successful_runs.is_empty() {
+                return Err(last_error.unwrap_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "All candidate seeds failed, including fallback retry.".to_string(),
+                    )
+                }));
+            }
         }
-    }
 
-    let (stationary_runs, non_stationary_runs): (
-        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
-        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
-    ) = successful_runs.into_iter().partition(|entry| entry.5);
+        let (stationary_runs, non_stationary_runs): (
+            Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
+            Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
+        ) = successful_runs.into_iter().partition(|entry| entry.5);
 
-    let select_by_final_value =
-        |entries: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>| {
-            entries
+        let select_by_final_value =
+            |entries: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>| {
+                entries.into_iter().min_by(|a, b| {
+                    match a.3.final_value.partial_cmp(&b.3.final_value) {
+                        Some(order) => order,
+                        None => std::cmp::Ordering::Equal,
+                    }
+                })
+            };
+
+        let (
+            best_label,
+            best_seed_index,
+            best_seed_cost,
+            best_solution,
+            best_grad_norm_rho,
+            best_stationary,
+        ) = if let Some(best) = select_by_final_value(stationary_runs) {
+            best
+        } else {
+            let fallback = non_stationary_runs
                 .into_iter()
-                .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
+                .min_by(|a, b| match a.4.partial_cmp(&b.4) {
                     Some(order) => order,
                     None => std::cmp::Ordering::Equal,
                 })
+                .unwrap();
+            eprintln!(
+                "\n[Winner] WARNING: no stationary candidates found; selecting minimal rho gradient norm ({:.3e}).",
+                fallback.4
+            );
+            log::warn!(
+                "REML optimizer could not find a stationary candidate; using minimal rho gradient norm {:.3e}.",
+                fallback.4
+            );
+            fallback
         };
 
-    let (
-        best_label,
-        best_seed_index,
-        best_seed_cost,
-        best_solution,
-        best_grad_norm_rho,
-        best_stationary,
-    ) = if let Some(best) = select_by_final_value(stationary_runs) {
-        best
-    } else {
-        let fallback = non_stationary_runs
-            .into_iter()
-            .min_by(|a, b| match a.4.partial_cmp(&b.4) {
-                Some(order) => order,
-                None => std::cmp::Ordering::Equal,
-            })
-            .unwrap();
+        let BfgsSolution {
+            final_point: final_z,
+            final_value,
+            iterations,
+            ..
+        } = best_solution;
+
         eprintln!(
-            "\n[Winner] WARNING: no stationary candidates found; selecting minimal rho gradient norm ({:.3e}).",
-            fallback.4
+            "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
         );
-        log::warn!(
-            "REML optimizer could not find a stationary candidate; using minimal rho gradient norm {:.3e}.",
-            fallback.4
+        if let Some(idx) = best_seed_index {
+            eprintln!("  -> Originating seed index: {idx}");
+        }
+        if let Some(cost) = best_seed_cost {
+            eprintln!("  -> Seed cost: {cost:.6}");
+        }
+        eprintln!(
+            "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
+            best_grad_norm_rho, best_stationary
         );
-        fallback
+        log::info!("REML optimization completed successfully");
+
+        // --- Finalize the Model (same as before) ---
+        // Map final unconstrained point to bounded rho, then clamp for safety
+        let final_rho = to_rho_from_z(&final_z);
+        let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
+        let final_lambda = final_rho_clamped.mapv(f64::exp);
+        log::info!(
+            "Final estimated smoothing parameters (lambda): {:?}",
+            &final_lambda.to_vec()
+        );
+
+        (final_rho_clamped, final_lambda)
     };
-
-    let BfgsSolution {
-        final_point: final_z,
-        final_value,
-        iterations,
-        ..
-    } = best_solution;
-
-    eprintln!(
-        "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
-    );
-    if let Some(idx) = best_seed_index {
-        eprintln!("  -> Originating seed index: {idx}");
-    }
-    if let Some(cost) = best_seed_cost {
-        eprintln!("  -> Seed cost: {cost:.6}");
-    }
-    eprintln!(
-        "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
-        best_grad_norm_rho, best_stationary
-    );
-    log::info!("REML optimization completed successfully");
-
-    // --- Finalize the Model (same as before) ---
-    // Map final unconstrained point to bounded rho, then clamp for safety
-    let final_rho = to_rho_from_z(&final_z);
-    let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
-    let final_lambda = final_rho_clamped.mapv(f64::exp);
-    log::info!(
-        "Final estimated smoothing parameters (lambda): {:?}",
-        &final_lambda.to_vec()
-    );
 
     eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
 
