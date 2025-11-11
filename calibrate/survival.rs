@@ -3254,15 +3254,13 @@ mod tests {
 
         let state_initial = model.update_state(&beta).unwrap();
         let mut step = 1e-3;
-        let mut beta_next = beta.clone();
-        let mut state_next = state_initial.clone();
-        loop {
-            beta_next = &beta - &(state_initial.gradient.mapv(|g| step * g));
-            match model.update_state(&beta_next) {
+        let state_next = loop {
+            let direction = state_initial.gradient.mapv(|g| step * g);
+            let beta_candidate = &beta - &direction;
+            match model.update_state(&beta_candidate) {
                 Ok(next) => {
-                    state_next = next;
-                    if state_next.deviance < state_initial.deviance {
-                        break;
+                    if next.deviance < state_initial.deviance {
+                        break next;
                     }
                 }
                 Err(SurvivalError::NonFiniteLinearPredictor)
@@ -3281,7 +3279,7 @@ mod tests {
                 step > 1e-8,
                 "unable to reduce deviance via gradient descent"
             );
-        }
+        };
         assert!(state_next.deviance < state_initial.deviance);
     }
 

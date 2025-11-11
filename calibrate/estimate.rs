@@ -2691,6 +2691,99 @@ pub fn optimize_external_design(
 }
 
 /// Computes the gradient of the LAML cost function using the central finite-difference method.
+const FD_REL_GAP_THRESHOLD: f64 = 0.2;
+const FD_MIN_BASE_STEP: f64 = 1e-6;
+const FD_MAX_REFINEMENTS: usize = 4;
+
+fn evaluate_fd_pair(
+    reml_state: &internal::RemlState,
+    rho: &Array1<f64>,
+    coord: usize,
+    base_h: f64,
+    attempt: usize,
+    log_lines: &mut Vec<String>,
+) -> Result<(f64, f64), EstimationError> {
+    log_lines.push(format!(
+        "[FD RIDGE] ---- Coordinate {coord} (attempt {}, rho = {:+.6e}, h = {:.3e}) ----",
+        attempt + 1,
+        rho[coord],
+        base_h
+    ));
+
+    let mut rho_p = rho.clone();
+    rho_p[coord] += 0.5 * base_h;
+    let mut rho_m = rho.clone();
+    rho_m[coord] -= 0.5 * base_h;
+    let f_p = reml_state.compute_cost(&rho_p)?;
+    let ridge_p = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    log_lines.push(format!(
+        "[FD RIDGE]    +0.5h cost = {:+.9e} | ridge = {ridge_p:.3e} | rho = {:?}",
+        f_p,
+        rho_p.to_vec()
+    ));
+
+    let f_m = reml_state.compute_cost(&rho_m)?;
+    let ridge_m = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    log_lines.push(format!(
+        "[FD RIDGE]    -0.5h cost = {:+.9e} | ridge = {ridge_m:.3e} | rho = {:?}",
+        f_m,
+        rho_m.to_vec()
+    ));
+    let d_small = (f_p - f_m) / base_h;
+
+    let h2 = 2.0 * base_h;
+    let mut rho_p2 = rho.clone();
+    rho_p2[coord] += 0.5 * h2;
+    let mut rho_m2 = rho.clone();
+    rho_m2[coord] -= 0.5 * h2;
+    let f_p2 = reml_state.compute_cost(&rho_p2)?;
+    let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    log_lines.push(format!(
+        "[FD RIDGE]    +1.0h cost = {:+.9e} | ridge = {ridge_p2:.3e} | rho = {:?}",
+        f_p2,
+        rho_p2.to_vec()
+    ));
+
+    let f_m2 = reml_state.compute_cost(&rho_m2)?;
+    let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
+    log_lines.push(format!(
+        "[FD RIDGE]    -1.0h cost = {:+.9e} | ridge = {ridge_m2:.3e} | rho = {:?}",
+        f_m2,
+        rho_m2.to_vec()
+    ));
+    let d_big = (f_p2 - f_m2) / h2;
+
+    log_lines.push(format!(
+        "[FD RIDGE]    d_small = {:+.9e}, d_big = {:+.9e}",
+        d_small, d_big
+    ));
+
+    Ok((d_small, d_big))
+}
+
+fn fd_same_sign(d_small: f64, d_big: f64) -> bool {
+    if !d_small.is_finite() || !d_big.is_finite() {
+        false
+    } else {
+        (d_small >= 0.0 && d_big >= 0.0) || (d_small <= 0.0 && d_big <= 0.0)
+    }
+}
+
+fn select_fd_derivative(d_small: f64, d_big: f64, same_sign: bool) -> f64 {
+    match (d_small.is_finite(), d_big.is_finite()) {
+        (true, true) => {
+            if same_sign {
+                d_small
+            } else {
+                d_big
+            }
+        }
+        (true, false) => d_small,
+        (false, true) => d_big,
+        (false, false) => 0.0,
+    }
+}
+
 fn compute_fd_gradient(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
@@ -2710,72 +2803,48 @@ fn compute_fd_gradient(
     }
 
     for i in 0..rho.len() {
-        // Robust central-difference step for nested solvers: overpower evaluation noise
         let h_rel = 1e-4_f64 * (1.0 + rho[i].abs());
-        let h_abs = 1e-5_f64; // absolute floor near zero
-        let h = h_rel.max(h_abs);
+        let h_abs = 1e-5_f64;
+        let mut base_h = h_rel.max(h_abs);
 
+        let mut d_small = 0.0;
+        let mut d_big = 0.0;
+        let mut derivative: Option<f64> = None;
+
+        for attempt in 0..=FD_MAX_REFINEMENTS {
+            let pair = evaluate_fd_pair(reml_state, rho, i, base_h, attempt, &mut log_lines)?;
+            d_small = pair.0;
+            d_big = pair.1;
+
+            let denom = d_small.abs().max(d_big.abs()).max(1e-12);
+            let rel_gap = (d_small - d_big).abs() / denom;
+            let same_sign = fd_same_sign(d_small, d_big);
+
+            if same_sign
+                && rel_gap > FD_REL_GAP_THRESHOLD
+                && base_h * 0.5 >= FD_MIN_BASE_STEP
+            {
+                base_h *= 0.5;
+                log_lines.push(format!(
+                    "[FD RIDGE]    rel_gap={:.3e} > {:.2}; reducing h to {:.3e} for coordinate {}",
+                    rel_gap, FD_REL_GAP_THRESHOLD, base_h, i
+                ));
+                continue;
+            }
+
+            derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+            break;
+        }
+
+        if derivative.is_none() {
+            let same_sign = fd_same_sign(d_small, d_big);
+            derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+        }
+
+        fd_grad[i] = derivative.unwrap_or(f64::NAN);
         log_lines.push(format!(
-            "[FD RIDGE] ---- Coordinate {i} (rho = {:+.6e}, h = {:.3e}) ----",
-            rho[i], h
-        ));
-
-        // D1 with step h
-        let mut rho_p = rho.clone();
-        rho_p[i] += 0.5 * h;
-        let mut rho_m = rho.clone();
-        rho_m[i] -= 0.5 * h;
-        let f_p = reml_state.compute_cost(&rho_p)?;
-        let ridge_p = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    +0.5h cost = {:+.9e} | ridge = {ridge_p:.3e} | rho = {:?}",
-            f_p,
-            rho_p.to_vec()
-        ));
-
-        let f_m = reml_state.compute_cost(&rho_m)?;
-        let ridge_m = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    -0.5h cost = {:+.9e} | ridge = {ridge_m:.3e} | rho = {:?}",
-            f_m,
-            rho_m.to_vec()
-        ));
-        let d1 = (f_p - f_m) / h;
-
-        // D2 with step 2h (two-scale guard)
-        let h2 = 2.0 * h;
-        let mut rho_p2 = rho.clone();
-        rho_p2[i] += 0.5 * h2;
-        let mut rho_m2 = rho.clone();
-        rho_m2[i] -= 0.5 * h2;
-        let f_p2 = reml_state.compute_cost(&rho_p2)?;
-        let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    +1.0h cost = {:+.9e} | ridge = {ridge_p2:.3e} | rho = {:?}",
-            f_p2,
-            rho_p2.to_vec()
-        ));
-
-        let f_m2 = reml_state.compute_cost(&rho_m2)?;
-        let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-        log_lines.push(format!(
-            "[FD RIDGE]    -1.0h cost = {:+.9e} | ridge = {ridge_m2:.3e} | rho = {:?}",
-            f_m2,
-            rho_m2.to_vec()
-        ));
-        let d2 = (f_p2 - f_m2) / h2;
-
-        // Prefer the larger-step derivative if the two disagree substantially
-        let denom = d1.abs().max(d2.abs()).max(1e-12);
-        fd_grad[i] = if (d1 - d2).abs() > 0.2 * denom {
-            d2
-        } else {
-            d1
-        };
-
-        log_lines.push(format!(
-            "[FD RIDGE]    d1 = {:+.9e}, d2 = {:+.9e}, chosen = {:+.9e}",
-            d1, d2, fd_grad[i]
+            "[FD RIDGE]    chosen derivative = {:+.9e}",
+            fd_grad[i]
         ));
     }
 
