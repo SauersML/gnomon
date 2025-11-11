@@ -281,6 +281,10 @@ fn extract_predictions(
         .iter()
         .position(|&column| column == "prediction")
         .ok_or_else(|| "prediction column missing from predictions.tsv".to_string())?;
+    let preferred_index = columns
+        .iter()
+        .position(|&column| column == "uncalibrated_prediction")
+        .unwrap_or(prediction_index);
 
     let mut predictions = Vec::with_capacity(expected_len);
     for line in lines {
@@ -288,18 +292,20 @@ fn extract_predictions(
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if prediction_index >= fields.len() {
+        let target_index = if preferred_index < fields.len() {
+            preferred_index
+        } else {
+            prediction_index
+        };
+        if target_index >= fields.len() {
             return Err(format!(
-                "prediction column index {prediction_index} out of bounds for line: {line}"
+                "prediction column index {target_index} out of bounds for line: {line}"
             )
             .into());
         }
-        let value: f64 = fields[prediction_index].parse().map_err(|e| {
-            format!(
-                "invalid prediction value '{}': {e}",
-                fields[prediction_index]
-            )
-        })?;
+        let value: f64 = fields[target_index]
+            .parse()
+            .map_err(|e| format!("invalid prediction value '{}': {e}", fields[target_index]))?;
         predictions.push(value);
     }
 
@@ -438,7 +444,7 @@ fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     let predicted = Array1::from_vec(predictions);
     let auc_value = auc(&observed, &predicted);
     let auc_floor = auc_lower_confidence_bound(
-        (MALE_CASES + FEMALE_CASES),
+        MALE_CASES + FEMALE_CASES,
         TOTAL_ROWS - (MALE_CASES + FEMALE_CASES),
         1.959963984540054,
     );
@@ -574,9 +580,14 @@ fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     let observed = Array1::from_vec(samples.iter().map(|sample| sample.phenotype).collect());
     let predicted = Array1::from_vec(predictions);
     let auc_value = auc(&observed, &predicted);
+    let auc_floor = auc_lower_confidence_bound(
+        MALE_CASES + FEMALE_CASES,
+        TOTAL_ROWS - (MALE_CASES + FEMALE_CASES),
+        1.959963984540054,
+    );
     assert!(
-        auc_value > 0.5,
-        "expected inference AUC to exceed 0.5, got {auc_value}"
+        auc_value > auc_floor,
+        "expected inference AUC to exceed the 95% null bound ({auc_floor:.4}), got {auc_value}"
     );
 
     Ok(())
