@@ -19,6 +19,20 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+fn auc_lower_confidence_bound(
+    num_positive: usize,
+    num_negative: usize,
+    z_value: f64,
+) -> f64 {
+    assert!(num_positive > 0 && num_negative > 0);
+    let n_pos = num_positive as f64;
+    let n_neg = num_negative as f64;
+    let variance = (n_pos + n_neg + 1.0) / (12.0 * n_pos * n_neg);
+    let standard_error = variance.sqrt();
+    let lower = 0.5 - z_value * standard_error;
+    lower.max(0.0)
+}
+
 #[test]
 fn calibration_toggle_round_trip() {
     reset_calibrator_flag();
@@ -423,9 +437,14 @@ fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     let observed = Array1::from_vec(samples.iter().map(|sample| sample.phenotype).collect());
     let predicted = Array1::from_vec(predictions);
     let auc_value = auc(&observed, &predicted);
+    let auc_floor = auc_lower_confidence_bound(
+        (MALE_CASES + FEMALE_CASES),
+        TOTAL_ROWS - (MALE_CASES + FEMALE_CASES),
+        1.959963984540054,
+    );
     assert!(
-        auc_value > 0.5,
-        "expected inference AUC to exceed 0.5, got {auc_value}"
+        auc_value > auc_floor,
+        "expected inference AUC to exceed the 95% null bound ({auc_floor:.4}), got {auc_value}"
     );
 
     Ok(())
@@ -435,11 +454,12 @@ fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     const TOTAL_ROWS: usize = 3_300;
     const MALE_ROWS: usize = 1_980;
     const FEMALE_ROWS: usize = 1_320;
-    const MALE_CASES: usize = 21;
-    const FEMALE_CASES: usize = 10;
-    const TARGET_PREVALENCE: f64 = 31.0 / 3_300.0;
-    const MALE_TO_FEMALE_RATIO: f64 = 1.4;
-    const SCORE_EFFECT: f64 = 0.9;
+    const MALE_CASES: usize = 54;
+    const FEMALE_CASES: usize = 26;
+    const TARGET_PREVALENCE: f64 = 80.0 / 3_300.0;
+    const MALE_TO_FEMALE_RATIO: f64 = (MALE_CASES as f64 / MALE_ROWS as f64)
+        / (FEMALE_CASES as f64 / FEMALE_ROWS as f64);
+    const SCORE_EFFECT: f64 = 1.4;
 
     let mut rng = StdRng::seed_from_u64(7_316_511);
 
