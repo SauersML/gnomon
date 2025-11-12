@@ -788,6 +788,7 @@ pub fn train_model(
             Some(reml_state.balanced_penalty_root()),
             &layout,
             config,
+            None,
         )?;
 
         // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
@@ -1250,6 +1251,7 @@ pub fn train_model(
         Some(reml_state.balanced_penalty_root()),
         &layout,
         config,
+        None,
     )?;
 
     // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
@@ -2549,6 +2551,7 @@ pub fn optimize_external_design(
         Some(reml_state.balanced_penalty_root()),
         &layout,
         &cfg,
+        None,
     )?;
 
     // Map beta back to original basis
@@ -3126,6 +3129,7 @@ pub mod internal {
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
         workspace: Mutex<RemlWorkspace>,
+        warm_start_beta: RefCell<Option<Array1<f64>>>,
     }
 
     impl<'a> RemlState<'a> {
@@ -3333,11 +3337,12 @@ pub mod internal {
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
                 consecutive_cost_errors: RefCell::new(0),
-                last_cost_error_msg: RefCell::new(None),
-                current_eval_bundle: RefCell::new(None),
-                workspace: Mutex::new(workspace),
-            })
-        }
+            last_cost_error_msg: RefCell::new(None),
+            current_eval_bundle: RefCell::new(None),
+            workspace: Mutex::new(workspace),
+            warm_start_beta: RefCell::new(None),
+        })
+    }
 
         /// Creates a sanitized cache key from rho values.
         /// Returns None if any component is NaN, which indicates that caching should be skipped.
@@ -3441,6 +3446,20 @@ pub mod internal {
             let edf = (p - trace_h_inv_s_lambda).clamp(mp, p);
 
             Ok(edf)
+        }
+
+        fn update_warm_start_from(&self, pr: &PirlsResult) {
+            match pr.status {
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                    let beta_original = pr.reparam_result.qs.dot(&pr.beta_transformed);
+                    self.warm_start_beta
+                        .borrow_mut()
+                        .replace(beta_original);
+                }
+                _ => {
+                    self.warm_start_beta.borrow_mut().take();
+                }
+            }
         }
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
         /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
@@ -3584,6 +3603,7 @@ pub mod internal {
                     Some(balanced_root),
                     layout,
                     config,
+                    None,
                 )?;
 
                 match pirls_result.status {
@@ -3728,8 +3748,12 @@ pub mod internal {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt {
-                if let Some(cached_result) = self.cache.borrow().get(key) {
-                    return Ok(Arc::clone(cached_result));
+                if let Some(cached) = {
+                    let cache_ref = self.cache.borrow();
+                    cache_ref.get(key).cloned()
+                } {
+                    self.update_warm_start_from(cached.as_ref());
+                    return Ok(cached);
                 }
             }
 
@@ -3745,6 +3769,8 @@ pub mod internal {
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
+            let warm_start_holder = self.warm_start_beta.borrow();
+            let warm_start_ref = warm_start_holder.as_ref().map(|beta| beta as &Array1<f64>);
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
@@ -3755,10 +3781,13 @@ pub mod internal {
                 Some(&self.balanced_penalty_root),
                 self.layout,
                 self.config,
+                warm_start_ref,
             );
+            drop(warm_start_holder);
 
             if let Err(e) = &pirls_result {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
+                self.warm_start_beta.borrow_mut().take();
             }
 
             let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
@@ -3767,6 +3796,7 @@ pub mod internal {
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                    self.update_warm_start_from(pirls_result.as_ref());
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
                         self.cache
@@ -3776,6 +3806,7 @@ pub mod internal {
                     Ok(pirls_result)
                 }
                 pirls::PirlsStatus::Unstable => {
+                    self.warm_start_beta.borrow_mut().take();
                     // The fit was unstable. This is where we throw our specific, user-friendly error.
                     // Pass the diagnostic info into the error
                     Err(EstimationError::PerfectSeparationDetected {
@@ -3784,6 +3815,7 @@ pub mod internal {
                     })
                 }
                 pirls::PirlsStatus::MaxIterationsReached => {
+                    self.warm_start_beta.borrow_mut().take();
                     // The fit timed out. This is a standard non-convergence error.
                     Err(EstimationError::PirlsDidNotConverge {
                         max_iterations: pirls_result.iteration,
@@ -6160,6 +6192,7 @@ pub mod internal {
                 Some(reml_state.balanced_penalty_root()),
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -6274,6 +6307,7 @@ pub mod internal {
                 Some(reml_state.balanced_penalty_root()),
                 &layout,
                 &config,
+                None,
             )
             .unwrap();
 
@@ -6554,6 +6588,7 @@ pub mod internal {
                         Some(&balanced_root),
                         &layout,
                         &trained.config,
+                        None,
                     )
                     .expect("pirls refit");
 
@@ -7888,6 +7923,7 @@ pub mod internal {
                 None,
                 &layout,
                 &config,
+                None,
             );
 
             match result {

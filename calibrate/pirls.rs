@@ -925,6 +925,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     balanced_penalty_root: Option<&Array2<f64>>,
     layout: &ModelLayout,
     config: &ModelConfig,
+    warm_start_beta: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
 
@@ -1060,6 +1061,14 @@ pub fn fit_model_for_fixed_rho<'a>(
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
     );
 
+    let mut initial_beta = Array1::<f64>::zeros(layout.total_coeffs);
+    if let Some(beta_original) = warm_start_beta {
+        if beta_original.len() == layout.total_coeffs {
+            // Project the previous fit into the current transformed basis
+            initial_beta = reparam_result.qs.t().dot(beta_original);
+        }
+    }
+
     let options = WorkingModelPirlsOptions {
         max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
@@ -1082,7 +1091,7 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let mut working_summary = run_working_model_pirls(
         &mut working_model,
-        Array1::<f64>::zeros(layout.total_coeffs),
+        initial_beta,
         &options,
         &mut iteration_logger,
     )?;
@@ -2729,6 +2738,7 @@ mod tests {
             None,
             &layout,
             &config,
+            None,
         )?;
 
         // --- Return all necessary components for assertion ---
@@ -3355,6 +3365,7 @@ mod tests {
             None,
             &layout,
             &config,
+            None,
         )
         .expect("First fit should converge for this stable test case");
 
@@ -3369,6 +3380,7 @@ mod tests {
             None,
             &layout,
             &config,
+            None,
         )
         .expect("Second fit should converge for this stable test case");
 
@@ -3483,6 +3495,7 @@ mod tests {
             None,
             &layout,
             &config,
+            None,
         )
         .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
 
@@ -3615,6 +3628,7 @@ mod tests {
             None,
             &layout,
             &config,
+            None,
         )
         .expect("P-IRLS should converge on realistic data with clear signal");
 
