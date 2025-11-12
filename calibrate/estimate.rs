@@ -191,7 +191,7 @@ impl RidgePlanner {
 }
 
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -333,8 +333,8 @@ fn run_gradient_check(
         return Ok(());
     }
 
-    let g_analytic = reml_state.compute_gradient(rho)?;
-    let g_fd = compute_fd_gradient(reml_state, rho)?;
+    let g_analytic = reml_state.with_warm_start_disabled(|| reml_state.compute_gradient(rho))?;
+    let g_fd = reml_state.with_warm_start_disabled(|| compute_fd_gradient(reml_state, rho))?;
 
     let dot = g_analytic.dot(&g_fd);
     let n_a = g_analytic.dot(&g_analytic).sqrt();
@@ -2917,8 +2917,9 @@ pub fn evaluate_external_gradients(
         Some(opts.nullspace_dims.clone()),
     )?;
 
-    let analytic_grad = reml_state.compute_gradient(rho)?;
-    let fd_grad = compute_fd_gradient(&reml_state, rho)?;
+    let analytic_grad = reml_state.with_warm_start_disabled(|| reml_state.compute_gradient(rho))?;
+    let fd_grad =
+        reml_state.with_warm_start_disabled(|| compute_fd_gradient(&reml_state, rho))?;
 
     Ok((analytic_grad, fd_grad))
 }
@@ -3130,6 +3131,7 @@ pub mod internal {
         current_eval_bundle: RefCell<Option<EvalShared>>,
         workspace: Mutex<RemlWorkspace>,
         warm_start_beta: RefCell<Option<Array1<f64>>>,
+        warm_start_enabled: Cell<bool>,
     }
 
     impl<'a> RemlState<'a> {
@@ -3337,10 +3339,11 @@ pub mod internal {
                 last_cost: RefCell::new(f64::INFINITY),
                 last_grad_norm: RefCell::new(f64::INFINITY),
                 consecutive_cost_errors: RefCell::new(0),
-            last_cost_error_msg: RefCell::new(None),
-            current_eval_bundle: RefCell::new(None),
-            workspace: Mutex::new(workspace),
-            warm_start_beta: RefCell::new(None),
+                last_cost_error_msg: RefCell::new(None),
+                current_eval_bundle: RefCell::new(None),
+                workspace: Mutex::new(workspace),
+                warm_start_beta: RefCell::new(None),
+                warm_start_enabled: Cell::new(true),
         })
     }
 
@@ -3449,6 +3452,9 @@ pub mod internal {
         }
 
         fn update_warm_start_from(&self, pr: &PirlsResult) {
+            if !self.warm_start_enabled.get() {
+                return;
+            }
             match pr.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     let beta_original = pr.reparam_result.qs.dot(&pr.beta_transformed);
@@ -3460,6 +3466,16 @@ pub mod internal {
                     self.warm_start_beta.borrow_mut().take();
                 }
             }
+        }
+
+        fn with_warm_start_disabled<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce() -> R,
+        {
+            let previous = self.warm_start_enabled.replace(false);
+            let result = f();
+            self.warm_start_enabled.set(previous);
+            result
         }
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
         /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
@@ -3752,7 +3768,9 @@ pub mod internal {
                     let cache_ref = self.cache.borrow();
                     cache_ref.get(key).cloned()
                 } {
-                    self.update_warm_start_from(cached.as_ref());
+                    if self.warm_start_enabled.get() {
+                        self.update_warm_start_from(cached.as_ref());
+                    }
                     return Ok(cached);
                 }
             }
@@ -3769,8 +3787,15 @@ pub mod internal {
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
-            let warm_start_holder = self.warm_start_beta.borrow();
-            let warm_start_ref = warm_start_holder.as_ref().map(|beta| beta as &Array1<f64>);
+            let warm_start_active = self.warm_start_enabled.get();
+            let warm_start_holder = if warm_start_active {
+                Some(self.warm_start_beta.borrow())
+            } else {
+                None
+            };
+            let warm_start_ref = warm_start_holder
+                .as_ref()
+                .and_then(|opt| opt.as_ref().map(|beta| beta as &Array1<f64>));
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
@@ -3787,7 +3812,9 @@ pub mod internal {
 
             if let Err(e) = &pirls_result {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
-                self.warm_start_beta.borrow_mut().take();
+                if warm_start_active {
+                    self.warm_start_beta.borrow_mut().take();
+                }
             }
 
             let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
@@ -3796,7 +3823,9 @@ pub mod internal {
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                    self.update_warm_start_from(pirls_result.as_ref());
+                    if warm_start_active {
+                        self.update_warm_start_from(pirls_result.as_ref());
+                    }
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
                         self.cache
@@ -3806,7 +3835,9 @@ pub mod internal {
                     Ok(pirls_result)
                 }
                 pirls::PirlsStatus::Unstable => {
-                    self.warm_start_beta.borrow_mut().take();
+                    if warm_start_active {
+                        self.warm_start_beta.borrow_mut().take();
+                    }
                     // The fit was unstable. This is where we throw our specific, user-friendly error.
                     // Pass the diagnostic info into the error
                     Err(EstimationError::PerfectSeparationDetected {
@@ -3815,7 +3846,9 @@ pub mod internal {
                     })
                 }
                 pirls::PirlsStatus::MaxIterationsReached => {
-                    self.warm_start_beta.borrow_mut().take();
+                    if warm_start_active {
+                        self.warm_start_beta.borrow_mut().take();
+                    }
                     // The fit timed out. This is a standard non-convergence error.
                     Err(EstimationError::PirlsDidNotConverge {
                         max_iterations: pirls_result.iteration,
@@ -5380,9 +5413,10 @@ pub mod internal {
             let rho = Array1::from(vec![0.30_f64, -0.45_f64]);
 
             let g_analytic = state
-                .compute_gradient(&rho)
+                .with_warm_start_disabled(|| state.compute_gradient(&rho))
                 .expect("analytic gradient should evaluate");
-            let g_fd = compute_fd_gradient(&state, &rho)
+            let g_fd = state
+                .with_warm_start_disabled(|| compute_fd_gradient(&state, &rho))
                 .expect("finite-difference gradient should evaluate");
 
             let dot = g_analytic.dot(&g_fd);
