@@ -1,1 +1,81 @@
-Infer other model terms, such as sex.
+# Terms module
+
+The `terms` crate provides reusable utilities for inferring sample-level
+metadata terms from genotype data. It currently powers the `gnomon terms`
+command's sex inference pipeline and exposes convenience helpers for writing the
+results alongside the source dataset.
+
+## CLI entry point: `gnomon terms`
+
+```
+gnomon terms --sex <GENOTYPE_PATH>
+```
+
+| Flag | Required | Purpose |
+| --- | --- | --- |
+| `<GENOTYPE_PATH>` | ✅ | Path or URI identifying the genotype dataset. The loader accepts PLINK `.bed/.bim/.fam` trios, directories of per-chromosome trios, and VCF/BCF files that share the same basename. Remote objects are supported anywhere the standard gnomon genotype I/O layer can reach them. |
+| `--sex` | ✅ | Enables sex inference. Additional term inference modes will appear behind their own flags as they are implemented. |
+
+Running the command prints high-level progress and writes a tab-delimited
+`sex.tsv` file next to the genotype input (for example, `data/ukb.sex.tsv` when
+pointing at `data/ukb.bed`). The command fails fast if no inference mode was
+requested, so remember to include the `--sex` flag.
+
+### Output schema
+
+`sex.tsv` captures one row per sample:
+
+| Column | Description |
+| --- | --- |
+| `IID` | Sample identifier sourced from the PLINK `.fam` file or VCF/BCF header. |
+| `Sex` | Final call (`male` or `female`). |
+
+The header is always included and the file is written with Unix newlines. Parent
+directories are created automatically when the resolved output lives outside the
+current working directory.
+
+### Sex inference algorithm
+
+The implementation streams genotype data in 256-variant blocks, forwarding the
+X and Y chromosome slices to the [`infer_sex`](https://docs.rs/infer_sex)
+accumulators provided by the upstream crate. Each sample maintains its own
+accumulator, which digests heterozygosity on the X chromosome together with Y
+coverage statistics to arrive at a final `InferredSex` call. Missing dosages are
+preserved as `NaN` by the genotype reader and therefore do not contribute to the
+summary counts.
+
+Before processing, gnomon inspects the maximum observed X-chromosome position to
+automatically select between the GRCh37 and GRCh38 coordinate systems. This is
+important because the reference position threshold for pseudoautosomal boundary
+detection differs by build. All other variant metadata are streamed directly
+from the genotype reader, so the command inherits the same provenance and
+validation guarantees as the PCA and scoring pipelines.
+
+### Library API
+
+The CLI experience is backed by two convenience APIs:
+
+* `terms::infer_sex_to_tsv(genotype_path: &Path)` – Loads the dataset, performs
+  inference, writes `sex.tsv`, and returns the resolved output path.
+* `terms::SexInferenceRecord` – Bundles the `individual_id` with the raw
+  `InferenceResult` produced by the upstream crate, giving downstream code
+  access to the detailed evidence that informed the final label written to
+  `sex.tsv`.
+
+These helpers make it straightforward to integrate sex inference into larger
+pipelines without shelling out to the CLI.
+
+### Failure modes and validation
+
+* **Unexpected variant counts.** The streaming interface expects the genotype
+  iterator to yield exactly the advertised number of variants. Overflows or
+  underflows raise explicit errors so the CLI exits instead of silently
+  skipping data.
+* **Unsupported chromosome labels.** Only chromosome labels recognised as X or Y
+  contribute to the inference. Everything else—including haploid or mitochondrial
+  contigs—is ignored.
+* **I/O errors.** Any underlying read/write failures are surfaced as structured
+  errors that bubble up to the CLI.
+
+In all cases the CLI exits with a non-zero status and prints the diagnostic so
+batch pipelines can react accordingly.
