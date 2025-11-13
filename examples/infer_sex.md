@@ -899,3 +899,503 @@ Logistic: + interaction 0.5707 0.0091
 
 The interaction doesn't help. All are decently calibrated. Adding sex improved the AUC a bit.
 
+Let's train a simple model and evaluate it in each ancestry group predefined by All of Us. First, we'll run it without standardizing score:
+```
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from sklearn.metrics import roc_auc_score
+
+print("="*80)
+print("TRAINING EUR MODEL: score + sex + age + age²")
+print("="*80)
+
+# Get EUR data with sex
+eur_ids = set(ancestry_labels_df[ancestry_labels_df['ANCESTRY'] == 'eur']['person_id'].astype(str))
+sample_id_col = 'person_id' if 'person_id' in df_age.columns else df_age.columns[0]
+
+df_eur = df_age[df_age[sample_id_col].astype(str).isin(eur_ids)].copy()
+df_eur = df_eur[df_eur['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_eur['sex'] = (df_eur['dragen_sex_ploidy'] == 'XY').astype(int)
+df_eur['age_sq'] = df_eur['age'] ** 2
+df_eur = df_eur.dropna(subset=['PGS003852_AVG', 'age', 'case'])
+
+print(f"EUR training: n={len(df_eur)}, cases={df_eur['case'].sum()}")
+
+# Train model
+X = sm.add_constant(df_eur[['PGS003852_AVG', 'sex', 'age', 'age_sq']])
+y = df_eur['case']
+model = sm.Logit(y, X).fit(disp=0)
+
+# Get coefficients
+b0 = model.params['const']
+b_score = model.params['PGS003852_AVG']
+b_sex = model.params['sex']
+b_age = model.params['age']
+b_age_sq = model.params['age_sq']
+
+# Calculate AUC
+y_pred = model.predict(X)
+auc_train = roc_auc_score(y, y_pred)
+
+print("\n" + "="*80)
+print("MODEL COEFFICIENTS")
+print("="*80)
+print(f"intercept      = {b0:.8f}  (p={model.pvalues['const']:.2e})")
+print(f"PGS003852_AVG  = {b_score:.8f}  (p={model.pvalues['PGS003852_AVG']:.2e})")
+print(f"sex            = {b_sex:.8f}  (p={model.pvalues['sex']:.2e})")
+print(f"age            = {b_age:.8f}  (p={model.pvalues['age']:.2e})")
+print(f"age_sq         = {b_age_sq:.8f}  (p={model.pvalues['age_sq']:.2e})")
+
+print("\n" + "="*80)
+print("FORMULA")
+print("="*80)
+print("logit = intercept + (β_score × score) + (β_sex × sex) + (β_age × age) + (β_age_sq × age²)")
+print(f"\nlogit = {b0:.8f} + ({b_score:.8f} × score) + ({b_sex:.8f} × sex) + ({b_age:.8f} × age) + ({b_age_sq:.8f} × age²)")
+print("\nP(CRC) = 1 / (1 + exp(-logit))")
+print("\nEncoding:")
+print("  score = PGS003852_AVG (polygenic score)")
+print("  sex = 0 (XX/female), 1 (XY/male)")
+print("  age = years")
+
+print("\n" + "="*80)
+print("ODDS RATIOS")
+print("="*80)
+print(f"Score (per SD): OR={np.exp(b_score * df_eur['PGS003852_AVG'].std()):.4f}")
+print(f"Sex (XY vs XX): OR={np.exp(b_sex):.4f}")
+print(f"Age @ 50 years: OR={np.exp(b_age * 50 + b_age_sq * 50**2):.4f}")
+print(f"Age @ 60 years: OR={np.exp(b_age * 60 + b_age_sq * 60**2):.4f}")
+
+print(f"\nTraining AUC (EUR): {auc_train:.4f}")
+
+# Now apply to all ancestries
+print("\n" + "="*80)
+print("APPLYING EUR MODEL TO ALL ANCESTRIES")
+print("="*80)
+
+df_all = df_age.merge(ancestry_labels_df, left_on=sample_id_col, right_on='person_id', how='inner')
+df_all = df_all[df_all['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_all['sex'] = (df_all['dragen_sex_ploidy'] == 'XY').astype(int)
+df_all['age_sq'] = df_all['age'] ** 2
+df_all = df_all.dropna(subset=['PGS003852_AVG', 'age', 'case'])
+
+# Predict using EUR model coefficients
+df_all['logit'] = (b0 + 
+                   b_score * df_all['PGS003852_AVG'] + 
+                   b_sex * df_all['sex'] + 
+                   b_age * df_all['age'] + 
+                   b_age_sq * df_all['age_sq'])
+df_all['pred'] = 1 / (1 + np.exp(-df_all['logit']))
+
+# Calculate AUC per ancestry
+results = []
+for anc in sorted(df_all['ANCESTRY'].unique()):
+    subset = df_all[df_all['ANCESTRY'] == anc]
+    n = len(subset)
+    cases = subset['case'].sum()
+    if cases > 0 and cases < n:
+        auc = roc_auc_score(subset['case'], subset['pred'])
+    else:
+        auc = np.nan
+    results.append({
+        'ancestry': anc,
+        'n': n,
+        'cases': cases,
+        'AUC': auc
+    })
+
+results_df = pd.DataFrame(results)
+print("\n" + results_df.to_string(index=False))
+```
+================================================================================
+TRAINING EUR MODEL: score + sex + age + age²
+================================================================================
+EUR training: n=233145, cases=2626
+
+================================================================================
+MODEL COEFFICIENTS
+================================================================================
+intercept      = -9.09711332  (p=2.73e-154)
+PGS003852_AVG  = -1098.75158677  (p=9.56e-01)
+sex            = 0.10227056  (p=1.00e-02)
+age            = 0.09743362  (p=9.71e-20)
+age_sq         = -0.00038742  (p=2.77e-06)
+
+================================================================================
+FORMULA
+================================================================================
+logit = intercept + (β_score × score) + (β_sex × sex) + (β_age × age) + (β_age_sq × age²)
+
+logit = -9.09711332 + (-1098.75158677 × score) + (0.10227056 × sex) + (0.09743362 × age) + (-0.00038742 × age²)
+
+P(CRC) = 1 / (1 + exp(-logit))
+
+Encoding:
+  score = PGS003852_AVG (polygenic score)
+  sex = 0 (XX/female), 1 (XY/male)
+  age = years
+
+================================================================================
+ODDS RATIOS
+================================================================================
+Score (per SD): OR=0.9989
+Sex (XY vs XX): OR=1.1077
+Age @ 50 years: OR=49.5569
+Age @ 60 years: OR=85.7375
+
+Training AUC (EUR): 0.6962
+
+================================================================================
+APPLYING EUR MODEL TO ALL ANCESTRIES
+================================================================================
+
+ancestry      n  cases      AUC
+     afr  84008    628 0.733068
+     amr  78984    470 0.744153
+     eas  10086     56 0.709979
+     eur 233145   2626 0.696179
+     mid   [low number of cases]
+     sas   [low number of cases]
+
+Now, we'll run it with score standardization:
+```
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from sklearn.metrics import roc_auc_score
+
+print("="*80)
+print("TRAINING EUR MODEL: score + sex + age + age²")
+print("="*80)
+
+# Get EUR data with sex
+eur_ids = set(ancestry_labels_df[ancestry_labels_df['ANCESTRY'] == 'eur']['person_id'].astype(str))
+sample_id_col = 'person_id' if 'person_id' in df_age.columns else df_age.columns[0]
+
+df_eur = df_age[df_age[sample_id_col].astype(str).isin(eur_ids)].copy()
+df_eur = df_eur[df_eur['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_eur['sex'] = (df_eur['dragen_sex_ploidy'] == 'XY').astype(int)
+df_eur['age_sq'] = df_eur['age'] ** 2
+df_eur = df_eur.dropna(subset=['PGS003852_AVG', 'age', 'case'])
+
+print(f"EUR training: n={len(df_eur)}, cases={df_eur['case'].sum()}")
+
+# Standardize score using EUR training data
+score_mean = df_eur['PGS003852_AVG'].mean()
+score_std = df_eur['PGS003852_AVG'].std()
+df_eur['score_std'] = (df_eur['PGS003852_AVG'] - score_mean) / score_std
+
+print(f"\nScore standardization parameters (EUR):")
+print(f"  mean = {score_mean:.10f}")
+print(f"  std  = {score_std:.10f}")
+
+# Train model on standardized score
+X = sm.add_constant(df_eur[['score_std', 'sex', 'age', 'age_sq']])
+y = df_eur['case']
+model = sm.Logit(y, X).fit(disp=0)
+
+# Get coefficients
+b0 = model.params['const']
+b_score = model.params['score_std']
+b_sex = model.params['sex']
+b_age = model.params['age']
+b_age_sq = model.params['age_sq']
+
+# Calculate AUC
+y_pred = model.predict(X)
+auc_train = roc_auc_score(y, y_pred)
+
+print("\n" + "="*80)
+print("MODEL COEFFICIENTS")
+print("="*80)
+print(f"intercept   = {b0:.10f}  (p={model.pvalues['const']:.2e})")
+print(f"score_std   = {b_score:.10f}  (p={model.pvalues['score_std']:.2e})")
+print(f"sex         = {b_sex:.10f}  (p={model.pvalues['sex']:.2e})")
+print(f"age         = {b_age:.10f}  (p={model.pvalues['age']:.2e})")
+print(f"age_sq      = {b_age_sq:.10f}  (p={model.pvalues['age_sq']:.2e})")
+
+print("\n" + "="*80)
+print("FORMULA (WITH STANDARDIZED SCORE)")
+print("="*80)
+print("Step 1: Standardize the score")
+print(f"  score_std = (PGS003852_AVG - {score_mean:.10f}) / {score_std:.10f}")
+print("\nStep 2: Calculate logit")
+print(f"  logit = {b0:.10f}")
+print(f"        + {b_score:.10f} × score_std")
+print(f"        + {b_sex:.10f} × sex")
+print(f"        + {b_age:.10f} × age")
+print(f"        + {b_age_sq:.10f} × age²")
+print("\nStep 3: Get probability")
+print("  P(CRC) = 1 / (1 + exp(-logit))")
+
+# Expanded formula (one-step)
+b0_expanded = b0 - (b_score * score_mean / score_std)
+b_score_expanded = b_score / score_std
+
+print("\n" + "="*80)
+print("FORMULA (ONE-STEP, USING RAW SCORE)")
+print("="*80)
+print(f"logit = {b0_expanded:.10f}")
+print(f"      + {b_score_expanded:.10f} × PGS003852_AVG")
+print(f"      + {b_sex:.10f} × sex")
+print(f"      + {b_age:.10f} × age")
+print(f"      + {b_age_sq:.10f} × age²")
+print("\nP(CRC) = 1 / (1 + exp(-logit))")
+
+print("\n" + "="*80)
+print("ENCODING")
+print("="*80)
+print("PGS003852_AVG: Raw polygenic score value")
+print("sex: 0 = XX (female), 1 = XY (male)")
+print("age: Age in years")
+
+print("\n" + "="*80)
+print("ODDS RATIOS")
+print("="*80)
+print(f"Score (per 1 SD):   OR = {np.exp(b_score):.4f}")
+print(f"Sex (XY vs XX):     OR = {np.exp(b_sex):.4f}")
+print(f"Age (per year @ 50): OR = {np.exp(b_age + 2*b_age_sq*50):.4f}")
+print(f"Age (per year @ 60): OR = {np.exp(b_age + 2*b_age_sq*60):.4f}")
+
+print(f"\nTraining AUC (EUR): {auc_train:.4f}")
+
+# Apply to all ancestries
+print("\n" + "="*80)
+print("APPLYING EUR MODEL TO ALL ANCESTRIES")
+print("="*80)
+
+df_all = df_age.merge(ancestry_labels_df, left_on=sample_id_col, right_on='person_id', how='inner')
+df_all = df_all[df_all['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_all['sex'] = (df_all['dragen_sex_ploidy'] == 'XY').astype(int)
+df_all['age_sq'] = df_all['age'] ** 2
+df_all = df_all.dropna(subset=['PGS003852_AVG', 'age', 'case'])
+
+# Standardize using EUR parameters
+df_all['score_std'] = (df_all['PGS003852_AVG'] - score_mean) / score_std
+
+# Predict
+df_all['logit'] = (b0 + 
+                   b_score * df_all['score_std'] + 
+                   b_sex * df_all['sex'] + 
+                   b_age * df_all['age'] + 
+                   b_age_sq * df_all['age_sq'])
+df_all['pred'] = 1 / (1 + np.exp(-df_all['logit']))
+
+# Calculate AUC per ancestry
+results = []
+for anc in sorted(df_all['ANCESTRY'].unique()):
+    subset = df_all[df_all['ANCESTRY'] == anc]
+    n = len(subset)
+    cases = subset['case'].sum()
+    if cases > 0 and cases < n:
+        auc = roc_auc_score(subset['case'], subset['pred'])
+    else:
+        auc = np.nan
+    results.append({
+        'ancestry': anc,
+        'n': n,
+        'cases': cases,
+        'AUC': auc
+    })
+
+results_df = pd.DataFrame(results)
+print("\n" + results_df.to_string(index=False))
+```
+================================================================================
+TRAINING EUR MODEL: score + sex + age + age²
+================================================================================
+EUR training: n=233145, cases=2626
+
+Score standardization parameters (EUR):
+  mean = -0.0000009977
+  std  = 0.0000009789
+
+================================================================================
+MODEL COEFFICIENTS
+================================================================================
+intercept   = -9.1206459889  (p=1.76e-155)
+score_std   = 0.2886184933  (p=1.46e-48)
+sex         = 0.1019907222  (p=1.03e-02)
+age         = 0.0963858986  (p=2.48e-19)
+age_sq      = -0.0003751652  (p=5.72e-06)
+
+================================================================================
+FORMULA (WITH STANDARDIZED SCORE)
+================================================================================
+Step 1: Standardize the score
+  score_std = (PGS003852_AVG - -0.0000009977) / 0.0000009789
+
+Step 2: Calculate logit
+  logit = -9.1206459889
+        + 0.2886184933 × score_std
+        + 0.1019907222 × sex
+        + 0.0963858986 × age
+        + -0.0003751652 × age²
+
+Step 3: Get probability
+  P(CRC) = 1 / (1 + exp(-logit))
+
+================================================================================
+FORMULA (ONE-STEP, USING RAW SCORE)
+================================================================================
+logit = -8.8264812706
+      + 294848.8164193559 × PGS003852_AVG
+      + 0.1019907222 × sex
+      + 0.0963858986 × age
+      + -0.0003751652 × age²
+
+P(CRC) = 1 / (1 + exp(-logit))
+
+================================================================================
+ENCODING
+================================================================================
+PGS003852_AVG: Raw polygenic score value
+sex: 0 = XX (female), 1 = XY (male)
+age: Age in years
+
+================================================================================
+ODDS RATIOS
+================================================================================
+Score (per 1 SD):   OR = 1.3346
+Sex (XY vs XX):     OR = 1.1074
+Age (per year @ 50): OR = 1.0606
+Age (per year @ 60): OR = 1.0527
+
+Training AUC (EUR): 0.7118
+
+================================================================================
+APPLYING EUR MODEL TO ALL ANCESTRIES
+================================================================================
+
+ancestry      n  cases      AUC
+     afr  84008    628 0.730533
+     amr  78984    470 0.758445
+     eas  10086     56 0.722547
+     eur 233145   2626 0.711833
+
+Standardizing the score is important. I believe this is actually due to the optimizer, not the math per se. We do not detect any obvious portability issues across ancestries.
+
+Now, can we manually apply this formula to predict new cases?
+
+Let's try it:
+```
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
+# Formula coefficients
+b0 = -8.8264812706
+b_pgs = 294848.8164193559
+b_sex = 0.1019907222
+b_age = 0.0963858986
+b_age2 = -0.0003751652
+
+# Prepare data
+sample_id_col = 'person_id' if 'person_id' in df_age.columns else df_age.columns[0]
+df_all = df_age.merge(ancestry_labels_df, left_on=sample_id_col, right_on='person_id', how='inner')
+df_all = df_all[df_all['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_all['sex'] = (df_all['dragen_sex_ploidy'] == 'XY').astype(int)
+df_all = df_all.dropna(subset=['PGS003852_AVG', 'age', 'case'])
+
+# Apply formula
+df_all['logit'] = (b0 + 
+                   b_pgs * df_all['PGS003852_AVG'] + 
+                   b_sex * df_all['sex'] + 
+                   b_age * df_all['age'] + 
+                   b_age2 * df_all['age']**2)
+df_all['P_CRC'] = 1 / (1 + np.exp(-df_all['logit']))
+
+# Results for AMR and AFR
+for ancestry in ['afr', 'amr']:
+    subset = df_all[df_all['ANCESTRY'] == ancestry]
+    n = len(subset)
+    cases = subset['case'].sum()
+    auc = roc_auc_score(subset['case'], subset['P_CRC'])
+    
+    print(f"{ancestry.upper()}: n={n:,}, cases={cases:,}, AUC={auc:.4f}")
+```
+
+AFR: n=84,008, cases=628, AUC=0.7305
+AMR: n=78,984, cases=470, AUC=0.7584
+
+Yes. These are the same results as earlier. It works.
+
+Let's get baseline risk as a function of age and sex, per ancestry group:
+```
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+
+print("="*80)
+print("BASELINE RISK MODELS (age + age² + sex only, no PGS)")
+print("="*80)
+
+# Prepare data
+sample_id_col = 'person_id' if 'person_id' in df_age.columns else df_age.columns[0]
+df_all = df_age.merge(ancestry_labels_df, left_on=sample_id_col, right_on='person_id', how='inner')
+df_all = df_all[df_all['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+df_all['sex'] = (df_all['dragen_sex_ploidy'] == 'XY').astype(int)
+df_all = df_all.dropna(subset=['age', 'case'])
+
+# Fit baseline model for each ancestry
+for ancestry in ['eur', 'afr', 'amr', 'eas']:
+    subset = df_all[df_all['ANCESTRY'] == ancestry].copy()
+    subset['age_sq'] = subset['age'] ** 2
+    
+    X = sm.add_constant(subset[['sex', 'age', 'age_sq']])
+    y = subset['case']
+    
+    model = sm.Logit(y, X).fit(disp=0)
+    
+    b0 = model.params['const']
+    b_sex = model.params['sex']
+    b_age = model.params['age']
+    b_age2 = model.params['age_sq']
+    
+    print(f"\n{ancestry.upper()}: n={len(subset):,}, cases={y.sum():,}")
+    print(f"  intercept = {b0:.10f}  (p={model.pvalues['const']:.2e})")
+    print(f"  sex       = {b_sex:.10f}  (p={model.pvalues['sex']:.2e})")
+    print(f"  age       = {b_age:.10f}  (p={model.pvalues['age']:.2e})")
+    print(f"  age_sq    = {b_age2:.10f}  (p={model.pvalues['age_sq']:.2e})")
+    print(f"\n  Formula:")
+    print(f"  logit = {b0:.10f} + {b_sex:.10f} × sex + {b_age:.10f} × age + {b_age2:.10f} × age²")
+```
+================================================================================
+BASELINE RISK MODELS (age + age² + sex only, no PGS)
+================================================================================
+
+EUR: n=233,145, cases=2,626
+  intercept = -9.0959649138  (p=8.04e-155)
+  sex       = 0.1022705366  (p=1.00e-02)
+  age       = 0.0974301035  (p=9.72e-20)
+  age_sq    = -0.0003873825  (p=2.77e-06)
+
+  Formula:
+  logit = -9.0959649138 + 0.1022705366 × sex + 0.0974301035 × age + -0.0003873825 × age²
+
+AFR: n=84,008, cases=628
+  intercept = -9.9101766486  (p=5.15e-45)
+  sex       = -0.0306824327  (p=7.07e-01)
+  age       = 0.1089007907  (p=1.73e-06)
+  age_sq    = -0.0003786147  (p=3.78e-02)
+
+  Formula:
+  logit = -9.9101766486 + -0.0306824327 × sex + 0.1089007907 × age + -0.0003786147 × age²
+
+AMR: n=78,984, cases=470
+  intercept = -11.1002708853  (p=1.37e-58)
+  sex       = 0.2636941754  (p=5.02e-03)
+  age       = 0.1629602797  (p=7.97e-12)
+  age_sq    = -0.0009405383  (p=3.36e-06)
+
+  Formula:
+  logit = -11.1002708853 + 0.2636941754 × sex + 0.1629602797 × age + -0.0009405383 × age²
+
+EAS: n=10,086, cases=56
+  intercept = -11.5423621124  (p=2.44e-10)
+  sex       = -0.2764595500  (p=3.37e-01)
+  age       = 0.2077715206  (p=1.58e-03)
+  age_sq    = -0.0014940009  (p=9.62e-03)
+
+  Formula:
+  logit = -11.5423621124 + -0.2764595500 × sex + 0.2077715206 × age + -0.0014940009 × age²
