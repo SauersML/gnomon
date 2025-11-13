@@ -3791,8 +3791,7 @@ pub mod internal {
             // The returned result will include the transformation matrix qs
             let warm_start_holder = self.warm_start_beta.borrow();
             let warm_start_ref = warm_start_holder
-                .as_ref()
-                .and_then(|opt| Some(opt.map(|beta| beta as &Array1<f64>)));
+                .as_ref();
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
