@@ -483,6 +483,42 @@ fn solve_newton_direction_dense(
     Ok(solution)
 }
 
+fn default_beta_guess(
+    layout: &ModelLayout,
+    link_function: LinkFunction,
+    y: ArrayView1<f64>,
+    prior_weights: ArrayView1<f64>,
+) -> Array1<f64> {
+    let mut beta = Array1::<f64>::zeros(layout.total_coeffs);
+    match link_function {
+        LinkFunction::Logit => {
+            let mut weighted_sum = 0.0;
+            let mut total_weight = 0.0;
+            for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
+                weighted_sum += wi * yi;
+                total_weight += wi;
+            }
+            if total_weight > 0.0 {
+                let prevalence = ((weighted_sum + 0.5) / (total_weight + 1.0))
+                    .clamp(1e-6, 1.0 - 1e-6);
+                beta[layout.intercept_col] = (prevalence / (1.0 - prevalence)).ln();
+            }
+        }
+        LinkFunction::Identity => {
+            let mut weighted_sum = 0.0;
+            let mut total_weight = 0.0;
+            for (&yi, &wi) in y.iter().zip(prior_weights.iter()) {
+                weighted_sum += wi * yi;
+                total_weight += wi;
+            }
+            if total_weight > 0.0 {
+                beta[layout.intercept_col] = weighted_sum / total_weight;
+            }
+        }
+    }
+    beta
+}
+
 pub fn run_working_model_pirls<M, F>(
     model: &mut M,
     mut beta: Array1<f64>,
@@ -1061,13 +1097,11 @@ pub fn fit_model_for_fixed_rho<'a>(
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
     );
 
-    let mut initial_beta = Array1::<f64>::zeros(layout.total_coeffs);
-    if let Some(beta_original) = warm_start_beta {
-        if beta_original.len() == layout.total_coeffs {
-            // Project the previous fit into the current transformed basis
-            initial_beta = reparam_result.qs.t().dot(beta_original);
-        }
-    }
+    let beta_guess_original = warm_start_beta
+        .filter(|beta| beta.len() == layout.total_coeffs)
+        .map(|beta| beta.to_owned())
+        .unwrap_or_else(|| default_beta_guess(layout, link_function, y, prior_weights));
+    let initial_beta = reparam_result.qs.t().dot(&beta_guess_original);
 
     let options = WorkingModelPirlsOptions {
         max_iterations: config.max_iterations,
