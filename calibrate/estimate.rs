@@ -358,9 +358,11 @@ fn run_gradient_check(
     let g_ref: Array1<f64> = g_analytic
         .iter()
         .zip(g_fd.iter())
-        .map(|(&a, &f)| a.abs().max(f.abs()))
+        .map(|(&a, &f): (&f64, &f64)| -> f64 { a.abs().max(f.abs()) })
         .collect();
-    let g_inf = g_ref.iter().fold(0.0_f64, |m, &v| m.max(v));
+    let g_inf = g_ref
+        .iter()
+        .fold(0.0_f64, |m: f64, &v| m.max(v));
     let tau_abs = 1e-6_f64;
     let tau_rel = 1e-3_f64 * g_inf;
     let mask: Vec<bool> = g_ref
@@ -3468,7 +3470,7 @@ pub mod internal {
             }
         }
 
-        fn with_warm_start_disabled<F, R>(&self, f: F) -> R
+        pub(super) fn with_warm_start_disabled<F, R>(&self, f: F) -> R
         where
             F: FnOnce() -> R,
         {
