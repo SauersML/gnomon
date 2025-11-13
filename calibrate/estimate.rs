@@ -3792,7 +3792,7 @@ pub mod internal {
             let warm_start_holder = self.warm_start_beta.borrow();
             let warm_start_ref = warm_start_holder
                 .as_ref()
-                .and_then(|opt| opt.as_ref().map(|beta| beta as &Array1<f64>));
+                .and_then(|opt| opt.map(|beta| beta as &Array1<f64>));
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
