@@ -3789,12 +3789,7 @@ pub mod internal {
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
-            let warm_start_active = self.warm_start_enabled.get();
-            let warm_start_holder = if warm_start_active {
-                Some(self.warm_start_beta.borrow())
-            } else {
-                None
-            };
+            let warm_start_holder = self.warm_start_beta.borrow();
             let warm_start_ref = warm_start_holder
                 .as_ref()
                 .and_then(|opt| opt.as_ref().map(|beta| beta as &Array1<f64>));
@@ -3814,7 +3809,7 @@ pub mod internal {
 
             if let Err(e) = &pirls_result {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
-                if warm_start_active {
+                if self.warm_start_enabled.get() {
                     self.warm_start_beta.borrow_mut().take();
                 }
             }
@@ -3825,9 +3820,7 @@ pub mod internal {
             // Check the status returned by the P-IRLS routine.
             match pirls_result.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                    if warm_start_active {
-                        self.update_warm_start_from(pirls_result.as_ref());
-                    }
+                    self.update_warm_start_from(pirls_result.as_ref());
                     // This is a successful fit. Cache only if key is valid (not NaN).
                     if let Some(key) = key_opt {
                         self.cache
@@ -3837,7 +3830,7 @@ pub mod internal {
                     Ok(pirls_result)
                 }
                 pirls::PirlsStatus::Unstable => {
-                    if warm_start_active {
+                    if self.warm_start_enabled.get() {
                         self.warm_start_beta.borrow_mut().take();
                     }
                     // The fit was unstable. This is where we throw our specific, user-friendly error.
@@ -3848,7 +3841,7 @@ pub mod internal {
                     })
                 }
                 pirls::PirlsStatus::MaxIterationsReached => {
-                    if warm_start_active {
+                    if self.warm_start_enabled.get() {
                         self.warm_start_beta.borrow_mut().take();
                     }
                     // The fit timed out. This is a standard non-convergence error.
