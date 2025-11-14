@@ -2311,7 +2311,7 @@ pub fn fit_calibrator(
         lambdas,
         scale,
         edf_by_block,
-        edf_total: _,
+        edf_total,
         iterations,
         final_grad_norm,
         ..
@@ -2369,7 +2369,7 @@ pub fn fit_calibrator(
     );
     eprintln!(
         "[CAL] edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}, scale={:.3e}",
-        edf_pred, edf_pred_param, edf_se, edf_dist, res.edf_total, res.scale
+        edf_pred, edf_pred_param, edf_se, edf_dist, edf_total, scale
     );
     let penalty_freeze_edf_threshold = 1e-3_f64;
     let penalty_freeze_lambda_threshold = 1e8_f64;
