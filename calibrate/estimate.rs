@@ -1418,6 +1418,7 @@ pub fn train_model(
                 &penalties_cal,
                 &penalty_nullspace_dims,
                 config.link_function(),
+                &spec,
             )
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
@@ -2292,6 +2293,7 @@ pub fn train_survival_model(
                 &penalties_cal,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                &spec,
             )
             .map_err(|e| {
                 EstimationError::CalibratorTrainingFailed(format!(
@@ -2461,6 +2463,7 @@ pub struct ExternalOptimResult {
     pub edf_total: f64,
     pub iterations: usize,
     pub final_grad_norm: f64,
+    pub pirls_status: crate::calibrate::pirls::PirlsStatus,
 }
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
@@ -2684,6 +2687,8 @@ pub fn optimize_external_design(
         grad_norm_reported
     };
 
+    let pirls_status = pirls_res.status.clone();
+
     Ok(ExternalOptimResult {
         beta: beta_orig,
         lambdas: lambdas.to_owned(),
@@ -2692,6 +2697,7 @@ pub fn optimize_external_design(
         edf_total,
         iterations: iters,
         final_grad_norm,
+        pirls_status,
     })
 }
 

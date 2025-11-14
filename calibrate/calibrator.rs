@@ -7,7 +7,7 @@ use crate::calibrate::faer_ndarray::FaerArrayView;
 use crate::calibrate::faer_ndarray::FaerColView;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
-use crate::calibrate::pirls; // for PirlsResult
+use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
 // no penalty root helpers needed directly here
 
 use ndarray::parallel::prelude::*;
@@ -2117,6 +2117,7 @@ pub fn fit_calibrator(
     penalties: &[Array2<f64>],
     penalty_nullspace_dims: &[usize],
     link: LinkFunction,
+    spec: &CalibratorSpec,
 ) -> Result<
     (
         Array1<f64>,
@@ -2195,33 +2196,80 @@ pub fn fit_calibrator(
         )));
     }
 
-    let firth = CalibratorSpec::firth_default_for_link(link);
-    if matches!(link, LinkFunction::Logit) {
-        if let Some(ref firth_spec) = firth {
-            if firth_spec.enabled {
-                eprintln!("[CAL] Firth penalization active for calibrator fit",);
-            } else {
-                eprintln!("[CAL] Firth penalization disabled for calibrator fit");
-            }
-        } else {
-            eprintln!("[CAL] Firth penalization disabled for calibrator fit");
-        }
+    let firth_fallback = spec
+        .firth
+        .as_ref()
+        .filter(|cfg| cfg.enabled);
+    if matches!(link, LinkFunction::Logit) && firth_fallback.is_none() {
+        eprintln!("[CAL] Firth penalization disabled for calibrator fit");
     }
 
-    let opts = ExternalOptimOptions {
-        link,
-        max_iter: 75,
-        tol: 1e-3,
-        nullspace_dims: active_null_dims.clone(),
-        firth,
+    let mut attempt_fit = |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
+        let opts = ExternalOptimOptions {
+            link,
+            max_iter: 75,
+            tol: 1e-3,
+            nullspace_dims: active_null_dims.clone(),
+            firth: firth_override.cloned(),
+        };
+        if matches!(link, LinkFunction::Logit) {
+            match firth_override {
+                Some(_) => eprintln!("[CAL] Firth penalization active for calibrator fit"),
+                None => eprintln!("[CAL] Firth penalization disabled for calibrator fit"),
+            }
+        }
+        eprintln!(
+            "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
+            x.nrows(),
+            x.ncols(),
+            active_penalty_count,
+            link
+        );
+        optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)
     };
-    eprintln!(
-        "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
-        x.nrows(),
-        x.ncols(),
-        active_penalty_count,
-        link
-    );
+
+    fn pirls_status_stable(status: &PirlsStatus) -> bool {
+        matches!(
+            status,
+            PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
+        )
+    }
+
+    let mut fit_result = match attempt_fit(None) {
+        Ok(res) => {
+            if pirls_status_stable(&res.pirls_status) || firth_fallback.is_none() {
+                res
+            } else {
+                eprintln!(
+                    "[CAL][INFO] Re-running calibrator with Firth penalty due to PIRLS status {:?}",
+                    res.pirls_status
+                );
+                match firth_fallback {
+                    Some(cfg) => attempt_fit(Some(cfg))?,
+                    None => res,
+                }
+            }
+        }
+        Err(err) => {
+            if let Some(cfg) = firth_fallback {
+                eprintln!(
+                    "[CAL][INFO] Initial calibrator fit failed ({:?}); retrying with Firth penalty",
+                    err
+                );
+                attempt_fit(Some(cfg))?
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    if !pirls_status_stable(&fit_result.pirls_status) {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "Calibrator fit ended with PIRLS status {:?}",
+            fit_result.pirls_status
+        )));
+    }
+
     let smooth_desc = match active_penalty_count {
         0 => "no calibrator smooths".to_string(),
         1 => "the calibrator smooth".to_string(),
@@ -2258,8 +2306,6 @@ pub fn fit_calibrator(
     );
     // End of shape guard: all penalty matrices now match the design width.
 
-    let res = optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)?;
-
     let ExternalOptimResult {
         beta,
         lambdas,
@@ -2268,7 +2314,8 @@ pub fn fit_calibrator(
         edf_total: _,
         iterations,
         final_grad_norm,
-    } = res;
+        ..
+    } = fit_result;
 
     // Extract lambdas directly from optimizer; do not clamp them.
     // They are exp(ρ) and already nonnegative.
@@ -4283,6 +4330,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
 
         // The fit should succeed without error
@@ -4513,6 +4561,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
 
         // Should converge successfully
@@ -4632,6 +4681,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
 
         // The fit with correct shape should succeed or at least not fail due to shape mismatch
@@ -4653,6 +4703,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
 
         // The fit should fail due to shape mismatch
@@ -4778,6 +4829,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, _, _, _), _) = fit_result;
@@ -4946,6 +4998,7 @@ mod tests {
                 &penalties,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                &spec,
             )
             .unwrap();
 
@@ -5112,6 +5165,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -5272,6 +5326,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, (edf_pred, _, edf_se, edf_dist), _) = fit_result;
@@ -5508,6 +5563,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (_, lambdas_opt, _, _, _) = fit_result;
@@ -5635,6 +5691,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Identity,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, scale, (edf_pred, _, edf_se, edf_dist), (iters, grad_norm)) =
@@ -5815,6 +5872,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
         assert!(fit_result.is_ok(), "Calibrator fitting should succeed");
     }
@@ -5931,6 +5989,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -6041,6 +6100,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let (beta, lambdas, _, _, _) = fit_result;
@@ -6265,6 +6325,7 @@ mod tests {
             &rs_blocks,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
 
@@ -6579,6 +6640,7 @@ mod tests {
             &rs_blocks,
             &penalty_nullspace_dims,
             LinkFunction::Identity,
+            &spec,
         )
         .unwrap();
 
@@ -6810,6 +6872,7 @@ mod tests {
                 &penalties,
                 &penalty_nullspace_dims,
                 LinkFunction::Logit,
+                &spec,
             )
             .unwrap();
             let (beta, lambdas, _, _, _) = fit_result;
@@ -6973,6 +7036,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
         let fit_time = fit_start.elapsed();
@@ -7103,6 +7167,7 @@ mod tests {
             &extreme_penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
 
         match result {
@@ -7226,6 +7291,7 @@ mod tests {
             &large_penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         );
         // The fit should succeed with large lambdas
         assert!(
@@ -7339,6 +7405,7 @@ mod tests {
             &penalties,
             &penalty_nullspace_dims,
             LinkFunction::Logit,
+            &spec,
         )
         .unwrap();
 
@@ -7849,6 +7916,7 @@ mod tests {
             &penalties_uniform,
             &penalty_nullspace_dims_uniform,
             LinkFunction::Logit,
+            &spec_uniform,
         )
         .unwrap();
 
@@ -7866,6 +7934,7 @@ mod tests {
             &penalties_nonuniform,
             &penalty_nullspace_dims_nonuniform,
             LinkFunction::Logit,
+            &spec_nonuniform,
         )
         .unwrap();
 
