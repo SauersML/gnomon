@@ -1007,23 +1007,23 @@ for anc in sorted(df_all['ANCESTRY'].unique()):
 results_df = pd.DataFrame(results)
 print("\n" + results_df.to_string(index=False))
 ```
-================================================================================
+
 TRAINING EUR MODEL: score + sex + age + age²
-================================================================================
+
 EUR training: n=233145, cases=2626
 
-================================================================================
+
 MODEL COEFFICIENTS
-================================================================================
+
 intercept      = -9.09711332  (p=2.73e-154)
 PGS003852_AVG  = -1098.75158677  (p=9.56e-01)
 sex            = 0.10227056  (p=1.00e-02)
 age            = 0.09743362  (p=9.71e-20)
 age_sq         = -0.00038742  (p=2.77e-06)
 
-================================================================================
+
 FORMULA
-================================================================================
+
 logit = intercept + (β_score × score) + (β_sex × sex) + (β_age × age) + (β_age_sq × age²)
 
 logit = -9.09711332 + (-1098.75158677 × score) + (0.10227056 × sex) + (0.09743362 × age) + (-0.00038742 × age²)
@@ -1035,9 +1035,9 @@ Encoding:
   sex = 0 (XX/female), 1 (XY/male)
   age = years
 
-================================================================================
+
 ODDS RATIOS
-================================================================================
+
 Score (per SD): OR=0.9989
 Sex (XY vs XX): OR=1.1077
 Age @ 50 years: OR=49.5569
@@ -1045,9 +1045,9 @@ Age @ 60 years: OR=85.7375
 
 Training AUC (EUR): 0.6962
 
-================================================================================
+
 APPLYING EUR MODEL TO ALL ANCESTRIES
-================================================================================
+
 
 ancestry      n  cases      AUC
      afr  84008    628 0.733068
@@ -1201,27 +1201,29 @@ for anc in sorted(df_all['ANCESTRY'].unique()):
 results_df = pd.DataFrame(results)
 print("\n" + results_df.to_string(index=False))
 ```
-================================================================================
+
+Results:
+```
 TRAINING EUR MODEL: score + sex + age + age²
-================================================================================
+
 EUR training: n=233145, cases=2626
 
 Score standardization parameters (EUR):
   mean = -0.0000009977
   std  = 0.0000009789
 
-================================================================================
+
 MODEL COEFFICIENTS
-================================================================================
+
 intercept   = -9.1206459889  (p=1.76e-155)
 score_std   = 0.2886184933  (p=1.46e-48)
 sex         = 0.1019907222  (p=1.03e-02)
 age         = 0.0963858986  (p=2.48e-19)
 age_sq      = -0.0003751652  (p=5.72e-06)
 
-================================================================================
+
 FORMULA (WITH STANDARDIZED SCORE)
-================================================================================
+
 Step 1: Standardize the score
   score_std = (PGS003852_AVG - -0.0000009977) / 0.0000009789
 
@@ -1235,9 +1237,9 @@ Step 2: Calculate logit
 Step 3: Get probability
   P(CRC) = 1 / (1 + exp(-logit))
 
-================================================================================
+
 FORMULA (ONE-STEP, USING RAW SCORE)
-================================================================================
+
 logit = -8.8264812706
       + 294848.8164193559 × PGS003852_AVG
       + 0.1019907222 × sex
@@ -1246,16 +1248,16 @@ logit = -8.8264812706
 
 P(CRC) = 1 / (1 + exp(-logit))
 
-================================================================================
+
 ENCODING
-================================================================================
+
 PGS003852_AVG: Raw polygenic score value
 sex: 0 = XX (female), 1 = XY (male)
 age: Age in years
 
-================================================================================
+
 ODDS RATIOS
-================================================================================
+
 Score (per 1 SD):   OR = 1.3346
 Sex (XY vs XX):     OR = 1.1074
 Age (per year @ 50): OR = 1.0606
@@ -1263,15 +1265,16 @@ Age (per year @ 60): OR = 1.0527
 
 Training AUC (EUR): 0.7118
 
-================================================================================
+
 APPLYING EUR MODEL TO ALL ANCESTRIES
-================================================================================
+
 
 ancestry      n  cases      AUC
      afr  84008    628 0.730533
      amr  78984    470 0.758445
      eas  10086     56 0.722547
      eur 233145   2626 0.711833
+```
 
 Standardizing the score is important. I believe this is actually due to the optimizer, not the math per se. We do not detect any obvious portability issues across ancestries.
 
@@ -1360,9 +1363,11 @@ for ancestry in ['eur', 'afr', 'amr', 'eas']:
     print(f"\n  Formula:")
     print(f"  logit = {b0:.10f} + {b_sex:.10f} × sex + {b_age:.10f} × age + {b_age2:.10f} × age²")
 ```
-================================================================================
+
+Results:
+```
 BASELINE RISK MODELS (age + age² + sex only, no PGS)
-================================================================================
+
 
 EUR: n=233,145, cases=2,626
   intercept = -9.0959649138  (p=8.04e-155)
@@ -1399,3 +1404,316 @@ EAS: n=10,086, cases=56
 
   Formula:
   logit = -11.5423621124 + -0.2764595500 × sex + 0.2077715206 × age + -0.0014940009 × age²
+```
+
+Now let's try inferring sex with gnomon:
+```
+!../../gnomon/target/release/gnomon terms --sex ../../arrays.bed
+```
+
+```
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+gnomon = pd.read_csv("../../arrays.sex.tsv", sep="\t")
+gnomon['IID'] = gnomon['IID'].astype(str)
+
+id_col = next(c for c in ["person_id", "research_id", "sample_id"] if c in sex_df.columns)
+sex_df[id_col] = sex_df[id_col].astype(str)
+
+merged = gnomon.merge(sex_df[[id_col, 'dragen_sex_ploidy']], left_on='IID', right_on=id_col, how='inner')
+
+ct = pd.crosstab(merged['dragen_sex_ploidy'], merged['Sex'], margins=True)
+print(ct)
+
+plt.figure(figsize=(8, 6))
+sns.heatmap(ct.iloc[:-1, :-1], annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Gnomon Sex')
+plt.ylabel('DRAGEN Sex Ploidy')
+plt.title('DRAGEN vs Gnomon Sex Assignment')
+plt.tight_layout()
+plt.show()
+```
+
+We can see that gnomon thinks that the X0, XO, XXY, XYY, and XY individuals are mostly male, whereas the XXX and XX individuals are mostly female.
+
+```
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import gcsfs
+import os
+
+project = os.environ.get("GOOGLE_PROJECT")
+fs = gcsfs.GCSFileSystem(project=project, token="cloud", requester_pays=True)
+
+# Load sex_at_birth
+with fs.open("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv", "rb") as f:
+    metrics = pd.read_csv(f, sep="\t")
+
+# Load gnomon predictions
+gnomon = pd.read_csv("../../arrays.sex.tsv", sep="\t")
+gnomon['IID'] = gnomon['IID'].astype(str)
+gnomon = gnomon.rename(columns={'Sex': 'gnomon_sex'})
+
+# Try to load germline allosomal aneuploidy
+aneu_path = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/structural_variants/aux/aneuploidies"
+aneu_files = fs.ls(aneu_path)
+print("Available aneuploidy files:")
+for f in aneu_files:
+    print(f"  {f}")
+
+germline_file = None
+for f in aneu_files:
+    fname = f.lower()
+    if 'germline' in fname and ('allosomal' in fname or 'sex' in fname or 'x' in fname or 'y' in fname):
+        germline_file = f
+        break
+
+if germline_file:
+    with fs.open(germline_file, "rb") as f:
+        germline_aneu = pd.read_csv(f, sep="\t")
+    print(f"\nLoaded: {germline_file}")
+    print(f"Columns: {list(germline_aneu.columns)}")
+else:
+    print("\nNo germline aneuploidy file found, creating empty placeholder")
+    germline_aneu = pd.DataFrame()
+
+# Find ID column
+id_col = next((c for c in ["research_id", "person_id", "sample_id"] if c in metrics.columns), None)
+metrics[id_col] = metrics[id_col].astype(str)
+
+# Merge all sources
+merged = metrics[[id_col, 'sex_at_birth', 'dragen_sex_ploidy']].copy()
+merged = merged.merge(gnomon, left_on=id_col, right_on='IID', how='left')
+
+if not germline_aneu.empty:
+    germline_aneu_id = next((c for c in ["research_id", "person_id", "sample_id"] if c in germline_aneu.columns), germline_aneu.columns[0])
+    germline_aneu[germline_aneu_id] = germline_aneu[germline_aneu_id].astype(str)
+    germline_aneu['has_germline_aneu'] = True
+    merged = merged.merge(germline_aneu[[germline_aneu_id, 'has_germline_aneu']], 
+                          left_on=id_col, right_on=germline_aneu_id, how='left')
+merged['has_germline_aneu'] = merged.get('has_germline_aneu', pd.Series(False, index=merged.index)).fillna(False)
+
+# Check for Hail ploidy columns
+hail_cols = [c for c in metrics.columns if 'ploidy' in c.lower() and c != 'dragen_sex_ploidy']
+if hail_cols:
+    print(f"\nFound Hail-related columns: {hail_cols}")
+    for col in hail_cols[:5]:  # limit to first 5
+        merged = merged.merge(metrics[[id_col, col]], on=id_col, how='left')
+
+print("\n" + "="*60)
+print("data coverage")
+print("="*60)
+print(f"total samples: {len(merged):,}")
+print(f"has sex_at_birth: {merged['sex_at_birth'].notna().sum():,} ({100*merged['sex_at_birth'].notna().mean():.1f}%)")
+print(f"has dragen_sex_ploidy: {merged['dragen_sex_ploidy'].notna().sum():,} ({100*merged['dragen_sex_ploidy'].notna().mean():.1f}%)")
+print(f"has gnomon_sex: {merged['gnomon_sex'].notna().sum():,} ({100*merged['gnomon_sex'].notna().mean():.1f}%)")
+print(f"has germline aneuploidy flag: {merged['has_germline_aneu'].sum():,} ({100*merged['has_germline_aneu'].mean():.1f}%)")
+
+print("\n" + "="*60)
+print("value distributions")
+print("="*60)
+print("\nsex_at_birth:")
+print(merged['sex_at_birth'].value_counts(dropna=False))
+print("\ndragen_sex_ploidy:")
+print(merged['dragen_sex_ploidy'].value_counts(dropna=False))
+print("\ngnomon_sex:")
+print(merged['gnomon_sex'].value_counts(dropna=False))
+
+# Concordance matrices
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+# Self-report vs dragen
+ct1 = pd.crosstab(merged['sex_at_birth'], merged['dragen_sex_ploidy'], dropna=False)
+sns.heatmap(ct1, annot=True, fmt='g', cmap='Blues', ax=axes[0,0], cbar_kws={'label': 'count'})
+axes[0,0].set_title('self-report vs dragen')
+
+# Self-report vs gnomon
+ct2 = pd.crosstab(merged['sex_at_birth'], merged['gnomon_sex'], dropna=False)
+sns.heatmap(ct2, annot=True, fmt='g', cmap='Greens', ax=axes[0,1], cbar_kws={'label': 'count'})
+axes[0,1].set_title('self-report vs gnomon')
+
+# dragen vs gnomon
+ct3 = pd.crosstab(merged['dragen_sex_ploidy'], merged['gnomon_sex'], dropna=False)
+sns.heatmap(ct3, annot=True, fmt='g', cmap='Oranges', ax=axes[0,2], cbar_kws={'label': 'count'})
+axes[0,2].set_title('dragen vs gnomon')
+
+# Aneuploidy breakdown by dragen
+aneu_dragen = merged.groupby('dragen_sex_ploidy')['has_germline_aneu'].agg(['sum', 'count', 'mean']).reset_index()
+aneu_dragen = aneu_dragen.sort_values('mean', ascending=False)
+axes[1,0].barh(range(len(aneu_dragen)), aneu_dragen['mean']*100)
+axes[1,0].set_yticks(range(len(aneu_dragen)))
+axes[1,0].set_yticklabels(aneu_dragen['dragen_sex_ploidy'])
+axes[1,0].set_xlabel('% with germline aneuploidy')
+axes[1,0].set_title('germline aneuploidy by dragen ploidy')
+
+# Discordance rates
+merged['dragen_binary'] = merged['dragen_sex_ploidy'].map({'XX': 'Female', 'XY': 'Male'})
+merged['self_vs_dragen_discord'] = (merged['sex_at_birth'] != merged['dragen_binary']) & merged['sex_at_birth'].notna() & merged['dragen_binary'].notna()
+merged['self_vs_gnomon_discord'] = (merged['sex_at_birth'].str.lower() != merged['gnomon_sex'].str.lower()) & merged['sex_at_birth'].notna() & merged['gnomon_sex'].notna()
+merged['dragen_vs_gnomon_discord'] = (merged['dragen_binary'].str.lower() != merged['gnomon_sex'].str.lower()) & merged['dragen_binary'].notna() & merged['gnomon_sex'].notna()
+
+discord_data = pd.DataFrame({
+    'comparison': ['self vs dragen', 'self vs gnomon', 'dragen vs gnomon'],
+    'discordance_pct': [
+        100*merged['self_vs_dragen_discord'].mean(),
+        100*merged['self_vs_gnomon_discord'].mean(),
+        100*merged['dragen_vs_gnomon_discord'].mean()
+    ]
+})
+axes[1,1].bar(discord_data['comparison'], discord_data['discordance_pct'])
+axes[1,1].set_ylabel('discordance %')
+axes[1,1].set_title('binary sex discordance rates')
+axes[1,1].tick_params(axis='x', rotation=45)
+
+# Non-xx/xy breakdown
+non_binary = merged[~merged['dragen_sex_ploidy'].isin(['XX', 'XY'])].copy()
+ploidy_counts = non_binary['dragen_sex_ploidy'].value_counts()
+axes[1,2].bar(range(len(ploidy_counts)), ploidy_counts.values)
+axes[1,2].set_xticks(range(len(ploidy_counts)))
+axes[1,2].set_xticklabels(ploidy_counts.index, rotation=45)
+axes[1,2].set_ylabel('count')
+axes[1,2].set_title(f'non-xx/xy ploidy (n={len(non_binary):,})')
+
+plt.tight_layout()
+plt.show()
+
+print("\n" + "="*60)
+print("concordance summary")
+print("="*60)
+print(f"self-report vs dragen (binary): {100*(1-merged['self_vs_dragen_discord'].mean()):.2f}% concordance")
+print(f"self-report vs gnomon: {100*(1-merged['self_vs_gnomon_discord'].mean()):.2f}% concordance")
+print(f"dragen vs gnomon (binary): {100*(1-merged['dragen_vs_gnomon_discord'].mean()):.2f}% concordance")
+
+print("\n" + "="*60)
+print("aneuploidy enrichment")
+print("="*60)
+print(aneu_dragen.to_string(index=False))
+```
+
+```
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Filter to confident XX/XY
+confident = merged[
+    (merged['dragen_sex_ploidy'].isin(['XX', 'XY'])) &
+    (merged['sex_at_birth'].isin(['Female', 'Male'])) &
+    (merged['gnomon_sex'].notna())
+].copy()
+
+confident['dragen_binary'] = confident['dragen_sex_ploidy'].map({'XX': 'female', 'XY': 'male'})
+confident['self_binary'] = confident['sex_at_birth'].str.lower()
+
+print("="*60)
+print(f"confident xx/xy subset: {len(confident):,} / {len(merged):,} ({100*len(confident)/len(merged):.1f}%)")
+print("="*60)
+
+# All pairwise concordances
+self_dragen_match = (confident['self_binary'] == confident['dragen_binary']).sum()
+self_gnomon_match = (confident['self_binary'] == confident['gnomon_sex']).sum()
+dragen_gnomon_match = (confident['dragen_binary'] == confident['gnomon_sex']).sum()
+
+print(f"\nself ↔ dragen:  {self_dragen_match:,} / {len(confident):,} ({100*self_dragen_match/len(confident):.3f}%)")
+print(f"self ↔ gnomon:  {self_gnomon_match:,} / {len(confident):,} ({100*self_gnomon_match/len(confident):.3f}%)")
+print(f"dragen ↔ gnomon: {dragen_gnomon_match:,} / {len(confident):,} ({100*dragen_gnomon_match/len(confident):.3f}%)")
+
+# Three-way concordance
+all_three_match = (
+    (confident['self_binary'] == confident['dragen_binary']) &
+    (confident['self_binary'] == confident['gnomon_sex'])
+).sum()
+print(f"\nall three agree: {all_three_match:,} / {len(confident):,} ({100*all_three_match/len(confident):.3f}%)")
+
+# Discordance patterns
+confident['pattern'] = (
+    confident['self_binary'] + '/' +
+    confident['dragen_binary'] + '/' +
+    confident['gnomon_sex']
+)
+
+discord_patterns = confident[confident['self_binary'] != confident['dragen_binary']]['pattern'].value_counts()
+print(f"\ndiscordance patterns (n={discord_patterns.sum():,}):")
+print(discord_patterns.head(10))
+
+# Crosstabs
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+ct1 = pd.crosstab(confident['self_binary'], confident['dragen_binary'], normalize='index') * 100
+sns.heatmap(ct1, annot=True, fmt='.3f', cmap='RdYlGn', vmin=0, vmax=100, ax=axes[0], cbar_kws={'label': '% within row'})
+axes[0].set_title('self → dragen (%)')
+
+ct2 = pd.crosstab(confident['self_binary'], confident['gnomon_sex'], normalize='index') * 100
+sns.heatmap(ct2, annot=True, fmt='.3f', cmap='RdYlGn', vmin=0, vmax=100, ax=axes[1], cbar_kws={'label': '% within row'})
+axes[1].set_title('self → gnomon (%)')
+
+ct3 = pd.crosstab(confident['dragen_binary'], confident['gnomon_sex'], normalize='index') * 100
+sns.heatmap(ct3, annot=True, fmt='.3f', cmap='RdYlGn', vmin=0, vmax=100, ax=axes[2], cbar_kws={'label': '% within row'})
+axes[2].set_title('dragen → gnomon (%)')
+
+plt.tight_layout()
+plt.show()
+
+# Discordance breakdown by method pair
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+# Self vs dragen discordances
+self_dragen_discord = confident[confident['self_binary'] != confident['dragen_binary']]
+if len(self_dragen_discord) > 0:
+    sd_counts = self_dragen_discord.groupby(['self_binary', 'dragen_binary']).size().reset_index(name='count')
+    sd_counts['label'] = sd_counts['self_binary'] + '→' + sd_counts['dragen_binary']
+    axes[0].bar(sd_counts['label'], sd_counts['count'])
+    axes[0].set_title(f'self ↔ dragen discord (n={len(self_dragen_discord):,})')
+    axes[0].set_ylabel('count')
+    axes[0].tick_params(axis='x', rotation=45)
+
+# Self vs gnomon discordances
+self_gnomon_discord = confident[confident['self_binary'] != confident['gnomon_sex']]
+if len(self_gnomon_discord) > 0:
+    sg_counts = self_gnomon_discord.groupby(['self_binary', 'gnomon_sex']).size().reset_index(name='count')
+    sg_counts['label'] = sg_counts['self_binary'] + '→' + sg_counts['gnomon_sex']
+    axes[1].bar(sg_counts['label'], sg_counts['count'])
+    axes[1].set_title(f'self ↔ gnomon discord (n={len(self_gnomon_discord):,})')
+    axes[1].set_ylabel('count')
+    axes[1].tick_params(axis='x', rotation=45)
+
+# Dragen vs gnomon discordances
+dragen_gnomon_discord = confident[confident['dragen_binary'] != confident['gnomon_sex']]
+if len(dragen_gnomon_discord) > 0:
+    dg_counts = dragen_gnomon_discord.groupby(['dragen_binary', 'gnomon_sex']).size().reset_index(name='count')
+    dg_counts['label'] = dg_counts['dragen_binary'] + '→' + dg_counts['gnomon_sex']
+    axes[2].bar(dg_counts['label'], dg_counts['count'])
+    axes[2].set_title(f'dragen ↔ gnomon discord (n={len(dragen_gnomon_discord):,})')
+    axes[2].set_ylabel('count')
+    axes[2].tick_params(axis='x', rotation=45)
+
+plt.tight_layout()
+plt.show()
+
+# Check if discordances are symmetric
+print("\n" + "="*60)
+print("discordance symmetry")
+print("="*60)
+female_to_male_self_dragen = ((confident['self_binary'] == 'female') & (confident['dragen_binary'] == 'male')).sum()
+male_to_female_self_dragen = ((confident['self_binary'] == 'male') & (confident['dragen_binary'] == 'female')).sum()
+print(f"self=female, dragen=male: {female_to_male_self_dragen:,}")
+print(f"self=male, dragen=female: {male_to_female_self_dragen:,}")
+
+female_to_male_self_gnomon = ((confident['self_binary'] == 'female') & (confident['gnomon_sex'] == 'male')).sum()
+male_to_female_self_gnomon = ((confident['self_binary'] == 'male') & (confident['gnomon_sex'] == 'female')).sum()
+print(f"self=female, gnomon=male: {female_to_male_self_gnomon:,}")
+print(f"self=male, gnomon=female: {male_to_female_self_gnomon:,}")
+
+female_to_male_dragen_gnomon = ((confident['dragen_binary'] == 'female') & (confident['gnomon_sex'] == 'male')).sum()
+male_to_female_dragen_gnomon = ((confident['dragen_binary'] == 'male') & (confident['gnomon_sex'] == 'female')).sum()
+print(f"dragen=female, gnomon=male: {female_to_male_dragen_gnomon:,}")
+print(f"dragen=male, gnomon=female: {male_to_female_dragen_gnomon:,}")
+```
+
+In 0.14% of cases, gnomon incorrectly predicted male when sex assigned at birth was female, but all male sex assignments were predicted correctly by gnomon. This implies gnomon miscalls XX as male in certain samples, which should be fixed.
+
