@@ -2204,7 +2204,7 @@ pub fn fit_calibrator(
         eprintln!("[CAL] Firth penalization disabled for calibrator fit");
     }
 
-    let mut attempt_fit = |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
+    let attempt_fit = |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
         let opts = ExternalOptimOptions {
             link,
             max_iter: 75,
@@ -2235,7 +2235,7 @@ pub fn fit_calibrator(
         )
     }
 
-    let mut fit_result = match attempt_fit(None) {
+    let fit_result = match attempt_fit(None) {
         Ok(res) => {
             if pirls_status_stable(&res.pirls_status) || firth_fallback.is_none() {
                 res
