@@ -32,19 +32,29 @@ git clone https://github.com/SauersML/gnomon.git
 cd gnomon
 rustup override set nightly
 cargo build --release
+```
 
+```
 # Compute a polygenic score
 ./target/release/gnomon score PGS003725 path/to/genotypes
+```
 
+```
 # Fit a PCA model
 ./target/release/gnomon fit path/to/genotypes --components 10
+```
 
+```
 # Infer sample sex
 ./target/release/gnomon terms --sex path/to/genotypes
+```
 
+```
 # Train a calibration model
 ./target/release/gnomon train training_data.tsv --num-pcs 10
+```
 
+```
 # Apply calibration to new samples
 ./target/release/gnomon infer test_data.tsv --model model.toml
 ```
