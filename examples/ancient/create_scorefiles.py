@@ -8,6 +8,7 @@ import tempfile
 import time
 import urllib.request
 import pandas as pd
+import gzip
 
 # --- Configuration ---
 CHUNK_SIZE = 50000  # Rows to process at a time
