@@ -671,9 +671,11 @@ pub fn sort_plink_fileset(
 
     let mut sorted_stem = stem.to_os_string();
     sorted_stem.push(".sorted");
-    let sorted_prefix = parent_dir.join(sorted_stem);
+    let sorted_prefix = parent_dir.join(&sorted_stem);
 
-    let sorted_bed_path = sorted_prefix.with_extension("bed");
+    let mut sorted_bed_name = sorted_stem.clone();
+    sorted_bed_name.push(".bed");
+    let sorted_bed_path = parent_dir.join(sorted_bed_name);
     let mut sorted_bed = BufWriter::with_capacity(1 << 20, File::create(&sorted_bed_path)?);
     sorted_bed.write_all(&mmap[..3])?;
 
@@ -684,14 +686,18 @@ pub fn sort_plink_fileset(
     }
     sorted_bed.flush()?;
 
-    let sorted_bim_path = sorted_prefix.with_extension("bim");
+    let mut sorted_bim_name = sorted_stem.clone();
+    sorted_bim_name.push(".bim");
+    let sorted_bim_path = parent_dir.join(sorted_bim_name);
     let mut sorted_bim = BufWriter::with_capacity(1 << 20, File::create(&sorted_bim_path)?);
     for record in &keyed_lines {
         writeln!(sorted_bim, "{}", record.raw_line)?;
     }
     sorted_bim.flush()?;
 
-    let sorted_fam_path = sorted_prefix.with_extension("fam");
+    let mut sorted_fam_name = sorted_stem.clone();
+    sorted_fam_name.push(".fam");
+    let sorted_fam_path = parent_dir.join(sorted_fam_name);
     fs::copy(fam_path, &sorted_fam_path).map_err(ReformatError::Io)?;
 
     Ok(sorted_prefix)
