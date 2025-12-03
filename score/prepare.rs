@@ -10,6 +10,7 @@
 
 use crate::score::io::{TextSource, open_text_source};
 use crate::score::pipeline::PipelineError;
+use crate::score::reformat;
 use crate::score::types::{
     BimRowIndex, FilesetBoundary, GenomicRegion, GroupedComplexRule, PersonSubset, PipelineKind,
     PreparationResult, ScoreColumnIndex, ScoreInfo, parse_chromosome_label,
@@ -247,11 +248,37 @@ pub enum PrepError {
     AmbiguousReconciliation(String),
 }
 
+enum PostMortemAction {
+    None,
+    Fatal(PrepError),
+    SortAndRetry {
+        fileset: FilesetPaths,
+        unsorted_error: PrepError,
+    },
+}
+
 pub fn prepare_for_computation(
     fileset_prefixes: &[PathBuf],
     sorted_score_files: &[PathBuf],
     keep_file: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
+) -> Result<PreparationResult, PrepError> {
+    let max_sort_retries = fileset_prefixes.len().max(1);
+    prepare_for_computation_with_retry(
+        fileset_prefixes,
+        sorted_score_files,
+        keep_file,
+        score_regions,
+        max_sort_retries,
+    )
+}
+
+fn prepare_for_computation_with_retry(
+    fileset_prefixes: &[PathBuf],
+    sorted_score_files: &[PathBuf],
+    keep_file: Option<&Path>,
+    score_regions: Option<&HashMap<String, GenomicRegion>>,
+    remaining_sort_retries: usize,
 ) -> Result<PreparationResult, PrepError> {
     // --- Stage 1: Initial setup ---
     eprintln!("> Stage 1: Indexing subject data...");
@@ -573,11 +600,47 @@ pub fn prepare_for_computation(
     }
 
     if all_required_indices.is_empty() {
-        if let Some(post_mortem_error) = conduct_post_mortem(&fileset_paths, sorted_score_files)? {
-            return Err(post_mortem_error);
-        }
+        match conduct_post_mortem(&fileset_paths, sorted_score_files)? {
+            PostMortemAction::Fatal(err) => return Err(err),
+            PostMortemAction::SortAndRetry {
+                fileset,
+                unsorted_error,
+            } => {
+                if remaining_sort_retries == 0 {
+                    return Err(unsorted_error);
+                }
 
-        return Err(PrepError::NoOverlappingVariants(diagnostics));
+                let sorted_prefix =
+                    reformat::sort_plink_fileset(&fileset.bed, &fileset.bim, &fileset.fam)
+                        .map_err(|e| PrepError::PipelineIo {
+                            path: fileset.bed.clone(),
+                            message: e.to_string(),
+                        })?;
+
+                eprintln!(
+                    "> Detected unsorted genotype data in {}. Sorting into {} and retrying...",
+                    fileset.bed.display(),
+                    sorted_prefix.display()
+                );
+
+                let mut new_prefixes = fileset_prefixes.to_vec();
+                if let Some(idx) = fileset_paths.iter().position(|fs| {
+                    fs.bed == fileset.bed && fs.bim == fileset.bim && fs.fam == fileset.fam
+                }) {
+                    new_prefixes[idx] = sorted_prefix;
+                    return prepare_for_computation_with_retry(
+                        &new_prefixes,
+                        sorted_score_files,
+                        keep_file,
+                        score_regions,
+                        remaining_sort_retries - 1,
+                    );
+                }
+
+                return Err(unsorted_error);
+            }
+            PostMortemAction::None => return Err(PrepError::NoOverlappingVariants(diagnostics)),
+        }
     }
 
     let required_bim_indices: Vec<BimRowIndex> = all_required_indices.into_iter().collect();
@@ -872,7 +935,7 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
 fn conduct_post_mortem(
     fileset_paths: &[FilesetPaths],
     score_files: &[PathBuf],
-) -> Result<Option<PrepError>, PrepError> {
+) -> Result<PostMortemAction, PrepError> {
     let mut bim_chromosomes: AHashSet<u8> = AHashSet::new();
     let mut score_chromosomes: AHashSet<u8> = AHashSet::new();
 
@@ -888,13 +951,25 @@ fn conduct_post_mortem(
 
                 if let Some(prev_key) = previous_bim_key {
                     if current_key < prev_key {
-                        return Ok(Some(PrepError::UnsortedInput {
+                        let unsorted_error = PrepError::UnsortedInput {
                             source: "BIM",
                             path: bim_iter.current_path.clone(),
                             line_number: bim_iter.local_line_num,
                             previous_key: prev_key,
                             current_key,
-                        }));
+                        };
+
+                        if let Some(fileset) = fileset_paths
+                            .iter()
+                            .find(|fs| fs.bim == bim_iter.current_path)
+                        {
+                            return Ok(PostMortemAction::SortAndRetry {
+                                fileset: fileset.clone(),
+                                unsorted_error,
+                            });
+                        }
+
+                        return Ok(PostMortemAction::Fatal(unsorted_error));
                     }
                 }
 
@@ -949,7 +1024,7 @@ fn conduct_post_mortem(
 
             if let Some(prev_key) = previous_key {
                 if key < prev_key {
-                    return Ok(Some(PrepError::UnsortedInput {
+                    return Ok(PostMortemAction::Fatal(PrepError::UnsortedInput {
                         source: "score",
                         path: path.clone(),
                         line_number,
@@ -972,14 +1047,14 @@ fn conduct_post_mortem(
             .iter()
             .any(|chr| score_chromosomes.contains(chr))
     {
-        return Ok(Some(PrepError::GenomeBuildMismatch));
+        return Ok(PostMortemAction::Fatal(PrepError::GenomeBuildMismatch));
     }
 
     if has_bim_chromosomes && has_score_chromosomes {
-        return Ok(Some(PrepError::DisjointChromosomes));
+        return Ok(PostMortemAction::Fatal(PrepError::DisjointChromosomes));
     }
 
-    Ok(None)
+    Ok(PostMortemAction::None)
 }
 
 impl<'a, 'arena> BimIterator<'a, 'arena> {
