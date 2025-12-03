@@ -1,6 +1,7 @@
 Download data and run Gnomon to generate sex inference metrics:
 
 ```
+%%bash
 # Download microarray PLINK data if not present
 if [ ! -f "../../arrays.bed" ]; then
     echo "Downloading microarray data..."
@@ -10,6 +11,7 @@ fi
 
 Build `gnomon`:
 ```
+%%bash
 # Install Rust nightly
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && { for f in ~/.bashrc ~/.profile; do [ -f "$f" ] || touch "$f"; grep -qxF 'source "$HOME/.cargo/env"' "$f" || printf '\n# Rust / Cargo\nsource "$HOME/.cargo/env"\n' >> "$f"; done; } && source "$HOME/.cargo/env" && rustup toolchain install nightly && rustup default nightly
 git clone https://github.com/SauersML/gnomon.git
