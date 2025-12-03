@@ -32,6 +32,7 @@ pub enum SexInferenceError {
 pub struct SexInferenceRecord {
     pub individual_id: String,
     pub inference: InferenceResult,
+    pub sry_variant_count: u64,
 }
 
 pub fn infer_sex_to_tsv(genotype_path: &Path) -> Result<PathBuf, SexInferenceError> {
@@ -56,6 +57,7 @@ fn collect_inference(
         .map(|record| record.individual_id.clone())
         .collect();
     let n_samples = sample_ids.len();
+    let mut sry_counts = vec![0u64; n_samples];
 
     let build = infer_build_from_keys(variant_keys);
     let config = InferenceConfig { build };
@@ -64,7 +66,7 @@ fn collect_inference(
         .collect();
 
     if variant_keys.is_empty() {
-        return Ok(finalize_records(accumulators, sample_ids));
+        return Ok(finalize_records(accumulators, sample_ids, sry_counts));
     }
 
     let mut block_source = dataset.block_source()?;
@@ -97,11 +99,15 @@ fn collect_inference(
             };
             let pos = key.position;
             let column_offset = local_idx * n_samples;
+            let is_sry_variant = matches!(chrom, Chromosome::Y) && is_in_sry_region(build, pos);
 
             for sample_idx in 0..n_samples {
                 let dosage = storage[column_offset + sample_idx];
                 if dosage.is_nan() {
                     continue;
+                }
+                if is_sry_variant {
+                    sry_counts[sample_idx] += 1;
                 }
                 let is_het = dosage == 1.0;
                 let info = VariantInfo {
@@ -123,20 +129,33 @@ fn collect_inference(
         });
     }
 
-    Ok(finalize_records(accumulators, sample_ids))
+    Ok(finalize_records(accumulators, sample_ids, sry_counts))
 }
 
 fn finalize_records(
     accumulators: Vec<SexInferenceAccumulator>,
     sample_ids: Vec<String>,
+    sry_counts: Vec<u64>,
+) -> Vec<SexInferenceRecord> {
+    finalize_records_with_sry(accumulators, sample_ids, sry_counts)
+}
+
+fn finalize_records_with_sry(
+    accumulators: Vec<SexInferenceAccumulator>,
+    sample_ids: Vec<String>,
+    sry_counts: Vec<u64>,
 ) -> Vec<SexInferenceRecord> {
     accumulators
         .into_iter()
         .zip(sample_ids.into_iter())
-        .map(|(acc, individual_id)| SexInferenceRecord {
-            individual_id,
-            inference: acc.finish(),
-        })
+        .zip(sry_counts.into_iter())
+        .map(
+            |((acc, individual_id), sry_variant_count)| SexInferenceRecord {
+                individual_id,
+                inference: acc.finish(),
+                sry_variant_count,
+            },
+        )
         .collect()
 }
 
@@ -149,16 +168,60 @@ fn write_results(path: &Path, records: &[SexInferenceRecord]) -> Result<(), SexI
 
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "IID\tSex")?;
+    writeln!(
+        writer,
+        "IID\tSex\tX_Het_Ratio\tX_Het_Vote\tY_Non_PAR\tY_PAR\tY_Vote\tSRY_Count\tSRY_Vote\tPAR_NonPAR_Ratio\tPAR_NonPAR_Vote\tMale_Votes\tFemale_Votes",
+    )?;
     for record in records {
-        let label = match record.inference.final_call {
-            InferredSex::Male => "male",
-            InferredSex::Female => "female",
+        let label = sex_label(record.inference.final_call);
+        let report = &record.inference.report;
+        let (x_ratio, x_vote) = match report.x_heterozygosity_check {
+            Some((ratio, vote)) => (ratio.to_string(), sex_label(vote).to_string()),
+            None => ("NA".to_string(), "NA".to_string()),
         };
-        writeln!(writer, "{}\t{}", record.individual_id, label)?;
+        let (y_non_par, y_par, y_vote) = match report.y_presence_check {
+            Some((non_par, par, vote)) => (
+                non_par.to_string(),
+                par.to_string(),
+                sex_label(vote).to_string(),
+            ),
+            None => ("NA".to_string(), "NA".to_string(), "NA".to_string()),
+        };
+        let sry_vote = report
+            .sry_presence_check
+            .map_or("NA".to_string(), |vote| sex_label(vote).to_string());
+        let (par_ratio, par_vote) = match report.par_non_par_het_check {
+            Some((ratio, vote)) => (ratio.to_string(), sex_label(vote).to_string()),
+            None => ("NA".to_string(), "NA".to_string()),
+        };
+
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            record.individual_id,
+            label,
+            x_ratio,
+            x_vote,
+            y_non_par,
+            y_par,
+            y_vote,
+            record.sry_variant_count,
+            sry_vote,
+            par_ratio,
+            par_vote,
+            report.final_male_votes,
+            report.final_female_votes,
+        )?;
     }
     writer.flush()?;
     Ok(())
+}
+
+fn sex_label(sex: InferredSex) -> &'static str {
+    match sex {
+        InferredSex::Male => "male",
+        InferredSex::Female => "female",
+    }
 }
 
 fn infer_build_from_keys(keys: &[VariantKey]) -> GenomeBuild {
@@ -186,6 +249,13 @@ fn classify_chromosome(label: &str) -> Option<Chromosome> {
         other if other.eq_ignore_ascii_case("X") => Some(Chromosome::X),
         other if other.eq_ignore_ascii_case("Y") => Some(Chromosome::Y),
         _ => None,
+    }
+}
+
+fn is_in_sry_region(build: GenomeBuild, pos: u64) -> bool {
+    match build {
+        GenomeBuild::Build37 => (2_786_855..=2_787_682).contains(&pos),
+        GenomeBuild::Build38 => (2_654_896..=2_655_723).contains(&pos),
     }
 }
 
@@ -428,6 +498,88 @@ FAM2\tM1\t0\t0\t1\t-9
         assert_eq!(male_par_vote, InferredSex::Male);
         assert_eq!(male.inference.report.final_male_votes, 4);
         assert_eq!(male.inference.report.final_female_votes, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sex_tsv_includes_evidence_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let mut variants = Vec::new();
+
+        for i in 0..200u64 {
+            let female_code = if i < 160 { 2 } else { 0 };
+            variants.push(VariantSpec::new("X", 20_000 + i, female_code, 0));
+        }
+        for i in 0..1_000u64 {
+            let female_code = if i < 800 { 2 } else { 0 };
+            variants.push(VariantSpec::new("X", 3_000_000 + i, female_code, 0));
+        }
+        for i in 0..50u64 {
+            variants.push(VariantSpec::new("Y", 20_000 + i, 0, 0));
+        }
+        for i in 0..60u64 {
+            variants.push(VariantSpec::new("Y", 3_000_000 + i, 1, 0));
+        }
+        variants.push(VariantSpec::new("Y", 2_655_000, 1, 3));
+
+        let bed_path = write_plink_dataset(dir.path(), "evidence", &variants)?;
+        let output_path = infer_sex_to_tsv(&bed_path)?;
+        let contents = fs::read_to_string(&output_path)?;
+        let mut lines = contents.lines();
+
+        let header = lines.next().unwrap();
+        assert_eq!(
+            header,
+            "IID\tSex\tX_Het_Ratio\tX_Het_Vote\tY_Non_PAR\tY_PAR\tY_Vote\tSRY_Count\tSRY_Vote\tPAR_NonPAR_Ratio\tPAR_NonPAR_Vote\tMale_Votes\tFemale_Votes",
+        );
+
+        let mut rows: HashMap<String, Vec<String>> = HashMap::new();
+        for line in lines {
+            let cols: Vec<String> = line.split('\t').map(|value| value.to_string()).collect();
+            assert_eq!(cols.len(), 13);
+            rows.insert(cols[0].clone(), cols);
+        }
+
+        let female = rows.get("F1").expect("female row missing");
+        assert_eq!(
+            female,
+            &vec![
+                "F1".to_string(),
+                "female".to_string(),
+                "0.8".to_string(),
+                "female".to_string(),
+                "0".to_string(),
+                "50".to_string(),
+                "female".to_string(),
+                "0".to_string(),
+                "NA".to_string(),
+                "1".to_string(),
+                "female".to_string(),
+                "0".to_string(),
+                "3".to_string(),
+            ],
+        );
+
+        let male = rows.get("M1").expect("male row missing");
+        assert_eq!(
+            male,
+            &vec![
+                "M1".to_string(),
+                "male".to_string(),
+                "0".to_string(),
+                "male".to_string(),
+                "60".to_string(),
+                "51".to_string(),
+                "male".to_string(),
+                "1".to_string(),
+                "male".to_string(),
+                "-1".to_string(),
+                "male".to_string(),
+                "4".to_string(),
+                "0".to_string(),
+            ],
+        );
 
         Ok(())
     }

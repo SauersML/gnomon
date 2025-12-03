@@ -29,6 +29,17 @@ requested, so remember to include the `--sex` flag.
 | --- | --- |
 | `IID` | Sample identifier sourced from the PLINK `.fam` file or VCF/BCF header. |
 | `Sex` | Final call (`male` or `female`). |
+| `X_Het_Ratio` | Heterozygosity ratio on the X chromosome when enough variants were observed; otherwise `NA`. |
+| `X_Het_Vote` | Vote contributed by the X heterozygosity check (`male`, `female`, or `NA`). |
+| `Y_Non_PAR` | Count of non-PAR Y variants observed. |
+| `Y_PAR` | Count of PAR Y variants observed. |
+| `Y_Vote` | Vote contributed by the Y presence check (`male`, `female`, or `NA`). |
+| `SRY_Count` | Number of variants observed in the SRY region. |
+| `SRY_Vote` | Vote contributed by the SRY presence check (`male` when present, otherwise `NA`). |
+| `PAR_NonPAR_Ratio` | Ratio of PAR to non-PAR X heterozygosity when available; otherwise `NA`. |
+| `PAR_NonPAR_Vote` | Vote contributed by the PAR/non-PAR heterozygosity check (`male`, `female`, or `NA`). |
+| `Male_Votes` | Total male votes tallied across all checks. |
+| `Female_Votes` | Total female votes tallied across all checks. |
 
 The header is always included and the file is written with Unix newlines. Parent
 directories are created automatically when the resolved output lives outside the
