@@ -572,6 +572,7 @@ pub fn sort_plink_fileset(
     let bim_reader = BufReader::new(bim_file);
     let mut keyed_lines: Vec<KeyedBimLine> = Vec::new();
 
+    let mut valid_variant_index: usize = 0;
     for (line_idx, line_result) in bim_reader.lines().enumerate() {
         let line_number = line_idx + 1;
         let line = line_result.map_err(ReformatError::Io)?;
@@ -603,9 +604,10 @@ pub fn sort_plink_fileset(
 
         keyed_lines.push(KeyedBimLine {
             key,
-            original_index: line_idx,
+            original_index: valid_variant_index,
             raw_line: line,
         });
+        valid_variant_index += 1;
     }
 
     if keyed_lines.is_empty() {
@@ -621,7 +623,10 @@ pub fn sort_plink_fileset(
     let fam_reader = BufReader::new(fam_file);
     let mut fam_line_count: usize = 0;
     for line in fam_reader.lines() {
-        line.map_err(ReformatError::Io)?;
+        let line = line.map_err(ReformatError::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
         fam_line_count += 1;
     }
 
