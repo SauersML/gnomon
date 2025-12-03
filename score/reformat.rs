@@ -556,7 +556,7 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
 }
 
 /// Sorts a PLINK binary fileset into a new `{prefix}.sorted.{bed,bim,fam}` trio and returns
-/// the sorted prefix path.
+/// the sorted BED path (which can be used with `Path::with_extension`).
 pub fn sort_plink_fileset(
     bed_path: &Path,
     bim_path: &Path,
@@ -671,8 +671,6 @@ pub fn sort_plink_fileset(
 
     let mut sorted_stem = stem.to_os_string();
     sorted_stem.push(".sorted");
-    let sorted_prefix = parent_dir.join(&sorted_stem);
-
     let mut sorted_bed_name = sorted_stem.clone();
     sorted_bed_name.push(".bed");
     let sorted_bed_path = parent_dir.join(sorted_bed_name);
@@ -700,7 +698,7 @@ pub fn sort_plink_fileset(
     let sorted_fam_path = parent_dir.join(sorted_fam_name);
     fs::copy(fam_path, &sorted_fam_path).map_err(ReformatError::Io)?;
 
-    Ok(sorted_prefix)
+    Ok(sorted_bed_path)
 }
 
 // ========================================================================================
