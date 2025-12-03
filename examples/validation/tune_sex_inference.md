@@ -65,7 +65,6 @@ merged = gnomon_df.merge(metrics_df, left_on="IID", right_on=id_col, how="inner"
 plot_df = merged.dropna(subset=["sex_at_birth", "dragen_sex_ploidy"]).copy()
 
 # List of new quantitative metrics from Gnomon to plot
-# Note: Adjust column names if they differ slightly in the final build output
 metric_cols = [
     "X_Het_Ratio", 
     "Y_Non_PAR", 
