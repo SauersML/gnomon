@@ -5,10 +5,11 @@
 // ========================================================================================
 
 use flate2::read::MultiGzDecoder;
+use memmap2::Mmap;
 use rayon::prelude::*;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,8 @@ pub enum ReformatError {
         line_content: String,
         details: String,
     },
+    /// The provided PLINK fileset could not be re-ordered safely.
+    InvalidPlinkFileset { path: PathBuf, details: String },
 }
 
 impl Display for ReformatError {
@@ -116,6 +119,11 @@ impl Display for ReformatError {
                 )?;
                 writeln!(f, "Details:      {details}")?;
             }
+            ReformatError::InvalidPlinkFileset { path, details } => {
+                writeln!(f, "File:         {}", path.display())?;
+                writeln!(f, "Reason:       Unable to sort PLINK fileset.")?;
+                writeln!(f, "Details:      {details}")?;
+            }
         }
         write!(
             f,
@@ -128,7 +136,10 @@ impl Error for ReformatError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ReformatError::Io(e) => Some(e),
-            _ => None,
+            ReformatError::NotPgsFormat { .. } => None,
+            ReformatError::MissingColumns { .. } => None,
+            ReformatError::Parse { .. } => None,
+            ReformatError::InvalidPlinkFileset { .. } => None,
         }
     }
 }
@@ -542,6 +553,143 @@ pub fn sort_native_file(input_path: &Path, output_path: &Path) -> Result<(), Ref
     }
     writer.flush()?;
     Ok(())
+}
+
+/// Sorts a PLINK binary fileset into a new `{prefix}.sorted.{bed,bim,fam}` trio and returns
+/// the sorted prefix path.
+pub fn sort_plink_fileset(
+    bed_path: &Path,
+    bim_path: &Path,
+    fam_path: &Path,
+) -> Result<PathBuf, ReformatError> {
+    struct KeyedBimLine {
+        key: (u8, u32),
+        original_index: usize,
+        raw_line: String,
+    }
+
+    let bim_file = File::open(bim_path)?;
+    let bim_reader = BufReader::new(bim_file);
+    let mut keyed_lines: Vec<KeyedBimLine> = Vec::new();
+
+    for (line_idx, line_result) in bim_reader.lines().enumerate() {
+        let line_number = line_idx + 1;
+        let line = line_result.map_err(ReformatError::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let chr_str = parts.next().unwrap_or("");
+        let _ = parts.next();
+        let _ = parts.next();
+        let pos_str = parts.next().unwrap_or("");
+
+        if chr_str.is_empty() || pos_str.is_empty() {
+            return Err(ReformatError::MissingColumns {
+                path: bim_path.to_path_buf(),
+                line_number,
+                line_content: line,
+                missing_column_name: "chromosome/position".to_string(),
+            });
+        }
+
+        let key = parse_key(chr_str, pos_str).map_err(|details| ReformatError::Parse {
+            path: bim_path.to_path_buf(),
+            line_number,
+            line_content: line.clone(),
+            details,
+        })?;
+
+        keyed_lines.push(KeyedBimLine {
+            key,
+            original_index: line_idx,
+            raw_line: line,
+        });
+    }
+
+    if keyed_lines.is_empty() {
+        return Err(ReformatError::InvalidPlinkFileset {
+            path: bim_path.to_path_buf(),
+            details: "BIM file contained no variants.".to_string(),
+        });
+    }
+
+    keyed_lines.par_sort_unstable_by_key(|record| record.key);
+
+    let fam_file = File::open(fam_path)?;
+    let fam_reader = BufReader::new(fam_file);
+    let mut fam_line_count: usize = 0;
+    for line in fam_reader.lines() {
+        line.map_err(ReformatError::Io)?;
+        fam_line_count += 1;
+    }
+
+    if fam_line_count == 0 {
+        return Err(ReformatError::InvalidPlinkFileset {
+            path: fam_path.to_path_buf(),
+            details: "FAM file contained no individuals.".to_string(),
+        });
+    }
+
+    let bytes_per_variant = fam_line_count.div_ceil(4);
+    let bed_file = File::open(bed_path)?;
+    let mmap = unsafe { Mmap::map(&bed_file)? };
+
+    if mmap.len() < 3 {
+        return Err(ReformatError::InvalidPlinkFileset {
+            path: bed_path.to_path_buf(),
+            details: "BED file is smaller than the 3-byte PLINK header.".to_string(),
+        });
+    }
+
+    let expected_bytes = 3 + keyed_lines.len() * bytes_per_variant;
+    if mmap.len() < expected_bytes {
+        return Err(ReformatError::InvalidPlinkFileset {
+            path: bed_path.to_path_buf(),
+            details: format!(
+                "BED file is {actual} bytes but expected at least {expected_bytes} bytes for {variants} variant(s) and {people} individual(s).",
+                actual = mmap.len(),
+                variants = keyed_lines.len(),
+                people = fam_line_count,
+            ),
+        });
+    }
+
+    let parent_dir = bed_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = bed_path
+        .file_stem()
+        .ok_or_else(|| ReformatError::InvalidPlinkFileset {
+            path: bed_path.to_path_buf(),
+            details: "Could not derive file stem for BED path.".to_string(),
+        })?;
+
+    let mut sorted_stem = stem.to_os_string();
+    sorted_stem.push(".sorted");
+    let sorted_prefix = parent_dir.join(sorted_stem);
+
+    let sorted_bed_path = sorted_prefix.with_extension("bed");
+    let mut sorted_bed = BufWriter::with_capacity(1 << 20, File::create(&sorted_bed_path)?);
+    sorted_bed.write_all(&mmap[..3])?;
+
+    for record in &keyed_lines {
+        let offset = 3 + record.original_index * bytes_per_variant;
+        let end = offset + bytes_per_variant;
+        sorted_bed.write_all(&mmap[offset..end])?;
+    }
+    sorted_bed.flush()?;
+
+    let sorted_bim_path = sorted_prefix.with_extension("bim");
+    let mut sorted_bim = BufWriter::with_capacity(1 << 20, File::create(&sorted_bim_path)?);
+    for record in &keyed_lines {
+        writeln!(sorted_bim, "{}", record.raw_line)?;
+    }
+    sorted_bim.flush()?;
+
+    let sorted_fam_path = sorted_prefix.with_extension("fam");
+    fs::copy(fam_path, &sorted_fam_path).map_err(ReformatError::Io)?;
+
+    Ok(sorted_prefix)
 }
 
 // ========================================================================================
