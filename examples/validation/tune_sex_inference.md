@@ -33,25 +33,27 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import gcsfs
 
+# --- Configuration & Styling ---
+sns.set_theme(style="whitegrid", context="notebook", font_scale=1.1)
+
 # 1. Load Gnomon Results (Local)
 gnomon_path = "../../arrays.sex.tsv"
 if not os.path.exists(gnomon_path):
-    raise FileNotFoundError(f"Could not find {gnomon_path}. Run the cell above.")
+    raise FileNotFoundError(f"Could not find {gnomon_path}. Please run the Gnomon inference first.")
 
 gnomon_df = pd.read_csv(gnomon_path, sep="\t")
-# Ensure ID is string for merging
 gnomon_df["IID"] = gnomon_df["IID"].astype(str)
 
 # 2. Load Truth Data (GCS)
 project_id = os.environ.get("GOOGLE_PROJECT")
 metrics_uri = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
 
+print(f"Loading metrics from {metrics_uri}...")
 fs = gcsfs.GCSFileSystem(project=project_id, token="cloud", requester_pays=True)
 with fs.open(metrics_uri, "rb") as f:
     metrics_df = pd.read_csv(f, sep="\t")
 
 # 3. Merge Datasets
-# Identify correct ID column in metrics file
 possible_ids = ["person_id", "sample_id", "participant_id"]
 id_col = next((c for c in possible_ids if c in metrics_df.columns), None)
 if not id_col:
@@ -59,58 +61,71 @@ if not id_col:
 
 metrics_df[id_col] = metrics_df[id_col].astype(str)
 merged = gnomon_df.merge(metrics_df, left_on="IID", right_on=id_col, how="inner")
+print(f"Merged dataset size: {len(merged)} samples.")
 
 # 4. Prepare for Plotting
-# Filter for visualization clarity (remove NAs in targets)
+# Filter for visualization clarity
 plot_df = merged.dropna(subset=["sex_at_birth", "dragen_sex_ploidy"]).copy()
 
-# List of new quantitative metrics from Gnomon to plot
 metric_cols = [
     "X_Het_Ratio", 
     "Y_Non_PAR", 
     "Y_PAR", 
-    "PAR_Ratio", 
+    "SRY_Count",         
+    "PAR_NonPAR_Ratio", 
     "Male_Votes", 
     "Female_Votes"
 ]
 
 targets = ["sex_at_birth", "dragen_sex_ploidy"]
 
-# Set up grid
-n_metrics = len(metric_cols)
-n_targets = len(targets)
-fig, axes = plt.subplots(n_metrics, n_targets, figsize=(14, 4 * n_metrics))
+# Pre-convert metrics to numeric, coercing errors to NaN for clean plotting
+for col in metric_cols:
+    if col in plot_df.columns:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
 
 # 5. Generate Plots
+n_metrics = len(metric_cols)
+n_targets = len(targets)
+
+fig, axes = plt.subplots(
+    n_metrics, 
+    n_targets, 
+    figsize=(15, 4.5 * n_metrics), 
+    constrained_layout=True
+)
+
 for i, metric in enumerate(metric_cols):
-    # Check if metric exists in output
     if metric not in plot_df.columns:
+        # Placeholder if column is missing from Gnomon output
         for j in range(n_targets):
             axes[i, j].text(0.5, 0.5, f"Column '{metric}' not found", ha='center')
         continue
 
-    # Ensure metric is numeric (coerce errors to NaN)
-    plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
-
     for j, target in enumerate(targets):
         ax = axes[i, j]
         
-        # Create Boxen plot for detailed distribution view
+        # Use boxenplot for detailed tail distribution
         sns.boxenplot(
             data=plot_df, 
             x=target, 
             y=metric, 
             ax=ax, 
             showfliers=False,
-            palette="viridis"
+            palette="mako" if j == 0 else "rocket"  # Different palettes for different targets
         )
         
-        ax.set_title(f"{metric} vs {target}")
-        ax.set_ylabel(metric)
+        clean_metric_name = metric.replace("_", " ")
+        clean_target_name = target.replace("_", " ").title()
+        
+        ax.set_title(f"{clean_metric_name} by {clean_target_name}", fontweight='bold')
+        ax.set_ylabel(clean_metric_name)
         ax.set_xlabel("")
-        ax.tick_params(axis='x', rotation=45)
-        ax.grid(True, linestyle='--', alpha=0.3)
+        ax.tick_params(axis='x', rotation=30)
+        
+        sns.despine(ax=ax, trim=True)
+        ax.grid(True, axis='y', linestyle=':', alpha=0.6)
 
-plt.tight_layout()
+plt.suptitle(f"Sex Inference Metrics Validation (N={len(plot_df)})", fontsize=16, y=1.02)
 plt.show()
 ```
