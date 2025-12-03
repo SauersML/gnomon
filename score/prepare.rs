@@ -985,6 +985,10 @@ fn conduct_post_mortem(
         let reader = BufReader::new(file);
         let mut previous_key: Option<VariantKey> = None;
 
+        // Score files are already normalized by `reformat_pgs_file`, which guarantees
+        // the tab-separated layout: variant_id, effect_allele, other_allele, weight....
+        // The quick parser below intentionally relies on that invariant to keep this
+        // post-mortem check minimal and fast to implement.
         for (line_index, line_result) in reader.lines().enumerate() {
             let line_number = line_index as u64 + 1;
             let line = line_result.map_err(|e| PrepError::Io(e, path.clone()))?;
