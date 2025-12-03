@@ -288,7 +288,7 @@ pub fn multi_file_producer_thread<'a, F>(
         Some(sp) => {
             let sp = sp;
             for (i, &global_bim_row_index) in prep_result.required_bim_indices.iter().enumerate() {
-                if global_bim_row_index.0 >= next_boundary_start_idx {
+                while global_bim_row_index.0 >= next_boundary_start_idx {
                     current_fileset_idx += 1;
                     current_source = bed_sources[current_fileset_idx].byte_source();
                     next_boundary_start_idx = if boundaries.len() > current_fileset_idx + 1 {
@@ -360,7 +360,7 @@ pub fn multi_file_producer_thread<'a, F>(
         }
         None => {
             for (i, &global_bim_row_index) in prep_result.required_bim_indices.iter().enumerate() {
-                if global_bim_row_index.0 >= next_boundary_start_idx {
+                while global_bim_row_index.0 >= next_boundary_start_idx {
                     current_fileset_idx += 1;
                     current_source = bed_sources[current_fileset_idx].byte_source();
                     next_boundary_start_idx = if boundaries.len() > current_fileset_idx + 1 {
