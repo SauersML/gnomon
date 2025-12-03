@@ -610,7 +610,7 @@ fn prepare_for_computation_with_retry(
                     return Err(unsorted_error);
                 }
 
-                let sorted_prefix =
+                let sorted_bed_path =
                     reformat::sort_plink_fileset(&fileset.bed, &fileset.bim, &fileset.fam)
                         .map_err(|e| PrepError::PipelineIo {
                             path: fileset.bed.clone(),
@@ -620,14 +620,14 @@ fn prepare_for_computation_with_retry(
                 eprintln!(
                     "> Detected unsorted genotype data in {}. Sorting into {} and retrying...",
                     fileset.bed.display(),
-                    sorted_prefix.display()
+                    sorted_bed_path.display()
                 );
 
                 let mut new_prefixes = fileset_prefixes.to_vec();
                 if let Some(idx) = fileset_paths.iter().position(|fs| {
                     fs.bed == fileset.bed && fs.bim == fileset.bim && fs.fam == fileset.fam
                 }) {
-                    new_prefixes[idx] = sorted_prefix;
+                    new_prefixes[idx] = sorted_bed_path;
                     return prepare_for_computation_with_retry(
                         &new_prefixes,
                         sorted_score_files,
