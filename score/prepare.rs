@@ -235,6 +235,15 @@ pub enum PrepError {
     /// An error indicating that no variants from the score files could be matched
     /// to variants in the genotype data.
     NoOverlappingVariants(MergeDiagnosticInfo),
+    UnsortedInput {
+        source: &'static str,
+        path: PathBuf,
+        line_number: u64,
+        previous_key: VariantKey,
+        current_key: VariantKey,
+    },
+    GenomeBuildMismatch,
+    DisjointChromosomes,
     AmbiguousReconciliation(String),
 }
 
@@ -564,6 +573,10 @@ pub fn prepare_for_computation(
     }
 
     if all_required_indices.is_empty() {
+        if let Some(post_mortem_error) = conduct_post_mortem(&fileset_paths, sorted_score_files)? {
+            return Err(post_mortem_error);
+        }
+
         return Err(PrepError::NoOverlappingVariants(diagnostics));
     }
 
@@ -854,6 +867,119 @@ fn parse_key(chr_str: &str, pos_str: &str) -> Result<(u8, u32), PrepError> {
         .map_err(|e| PrepError::Parse(format!("Invalid position '{pos_str}': {e}")))?;
 
     Ok((chr_num, pos_num))
+}
+
+fn conduct_post_mortem(
+    fileset_paths: &[FilesetPaths],
+    score_files: &[PathBuf],
+) -> Result<Option<PrepError>, PrepError> {
+    let mut bim_chromosomes: AHashSet<u8> = AHashSet::new();
+    let mut score_chromosomes: AHashSet<u8> = AHashSet::new();
+
+    let post_mortem_bump = Bump::new();
+    let mut bim_iter = BimIterator::new(fileset_paths, &post_mortem_bump)?;
+    let mut previous_bim_key: Option<VariantKey> = None;
+
+    while let Some(next_item) = bim_iter.next() {
+        match next_item {
+            Ok(record) => {
+                let current_key = record.key;
+                bim_chromosomes.insert(current_key.0);
+
+                if let Some(prev_key) = previous_bim_key {
+                    if current_key < prev_key {
+                        return Ok(Some(PrepError::UnsortedInput {
+                            source: "BIM",
+                            path: bim_iter.current_path.clone(),
+                            line_number: bim_iter.local_line_num,
+                            previous_key: prev_key,
+                            current_key,
+                        }));
+                    }
+                }
+
+                previous_bim_key = Some(current_key);
+            }
+            Err(PrepError::Parse(_)) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    for path in score_files {
+        let file = File::open(path).map_err(|e| PrepError::Io(e, path.clone()))?;
+        let reader = BufReader::new(file);
+        let mut previous_key: Option<VariantKey> = None;
+
+        for (line_index, line_result) in reader.lines().enumerate() {
+            let line_number = line_index as u64 + 1;
+            let line = line_result.map_err(|e| PrepError::Io(e, path.clone()))?;
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let mut parts = trimmed.split('\t');
+            let variant_id = match parts.next() {
+                Some(id) if !id.is_empty() => id,
+                _ => continue,
+            };
+
+            if variant_id.eq_ignore_ascii_case("variant_id") {
+                continue;
+            }
+
+            let effect_allele = parts.next();
+            let other_allele = parts.next();
+
+            if effect_allele.is_none()
+                || other_allele.is_none()
+                || effect_allele.is_some_and(|a| a.is_empty())
+                || other_allele.is_some_and(|a| a.is_empty())
+            {
+                continue;
+            }
+
+            let mut key_parts = variant_id.splitn(2, ':');
+            let chr_str = key_parts.next().unwrap_or("");
+            let pos_str = key_parts.next().unwrap_or("");
+            let key = parse_key(chr_str, pos_str)?;
+
+            score_chromosomes.insert(key.0);
+
+            if let Some(prev_key) = previous_key {
+                if key < prev_key {
+                    return Ok(Some(PrepError::UnsortedInput {
+                        source: "score",
+                        path: path.clone(),
+                        line_number,
+                        previous_key: prev_key,
+                        current_key: key,
+                    }));
+                }
+            }
+
+            previous_key = Some(key);
+        }
+    }
+
+    let has_bim_chromosomes = !bim_chromosomes.is_empty();
+    let has_score_chromosomes = !score_chromosomes.is_empty();
+
+    if has_bim_chromosomes
+        && has_score_chromosomes
+        && bim_chromosomes
+            .iter()
+            .any(|chr| score_chromosomes.contains(chr))
+    {
+        return Ok(Some(PrepError::GenomeBuildMismatch));
+    }
+
+    if has_bim_chromosomes && has_score_chromosomes {
+        return Ok(Some(PrepError::DisjointChromosomes));
+    }
+
+    Ok(None)
 }
 
 impl<'a, 'arena> BimIterator<'a, 'arena> {
@@ -1470,6 +1596,44 @@ impl Display for PrepError {
             PrepError::InconsistentKeepId(s) => write!(f, "Configuration Error: {s}"),
             PrepError::PipelineIo { path, message } => {
                 write!(f, "I/O Error for file {}: {}", path.display(), message)
+            }
+            PrepError::UnsortedInput {
+                source,
+                path,
+                line_number,
+                previous_key,
+                current_key,
+            } => {
+                writeln!(f, "Detected unsorted {source} data in {}.", path.display())?;
+                writeln!(
+                    f,
+                    "Encountered key {}:{} at line {}, which comes after {}:{}.",
+                    current_key.0, current_key.1, line_number, previous_key.0, previous_key.1
+                )?;
+                writeln!(
+                    f,
+                    "Please sort your input by chromosome and position before running gnomon."
+                )
+            }
+            PrepError::GenomeBuildMismatch => {
+                writeln!(
+                    f,
+                    "No overlapping variants found even though both inputs are sorted and share chromosomes."
+                )?;
+                writeln!(
+                    f,
+                    "This strongly suggests a genome build mismatch (for example, GRCh37 vs GRCh38)."
+                )
+            }
+            PrepError::DisjointChromosomes => {
+                writeln!(
+                    f,
+                    "The genotype BIM files and score files do not share any chromosomes."
+                )?;
+                writeln!(
+                    f,
+                    "Verify that you are using compatible datasets (e.g., human vs. mouse or differing chromosome naming schemes)."
+                )
             }
             PrepError::NoOverlappingVariants(diag) => {
                 writeln!(
