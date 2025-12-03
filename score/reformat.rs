@@ -581,8 +581,8 @@ pub fn sort_plink_fileset(
 
         let mut parts = line.split_whitespace();
         let chr_str = parts.next().unwrap_or("");
-        let _snp_id = parts.next();
-        let _cm_pos = parts.next();
+        let _ = parts.next();
+        let _ = parts.next();
         let pos_str = parts.next().unwrap_or("");
 
         if chr_str.is_empty() || pos_str.is_empty() {
