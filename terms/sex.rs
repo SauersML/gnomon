@@ -28,6 +28,10 @@ pub enum SexInferenceError {
         "variant stream terminated early (processed {observed} of {expected} expected variants)"
     )]
     VariantUnderflow { expected: usize, observed: usize },
+    #[error(
+        "insufficient sex-informative variants: {autosomes} autosomal and {y_non_par} Y non-PAR loci available"
+    )]
+    InsufficientInformativeVariants { autosomes: u64, y_non_par: u64 },
 }
 
 impl From<InferenceError> for SexInferenceError {
@@ -132,6 +136,7 @@ fn collect_inference(
 
     let build = selection.build;
     let platform = derive_platform_definition(&selection.keys, build);
+    ensure_informative_platform(&platform)?;
     let config = InferenceConfig {
         build,
         platform,
@@ -332,6 +337,16 @@ fn derive_platform_definition(keys: &[SelectedVariant], build: GenomeBuild) -> P
     }
 }
 
+fn ensure_informative_platform(platform: &PlatformDefinition) -> Result<(), SexInferenceError> {
+    if platform.n_attempted_autosomes == 0 || platform.n_attempted_y_nonpar == 0 {
+        return Err(SexInferenceError::InsufficientInformativeVariants {
+            autosomes: platform.n_attempted_autosomes,
+            y_non_par: platform.n_attempted_y_nonpar,
+        });
+    }
+    Ok(())
+}
+
 fn is_in_y_non_par(build: GenomeBuild, pos: u64) -> bool {
     match build {
         GenomeBuild::Build37 => (2_649_521..=59_034_049).contains(&pos),
@@ -396,6 +411,38 @@ mod tests {
         let platform = derive_platform_definition(&keys, build);
         assert_eq!(platform.n_attempted_autosomes, 2);
         assert_eq!(platform.n_attempted_y_nonpar, 2);
+    }
+
+    #[test]
+    fn ensure_informative_platform_rejects_missing_loci() {
+        let ok_platform = PlatformDefinition {
+            n_attempted_autosomes: 1,
+            n_attempted_y_nonpar: 1,
+        };
+        ensure_informative_platform(&ok_platform).expect("platform should be accepted");
+
+        let missing_autosomes = PlatformDefinition {
+            n_attempted_autosomes: 0,
+            n_attempted_y_nonpar: 5,
+        };
+        let err = ensure_informative_platform(&missing_autosomes)
+            .expect_err("should reject missing autosomes");
+        match err {
+            SexInferenceError::InsufficientInformativeVariants {
+                autosomes,
+                y_non_par,
+            } => {
+                assert_eq!(autosomes, 0);
+                assert_eq!(y_non_par, 5);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let missing_y = PlatformDefinition {
+            n_attempted_autosomes: 10,
+            n_attempted_y_nonpar: 0,
+        };
+        ensure_informative_platform(&missing_y).expect_err("should reject missing Y");
     }
 
     #[test]

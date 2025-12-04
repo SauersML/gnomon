@@ -51,8 +51,9 @@ accumulators provided by the upstream crate. Each sample maintains its own
 accumulator, which digests heterozygosity on the X chromosome together with Y
 coverage statistics to arrive at a final `InferredSex` call. Missing dosages are
 preserved as `NaN` by the genotype reader and therefore do not contribute to the
-summary counts. Both pseudoautosomal (PAR) and non-PAR Y variants participate in
-the inference so the PAR-specific column in `sex.tsv` reflects observed data.
+summary counts. Both pseudoautosomal (PAR) and non-PAR Y variants are tracked
+and written to `sex.tsv`; the upstream algorithm uses non-PAR Y density for its
+decision metrics while still surfacing PAR counts for QC.
 
 Before processing, gnomon inspects the maximum observed X-chromosome position to
 automatically select between the GRCh37 and GRCh38 coordinate systems. This is
@@ -83,6 +84,9 @@ pipelines without shelling out to the CLI.
   iterator to yield exactly the advertised number of variants. Overflows or
   underflows raise explicit errors so the CLI exits instead of silently
   skipping data.
+* **Insufficient informative loci.** Sex inference requires at least one
+  autosomal and one non-PAR Y variant after selection; runs missing either set
+  terminate with a clear error instead of synthesizing placeholder labels.
 * **Unsupported chromosome labels.** Only chromosome labels recognised as X or Y
   contribute to the inference. Everything else—including haploid or mitochondrial
   contigs—is ignored.
