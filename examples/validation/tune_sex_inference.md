@@ -26,108 +26,103 @@ Run Gnomon sex inference to generate arrays.sex.tsv with metric columns:
 !./gnomon/target/release/gnomon terms --sex ../../arrays.bed
 ```
 
-Load data and visualize specific inference metrics against Self-Reported Sex and DRAGEN Ploidy:
+Load data and visualize specific inference metrics against Self-Reported Sex:
 
 ```
-import os
 import pandas as pd
-import seaborn as sns
+import numpy as np
 import matplotlib.pyplot as plt
-import gcsfs
+import seaborn as sns
+from sklearn.svm import SVC
 
-# --- Configuration & Styling ---
-sns.set_theme(style="whitegrid", context="notebook", font_scale=1.1)
+# =============================================================================
+# 1. PREPARE DATA FOR SVM
+# =============================================================================
+# Filter to clean Male/Female data for training the separator
+train_df = df.dropna(subset=['sex_at_birth', 'X_AutoHet_Ratio', 'Y_Density']).copy()
+train_df = train_df[train_df['sex_at_birth'].isin(['Male', 'Female'])]
 
-# 1. Load Gnomon Results (Local)
-gnomon_path = "../../arrays.sex.tsv"
-if not os.path.exists(gnomon_path):
-    raise FileNotFoundError(f"Could not find {gnomon_path}. Please run the Gnomon inference first.")
+# Features (X) and Target (y)
+X = train_df[['X_AutoHet_Ratio', 'Y_Density']].values
+# Map labels: Male=1, Female=0
+y = (train_df['sex_at_birth'] == 'Male').astype(int).values
 
-gnomon_df = pd.read_csv(gnomon_path, sep="\t")
-gnomon_df["IID"] = gnomon_df["IID"].astype(str)
+# =============================================================================
+# 2. TRAIN LINEAR SVM (Find the Best Line)
+# =============================================================================
+# C=1.0 is standard regularization. kernel='linear' forces a straight line.
+clf = SVC(kernel='linear', C=1.0)
+clf.fit(X, y)
 
-# 2. Load Truth Data (GCS)
-project_id = os.environ.get("GOOGLE_PROJECT")
-metrics_uri = "gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv"
+# =============================================================================
+# 3. EXTRACT THE LINE EQUATION
+# =============================================================================
+# The equation of the separating plane is: w0*x + w1*y + b = 0
+w = clf.coef_[0]
+b = clf.intercept_[0]
 
-print(f"Loading metrics from {metrics_uri}...")
-fs = gcsfs.GCSFileSystem(project=project_id, token="cloud", requester_pays=True)
-with fs.open(metrics_uri, "rb") as f:
-    metrics_df = pd.read_csv(f, sep="\t")
+# To plot as y = mx + c:
+# w0*x + w1*y + b = 0  =>  y = -(w0/w1)*x - (b/w1)
+slope = -w[0] / w[1]
+intercept = -b / w[1]
 
-# 3. Merge Datasets
-possible_ids = ["person_id", "sample_id", "participant_id"]
-id_col = next((c for c in possible_ids if c in metrics_df.columns), None)
-if not id_col:
-    raise ValueError(f"Could not find ID column in metrics. Checked: {possible_ids}")
+print("="*60)
+print("OPTIMAL SEPARATION LINE EQUATION")
+print("="*60)
+print(f"Formula: Y_Density = ({slope:.4f} * X_AutoHet_Ratio) + {intercept:.4f}")
+print("-" * 60)
+print("Decision Logic:")
+print(f"If Point is ABOVE line -> MALE")
+print(f"If Point is BELOW line -> FEMALE")
 
-metrics_df[id_col] = metrics_df[id_col].astype(str)
-merged = gnomon_df.merge(metrics_df, left_on="IID", right_on=id_col, how="inner")
-print(f"Merged dataset size: {len(merged)} samples.")
+# =============================================================================
+# 4. VISUALIZATION
+# =============================================================================
+plt.figure(figsize=(12, 9))
+sns.set_theme(style="whitegrid")
 
-# 4. Prepare for Plotting
-# Filter for visualization clarity
-plot_df = merged.dropna(subset=["sex_at_birth", "dragen_sex_ploidy"]).copy()
-
-metric_cols = [
-    "X_Het_Ratio", 
-    "Y_Non_PAR", 
-    "Y_PAR", 
-    "SRY_Count",         
-    "PAR_NonPAR_Ratio", 
-    "Male_Votes", 
-    "Female_Votes"
-]
-
-targets = ["sex_at_birth", "dragen_sex_ploidy"]
-
-# Pre-convert metrics to numeric, coercing errors to NaN for clean plotting
-for col in metric_cols:
-    if col in plot_df.columns:
-        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
-
-# 5. Generate Plots
-n_metrics = len(metric_cols)
-n_targets = len(targets)
-
-fig, axes = plt.subplots(
-    n_metrics, 
-    n_targets, 
-    figsize=(15, 4.5 * n_metrics), 
-    constrained_layout=True
+# 1. Plot the actual Data Points
+sns.scatterplot(
+    data=train_df, 
+    x='X_AutoHet_Ratio', 
+    y='Y_Density', 
+    hue='sex_at_birth', 
+    palette={'Male': '#1f77b4', 'Female': '#e377c2'},
+    alpha=0.6,
+    s=50,
+    edgecolor='k'
 )
 
-for i, metric in enumerate(metric_cols):
-    if metric not in plot_df.columns:
-        # Placeholder if column is missing from Gnomon output
-        for j in range(n_targets):
-            axes[i, j].text(0.5, 0.5, f"Column '{metric}' not found", ha='center')
-        continue
+# 2. Plot the SVM Decision Boundary (The Optimal Line)
+# Create a range of x values across the plot
+x_vals = np.linspace(train_df['X_AutoHet_Ratio'].min(), train_df['X_AutoHet_Ratio'].max(), 100)
+y_vals = slope * x_vals + intercept
 
-    for j, target in enumerate(targets):
-        ax = axes[i, j]
-        
-        # Use boxenplot for detailed tail distribution
-        sns.boxenplot(
-            data=plot_df, 
-            x=target, 
-            y=metric, 
-            ax=ax, 
-            showfliers=False,
-            palette="mako" if j == 0 else "rocket"  # Different palettes for different targets
-        )
-        
-        clean_metric_name = metric.replace("_", " ")
-        clean_target_name = target.replace("_", " ").title()
-        
-        ax.set_title(f"{clean_metric_name} by {clean_target_name}", fontweight='bold')
-        ax.set_ylabel(clean_metric_name)
-        ax.set_xlabel("")
-        ax.tick_params(axis='x', rotation=30)
-        
-        sns.despine(ax=ax, trim=True)
-        ax.grid(True, axis='y', linestyle=':', alpha=0.6)
+plt.plot(x_vals, y_vals, color='black', linewidth=3, linestyle='-', label='SVM Optimal Separator')
 
-plt.suptitle(f"Sex Inference Metrics Validation (N={len(plot_df)})", fontsize=16, y=1.02)
+# 3. Plot the Margins (The "Street" width)
+# The margins are 1 unit away in the transformed space
+margin = 1 / np.sqrt(np.sum(clf.coef_ ** 2))
+y_margin_up = y_vals + np.sqrt(1 + slope**2) * margin
+y_margin_down = y_vals - np.sqrt(1 + slope**2) * margin
+
+plt.plot(x_vals, y_margin_up, 'k--', linewidth=1, alpha=0.5, label='Maximum Margin')
+plt.plot(x_vals, y_margin_down, 'k--', linewidth=1, alpha=0.5)
+
+# Fill the areas to show classification zones
+plt.fill_between(x_vals, y_vals, 2.0, color='#1f77b4', alpha=0.1) # Male Zone
+plt.fill_between(x_vals, -1.0, y_vals, color='#e377c2', alpha=0.1) # Female Zone
+
+# Formatting
+plt.title(f"SVM Optimal Decision Boundary (Accuracy: {clf.score(X, y)*100:.2f}%)", fontsize=16, fontweight='bold')
+plt.xlabel("X-to-Autosome Heterozygosity Ratio", fontsize=12, fontweight='bold')
+plt.ylabel("Y-Genome Density", fontsize=12, fontweight='bold')
+
+# Lock axis to relevant data range
+plt.ylim(-0.1, 1.2)
+plt.xlim(-0.1, 1.4)
+
+plt.legend(loc='lower left', frameon=True, facecolor='white', framealpha=1)
+plt.tight_layout()
 plt.show()
 ```
