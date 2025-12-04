@@ -68,7 +68,7 @@ stay fast while avoiding bias toward the earliest chromosomes in the BIM.
 
 The CLI experience is backed by two convenience APIs:
 
-* `terms::infer_sex_to_tsv(genotype_path: &Path)` – Loads the dataset, performs
+* `terms::infer_sex_to_tsv(genotype_path: &Path, force_build: Option<GenomeBuild>)` – Loads the dataset, performs
   inference, writes `sex.tsv`, and returns the resolved output path.
 * `terms::SexInferenceRecord` – Bundles the `individual_id` with the raw
   `InferenceResult` produced by the upstream crate, giving downstream code
@@ -85,8 +85,9 @@ pipelines without shelling out to the CLI.
   underflows raise explicit errors so the CLI exits instead of silently
   skipping data.
 * **Insufficient informative loci.** Sex inference requires at least one
-  autosomal and one non-PAR Y variant after selection; runs missing either set
-  terminate with a clear error instead of synthesizing placeholder labels.
+  autosomal variant after selection; Y evidence is optional to support X-only
+  datasets. Runs missing the autosomal baseline terminate with a clear error
+  instead of synthesizing placeholder labels.
 * **Unsupported chromosome labels.** Only chromosome labels recognised as X or Y
   contribute to the inference. Everything else—including haploid or mitochondrial
   contigs—is ignored.

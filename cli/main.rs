@@ -848,7 +848,7 @@ fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
 
-    let output_path = infer_sex_to_tsv(&args.genotype_path)
+    let output_path = infer_sex_to_tsv(&args.genotype_path, None)
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)?;
     println!("Sex inference results written to {}", output_path.display());
     Ok(())

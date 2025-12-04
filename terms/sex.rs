@@ -121,20 +121,27 @@ impl SexVariantSelection {
 }
 
 const SEX_TSV_HEADER: &str = concat!(
-    "IID\tSex\tY_Density\tX_AutoHet_Ratio\tComposite_Index\tAuto_Valid\tAuto_Het\t",
+    "IID\tBuild\tSex\tY_Density\tX_AutoHet_Ratio\tComposite_Index\tAuto_Valid\tAuto_Het\t",
     "X_NonPAR_Valid\tX_NonPAR_Het\tY_NonPAR_Valid\tY_PAR_Valid",
 );
 
-pub fn infer_sex_to_tsv(genotype_path: &Path) -> Result<PathBuf, SexInferenceError> {
+pub fn infer_sex_to_tsv(
+    genotype_path: &Path,
+    force_build: Option<GenomeBuild>,
+) -> Result<PathBuf, SexInferenceError> {
     let dataset = GenotypeDataset::open(genotype_path)?;
     let default_output = dataset.output_path("sex.tsv");
 
     let variant_keys = dataset.variant_keys_for_plan(&SelectionPlan::All)?;
-    let selection =
-        SexVariantSelection::from_all_keys(&variant_keys, infer_build_from_keys(&variant_keys));
+    let build = force_build.unwrap_or_else(|| {
+        let inferred = infer_build_from_keys(&variant_keys);
+        eprintln!("Inferred Genome Build: {:?}", inferred);
+        inferred
+    });
+    let selection = SexVariantSelection::from_all_keys(&variant_keys, build);
     let records = collect_inference(&dataset, &selection)?;
 
-    write_results(&default_output, &records)?;
+    write_results(&default_output, &records, build)?;
 
     Ok(default_output)
 }
@@ -236,7 +243,11 @@ fn finalize_records(
         .collect()
 }
 
-fn write_results(path: &Path, records: &[SexInferenceRecord]) -> Result<(), SexInferenceError> {
+fn write_results(
+    path: &Path,
+    records: &[SexInferenceRecord],
+    build: GenomeBuild,
+) -> Result<(), SexInferenceError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -251,18 +262,19 @@ fn write_results(path: &Path, records: &[SexInferenceRecord]) -> Result<(), SexI
         let report = &record.inference.report;
         let y_density = report
             .y_genome_density
-            .map_or("NA".to_string(), |v| v.to_string());
+            .map_or("NA".to_string(), |v| format!("{v:.6}"));
         let x_ratio = report
             .x_autosome_het_ratio
-            .map_or("NA".to_string(), |v| v.to_string());
+            .map_or("NA".to_string(), |v| format!("{v:.6}"));
         let composite = report
             .composite_sex_index
-            .map_or("NA".to_string(), |v| v.to_string());
+            .map_or("NA".to_string(), |v| format!("{v:.6}"));
 
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             record.individual_id,
+            format!("{:?}", build),
             label,
             y_density,
             x_ratio,
@@ -340,7 +352,7 @@ fn derive_platform_definition(keys: &[SelectedVariant], build: GenomeBuild) -> P
     for selected in keys {
         match selected.chrom {
             Chromosome::Autosome => n_attempted_autosomes += 1,
-            Chromosome::Y if is_in_y_non_par(build, selected.key.position) => {
+            Chromosome::Y if build.is_in_y_non_par(selected.key.position) => {
                 n_attempted_y_nonpar += 1
             }
             _ => {}
@@ -354,20 +366,13 @@ fn derive_platform_definition(keys: &[SelectedVariant], build: GenomeBuild) -> P
 }
 
 fn ensure_informative_platform(platform: &PlatformDefinition) -> Result<(), SexInferenceError> {
-    if platform.n_attempted_autosomes == 0 || platform.n_attempted_y_nonpar == 0 {
+    if platform.n_attempted_autosomes == 0 {
         return Err(SexInferenceError::InsufficientInformativeVariants {
             autosomes: platform.n_attempted_autosomes,
             y_non_par: platform.n_attempted_y_nonpar,
         });
     }
     Ok(())
-}
-
-fn is_in_y_non_par(build: GenomeBuild, pos: u64) -> bool {
-    match build {
-        GenomeBuild::Build37 => (2_649_521..=59_034_049).contains(&pos),
-        GenomeBuild::Build38 => (2_781_480..=56_887_902).contains(&pos),
-    }
 }
 
 #[cfg(test)]
@@ -453,12 +458,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-
-        let missing_y = PlatformDefinition {
-            n_attempted_autosomes: 10,
-            n_attempted_y_nonpar: 0,
-        };
-        ensure_informative_platform(&missing_y).expect_err("should reject missing Y");
     }
 
     #[test]
@@ -630,7 +629,7 @@ mod tests {
 
         let dir = tempdir()?;
         let output_path = dir.path().join("sex.tsv");
-        write_results(&output_path, &[female, male])?;
+        write_results(&output_path, &[female, male], build)?;
         let tsv_contents = std::fs::read_to_string(&output_path)?;
         let mut lines = tsv_contents.lines();
         let header = lines.next().unwrap();
@@ -639,6 +638,7 @@ mod tests {
         for line in lines {
             let mut parts = line.split('\t');
             let _ = parts.next().unwrap();
+            let build = parts.next().unwrap();
             let sex = parts.next().unwrap();
             let y_density = parts.next().unwrap();
             let x_ratio = parts.next().unwrap();
@@ -662,6 +662,7 @@ mod tests {
                 assert_eq!(y_par, 0);
             }
             assert!(x_valid > 0);
+            assert_eq!(build, "Build38");
         }
 
         Ok(())
