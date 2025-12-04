@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -63,8 +64,8 @@ impl SexVariantSelection {
     fn from_all_keys(keys: &[VariantKey], build: GenomeBuild) -> Self {
         const AUTOSOME_SAMPLE_TARGET: usize = 2000;
 
-        let mut selected_keys = Vec::new();
-        let mut selected_indices = Vec::new();
+        let mut selected = Vec::new();
+        let mut selected_autosomes = HashSet::new();
         let mut autosome_indices = Vec::new();
 
         for (index, key) in keys.iter().enumerate() {
@@ -75,11 +76,13 @@ impl SexVariantSelection {
             match chrom {
                 Chromosome::Autosome => autosome_indices.push(index),
                 Chromosome::X | Chromosome::Y => {
-                    selected_indices.push(index);
-                    selected_keys.push(SelectedVariant {
-                        key: key.clone(),
-                        chrom,
-                    });
+                    selected.push((
+                        index,
+                        SelectedVariant {
+                            key: key.clone(),
+                            chrom,
+                        },
+                    ));
                 }
             }
         }
@@ -88,11 +91,24 @@ impl SexVariantSelection {
         for i in 0..autosome_sample_count {
             let source_idx = i * autosome_indices.len() / autosome_sample_count;
             let key_index = autosome_indices[source_idx];
-            selected_indices.push(key_index);
-            selected_keys.push(SelectedVariant {
-                key: keys[key_index].clone(),
-                chrom: Chromosome::Autosome,
-            });
+            if selected_autosomes.insert(key_index) {
+                selected.push((
+                    key_index,
+                    SelectedVariant {
+                        key: keys[key_index].clone(),
+                        chrom: Chromosome::Autosome,
+                    },
+                ));
+            }
+        }
+
+        selected.sort_by_key(|entry| entry.0);
+
+        let mut selected_indices = Vec::with_capacity(selected.len());
+        let mut selected_keys = Vec::with_capacity(selected.len());
+        for (index, variant) in selected.into_iter() {
+            selected_indices.push(index);
+            selected_keys.push(variant);
         }
 
         let plan = SelectionPlan::ByIndices(selected_indices);
@@ -461,6 +477,7 @@ mod tests {
         assert_eq!(selection.keys.len(), 2003);
         if let SelectionPlan::ByIndices(indices) = &selection.plan {
             assert_eq!(indices.len(), selection.keys.len());
+            assert!(indices.windows(2).all(|w| w[0] < w[1]));
             assert!(indices.contains(&0));
             assert!(indices.contains(&3000));
             assert!(indices.contains(&3001));
