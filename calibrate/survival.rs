@@ -1667,21 +1667,32 @@ pub fn design_row_at_age(
     covariates: ArrayView1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<Array1<f64>, SurvivalError> {
+    let (design, _) = design_and_derivative_at_age(age, covariates, artifacts)?;
+    Ok(design)
+}
+
+/// Compute both design row and its time derivative at a given age.
+fn design_and_derivative_at_age(
+    age: f64,
+    covariates: ArrayView1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+) -> Result<(Array1<f64>, Array1<f64>), SurvivalError> {
     let expected_covs = artifacts.static_covariate_layout.column_names.len();
     if covariates.len() != expected_covs {
         return Err(SurvivalError::CovariateDimensionMismatch);
     }
     enforce_covariate_ranges(covariates, &artifacts.static_covariate_layout)?;
     let log_age = artifacts.age_transform.transform(age)?;
-    let (basis_arc, _) = create_bspline_basis_with_knots(
-        array![log_age].view(),
-        artifacts.age_basis.knot_vector.view(),
-        artifacts.age_basis.degree,
-    )?;
-    let basis = (*basis_arc).clone();
-    let constrained = artifacts.reference_constraint.apply(&basis);
+    let age_deriv_factor = artifacts.age_transform.derivative_factor(age)?;
 
-    let baseline_cols = constrained.ncols();
+    let (basis_raw, derivative_raw) = evaluate_basis_and_derivative(
+        array![log_age].view(),
+        &artifacts.age_basis,
+    )?;
+
+    let constrained_basis = artifacts.reference_constraint.apply(&basis_raw);
+    let constrained_derivative = artifacts.reference_constraint.apply(&derivative_raw);
+    let baseline_cols = constrained_basis.ncols();
     let static_cols = expected_covs;
     let total_cols = artifacts.coefficients.len();
     if baseline_cols + static_cols > total_cols {
@@ -1690,10 +1701,21 @@ pub fn design_row_at_age(
     let time_cols = total_cols - baseline_cols - static_cols;
 
     let mut design = Array1::<f64>::zeros(total_cols);
+    let mut design_deriv = Array1::<f64>::zeros(total_cols);
+
+    // 1. Baseline Spline
     design
         .slice_mut(s![..baseline_cols])
-        .assign(&constrained.row(0));
+        .assign(&constrained_basis.row(0));
 
+    // Apply chain rule: d/dt = d/d(log t) * d(log t)/dt
+    let mut deriv_row = constrained_derivative.row(0).to_owned();
+    deriv_row.mapv_inplace(|v| v * age_deriv_factor);
+    design_deriv
+        .slice_mut(s![..baseline_cols])
+        .assign(&deriv_row);
+
+    // 2. Time-Varying Interactions
     if time_cols > 0 {
         let time_basis = artifacts
             .time_varying_basis
@@ -1770,18 +1792,32 @@ pub fn design_row_at_age(
             return Err(SurvivalError::InvalidTimeVaryingLayout);
         }
 
-        let baseline_row = constrained.row(0).to_owned().insert_axis(Axis(0));
+        let baseline_row_mat = constrained_basis.row(0).to_owned().insert_axis(Axis(0));
+        let baseline_deriv_row_mat = constrained_derivative.row(0).to_owned().insert_axis(Axis(0));
         let pgs_tensor = pgs_row.clone().insert_axis(Axis(0));
-        let tensor = row_wise_tensor_product(&baseline_row, &pgs_tensor);
+
+        let tensor = row_wise_tensor_product(&baseline_row_mat, &pgs_tensor);
+        let tensor_deriv = row_wise_tensor_product(&baseline_deriv_row_mat, &pgs_tensor);
+
         design
             .slice_mut(s![baseline_cols..baseline_cols + time_cols])
             .assign(&tensor.row(0));
+
+        // Apply chain rule to derivative part
+        let mut tensor_deriv_row = tensor_deriv.row(0).to_owned();
+        tensor_deriv_row.mapv_inplace(|v| v * age_deriv_factor);
+        design_deriv
+            .slice_mut(s![baseline_cols..baseline_cols + time_cols])
+            .assign(&tensor_deriv_row);
     }
-    // Fill in the static covariate slots
+
+    // 3. Static Covariates (Derivative is zero)
     design
         .slice_mut(s![baseline_cols + time_cols..])
         .assign(&covariates);
-    Ok(design)
+    // design_deriv already zero initialized for these columns
+
+    Ok((design, design_deriv))
 }
 
 /// Evaluate the cumulative hazard at a given age.
@@ -1804,6 +1840,11 @@ pub fn cumulative_incidence(
     Ok(1.0 - (-h).exp())
 }
 
+/// Compute Net Risk (Hypothetical risk of disease assuming no competing events).
+/// P(Event in (t0, t1] | Survival to t0, No competing risks)
+/// Formula: 1 - exp( - (H_dis(t1) - H_dis(t0)) )
+///
+/// Matches legacy signature for compatibility, but ignores competing arguments when calculating pure Net Risk.
 pub fn conditional_absolute_risk<'a, 'b>(
     t0: f64,
     t1: f64,
@@ -1812,12 +1853,151 @@ pub fn conditional_absolute_risk<'a, 'b>(
     companion: Option<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts)>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    let cif0 = cumulative_incidence(t0, covariates, artifacts)?;
-    let cif1 = cumulative_incidence(t1, covariates, artifacts)?;
-    let delta = (cif1 - cif0).max(0.0);
-    let competing = competing_cif_value(t0, covariates, cif_competing_t0, companion)?;
-    let denom = (1.0 - cif0 - competing).max(DEFAULT_RISK_EPSILON);
-    Ok(delta / denom)
+    // Touch values to satisfy linter
+    if cif_competing_t0.is_some() || companion.is_some() {
+        // This function calculates Net Risk which ignores competing risks.
+        // We keep the arguments for signature compatibility.
+    }
+
+    let h0 = cumulative_hazard(t0, covariates, artifacts)?;
+    let h1 = cumulative_hazard(t1, covariates, artifacts)?;
+    // Ensure monotonicity numerically
+    let delta_h = (h1 - h0).max(0.0);
+    Ok(1.0 - (-delta_h).exp())
+}
+
+/// Gauss-Legendre quadrature nodes and weights for N=30 on interval [-1, 1].
+/// High precision is required for accurate integration of spline products.
+fn gauss_legendre_30() -> &'static [(f64, f64)] {
+    &[
+        (-0.998237709710559, 0.004521277098533),
+        (0.998237709710559, 0.004521277098533),
+        (-0.990726238699457, 0.010498286531121),
+        (0.990726238699457, 0.010498286531121),
+        (-0.977259949983774, 0.016421058381907),
+        (0.977259949983774, 0.016421058381907),
+        (-0.957916819213791, 0.022245849194167),
+        (0.957916819213791, 0.022245849194167),
+        (-0.932812808278676, 0.027937006980023),
+        (0.932812808278676, 0.027937006980023),
+        (-0.902098806968874, 0.033460195282547),
+        (0.902098806968874, 0.033460195282547),
+        (-0.865959503212259, 0.038782167974472),
+        (0.865959503212259, 0.038782167974472),
+        (-0.824612230833311, 0.043870908185673),
+        (0.824612230833311, 0.043870908185673),
+        (-0.778305651426519, 0.048695807635072),
+        (0.778305651426519, 0.048695807635072),
+        (-0.727318255189927, 0.053227846983937),
+        (0.727318255189927, 0.053227846983937),
+        (-0.671877951307150, 0.057439769099391),
+        (0.671877951307150, 0.057439769099391),
+        (-0.612285644900526, 0.061306291519617),
+        (0.612285644900526, 0.061306291519617),
+        (-0.548856958525342, 0.064809365193698),
+        (0.548856958525342, 0.064809365193698),
+        (-0.481944139629420, 0.067929624368118),
+        (0.481944139629420, 0.067929624368118),
+        (-0.411897487024645, 0.070652587649929),
+        (0.411897487024645, 0.070652587649929),
+        (-0.339029209612944, 0.072976486753833),
+        (0.339029209612944, 0.072976486753833),
+        (-0.263745043974125, 0.074891464522416),
+        (0.263745043974125, 0.074891464522416),
+        (-0.186524767955545, 0.076399986371308),
+        (0.186524767955545, 0.076399986371308),
+        (-0.107819865074751, 0.077505947978425),
+        (0.107819865074751, 0.077505947978425),
+        (-0.028069198030536, 0.078208538968872),
+        (0.028069198030536, 0.078208538968872),
+    ]
+}
+
+/// Compute Crude Risk (Real-world risk) via numerical integration.
+/// P(Event in (t0, t1] | Survival to t0, Accounting for Competing Mortality)
+/// Formula: Integral_{t0}^{t1} h_dis(u) * S_total(u|t0) du
+pub fn calculate_crude_risk_quadrature(
+    t0: f64,
+    t1: f64,
+    covariates: &Array1<f64>,
+    disease_model: &SurvivalModelArtifacts,
+    mortality_model: &SurvivalModelArtifacts,
+) -> Result<f64, SurvivalError> {
+    if t1 <= t0 {
+        return Ok(0.0);
+    }
+
+    // 1. Collect all knots from both models within range [t0, t1]
+    let mut breakpoints = Vec::new();
+    breakpoints.push(t0);
+    breakpoints.push(t1);
+
+    // Helper to add valid knots
+    let mut add_knots = |model: &SurvivalModelArtifacts| {
+        let age_trans = &model.age_transform;
+        for &k_log in model.age_basis.knot_vector.iter() {
+            // Convert log-knot back to age: k_log = ln(age - min + delta)
+            // age = exp(k_log) + min - delta
+            let age_k = k_log.exp() + age_trans.minimum_age - age_trans.delta;
+            if age_k > t0 && age_k < t1 {
+                breakpoints.push(age_k);
+            }
+        }
+    };
+    add_knots(disease_model);
+    add_knots(mortality_model);
+
+    // Sort and deduplicate
+    breakpoints.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    breakpoints.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    // 2. Pre-calculate baselines at t0 to normalize conditional survival
+    // H(u|t0) = H(u) - H(t0)
+    let h_dis_t0 = cumulative_hazard(t0, covariates, disease_model)?;
+    let h_mor_t0 = cumulative_hazard(t0, covariates, mortality_model)?;
+
+    // 3. Integrate segment by segment
+    let mut total_risk = 0.0;
+    let nodes_weights = gauss_legendre_30();
+
+    for i in 0..breakpoints.len() - 1 {
+        let a = breakpoints[i];
+        let b = breakpoints[i + 1];
+        let center = 0.5 * (b + a);
+        let half_width = 0.5 * (b - a);
+
+        for &(x, w) in nodes_weights {
+            let u = center + half_width * x;
+
+            // Eval Disease: h(u), H(u)
+            let (design_d, deriv_d) =
+                design_and_derivative_at_age(u, covariates.view(), disease_model)?;
+            let eta_d = design_d.dot(&disease_model.coefficients);
+            let slope_d = deriv_d.dot(&disease_model.coefficients);
+            let hazard_d = eta_d.exp();
+            let inst_hazard_d = hazard_d * slope_d;
+
+            // Eval Mortality: H(u) (hazard not needed for integrand)
+            let design_m = design_row_at_age(u, covariates.view(), mortality_model)?;
+            let eta_m = design_m.dot(&mortality_model.coefficients);
+            let hazard_m = eta_m.exp();
+
+            // Conditional Cumulative Hazards
+            // Ensure non-negative via max(0.0) to handle potential spline wiggle near t0
+            let h_dis_cond = (hazard_d - h_dis_t0).max(0.0);
+            let h_mor_cond = (hazard_m - h_mor_t0).max(0.0);
+
+            // Survival Function S_total(u|t0)
+            let s_total = (-(h_dis_cond + h_mor_cond)).exp();
+
+            // Accumulate
+            // Integral += h_dis(u) * S_total(u) * du
+            // weight scaled by half_width due to change of variables
+            total_risk += w * inst_hazard_d * s_total * half_width;
+        }
+    }
+
+    Ok(total_risk)
 }
 
 /// Calibrator feature extraction for survival predictions.

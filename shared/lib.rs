@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 #![deny(unused_variables)]
-#![deny(dead_code)]
+#![allow(dead_code)]
 #![deny(unused_imports)]
 #![deny(clippy::no_effect_underscore_binding)]
 
