@@ -40,14 +40,19 @@ impl From<InferenceError> for SexInferenceError {
 pub struct SexInferenceRecord {
     pub individual_id: String,
     pub inference: InferenceResult,
-    pub sry_variant_count: u64,
 }
 
 #[derive(Debug, Clone)]
 struct SexVariantSelection {
-    keys: Vec<VariantKey>,
+    keys: Vec<SelectedVariant>,
     plan: SelectionPlan,
     build: GenomeBuild,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedVariant {
+    key: VariantKey,
+    chrom: Chromosome,
 }
 
 impl SexVariantSelection {
@@ -56,25 +61,34 @@ impl SexVariantSelection {
 
         let mut selected_keys = Vec::new();
         let mut selected_indices = Vec::new();
-        let mut autosomes_selected = 0usize;
+        let mut autosome_indices = Vec::new();
 
         for (index, key) in keys.iter().enumerate() {
-            match classify_chromosome(&key.chromosome) {
-                Some(Chromosome::Autosome) if autosomes_selected < AUTOSOME_SAMPLE_TARGET => {
-                    autosomes_selected += 1;
+            let Some(chrom) = classify_chromosome(&key.chromosome) else {
+                continue;
+            };
+
+            match chrom {
+                Chromosome::Autosome => autosome_indices.push(index),
+                Chromosome::X | Chromosome::Y => {
                     selected_indices.push(index);
-                    selected_keys.push(key.clone());
+                    selected_keys.push(SelectedVariant {
+                        key: key.clone(),
+                        chrom,
+                    });
                 }
-                Some(Chromosome::X) => {
-                    selected_indices.push(index);
-                    selected_keys.push(key.clone());
-                }
-                Some(Chromosome::Y) if is_in_y_non_par(build, key.position) => {
-                    selected_indices.push(index);
-                    selected_keys.push(key.clone());
-                }
-                _ => {}
             }
+        }
+
+        let autosome_sample_count = AUTOSOME_SAMPLE_TARGET.min(autosome_indices.len());
+        for i in 0..autosome_sample_count {
+            let source_idx = i * autosome_indices.len() / autosome_sample_count;
+            let key_index = autosome_indices[source_idx];
+            selected_indices.push(key_index);
+            selected_keys.push(SelectedVariant {
+                key: keys[key_index].clone(),
+                chrom: Chromosome::Autosome,
+            });
         }
 
         let plan = SelectionPlan::ByIndices(selected_indices);
@@ -88,7 +102,7 @@ impl SexVariantSelection {
 
 const SEX_TSV_HEADER: &str = concat!(
     "IID\tSex\tY_Density\tX_AutoHet_Ratio\tComposite_Index\tAuto_Valid\tAuto_Het\t",
-    "X_NonPAR_Valid\tX_NonPAR_Het\tY_NonPAR_Valid\tY_PAR_Valid\tSRY_Count",
+    "X_NonPAR_Valid\tX_NonPAR_Het\tY_NonPAR_Valid\tY_PAR_Valid",
 );
 
 pub fn infer_sex_to_tsv(genotype_path: &Path) -> Result<PathBuf, SexInferenceError> {
@@ -115,7 +129,6 @@ fn collect_inference(
         .map(|record| record.individual_id.clone())
         .collect();
     let n_samples = sample_ids.len();
-    let mut sry_counts = vec![0u64; n_samples];
 
     let build = selection.build;
     let platform = derive_platform_definition(&selection.keys, build);
@@ -127,10 +140,6 @@ fn collect_inference(
     let mut accumulators: Vec<SexInferenceAccumulator> = (0..n_samples)
         .map(|_| SexInferenceAccumulator::new(config))
         .collect();
-
-    if selection.keys.is_empty() {
-        return finalize_records(accumulators, sample_ids, sry_counts);
-    }
 
     let mut block_source = dataset.block_source_with_plan(selection.plan.clone())?;
     let total_variants = selection.keys.len();
@@ -156,21 +165,15 @@ fn collect_inference(
         }
 
         for local_idx in 0..filled {
-            let key = &selection.keys[processed + local_idx];
-            let Some(chrom) = classify_chromosome(&key.chromosome) else {
-                continue;
-            };
-            let pos = key.position;
+            let selected = &selection.keys[processed + local_idx];
+            let chrom = selected.chrom;
+            let pos = selected.key.position;
             let column_offset = local_idx * n_samples;
-            let is_sry_variant = matches!(chrom, Chromosome::Y) && is_in_sry_region(build, pos);
 
             for sample_idx in 0..n_samples {
                 let dosage = storage[column_offset + sample_idx];
                 if dosage.is_nan() {
                     continue;
-                }
-                if is_sry_variant {
-                    sry_counts[sample_idx] += 1;
                 }
                 let is_het = dosage == 1.0;
                 let info = VariantInfo {
@@ -192,32 +195,21 @@ fn collect_inference(
         });
     }
 
-    finalize_records(accumulators, sample_ids, sry_counts)
+    finalize_records(accumulators, sample_ids)
 }
 
 fn finalize_records(
     accumulators: Vec<SexInferenceAccumulator>,
     sample_ids: Vec<String>,
-    sry_counts: Vec<u64>,
-) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
-    finalize_records_with_sry(accumulators, sample_ids, sry_counts)
-}
-
-fn finalize_records_with_sry(
-    accumulators: Vec<SexInferenceAccumulator>,
-    sample_ids: Vec<String>,
-    sry_counts: Vec<u64>,
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     accumulators
         .into_iter()
         .zip(sample_ids.into_iter())
-        .zip(sry_counts.into_iter())
-        .map(|((acc, individual_id), sry_variant_count)| {
+        .map(|(acc, individual_id)| {
             let inference = acc.finish()?;
             Ok(SexInferenceRecord {
                 individual_id,
                 inference,
-                sry_variant_count,
             })
         })
         .collect()
@@ -248,7 +240,7 @@ fn write_results(path: &Path, records: &[SexInferenceRecord]) -> Result<(), SexI
 
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             record.individual_id,
             label,
             y_density,
@@ -260,7 +252,6 @@ fn write_results(path: &Path, records: &[SexInferenceRecord]) -> Result<(), SexI
             report.x_non_par_het_count,
             report.y_non_par_valid_count,
             report.y_par_valid_count,
-            record.sry_variant_count,
         )?;
     }
     writer.flush()?;
@@ -293,30 +284,42 @@ fn infer_build_from_keys(keys: &[VariantKey]) -> GenomeBuild {
 }
 
 fn classify_chromosome(label: &str) -> Option<Chromosome> {
-    let mut normalized = label.trim().to_ascii_uppercase();
-    if let Some(stripped) = normalized.strip_prefix("CHR") {
-        normalized = stripped.to_string();
+    let trimmed = label.trim();
+    let bytes = trimmed.as_bytes();
+    let stripped = if bytes.len() >= 3
+        && matches!(bytes[0] | 32, b'c')
+        && matches!(bytes[1] | 32, b'h')
+        && matches!(bytes[2] | 32, b'r')
+    {
+        &trimmed[3..]
+    } else {
+        trimmed
+    };
+
+    if stripped.len() == 1 {
+        match stripped.as_bytes()[0] {
+            b'X' | b'x' => return Some(Chromosome::X),
+            b'Y' | b'y' => return Some(Chromosome::Y),
+            _ => {}
+        }
     }
 
-    match normalized.as_str() {
-        "X" | "23" => Some(Chromosome::X),
-        "Y" | "24" => Some(Chromosome::Y),
-        value => value
-            .parse::<u8>()
-            .ok()
-            .filter(|chrom| (1..=22).contains(chrom))
-            .map(|_| Chromosome::Autosome),
+    match stripped.parse::<u8>().ok()? {
+        23 => Some(Chromosome::X),
+        24 => Some(Chromosome::Y),
+        chrom if (1..=22).contains(&chrom) => Some(Chromosome::Autosome),
+        _ => None,
     }
 }
 
-fn derive_platform_definition(keys: &[VariantKey], build: GenomeBuild) -> PlatformDefinition {
+fn derive_platform_definition(keys: &[SelectedVariant], build: GenomeBuild) -> PlatformDefinition {
     let mut n_attempted_autosomes = 0u64;
     let mut n_attempted_y_nonpar = 0u64;
 
-    for key in keys {
-        match classify_chromosome(&key.chromosome) {
-            Some(Chromosome::Autosome) => n_attempted_autosomes += 1,
-            Some(Chromosome::Y) if is_in_y_non_par(build, key.position) => {
+    for selected in keys {
+        match selected.chrom {
+            Chromosome::Autosome => n_attempted_autosomes += 1,
+            Chromosome::Y if is_in_y_non_par(build, selected.key.position) => {
                 n_attempted_y_nonpar += 1
             }
             _ => {}
@@ -326,13 +329,6 @@ fn derive_platform_definition(keys: &[VariantKey], build: GenomeBuild) -> Platfo
     PlatformDefinition {
         n_attempted_autosomes,
         n_attempted_y_nonpar,
-    }
-}
-
-fn is_in_sry_region(build: GenomeBuild, pos: u64) -> bool {
-    match build {
-        GenomeBuild::Build37 => (2_786_855..=2_787_682).contains(&pos),
-        GenomeBuild::Build38 => (2_654_896..=2_655_723).contains(&pos),
     }
 }
 
@@ -375,11 +371,26 @@ mod tests {
     fn platform_definition_counts_autosomes_and_y_nonpar() {
         let build = GenomeBuild::Build38;
         let keys = vec![
-            VariantKey::new("1", 1_000),
-            VariantKey::new("2", 2_000),
-            VariantKey::new("Y", 3_000_000),
-            VariantKey::new("Y", 56_887_902),
-            VariantKey::new("Y", 56_887_903),
+            SelectedVariant {
+                key: VariantKey::new("1", 1_000),
+                chrom: Chromosome::Autosome,
+            },
+            SelectedVariant {
+                key: VariantKey::new("2", 2_000),
+                chrom: Chromosome::Autosome,
+            },
+            SelectedVariant {
+                key: VariantKey::new("Y", 3_000_000),
+                chrom: Chromosome::Y,
+            },
+            SelectedVariant {
+                key: VariantKey::new("Y", 56_887_902),
+                chrom: Chromosome::Y,
+            },
+            SelectedVariant {
+                key: VariantKey::new("Y", 56_887_903),
+                chrom: Chromosome::Y,
+            },
         ];
 
         let platform = derive_platform_definition(&keys, build);
@@ -400,14 +411,20 @@ mod tests {
 
         let selection = SexVariantSelection::from_all_keys(&keys, build);
 
-        assert_eq!(selection.keys.len(), 2002);
+        assert_eq!(selection.keys.len(), 2003);
         if let SelectionPlan::ByIndices(indices) = &selection.plan {
             assert_eq!(indices.len(), selection.keys.len());
-            assert_eq!(indices[0], 0);
-            assert_eq!(indices[1999], 1999);
+            assert!(indices.contains(&0));
             assert!(indices.contains(&3000));
             assert!(indices.contains(&3001));
-            assert!(!indices.contains(&3002));
+            assert!(indices.contains(&3002));
+
+            let autosome_indices: Vec<_> =
+                indices.iter().copied().filter(|idx| *idx < 3000).collect();
+            assert_eq!(autosome_indices.len(), 2000);
+            assert!(autosome_indices.contains(&0));
+            assert!(autosome_indices.contains(&1500));
+            assert!(autosome_indices.contains(&2998));
         } else {
             panic!("unexpected selection plan type");
         }
@@ -541,12 +558,10 @@ mod tests {
         let female = SexInferenceRecord {
             individual_id: "F1".to_string(),
             inference: female_acc.finish().unwrap(),
-            sry_variant_count: 0,
         };
         let male = SexInferenceRecord {
             individual_id: "M1".to_string(),
             inference: male_acc.finish().unwrap(),
-            sry_variant_count: 1,
         };
 
         let dir = tempdir()?;
@@ -565,21 +580,22 @@ mod tests {
             let x_ratio = parts.next().unwrap();
             let composite = parts.next().unwrap();
             let auto_valid = parts.next().unwrap();
+            let auto_het = parts.next().unwrap();
             assert_ne!(y_density, "NA");
             assert_ne!(x_ratio, "NA");
             assert_ne!(composite, "NA");
             assert!(auto_valid.parse::<u64>().unwrap() > 0);
-            let _ = parts.next().unwrap();
+            assert!(auto_het.parse::<u64>().unwrap() > 0);
             let x_valid = parts.next().unwrap().parse::<u64>().unwrap();
             let _ = parts.next().unwrap();
             let y_non_par = parts.next().unwrap().parse::<u64>().unwrap();
-            let _ = parts.next().unwrap();
-            let sry = parts.next().unwrap().parse::<u64>().unwrap();
+            let y_par = parts.next().unwrap().parse::<u64>().unwrap();
             if sex == "female" {
                 assert_eq!(y_non_par, 0);
+                assert_eq!(y_par, 0);
             } else {
                 assert!(y_non_par > 0);
-                assert_eq!(sry, 1);
+                assert_eq!(y_par, 0);
             }
             assert!(x_valid > 0);
         }

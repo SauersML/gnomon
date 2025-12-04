@@ -29,17 +29,15 @@ requested, so remember to include the `--sex` flag.
 | --- | --- |
 | `IID` | Sample identifier sourced from the PLINK `.fam` file or VCF/BCF header. |
 | `Sex` | Final call (`male` or `female`). |
-| `X_Het_Ratio` | Heterozygosity ratio on the X chromosome when enough variants were observed; otherwise `NA`. |
-| `X_Het_Vote` | Vote contributed by the X heterozygosity check (`male`, `female`, or `NA`). |
-| `Y_Non_PAR` | Count of non-PAR Y variants observed. |
-| `Y_PAR` | Count of PAR Y variants observed. |
-| `Y_Vote` | Vote contributed by the Y presence check (`male`, `female`, or `NA`). |
-| `SRY_Count` | Number of variants observed in the SRY region. |
-| `SRY_Vote` | Vote contributed by the SRY presence check (`male` when present, otherwise `NA`). |
-| `PAR_NonPAR_Ratio` | Ratio of PAR to non-PAR X heterozygosity when available; otherwise `NA`. |
-| `PAR_NonPAR_Vote` | Vote contributed by the PAR/non-PAR heterozygosity check (`male`, `female`, or `NA`). |
-| `Male_Votes` | Total male votes tallied across all checks. |
-| `Female_Votes` | Total female votes tallied across all checks. |
+| `Y_Density` | Coverage density estimate across chromosome Y when enough variants were observed; otherwise `NA`. |
+| `X_AutoHet_Ratio` | Ratio of X heterozygosity to the autosomal baseline; `NA` when insufficient variants remain. |
+| `Composite_Index` | The upstream library's composite sex index when available; otherwise `NA`. |
+| `Auto_Valid` | Number of autosomal variants processed. |
+| `Auto_Het` | Number of heterozygous autosomal variants processed. |
+| `X_NonPAR_Valid` | Number of non-PAR X variants processed. |
+| `X_NonPAR_Het` | Number of heterozygous non-PAR X variants processed. |
+| `Y_NonPAR_Valid` | Number of non-PAR Y variants processed. |
+| `Y_PAR_Valid` | Number of Y PAR variants processed. |
 
 The header is always included and the file is written with Unix newlines. Parent
 directories are created automatically when the resolved output lives outside the
@@ -53,14 +51,17 @@ accumulators provided by the upstream crate. Each sample maintains its own
 accumulator, which digests heterozygosity on the X chromosome together with Y
 coverage statistics to arrive at a final `InferredSex` call. Missing dosages are
 preserved as `NaN` by the genotype reader and therefore do not contribute to the
-summary counts.
+summary counts. Both pseudoautosomal (PAR) and non-PAR Y variants participate in
+the inference so the PAR-specific column in `sex.tsv` reflects observed data.
 
 Before processing, gnomon inspects the maximum observed X-chromosome position to
 automatically select between the GRCh37 and GRCh38 coordinate systems. This is
 important because the reference position threshold for pseudoautosomal boundary
 detection differs by build. All other variant metadata are streamed directly
 from the genotype reader, so the command inherits the same provenance and
-validation guarantees as the PCA and scoring pipelines.
+validation guarantees as the PCA and scoring pipelines. Autosomal variants are
+downsampled to a maximum of 2,000 evenly spaced sites across the input order to
+stay fast while avoiding bias toward the earliest chromosomes in the BIM.
 
 ### Library API
 
