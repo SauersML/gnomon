@@ -22,8 +22,8 @@ cargo build --release
 
 Run Gnomon sex inference to generate arrays.sex.tsv with metric columns:
 ```
-echo "Running Gnomon sex inference..."
-../../gnomon/target/release/gnomon terms --sex ../../arrays.bed
+!echo "Running Gnomon sex inference..."
+!../../gnomon/target/release/gnomon terms --sex ../../arrays.bed
 ```
 
 Load data and visualize specific inference metrics against Self-Reported Sex and DRAGEN Ploidy:
