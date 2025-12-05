@@ -1,3 +1,4 @@
+Run this:
 ```
 import os
 import numpy as np
@@ -6,8 +7,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from google.cloud import bigquery as bq
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 import statsmodels.api as sm
 import warnings
+
+# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -44,7 +48,7 @@ cdr_id = os.environ["WORKSPACE_CDR"]
 google_project = os.getenv('GOOGLE_PROJECT')
 
 print("="*80)
-print("MULTI-DISEASE POLYGENIC RISK MODEL TRAINING AND EVALUATION")
+print("DISEASE RISK MODELING: CV EVALUATION + FINAL CALIBRATION")
 print("="*80)
 
 # ============================================================================
@@ -53,7 +57,7 @@ print("="*80)
 
 print("\n[1/7] Loading base genomic data...")
 
-# Load genetic sex and metrics
+# Load genetic sex
 import gcsfs
 fs = gcsfs.GCSFileSystem(project=google_project, token="cloud", requester_pays=True)
 with fs.open("gs://fc-aou-datasets-controlled/v8/wgs/short_read/snpindel/aux/qc/genomic_metrics.tsv", "rb") as f:
@@ -106,9 +110,6 @@ base_df['sex_binary'] = (base_df['gnomon_sex'].str.lower() == 'male').astype(int
 base_df['age_sq'] = base_df['age'] ** 2
 
 print(f"  Base cohort: {len(base_df):,} individuals")
-print(f"  With age: {base_df['age'].notna().sum():,}")
-print(f"  With gnomon sex: {base_df['gnomon_sex'].notna().sum():,}")
-print(f"  With ancestry: {base_df['ancestry'].notna().sum():,}")
 
 # ============================================================================
 # DEFINE CASES FOR EACH DISEASE
@@ -183,7 +184,7 @@ for disease_name, config in DISEASES.items():
     print(f"  {disease_name}: {len(cases):,} cases")
 
 # ============================================================================
-# CREATE DISEASE-SPECIFIC DATAFRAMES
+# CREATE DATASETS
 # ============================================================================
 
 print("\n[3/7] Creating disease-specific datasets...")
@@ -191,291 +192,241 @@ print("\n[3/7] Creating disease-specific datasets...")
 disease_dfs = {}
 for disease_name, config in DISEASES.items():
     df = base_df.copy()
-    
-    # Add case status
     df['case'] = df[id_col].isin(disease_cases[disease_name]).astype(int)
     
-    # Add PGS columns (check if they exist)
     pgs_cols = [f"{pgs}_AVG" for pgs in config['pgs']]
     available_pgs = [col for col in pgs_cols if col in df.columns]
     
     if not available_pgs:
-        print(f"  WARNING: No PGS columns found for {disease_name}")
         continue
     
-    # Keep only necessary columns
     keep_cols = [id_col, 'IID', 'gnomon_sex', 'sex_binary', 'ancestry', 'age', 'age_sq', 'case'] + available_pgs
-    df = df[keep_cols].copy()
+    df = df[keep_cols].dropna().copy()
     
-    # Remove rows with missing critical data
-    df = df.dropna(subset=['age', 'sex_binary'] + available_pgs)
-    
-    disease_dfs[disease_name] = {
-        'data': df,
-        'pgs_cols': available_pgs,
-        'n_pgs': len(available_pgs)
-    }
-    
-    print(f"  {disease_name}: {len(df):,} samples, {df['case'].sum():,} cases ({100*df['case'].mean():.2f}%)")
+    disease_dfs[disease_name] = {'data': df, 'pgs_cols': available_pgs}
+    print(f"  {disease_name}: {len(df):,} samples, {df['case'].sum():,} cases")
 
 # ============================================================================
-# TRAIN MODELS
+# CV EVALUATION & FINAL MODEL TRAINING
 # ============================================================================
 
-print("\n[4/7] Training models...")
+print("\n[4/7] Running 5-Fold Cross-Validation and Final Training...")
 
-results = []
+final_models = []
+eval_metrics = []
 
-for disease_name, disease_info in disease_dfs.items():
-    print(f"\n  {disease_name.upper()}")
-    print("  " + "-"*60)
+for disease_name, info in disease_dfs.items():
+    print(f"\n  Processing {disease_name.upper()}...")
+    df = info['data']
+    pgs_cols = info['pgs_cols']
     
-    df = disease_info['data']
-    pgs_cols = disease_info['pgs_cols']
-    
-    # Split by ancestry
-    df_eur = df[df['ancestry'] == 'eur'].copy()
-    df_all = df.copy()
-    
-    for dataset_name, dataset in [('EUR', df_eur), ('ALL', df_all)]:
-        print(f"    {dataset_name}: n={len(dataset):,}, cases={dataset['case'].sum():,}")
-        
-        # Standardize PGS scores using this dataset
-        pgs_means = {}
-        pgs_stds = {}
-        for pgs_col in pgs_cols:
-            pgs_means[pgs_col] = dataset[pgs_col].mean()
-            pgs_stds[pgs_col] = dataset[pgs_col].std()
-            dataset[f'{pgs_col}_std'] = (dataset[pgs_col] - pgs_means[pgs_col]) / pgs_stds[pgs_col]
-        
-        pgs_std_cols = [f'{col}_std' for col in pgs_cols]
-        
-        # Train baseline model (age + age² + sex)
-        X_base = sm.add_constant(dataset[['age', 'age_sq', 'sex_binary']])
-        y = dataset['case']
-        model_base = sm.Logit(y, X_base).fit(disp=0)
-        
-        # Train full model (baseline + PGS)
-        X_full = sm.add_constant(dataset[['age', 'age_sq', 'sex_binary'] + pgs_std_cols])
-        model_full = sm.Logit(y, X_full).fit(disp=0)
-        
-        # Store results
-        results.append({
-            'disease': disease_name,
-            'dataset': dataset_name,
-            'model_type': 'baseline',
-            'model': model_base,
-            'pgs_means': pgs_means,
-            'pgs_stds': pgs_stds,
-            'pgs_cols': pgs_cols,
-            'train_n': len(dataset),
-            'train_cases': int(dataset['case'].sum())
-        })
-        
-        results.append({
-            'disease': disease_name,
-            'dataset': dataset_name,
-            'model_type': 'full',
-            'model': model_full,
-            'pgs_means': pgs_means,
-            'pgs_stds': pgs_stds,
-            'pgs_cols': pgs_cols,
-            'train_n': len(dataset),
-            'train_cases': int(dataset['case'].sum())
-        })
+    # Use only European ancestry for consistent risk modeling
+    df_eur = df[df['ancestry'] == 'eur'].reset_index(drop=True)
+    if len(df_eur) < 100:
+        print("    Skipping: Not enough EUR samples")
+        continue
 
-print(f"\n  Trained {len(results)} models total")
+    # --- PART A: 5-FOLD CROSS-VALIDATION (Metric Estimation) ---
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_aucs_base = []
+    fold_aucs_full = []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df_eur, df_eur['case'])):
+        train_set = df_eur.iloc[train_idx].copy()
+        val_set = df_eur.iloc[val_idx].copy()
+        
+        # Standardize based on TRAIN fold only
+        fold_means = train_set[pgs_cols].mean()
+        fold_stds = train_set[pgs_cols].std()
+        
+        train_pgs_std = (train_set[pgs_cols] - fold_means) / fold_stds
+        val_pgs_std = (val_set[pgs_cols] - fold_means) / fold_stds
+        
+        # Baseline (Age + Sex)
+        X_train_base = sm.add_constant(train_set[['age', 'age_sq', 'sex_binary']])
+        X_val_base = sm.add_constant(val_set[['age', 'age_sq', 'sex_binary']], has_constant='add')
+        m_base = sm.Logit(train_set['case'], X_train_base).fit(disp=0)
+        p_base = m_base.predict(X_val_base)
+        
+        # Full (Age + Sex + PGS)
+        X_train_full = pd.concat([X_train_base, train_pgs_std.add_suffix('_std')], axis=1)
+        X_val_full = pd.concat([X_val_base, val_pgs_std.add_suffix('_std')], axis=1)
+        m_full = sm.Logit(train_set['case'], X_train_full).fit(disp=0)
+        p_full = m_full.predict(X_val_full)
+        
+        if val_set['case'].sum() > 0:
+            fold_aucs_base.append(roc_auc_score(val_set['case'], p_base))
+            fold_aucs_full.append(roc_auc_score(val_set['case'], p_full))
+
+    # --- PART B: FINAL MODEL TRAINING (On ALL EUR Data) ---
+    # Standardize on FULL dataset
+    final_means = df_eur[pgs_cols].mean()
+    final_stds = df_eur[pgs_cols].std()
+    
+    df_eur_std = df_eur.copy()
+    for col in pgs_cols:
+        df_eur_std[f'{col}_std'] = (df_eur[col] - final_means[col]) / final_stds[col]
+    
+    std_cols = [f'{c}_std' for c in pgs_cols]
+    
+    # Train Baseline
+    X_base = sm.add_constant(df_eur_std[['age', 'age_sq', 'sex_binary']])
+    model_base = sm.Logit(df_eur_std['case'], X_base).fit(disp=0)
+    
+    # Train Full
+    X_full = sm.add_constant(df_eur_std[['age', 'age_sq', 'sex_binary'] + std_cols])
+    model_full = sm.Logit(df_eur_std['case'], X_full).fit(disp=0)
+    
+    # Store everything needed for plotting and manual calc
+    final_models.append({
+        'disease': disease_name,
+        'model_full': model_full,
+        'model_base': model_base,
+        'means': final_means,
+        'stds': final_stds,
+        'pgs_cols': pgs_cols,
+        'data': df_eur,
+        'std_cols': std_cols
+    })
+    
+    eval_metrics.append({
+        'disease': disease_name,
+        'n': len(df_eur),
+        'cases': df_eur['case'].sum(),
+        'cv_auc_base': np.mean(fold_aucs_base),
+        'cv_auc_full': np.mean(fold_aucs_full)
+    })
 
 # ============================================================================
-# EVALUATE MODELS ON EACH ANCESTRY
+# METRICS REPORT
 # ============================================================================
 
-print("\n[5/7] Evaluating models on each ancestry...")
-
-eval_results = []
-
-for result in results:
-    disease_name = result['disease']
-    dataset_name = result['dataset']
-    model_type = result['model_type']
-    model = result['model']
-    pgs_means = result['pgs_means']
-    pgs_stds = result['pgs_stds']
-    pgs_cols = result['pgs_cols']
-    
-    df = disease_dfs[disease_name]['data']
-    
-    # Evaluate on each ancestry
-    for ancestry in ['eur', 'afr', 'amr', 'eas', 'sas']:
-        df_anc = df[df['ancestry'] == ancestry].copy()
-        
-        if len(df_anc) < 10 or df_anc['case'].sum() < 2:
-            continue
-        
-        # Standardize PGS using training parameters
-        for pgs_col in pgs_cols:
-            df_anc[f'{pgs_col}_std'] = (df_anc[pgs_col] - pgs_means[pgs_col]) / pgs_stds[pgs_col]
-        
-        pgs_std_cols = [f'{col}_std' for col in pgs_cols]
-        
-        # Prepare features
-        if model_type == 'baseline':
-            X_eval = sm.add_constant(df_anc[['age', 'age_sq', 'sex_binary']])
-        else:
-            X_eval = sm.add_constant(df_anc[['age', 'age_sq', 'sex_binary'] + pgs_std_cols])
-        
-        # Predict
-        y_true = df_anc['case']
-        y_pred = model.predict(X_eval)
-        
-        # Calculate metrics
-        if y_true.sum() > 0 and y_true.sum() < len(y_true):
-            auc = roc_auc_score(y_true, y_pred)
-        else:
-            auc = np.nan
-        
-        # Calculate OR per SD for PGS (only for full models)
-        ors_per_sd = {}
-        if model_type == 'full':
-            for pgs_std_col in pgs_std_cols:
-                if pgs_std_col in model.params:
-                    beta = model.params[pgs_std_col]
-                    or_per_sd = np.exp(beta)
-                    ors_per_sd[pgs_std_col] = or_per_sd
-        
-        eval_results.append({
-            'disease': disease_name,
-            'train_dataset': dataset_name,
-            'model_type': model_type,
-            'eval_ancestry': ancestry,
-            'n': len(df_anc),
-            'cases': int(y_true.sum()),
-            'prevalence': y_true.mean(),
-            'auc': auc,
-            'ors_per_sd': ors_per_sd
-        })
-
-eval_df = pd.DataFrame(eval_results)
+print("\n[5/7] 5-Fold Cross-Validation Results (Robust AUC)")
+print("-" * 80)
+print(f"{'DISEASE':<15} {'N':>8} {'CASES':>6} {'BASE AUC':>10} {'FULL AUC':>10} {'GAIN':>8}")
+print("-" * 80)
+for m in eval_metrics:
+    gain = m['cv_auc_full'] - m['cv_auc_base']
+    print(f"{m['disease']:<15} {m['n']:8,} {m['cases']:6,} {m['cv_auc_base']:10.4f} {m['cv_auc_full']:10.4f} {gain:+8.4f}")
 
 # ============================================================================
-# PRINT COMPREHENSIVE STATISTICS
+# PLOTTING: DECILES AND AGE CURVES
 # ============================================================================
 
-print("\n[6/7] Model performance summary...")
-print("="*80)
+print("\n[6/7] Generating Plots...")
+# 2 plots per disease: 1. PGS Decile Bar, 2. Age-Risk Curves
+n_dis = len(final_models)
+fig, axes = plt.subplots(n_dis, 2, figsize=(15, 6 * n_dis))
+if n_dis == 1: axes = axes.reshape(1, -1)
 
-for disease_name in disease_dfs.keys():
-    print(f"\n{disease_name.upper()}")
-    print("-"*80)
+for idx, res in enumerate(final_models):
+    disease = res['disease']
+    df = res['data'].copy()
+    pgs_cols = res['pgs_cols']
     
-    disease_evals = eval_df[eval_df['disease'] == disease_name]
+    # --- PLOT 1: PGS DECILE vs PREVALENCE ---
+    # Create a composite PGS Score using the coefficients from the model
+    # LogOdds = Intercept + Age... + (Beta1 * PGS1_std) + (Beta2 * PGS2_std)
+    # We isolate just the genetic part: GeneticScore = Sum(Beta_i * PGS_i_std)
     
-    for dataset_name in ['EUR', 'ALL']:
-        for model_type in ['baseline', 'full']:
-            print(f"\n  {dataset_name} {model_type.upper()} MODEL:")
+    weights = res['model_full'].params
+    df['genetic_component'] = 0
+    for col, std_col in zip(pgs_cols, res['std_cols']):
+        if std_col in weights:
+            # Re-standardize here just to be safe
+            val_std = (df[col] - res['means'][col]) / res['stds'][col]
+            df['genetic_component'] += val_std * weights[std_col]
             
-            subset = disease_evals[
-                (disease_evals['train_dataset'] == dataset_name) & 
-                (disease_evals['model_type'] == model_type)
-            ]
-            
-            for _, row in subset.iterrows():
-                anc = row['eval_ancestry'].upper()
-                n = row['n']
-                cases = row['cases']
-                prev = row['prevalence']
-                auc = row['auc']
-                
-                print(f"    {anc:4s}: n={n:7,} cases={cases:6,} ({100*prev:5.2f}%) AUC={auc:.4f}")
-                
-                if model_type == 'full' and row['ors_per_sd']:
-                    for pgs, or_val in row['ors_per_sd'].items():
-                        print(f"          {pgs}: OR/SD={or_val:.4f}")
-
-# Print model coefficients
-print("\n" + "="*80)
-print("MODEL COEFFICIENTS")
-print("="*80)
-
-for result in results:
-    disease = result['disease']
-    dataset = result['dataset']
-    model_type = result['model_type']
-    model = result['model']
+    df['pgs_decile'] = pd.qcut(df['genetic_component'], 10, labels=False) + 1
     
-    print(f"\n{disease.upper()} - {dataset} {model_type.upper()}")
-    print("-"*60)
+    decile_stats = df.groupby('pgs_decile')['case'].mean() * 100 # Prevalence %
     
-    for param, coef in model.params.items():
-        pval = model.pvalues[param]
-        print(f"  {param:20s}: β={coef:12.6f}  p={pval:.2e}  OR={np.exp(coef):.4f}")
-
-# ============================================================================
-# CREATE DECILE RISK PLOTS FOR EUR MODELS
-# ============================================================================
-
-print("\n[7/7] Creating decile risk plots for EUR models...")
-
-n_diseases = len(disease_dfs)
-fig, axes = plt.subplots(n_diseases, 2, figsize=(14, 4*n_diseases))
-if n_diseases == 1:
-    axes = axes.reshape(1, -1)
-
-for idx, (disease_name, disease_info) in enumerate(disease_dfs.items()):
-    df = disease_info['data']
-    pgs_cols = disease_info['pgs_cols']
+    ax1 = axes[idx, 0]
+    bars = ax1.bar(decile_stats.index, decile_stats.values, color='teal', alpha=0.7)
+    ax1.set_xlabel('Polygenic Score Decile (Low -> High)')
+    ax1.set_ylabel('Observed Prevalence (%)')
+    ax1.set_title(f'{disease.upper()}: Disease Rate by Genetic Risk')
+    ax1.set_xticks(range(1, 11))
+    ax1.grid(axis='y', alpha=0.3)
     
-    df_eur = df[df['ancestry'] == 'eur'].copy()
+    # --- PLOT 2: ABSOLUTE RISK OVER AGE ---
+    ax2 = axes[idx, 1]
     
-    # Get EUR models
-    baseline_result = [r for r in results if r['disease']==disease_name and r['dataset']=='EUR' and r['model_type']=='baseline'][0]
-    full_result = [r for r in results if r['disease']==disease_name and r['dataset']=='EUR' and r['model_type']=='full'][0]
+    # Create synthetic data for ages 40 to 90
+    ages = np.arange(40, 91, 1)
     
-    for col_idx, (model_result, model_name) in enumerate([(baseline_result, 'Baseline'), (full_result, 'Full')]):
-        model = model_result['model']
-        pgs_means = model_result['pgs_means']
-        pgs_stds = model_result['pgs_stds']
-        
-        # Standardize PGS
-        for pgs_col in pgs_cols:
-            df_eur[f'{pgs_col}_std'] = (df_eur[pgs_col] - pgs_means[pgs_col]) / pgs_stds[pgs_col]
-        
-        pgs_std_cols = [f'{col}_std' for col in pgs_cols]
-        
-        # Predict
-        if model_name == 'Baseline':
-            X = sm.add_constant(df_eur[['age', 'age_sq', 'sex_binary']])
-        else:
-            X = sm.add_constant(df_eur[['age', 'age_sq', 'sex_binary'] + pgs_std_cols])
-        
-        df_eur['risk'] = model.predict(X)
-        
-        # Create deciles
-        df_eur['decile'] = pd.qcut(df_eur['risk'], 10, labels=False, duplicates='drop') + 1
-        
-        # Calculate risk per decile
-        decile_stats = df_eur.groupby('decile').agg({
-            'case': ['sum', 'count', 'mean']
-        }).reset_index()
-        decile_stats.columns = ['decile', 'cases', 'n', 'risk']
-        
-        # Plot
-        ax = axes[idx, col_idx]
-        ax.plot(decile_stats['decile'], decile_stats['risk']*100, 'o-', linewidth=2, markersize=8)
-        ax.set_xlabel('Risk decile')
-        ax.set_ylabel('Disease prevalence (%)')
-        ax.set_title(f'{disease_name.upper()} - EUR {model_name}')
-        ax.grid(alpha=0.3)
-        ax.set_xticks(range(1, 11))
+    # Determine reference sex (Majority sex in cases)
+    pct_male_cases = df[df['case']==1]['sex_binary'].mean()
+    ref_sex = 1 if pct_male_cases > 0.5 else 0
+    sex_label = "Males" if ref_sex == 1 else "Females"
+    
+    # Determine genetic levels (10th, 50th, 90th percentile of the genetic component)
+    gen_low = df['genetic_component'].quantile(0.10)
+    gen_mid = df['genetic_component'].quantile(0.50)
+    gen_high = df['genetic_component'].quantile(0.90)
+    
+    # Function to calculate probability
+    def get_prob(age_arr, gen_score):
+        # LogOdds = Intercept + B_age*Age + B_age2*Age^2 + B_sex*Sex + GenScore
+        lp = (weights['const'] + 
+              weights['age'] * age_arr + 
+              weights['age_sq'] * (age_arr**2) + 
+              weights['sex_binary'] * ref_sex + 
+              gen_score)
+        return 1 / (1 + np.exp(-lp))
+    
+    prob_low = get_prob(ages, gen_low) * 100
+    prob_mid = get_prob(ages, gen_mid) * 100
+    prob_high = get_prob(ages, gen_high) * 100
+    
+    ax2.plot(ages, prob_low, label='Low Risk (Bottom 10%)', color='green', linestyle='--')
+    ax2.plot(ages, prob_mid, label='Average Risk', color='gray')
+    ax2.plot(ages, prob_high, label='High Risk (Top 10%)', color='red', linewidth=2)
+    
+    ax2.set_xlabel('Age (years)')
+    ax2.set_ylabel('Predicted Absolute Risk (%)')
+    ax2.set_title(f'{disease.upper()}: Risk over Age ({sex_label})')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('../../disease_risk_deciles.png', dpi=150, bbox_inches='tight')
+plt.savefig('../../disease_risk_summary.png', dpi=150)
 plt.show()
 
-print("\n" + "="*80)
-print("ANALYSIS COMPLETE")
+# ============================================================================
+# FINAL OUTPUT: COEFFICIENTS AND MANUAL CALCULATOR
+# ============================================================================
+
+print("\n[7/7] FINAL MODEL PARAMETERS (FOR MANUAL CALCULATION)")
 print("="*80)
-print(f"Trained and evaluated {len(results)} models across {len(disease_dfs)} diseases")
-print(f"Results saved to: ../../disease_risk_deciles.png")
+print("INSTRUCTIONS FOR MANUAL CALCULATION:")
+print("1. Get your RAW Polygenic Score(s).")
+print("2. STANDARDIZE each score: (Raw - Mean) / StdDev")
+print("3. CALCULATE Log-Odds (L): Intercept + (Age*Coeff) + (Age^2*Coeff) + (Sex*Coeff) + (StdPGS*Coeff)")
+print("   * Note: Age^2 is Age squared. Sex is 1 for Male, 0 for Female.")
+print("4. CALCULATE Risk Probability: 1 / (1 + exp(-L))")
+print("="*80)
+
+for res in final_models:
+    d = res['disease'].upper()
+    print(f"\nDISEASE: {d}")
+    print("-" * 60)
+    
+    # 1. Print Standardization Params
+    print("STANDARDIZATION PARAMETERS (Use these first):")
+    for col in res['pgs_cols']:
+        m = res['means'][col]
+        s = res['stds'][col]
+        print(f"  {col}:")
+        print(f"    Mean (μ)   = {m:.6f}")
+        print(f"    StdDev (σ) = {s:.6f}")
+    
+    # 2. Print Regression Coefficients
+    print("\nMODEL COEFFICIENTS (Use these second):")
+    params = res['model_full'].params
+    for name, val in params.items():
+        print(f"  {name:20s}: {val:12.6f}")
+        
+    print("-" * 60)
 ```
 
