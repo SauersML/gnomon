@@ -18,6 +18,10 @@ use gnomon::calibrate::model::BasisConfig;
 use gnomon::calibrate::model::SurvivalModelConfig;
 #[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalPrediction;
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::model::SurvivalRiskType;
+#[cfg(feature = "survival-data")]
+use gnomon::calibrate::model::SurvivalTimeVaryingConfig;
 use gnomon::calibrate::model::{
     InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
 };
@@ -292,6 +296,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 guard_delta: args.survival_guard_delta,
                 monotonic_grid_size: args.survival_monotonic_grid,
                 time_varying,
+                model_competing_risk: false,
             };
 
             let config = ModelConfig {
@@ -410,7 +415,7 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                     data.pgs.view(),
                     data.sex.view(),
                     data.pcs.view(),
-                    None,
+                    SurvivalRiskType::Net,
                     Some(&model.survival_companions),
                 )?;
 
@@ -430,7 +435,6 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
                         data.pgs.view(),
                         data.sex.view(),
                         data.pcs.view(),
-                        None,
                         Some(&model.survival_companions),
                     ) {
                         Ok(calibrated) => Some(calibrated),

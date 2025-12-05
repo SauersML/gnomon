@@ -142,7 +142,6 @@ fn configure_linker_for_low_memory() {
     match detect_total_memory_bytes() {
         Some(total) if total < TEN_GIB => {
             println!("cargo:rustc-link-arg=-Wl,--no-keep-memory");
-            println!("cargo:rustc-link-arg=-Wl,--reduce-memory-overheads");
             configure_rustc_parallelism_for_low_memory(total);
             if warnings_enabled() {
                 println!(
