@@ -8,11 +8,9 @@ use crate::calibrate::faer_ndarray::FaerColView;
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
-// no penalty root helpers needed directly here
 
 use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
-// no direct ndarray-linalg imports needed here
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::matmul::matmul;
