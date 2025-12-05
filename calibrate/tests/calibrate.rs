@@ -69,7 +69,7 @@ fn logit_risk_calibration_improves_log_loss() {
     assert_eq!(se.len(), predictions.len());
 
     let features_matrix =
-        survival_calibrator_features(&predictions, &design, Some(&factor), None).unwrap();
+        survival_calibrator_features(&predictions, &design, Some(&factor)).unwrap();
 
     let features = CalibratorFeatures {
         pred: features_matrix.column(0).to_owned(),
