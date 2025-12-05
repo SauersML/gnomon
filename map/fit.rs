@@ -875,6 +875,11 @@ fn standardize_column_simd(values: &mut [f64], mean: f64, inv: f64) {
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -894,6 +899,11 @@ fn standardize_column_simd_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 /// # Safety
@@ -963,6 +973,11 @@ fn standardize_column_with_mask_simd(values: &mut [f64], mask: &mut [f64], mean:
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[inline(always)]
 fn standardize_column_with_mask_simd_lanes4(
     values: &mut [f64],
@@ -986,6 +1001,11 @@ fn standardize_column_with_mask_simd_lanes4(
     }
 }
 
+#[cfg(any(
+    target_feature = "avx",
+    target_arch = "aarch64",
+    target_arch = "wasm32"
+))]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 /// # Safety
@@ -1043,7 +1063,7 @@ fn standardize_column_with_mask_simd_impl<const LANES: usize>(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[inline(always)]
 fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
     match detected_simd_lane_selection() {
@@ -1059,7 +1079,7 @@ fn standardize_column_simd_full(values: &mut [f64], mean: f64, inv: f64) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[inline(always)]
 fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1078,6 +1098,7 @@ fn standardize_column_simd_full_lanes4(values: &mut [f64], mean: f64, inv: f64) 
     }
 }
 
+#[cfg(test)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 /// # Safety
@@ -1087,7 +1108,7 @@ unsafe fn standardize_column_simd_full_avx(values: &mut [f64], mean: f64, inv: f
     standardize_column_simd_full_impl::<4>(values, mean, inv);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[inline(always)]
 fn standardize_column_simd_full_impl<const LANES: usize>(values: &mut [f64], mean: f64, inv: f64)
 where

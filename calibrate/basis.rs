@@ -1576,3 +1576,57 @@ mod tests {
         }
     }
 }
+
+/// Scratch memory for B-spline evaluation to avoid allocations in tight loops.
+pub struct SplineScratch {
+    inner: internal::BsplineScratch,
+}
+
+impl SplineScratch {
+    pub fn new(degree: usize) -> Self {
+        Self {
+            inner: internal::BsplineScratch::new(degree),
+        }
+    }
+}
+
+/// Evaluates B-spline basis functions at a single scalar point `x` into a provided buffer.
+///
+/// This is a non-allocating alternative to `create_bspline_basis_with_knots` for scalar inputs.
+pub fn evaluate_bspline_basis_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    scratch: &mut SplineScratch,
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        // For performance in this hot path, we could panic or return error.
+        // Since BasisError doesn't have a DimensionMismatch for this specific case, reusing a generic one or just Linalg.
+        // Let's panic for now as this is a logic error in the caller.
+        panic!("Output buffer length {} does not match number of basis functions {}", out.len(), num_basis);
+    }
+
+    internal::evaluate_splines_at_point_into(
+        x,
+        degree,
+        knot_vector,
+        out,
+        &mut scratch.inner,
+    );
+
+    Ok(())
+}
