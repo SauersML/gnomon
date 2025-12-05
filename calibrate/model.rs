@@ -105,6 +105,17 @@ pub struct SurvivalModelConfig {
     pub monotonic_grid_size: usize,
     #[serde(default)]
     pub time_varying: Option<SurvivalTimeVaryingConfig>,
+    #[serde(default)]
+    pub model_competing_risk: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurvivalRiskType {
+    /// Hypothetical risk assuming no competing death (Net Risk).
+    Net,
+    /// Actuarial risk accounting for probability of death (Crude Risk).
+    /// Requires `model_competing_risk = true` during training.
+    Crude,
 }
 
 /// Holds the transformation matrix for a sum-to-zero constraint.
@@ -780,7 +791,7 @@ impl TrainedModel {
         p_new: ArrayView1<f64>,
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
-        cif_competing_entry: Option<ArrayView1<f64>>,
+        risk_type: SurvivalRiskType,
         companion_registry: Option<&HashMap<String, SurvivalModelArtifacts>>,
     ) -> Result<SurvivalPrediction, ModelError> {
         if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
@@ -805,30 +816,22 @@ impl TrainedModel {
 
         let artifacts = self.survival_artifacts()?;
         let covariates = self.assemble_survival_covariates(p_new, sex_new, pcs_new, artifacts)?;
-        let cif_competing_owned = cif_competing_entry.map(|vals| vals.to_owned());
-        if let Some(ref cif) = cif_competing_owned {
-            if cif.len() != n {
-                return Err(ModelError::DimensionMismatch(format!(
-                    "cif_competing_entry has {} elements but age_entry has {}",
-                    cif.len(),
-                    n
-                )));
-            }
-        }
 
         let registry = companion_registry.unwrap_or(&self.survival_companions);
-        let resolved_companions: Vec<(&survival::CompanionModelHandle, &SurvivalModelArtifacts)> =
-            if cif_competing_owned.is_none() && !artifacts.companion_models.is_empty() {
-                let mut resolved = Vec::with_capacity(artifacts.companion_models.len());
-                for handle in &artifacts.companion_models {
-                    let (resolved_handle, companion) =
-                        survival::resolve_companion_model(artifacts, &handle.reference, registry)?;
-                    resolved.push((resolved_handle, companion));
-                }
-                resolved
+
+        let mortality_model = if let SurvivalRiskType::Crude = risk_type {
+            if let Some(model) = registry.get("__internal_mortality") {
+                Some(model)
             } else {
-                Vec::new()
-            };
+                return Err(ModelError::SurvivalPrediction(
+                    SurvivalError::CompanionModelUnavailable {
+                        reference: "__internal_mortality".to_string(),
+                    },
+                ));
+            }
+        } else {
+            None
+        };
 
         let coeffs = &artifacts.coefficients;
         let design_width = coeffs.len();
@@ -844,42 +847,6 @@ impl TrainedModel {
             let cov_row = covariates.row(i).to_owned();
             let entry_age = age_entry[i];
             let exit_age = age_exit[i];
-            let explicit_competing = cif_competing_owned.as_ref().map(|arr| arr[i]);
-            let cif_competing = if let Some(value) = explicit_competing {
-                survival::competing_cif_value(entry_age, &cov_row, Some(value), None)?
-            } else if resolved_companions.is_empty() {
-                0.0
-            } else {
-                let mut candidate: Option<f64> = None;
-                let mut last_horizon_error: Option<SurvivalError> = None;
-                for &(handle, companion) in &resolved_companions {
-                    match survival::competing_cif_value(
-                        entry_age,
-                        &cov_row,
-                        None,
-                        Some((handle, companion)),
-                    ) {
-                        Ok(value) => {
-                            candidate = Some(value);
-                            break;
-                        }
-                        Err(err @ SurvivalError::CompanionModelMissingHorizon { .. }) => {
-                            last_horizon_error = Some(err);
-                        }
-                        Err(err) => return Err(err.into()),
-                    }
-                }
-
-                match candidate {
-                    Some(value) => value,
-                    None => {
-                        if let Some(err) = last_horizon_error {
-                            return Err(err.into());
-                        }
-                        return Err(SurvivalError::MissingCompanionCifData.into());
-                    }
-                }
-            };
 
             let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row, artifacts)?;
             let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row, artifacts)?;
@@ -891,14 +858,26 @@ impl TrainedModel {
             cif_entry[i] = cif_entry_val;
             cif_exit[i] = cif_exit_val;
 
-            let risk_val = survival::conditional_absolute_risk(
-                entry_age,
-                exit_age,
-                &cov_row,
-                Some(cif_competing),
-                None,
-                artifacts,
-            )?;
+            let risk_val = match risk_type {
+                SurvivalRiskType::Net => survival::conditional_absolute_risk(
+                    entry_age,
+                    exit_age,
+                    &cov_row,
+                    Some(0.0),
+                    None,
+                    artifacts,
+                )?,
+                SurvivalRiskType::Crude => {
+                    let mortality = mortality_model.expect("checked above");
+                    survival::calculate_crude_risk_quadrature(
+                        entry_age,
+                        exit_age,
+                        &cov_row,
+                        artifacts,
+                        mortality,
+                    )?
+                }
+            };
             conditional_risk[i] = risk_val;
 
             let design_entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
@@ -918,6 +897,7 @@ impl TrainedModel {
             let f_entry = 1.0 - exp_neg_entry;
             let f_exit = 1.0 - exp_neg_exit;
             let delta_raw = f_exit - f_entry;
+            let cif_competing = 0.0;
             let denom_raw = 1.0 - f_entry - cif_competing;
             let delta = delta_raw.max(0.0);
             let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
@@ -973,7 +953,6 @@ impl TrainedModel {
         p_new: ArrayView1<f64>,
         sex_new: ArrayView1<f64>,
         pcs_new: ArrayView2<f64>,
-        cif_competing_entry: Option<ArrayView1<f64>>,
         companion_registry: Option<&HashMap<String, SurvivalModelArtifacts>>,
     ) -> Result<Array1<f64>, ModelError> {
         if !matches!(self.config.model_family, ModelFamily::Survival(_)) {
@@ -992,7 +971,7 @@ impl TrainedModel {
             p_new,
             sex_new,
             pcs_new,
-            cif_competing_entry,
+            SurvivalRiskType::Net,
             companion_registry,
         )?;
         artifacts
@@ -1910,6 +1889,7 @@ mod tests {
                 guard_delta: 0.1,
                 monotonic_grid_size: 4,
                 time_varying: None,
+                model_competing_risk: false,
             }),
         };
 
@@ -1932,8 +1912,7 @@ mod tests {
                 data.pgs.view(),
                 data.sex.view(),
                 data.pcs.view(),
-                None,
-                None,
+                SurvivalRiskType::Net,
             )
             .expect("survival prediction succeeded");
 
