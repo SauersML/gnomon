@@ -41,7 +41,7 @@ dwldutil = { version = "3.1.1", features = ["indicatif_indicator"] }
 indicatif = "0.18"
 google-cloud-storage = "1.1.0"
 google-cloud-auth = "1.0.1"
-flate2 = "1.1.4"
+flate2 = "=1.1.5"
 ndarray = { version = "0.16.1", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"

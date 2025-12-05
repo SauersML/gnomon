@@ -858,28 +858,6 @@ impl TrainedModel {
             cif_entry[i] = cif_entry_val;
             cif_exit[i] = cif_exit_val;
 
-            let risk_val = match risk_type {
-                SurvivalRiskType::Net => survival::conditional_absolute_risk(
-                    entry_age,
-                    exit_age,
-                    &cov_row,
-                    Some(0.0),
-                    None,
-                    artifacts,
-                )?,
-                SurvivalRiskType::Crude => {
-                    let mortality = mortality_model.expect("checked above");
-                    survival::calculate_crude_risk_quadrature(
-                        entry_age,
-                        exit_age,
-                        &cov_row,
-                        artifacts,
-                        mortality,
-                    )?
-                }
-            };
-            conditional_risk[i] = risk_val;
-
             let design_entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
             let design_exit = survival::design_row_at_age(exit_age, cov_row.view(), artifacts)?;
             if design_entry.len() != design_width || design_exit.len() != design_width {
@@ -888,43 +866,65 @@ impl TrainedModel {
                 ));
             }
 
-            let eta_entry = design_entry.dot(coeffs);
-            let eta_exit = design_exit.dot(coeffs);
-            let h_entry = eta_entry.exp();
-            let h_exit = eta_exit.exp();
-            let exp_neg_entry = (-h_entry).exp();
-            let exp_neg_exit = (-h_exit).exp();
-            let f_entry = 1.0 - exp_neg_entry;
-            let f_exit = 1.0 - exp_neg_exit;
-            let delta_raw = f_exit - f_entry;
-            let cif_competing = 0.0;
-            let denom_raw = 1.0 - f_entry - cif_competing;
-            let delta = delta_raw.max(0.0);
-            let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
+            let (risk_val, mut grad_row) = match risk_type {
+                SurvivalRiskType::Net => {
+                    let risk = survival::conditional_absolute_risk(
+                        entry_age,
+                        exit_age,
+                        &cov_row,
+                        Some(0.0),
+                        None,
+                        artifacts,
+                    )?;
 
-            let d_f_entry = h_entry * exp_neg_entry;
-            let d_f_exit = h_exit * exp_neg_exit;
-            let dr_deta_exit = if delta_raw > 0.0 {
-                d_f_exit / denom
-            } else {
-                0.0
-            };
-            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
-            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
-            let dden = -d_f_entry;
-            let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
-                (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
-            } else {
-                0.0
-            };
+                    let eta_entry = design_entry.dot(coeffs);
+                    let eta_exit = design_exit.dot(coeffs);
+                    let h_entry = eta_entry.exp();
+                    let h_exit = eta_exit.exp();
+                    let exp_neg_entry = (-h_entry).exp();
+                    let exp_neg_exit = (-h_exit).exp();
+                    let f_entry = 1.0 - exp_neg_entry;
+                    let f_exit = 1.0 - exp_neg_exit;
+                    let delta_raw = f_exit - f_entry;
+                    let denom_raw = 1.0 - f_entry;
+                    let delta = delta_raw.max(0.0);
+                    let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
 
+                    let d_f_entry = h_entry * exp_neg_entry;
+                    let d_f_exit = h_exit * exp_neg_exit;
+                    let dr_deta_exit = if delta_raw > 0.0 {
+                        d_f_exit / denom
+                    } else {
+                        0.0
+                    };
+                    let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                    let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                    let dden = -d_f_entry;
+                    let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+                        (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+                    } else {
+                        0.0
+                    };
+
+                    let grad_exit = design_exit.mapv(|v| v * dr_deta_exit);
+                    let grad_entry = design_entry.mapv(|v| v * dr_deta_entry);
+                    let grad = grad_exit + grad_entry;
+
+                    (risk, grad)
+                }
+                SurvivalRiskType::Crude => {
+                    let mortality = mortality_model.expect("checked above");
+                    survival::calculate_crude_risk_quadrature(
+                        entry_age, exit_age, &cov_row, artifacts, mortality,
+                    )?
+                }
+            };
+            conditional_risk[i] = risk_val;
             let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
             logit_risk[i] = (risk_clamped / (1.0 - risk_clamped)).ln();
             let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
 
-            let grad_exit = design_exit.mapv(|v| v * dr_deta_exit * logistic_scale);
-            let grad_entry = design_entry.mapv(|v| v * dr_deta_entry * logistic_scale);
-            let grad_row = grad_exit + grad_entry;
+            grad_row.mapv_inplace(|v| v * logistic_scale);
             gradient.row_mut(i).assign(&grad_row);
         }
 
@@ -975,10 +975,7 @@ impl TrainedModel {
             companion_registry,
         )?;
         artifacts
-            .apply_logit_risk_calibrator(
-                &baseline.conditional_risk,
-                &baseline.logit_risk_design,
-            )
+            .apply_logit_risk_calibrator(&baseline.conditional_risk, &baseline.logit_risk_design)
             .map_err(ModelError::from)
     }
 

@@ -1,6 +1,6 @@
 use crate::calibrate::basis::{
-    BasisError, create_bspline_basis_with_knots, create_difference_penalty_matrix,
-    null_range_whiten, evaluate_bspline_basis_scalar, SplineScratch
+    BasisError, SplineScratch, create_bspline_basis_with_knots, create_difference_penalty_matrix,
+    evaluate_bspline_basis_scalar, null_range_whiten,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
@@ -670,7 +670,7 @@ fn evaluate_basis_and_derivative_scalar_into(
         descriptor.knot_vector.view(),
         descriptor.degree,
         out_basis,
-        spline_scratch
+        spline_scratch,
     )?;
 
     let eps = 1e-6;
@@ -679,7 +679,7 @@ fn evaluate_basis_and_derivative_scalar_into(
         descriptor.knot_vector.view(),
         descriptor.degree,
         plus_buff,
-        spline_scratch
+        spline_scratch,
     )?;
 
     evaluate_bspline_basis_scalar(
@@ -687,7 +687,7 @@ fn evaluate_basis_and_derivative_scalar_into(
         descriptor.knot_vector.view(),
         descriptor.degree,
         minus_buff,
-        spline_scratch
+        spline_scratch,
     )?;
 
     for i in 0..num_basis {
@@ -1819,7 +1819,7 @@ fn design_and_derivative_at_age(
         artifacts,
         &mut design,
         &mut design_deriv,
-        &mut scratch
+        &mut scratch,
     )?;
 
     Ok((design, design_deriv))
@@ -1850,7 +1850,12 @@ fn design_and_derivative_at_age_scratch(
 
     // Resize scratch if needed (unlikely given initialization)
     if scratch.basis_raw.len() < k {
-        return Err(SurvivalError::Basis(BasisError::ConstraintMatrixRowMismatch { basis_rows: k, constraint_rows: scratch.basis_raw.len() }));
+        return Err(SurvivalError::Basis(
+            BasisError::ConstraintMatrixRowMismatch {
+                basis_rows: k,
+                constraint_rows: scratch.basis_raw.len(),
+            },
+        ));
     }
 
     let basis_raw_buff = &mut scratch.basis_raw[..k];
@@ -1865,16 +1870,24 @@ fn design_and_derivative_at_age_scratch(
         deriv_raw_buff,
         &mut scratch.spline_scratch,
         plus_buff,
-        minus_buff
+        minus_buff,
     )?;
 
     // 2. Constrain
     // constrained = basis . transform (1 x k . k x k-1 -> 1 x k-1)
     let constrained_basis_buff = &mut scratch.constrained_basis[..k_minus_1];
-    vec_mat_mul_into(basis_raw_buff, &artifacts.reference_constraint.transform, constrained_basis_buff);
+    vec_mat_mul_into(
+        basis_raw_buff,
+        &artifacts.reference_constraint.transform,
+        constrained_basis_buff,
+    );
 
     let constrained_deriv_buff = &mut scratch.constrained_derivative[..k_minus_1];
-    vec_mat_mul_into(deriv_raw_buff, &artifacts.reference_constraint.transform, constrained_deriv_buff);
+    vec_mat_mul_into(
+        deriv_raw_buff,
+        &artifacts.reference_constraint.transform,
+        constrained_deriv_buff,
+    );
 
     let baseline_cols = k_minus_1;
     let static_cols = expected_covs;
@@ -1903,13 +1916,13 @@ fn design_and_derivative_at_age_scratch(
     // 2. Time-Varying
     let time_cols = total_cols - baseline_cols - static_cols;
     if time_cols > 0 {
-         let time_basis = artifacts
+        let time_basis = artifacts
             .time_varying_basis
             .as_ref()
             .ok_or(SurvivalError::MissingTimeVaryingBasis)?;
 
-         // Find descriptor
-         let descriptor = artifacts
+        // Find descriptor
+        let descriptor = artifacts
             .interaction_metadata
             .iter()
             .find(|meta| {
@@ -1928,19 +1941,29 @@ fn design_and_derivative_at_age_scratch(
 
         // Check range
         if let Some(range) = descriptor.value_ranges.first() {
-             if range.min.is_finite() && pgs_value < range.min {
-                 return Err(SurvivalError::CovariateBelowRange { column: "pgs".into(), index: pgs_idx, value: pgs_value, minimum: range.min });
-             }
-             if range.max.is_finite() && pgs_value > range.max {
-                 return Err(SurvivalError::CovariateAboveRange { column: "pgs".into(), index: pgs_idx, value: pgs_value, maximum: range.max });
-             }
+            if range.min.is_finite() && pgs_value < range.min {
+                return Err(SurvivalError::CovariateBelowRange {
+                    column: "pgs".into(),
+                    index: pgs_idx,
+                    value: pgs_value,
+                    minimum: range.min,
+                });
+            }
+            if range.max.is_finite() && pgs_value > range.max {
+                return Err(SurvivalError::CovariateAboveRange {
+                    column: "pgs".into(),
+                    index: pgs_idx,
+                    value: pgs_value,
+                    maximum: range.max,
+                });
+            }
         }
 
         // Eval PGS basis
         let pgs_basis_dim = time_basis.knot_vector.len() - time_basis.degree - 1;
         if scratch.pgs_basis_buff.len() < pgs_basis_dim {
-             // Should not happen if sized correctly
-             return Err(SurvivalError::InvalidTimeVaryingLayout);
+            // Should not happen if sized correctly
+            return Err(SurvivalError::InvalidTimeVaryingLayout);
         }
         let pgs_buff = &mut scratch.pgs_basis_buff[..pgs_basis_dim];
 
@@ -1949,14 +1972,15 @@ fn design_and_derivative_at_age_scratch(
             time_basis.knot_vector.view(),
             time_basis.degree,
             pgs_buff,
-            &mut scratch.spline_scratch
-        ).map_err(|_| SurvivalError::InvalidTimeVaryingLayout)?; // Map basis error
+            &mut scratch.spline_scratch,
+        )
+        .map_err(|_| SurvivalError::InvalidTimeVaryingLayout)?; // Map basis error
 
         // The first column of PGS basis is usually dropped/centered, need to replicate logic.
         // Logic in `build_survival_layout`: `pgs_basis_full.slice(s![.., 1..])`.
         // So we skip index 0.
         if pgs_basis_dim <= 1 {
-             return Err(SurvivalError::InvalidTimeVaryingLayout);
+            return Err(SurvivalError::InvalidTimeVaryingLayout);
         }
         let pgs_reduced_len = pgs_basis_dim - 1;
         let pgs_reduced = &mut pgs_buff[1..];
@@ -2103,9 +2127,9 @@ pub fn calculate_crude_risk_quadrature(
     covariates: &Array1<f64>,
     disease_model: &SurvivalModelArtifacts,
     mortality_model: &SurvivalModelArtifacts,
-) -> Result<f64, SurvivalError> {
+) -> Result<(f64, Array1<f64>), SurvivalError> {
     if t1 <= t0 {
-        return Ok(0.0);
+        return Ok((0.0, Array1::zeros(disease_model.coefficients.len())));
     }
 
     // 1. Collect all knots from both models within range [t0, t1]
@@ -2139,21 +2163,16 @@ pub fn calculate_crude_risk_quadrature(
 
     // Pre-allocate scratch for hot loop
     // Determine max sizes
-    let max_basis = disease_model.age_basis.knot_vector.len()
+    let max_basis = disease_model
+        .age_basis
+        .knot_vector
+        .len()
         .max(mortality_model.age_basis.knot_vector.len());
     let max_pgs = 20; // Sufficient for most splines
 
-    let mut scratch_d = SurvivalScratch::new(
-        disease_model.age_basis.degree,
-        max_basis,
-        max_pgs
-    );
+    let mut scratch_d = SurvivalScratch::new(disease_model.age_basis.degree, max_basis, max_pgs);
 
-    let mut scratch_m = SurvivalScratch::new(
-        mortality_model.age_basis.degree,
-        max_basis,
-        max_pgs
-    );
+    let mut scratch_m = SurvivalScratch::new(mortality_model.age_basis.degree, max_basis, max_pgs);
 
     let coeff_len_d = disease_model.coefficients.len();
     let coeff_len_m = mortality_model.coefficients.len();
@@ -2166,7 +2185,19 @@ pub fn calculate_crude_risk_quadrature(
 
     // 3. Integrate segment by segment
     let mut total_risk = 0.0;
+    let mut total_gradient = Array1::zeros(coeff_len_d);
     let nodes_weights = gauss_legendre_30();
+
+    // Design row at entry age for gradient term involving H_D(t0) X(t0)
+    design_and_derivative_at_age_scratch(
+        t0,
+        covariates.view(),
+        disease_model,
+        &mut design_d,
+        &mut deriv_d,
+        &mut scratch_d,
+    )?;
+    let design_d_t0 = design_d.clone();
 
     for i in 0..breakpoints.len() - 1 {
         let a = breakpoints[i];
@@ -2184,7 +2215,7 @@ pub fn calculate_crude_risk_quadrature(
                 disease_model,
                 &mut design_d,
                 &mut deriv_d,
-                &mut scratch_d
+                &mut scratch_d,
             )?;
 
             let eta_d = design_d.dot(&disease_model.coefficients);
@@ -2199,7 +2230,7 @@ pub fn calculate_crude_risk_quadrature(
                 mortality_model,
                 &mut design_m,
                 &mut deriv_m,
-                &mut scratch_m
+                &mut scratch_m,
             )?;
             let eta_m = design_m.dot(&mortality_model.coefficients);
             let hazard_m = eta_m.exp();
@@ -2216,10 +2247,23 @@ pub fn calculate_crude_risk_quadrature(
             // Integral += h_dis(u) * S_total(u) * du
             // weight scaled by half_width due to change of variables
             total_risk += w * inst_hazard_d * s_total * half_width;
+
+            if inst_hazard_d > 0.0 {
+                let weight = w * s_total * half_width;
+                let mut grad_contrib = design_d.mapv(|x| inst_hazard_d * (1.0 - hazard_d) * x);
+                grad_contrib.zip_mut_with(&deriv_d, |g, &d| {
+                    *g += hazard_d * d;
+                });
+                grad_contrib.zip_mut_with(&design_d_t0, |g, &x0| {
+                    *g += inst_hazard_d * h_dis_t0 * x0;
+                });
+                grad_contrib.mapv_inplace(|v| v * weight);
+                total_gradient += &grad_contrib;
+            }
         }
     }
 
-    Ok(total_risk)
+    Ok((total_risk, total_gradient))
 }
 
 pub fn survival_calibrator_features(
