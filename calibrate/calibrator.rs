@@ -7550,9 +7550,9 @@ mod tests {
     }
 
     #[test]
-    fn global_calibration_extreme_parameters_detected_for_large_sample() {
-        let n_small = 10; // Smaller sample reproduces the failure observed in production
-        let (outcomes, calibrated_probs) = fit_sinusoidal_calibrator_fixture(n_small, 4242);
+    fn global_calibration_extreme_parameters_for_large_sample() {
+        let n_large = 60000;
+        let (outcomes, calibrated_probs) = fit_sinusoidal_calibrator_fixture(n_large, 4242);
 
         let (intercept, slope) =
             logistic_recalibration_intercept_slope_for_check(&calibrated_probs, &outcomes);
