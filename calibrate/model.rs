@@ -189,7 +189,7 @@ impl ModelConfig {
             model_family: ModelFamily::Gam(link),
             penalty_order: 2,
             convergence_tolerance: 1e-6,
-            max_iterations: 50,
+            max_iterations: 150,
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,
             firth_bias_reduction,
