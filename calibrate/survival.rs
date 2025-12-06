@@ -3847,4 +3847,37 @@ mod tests {
         let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
         assert_artifacts_close(&artifacts, &round_trip);
     }
+
+    #[test]
+    fn delta_method_observed_factor_matches_expected() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let (lower, diag, subdiag, perm_fwd, perm_inv, inertia) = ldlt_rook(&hessian).unwrap();
+        let factor = HessianFactor::Observed {
+            factor: LdltFactor {
+                lower: lower.clone(),
+                diag: diag.clone(),
+                subdiag: subdiag.clone(),
+            },
+            permutation: PermutationDescriptor {
+                forward: perm_fwd.clone(),
+                inverse: perm_inv.clone(),
+            },
+            inertia,
+        };
+
+        let design = array![[1.0, 0.0], [0.0, 1.0], [0.3, -0.2]];
+        let expected_factor = HessianFactor::Expected {
+            factor: CholeskyFactor {
+                lower: array![[2.0, 0.0], [0.5, (2.75_f64).sqrt()]],
+            },
+        };
+
+        let se_observed = delta_method_standard_errors(&factor, &design).unwrap();
+        let se_expected = delta_method_standard_errors(&expected_factor, &design).unwrap();
+
+        for i in 0..se_observed.len() {
+            assert_abs_diff_eq!(se_observed[i], se_expected[i], epsilon = 1e-10);
+        }
+    }
+    
 }
