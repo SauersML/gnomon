@@ -55,6 +55,8 @@ pub struct CalibratorSpec {
     pub penalty_order_pred: usize,
     pub penalty_order_se: usize,
     pub penalty_order_dist: usize,
+    #[serde(default = "default_true")]
+    pub distance_enabled: bool,
     pub distance_hinge: bool,
     /// Optional training weights to use for STZ constraint and fitting
     /// If not provided, uniform weights (1.0) will be used
@@ -947,10 +949,15 @@ pub fn build_calibrator_design(
 
     // --- Apply distance hinge in raw space before standardization ---
     // This preserves the special meaning of zero (hull boundary)
-    let dist_raw = if spec.distance_hinge {
-        features.dist.mapv(|v| v.max(0.0))
+    let distance_enabled = spec.distance_enabled;
+    let dist_raw = if distance_enabled {
+        if spec.distance_hinge {
+            features.dist.mapv(|v| v.max(0.0))
+        } else {
+            features.dist.clone()
+        }
     } else {
-        features.dist.clone()
+        Array1::zeros(0)
     };
 
     // Compute robust statistics for the distance component
@@ -1026,6 +1033,7 @@ pub fn build_calibrator_design(
     }
 
     let use_wiggle_only_dist =
+        !distance_enabled ||
         // Basic criteria:
         dist_std_raw < 1e-6_f64 ||                  // Low variance
         dist_raw.len() == 0 ||                 // Empty data
@@ -1039,17 +1047,21 @@ pub fn build_calibrator_design(
             unique_frac < 0.25                // Very low diversity in positive values
         ));
 
+    let dist_mode_label = if !distance_enabled {
+        "disabled"
+    } else if use_wiggle_only_dist {
+        "wiggle-only drop"
+    } else {
+        "spline"
+    };
+
     eprintln!(
         "[CAL] Distance component analysis: std={:.2e}, zeros={:.1}%, pos={:.1}%, unique={:.1}%, using {}",
         dist_std_raw,
         100.0 * zeros_frac,
         100.0 * pos_frac,
         100.0 * unique_frac,
-        if use_wiggle_only_dist {
-            "wiggle-only drop"
-        } else {
-            "spline"
-        }
+        dist_mode_label,
     );
 
     let (pred_std, pred_ms) = standardize_with(pred_mean, pred_std_raw, &features.pred_identity);
@@ -1974,8 +1986,9 @@ pub fn predict_calibrator(
             max_abs_std_se
         );
     }
-    let any_positive_after_hinge =
-        model.spec.distance_hinge && dist_hinged.iter().any(|&v| v > warn_variation_threshold);
+    let any_positive_after_hinge = model.spec.distance_enabled
+        && model.spec.distance_hinge
+        && dist_hinged.iter().any(|&v| v > warn_variation_threshold);
     if n_dist_cols == 0 && any_positive_after_hinge {
         eprintln!(
             "[CAL][WARN] block=dist reason=axis_frozen_but_hinge_active action=no_effect_on_eta any_positive_after_hinge=true"
@@ -3859,6 +3872,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -3945,6 +3959,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4017,6 +4032,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4110,6 +4126,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
@@ -4132,6 +4149,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
@@ -4293,6 +4311,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4398,6 +4417,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
@@ -4539,6 +4559,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4654,6 +4675,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4808,6 +4830,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -4947,6 +4970,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5146,6 +5170,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5305,6 +5330,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5441,6 +5467,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5545,6 +5572,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5673,6 +5701,7 @@ mod tests {
             penalty_order_pred: 1,
             penalty_order_se: 1,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
@@ -5855,6 +5884,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -5941,6 +5971,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,                 // Enable distance hinging
             prior_weights: Some(weights.clone()), // Use non-uniform weights
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -6081,6 +6112,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -6306,6 +6338,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -6520,6 +6553,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -6621,6 +6655,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Identity),
@@ -6852,6 +6887,7 @@ mod tests {
                 penalty_order_pred: 2,
                 penalty_order_se: 2,
                 penalty_order_dist: 2,
+                distance_enabled: true,
                 distance_hinge: false,
                 prior_weights: None,
                 firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7005,6 +7041,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7139,6 +7176,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7260,6 +7298,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7386,6 +7425,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: false,
             prior_weights: None,
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7848,6 +7888,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,
             prior_weights: None, // Uniform weights
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
@@ -7894,6 +7935,7 @@ mod tests {
             penalty_order_pred: 2,
             penalty_order_se: 2,
             penalty_order_dist: 2,
+            distance_enabled: true,
             distance_hinge: true,
             prior_weights: Some(weights.clone()), // Non-uniform weights
             firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),

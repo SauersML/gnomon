@@ -847,7 +847,10 @@ pub fn train_model(
         config_with_constraints.pc_null_transforms = pc_null_transforms;
 
         // Build PHC hull as in the standard path
-        let hull_opt = {
+        let hull_opt = if config.pc_configs.is_empty() {
+            eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
+            None
+        } else {
             let n = data.p.len();
             let d = 1 + config.pc_configs.len();
             let mut x_raw = ndarray::Array2::zeros((n, d));
@@ -1317,8 +1320,9 @@ pub fn train_model(
     config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
     config_with_constraints.pc_null_transforms = pc_null_transforms;
 
+    let has_pc_axes = !config.pc_configs.is_empty();
     // Build Peeled Hull Clamping (PHC) hull from training predictors
-    let hull_opt = {
+    let hull_opt = if has_pc_axes {
         let n = data.p.len();
         let d = 1 + config.pc_configs.len();
         let mut x_raw = ndarray::Array2::zeros((n, d));
@@ -1334,6 +1338,9 @@ pub fn train_model(
                 None
             }
         }
+    } else {
+        eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
+        None
     };
     // ===== Calibrator training (post-fit layer; loud behavior) =====
     let calibrator_opt = if !crate::calibrate::model::calibrator_enabled() {
@@ -1393,6 +1400,7 @@ pub fn train_model(
             penalty_order_pred: base_penalty_order,
             penalty_order_se: base_penalty_order,
             penalty_order_dist: base_penalty_order,
+            distance_enabled: has_pc_axes,
             distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
             firth: cal::CalibratorSpec::firth_default_for_link(config.link_function()),
@@ -2243,6 +2251,7 @@ pub fn train_survival_model(
                 penalty_order_pred: config.penalty_order,
                 penalty_order_se: config.penalty_order,
                 penalty_order_dist: config.penalty_order,
+                distance_enabled: false,
                 distance_hinge: false,
                 prior_weights: Some(features.fisher_weights.clone()),
                 firth: cal::CalibratorSpec::firth_default_for_link(LinkFunction::Logit),

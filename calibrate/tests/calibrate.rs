@@ -96,6 +96,7 @@ fn logit_risk_calibration_improves_log_loss() {
         penalty_order_pred: 2,
         penalty_order_se: 2,
         penalty_order_dist: 2,
+        distance_enabled: true,
         distance_hinge: false,
         prior_weights: Some(weights.clone()),
         firth: CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
