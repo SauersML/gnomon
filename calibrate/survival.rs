@@ -2319,9 +2319,86 @@ pub fn delta_method_standard_errors(
                 se[i] = y.dot(&y).sqrt();
             }
         }
-        HessianFactor::Observed { .. } => {
-            // LDLT standard error calculation is not yet implemented for the observed Hessian.
-            // Returning zeros allows the process to continue without SEs.
+        HessianFactor::Observed {
+            factor,
+            permutation,
+            ..
+        } => {
+            let dim = factor.lower.nrows();
+            let mut y = Array1::<f64>::zeros(dim);
+            let mut g_perm = Array1::<f64>::zeros(dim);
+
+            // Precompute D^-1 structure into diagonal and off-diagonal arrays for efficiency
+            // inv_diag stores (D^-1)_{ii}
+            // inv_offdiag stores (D^-1)_{i, i+1}
+            let mut inv_diag = Array1::<f64>::zeros(dim);
+            let mut inv_offdiag = Array1::<f64>::zeros(dim);
+
+            let mut k = 0;
+            while k < dim {
+                if k + 1 < dim && factor.subdiag[k].abs() > 1e-12 {
+                    // 2x2 block
+                    let d11 = factor.diag[k];
+                    let d22 = factor.diag[k + 1];
+                    let d12 = factor.subdiag[k];
+                    let det = d11 * d22 - d12 * d12;
+                    if det == 0.0 {
+                        return Err(SurvivalError::HessianSingular);
+                    }
+                    // Inverse of [[d11, d12], [d12, d22]] is [[d22, -d12], [-d12, d11]] / det
+                    inv_diag[k] = d22 / det;
+                    inv_diag[k + 1] = d11 / det;
+                    inv_offdiag[k] = -d12 / det;
+                    k += 2;
+                } else {
+                    // 1x1 block
+                    let d = factor.diag[k];
+                    if d == 0.0 {
+                        return Err(SurvivalError::HessianSingular);
+                    }
+                    inv_diag[k] = 1.0 / d;
+                    k += 1;
+                }
+            }
+
+            for i in 0..n {
+                let row = jacobian.row(i);
+
+                // 1. Permute the Jacobian row (gradient)
+                for k in 0..dim {
+                    g_perm[k] = row[permutation.forward[k]];
+                }
+
+                // 2. Forward Solve L y = g_perm
+                // L is unit lower triangular. y_r = g_perm_r - sum_{c<r} L_{rc} y_c
+                // Optimization: Use dot product for inner loop
+                for r in 0..dim {
+                    // Safe slicing: factor.lower is dim x dim, y is dim.
+                    // We need dot product of row r of L (up to r) and y (up to r).
+                    let sum = factor
+                        .lower
+                        .row(r)
+                        .slice(s![..r])
+                        .dot(&y.slice(s![..r]));
+                    y[r] = g_perm[r] - sum;
+                }
+
+                // 3. Compute quadratic form val = y^T D^-1 y
+                // Since D^-1 is block tridiagonal (max block size 2), this is:
+                // sum_i (D^-1)_ii y_i^2 + 2 * sum_i (D^-1)_{i,i+1} y_i y_{i+1}
+                let mut val = 0.0;
+                for k in 0..dim {
+                    val += y[k] * y[k] * inv_diag[k];
+                }
+                for k in 0..dim - 1 {
+                    if inv_offdiag[k] != 0.0 {
+                        val += 2.0 * y[k] * y[k + 1] * inv_offdiag[k];
+                    }
+                }
+
+                // 4. Standard Error
+                se[i] = if val > 0.0 { val.sqrt() } else { 0.0 };
+            }
         }
     }
     Ok(se)
