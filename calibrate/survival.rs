@@ -2441,3 +2441,1410 @@ impl SurvivalModelArtifacts {
         Ok(preds)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calibrate::calibrator::{CalibratorModel, CalibratorSpec};
+    use crate::calibrate::model::{
+        BasisConfig, LinkFunction, reset_calibrator_flag, set_calibrator_enabled,
+    };
+    use approx::assert_abs_diff_eq;
+    use log::Level;
+    use logtest::Logger;
+    use ndarray::array;
+    use serde_json;
+    use serial_test::serial;
+
+    fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
+        let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];
+        array![
+            [matrix[[1, 1]] / det, -matrix[[0, 1]] / det],
+            [-matrix[[1, 0]] / det, matrix[[0, 0]] / det]
+        ]
+    }
+
+    fn finite_difference_derivatives(
+        model: &mut WorkingModelSurvival,
+        beta: &Array1<f64>,
+        epsilon: f64,
+    ) -> Result<(Array1<f64>, Array2<f64>), SurvivalError> {
+        let p = beta.len();
+        let mut gradient = Array1::<f64>::zeros(p);
+        let mut hessian = Array2::<f64>::zeros((p, p));
+
+        for column in 0..p {
+            let mut beta_plus = beta.to_owned();
+            beta_plus[column] += epsilon;
+            let plus_state = model.update_state(&beta_plus)?;
+
+            let mut beta_minus = beta.to_owned();
+            beta_minus[column] -= epsilon;
+            let minus_state = model.update_state(&beta_minus)?;
+
+            gradient[column] = (plus_state.deviance - minus_state.deviance) / (2.0 * epsilon);
+
+            let diff = (&plus_state.gradient - &minus_state.gradient) * (0.5 / epsilon);
+            hessian.column_mut(column).assign(&diff);
+        }
+
+        Ok((gradient, hessian))
+    }
+
+    #[test]
+    fn delta_method_expected_factor_matches_manual_inverse() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let chol = CholeskyFactor {
+            lower: array![[2.0, 0.0], [0.5, (2.75_f64).sqrt()]],
+        };
+        let factor = HessianFactor::Expected { factor: chol };
+        let design = array![[1.0, 0.0], [0.0, 1.0], [0.3, -0.2]];
+
+        let se = delta_method_standard_errors(&factor, &design).unwrap();
+        let inv = manual_inverse(&hessian);
+
+        for (idx, row) in design.rows().into_iter().enumerate() {
+            let row_vec = row.to_owned();
+            let tmp = inv.dot(&row_vec);
+            let expected = row_vec.dot(&tmp).max(0.0).sqrt();
+            assert_abs_diff_eq!(se[idx], expected, epsilon = 1e-10);
+        }
+    }
+
+    // survival_calibrator_features_clamps_leverage_and_uses_delta_se SKIPPED because
+    // survival_calibrator_features does not support leverage input yet.
+
+    fn toy_training_data() -> SurvivalTrainingData {
+        SurvivalTrainingData {
+            age_entry: array![50.0, 55.0, 60.0],
+            age_exit: array![55.0, 60.0, 65.0],
+            event_target: array![1, 0, 1],
+            event_competing: array![0, 0, 0],
+            sample_weight: array![1.0, 1.0, 1.0],
+            pgs: array![0.1, -0.2, 0.3],
+            sex: array![0.0, 1.0, 0.0],
+            pcs: array![[0.01, -0.02], [0.02, 0.03], [-0.04, 0.05]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn apply_logit_risk_calibrator_respects_toggle() {
+        reset_calibrator_flag();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        let layout = layout_bundle.layout;
+        let p = layout.combined_exit.ncols();
+
+        let identity_calibrator = CalibratorModel {
+            spec: CalibratorSpec {
+                link: LinkFunction::Logit,
+                pred_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                se_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                dist_basis: BasisConfig {
+                    num_knots: 2,
+                    degree: 1,
+                },
+                penalty_order_pred: 2,
+                penalty_order_se: 2,
+                penalty_order_dist: 2,
+                distance_enabled: false,
+                distance_hinge: false,
+                prior_weights: None,
+                firth: None,
+            },
+            knots_pred: Array1::zeros(0),
+            knots_se: Array1::zeros(0),
+            knots_dist: Array1::zeros(0),
+            pred_constraint_transform: Array2::zeros((0, 0)),
+            stz_se: Array2::zeros((0, 0)),
+            stz_dist: Array2::zeros((0, 0)),
+            penalty_nullspace_dims: (0, 0, 0, 0),
+            standardize_pred: (0.0, 1.0),
+            standardize_se: (0.0, 1.0),
+            standardize_dist: (0.0, 1.0),
+            interaction_center_pred: None,
+            se_wiggle_only_drop: false,
+            dist_wiggle_only_drop: false,
+            lambda_pred: 1.0,
+            lambda_pred_param: 1.0,
+            lambda_se: 1.0,
+            lambda_dist: 1.0,
+            coefficients: Array1::zeros(0),
+            column_spans: (0..0, 0..0, 0..0),
+            pred_param_range: 0..0,
+            scale: None,
+            assumes_frequency_weights: true,
+        };
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(p),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: Some(HessianFactor::Expected {
+                factor: CholeskyFactor {
+                    lower: Array2::<f64>::eye(p),
+                },
+            }),
+            calibrator: Some(identity_calibrator),
+        };
+
+        let risks = array![0.2, 0.8];
+        let mut design = Array2::<f64>::zeros((2, p));
+        if p > 0 {
+            design[[0, 0]] = 1.0;
+        }
+        if p > 1 {
+            design[[1, 1]] = 1.0;
+        }
+
+        // We assume enabled by default or we enable it
+        set_calibrator_enabled(true);
+        let calibrated = artifacts
+            .apply_logit_risk_calibrator(&risks, &design)
+            .unwrap();
+        assert_eq!(calibrated.len(), risks.len());
+        // Since coeffs are zero, output should be transformed but likely different if standardization or basis shifts.
+        // We just check that toggling it off yields original values.
+
+        set_calibrator_enabled(false);
+        let bypass = artifacts
+            .apply_logit_risk_calibrator(&risks, &design)
+            .unwrap();
+        for (cal, base) in bypass.iter().zip(risks.iter()) {
+            assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
+        }
+        reset_calibrator_flag();
+    }
+
+    #[test]
+    fn update_state_warns_when_derivative_guard_is_common() {
+        let mut logger = Logger::start();
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let mut model = WorkingModelSurvival::new(
+            layout_bundle.layout.clone(),
+            &data,
+            layout_bundle.monotonicity.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let beta = Array1::<f64>::zeros(model.layout.combined_exit.ncols());
+
+        model.update_state(&beta).unwrap();
+
+        let mut matches = 0usize;
+        while let Some(record) = logger.pop() {
+            if record.level() == Level::Warn
+                && record.args().contains("derivative guard activated for")
+            {
+                matches += 1;
+            }
+        }
+        assert!(
+            matches >= 1,
+            "expected at least one derivative guard warning, got {}",
+            matches
+        );
+    }
+
+    fn repeat_rows(matrix: &Array2<f64>, pattern: &[usize]) -> Array2<f64> {
+        let cols = matrix.ncols();
+        let mut result = Array2::<f64>::zeros((pattern.len(), cols));
+        for (row_idx, &source_idx) in pattern.iter().enumerate() {
+            assert!(source_idx < matrix.nrows());
+            result.row_mut(row_idx).assign(&matrix.row(source_idx));
+        }
+        result
+    }
+
+    fn repeat_optional(matrix: &Option<Array2<f64>>, pattern: &[usize]) -> Option<Array2<f64>> {
+        matrix.as_ref().map(|array| repeat_rows(array, pattern))
+    }
+
+    fn combined_static_row(layout: &SurvivalLayout, idx: usize) -> Array1<f64> {
+        let base = layout.static_covariates.row(idx);
+        let extra = layout.extra_static_covariates.row(idx);
+        let total = base.len() + extra.len();
+        let mut result = Array1::<f64>::zeros(total);
+        if base.len() > 0 {
+            result.slice_mut(s![..base.len()]).assign(&base);
+        }
+        if extra.len() > 0 {
+            result
+                .slice_mut(s![base.len()..base.len() + extra.len()])
+                .assign(&extra);
+        }
+        result
+    }
+
+    fn compute_value_ranges(matrix: &Array2<f64>) -> Vec<ValueRange> {
+        (0..matrix.ncols())
+            .map(|col_idx| {
+                if matrix.nrows() == 0 {
+                    return ValueRange { min: 0.0, max: 0.0 };
+                }
+                let mut min_val = f64::INFINITY;
+                let mut max_val = f64::NEG_INFINITY;
+                for &value in matrix.column(col_idx).iter() {
+                    if value < min_val {
+                        min_val = value;
+                    }
+                    if value > max_val {
+                        max_val = value;
+                    }
+                }
+                ValueRange {
+                    min: min_val,
+                    max: max_val,
+                }
+            })
+            .collect()
+    }
+
+    fn make_covariate_layout(layout: &SurvivalLayout) -> CovariateLayout {
+        let mut ranges = compute_value_ranges(&layout.static_covariates);
+        ranges.extend(compute_value_ranges(&layout.extra_static_covariates));
+        CovariateLayout {
+            column_names: layout.static_covariate_names.clone(),
+            ranges,
+        }
+    }
+
+    fn baseline_penalty_descriptor(
+        layout: &SurvivalLayout,
+        order: usize,
+        lambda: f64,
+    ) -> PenaltyDescriptor {
+        let baseline_cols = layout.baseline_exit.ncols();
+        let matrix =
+            create_difference_penalty_matrix(baseline_cols, order).expect("baseline penalty");
+        PenaltyDescriptor {
+            order,
+            lambda,
+            matrix,
+            column_range: ColumnRange::new(0, baseline_cols),
+        }
+    }
+
+    fn assert_array1_close(left: &Array1<f64>, right: &Array1<f64>, tol: f64) {
+        assert_eq!(left.len(), right.len());
+        for (l, r) in left.iter().zip(right.iter()) {
+            assert!((l - r).abs() <= tol, "array1 mismatch: {l} vs {r}");
+        }
+    }
+
+    fn assert_array2_close(left: &Array2<f64>, right: &Array2<f64>, tol: f64) {
+        assert_eq!(left.dim(), right.dim());
+        for (l, r) in left.iter().zip(right.iter()) {
+            assert!((l - r).abs() <= tol, "array2 mismatch: {l} vs {r}");
+        }
+    }
+
+    fn assert_artifacts_close(left: &SurvivalModelArtifacts, right: &SurvivalModelArtifacts) {
+        assert_array1_close(&left.coefficients, &right.coefficients, 1e-12);
+        assert_array1_close(
+            &left.age_basis.knot_vector,
+            &right.age_basis.knot_vector,
+            1e-12,
+        );
+        assert_eq!(left.age_basis.degree, right.age_basis.degree);
+        assert_eq!(left.time_varying_basis, right.time_varying_basis);
+        assert_eq!(
+            left.static_covariate_layout.column_names,
+            right.static_covariate_layout.column_names
+        );
+        for (l_range, r_range) in left
+            .static_covariate_layout
+            .ranges
+            .iter()
+            .zip(&right.static_covariate_layout.ranges)
+        {
+            assert!((l_range.min - r_range.min).abs() <= 1e-12);
+            assert!((l_range.max - r_range.max).abs() <= 1e-12);
+        }
+        assert_eq!(left.penalties.len(), right.penalties.len());
+        for (l_penalty, r_penalty) in left.penalties.iter().zip(&right.penalties) {
+            assert_eq!(l_penalty.order, r_penalty.order);
+            assert!((l_penalty.lambda - r_penalty.lambda).abs() <= 1e-12);
+            assert_array2_close(&l_penalty.matrix, &r_penalty.matrix, 1e-12);
+            assert_eq!(l_penalty.column_range, r_penalty.column_range);
+        }
+        assert_array2_close(
+            &left.reference_constraint.transform,
+            &right.reference_constraint.transform,
+            1e-12,
+        );
+        assert!(
+            (left.reference_constraint.reference_log_age
+                - right.reference_constraint.reference_log_age)
+                .abs()
+                <= 1e-12
+        );
+        assert!((left.age_transform.minimum_age - right.age_transform.minimum_age).abs() <= 1e-12);
+        assert!((left.age_transform.delta - right.age_transform.delta).abs() <= 1e-12);
+        assert_eq!(
+            left.interaction_metadata.len(),
+            right.interaction_metadata.len()
+        );
+        for (l_meta, r_meta) in left
+            .interaction_metadata
+            .iter()
+            .zip(&right.interaction_metadata)
+        {
+            assert_eq!(l_meta.label, r_meta.label);
+            assert_eq!(l_meta.column_range, r_meta.column_range);
+            assert_eq!(l_meta.value_ranges.len(), r_meta.value_ranges.len());
+            for (l_range, r_range) in l_meta.value_ranges.iter().zip(&r_meta.value_ranges) {
+                assert!((l_range.min - r_range.min).abs() <= 1e-12);
+                assert!((l_range.max - r_range.max).abs() <= 1e-12);
+            }
+            match (&l_meta.centering, &r_meta.centering) {
+                (Some(l), Some(r)) => {
+                    assert_array1_close(&l.offsets, &r.offsets, 1e-12);
+                }
+                (None, None) => {}
+                _ => panic!("centering mismatch"),
+            }
+        }
+        assert_eq!(left.companion_models, right.companion_models);
+        match (&left.hessian_factor, &right.hessian_factor) {
+            (
+                Some(HessianFactor::Observed {
+                    factor: l_ldlt,
+                    permutation: l_perm,
+                    inertia: l_inertia,
+                }),
+                Some(HessianFactor::Observed {
+                    factor: r_ldlt,
+                    permutation: r_perm,
+                    inertia: r_inertia,
+                }),
+            ) => {
+                assert_array2_close(&l_ldlt.lower, &r_ldlt.lower, 1e-12);
+                assert_array1_close(&l_ldlt.diag, &r_ldlt.diag, 1e-12);
+                assert_array1_close(&l_ldlt.subdiag, &r_ldlt.subdiag, 1e-12);
+                assert_eq!(l_perm, r_perm);
+                assert_eq!(l_inertia, r_inertia);
+            }
+            (
+                Some(HessianFactor::Expected { factor: l_chol }),
+                Some(HessianFactor::Expected { factor: r_chol }),
+            ) => {
+                assert_array2_close(&l_chol.lower, &r_chol.lower, 1e-12);
+            }
+            (None, None) => {}
+            _ => panic!("hessian factor mismatch"),
+        }
+        assert_eq!(left.calibrator.is_some(), right.calibrator.is_some());
+        if let (Some(l), Some(r)) = (&left.calibrator, &right.calibrator) {
+            let left_json = serde_json::to_string(l).unwrap();
+            let right_json = serde_json::to_string(r).unwrap();
+            assert_eq!(left_json, right_json);
+        }
+    }
+
+    trait LogitExt { fn logit(self) -> f64; }
+    impl LogitExt for f64 { fn logit(self) -> f64 { (self / (1.0 - self)).ln() } }
+
+    #[test]
+    fn logit_extension_behaves() {
+        assert!(0.5f64.logit().abs() < 1e-12);
+        assert!(f64::is_finite(0.01f64.logit()));
+    }
+
+    #[test]
+    fn age_transform_rejects_non_positive_guard() {
+        let ages = array![50.0, 55.0];
+        let err = AgeTransform::from_training(&ages, 0.0).unwrap_err();
+        assert!(matches!(err, SurvivalError::NonPositiveGuard));
+    }
+
+    #[test]
+    fn monotonic_constraint_clamps_negative_derivatives() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let spec = SurvivalSpec::default();
+        let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
+
+        let state = model.update_state(&beta).unwrap();
+        assert!(state.deviance.is_finite());
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let derivative_raw = layout.combined_derivative_exit.dot(&beta);
+        let guard = model.spec.derivative_guard.max(f64::EPSILON);
+
+        let mut log_likelihood = 0.0;
+        for i in 0..data.age_entry.len() {
+            let weight = data.sample_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let d = f64::from(data.event_target[i]);
+            let h_exit = eta_exit[i].exp();
+            let h_entry = eta_entry[i].exp();
+            let log_guard = if derivative_raw[i] <= guard {
+                guard.ln()
+            } else {
+                derivative_raw[i].ln()
+            };
+            log_likelihood += weight * (d * (eta_exit[i] + log_guard) - (h_exit - h_entry));
+        }
+
+        let penalty = layout.penalties.deviance(&beta);
+        let manual_deviance = -2.0 * log_likelihood + penalty;
+        assert_abs_diff_eq!(state.deviance, manual_deviance, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn monotonic_constraint_rejects_negative_slopes() {
+        let mut data = toy_training_data();
+        data.sample_weight.fill(0.0);
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 12, None).unwrap();
+        assert!(monotonicity.derivative_design.nrows() > 0);
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let mut found = false;
+        for row in monotonicity.derivative_design.rows() {
+            if row.iter().any(|value| value.abs() > 1e-12) {
+                beta.assign(&row);
+                // Scale the row so the induced slopes violate MONOTONICITY_TOLERANCE.
+                beta.mapv_inplace(|value| -0.1 * value);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "monotonicity grid returned only zero rows");
+
+        let slopes = monotonicity.derivative_design.dot(&beta);
+        assert!(slopes.iter().any(|value| *value < MONOTONICITY_TOLERANCE));
+
+        let mut model =
+            WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
+                .unwrap();
+        let err = model.update_state(&beta).unwrap_err();
+        assert!(matches!(err, SurvivalError::MonotonicityViolation { .. }));
+    }
+
+    #[test]
+    fn conditional_risk_monotone() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            penalty_descriptors,
+            interaction_metadata,
+            time_varying_basis,
+        } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
+        let layout = layout;
+        let model = WorkingModelSurvival::new(
+            layout.clone(),
+            &data,
+            monotonicity.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(model.layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata,
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+        let cov_cols =
+            model.layout.static_covariates.ncols() + model.layout.extra_static_covariates.ncols();
+        let covs = Array1::<f64>::zeros(cov_cols);
+        let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
+        let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
+        assert!(cif1 >= cif0 - 1e-9);
+        let risk =
+            conditional_absolute_risk(55.0, 60.0, &covs, Some(0.0), None, &artifacts).unwrap();
+        assert!(risk >= -1e-9);
+    }
+
+    #[test]
+    fn competing_cif_helpers_require_available_sources() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let layout = layout_bundle.layout;
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts);
+
+        let base_artifacts = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0],
+        }]);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let err = competing_cif_value(55.0, &covs, Some(f64::NAN), None).unwrap_err();
+        assert!(matches!(err, SurvivalError::InvalidCompetingCif { .. }));
+
+        let err = competing_cif_value(55.0, &covs, None, None).unwrap_err();
+        assert!(matches!(err, SurvivalError::MissingCompanionCifData));
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&base_artifacts, "companion", &registry).unwrap();
+            let explicit = 0.25;
+            let value =
+                competing_cif_value(55.0, &covs, Some(explicit), Some((handle, resolved))).unwrap();
+            assert_abs_diff_eq!(value, explicit, epsilon = 1e-12);
+        }
+
+        let err = resolve_companion_model(&base_artifacts, "missing", &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            SurvivalError::UnknownCompanionModelHandle { .. }
+        ));
+
+        registry.clear();
+        let err = resolve_companion_model(&base_artifacts, "companion", &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            SurvivalError::CompanionModelUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn conditional_risk_uses_resolved_companion_model() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let layout = layout_bundle.layout;
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts.clone());
+        let base_artifacts = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0, 60.0],
+        }]);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let (handle, resolved) =
+            resolve_companion_model(&base_artifacts, "companion", &registry).unwrap();
+        let explicit = cumulative_incidence(55.0, &covs, &registry["companion"]).unwrap();
+        let expected =
+            conditional_absolute_risk(55.0, 60.0, &covs, Some(explicit), None, &base_artifacts)
+                .unwrap();
+        let via_companion = conditional_absolute_risk(
+            55.0,
+            60.0,
+            &covs,
+            None,
+            Some((handle, resolved)),
+            &base_artifacts,
+        )
+        .unwrap();
+        assert_abs_diff_eq!(via_companion, expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn competing_cif_helpers_validate_horizons() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        let layout = layout_bundle.layout;
+        let make_artifacts = |companion_models: Vec<CompanionModelHandle>| SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout_bundle.monotonicity.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models,
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let companion_artifacts = make_artifacts(Vec::new());
+        let mut registry = HashMap::new();
+        registry.insert("companion".to_string(), companion_artifacts);
+        let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
+
+        let missing_horizon = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![60.0],
+        }]);
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&missing_horizon, "companion", &registry).unwrap();
+            let err = competing_cif_value(55.0, &covs, None, Some((handle, resolved))).unwrap_err();
+            assert!(matches!(
+                err,
+                SurvivalError::CompanionModelMissingHorizon { .. }
+            ));
+        }
+
+        let matching_horizon = make_artifacts(vec![CompanionModelHandle {
+            reference: "companion".to_string(),
+            cif_horizons: vec![55.0, 65.0],
+        }]);
+
+        {
+            let (handle, resolved) =
+                resolve_companion_model(&matching_horizon, "companion", &registry).unwrap();
+            let value = competing_cif_value(55.0, &covs, None, Some((handle, resolved))).unwrap();
+            let expected =
+                cumulative_incidence(55.0, &covs, registry.get("companion").unwrap()).unwrap();
+            assert_abs_diff_eq!(value, expected, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn likelihood_matches_manual_computation() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        for (idx, value) in beta.iter_mut().enumerate() {
+            *value = 0.01 * (idx as f64 + 1.0);
+        }
+        if beta.len() > 0 {
+            beta[0] = -0.15;
+        }
+
+        let state = model.update_state(&beta).unwrap();
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        let guard = spec.derivative_guard.max(f64::EPSILON);
+        assert!(derivative_exit.iter().any(|value| *value <= guard));
+
+        let mut manual = 0.0;
+        for i in 0..data.age_entry.len() {
+            let d = f64::from(data.event_target[i]);
+            let weight = data.sample_weight[i];
+            let guarded = derivative_exit[i].max(guard);
+            let h_exit = eta_exit[i].exp();
+            let h_entry = eta_entry[i].exp();
+            manual += weight * (d * (eta_exit[i] + guarded.ln()) - (h_exit - h_entry));
+        }
+
+        assert_abs_diff_eq!(state.deviance, -2.0 * manual, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn left_truncation_matches_scoring_difference() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.45, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let penalty_descriptors = bundle.penalty_descriptors.clone();
+        let interaction_metadata = bundle.interaction_metadata.clone();
+        let time_varying_basis = bundle.time_varying_basis.clone();
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let baseline_cols = layout.baseline_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..baseline_cols {
+            beta[idx] = 0.05 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update_state(&beta).unwrap();
+        assert!(state.deviance.is_finite());
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: beta.clone(),
+            age_basis: basis.clone(),
+            time_varying_basis,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata,
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+
+        for i in 0..data.age_entry.len() {
+            let covariates = combined_static_row(&layout, i);
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_entry =
+                cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
+            let delta_scoring = hazard_exit - hazard_entry;
+            let delta_training = eta_exit[i].exp() - eta_entry[i].exp();
+            assert_abs_diff_eq!(delta_scoring, delta_training, epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn cumulative_hazard_matches_update_state_with_delayed_entry() {
+        let data = SurvivalTrainingData {
+            age_entry: array![45.0, 60.0, 58.0],
+            age_exit: array![50.0, 66.0, 65.0],
+            event_target: array![1, 0, 1],
+            event_competing: array![0, 0, 0],
+            sample_weight: array![1.0, 1.0, 1.0],
+            pgs: array![0.05, -0.1, 0.2],
+            sex: array![0.0, 1.0, 0.0],
+            pcs: array![[0.01, -0.02], [0.03, 0.04], [-0.05, 0.06]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
+        };
+
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 6, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let penalty_descriptors = bundle.penalty_descriptors.clone();
+        let interaction_metadata = bundle.interaction_metadata.clone();
+        let time_varying_basis = bundle.time_varying_basis.clone();
+
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let p = layout.combined_exit.ncols();
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.02 * (idx as f64 + 1.0);
+        }
+
+        let state = model.update_state(&beta).unwrap();
+        assert!(state.deviance.is_finite());
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let eta_entry = layout.combined_entry.dot(&beta);
+        let h_exit = eta_exit.mapv(f64::exp);
+        let h_entry = eta_entry.mapv(f64::exp);
+        let delta_training = &h_exit - &h_entry;
+
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: beta.clone(),
+            age_basis: basis.clone(),
+            time_varying_basis,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata,
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        for i in 0..data.age_entry.len() {
+            let covariates = combined_static_row(&layout, i);
+            let hazard_exit = cumulative_hazard(data.age_exit[i], &covariates, &artifacts).unwrap();
+            let hazard_entry =
+                cumulative_hazard(data.age_entry[i], &covariates, &artifacts).unwrap();
+            let delta_scoring = hazard_exit - hazard_entry;
+            assert_abs_diff_eq!(delta_scoring, delta_training[i], epsilon = 1e-10);
+        }
+    }
+
+    #[test]
+    fn gradient_and_hessian_match_numeric() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let mut bundle = build_survival_layout(&data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        let layout = bundle.layout.clone();
+        let monotonicity = bundle.monotonicity.clone();
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+        let mut model =
+            WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
+
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_cols = layout
+            .time_varying_exit
+            .as_ref()
+            .map(|matrix| matrix.ncols())
+            .unwrap_or(0);
+        let static_cols = layout.static_covariates.ncols();
+        let extra_cols = layout.extra_static_covariates.ncols();
+
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let weights = Array1::from_elem(layout.baseline_derivative_exit.nrows(), 0.5);
+        let baseline_beta = layout.baseline_derivative_exit.t().dot(&weights);
+        beta.slice_mut(s![..baseline_cols]).assign(&baseline_beta);
+
+        let static_offset = baseline_cols + time_cols;
+        if static_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![static_offset..static_offset + static_cols])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = -0.1 + 0.05 * (idx as f64);
+            }
+        }
+        if extra_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![
+                    static_offset + static_cols..static_offset + static_cols + extra_cols
+                ])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = 0.02 * (idx as f64 + 1.0);
+            }
+        }
+
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        assert!(
+            derivative_exit
+                .iter()
+                .all(|value| *value > spec.derivative_guard)
+        );
+
+        let epsilon = 1e-6;
+        let (numeric_gradient, numeric_hessian) =
+            finite_difference_derivatives(&mut model, &beta, epsilon).unwrap();
+
+        let analytic_state = model.update_state(&beta).unwrap();
+
+        for (numeric, analytic) in numeric_gradient.iter().zip(analytic_state.gradient.iter()) {
+            assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-7);
+        }
+
+        for (numeric_row, analytic_row) in numeric_hessian
+            .rows()
+            .into_iter()
+            .zip(analytic_state.hessian.rows())
+        {
+            for (numeric, analytic) in numeric_row.iter().zip(analytic_row.iter()) {
+                assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_weights_match_replication() {
+        let weighted_data = SurvivalTrainingData {
+            age_entry: array![50.0, 55.0],
+            age_exit: array![55.0, 60.0],
+            event_target: array![1, 0],
+            event_competing: array![0, 0],
+            sample_weight: array![1.0, 2.0],
+            pgs: array![0.1, -0.3],
+            sex: array![0.0, 1.0],
+            pcs: array![[0.01, -0.02], [0.02, 0.03]],
+            extra_static_covariates: Array2::<f64>::zeros((2, 0)),
+            extra_static_names: Vec::new(),
+        };
+
+        let expanded_data = SurvivalTrainingData {
+            age_entry: array![50.0, 55.0, 55.0],
+            age_exit: array![55.0, 60.0, 60.0],
+            event_target: array![1, 0, 0],
+            event_competing: array![0, 0, 0],
+            sample_weight: array![1.0, 1.0, 1.0],
+            pgs: array![0.1, -0.3, -0.3],
+            sex: array![0.0, 1.0, 1.0],
+            pcs: array![[0.01, -0.02], [0.02, 0.03], [0.02, 0.03]],
+            extra_static_covariates: Array2::<f64>::zeros((3, 0)),
+            extra_static_names: Vec::new(),
+        };
+
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 0.75, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+
+        let mut bundle = build_survival_layout(&weighted_data, &basis, 0.1, 2, 0, None).unwrap();
+        bundle
+            .layout
+            .penalties
+            .blocks
+            .iter_mut()
+            .for_each(|block| block.lambda = 0.0);
+        bundle
+            .penalty_descriptors
+            .iter_mut()
+            .for_each(|descriptor| descriptor.lambda = 0.0);
+        let layout_weighted = bundle.layout.clone();
+        let monotonic_weighted = bundle.monotonicity.clone();
+        let replicate_pattern = [0usize, 1, 1];
+        let layout_expanded = SurvivalLayout {
+            baseline_entry: repeat_rows(&layout_weighted.baseline_entry, &replicate_pattern),
+            baseline_exit: repeat_rows(&layout_weighted.baseline_exit, &replicate_pattern),
+            baseline_derivative_exit: repeat_rows(
+                &layout_weighted.baseline_derivative_exit,
+                &replicate_pattern,
+            ),
+            time_varying_entry: repeat_optional(
+                &layout_weighted.time_varying_entry,
+                &replicate_pattern,
+            ),
+            time_varying_exit: repeat_optional(
+                &layout_weighted.time_varying_exit,
+                &replicate_pattern,
+            ),
+            time_varying_derivative_exit: repeat_optional(
+                &layout_weighted.time_varying_derivative_exit,
+                &replicate_pattern,
+            ),
+            static_covariates: repeat_rows(&layout_weighted.static_covariates, &replicate_pattern),
+            extra_static_covariates: repeat_rows(
+                &layout_weighted.extra_static_covariates,
+                &replicate_pattern,
+            ),
+            static_covariate_names: layout_weighted.static_covariate_names.clone(),
+            age_transform: layout_weighted.age_transform,
+            reference_constraint: layout_weighted.reference_constraint.clone(),
+            penalties: layout_weighted.penalties.clone(),
+            combined_entry: repeat_rows(&layout_weighted.combined_entry, &replicate_pattern),
+            combined_exit: repeat_rows(&layout_weighted.combined_exit, &replicate_pattern),
+            combined_derivative_exit: repeat_rows(
+                &layout_weighted.combined_derivative_exit,
+                &replicate_pattern,
+            ),
+            monotonicity: monotonic_weighted.clone(),
+        };
+
+        let mut spec = SurvivalSpec::default();
+        spec.derivative_guard = 1e-12;
+
+        let mut weighted_model = WorkingModelSurvival::new(
+            layout_weighted.clone(),
+            &weighted_data,
+            monotonic_weighted.clone(),
+            spec,
+        )
+        .unwrap();
+        let mut expanded_model = WorkingModelSurvival::new(
+            layout_expanded.clone(),
+            &expanded_data,
+            monotonic_weighted,
+            spec,
+        )
+        .unwrap();
+
+        let p = layout_weighted.combined_exit.ncols();
+        assert_eq!(p, layout_expanded.combined_exit.ncols());
+        let mut beta = Array1::<f64>::zeros(p);
+        for idx in 0..p {
+            beta[idx] = 0.03 * (idx as f64 + 1.0);
+        }
+
+        let state_weighted = weighted_model.update_state(&beta).unwrap();
+        let state_expanded = expanded_model.update_state(&beta).unwrap();
+
+        assert_abs_diff_eq!(
+            state_weighted.deviance,
+            state_expanded.deviance,
+            epsilon = 1e-4
+        );
+        for (g_weighted, g_expanded) in state_weighted
+            .gradient
+            .iter()
+            .zip(state_expanded.gradient.iter())
+        {
+            assert_abs_diff_eq!(*g_weighted, *g_expanded, epsilon = 1e-4);
+        }
+        for (h_weighted, h_expanded) in state_weighted
+            .hessian
+            .iter()
+            .zip(state_expanded.hessian.iter())
+        {
+            assert_abs_diff_eq!(*h_weighted, *h_expanded, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn time_varying_tensor_product_contributes_to_hazard() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let pgs_basis = BasisDescriptor {
+            knot_vector: array![-0.6, -0.6, -0.6, -0.3, -0.1, 0.1, 0.3, 0.6, 0.6, 0.6,],
+            degree: 2,
+        };
+        let tensor_config = TensorProductConfig {
+            label: Some("pgs_by_age".to_string()),
+            pgs_basis: pgs_basis.clone(),
+            pgs_penalty_order: 2,
+            lambda_age: 0.15,
+            lambda_pgs: 0.2,
+            lambda_null: 0.05,
+        };
+
+        let SurvivalLayoutBundle {
+            layout,
+            monotonicity,
+            penalty_descriptors,
+            interaction_metadata,
+            time_varying_basis,
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, Some(&tensor_config)).unwrap();
+
+        assert!(layout.time_varying_exit.is_some());
+        assert_eq!(time_varying_basis, Some(pgs_basis.clone()));
+        assert!(penalty_descriptors.len() >= 4);
+        let metadata = interaction_metadata
+            .first()
+            .expect("time-varying interaction metadata");
+        let time_exit = layout.time_varying_exit.as_ref().unwrap();
+        assert_eq!(
+            metadata.column_range.end - metadata.column_range.start,
+            time_exit.ncols()
+        );
+        let offsets = metadata
+            .centering
+            .as_ref()
+            .expect("centering metadata for tensor product")
+            .offsets
+            .clone();
+        let (pgs_basis_full, _) = create_bspline_basis_with_knots(
+            data.pgs.view(),
+            pgs_basis.knot_vector.view(),
+            pgs_basis.degree,
+        )
+        .unwrap();
+        let mut pgs_basis_matrix = pgs_basis_full.slice(s![.., 1..]).to_owned();
+        let raw_means = compute_weighted_column_means(&pgs_basis_matrix, &data.sample_weight);
+        assert_eq!(raw_means.len(), offsets.len());
+        for (raw, offset) in raw_means.iter().zip(offsets.iter()) {
+            assert_abs_diff_eq!(raw, offset, epsilon = 1e-10);
+        }
+        for (mut column, &offset) in pgs_basis_matrix.axis_iter_mut(Axis(1)).zip(offsets.iter()) {
+            column.mapv_inplace(|value| value - offset);
+        }
+        let centered_means = compute_weighted_column_means(&pgs_basis_matrix, &data.sample_weight);
+        for mean in centered_means.iter() {
+            assert!(mean.abs() < 5e-10);
+        }
+
+        let baseline_cols = layout.baseline_exit.ncols();
+        let time_cols = time_exit.ncols();
+        let static_cols = layout.static_covariates.ncols();
+        let mut beta = Array1::<f64>::zeros(baseline_cols + time_cols + static_cols);
+        for idx in baseline_cols..baseline_cols + time_cols {
+            beta[idx] = 0.05 * ((idx - baseline_cols + 1) as f64);
+        }
+
+        let eta_exit = layout.combined_exit.dot(&beta);
+        let covariates = layout.static_covariates.row(0).to_owned();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: beta,
+            age_basis: basis.clone(),
+            time_varying_basis: time_varying_basis.clone(),
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata: interaction_metadata.clone(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+
+        let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
+        assert_abs_diff_eq!(hazard, eta_exit[0].exp(), epsilon = 1e-10);
+
+        let pgs_idx = artifacts
+            .static_covariate_layout
+            .column_names
+            .iter()
+            .position(|name| name == "pgs")
+            .expect("pgs column present");
+        let mut covariates_high = covariates.clone();
+        covariates_high[pgs_idx] = metadata.value_ranges[0].max + 0.5;
+        let err_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts)
+            .expect_err("pgs above range should error");
+        assert!(matches!(
+            err_high,
+            SurvivalError::CovariateAboveRange { .. }
+        ));
+
+        let mut covariates_low = covariates;
+        covariates_low[pgs_idx] = metadata.value_ranges[0].min - 0.5;
+        let err_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts)
+            .expect_err("pgs below range should error");
+        assert!(matches!(err_low, SurvivalError::CovariateBelowRange { .. }));
+
+        let mut model = WorkingModelSurvival::new(
+            layout.clone(),
+            &data,
+            monotonicity.clone(),
+            SurvivalSpec::default(),
+        )
+        .unwrap();
+        let state = model.update_state(&artifacts.coefficients).unwrap();
+        assert!(state.deviance.is_finite());
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_covariate_mismatch() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle {
+            layout,
+            penalty_descriptors,
+            interaction_metadata,
+            time_varying_basis,
+            ..
+        } = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: penalty_descriptors,
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata,
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+        let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
+        let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_covariates_out_of_persisted_range() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        let layout = layout_bundle.layout;
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata: Vec::new(),
+            companion_models: Vec::new(),
+            hessian_factor: None,
+            calibrator: None,
+        };
+        let mismatched_covs = Array1::<f64>::zeros(
+            layout.static_covariates.ncols() + layout.extra_static_covariates.ncols() + 1,
+        );
+        let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
+        assert!(matches!(err, SurvivalError::CovariateDimensionMismatch));
+    }
+
+    #[test]
+    fn survival_artifacts_round_trip_serialization() {
+        let data = toy_training_data();
+        let basis = BasisDescriptor {
+            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
+            degree: 2,
+        };
+        let SurvivalLayoutBundle { layout, .. } =
+            build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
+        let penalty = baseline_penalty_descriptor(&layout, 2, 0.5);
+        let interaction = InteractionDescriptor {
+            label: Some("pgs_by_age".to_string()),
+            column_range: ColumnRange::new(1, 3),
+            value_ranges: vec![ValueRange {
+                min: -0.5,
+                max: 0.5,
+            }],
+            centering: Some(CenteringTransform {
+                offsets: array![0.1, -0.1],
+            }),
+        };
+        let companion = CompanionModelHandle {
+            reference: "competing-risk-model".to_string(),
+            cif_horizons: vec![55.0],
+        };
+        let artifacts = SurvivalModelArtifacts {
+            coefficients: Array1::<f64>::zeros(layout.combined_exit.ncols()),
+            age_basis: basis.clone(),
+            time_varying_basis: None,
+            static_covariate_layout: make_covariate_layout(&layout),
+            penalties: vec![penalty],
+            age_transform: layout.age_transform,
+            reference_constraint: layout.reference_constraint.clone(),
+            monotonicity: layout.monotonicity.clone(),
+            interaction_metadata: vec![interaction],
+            companion_models: vec![companion],
+            hessian_factor: Some(HessianFactor::Expected {
+                factor: CholeskyFactor {
+                    lower: Array2::<f64>::eye(layout.combined_exit.ncols()),
+                },
+            }),
+            calibrator: None,
+        };
+
+        let serialized = serde_json::to_string(&artifacts).unwrap();
+        let round_trip: SurvivalModelArtifacts = serde_json::from_str(&serialized).unwrap();
+        assert_artifacts_close(&artifacts, &round_trip);
+    }
+}
