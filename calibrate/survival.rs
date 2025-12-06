@@ -2319,9 +2319,80 @@ pub fn delta_method_standard_errors(
                 se[i] = y.dot(&y).sqrt();
             }
         }
-        HessianFactor::Observed { .. } => {
-            // LDLT standard error calculation is not yet implemented for the observed Hessian.
-            // Returning zeros allows the process to continue without SEs.
+        HessianFactor::Observed {
+            factor,
+            permutation,
+            ..
+        } => {
+            let dim = factor.lower.nrows();
+            let mut y = Array1::<f64>::zeros(dim);
+            let mut z = Array1::<f64>::zeros(dim);
+            let mut w = Array1::<f64>::zeros(dim);
+            let mut g_perm = Array1::<f64>::zeros(dim);
+
+            for i in 0..n {
+                let row = jacobian.row(i);
+
+                // 1. Permute the Jacobian row (gradient)
+                for k in 0..dim {
+                    g_perm[k] = row[permutation.forward[k]];
+                }
+
+                // 2. Forward Solve L y = g_perm
+                // L is unit lower triangular (implicit 1s on diagonal)
+                for r in 0..dim {
+                    let mut sum = 0.0;
+                    for c in 0..r {
+                        sum += factor.lower[[r, c]] * y[c];
+                    }
+                    y[r] = g_perm[r] - sum;
+                }
+
+                // 3. Diagonal Solve D z = y (Block diagonal D)
+                let mut k = 0;
+                while k < dim {
+                    // Check for 2x2 block using the same threshold as inertia calculation
+                    if k + 1 < dim && factor.subdiag[k].abs() > 1e-12 {
+                        let d11 = factor.diag[k];
+                        let d22 = factor.diag[k + 1];
+                        let d12 = factor.subdiag[k]; // D[k, k+1]
+
+                        let b1 = y[k];
+                        let b2 = y[k + 1];
+
+                        let det = d11 * d22 - d12 * d12;
+                        if det == 0.0 {
+                            return Err(SurvivalError::HessianSingular);
+                        }
+                        z[k] = (d22 * b1 - d12 * b2) / det;
+                        z[k + 1] = (-d12 * b1 + d11 * b2) / det;
+
+                        k += 2;
+                    } else {
+                        // 1x1 block
+                        let d = factor.diag[k];
+                        if d == 0.0 {
+                            return Err(SurvivalError::HessianSingular);
+                        }
+                        z[k] = y[k] / d;
+                        k += 1;
+                    }
+                }
+
+                // 4. Backward Solve L^T w = z
+                // L^T is unit upper triangular
+                for r in (0..dim).rev() {
+                    let mut sum = 0.0;
+                    for c in r + 1..dim {
+                        sum += factor.lower[[c, r]] * w[c];
+                    }
+                    w[r] = z[r] - sum;
+                }
+
+                // 5. Compute variance = g^T H^-1 g = g_perm^T w
+                let var = g_perm.dot(&w);
+                se[i] = if var > 0.0 { var.sqrt() } else { 0.0 };
+            }
         }
     }
     Ok(se)
