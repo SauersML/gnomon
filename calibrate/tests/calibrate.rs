@@ -328,8 +328,10 @@ fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     const FEMALE_ROWS: usize = 13_200;
     const MALE_CASES: usize = 206;
     const FEMALE_CASES: usize = 98;
-    const TARGET_PREVALENCE: f64 = 0.0092;
-    const MALE_TO_FEMALE_RATIO: f64 = 1.4;
+    // Calculate exact target prevalence
+    const TARGET_PREVALENCE: f64 = (MALE_CASES + FEMALE_CASES) as f64 / TOTAL_ROWS as f64;
+    // Calculate exact ratio based on integer counts
+    const MALE_TO_FEMALE_RATIO: f64 = ((MALE_CASES as f64) / (MALE_ROWS as f64)) / ((FEMALE_CASES as f64) / (FEMALE_ROWS as f64));
     const SCORE_EFFECT: f64 = 0.9;
 
     let mut rng = StdRng::seed_from_u64(7_316_511);
