@@ -12,6 +12,7 @@ use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
@@ -2071,51 +2072,57 @@ pub fn conditional_absolute_risk<'a, 'b>(
     Ok(1.0 - (-delta_h).exp())
 }
 
-/// Gauss-Legendre quadrature nodes and weights for N=30 on interval [-1, 1].
+/// Compute Gauss-Legendre quadrature nodes and weights for N points on interval [-1, 1].
+fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
+    let mut nodes_weights = Vec::with_capacity(n);
+    let m = (n + 1) / 2;
+    let pi = std::f64::consts::PI;
+
+    for i in 0..m {
+        // Initial guess for the root using asymptotic approximation
+        let mut z = (pi * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();
+        let mut pp = 0.0;
+
+        // Newton's method
+        for _ in 0..100 {
+            let mut p1 = 1.0;
+            let mut p2 = 0.0;
+            for j in 0..n {
+                let p3 = p2;
+                p2 = p1;
+                p1 = ((2.0 * j as f64 + 1.0) * z * p2 - j as f64 * p3) / (j as f64 + 1.0);
+            }
+            // p1 is P_n(z)
+            // pp is P'_n(z) calculated using derivative relation
+            pp = n as f64 * (z * p1 - p2) / (z * z - 1.0);
+            let z1 = z;
+            z = z1 - p1 / pp;
+
+            if (z - z1).abs() < 1e-14 {
+                break;
+            }
+        }
+
+        let x = z;
+        let w = 2.0 / ((1.0 - z * z) * pp * pp);
+
+        if n % 2 != 0 && i == m - 1 {
+            nodes_weights.push((0.0, w));
+        } else {
+            nodes_weights.push((-x, w));
+            nodes_weights.push((x, w));
+        }
+    }
+    nodes_weights.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    nodes_weights
+}
+
+/// Returns cached Gauss-Legendre quadrature nodes and weights for N=40 on interval [-1, 1].
 /// High precision is required for accurate integration of spline products.
-fn gauss_legendre_30() -> &'static [(f64, f64)] {
-    &[
-        (-0.998237709710559, 0.004521277098533),
-        (0.998237709710559, 0.004521277098533),
-        (-0.990726238699457, 0.010498286531121),
-        (0.990726238699457, 0.010498286531121),
-        (-0.977259949983774, 0.016421058381907),
-        (0.977259949983774, 0.016421058381907),
-        (-0.957916819213791, 0.022245849194167),
-        (0.957916819213791, 0.022245849194167),
-        (-0.932812808278676, 0.027937006980023),
-        (0.932812808278676, 0.027937006980023),
-        (-0.902098806968874, 0.033460195282547),
-        (0.902098806968874, 0.033460195282547),
-        (-0.865959503212259, 0.038782167974472),
-        (0.865959503212259, 0.038782167974472),
-        (-0.824612230833311, 0.043870908185673),
-        (0.824612230833311, 0.043870908185673),
-        (-0.778305651426519, 0.048695807635072),
-        (0.778305651426519, 0.048695807635072),
-        (-0.727318255189927, 0.053227846983937),
-        (0.727318255189927, 0.053227846983937),
-        (-0.671877951307150, 0.057439769099391),
-        (0.671877951307150, 0.057439769099391),
-        (-0.612285644900526, 0.061306291519617),
-        (0.612285644900526, 0.061306291519617),
-        (-0.548856958525342, 0.064809365193698),
-        (0.548856958525342, 0.064809365193698),
-        (-0.481944139629420, 0.067929624368118),
-        (0.481944139629420, 0.067929624368118),
-        (-0.411897487024645, 0.070652587649929),
-        (0.411897487024645, 0.070652587649929),
-        (-0.339029209612944, 0.072976486753833),
-        (0.339029209612944, 0.072976486753833),
-        (-0.263745043974125, 0.074891464522416),
-        (0.263745043974125, 0.074891464522416),
-        (-0.186524767955545, 0.076399986371308),
-        (0.186524767955545, 0.076399986371308),
-        (-0.107819865074751, 0.077505947978425),
-        (0.107819865074751, 0.077505947978425),
-        (-0.028069198030536, 0.078208538968872),
-        (0.028069198030536, 0.078208538968872),
-    ]
+/// Previously hardcoded as N=30 but values corresponded to N=40.
+fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
+    static CACHE: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
+    CACHE.get_or_init(|| compute_gauss_legendre_nodes(40))
 }
 
 /// Compute Crude Risk (Real-world risk) via numerical integration.
@@ -2186,7 +2193,7 @@ pub fn calculate_crude_risk_quadrature(
     // 3. Integrate segment by segment
     let mut total_risk = 0.0;
     let mut total_gradient = Array1::zeros(coeff_len_d);
-    let nodes_weights = gauss_legendre_30();
+    let nodes_weights = gauss_legendre_quadrature();
 
     // Design row at entry age for gradient term involving H_D(t0) X(t0)
     design_and_derivative_at_age_scratch(
