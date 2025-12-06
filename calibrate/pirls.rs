@@ -410,7 +410,7 @@ fn solve_newton_direction_dense(
 ) -> Result<Array1<f64>, EstimationError> {
     // Use the shared rook-pivoted LDLᵀ factorization plan; if it fails we bubble the
     // error so callers can surface a single fallback message instead of ridge loops.
-    let (lower, diag, subdiag, perm_fwd, perm_inv, _) =
+    let (lower, diag, subdiag, perm_fwd, _, _) =
         ldlt_rook(hessian).map_err(EstimationError::LinearSystemSolveFailed)?;
 
     let rhs = gradient.mapv(|v| -v);
