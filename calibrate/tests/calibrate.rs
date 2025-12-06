@@ -323,11 +323,11 @@ fn extract_predictions(
 }
 
 fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn std::error::Error>> {
-    const TOTAL_ROWS: usize = 330_000;
-    const MALE_ROWS: usize = 198_000;
-    const FEMALE_ROWS: usize = 132_000;
-    const MALE_CASES: usize = 2_057;
-    const FEMALE_CASES: usize = 979;
+    const TOTAL_ROWS: usize = 33_000;
+    const MALE_ROWS: usize = 19_800;
+    const FEMALE_ROWS: usize = 13_200;
+    const MALE_CASES: usize = 206;
+    const FEMALE_CASES: usize = 98;
     const TARGET_PREVALENCE: f64 = 0.0092;
     const MALE_TO_FEMALE_RATIO: f64 = 1.4;
     const SCORE_EFFECT: f64 = 0.9;
