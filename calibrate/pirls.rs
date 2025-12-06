@@ -418,7 +418,7 @@ fn solve_newton_direction_dense(
 
     let mut permuted = Array1::<f64>::zeros(n);
     for i in 0..n {
-        permuted[i] = rhs[perm_inv[i]];
+        permuted[i] = rhs[perm_fwd[i]];
     }
 
     let mut y = permuted;
