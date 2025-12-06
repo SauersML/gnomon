@@ -139,7 +139,7 @@ jobs:
 
       - name: Run calibrate-specific tests
         if: steps.rust_changes.outputs.calibrate == 'true'
-        run: 'cargo +nightly test --release calibrate:: -- --nocapture'
+        run: 'cargo +nightly test --release calib -- --nocapture'
 
       - name: Run map-specific tests
         if: steps.rust_changes.outputs.map == 'true'
