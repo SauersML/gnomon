@@ -3632,6 +3632,12 @@ pub mod internal {
             let link_is_logit = matches!(config.link_function(), LinkFunction::Logit);
             let balanced_root = &self.balanced_penalty_root;
 
+            // Capture the current best beta to warm-start the gradient probes.
+            // This is crucial for stability: if we start from zero, P-IRLS might converge
+            // to a different local optimum (or stall differently) than the main cost evaluation,
+            // creating huge phantom gradients that violate the envelope theorem.
+            let warm_start_initial = self.warm_start_beta.borrow().clone();
+
             // Run a fresh PIRLS solve for each perturbed smoothing vector.  We avoid the
             // `execute_pirls_if_needed` cache here because these evaluations happen in parallel
             // and never reuse the same ρ, so the cache would not help and would require
@@ -3647,7 +3653,7 @@ pub mod internal {
                     Some(balanced_root),
                     layout,
                     config,
-                    None,
+                    warm_start_initial.as_ref(),
                 )?;
 
                 match pirls_result.status {
@@ -3867,16 +3873,6 @@ pub mod internal {
                     }
                     // The fit was unstable. This is where we throw our specific, user-friendly error.
                     // Pass the diagnostic info into the error
-                    Err(EstimationError::PerfectSeparationDetected {
-                        iteration: pirls_result.iteration,
-                        max_abs_eta: pirls_result.max_abs_eta,
-                    })
-                }
-                pirls::PirlsStatus::Unstable => {
-                    if self.warm_start_enabled.get() {
-                        self.warm_start_beta.borrow_mut().take();
-                    }
-                    // The fit was unstable. This is where we throw our specific, user-friendly error.
                     Err(EstimationError::PerfectSeparationDetected {
                         iteration: pirls_result.iteration,
                         max_abs_eta: pirls_result.max_abs_eta,
