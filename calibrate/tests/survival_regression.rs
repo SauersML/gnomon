@@ -1,10 +1,8 @@
 use gnomon::calibrate::survival::{
-    CompanionModelHandle, SurvivalError, SurvivalModelArtifacts, SurvivalTrainingData,
-    conditional_absolute_risk, cumulative_incidence, resolve_companion_model,
+    SurvivalModelArtifacts, SurvivalTrainingData, conditional_absolute_risk, cumulative_incidence,
 };
 use ndarray::{Array1, Array2, Axis};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -237,47 +235,11 @@ fn conditional_risk_monotonic_with_calibration_toggle() {
     let t0 = 55.0;
     let horizons = [60.0, 62.0, 64.0, 66.0];
     let mut base = Vec::new();
-    let mut calibrated = Vec::new();
     for &t1 in &horizons {
-        let raw =
-            conditional_absolute_risk(t0, t1, &covs, Some(0.0), None, &trusted.artifacts).unwrap();
+        let raw = conditional_absolute_risk(t0, t1, &covs, &trusted.artifacts).unwrap();
         base.push(raw);
-        let cal =
-            conditional_absolute_risk(t0, t1, &covs, Some(0.12), None, &trusted.artifacts).unwrap();
-        calibrated.push(cal);
     }
     assert!(base.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
-    assert!(calibrated.windows(2).all(|w| w[1] + 1e-12 >= w[0]));
-}
-
-#[test]
-fn conditional_risk_missing_competing_inputs_error() {
-    let trusted = TrustedReference::load();
-    let covs = trusted.covariates_row(0);
-    let err =
-        conditional_absolute_risk(55.0, 60.0, &covs, None, None, &trusted.artifacts).unwrap_err();
-    assert!(matches!(err, SurvivalError::MissingCompanionCifData));
-}
-
-#[test]
-fn conditional_risk_matches_companion_reference() {
-    let trusted = TrustedReference::load();
-    let mut base = trusted.artifacts.clone();
-    base.companion_models = vec![CompanionModelHandle {
-        reference: "companion".to_string(),
-        cif_horizons: vec![55.0, 60.0],
-    }];
-    let mut registry = HashMap::new();
-    registry.insert("companion".to_string(), trusted.artifacts.clone());
-    let (handle, resolved) = resolve_companion_model(&base, "companion", &registry).unwrap();
-    let covs = trusted.covariates_row(0);
-    let explicit = cumulative_incidence(55.0, &covs, &registry["companion"]).unwrap();
-    let expected =
-        conditional_absolute_risk(55.0, 60.0, &covs, Some(explicit), None, &base).unwrap();
-    let via_companion =
-        conditional_absolute_risk(55.0, 60.0, &covs, None, Some((handle, resolved)), &base)
-            .unwrap();
-    assert!((via_companion - expected).abs() <= 1e-12);
 }
 
 #[test]

@@ -872,8 +872,6 @@ impl TrainedModel {
                         entry_age,
                         exit_age,
                         &cov_row,
-                        Some(0.0),
-                        None,
                         artifacts,
                     )?;
 
