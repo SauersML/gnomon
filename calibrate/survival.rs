@@ -2379,6 +2379,7 @@ mod tests {
     use logtest::Logger;
     use ndarray::array;
     use serde_json;
+    use serial_test::serial;
 
     fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
         let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];
@@ -2386,6 +2387,33 @@ mod tests {
             [matrix[[1, 1]] / det, -matrix[[0, 1]] / det],
             [-matrix[[1, 0]] / det, matrix[[0, 0]] / det]
         ]
+    }
+
+    fn finite_difference_derivatives(
+        model: &mut WorkingModelSurvival,
+        beta: &Array1<f64>,
+        epsilon: f64,
+    ) -> Result<(Array1<f64>, Array2<f64>), SurvivalError> {
+        let p = beta.len();
+        let mut gradient = Array1::<f64>::zeros(p);
+        let mut hessian = Array2::<f64>::zeros((p, p));
+
+        for column in 0..p {
+            let mut beta_plus = beta.to_owned();
+            beta_plus[column] += epsilon;
+            let plus_state = model.update_state(&beta_plus)?;
+
+            let mut beta_minus = beta.to_owned();
+            beta_minus[column] -= epsilon;
+            let minus_state = model.update_state(&beta_minus)?;
+
+            gradient[column] = (plus_state.deviance - minus_state.deviance) / (2.0 * epsilon);
+
+            let diff = (&plus_state.gradient - &minus_state.gradient) * (0.5 / epsilon);
+            hessian.column_mut(column).assign(&diff);
+        }
+
+        Ok((gradient, hessian))
     }
 
     #[test]
@@ -2427,6 +2455,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn apply_logit_risk_calibrator_respects_toggle() {
         reset_calibrator_flag();
         let data = toy_training_data();
@@ -3311,92 +3340,66 @@ mod tests {
         let mut model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
 
-        let p = layout.combined_exit.ncols();
-        let mut beta = Array1::<f64>::zeros(p);
         let baseline_cols = layout.baseline_exit.ncols();
-        for idx in 0..baseline_cols {
-            beta[idx] = 0.05 * (idx as f64 + 1.0);
-        }
-        for idx in baseline_cols..p {
-            beta[idx] = 0.01 * (idx as f64 + 1.0);
-        }
+        let time_cols = layout
+            .time_varying_exit
+            .as_ref()
+            .map(|matrix| matrix.ncols())
+            .unwrap_or(0);
+        let static_cols = layout.static_covariates.ncols();
+        let extra_cols = layout.extra_static_covariates.ncols();
 
-        let guard = spec.derivative_guard.max(f64::EPSILON);
-        let mut derivative_vector = layout.combined_derivative_exit.dot(&beta);
-        if derivative_vector.iter().all(|value| *value > guard) {
-            if baseline_cols > 0 {
-                beta[0] -= 0.25;
+        let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
+        let weights = Array1::from_elem(layout.baseline_derivative_exit.nrows(), 0.5);
+        let baseline_beta = layout.baseline_derivative_exit.t().dot(&weights);
+        beta.slice_mut(s![..baseline_cols]).assign(&baseline_beta);
+
+        let static_offset = baseline_cols + time_cols;
+        if static_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![static_offset..static_offset + static_cols])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = -0.1 + 0.05 * (idx as f64);
             }
-            derivative_vector = layout.combined_derivative_exit.dot(&beta);
         }
-        assert!(derivative_vector.iter().any(|value| *value <= guard));
-
-        let base_state = model.update_state(&beta).unwrap();
-        let eta_exit = layout.combined_exit.dot(&beta);
-        let eta_entry = layout.combined_entry.dot(&beta);
-        let h_exit = eta_exit.mapv(f64::exp);
-        let h_entry = eta_entry.mapv(f64::exp);
-
-        let mut manual_gradient = Array1::<f64>::zeros(p);
-        let mut manual_hessian = Array2::<f64>::zeros((p, p));
-
-        for i in 0..data.age_entry.len() {
-            let weight = data.sample_weight[i];
-            if weight == 0.0 {
-                continue;
-            }
-            let d = f64::from(data.event_target[i]);
-            let x_exit_row = layout.combined_exit.row(i);
-            let x_entry_row = layout.combined_entry.row(i);
-            let d_exit_row = layout.combined_derivative_exit.row(i);
-            let guard_threshold = spec.derivative_guard.max(f64::EPSILON);
-            let raw_derivative = derivative_vector[i];
-            let scale = if raw_derivative <= guard_threshold {
-                0.0
-            } else {
-                1.0 / raw_derivative
-            };
-            let mut x_tilde = x_exit_row.to_owned();
-            Zip::from(&mut x_tilde)
-                .and(&d_exit_row)
-                .for_each(|value, &deriv| *value += deriv * scale);
-
-            accumulate_weighted_vector(&mut manual_gradient, 2.0 * weight * h_exit[i], &x_exit_row);
-            accumulate_weighted_vector(
-                &mut manual_gradient,
-                -2.0 * weight * h_entry[i],
-                &x_entry_row,
-            );
-            if d > 0.0 {
-                accumulate_weighted_vector(&mut manual_gradient, -2.0 * weight * d, &x_tilde);
-            }
-
-            accumulate_symmetric_outer(&mut manual_hessian, 2.0 * weight * h_exit[i], &x_exit_row);
-            accumulate_symmetric_outer(
-                &mut manual_hessian,
-                -2.0 * weight * h_entry[i],
-                &x_entry_row,
-            );
-            if d > 0.0 && scale != 0.0 {
-                accumulate_symmetric_outer(
-                    &mut manual_hessian,
-                    2.0 * weight * d * scale * scale,
-                    &d_exit_row,
-                );
+        if extra_cols > 0 {
+            for (idx, value) in beta
+                .slice_mut(s![
+                    static_offset + static_cols..static_offset + static_cols + extra_cols
+                ])
+                .iter_mut()
+                .enumerate()
+            {
+                *value = 0.02 * (idx as f64 + 1.0);
             }
         }
 
-        for (observed, expected) in manual_gradient.iter().zip(base_state.gradient.iter()) {
-            assert_abs_diff_eq!(*observed, *expected, epsilon = 1e-8);
+        let derivative_exit = layout.combined_derivative_exit.dot(&beta);
+        assert!(
+            derivative_exit
+                .iter()
+                .all(|value| *value > spec.derivative_guard)
+        );
+
+        let epsilon = 1e-6;
+        let (numeric_gradient, numeric_hessian) =
+            finite_difference_derivatives(&mut model, &beta, epsilon).unwrap();
+
+        let analytic_state = model.update_state(&beta).unwrap();
+
+        for (numeric, analytic) in numeric_gradient.iter().zip(analytic_state.gradient.iter()) {
+            assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-7);
         }
 
-        for (manual_row, observed_row) in manual_hessian
+        for (numeric_row, analytic_row) in numeric_hessian
             .rows()
             .into_iter()
-            .zip(base_state.hessian.rows())
+            .zip(analytic_state.hessian.rows())
         {
-            for (manual_val, observed_val) in manual_row.iter().zip(observed_row.iter()) {
-                assert_abs_diff_eq!(*manual_val, *observed_val, epsilon = 1e-6);
+            for (numeric, analytic) in numeric_row.iter().zip(analytic_row.iter()) {
+                assert_abs_diff_eq!(numeric, analytic, epsilon = 1e-6);
             }
         }
     }
