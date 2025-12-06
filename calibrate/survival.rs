@@ -3009,8 +3009,7 @@ mod tests {
         let cif0 = cumulative_incidence(55.0, &covs, &artifacts).unwrap();
         let cif1 = cumulative_incidence(60.0, &covs, &artifacts).unwrap();
         assert!(cif1 >= cif0 - 1e-9);
-        let risk =
-            conditional_absolute_risk(55.0, 60.0, &covs, Some(0.0), None, &artifacts).unwrap();
+        let risk = conditional_absolute_risk(55.0, 60.0, &covs, &artifacts).unwrap();
         assert!(risk >= -1e-9);
     }
 
@@ -3110,22 +3109,10 @@ mod tests {
         }]);
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
 
-        let (handle, resolved) =
-            resolve_companion_model(&base_artifacts, "companion", &registry).unwrap();
-        let explicit = cumulative_incidence(55.0, &covs, &registry["companion"]).unwrap();
-        let expected =
-            conditional_absolute_risk(55.0, 60.0, &covs, Some(explicit), None, &base_artifacts)
-                .unwrap();
-        let via_companion = conditional_absolute_risk(
-            55.0,
-            60.0,
-            &covs,
-            None,
-            Some((handle, resolved)),
-            &base_artifacts,
-        )
-        .unwrap();
-        assert_abs_diff_eq!(via_companion, expected, epsilon = 1e-12);
+        let via_companion = conditional_absolute_risk(55.0, 60.0, &covs, &base_artifacts).unwrap();
+        let direct =
+            conditional_absolute_risk(55.0, 60.0, &covs, &registry["companion"]).unwrap();
+        assert_abs_diff_eq!(via_companion, direct, epsilon = 1e-12);
     }
 
     #[test]
