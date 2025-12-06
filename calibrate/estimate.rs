@@ -3785,12 +3785,10 @@ pub mod internal {
                 }
             }
 
-            println!("  -> Solving inner P-IRLS loop for this evaluation...");
-
             // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
             let lambdas_for_logging = rho.mapv(f64::exp);
             println!(
-                "Smoothing parameters for this evaluation: [{:.2e}, {:.2e}, ...]",
+                "  -> P-IRLS eval | Smooth: [{:.2e}, {:.2e}, ...]",
                 lambdas_for_logging.get(0).unwrap_or(&0.0),
                 lambdas_for_logging.get(1).unwrap_or(&0.0)
             );
