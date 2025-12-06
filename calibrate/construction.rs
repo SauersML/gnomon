@@ -593,6 +593,7 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 
     let a_cols = a.ncols();
     let b_cols = b.ncols();
+
     // Trivial early return for degenerate shapes
     if n_samples == 0 || a_cols == 0 || b_cols == 0 {
         return Array2::zeros((n_samples, a_cols * b_cols));
