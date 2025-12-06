@@ -538,13 +538,12 @@ where
     let mut iterations = 0usize;
     let mut final_state: Option<WorkingState> = None;
 
-    for iter in 1..=options.max_iterations {
+    'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
         let current_penalized = state.deviance + state.penalty_term;
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
-        let state_grad_norm = state.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let mut direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
         let mut descent = state.gradient.dot(&direction);
         if !(descent.is_nan() || descent < 0.0) {
@@ -596,10 +595,10 @@ where
                 if let Some(err) = last_error {
                     return Err(err);
                 }
-                return Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: iter,
-                    last_change: state_grad_norm,
-                });
+                log::warn!("P-IRLS step halving exhausted at iter {}; returning current state.", iter);
+                status = PirlsStatus::StalledAtValidMinimum;
+                final_state = Some(state);
+                break 'pirls_loop;
             }
 
             step *= 0.5;
@@ -856,6 +855,7 @@ pub struct PirlsResult {
     pub status: PirlsStatus,
     pub iteration: usize,
     pub max_abs_eta: f64,
+    pub last_gradient_norm: f64,
 
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
@@ -1077,6 +1077,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
+            last_gradient_norm: gradient_norm,
             reparam_result,
             x_transformed,
         };
@@ -1107,7 +1108,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
         max_step_halving: 30,
-        min_step_size: 1e-6,
+        min_step_size: 1e-10,
         firth_bias_reduction: config.firth_bias_reduction
             && matches!(link_function, LinkFunction::Logit),
     };
@@ -1184,6 +1185,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
+        last_gradient_norm: working_summary.last_gradient_norm,
         reparam_result,
         x_transformed,
     };

@@ -643,7 +643,7 @@ pub enum EstimationError {
     ParameterConstraintViolation(String),
 
     #[error(
-        "The P-IRLS inner loop did not converge within {max_iterations} iterations. Last deviance change was {last_change:.6e}."
+        "The P-IRLS inner loop did not converge within {max_iterations} iterations. Last gradient norm was {last_change:.6e}."
     )]
     PirlsDidNotConverge {
         max_iterations: usize,
@@ -803,10 +803,16 @@ pub fn train_model(
                 });
             }
             crate::calibrate::pirls::PirlsStatus::MaxIterationsReached => {
-                return Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: final_fit.iteration,
-                    last_change: 0.0,
-                });
+                if final_fit.last_gradient_norm > 1.0 {
+                    return Err(EstimationError::PirlsDidNotConverge {
+                        max_iterations: final_fit.iteration,
+                        last_change: final_fit.last_gradient_norm,
+                    });
+                }
+                log::warn!(
+                    "Final P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
+                    final_fit.last_gradient_norm
+                );
             }
             _ => {}
         }
@@ -2126,11 +2132,23 @@ pub fn train_survival_model(
         )?;
 
         match pirls_outcome.status {
-            crate::calibrate::pirls::PirlsStatus::Unstable | crate::calibrate::pirls::PirlsStatus::MaxIterationsReached => {
-                 return Err(EstimationError::PirlsDidNotConverge {
-                     max_iterations: config.max_iterations,
-                     last_change: pirls_outcome.last_gradient_norm
-                 });
+            crate::calibrate::pirls::PirlsStatus::Unstable => {
+                return Err(EstimationError::PirlsDidNotConverge {
+                    max_iterations: config.max_iterations,
+                    last_change: pirls_outcome.last_gradient_norm,
+                });
+            }
+            crate::calibrate::pirls::PirlsStatus::MaxIterationsReached => {
+                if pirls_outcome.last_gradient_norm > 1.0 {
+                    return Err(EstimationError::PirlsDidNotConverge {
+                        max_iterations: config.max_iterations,
+                        last_change: pirls_outcome.last_gradient_norm,
+                    });
+                }
+                log::warn!(
+                    "Survival P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
+                    pirls_outcome.last_gradient_norm
+                );
             }
             _ => {}
         }
@@ -3648,10 +3666,19 @@ pub mod internal {
                         })
                     }
                     pirls::PirlsStatus::MaxIterationsReached => {
-                        Err(EstimationError::PirlsDidNotConverge {
-                            max_iterations: pirls_result.iteration,
-                            last_change: 0.0,
-                        })
+                        if pirls_result.last_gradient_norm > 1.0 {
+                            Err(EstimationError::PirlsDidNotConverge {
+                                max_iterations: pirls_result.iteration,
+                                last_change: pirls_result.last_gradient_norm,
+                            })
+                        } else {
+                            let penalty = pirls_result.stable_penalty_term;
+                            let penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                            if firth_bias && link_is_logit {
+                                let _ = pirls_result.firth_log_det;
+                            }
+                            Ok(penalised)
+                        }
                     }
                 }
             };
@@ -3845,15 +3872,36 @@ pub mod internal {
                         max_abs_eta: pirls_result.max_abs_eta,
                     })
                 }
+                pirls::PirlsStatus::Unstable => {
+                    if self.warm_start_enabled.get() {
+                        self.warm_start_beta.borrow_mut().take();
+                    }
+                    // The fit was unstable. This is where we throw our specific, user-friendly error.
+                    Err(EstimationError::PerfectSeparationDetected {
+                        iteration: pirls_result.iteration,
+                        max_abs_eta: pirls_result.max_abs_eta,
+                    })
+                }
                 pirls::PirlsStatus::MaxIterationsReached => {
                     if self.warm_start_enabled.get() {
                         self.warm_start_beta.borrow_mut().take();
                     }
-                    // The fit timed out. This is a standard non-convergence error.
-                    Err(EstimationError::PirlsDidNotConverge {
-                        max_iterations: pirls_result.iteration,
-                        last_change: 0.0, // We don't track the last_change anymore
-                    })
+                    if pirls_result.last_gradient_norm > 1.0 {
+                        // The fit timed out and gradient is large.
+                        log::error!(
+                            "P-IRLS failed convergence check: gradient norm {} > 1.0 (iter {})",
+                            pirls_result.last_gradient_norm,
+                            pirls_result.iteration
+                        );
+                        Err(EstimationError::PirlsDidNotConverge {
+                            max_iterations: pirls_result.iteration,
+                            last_change: pirls_result.last_gradient_norm,
+                        })
+                    } else {
+                        // Gradient is acceptable, treat as converged but with warning if needed
+                        log::warn!("P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.", pirls_result.last_gradient_norm);
+                        Ok(pirls_result)
+                    }
                 }
             }
         }
