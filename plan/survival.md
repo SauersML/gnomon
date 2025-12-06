@@ -209,7 +209,7 @@ Expose:
 ```rust
 fn cumulative_hazard(age: f64, covariates: &Covariates) -> f64;
 fn cumulative_incidence(age: f64, covariates: &Covariates) -> f64;
-fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates, cif_competing_t0: f64) -> f64;
+fn conditional_absolute_risk(t0: f64, t1: f64, covariates: &Covariates) -> f64;
 ```
 - All prediction APIs surface per-subject risks under the frequency-weighted fit. We do not rescale outputs for inverse-probability sampling or provide sandwich-standard-error corrections at prediction time.
 

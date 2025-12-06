@@ -2048,22 +2048,12 @@ pub fn cumulative_incidence(
 /// Compute Net Risk (Hypothetical risk of disease assuming no competing events).
 /// P(Event in (t0, t1] | Survival to t0, No competing risks)
 /// Formula: 1 - exp( - (H_dis(t1) - H_dis(t0)) )
-///
-/// Matches legacy signature for compatibility, but ignores competing arguments when calculating pure Net Risk.
-pub fn conditional_absolute_risk<'a, 'b>(
+pub fn conditional_absolute_risk(
     t0: f64,
     t1: f64,
     covariates: &Array1<f64>,
-    cif_competing_t0: Option<f64>,
-    companion: Option<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts)>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
-    // Touch values to satisfy linter
-    if cif_competing_t0.is_some() || companion.is_some() {
-        // This function calculates Net Risk which ignores competing risks.
-        // We keep the arguments for signature compatibility.
-    }
-
     let h0 = cumulative_hazard(t0, covariates, artifacts)?;
     let h1 = cumulative_hazard(t1, covariates, artifacts)?;
     // Ensure monotonicity numerically
