@@ -1,3 +1,17 @@
+Microarray data should be downloaded if you haven't already:
+```
+gsutil -u "$GOOGLE_PROJECT" -m cp -r gs://fc-aou-datasets-controlled/v8/microarray/plink/* .
+```
+
+Install gnomon:
+```
+!curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && { for f in ~/.bashrc ~/.profile; do [ -f "$f" ] || touch "$f"; grep -qxF 'source "$HOME/.cargo/env"' "$f" || printf '\n# Rust / Cargo\nsource "$HOME/.cargo/env"\n' >> "$f"; done; } && source "$HOME/.cargo/env" && git clone https://github.com/SauersML/gnomon.git && cd gnomon && rustup override set nightly && cargo build --release && cd ~
+```
+
+```
+./gnomon/target/release/gnomon score "PGS004146, PGS004898, PGS003334, PGS003852, PGS005199, PGS004150, PGS000007, PGS000508, PGS000332" arrays
+```
+
 Run this:
 ```
 import os
