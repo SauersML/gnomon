@@ -445,3 +445,191 @@ for res in final_models:
     print("-" * 60)
 ```
 
+Make some plots:
+```
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import warnings
+
+warnings.filterwarnings('ignore')
+sns.set_style("whitegrid")
+plt.rcParams['font.size'] = 10
+
+DECILE_COLORS = sns.color_palette("RdYlGn_r", 10)
+RISK_COLORS = {'low': '#2ecc71', 'average': '#95a5a6', 'high': '#e74c3c'}
+
+DISEASE_NAMES = {
+    'alzheimers': "Alzheimer's Disease",
+    'colorectal': 'Colorectal Cancer',
+    'obesity': 'Obesity',
+    'breast': 'Breast Cancer'
+}
+
+def wilson_ci(n_success, n_total, confidence=0.95):
+    if n_total == 0:
+        return 0, 0
+    p = n_success / n_total
+    z = stats.norm.ppf((1 + confidence) / 2)
+    denominator = 1 + z**2 / n_total
+    centre = (p + z**2 / (2 * n_total)) / denominator
+    margin = z * np.sqrt(p * (1 - p) / n_total + z**2 / (4 * n_total**2)) / denominator
+    return centre - margin, centre + margin
+
+summary_data = []
+
+for res in final_models:
+    disease_key = res['disease']
+    disease = DISEASE_NAMES.get(disease_key, disease_key.title())
+    df = res['data'].copy()
+    weights = res['model_full'].params
+    
+    df['genetic_component'] = 0
+    for col, std_col in zip(res['pgs_cols'], res['std_cols']):
+        if std_col in weights:
+            val_std = (df[col] - res['means'][col]) / res['stds'][col]
+            df['genetic_component'] += val_std * weights[std_col]
+    
+    df['pgs_decile'] = pd.qcut(df['genetic_component'], 10, labels=False, duplicates='drop') + 1
+    decile_stats = df.groupby('pgs_decile').agg({
+        'case': ['sum', 'count', 'mean']
+    }).reset_index()
+    decile_stats.columns = ['decile', 'cases', 'total', 'prevalence']
+    decile_stats['prevalence_pct'] = decile_stats['prevalence'] * 100
+    decile_stats['ci_lower'] = decile_stats.apply(
+        lambda x: wilson_ci(x['cases'], x['total'])[0] * 100, axis=1)
+    decile_stats['ci_upper'] = decile_stats.apply(
+        lambda x: wilson_ci(x['cases'], x['total'])[1] * 100, axis=1)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(decile_stats['decile'], decile_stats['prevalence_pct'],
+                  color=DECILE_COLORS, edgecolor='white', linewidth=1.5, alpha=0.85)
+    ax.errorbar(decile_stats['decile'], decile_stats['prevalence_pct'],
+                yerr=[decile_stats['prevalence_pct'] - decile_stats['ci_lower'],
+                      decile_stats['ci_upper'] - decile_stats['prevalence_pct']],
+                fmt='none', ecolor='black', capsize=3, alpha=0.4, linewidth=1.5)
+    
+    ax.set_xlabel('Combined Genetic Risk Score (1=Lowest, 10=Highest)', fontsize=11)
+    ax.set_ylabel('Observed Prevalence (%)', fontsize=11)
+    ax.set_title(f'{disease} — Disease Rate by Genetic Risk Decile', fontsize=13, pad=15)
+    ax.set_xticks(range(1, 11))
+    ax.set_xticklabels([f'{i}\n(Low)' if i==1 else f'{i}\n(High)' if i==10 else str(i) 
+                        for i in range(1, 11)], fontsize=9)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    for bar, (_, row) in zip(bars, decile_stats.iterrows()):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height, f'n={int(row["total"]):,}',
+                ha='center', va='bottom', fontsize=7, color='black', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(f'../../{disease_key}_decile.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    df['genetic_risk_group'] = pd.cut(
+        df['genetic_component'],
+        bins=[df['genetic_component'].min(), df['genetic_component'].quantile(0.10),
+              df['genetic_component'].quantile(0.90), df['genetic_component'].max()],
+        labels=['Low (Bottom 10%)', 'Average (Middle 80%)', 'High (Top 10%)'],
+        include_lowest=True)
+    
+    age_thresholds = np.arange(40, 91, 1)
+    
+    for sex_val, sex_label in [(0, 'Females'), (1, 'Males')]:
+        df_sex = df[df['sex_binary'] == sex_val].copy()
+        
+        if len(df_sex) < 100:
+            continue
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        plot_created = False
+        for risk_group, color, label_base in [
+            ('Low (Bottom 10%)', RISK_COLORS['low'], 'Low genetic risk (Bottom 10%)'),
+            ('Average (Middle 80%)', RISK_COLORS['average'], 'Average genetic risk'),
+            ('High (Top 10%)', RISK_COLORS['high'], 'High genetic risk (Top 10%)')]:
+            
+            df_group = df_sex[df_sex['genetic_risk_group'] == risk_group].copy()
+            if len(df_group) < 10:
+                continue
+            
+            cumulative_ages = []
+            cumulative_risks = []
+            cumulative_ns = []
+            ci_lowers = []
+            ci_uppers = []
+            
+            for age_threshold in age_thresholds:
+                df_up_to_age = df_group[df_group['age'] <= age_threshold]
+                
+                if len(df_up_to_age) >= 20:
+                    n_total = len(df_up_to_age)
+                    n_cases = df_up_to_age['case'].sum()
+                    cumulative_risk = (n_cases / n_total) * 100
+                    
+                    ci_low, ci_high = wilson_ci(n_cases, n_total)
+                    
+                    cumulative_ages.append(age_threshold)
+                    cumulative_risks.append(cumulative_risk)
+                    cumulative_ns.append(n_total)
+                    ci_lowers.append(ci_low * 100)
+                    ci_uppers.append(ci_high * 100)
+            
+            if len(cumulative_ages) < 3:
+                continue
+            
+            total_n = df_group.shape[0]
+            label_with_n = f'{label_base} (n={total_n:,})'
+            
+            linewidth = 3 if 'High' in risk_group else 2
+            linestyle = '-' if 'Average' in risk_group else '--'
+            
+            ax.plot(cumulative_ages, cumulative_risks,
+                   marker='o', label=label_with_n, color=color, linewidth=linewidth, 
+                   linestyle=linestyle, markersize=4, alpha=0.9, markevery=5)
+            ax.fill_between(cumulative_ages, ci_lowers, ci_uppers, 
+                           alpha=0.15, color=color)
+            
+            plot_created = True
+        
+        if not plot_created:
+            plt.close(fig)
+            continue
+        
+        ax.set_xlabel('Age (years)', fontsize=11)
+        ax.set_ylabel('Cumulative Risk (%)', fontsize=11)
+        ax.set_title(f'{disease} — Cumulative Risk by Age and Genetics ({sex_label})', 
+                    fontsize=13, pad=15)
+        ax.legend(frameon=True, fancybox=True, shadow=True, fontsize=9, loc='upper left')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_xlim(38, 92)
+        
+        plt.tight_layout()
+        sex_suffix = 'female' if sex_val == 0 else 'male'
+        plt.savefig(f'../../{disease_key}_age_{sex_suffix}.png', dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    low_risk = df[df['genetic_component'] <= df['genetic_component'].quantile(0.10)]['case'].mean() * 100
+    high_risk = df[df['genetic_component'] >= df['genetic_component'].quantile(0.90)]['case'].mean() * 100
+    fold_change = high_risk / low_risk if low_risk > 0 else float('inf')
+    summary_data.append({
+        'Disease': disease,
+        'Low 10%': low_risk,
+        'High 10%': high_risk,
+        'Fold Change': fold_change
+    })
+
+summary_df = pd.DataFrame(summary_data)
+print("\n" + "="*70)
+print("GENETIC RISK IMPACT SUMMARY")
+print("="*70)
+print(f"{'Disease':<22} {'Low 10%':>10} {'High 10%':>10} {'Fold Change':>12}")
+print("-"*70)
+for _, row in summary_df.iterrows():
+    print(f"{row['Disease']:<22} {row['Low 10%']:>9.2f}% {row['High 10%']:>9.2f}% {row['Fold Change']:>11.2f}x")
+print("="*70)
+```
