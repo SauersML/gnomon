@@ -9,7 +9,7 @@ use crate::score::types::{
 use ahash::AHashMap;
 use crossbeam_channel::{Receiver, bounded};
 use crossbeam_queue::ArrayQueue;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{Mmap, MmapOptions};
 use num_cpus;
 use rand::{RngCore, thread_rng};
@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -44,6 +44,26 @@ struct SpoolState {
     writer: BufWriter<File>,
     offsets: AHashMap<BimRowIndex, u64>,
     cursor: u64,
+}
+
+fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
+    let draw_target = if std::io::stderr().is_terminal() {
+        ProgressDrawTarget::stderr_with_hz(20)
+    } else {
+        ProgressDrawTarget::hidden()
+    };
+
+    let pb = ProgressBar::with_draw_target(len, draw_target);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.set_message(message);
+
+    pb
 }
 
 // ========================================================================================
@@ -192,15 +212,7 @@ fn run_single_file_pipeline(
     // Progress Reporting Setup
     let variants_to_process = context.prep_result.num_reconciled_variants as u64;
     let variants_processed_count = Arc::new(AtomicU64::new(0));
-    let pb = ProgressBar::new(variants_to_process);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
-    pb.set_message("Computing scores...");
+    let pb = create_progress_bar(variants_to_process, "Computing scores...");
 
     // --- 2. Pre-computation & STRATEGY SELECTION ---
     let prep_result = &context.prep_result;
@@ -534,15 +546,7 @@ fn run_multi_file_pipeline(
     // Progress Reporting Setup
     let variants_to_process = context.prep_result.num_reconciled_variants as u64;
     let variants_processed_count = Arc::new(AtomicU64::new(0));
-    let pb = ProgressBar::new(variants_to_process);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
-    pb.set_message("Computing scores...");
+    let pb = create_progress_bar(variants_to_process, "Computing scores...");
 
     // --- 2. Pre-computation (same as single-file) ---
     let prep_result = &context.prep_result;
