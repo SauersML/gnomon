@@ -633,3 +633,24 @@ for _, row in summary_df.iterrows():
     print(f"{row['Disease']:<22} {row['Low 10%']:>9.2f}% {row['High 10%']:>9.2f}% {row['Fold Change']:>11.2f}x")
 print("="*70)
 ```
+
+Let's say we want to run these scores on a new sample with a different genome build (hg37). First, we download the scores into a new directory `scorefiles`:
+```
+mkdir -p scorefiles && printf "%s\n" PGS004146 PGS004898 PGS003334 PGS003852 PGS005199 PGS004150 PGS000007 PGS000508 PGS000332 | xargs -I {} -P 4 wget -P scorefiles "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{}/ScoringFiles/Harmonized/{}_hmPOS_GRCh37.txt.gz"
+```
+
+Unzip them:
+```
+ls scorefiles/*.gz | xargs -P 4 -n 1 gunzip
+```
+
+Let's assume we have files called multiallelic.bed, multiallelic.bim, and multiallelic.fam in the current directory. We can now run:
+
+```
+./gnomon/target/release/gnomon score scorefiles multiallelic
+```
+
+The "scorefiles" argument means to look for the scorefiles in the scorefiles directory, while the "multiallelic" argument specifies the genotype file prefix.
+
+
+
