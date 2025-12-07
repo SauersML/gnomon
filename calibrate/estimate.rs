@@ -3872,16 +3872,6 @@ pub mod internal {
                         max_abs_eta: pirls_result.max_abs_eta,
                     })
                 }
-                pirls::PirlsStatus::Unstable => {
-                    if self.warm_start_enabled.get() {
-                        self.warm_start_beta.borrow_mut().take();
-                    }
-                    // The fit was unstable. This is where we throw our specific, user-friendly error.
-                    Err(EstimationError::PerfectSeparationDetected {
-                        iteration: pirls_result.iteration,
-                        max_abs_eta: pirls_result.max_abs_eta,
-                    })
-                }
                 pirls::PirlsStatus::MaxIterationsReached => {
                     if self.warm_start_enabled.get() {
                         self.warm_start_beta.borrow_mut().take();
