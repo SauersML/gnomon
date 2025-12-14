@@ -89,6 +89,7 @@ jobs:
           echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo registry (CI speed only)
+        if: steps.rust_changes.outputs.rust == 'true'
         uses: actions/cache@v4
         with:
           path: |
