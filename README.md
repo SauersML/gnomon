@@ -18,8 +18,16 @@ Gnomon is a high-performance Rust engine for computing and calibrating polygenic
 - **[`terms/`](terms/)** – Infer sample-level metadata terms, starting with sex inference. See [`terms/README.md`](terms/README.md) for CLI usage and integration tips.
 - **[`examples/`](examples/)** – Reproduce published polygenic score analyses and validate calibration performance.
 
-## Quick Start
+## Installation
 
+### Automatic Install (Recommended)
+Installs the latest binary for your platform (macOS/Linux):
+```bash
+curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
+```
+
+### Build from Source
+To build the latest development version:
 ```
 # Install Rust nightly
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && { for f in ~/.bashrc ~/.profile; do [ -f "$f" ] || touch "$f"; grep -qxF 'source "$HOME/.cargo/env"' "$f" || printf '\n# Rust / Cargo\nsource "$HOME/.cargo/env"\n' >> "$f"; done; } && source "$HOME/.cargo/env" && rustup toolchain install nightly && rustup default nightly
