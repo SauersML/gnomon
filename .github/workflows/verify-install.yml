@@ -1,0 +1,29 @@
+name: Verify Install Script
+
+on:
+  workflow_run:
+    workflows: ["Build and Release All"]
+    types:
+      - completed
+
+jobs:
+  verify:
+    name: Verify on ${{ matrix.os }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Install Script
+        run: ./install.sh
+
+      - name: Verify Installation
+        run: |
+          echo "Verifying gnomon..."
+          gnomon --help
+          gnomon --version
