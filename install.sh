@@ -107,12 +107,23 @@ curl -L --progress-bar -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"
 log_info "Extracting..."
 tar -xzf "$ARCHIVE_PATH" -C "$TEMP_DIR"
 
-# Determine binary location after extraction (it might be in a subdir or root)
-# We look for the binary named 'gnomon' (or 'gnomon.exe' though this script is bash)
-SOURCE_BIN=$(find "$TEMP_DIR" -type f -name "${BINARY_NAME}" | head -n 1)
+# Determine binary location after extraction.
+# The binary inside the tarball is named identically to the asset (minus extensions)
+# e.g. gnomon-macos-arm64.tar.gz -> gnomon-macos-arm64
+INTERNAL_BIN_NAME="${TARGET_ASSET%.tar.gz}"
 
-if [ ! -f "$SOURCE_BIN" ]; then
+# Search for this specific file
+SOURCE_BIN=$(find "$TEMP_DIR" -type f -name "${INTERNAL_BIN_NAME}" | head -n 1)
+
+# Fallback: if not found, look for any executable file that is not the archive itself
+if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
+    log_info "Exact match not found. Searching for executable..."
+    SOURCE_BIN=$(find "$TEMP_DIR" -type f -perm +111 ! -name "*.*" | head -n 1)
+fi
+
+if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
     log_error "Binary not found in extracted archive."
+    log_error "Contents of extraction: $(ls -R "$TEMP_DIR")"
     exit 1
 fi
 
