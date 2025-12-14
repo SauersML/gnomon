@@ -26,16 +26,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # NOTE: ARM targets temporarily disabled due to ring 0.17.x + nightly incompatibility
-          # See: https://github.com/briansmith/ring/issues - CAPS_STATIC assertion failure
-          # TODO: Re-enable when ring fixes nightly support or update to newer ring version
-          #
-          # # MacOS ARM (Apple Silicon)
-          # - os: macos-14
-          #   target: aarch64-apple-darwin
-          #   artifact_name: gnomon
-          #   asset_name: gnomon-macos-arm64
-          #   use_cross: false
+          # MacOS ARM (Apple Silicon)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact_name: gnomon
+            asset_name: gnomon-macos-arm64
+            use_cross: false
 
           # MacOS Intel
           - os: macos-15
@@ -51,12 +47,12 @@ jobs:
             asset_name: gnomon-linux-x64
             use_cross: false
 
-          # # Linux ARM64 - disabled due to cross-compile issues with build.rs
-          # - os: ubuntu-latest
-          #   target: aarch64-unknown-linux-gnu
-          #   artifact_name: gnomon
-          #   asset_name: gnomon-linux-arm64
-          #   use_cross: true
+          # Linux ARM64 (cross-compile from x86 runner)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: gnomon
+            asset_name: gnomon-linux-arm64
+            use_cross: true
 
           # Windows x86_64
           - os: windows-latest
@@ -65,19 +61,20 @@ jobs:
             asset_name: gnomon-windows-x64
             use_cross: false
 
-          # # Windows ARM64 - disabled due to ring+nightly issues
-          # - os: windows-latest
-          #   target: aarch64-pc-windows-msvc
-          #   artifact_name: gnomon.exe
-          #   asset_name: gnomon-windows-arm64
-          #   use_cross: false
+          # Windows ARM64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: gnomon.exe
+            asset_name: gnomon-windows-arm64
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-12-01
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies
