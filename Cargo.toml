@@ -37,7 +37,7 @@ ryu = "1.0.20"
 crossbeam-channel = "0.5.15"
 natord = "1.0.9"
 bumpalo = { version = "3.19.0", features = ["collections"] }
-dwldutil = { version = "3.1.1", features = ["indicatif_indicator"] }
+
 indicatif = "0.18"
 google-cloud-storage = "1.1.0"
 google-cloud-auth = "1.0.1"

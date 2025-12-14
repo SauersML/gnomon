@@ -6,8 +6,8 @@
 
 use crate::score::reformat;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
-use dwldutil::indicator::{IndicateSignal, Indicator, IndicatorFactory};
-use dwldutil::{DLFile, Downloader};
+use reqwest::blocking::Client;
+use std::io::Write;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
@@ -18,68 +18,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// ========================================================================================
-//                               Progress indicator adapter
-// ========================================================================================
 
-#[derive(Clone)]
-struct DownloadIndicatorFactory {
-    style: ProgressStyle,
-    multiprogress: Arc<MultiProgress>,
-}
-
-impl DownloadIndicatorFactory {
-    fn new(style: ProgressStyle) -> Self {
-        Self {
-            style,
-            multiprogress: Arc::new(MultiProgress::new()),
-        }
-    }
-}
-
-impl Default for DownloadIndicatorFactory {
-    fn default() -> Self {
-        Self::new(ProgressStyle::default_bar())
-    }
-}
-
-impl IndicatorFactory for DownloadIndicatorFactory {
-    fn create_task(&self, name: &str, size: u64) -> impl Indicator {
-        let bar = ProgressBar::new(size).with_style(self.style.clone());
-        bar.set_draw_target(ProgressDrawTarget::hidden());
-        let bar = self.multiprogress.add(bar);
-        bar.set_message(name.to_string());
-        DownloadIndicatorTask { bar }
-    }
-}
-
-struct DownloadIndicatorTask {
-    bar: ProgressBar,
-}
-
-impl Indicator for DownloadIndicatorTask {
-    fn effect(&mut self, position: u64) {
-        self.bar.set_position(position);
-    }
-
-    fn signal(&mut self, signal: IndicateSignal) {
-        match signal {
-            IndicateSignal::Fail(message) => {
-                self.bar
-                    .finish_with_message(format!("Error -- {}", message));
-            }
-            IndicateSignal::State(message) => {
-                self.bar.set_message(message);
-            }
-            IndicateSignal::Success() => {
-                self.bar.finish_with_message("Done!".to_string());
-            }
-            IndicateSignal::Start() => {
-                self.bar.set_draw_target(ProgressDrawTarget::stdout());
-            }
-        }
-    }
-}
 
 // ========================================================================================
 //                              Public API
@@ -306,8 +245,6 @@ mod tests {
 }
 
 /// Orchestrates the parallel download of all specified missing PGS IDs.
-/// Returns a list of tuples, where each tuple contains the path to the downloaded
-/// compressed file and the path where the final native file should be written.
 fn download_missing_files(
     pgs_ids: &[String],
     target_dir: &Path,
@@ -317,51 +254,68 @@ fn download_missing_files(
         pgs_ids.len()
     );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let client = Client::builder()
+        .user_agent("gnomon-http-client/1.0")
         .build()
-        .map_err(DownloadError::RuntimeCreation)?;
+        .map_err(|e| DownloadError::Network(format!("Failed to create HTTP client: {e}")))?;
 
-    runtime.block_on(async {
-        let mut downloader = Downloader::new();
-        let mut paths_to_reformat = Vec::with_capacity(pgs_ids.len());
+    let multi = Arc::new(MultiProgress::new());
+    // Use a progress bar style that does not require the total file size.
+    let style = ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {msg}")
+        .unwrap()
+        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
 
-        for id in pgs_ids {
-            // Use the reliable HTTPS endpoint for downloads.
+    let results: Result<Vec<_>, DownloadError> = pgs_ids
+        .par_iter()
+        .map(|id| {
+            let temp_gz_path = target_dir.join(format!("{id}.txt.gz"));
+            let final_native_path = target_dir.join(format!("{id}.gnomon.tsv"));
             let url = format!(
                 "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/{id}/ScoringFiles/Harmonized/{id}_hmPOS_GRCh38.txt.gz"
             );
-            // The compressed file is an intermediate artifact.
-            let temp_gz_path = target_dir.join(format!("{id}.txt.gz"));
-            // This is the final, desired output file.
-            let final_native_path = target_dir.join(format!("{id}.gnomon.tsv"));
 
-            let file_to_download = DLFile::new()
-                .with_url(&url)
-                .with_path(&temp_gz_path);
+            let pb = multi.add(ProgressBar::new_spinner());
+            pb.set_style(style.clone());
+            pb.set_message(format!("Downloading {id}..."));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-            // Each call to `add_file` consumes the
-            // downloader and returns a new one, so we must re-assign it.
-            downloader = downloader.add_file(file_to_download);
-            paths_to_reformat.push((temp_gz_path, final_native_path));
-        }
+            let mut response = client
+                .get(&url)
+                .send()
+                .map_err(|e| DownloadError::Network(format!("Failed to initiate download for {id}: {e}")))?;
 
-        // Use a progress bar style that does not require the total file size.
-        let style = ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] {msg}",
-        )
-        .unwrap()
-        .progress_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
-        let indicator = DownloadIndicatorFactory::new(style);
-        let configured_downloader = downloader
-            .with_indicator(indicator)
-            .with_max_concurrent_downloads(12)
-            .with_max_redirections(5);
+            if !response.status().is_success() {
+                let status = response.status();
+                pb.finish_with_message(format!("Failed: {status}"));
+                return Err(DownloadError::Network(format!(
+                    "Download failed for {id} with status {status}"
+                )));
+            }
 
-        configured_downloader.start();
+            let mut file = std::fs::File::create(&temp_gz_path)
+                .map_err(|e| DownloadError::Io(e, temp_gz_path.clone()))?;
 
-        Ok(paths_to_reformat)
-    })
+            // Copy with progress
+            let mut buf = [0; 8192];
+            use std::io::Read;
+            loop {
+                let n = response.read(&mut buf).map_err(|e| {
+                    DownloadError::Network(format!("Failed reading response for {id}: {e}"))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .map_err(|e| DownloadError::Io(e, temp_gz_path.clone()))?;
+                // Since we don't know total size for gzip stream comfortably from all servers, just spinner
+            }
+
+            pb.finish_with_message(format!("Downloaded {id}"));
+            Ok((temp_gz_path, final_native_path))
+        })
+        .collect();
+
+    results
 }
 #[derive(Debug)]
 pub struct ResolvedScoreFiles {
