@@ -63,6 +63,17 @@ case "$OS" in
                 ;;
         esac
         ;;
+    mingw*|msys*|cygwin*)
+        OS="windows"
+        case "$ARCH" in
+            x86_64) TARGET_ASSET="gnomon-windows-x64.zip" ;;
+            aarch64) TARGET_ASSET="gnomon-windows-arm64.zip" ;;
+            *)
+                log_error "Unsupported Windows architecture: $ARCH"
+                exit 1
+                ;;
+        esac
+        ;;
     *)
         log_error "Unsupported OS: $OS"
         exit 1
@@ -130,20 +141,35 @@ log_info "${ICON_PKG} Downloading..."
 curl -L --progress-bar -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"
 
 log_info "Extracting..."
-tar -xzf "$ARCHIVE_PATH" -C "$TEMP_DIR"
+if [[ "$TARGET_ASSET" == *.zip ]]; then
+    unzip -q "$ARCHIVE_PATH" -d "$TEMP_DIR"
+else
+    tar -xzf "$ARCHIVE_PATH" -C "$TEMP_DIR"
+fi
 
 # Determine binary location after extraction.
 # The binary inside the tarball is named identically to the asset (minus extensions)
 # e.g. gnomon-macos-arm64.tar.gz -> gnomon-macos-arm64
-INTERNAL_BIN_NAME="${TARGET_ASSET%.tar.gz}"
+if [[ "$TARGET_ASSET" == *.zip ]]; then
+    INTERNAL_BIN_NAME="${TARGET_ASSET%.zip}.exe"
+    DEST_BINARY_NAME="${BINARY_NAME}.exe"
+else
+    INTERNAL_BIN_NAME="${TARGET_ASSET%.tar.gz}"
+    DEST_BINARY_NAME="${BINARY_NAME}"
+fi
 
 # Search for this specific file
 SOURCE_BIN=$(find "$TEMP_DIR" -type f -name "${INTERNAL_BIN_NAME}" | head -n 1)
 
 # Fallback: if not found, look for any executable file that is not the archive itself
+# For Windows, look for .exe
 if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
     log_info "Exact match not found. Searching for executable..."
-    SOURCE_BIN=$(find "$TEMP_DIR" -type f -perm +111 ! -name "*.*" | head -n 1)
+    if [[ "$OS" == "windows" ]]; then
+         SOURCE_BIN=$(find "$TEMP_DIR" -type f -name "*.exe" | head -n 1)
+    else
+         SOURCE_BIN=$(find "$TEMP_DIR" -type f -perm +111 ! -name "*.*" | head -n 1)
+    fi
 fi
 
 if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
@@ -154,13 +180,28 @@ fi
 
 log_info "Installing to ${INSTALL_DIR}..."
 
+# Create install dir if it doesn't exist
+if [ ! -d "$INSTALL_DIR" ]; then
+    log_info "Creating directory ${INSTALL_DIR}..."
+    mkdir -p "$INSTALL_DIR" || {
+         log_error "Failed to create ${INSTALL_DIR}. Try running with sudo."
+         exit 1
+    }
+fi
+
 if [ ! -w "$INSTALL_DIR" ]; then
-    log_info "Sudo permissions required to write to ${INSTALL_DIR}"
-    sudo mv "$SOURCE_BIN" "${INSTALL_DIR}/${BINARY_NAME}"
-    sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    if command -v sudo >/dev/null 2>&1; then
+        log_info "Sudo permissions required to write to ${INSTALL_DIR}"
+        sudo mv "$SOURCE_BIN" "${INSTALL_DIR}/${DEST_BINARY_NAME}"
+        sudo chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
+    else
+        log_error "Directory ${INSTALL_DIR} is not writable and 'sudo' is not available."
+        log_error "Please run this script as Administrator or choose a writable directory."
+        exit 1
+    fi
 else
-    mv "$SOURCE_BIN" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    mv "$SOURCE_BIN" "${INSTALL_DIR}/${DEST_BINARY_NAME}"
+    chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
 fi
 
 # --- 4. Verify ---
