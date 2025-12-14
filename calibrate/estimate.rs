@@ -18,8 +18,7 @@
 //!     to convergence.
 //!
 //! This two-tiered structure allows the model to learn the appropriate complexity for
-//! each smooth term directly from the data, resulting in a data-driven, statistically
-//! robust fit.
+//! each smooth term directly from the data.
 
 // External Crate for Optimization
 use wolfe_bfgs::{Bfgs, BfgsSolution};
