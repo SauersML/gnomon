@@ -60,6 +60,13 @@ jobs:
             asset_name: gnomon-windows-x64
             use_cross: false
 
+          # Windows ARM64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: gnomon.exe
+            asset_name: gnomon-windows-arm64
+            use_cross: false
+
     steps:
       - uses: actions/checkout@v4
 
