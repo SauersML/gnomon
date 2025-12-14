@@ -61,7 +61,7 @@ fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏  "),
     );
-    pb.set_message(message);
+    pb.set_message(message.to_string());
 
     pb
 }
