@@ -214,6 +214,7 @@ pub fn open_bed_source(path: &Path) -> Result<BedSource, PipelineError> {
         let file = File::open(path)
             .map_err(|e| PipelineError::Io(format!("Opening {}: {e}", path.display())))?;
         let mmap = unsafe { Mmap::map(&file).map_err(|e| PipelineError::Io(e.to_string()))? };
+        #[cfg(unix)]
         mmap.advise(memmap2::Advice::Sequential)
             .map_err(|e| PipelineError::Io(e.to_string()))?;
         let mmap = Arc::new(mmap);

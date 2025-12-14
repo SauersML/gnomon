@@ -87,6 +87,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Remove local cargo config
+        # Prevent .cargo/config.toml's target-cpu=native from interfering with release builds
+        shell: bash
+        run: rm -f .cargo/config.toml
+
       - name: Install Cross
         if: matrix.use_cross
         shell: bash

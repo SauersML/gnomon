@@ -1203,6 +1203,7 @@ where
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(dead_code)] // Called via runtime detection, appears unused under some cfg combinations
 #[target_feature(enable = "avx")]
 /// # Safety
 /// Callers must ensure AVX is supported by the running CPU. Runtime feature
