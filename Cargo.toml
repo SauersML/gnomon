@@ -111,3 +111,9 @@ harness = false
 name = "calibrate"
 path = "calibrate/tests/mod.rs"
 
+# Patch spindle to fix Rust 1.94+ raw pointer lifetime cast issue
+# See: https://github.com/rust-lang/rust/issues/141402
+# Remove this patch once spindle > 0.2.5 is published
+[patch.crates-io]
+spindle = { git = "https://github.com/sarah-quinones/spindle", rev = "88fa33f" }
+
