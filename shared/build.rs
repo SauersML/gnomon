@@ -875,6 +875,13 @@ fn main() {
     update_stage("initialization");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Skip lint checks during release builds or cross-compilation
+    // (the grep crate won't be available in target deps during cross-compile)
+    if std::env::var("GNOMON_SKIP_LINT_CHECKS").is_ok() {
+        update_stage("skipping lint checks (GNOMON_SKIP_LINT_CHECKS set)");
+        return;
+    }
+
     // Manually check for unused variables in the build script
     update_stage("manual lint self-check");
     manually_check_for_unused_variables();
