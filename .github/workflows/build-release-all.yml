@@ -26,12 +26,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MacOS ARM (Apple Silicon)
+          # MacOS ARM (Apple Silicon) - GH Actions uses M1
           - os: macos-14
             target: aarch64-apple-darwin
             artifact_name: gnomon
             asset_name: gnomon-macos-arm64
             use_cross: false
+            cpu: apple-m1
 
           # MacOS Intel
           - os: macos-15
@@ -39,6 +40,7 @@ jobs:
             artifact_name: gnomon
             asset_name: gnomon-macos-intel
             use_cross: false
+            cpu: x86-64-v3
 
           # Linux x86_64
           - os: ubuntu-latest
@@ -46,6 +48,7 @@ jobs:
             artifact_name: gnomon
             asset_name: gnomon-linux-x64
             use_cross: false
+            cpu: x86-64-v3
 
           # Linux ARM64 (cross-compile from x86 runner)
           - os: ubuntu-latest
@@ -53,6 +56,7 @@ jobs:
             artifact_name: gnomon
             asset_name: gnomon-linux-arm64
             use_cross: true
+            cpu: neoverse-n1
 
           # Windows x86_64
           - os: windows-latest
@@ -60,6 +64,7 @@ jobs:
             artifact_name: gnomon.exe
             asset_name: gnomon-windows-x64
             use_cross: false
+            cpu: x86-64-v3
 
           # Windows ARM64
           - os: windows-latest
@@ -67,16 +72,14 @@ jobs:
             artifact_name: gnomon.exe
             asset_name: gnomon-windows-arm64
             use_cross: false
+            cpu: cortex-a76
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        # Pin to nightly-2025-12-01 due to ring#2527: MIN_STATIC_FEATURES assertion
-        # fails on GitHub Actions ARM runners (but works locally). Unfixed upstream.
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2025-12-01
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies
@@ -93,6 +96,9 @@ jobs:
 
       - name: Build
         shell: bash
+        env:
+          # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
+          RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
         run: |
           if [ "${{ matrix.use_cross }}" == "true" ]; then
             cross build --release --target ${{ matrix.target }}
