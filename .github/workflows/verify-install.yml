@@ -1,6 +1,7 @@
 name: Verify Install Script
 
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["Build and Release All"]
     types:
@@ -9,7 +10,7 @@ on:
 jobs:
   verify:
     name: Verify on ${{ matrix.os }}
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
