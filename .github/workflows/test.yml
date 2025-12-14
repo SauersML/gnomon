@@ -250,6 +250,11 @@ jobs:
           name: target-all-${{ steps.naming.outputs.short_sha }}
           path: target-all-${{ steps.naming.outputs.short_sha }}.tar
           retention-days: 3
+
+      - name: Cleanup target-all tar after upload (free disk space)
+        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        run: rm -f target-all-*.tar
+
       - name: Prepare trimmed build artifact (always)
         if: always()
         shell: bash
