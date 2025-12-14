@@ -21,8 +21,9 @@ Gnomon is a high-performance Rust engine for computing and calibrating polygenic
 ## Installation
 
 ### Automatic Install (Recommended)
-Installs the latest binary for your platform (macOS/Linux):
+Installs the latest binary for your platform (macOS/Linux/Windows):
 ```bash
+# macOS / Linux / Windows (Git Bash)
 curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 ```
 
