@@ -8,7 +8,7 @@ use crate::score::reformat;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
 use reqwest::blocking::Client;
 use std::io::Write;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
