@@ -27,4 +27,4 @@ jobs:
         run: |
           echo "Verifying gnomon..."
           gnomon --help
-          gnomon --version
+          gnomon --help

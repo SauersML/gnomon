@@ -142,9 +142,14 @@ fi
 log_header "Verification"
 
 if command -v "${BINARY_NAME}" >/dev/null 2>&1; then
-    VERSION=$("${BINARY_NAME}" --version)
-    log_success "Successfully installed: ${BOLD}${VERSION}${RESET}"
-    echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
+    # Binary doesn't support --version, so we check help output
+    if "${BINARY_NAME}" --help >/dev/null 2>&1; then
+        log_success "Successfully installed gnomon!"
+        echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
+    else
+        log_error "Binary installed but failed to run."
+        exit 1
+    fi
 else
     log_error "Installation appeared to succeed, but 'gnomon' is not in your PATH."
     log_info "Ensure ${INSTALL_DIR} is in your PATH."
