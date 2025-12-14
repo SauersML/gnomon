@@ -53,7 +53,7 @@ fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
         ProgressDrawTarget::hidden()
     };
 
-    let pb = ProgressBar::with_draw_target(len, draw_target);
+    let pb = ProgressBar::with_draw_target(Some(len), draw_target);
     pb.set_style(
         ProgressStyle::with_template(
             "\n> [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
