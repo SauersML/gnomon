@@ -80,10 +80,29 @@ log_info "Fetching metadata from GitHub..."
 
 # Fetch release info, filtering for the asset URL that matches our target name
 # We use grep/sed hacks to avoid 'jq' dependency for universal compatibility.
-DOWNLOAD_URL=$(curl -sL "${API_URL}" | \
-    grep "browser_download_url.*${TARGET_ASSET}" | \
-    cut -d '"' -f 4 | \
-    head -n 1)
+# We retry a few times because GitHub API can be slow to update 'latest' immediately after release.
+
+MAX_RETRIES=5
+DELAY=5
+DOWNLOAD_URL=""
+
+for ((i=1; i<=MAX_RETRIES; i++)); do
+    log_info "Fetching metadata from GitHub (Attempt $i/$MAX_RETRIES)..."
+    
+    DOWNLOAD_URL=$(curl -sL "${API_URL}" | \
+        grep "browser_download_url.*${TARGET_ASSET}" | \
+        cut -d '"' -f 4 | \
+        head -n 1)
+
+    if [ -n "$DOWNLOAD_URL" ]; then
+        break
+    fi
+
+    if [ $i -lt $MAX_RETRIES ]; then
+        log_info "Asset not found yet. Retrying in ${DELAY}s..."
+        sleep $DELAY
+    fi
+done
 
 if [ -z "$DOWNLOAD_URL" ]; then
     log_error "Could not find a download URL for ${TARGET_ASSET} in the latest release."
