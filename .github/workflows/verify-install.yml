@@ -12,10 +12,13 @@ jobs:
     name: Verify on ${{ matrix.os }}
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-14]
+        os: [ubuntu-latest, macos-latest, macos-14, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -26,5 +29,4 @@ jobs:
       - name: Verify Installation
         run: |
           echo "Verifying gnomon..."
-          gnomon --help
           gnomon --help
