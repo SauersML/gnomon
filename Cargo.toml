@@ -135,5 +135,5 @@ path = "calibrate/tests/mod.rs"
 #
 # =============================================================================
 [patch.crates-io]
-spindle = { git = "https://github.com/sarah-quinones/spindle", rev = "88fa33f" }
+spindle = { git = "https://github.com/TKanX/spindle", rev = "88fa33fc64f57a69c58b5f9e7c3d3b7083f3238f" }
 
