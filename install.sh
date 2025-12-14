@@ -82,14 +82,19 @@ log_info "Fetching metadata from GitHub..."
 # We use grep/sed hacks to avoid 'jq' dependency for universal compatibility.
 # We retry a few times because GitHub API can be slow to update 'latest' immediately after release.
 
-MAX_RETRIES=5
+MAX_RETRIES=30
 DELAY=5
 DOWNLOAD_URL=""
 
 for ((i=1; i<=MAX_RETRIES; i++)); do
-    log_info "Fetching metadata from GitHub (Attempt $i/$MAX_RETRIES)..."
+    # Only print "Fetching..." on first attempt or every 5th retry to reduce log noise
+    if [ $i -eq 1 ] || [ $((i % 5)) -eq 0 ]; then
+        log_info "Fetching metadata from GitHub (Attempt $i/$MAX_RETRIES)..."
+    fi
     
-    DOWNLOAD_URL=$(curl -sL "${API_URL}" | \
+    RESPONSE=$(curl -sL "${API_URL}")
+    
+    DOWNLOAD_URL=$(echo "$RESPONSE" | \
         grep "browser_download_url.*${TARGET_ASSET}" | \
         cut -d '"' -f 4 | \
         head -n 1)
@@ -99,13 +104,14 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
     fi
 
     if [ $i -lt $MAX_RETRIES ]; then
-        log_info "Asset not found yet. Retrying in ${DELAY}s..."
         sleep $DELAY
     fi
 done
 
 if [ -z "$DOWNLOAD_URL" ]; then
     log_error "Could not find a download URL for ${TARGET_ASSET} in the latest release."
+    log_error "Available assets in release:"
+    echo "$RESPONSE" | grep "browser_download_url" | cut -d '"' -f 4
     log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases manually."
     exit 1
 fi
