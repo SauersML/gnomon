@@ -27,19 +27,8 @@ ICON_ROCK="${GREEN}🚀${RESET}"
 REPO_OWNER="SauersML"
 REPO_NAME="gnomon"
 BINARY_NAME="gnomon"
-
-# Determine install directory: prefer /usr/local/bin if writable, else ~/.local/bin
-if [ -w "/usr/local/bin" ]; then
-    INSTALL_DIR="/usr/local/bin"
-elif [ -d "$HOME/.local/bin" ] && [ -w "$HOME/.local/bin" ]; then
-    INSTALL_DIR="$HOME/.local/bin"
-elif [ -w "/usr/local/bin" ] || command -v sudo >/dev/null 2>&1; then
-    # Will try sudo later if needed
-    INSTALL_DIR="/usr/local/bin"
-else
-    # Fallback to user-local install
-    INSTALL_DIR="$HOME/.local/bin"
-fi
+# Default to user-local install (no sudo required, works everywhere)
+INSTALL_DIR="$HOME/.local/bin"
 
 log_info() { echo -e "${ICON_INFO}  $1"; }
 log_success() { echo -e "${ICON_CHECK}  $1"; }
@@ -218,25 +207,13 @@ log_info "Installing to ${INSTALL_DIR}..."
 if [ ! -d "$INSTALL_DIR" ]; then
     log_info "Creating directory ${INSTALL_DIR}..."
     mkdir -p "$INSTALL_DIR" || {
-         log_error "Failed to create ${INSTALL_DIR}. Try running with sudo."
+         log_error "Failed to create ${INSTALL_DIR}."
          exit 1
     }
 fi
 
-if [ ! -w "$INSTALL_DIR" ]; then
-    if command -v sudo >/dev/null 2>&1; then
-        log_info "Sudo permissions required to write to ${INSTALL_DIR}"
-        sudo mv "$SOURCE_BIN" "${INSTALL_DIR}/${DEST_BINARY_NAME}"
-        sudo chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
-    else
-        log_error "Directory ${INSTALL_DIR} is not writable and 'sudo' is not available."
-        log_error "Please run this script as Administrator or choose a writable directory."
-        exit 1
-    fi
-else
-    mv "$SOURCE_BIN" "${INSTALL_DIR}/${DEST_BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
-fi
+mv "$SOURCE_BIN" "${INSTALL_DIR}/${DEST_BINARY_NAME}"
+chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
 
 # --- 4. Verify ---
 log_header "Verification"
