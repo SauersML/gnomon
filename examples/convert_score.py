@@ -340,7 +340,9 @@ def run_gnomon_score(
 
     run_command((tool, "score", score_path, plink_prefix))
 
-    sscore_path = plink_prefix.with_suffix(".sscore")
+    # New naming convention: plink_prefix + "_" + score_stem + ".sscore"
+    score_stem = score_path.stem
+    sscore_path = plink_prefix.parent / f"{plink_prefix.name}_{score_stem}.sscore"
     if not sscore_path.exists():
         raise RuntimeError(f"gnomon score did not create {sscore_path}")
     return sscore_path

@@ -318,7 +318,10 @@ def test_variant_subset(variant_df: pd.DataFrame, iteration_name: str) -> float:
     # After running, move the output to the unique name we expect
     if g_res['success']:
         try:
-            shutil.move(SHARED_GENOTYPE_PREFIX.with_suffix('.sscore'), g_iter_prefix.with_suffix('.sscore'))
+            # New naming: prefix_scorename.sscore
+            score_stem = temp_score_path.stem
+            gnomon_output = SHARED_GENOTYPE_PREFIX.parent / f"{SHARED_GENOTYPE_PREFIX.name}_{score_stem}.sscore"
+            shutil.move(gnomon_output, g_iter_prefix.with_suffix('.sscore'))
         except FileNotFoundError:
             print(f"  > [BISECTION_WARNING] Could not find Gnomon output for iteration {iteration_name}")
             return -1.0 # Return a value indicating failure
@@ -474,9 +477,12 @@ def main():
             res = run_and_measure(cmd, f"{tool}_{pgs_id}", out_prefix)
             if tool == 'gnomon' and res['success']:
                 try:
-                    shutil.move(out_prefix.with_suffix('.sscore'), CI_WORKDIR / f"gnomon_{pgs_id}.sscore")
+                    # New naming: prefix_scorename.sscore
+                    score_stem = unified_score_file_path.stem
+                    gnomon_output = out_prefix.parent / f"{out_prefix.name}_{score_stem}.sscore"
+                    shutil.move(gnomon_output, CI_WORKDIR / f"gnomon_{pgs_id}.sscore")
                 except FileNotFoundError:
-                    print(f"Warning: Could not find expected Gnomon output at {out_prefix.with_suffix('.sscore')}")
+                    print(f"Warning: Could not find expected Gnomon output at {gnomon_output}")
             pgs_run_results.append(res)
             if not res['success']: failures.append(f"{pgs_id} ({tool}_failed)")
         

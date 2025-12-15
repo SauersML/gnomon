@@ -341,7 +341,8 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
         "Simple Gnomon Test",
         workdir,
     )
-    gnomon_output_path = workdir / f"{prefix.name}.sscore"
+    # New naming: prefix_scorename.sscore
+    gnomon_output_path = workdir / f"{prefix.name}_{score_file.stem}.sscore"
     if gnomon_res and gnomon_res.returncode == 0:
         print_file_header(gnomon_output_path, "Gnomon")
 
@@ -475,7 +476,7 @@ def run_impossible_diploid_test(workdir: Path, gnomon_path: Path, run_cmd_func):
     )
 
     if gnomon_res.returncode == 0 and resolved_signal:
-        out_path = workdir / f"{prefix.name}.sscore"
+        out_path = workdir / f"{prefix.name}_{score_file.stem}.sscore"
         if out_path.exists():
             print_file_header(out_path, "Gnomon")
         print("\n✅ Verification successful: ambiguity detected and resolved (non-fatal).")
@@ -562,7 +563,8 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
         print("❌ Test failed: Gnomon command failed to execute successfully.")
         return False
     
-    gnomon_output_path = workdir / f"{prefix.name}.sscore"
+    # Gnomon outputs to: genotype_prefix + "_" + score_dir_name + ".sscore"
+    gnomon_output_path = workdir / f"{prefix.name}_{scores_dir.name}.sscore"
     try:
         result_df = pd.read_csv(gnomon_output_path, sep='\t')
         print_file_header(gnomon_output_path, "Gnomon (Multi-Score Test)")
@@ -664,7 +666,8 @@ def run_and_validate_tools(runtimes):
     def analyze_large_scale_results():
         _print_header("Step D: Analyzing and Comparing Large-Scale Simulation Results")
         try:
-            gnomon_output_path = WORKDIR / f"{OUTPUT_PREFIX.name}.sscore"
+            # New naming: prefix_scorename.sscore
+            gnomon_output_path = WORKDIR / f"{OUTPUT_PREFIX.name}_{OUTPUT_PREFIX.name}.gnomon.sscore"
             truth_df = pd.read_csv(OUTPUT_PREFIX.with_suffix(".truth.sscore"), sep='\t').rename(columns={'PRS_AVG':'SCORE_TRUTH'})[['IID','SCORE_TRUTH']]
             gnomon_df = pd.read_csv(gnomon_output_path, sep='\t').rename(columns={'#IID':'IID','simulated_score_AVG':'SCORE_GNOMON'})[['IID','SCORE_GNOMON']]
         except (FileNotFoundError, KeyError) as e:
