@@ -93,6 +93,38 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     let overall_start_time = Instant::now();
     let fileset_prefixes = resolve_filesets(&args.input_path)?;
 
+    // --- Safety Check: Prevent Output Overwrite ---
+    {
+        let output_prefix = &fileset_prefixes[0];
+        let (output_dir, out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+            let stem = output_prefix
+                .file_name()
+                .map_or_else(|| std::ffi::OsString::from("gnomon_results"), std::ffi::OsString::from);
+            (std::path::Path::new(".").to_path_buf(), stem)
+        } else {
+            let dir = output_prefix
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let stem = output_prefix
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
+                .to_os_string();
+            (dir, stem)
+        };
+
+        let mut output_path = output_dir.join(out_stem);
+        output_path.set_extension("sscore");
+
+        if output_path.exists() {
+             return Err(format!(
+                "Output file '{}' already exists. Gnomon will not overwrite it. Please remove it or rename it before running.",
+                output_path.display()
+            )
+            .into());
+        }
+    }
+
     // --- Phase 1a: Score File Resolution ---
     // This block resolves the --score argument into a definitive list of files.
     let (resolved_score_files, score_regions_map): (Vec<PathBuf>, HashMap<String, GenomicRegion>) = {
