@@ -93,10 +93,17 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     let overall_start_time = Instant::now();
     let fileset_prefixes = resolve_filesets(&args.input_path)?;
 
-    // --- Safety Check: Prevent Output Overwrite ---
+    // --- Output Naming & Safety Check ---
+    // We derive a suffix from the score path (e.g. "my_scores.txt" -> "my_scores")
+    // and append it to the genotype prefix to create a unique output name.
+    let out_suffix = args.score
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "scores".to_string());
+
     {
         let output_prefix = &fileset_prefixes[0];
-        let (output_dir, out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+        let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
             let stem = output_prefix
                 .file_name()
                 .map_or_else(|| std::ffi::OsString::from("gnomon_results"), std::ffi::OsString::from);
@@ -112,6 +119,10 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 .to_os_string();
             (dir, stem)
         };
+
+        // Apply smart naming: cohort + "_" + score_name
+        out_stem.push("_");
+        out_stem.push(&out_suffix);
 
         let mut output_path = output_dir.join(out_stem);
         output_path.set_extension("sscore");
@@ -203,6 +214,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         &final_scores,
         &final_counts,
         score_regions_ref,
+        Some(&out_suffix),
     )?;
 
     eprintln!(
@@ -339,8 +351,9 @@ fn finalize_and_write_output(
     final_scores: &[f64],
     final_counts: &[u32],
     score_regions: Option<&HashMap<String, GenomicRegion>>,
+    name_suffix: Option<&str>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (output_dir, out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
+    let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
         let stem = output_prefix
             .file_name()
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
@@ -352,9 +365,15 @@ fn finalize_and_write_output(
             .to_path_buf();
         let stem = output_prefix
             .file_name()
-            .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
+            .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
+            .to_os_string();
         (dir, stem)
     };
+
+    if let Some(suffix) = name_suffix {
+        out_stem.push("_");
+        out_stem.push(suffix);
+    }
     fs::create_dir_all(&output_dir)?;
     let mut out_filename = out_stem;
     out_filename.push(".sscore");
