@@ -40,6 +40,11 @@ log_header "Detecting Platform"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m | tr '[:upper:]' '[:lower:]')"
 
+if [[ "$OS" == mingw* ]] || [[ "$OS" == msys* ]] || [[ "$OS" == cygwin* ]]; then
+    log_info "Raw Git Bash detection (uname): $OS / $ARCH"
+    log_info "Windows Env: PROCESSOR_ARCHITECTURE='$PROCESSOR_ARCHITECTURE', PROCESSOR_ARCHITEW6432='$PROCESSOR_ARCHITEW6432'"
+fi
+
 TARGET_ASSET=""
 
 case "$OS" in
@@ -70,6 +75,7 @@ case "$OS" in
         # Check for Windows ARM64 environment variables (Git Bash often runs as x64 emulated)
         if [[ "$PROCESSOR_ARCHITECTURE" == "ARM64" ]] || [[ "$PROCESSOR_ARCHITEW6432" == "ARM64" ]]; then
             ARCH="aarch64"
+            log_info "Detected Windows ARM64 environment via environment variables."
         fi
 
         case "$ARCH" in
@@ -94,11 +100,15 @@ log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 log_header "Checking Latest Release"
 
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
-log_info "Fetching metadata from GitHub..."
 
-# Fetch release info, filtering for the asset URL that matches our target name
-# We use grep/sed hacks to avoid 'jq' dependency for universal compatibility.
-# We retry a few times because GitHub API can be slow to update 'latest' immediately after release.
+CURL_ARGS=(-sL)
+if [ -n "$GITHUB_TOKEN" ]; then
+    log_info "Using GITHUB_TOKEN for authenticated API request."
+    CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
+elif [ -n "$GH_TOKEN" ]; then
+    log_info "Using GH_TOKEN for authenticated API request."
+    CURL_ARGS+=(-H "Authorization: token $GH_TOKEN")
+fi
 
 MAX_RETRIES=30
 DELAY=5
@@ -110,7 +120,7 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
         log_info "Fetching metadata from GitHub (Attempt $i/$MAX_RETRIES)..."
     fi
     
-    RESPONSE=$(curl -sL "${API_URL}")
+    RESPONSE=$(curl "${CURL_ARGS[@]}" "${API_URL}")
     
     DOWNLOAD_URL=$(echo "$RESPONSE" | \
         grep "browser_download_url.*${TARGET_ASSET}" | \
@@ -128,8 +138,9 @@ done
 
 if [ -z "$DOWNLOAD_URL" ]; then
     log_error "Could not find a download URL for ${TARGET_ASSET} in the latest release."
-    log_error "Available assets in release:"
-    echo "$RESPONSE" | grep "browser_download_url" | cut -d '"' -f 4
+    log_error "GitHub API Response Preview:"
+    echo "$RESPONSE" | head -n 20
+    log_error "..."
     log_error "Please check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases manually."
     exit 1
 fi
