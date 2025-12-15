@@ -223,23 +223,42 @@ fn run_preparation_phase(
                 let output_dir = score_file_path.parent().unwrap_or_else(|| Path::new("."));
                 fs::create_dir_all(output_dir)?;
 
-                eprintln!(
-                    "> Info: Score file '{}' is not in native format. Attempting conversion...",
-                    score_file_path.display()
-                );
                 let new_path = score_file_path.with_extension("gnomon.tsv");
+                
+                // Smart cache check: only reformat if source is newer than existing cache
+                let should_reformat = if new_path.exists() {
+                    let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
+                    let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
+                    
+                    match (source_meta, cache_meta) {
+                        (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
+                        _ => true, // Fallback to safe reformat on any error
+                    }
+                } else {
+                    true
+                };
 
-                match reformat::reformat_pgs_file(score_file_path, &new_path) {
-                    Ok(_) => {
-                        eprintln!("> Success: Converted to '{}'.", new_path.display());
-                        native_score_files.push(new_path);
+                if should_reformat {
+                    eprintln!(
+                        "> Info: Score file '{}' is not in native format. Attempting conversion...",
+                        score_file_path.display()
+                    );
+                    
+                    match reformat::reformat_pgs_file(score_file_path, &new_path) {
+                        Ok(_) => {
+                            eprintln!("> Success: Converted to '{}'.", new_path.display());
+                            native_score_files.push(new_path);
+                        }
+                        Err(e) => {
+                            // The reformatting failed. The `ReformatError` type now
+                            // contains a rich, detailed diagnostic message. We can
+                            // simply convert it into a boxed error and return it.
+                            return Err(Box::new(e));
+                        }
                     }
-                    Err(e) => {
-                        // The reformatting failed. The `ReformatError` type now
-                        // contains a rich, detailed diagnostic message. We can
-                        // simply convert it into a boxed error and return it.
-                        return Err(Box::new(e));
-                    }
+                } else {
+                    eprintln!("> Info: Using cached converted file '{}'.", new_path.display());
+                    native_score_files.push(new_path);
                 }
             }
             Err(e) => {
