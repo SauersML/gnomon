@@ -160,15 +160,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 fs::read_dir(&args.score)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
-                    .filter(|p| {
-                        // Must be a file, not a directory
-                        if !p.is_file() {
-                            return false;
-                        }
-                        // Exclude .gnomon.tsv cache files to avoid double-processing
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        !name.ends_with(".gnomon.tsv")
-                    })
+                    .filter(|p| p.is_file())
                     .collect()
             } else {
                 vec![args.score.clone()]
