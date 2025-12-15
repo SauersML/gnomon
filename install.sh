@@ -66,9 +66,15 @@ case "$OS" in
     mingw*|msys*|cygwin*)
         OS="windows"
         INSTALL_DIR="$HOME/bin"
+        
+        # Check for Windows ARM64 environment variables (Git Bash often runs as x64 emulated)
+        if [[ "$PROCESSOR_ARCHITECTURE" == "ARM64" ]] || [[ "$PROCESSOR_ARCHITEW6432" == "ARM64" ]]; then
+            ARCH="aarch64"
+        fi
+
         case "$ARCH" in
             x86_64) TARGET_ASSET="gnomon-windows-x64.zip" ;;
-            aarch64) TARGET_ASSET="gnomon-windows-arm64.zip" ;;
+            aarch64|arm64) TARGET_ASSET="gnomon-windows-arm64.zip" ;;
             *)
                 log_error "Unsupported Windows architecture: $ARCH"
                 exit 1
