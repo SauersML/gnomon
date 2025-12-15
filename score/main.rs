@@ -109,10 +109,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map_or_else(|| std::ffi::OsString::from("gnomon_results"), std::ffi::OsString::from);
             (std::path::Path::new(".").to_path_buf(), stem)
         } else {
-            let dir = output_prefix
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .to_path_buf();
+            let parent = output_prefix.parent();
+            // Handle both None and empty parent (Path::new("arrays").parent() == Some(""))
+            let dir = match parent {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => std::path::Path::new(".").to_path_buf(),
+            };
             let stem = output_prefix
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
@@ -402,10 +404,12 @@ fn finalize_and_write_output(
             .map_or_else(|| OsString::from("gnomon_results"), OsString::from);
         (Path::new(".").to_path_buf(), stem)
     } else {
-        let dir = output_prefix
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let parent = output_prefix.parent();
+        // Handle both None and empty parent (Path::new("arrays").parent() == Some(""))
+        let dir = match parent {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => Path::new(".").to_path_buf(),
+        };
         let stem = output_prefix
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("gnomon_results"))
