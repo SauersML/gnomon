@@ -461,7 +461,7 @@ fn prepare_for_computation_with_retry(
                                     .is_some()
                                 {
                                     return Err(PrepError::AmbiguousReconciliation(format!(
-                                        "Ambiguous input: The same variant-score pair is defined with different weights across input files. Variant BIM index: {}, Score: {}",
+                                        "Ambiguous input: The same variant appears multiple times with different weights for the same score. This can happen from duplicate rows in a single file or across multiple files. Variant BIM index: {}, Score: {}",
                                         bim_rec.bim_row_index.0,
                                         score_names[score_record.score_column_index.0]
                                     )));
