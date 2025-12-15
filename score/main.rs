@@ -166,27 +166,59 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     .collect();
                 
                 // Smart deduplication: if both foo.txt and foo.gnomon.tsv exist,
-                // only keep the .gnomon.tsv (prefer cache over source)
-                let cache_stems: std::collections::HashSet<_> = all_files.iter()
+                // only keep the cache IF it's newer than the source (not stale)
+                let fresh_cache_stems: std::collections::HashSet<_> = all_files.iter()
                     .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
-                    .filter_map(|p| {
+                    .filter_map(|cache_path| {
                         // Extract stem: "foo.gnomon.tsv" -> "foo"
-                        let name = p.file_name()?.to_string_lossy();
-                        Some(name.strip_suffix(".gnomon.tsv")?.to_string())
+                        let name = cache_path.file_name()?.to_string_lossy();
+                        let stem = name.strip_suffix(".gnomon.tsv")?;
+                        
+                        // Find corresponding source file and check timestamps
+                        let source_candidates: Vec<_> = all_files.iter()
+                            .filter(|p| {
+                                p.file_stem().map(|s| s.to_string_lossy().to_string()) == Some(stem.to_string())
+                                    && !p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
+                            })
+                            .collect();
+                        
+                        if source_candidates.is_empty() {
+                            // No source file, cache is standalone (keep it)
+                            return Some(stem.to_string());
+                        }
+                        
+                        // Check if cache is fresh (newer than all source files)
+                        let cache_mtime = fs::metadata(cache_path).and_then(|m| m.modified()).ok()?;
+                        let source_is_newer = source_candidates.iter().any(|src| {
+                            fs::metadata(src)
+                                .and_then(|m| m.modified())
+                                .map(|src_time| src_time > cache_mtime)
+                                .unwrap_or(false)
+                        });
+                        
+                        if source_is_newer {
+                            None // Cache is stale, don't skip source
+                        } else {
+                            Some(stem.to_string()) // Cache is fresh, skip source
+                        }
                     })
                     .collect();
                 
                 all_files.into_iter()
                     .filter(|p| {
                         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        // Always keep .gnomon.tsv files
+                        // Always keep .gnomon.tsv files (even stale ones - they'll be regenerated)
                         if name.ends_with(".gnomon.tsv") {
-                            return true;
+                            // But skip stale caches when fresh source exists
+                            let stem = name.strip_suffix(".gnomon.tsv").unwrap_or(&name);
+                            // If stem is NOT in fresh_cache_stems, the source will be processed
+                            // and we should skip this stale cache
+                            return fresh_cache_stems.contains(stem);
                         }
-                        // For other files, skip if a corresponding cache exists
+                        // For source files, skip if a fresh cache exists
                         if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                            if cache_stems.contains(&stem) {
-                                return false; // Skip source, cache exists
+                            if fresh_cache_stems.contains(&stem) {
+                                return false; // Skip source, fresh cache exists
                             }
                         }
                         true
