@@ -254,6 +254,11 @@ fn run_preparation_phase(
         }
     }
 
+    // Deduplicate the list to handle cases where a directory scan picks up both
+    // a source file (e.g. score.txt) and its converted output (score.gnomon.tsv).
+    native_score_files.sort();
+    native_score_files.dedup();
+
     // --- Run the main preparation logic with the fully normalized and sorted files ---
     let prep = prepare::prepare_for_computation(
         fileset_prefixes,
