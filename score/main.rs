@@ -158,11 +158,39 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 download::resolve_and_download_scores(&score_arg_str, &scores_cache_dir)?;
             (resolved.paths, resolved.regions)
         } else {
-            let files = if args.score.is_dir() {
-                fs::read_dir(&args.score)?
+            let files: Vec<PathBuf> = if args.score.is_dir() {
+                let all_files: Vec<PathBuf> = fs::read_dir(&args.score)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
                     .filter(|p| p.is_file())
+                    .collect();
+                
+                // Smart deduplication: if both foo.txt and foo.gnomon.tsv exist,
+                // only keep the .gnomon.tsv (prefer cache over source)
+                let cache_stems: std::collections::HashSet<_> = all_files.iter()
+                    .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
+                    .filter_map(|p| {
+                        // Extract stem: "foo.gnomon.tsv" -> "foo"
+                        let name = p.file_name()?.to_string_lossy();
+                        Some(name.strip_suffix(".gnomon.tsv")?.to_string())
+                    })
+                    .collect();
+                
+                all_files.into_iter()
+                    .filter(|p| {
+                        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        // Always keep .gnomon.tsv files
+                        if name.ends_with(".gnomon.tsv") {
+                            return true;
+                        }
+                        // For other files, skip if a corresponding cache exists
+                        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                            if cache_stems.contains(&stem) {
+                                return false; // Skip source, cache exists
+                            }
+                        }
+                        true
+                    })
                     .collect()
             } else {
                 vec![args.score.clone()]
