@@ -177,6 +177,20 @@ fn process_block<'a>(
     tile.clear();
     tile.resize(tile_size, EffectAlleleDosage::default());
 
+    // Hint to use huge pages on Linux. This reduces TLB misses for large tiles.
+    // If huge pages are not available, this is a no-op.
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        let ptr = tile.as_mut_ptr() as *mut std::ffi::c_void;
+        let len = tile.len() * std::mem::size_of::<EffectAlleleDosage>();
+        unsafe { madvise(ptr, len, MADV_HUGEPAGE) };
+    }
+
+
     // This pivot function has a single, clear responsibility.
     pivot_tile(
         variant_major_data,
@@ -316,8 +330,85 @@ pub(crate) fn process_tile_impl<'a>(
             let row_start = person_idx * variants_in_chunk + variant_mini_batch_start;
             let dosage_row = &tile[row_start..row_start + mini_batch_size];
 
-            for (i, &dosage) in dosage_row.iter().enumerate() {
-                match dosage.0 {
+            // --- SIMD-Accelerated Dosage Scan ---
+            // Process 32 dosages at a time. For the common case (all zeros), this
+            // reduces instruction count from ~100 to ~3 per 32 bytes.
+            // Safety: EffectAlleleDosage is #[repr(transparent)] around u8
+            let dosage_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(dosage_row.as_ptr() as *const u8, dosage_row.len()) };
+
+            let chunks = dosage_bytes.chunks_exact(32);
+            let remainder_start = chunks.len() * 32;
+            let mut base_idx = 0usize;
+
+            for chunk in chunks {
+                // Load 32 bytes into a SIMD vector
+                let vec: std::simd::Simd<u8, 32> = std::simd::Simd::from_slice(chunk);
+
+                // Fast path: if entire chunk is zeros, skip it
+                let zero_vec = std::simd::Simd::<u8, 32>::splat(0);
+                if vec == zero_vec {
+                    base_idx += 32;
+                    continue;
+                }
+
+                // Extract bitmasks for each dosage type
+                let g1_mask = vec.simd_eq(std::simd::Simd::splat(1)).to_bitmask();
+                let g2_mask = vec.simd_eq(std::simd::Simd::splat(2)).to_bitmask();
+                let missing_mask = vec.simd_eq(std::simd::Simd::splat(3)).to_bitmask();
+
+                // Process g1 indices using trailing_zeros
+                let mut m = g1_mask;
+                while m != 0 {
+                    let idx = m.trailing_zeros() as usize;
+                    g1_indices[g1_count] = (base_idx + idx) as u16;
+                    g1_count += 1;
+                    m &= m - 1; // Clear lowest set bit
+                }
+
+                // Process g2 indices
+                let mut m = g2_mask;
+                while m != 0 {
+                    let idx = m.trailing_zeros() as usize;
+                    g2_indices[g2_count] = (base_idx + idx) as u16;
+                    g2_count += 1;
+                    m &= m - 1;
+                }
+
+                // Process missing genotypes inline
+                let mut m = missing_mask;
+                while m != 0 {
+                    let idx = m.trailing_zeros() as usize;
+                    let i = base_idx + idx;
+                    let variant_idx_in_chunk = variant_mini_batch_start + i;
+                    let global_matrix_row_idx =
+                        reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
+                    let scores_for_this_variant =
+                        &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                    let weight_row_offset = i * stride;
+                    let person_scores_slice = &mut block_scores_out
+                        [person_idx * num_scores..(person_idx + 1) * num_scores];
+                    let person_missing_counts_slice = &mut block_missing_counts_out
+                        [person_idx * num_scores..(person_idx + 1) * num_scores];
+
+                    for &score_idx in scores_for_this_variant {
+                        let score_col = score_idx.0;
+                        person_missing_counts_slice[score_col] += 1;
+                        if flip_flags_chunk[weight_row_offset + score_col] == 1 {
+                            person_scores_slice[score_col] -=
+                                2.0 * (weights_chunk[weight_row_offset + score_col] as f64);
+                        }
+                    }
+                    m &= m - 1;
+                }
+
+                base_idx += 32;
+            }
+
+            // Handle remainder with scalar loop
+            for i in remainder_start..mini_batch_size {
+                let dosage = dosage_bytes[i];
+                match dosage {
                     1 => {
                         g1_indices[g1_count] = i as u16;
                         g1_count += 1;
@@ -327,7 +418,6 @@ pub(crate) fn process_tile_impl<'a>(
                         g2_count += 1;
                     }
                     3 => {
-                        // Handle missing genotype inline
                         let variant_idx_in_chunk = variant_mini_batch_start + i;
                         let global_matrix_row_idx =
                             reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
