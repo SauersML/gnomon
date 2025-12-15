@@ -1701,7 +1701,7 @@ impl Display for PrepError {
                 )?;
                 writeln!(
                     f,
-                    "This strongly suggests a genome build mismatch (for example, GRCh37 vs GRCh38)."
+                    "This suggests a genome build mismatch (for example, GRCh37 vs GRCh38) or a formatting issue."
                 )
             }
             PrepError::DisjointChromosomes => {
