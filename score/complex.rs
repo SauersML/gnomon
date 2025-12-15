@@ -173,6 +173,9 @@ pub enum Heuristic {
     ConsistentDosage,
     /// As a last resort, prefers a single heterozygous call over homozygous ones.
     PreferHeterozygous,
+    /// Infers a heterozygous genotype if conflicting homozygous calls involve alleles
+    /// where one is a prefix of the other (e.g. C/C vs CAGA/CAGA -> C/CAGA).
+    IndelAnchorBase,
 }
 
 /// Describes the specific heuristic used to resolve a critical data ambiguity,
@@ -197,6 +200,9 @@ pub enum ResolutionMethod {
         chosen_dosage: f64,
     },
     PreferMatchingAlleleStructure {
+        chosen_dosage: f64,
+    },
+    IndelAnchorBase {
         chosen_dosage: f64,
     },
 }
@@ -319,6 +325,7 @@ impl Heuristic {
             }
             Heuristic::ConsistentDosage => self.resolve_consistent_dosage(context),
             Heuristic::PreferHeterozygous => self.resolve_prefer_het(context),
+            Heuristic::IndelAnchorBase => self.resolve_indel_anchor_base(context),
         }
     }
 
@@ -488,6 +495,79 @@ impl Heuristic {
         }
     }
 
+    /// Heuristic 5: Resolves conflicts where one row says homozygous Ref and another
+    /// says homozygous Alt, but the alleles share an anchor base (one is a prefix of the other).
+    /// This implies the array detected both the short (Ref) and long (Alt) alleles,
+    /// so the true genotype is Heterozygous.
+    fn resolve_indel_anchor_base(&self, context: &ResolutionContext) -> Option<Resolution> {
+        let mut homozygous_alleles = Vec::new();
+
+        for (packed_geno, (_, bim_a1, bim_a2)) in context.conflicting_interpretations {
+            // Check for Homozygous calls (00 = Hom A1, 11 = Hom A2)
+            match packed_geno {
+                0b00 => homozygous_alleles.push(bim_a1.as_str()),
+                0b11 => homozygous_alleles.push(bim_a2.as_str()),
+                _ => {} // Ignore heterozygous or missing for this check
+            }
+        }
+
+        if homozygous_alleles.len() < 2 {
+            return None;
+        }
+
+        // Check if we have valid conflicting homozygous alleles
+        let first_allele = homozygous_alleles[0];
+        let has_conflict = homozygous_alleles.iter().any(|&a| a != first_allele);
+        
+        if !has_conflict {
+            return None; // All homozygous calls agree, so this heuristic doesn't apply
+        }
+
+        // We have conflicting homozygous calls. Check if they form a prefix relationship.
+        // We require that ALL observed homozygous alleles can be explained by a single
+        // pair of (Short, Long) alleles where Short is a prefix of Long.
+        
+        // Find the shortest and longest alleles
+        let shortest = homozygous_alleles.iter().min_by_key(|a| a.len()).unwrap();
+        let longest = homozygous_alleles.iter().max_by_key(|a| a.len()).unwrap();
+
+        // The prefix condition must hold
+        if !longest.starts_with(shortest) {
+             return None;
+        }
+
+        // Also strictly require that every homozygous allele found is EITHER the short or the long one.
+        // (No third unrelated allele allowed)
+        let clean_evidence = homozygous_alleles.iter().all(|&a| a == *shortest || a == *longest);
+        if !clean_evidence {
+            return None;
+        }
+
+        // If we get here, we have evidence for both Short and Long alleles, and one is a prefix of the other.
+        // This strongly suggests a Heterozygous genotype (Short/Long).
+        // Since we are creating a synthetic Het call, the dosage of the effect allele is always 1.0,
+        // (assuming the effect allele is one of the two).
+        
+        // Sanity check: is the effect allele even involved?
+        let effect = &context.score_info.effect_allele;
+        
+        // The inferred genotype is Short/Long.
+        // If Effect == Short or Effect == Long, dosage is 1.0.
+        // If Effect is neither (weird?), dosage is 0.0.
+        // Derived from logic: if we infer Het (Short/Long), and one of them is the effect allele, dosage is 1.
+
+        // Inferred Genotype: { *shortest, *longest }
+        // Dosage = count of Effect Allele in that set.
+        let mut final_dosage = 0.0;
+        if effect == *shortest { final_dosage += 1.0; }
+        if effect == *longest { final_dosage += 1.0; }
+
+        Some(Resolution {
+            chosen_dosage: final_dosage,
+            method_used: *self,
+        })
+    }
+
     /// A private helper to compute dosage from raw PLINK bits.
     /// This function is now fully safe and self-contained, returning 0.0 if the
     /// effect allele is not one of the two alleles from the BIM entry.
@@ -549,7 +629,9 @@ impl ResolverPipeline {
             Heuristic::ExactScoreAlleleMatch,
             Heuristic::PrioritizeUnambiguousGenotype,
             Heuristic::PreferMatchingAlleleStructure,
-            Heuristic::ConsistentDosage,
+
+
+            Heuristic::IndelAnchorBase,
             Heuristic::PreferHeterozygous,
         ];
         Self { heuristics }
@@ -730,6 +812,7 @@ pub fn resolve_complex_variants(
                                                     Heuristic::PreferMatchingAlleleStructure => ResolutionMethod::PreferMatchingAlleleStructure { chosen_dosage: resolution.chosen_dosage },
                                                     Heuristic::ConsistentDosage => ResolutionMethod::ConsistentDosage { dosage: resolution.chosen_dosage },
                                                     Heuristic::PreferHeterozygous => ResolutionMethod::PreferHeterozygous { chosen_dosage: resolution.chosen_dosage },
+                                                    Heuristic::IndelAnchorBase => ResolutionMethod::IndelAnchorBase { chosen_dosage: resolution.chosen_dosage },
                                                 };
 
                                                 let conflicts = valid_interpretations.iter().map(|(bits, ctx)| ConflictSource {
@@ -973,6 +1056,15 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             }
             ResolutionMethod::PreferHeterozygous { .. } => conflict.genotype_bits == 0b10,
             ResolutionMethod::ConsistentDosage { .. } => true,
+            ResolutionMethod::IndelAnchorBase { .. } => {
+                // For indel anchor base, we "chose" the homozygous rows that contributed
+                // to the inference.
+                 match conflict.genotype_bits {
+                    0b00 => true, // Contributed evidence if hom
+                    0b11 => true, 
+                    _ => false,
+                 }
+            },
         }
     };
 
@@ -1049,7 +1141,12 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
         }
         ResolutionMethod::ConsistentDosage { dosage } => {
             method_name = "'Consistent Dosage' Heuristic";
+
             write!(rationale, "All conflicting sources yielded a consistent effect allele dosage of {}, so computation continued.", dosage).unwrap();
+        }
+        ResolutionMethod::IndelAnchorBase { .. } => {
+            method_name = "'Indel Anchor Base' Heuristic";
+            write!(rationale, "Conflicting homozygous calls were found for alleles sharing an anchor base (one is a prefix of the other). This implies the array detected both alleles, so a Heterozygous genotype was inferred.").unwrap();
         }
     };
 
