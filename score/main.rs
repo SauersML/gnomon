@@ -237,6 +237,28 @@ fn run_preparation_phase(
     keep: Option<&Path>,
     score_regions: Option<&HashMap<String, GenomicRegion>>,
 ) -> Result<Arc<PreparationResult>, Box<dyn Error + Send + Sync>> {
+    /// Reads the score label from a cached .gnomon.tsv file by parsing its header.
+    /// Format: variant_id\teffect_allele\tother_allele\tSCORE_LABEL\n
+    fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
+        use std::io::{BufRead, BufReader};
+        use std::fs::File;
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            if line.starts_with('#') {
+                continue;
+            }
+            // First non-comment line is the header
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 4 {
+                return Ok(cols[3].to_string());
+            }
+            return Err(format!("Invalid header in cached file '{}'", path.display()).into());
+        }
+        Err(format!("Empty cached file '{}'", path.display()).into())
+    }
+
     if fileset_prefixes.len() > 1 {
         eprintln!(
             "> Found {} PLINK filesets, starting with: {}",
@@ -254,16 +276,28 @@ fn run_preparation_phase(
     let prep_phase_start = Instant::now();
 
     let mut native_score_files = Vec::with_capacity(score_files.len());
+    // Track (label, source_path) for duplicate detection
+    let mut label_to_path: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+
     for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
             Ok(true) => {
                 // If a file is already in the native format, we assume it is correctly
-                // sorted and ready for processing.
+                // formatted. We still need to extract its label for duplicate detection.
+                let label = read_label_from_cached_file(score_file_path)?;
+                if let Some(existing_path) = label_to_path.get(&label) {
+                    return Err(format!(
+                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
+                        label,
+                        existing_path.display(),
+                        score_file_path.display()
+                    ).into());
+                }
+                label_to_path.insert(label, score_file_path.clone());
                 native_score_files.push(score_file_path.clone());
             }
             Ok(false) => {
-                // The file is not in native format, so we must convert it.
-                // The reformatting function is intelligent and will produce a sorted file.
+                // Not in native format. Reformat it.
                 let output_dir = score_file_path.parent().unwrap_or_else(|| Path::new("."));
                 fs::create_dir_all(output_dir)?;
 
@@ -282,28 +316,37 @@ fn run_preparation_phase(
                     true
                 };
 
-                if should_reformat {
+                let label = if should_reformat {
                     eprintln!(
                         "> Info: Score file '{}' is not in native format. Attempting conversion...",
                         score_file_path.display()
                     );
                     
                     match reformat::reformat_pgs_file(score_file_path, &new_path) {
-                        Ok(_) => {
+                        Ok(lbl) => {
                             eprintln!("> Success: Converted to '{}'.", new_path.display());
-                            native_score_files.push(new_path);
+                            native_score_files.push(new_path.clone());
+                            lbl
                         }
                         Err(e) => {
-                            // The reformatting failed. The `ReformatError` type now
-                            // contains a rich, detailed diagnostic message. We can
-                            // simply convert it into a boxed error and return it.
                             return Err(Box::new(e));
                         }
                     }
                 } else {
                     eprintln!("> Info: Using cached converted file '{}'.", new_path.display());
-                    native_score_files.push(new_path);
+                    native_score_files.push(new_path.clone());
+                    read_label_from_cached_file(&new_path)?
+                };
+
+                if let Some(existing_path) = label_to_path.get(&label) {
+                    return Err(format!(
+                        "Duplicate Score ID '{}' detected!\n  File 1: '{}'\n  File 2: '{}'\nPlease ensure each score file has a unique identifier.",
+                        label,
+                        existing_path.display(),
+                        score_file_path.display()
+                    ).into());
                 }
+                label_to_path.insert(label, score_file_path.clone());
             }
             Err(e) => {
                 // This is a lower-level I/O error from just trying to open the file.

@@ -151,7 +151,7 @@ impl From<io::Error> for ReformatError {
 }
 
 /// Reformat a PGS Catalog scoring file into a gnomon-native, sorted TSV.
-pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), ReformatError> {
+pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String, ReformatError> {
     // --- Define helper types within the function scope ---
     #[derive(Clone, Copy)]
     enum ParsingStrategy {
@@ -510,7 +510,7 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
         }
     }
 
-    Ok(())
+    Ok(score_label)
 }
 
 /// Sorts a gnomon-native file that is not guaranteed to be sorted.
