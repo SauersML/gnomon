@@ -84,30 +84,34 @@ def init_pgs_file(filename, build, direction):
     return filename
 
 def write_pgs_chunk(df, f_pos, f_neg):
-    """Appends PGS rows."""
-    # Prepare standard columns
-    subset = pd.DataFrame()
-    subset['rsID'] = df['RSID'].fillna('.')
-    subset['chr_name'] = df['CHROM']
-    subset['chr_position'] = df['POS']
-    subset['effect_allele'] = df['ALT']
-    subset['other_allele'] = df['REF']
-    subset['weight_type'] = 'selection_coefficient_magnitude'
-    subset['S_raw'] = df['S']
-
-    # Positive
-    pos = subset[subset['S_raw'] > 0].copy()
+    """Appends PGS rows with CORRECT column order."""
+    # Positive selection
+    pos = df[df['S'] > 0].copy()
     if not pos.empty:
-        pos['effect_weight'] = pos['S_raw'].abs()
-        pos.drop(columns=['S_raw'], inplace=True)
-        pos.to_csv(f_pos, sep='\t', index=False, header=False, mode='a')
+        pos_out = pd.DataFrame({
+            'rsID': pos['RSID'].fillna('.'),
+            'chr_name': pos['CHROM'],
+            'chr_position': pos['POS'],
+            'effect_allele': pos['ALT'],
+            'other_allele': pos['REF'],
+            'effect_weight': pos['S'].abs(),
+            'weight_type': 'selection_coefficient_magnitude'
+        })
+        pos_out.to_csv(f_pos, sep='\t', index=False, header=False, mode='a')
 
-    # Negative
-    neg = subset[subset['S_raw'] < 0].copy()
+    # Negative selection
+    neg = df[df['S'] < 0].copy()
     if not neg.empty:
-        neg['effect_weight'] = neg['S_raw'].abs()
-        neg.drop(columns=['S_raw'], inplace=True)
-        neg.to_csv(f_neg, sep='\t', index=False, header=False, mode='a')
+        neg_out = pd.DataFrame({
+            'rsID': neg['RSID'].fillna('.'),
+            'chr_name': neg['CHROM'],
+            'chr_position': neg['POS'],
+            'effect_allele': neg['ALT'],
+            'other_allele': neg['REF'],
+            'effect_weight': neg['S'].abs(),
+            'weight_type': 'selection_coefficient_magnitude'
+        })
+        neg_out.to_csv(f_neg, sep='\t', index=False, header=False, mode='a')
 
 def lift_row(lo, chrom, pos):
     """
@@ -163,8 +167,6 @@ def process_data(input_file, chain_file):
             positions = chunk['POS']
             
             # Apply liftover row-by-row
-            # Note: pyliftover is fast C++ under the hood usually, but logic is python loop here
-            # We use zip to iterate faster
             new_chroms = []
             new_pos = []
             valid_mask = []
