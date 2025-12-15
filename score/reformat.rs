@@ -319,7 +319,14 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<(), Re
 
     // This is the "hot path". We use the pre-selected strategy and indices to
     // process all data lines in parallel with minimal branching or overhead.
-    let score_label = score_id.unwrap_or_else(|| "PGS_SCORE".to_string());
+    // Derive score label from pgs_id if available, otherwise from filename.
+    let score_label = score_id.unwrap_or_else(|| {
+        input_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "PGS_SCORE".to_string())
+    });
 
     // --- Define the resolver closure based on the chosen strategy ---
     // The `move` keyword captures the `column_indices` struct by value.
