@@ -170,36 +170,34 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     .filter(|p| p.is_file())
                     .collect();
                 
-                // Smart deduplication: if both foo.txt and foo.gnomon.tsv exist,
-                // only keep the cache IF it's newer than the source (not stale)
-                let fresh_cache_stems: std::collections::HashSet<_> = all_files.iter()
+                // O(n) pre-pass: build HashMap of stem -> source file mtime
+                // This avoids O(n²) nested loops when checking cache freshness
+                let source_mtimes: std::collections::HashMap<String, std::time::SystemTime> = all_files.iter()
+                    .filter(|p| !p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
+                    .filter_map(|p| {
+                        let stem = p.file_stem()?.to_string_lossy().to_string();
+                        let mtime = fs::metadata(p).and_then(|m| m.modified()).ok()?;
+                        Some((stem, mtime))
+                    })
+                    .collect();
+                
+                // O(n) pass: check which caches are fresh
+                let fresh_cache_stems: std::collections::HashSet<String> = all_files.iter()
                     .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
                     .filter_map(|cache_path| {
-                        // Extract stem: "foo.gnomon.tsv" -> "foo"
                         let name = cache_path.file_name()?.to_string_lossy();
                         let stem = name.strip_suffix(".gnomon.tsv")?;
                         
-                        // Find corresponding source file and check timestamps
-                        let source_candidates: Vec<_> = all_files.iter()
-                            .filter(|p| {
-                                p.file_stem().map(|s| s.to_string_lossy().to_string()) == Some(stem.to_string())
-                                    && !p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
-                            })
-                            .collect();
+                        // O(1) lookup instead of O(n) scan
+                        let source_mtime = source_mtimes.get(stem);
                         
-                        if source_candidates.is_empty() {
+                        if source_mtime.is_none() {
                             // No source file, cache is standalone (keep it)
                             return Some(stem.to_string());
                         }
                         
-                        // Check if cache is fresh (newer than all source files)
                         let cache_mtime = fs::metadata(cache_path).and_then(|m| m.modified()).ok()?;
-                        let source_is_newer = source_candidates.iter().any(|src| {
-                            fs::metadata(src)
-                                .and_then(|m| m.modified())
-                                .map(|src_time| src_time > cache_mtime)
-                                .unwrap_or(false)
-                        });
+                        let source_is_newer = source_mtime.map_or(false, |&src_time| src_time > cache_mtime);
                         
                         if source_is_newer {
                             None // Cache is stale, don't skip source
@@ -209,21 +207,17 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     })
                     .collect();
                 
+                // O(n) final filter
                 all_files.into_iter()
                     .filter(|p| {
                         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        // Always keep .gnomon.tsv files (even stale ones - they'll be regenerated)
                         if name.ends_with(".gnomon.tsv") {
-                            // But skip stale caches when fresh source exists
                             let stem = name.strip_suffix(".gnomon.tsv").unwrap_or(&name);
-                            // If stem is NOT in fresh_cache_stems, the source will be processed
-                            // and we should skip this stale cache
                             return fresh_cache_stems.contains(stem);
                         }
-                        // For source files, skip if a fresh cache exists
                         if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
                             if fresh_cache_stems.contains(&stem) {
-                                return false; // Skip source, fresh cache exists
+                                return false;
                             }
                         }
                         true
