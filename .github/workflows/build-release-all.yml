@@ -61,8 +61,8 @@ jobs:
             asset_name: gnomon-windows-x64
             cpu: x86-64-v3
 
-          # Windows ARM64
-          - os: windows-latest
+          # Windows ARM64 (native ARM runner)
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             artifact_name: gnomon.exe
             asset_name: gnomon-windows-arm64
