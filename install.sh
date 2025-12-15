@@ -69,13 +69,17 @@ case "$OS" in
         esac
         ;;
     mingw*|msys*|cygwin*)
+        RAW_OS="$OS"
         OS="windows"
         INSTALL_DIR="$HOME/bin"
         
         # Check for Windows ARM64 environment variables (Git Bash often runs as x64 emulated)
-        if [[ "$PROCESSOR_ARCHITECTURE" == "ARM64" ]] || [[ "$PROCESSOR_ARCHITEW6432" == "ARM64" ]]; then
+        # Fallback: check if uname string contains "arm64" (e.g. mingw64_nt-10.0-26200-arm64)
+        if [[ "$PROCESSOR_ARCHITECTURE" == "ARM64" ]] || \
+           [[ "$PROCESSOR_ARCHITEW6432" == "ARM64" ]] || \
+           [[ "$RAW_OS" == *"arm64"* ]]; then
             ARCH="aarch64"
-            log_info "Detected Windows ARM64 environment via environment variables."
+            log_info "Detected Windows ARM64 environment."
         fi
 
         case "$ARCH" in
