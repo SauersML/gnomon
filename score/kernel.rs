@@ -133,8 +133,8 @@ const MAX_KERNEL_ACCUMULATOR_LANES: usize = 100_usize.div_ceil(LANE_COUNT);
 pub fn accumulate_adjustments_for_person(
     weights: &PaddedInterleavedWeights,
     flip_flags: &PaddedInterleavedFlags,
-    g1_indices: &[usize],
-    g2_indices: &[usize],
+    g1_indices: &[u16],
+    g2_indices: &[u16],
 ) -> [SimdVec; MAX_KERNEL_ACCUMULATOR_LANES] {
     let num_scores = weights.num_scores();
     let num_accumulator_lanes = num_scores.div_ceil(LANE_COUNT);
@@ -145,6 +145,7 @@ pub fn accumulate_adjustments_for_person(
     // --- Loop 1: Dosage=1 Adjustments ---
     let two = SimdVec::splat(2.0);
     for &matrix_row_idx in g1_indices {
+        let matrix_row_idx = matrix_row_idx as usize;
         // This inner loop over score columns is the same performant structure as the original kernel.
         for i in 0..num_accumulator_lanes {
             unsafe {
@@ -161,6 +162,7 @@ pub fn accumulate_adjustments_for_person(
 
     // --- Loop 2: Dosage=2 Adjustments ---
     for &matrix_row_idx in g2_indices {
+        let matrix_row_idx = matrix_row_idx as usize;
         for i in 0..num_accumulator_lanes {
             unsafe {
                 let weights_vec = weights.get_simd_lane_unchecked(matrix_row_idx, i);
@@ -178,3 +180,4 @@ pub fn accumulate_adjustments_for_person(
 
     accumulator_buffer
 }
+

@@ -53,8 +53,10 @@ pub struct AllocatedData<'a> {
     missing_events: Vec<(usize, usize)>,
     g1_offsets: Vec<usize>,
     g2_offsets: Vec<usize>,
-    all_g1_indices: Vec<usize>,
-    all_g2_indices: Vec<usize>,
+    // Using u16 instead of usize: indices are into a mini-batch of max 256 variants,
+    // so u16 is more than sufficient and reduces memory bandwidth by 4x.
+    all_g1_indices: Vec<u16>,
+    all_g2_indices: Vec<u16>,
 }
 
 pub struct FilledData {
@@ -62,8 +64,9 @@ pub struct FilledData {
     pub missing_events: Vec<(usize, usize)>,
     pub g1_offsets: Vec<usize>,
     pub g2_offsets: Vec<usize>,
-    pub all_g1_indices: Vec<usize>,
-    pub all_g2_indices: Vec<usize>,
+    // Using u16 instead of usize: indices are into a mini-batch of max 256 variants.
+    pub all_g1_indices: Vec<u16>,
+    pub all_g2_indices: Vec<u16>,
 }
 
 // --- The Main Builder Struct ---
@@ -219,8 +222,8 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
 
             // Inside the thread, cast usize back to raw pointer and use it.
             // This is our promise to the compiler that this is safe because the underlying Vec lives.
-            let g1_ptr = g1_ptr_addr as *mut usize;
-            let g2_ptr = g2_ptr_addr as *mut usize;
+            let g1_ptr = g1_ptr_addr as *mut u16;
+            let g2_ptr = g2_ptr_addr as *mut u16;
 
             let person_g1_slice =
                 unsafe { std::slice::from_raw_parts_mut(g1_ptr.add(g1_offset), g1_count) };
@@ -238,11 +241,11 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
             for (i, &dosage) in genotype_row.iter().enumerate() {
                 match dosage.0 {
                     1 => {
-                        person_g1_slice[g1_written] = i;
+                        person_g1_slice[g1_written] = i as u16;
                         g1_written += 1;
                     }
                     2 => {
-                        person_g2_slice[g2_written] = i;
+                        person_g2_slice[g2_written] = i as u16;
                         g2_written += 1;
                     }
                     _ => (),
@@ -266,12 +269,12 @@ impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
 
 impl<'a> SparseIndexBuilder<'a, FilledData> {
     // Final safe getters
-    pub fn g1_slice_for_person(&self, person_idx: usize) -> &[usize] {
+    pub fn g1_slice_for_person(&self, person_idx: usize) -> &[u16] {
         let start = self.state.g1_offsets[person_idx];
         let count = self.state.person_counts[person_idx].0 as usize;
         &self.state.all_g1_indices[start..start + count]
     }
-    pub fn g2_slice_for_person(&self, person_idx: usize) -> &[usize] {
+    pub fn g2_slice_for_person(&self, person_idx: usize) -> &[u16] {
         let start = self.state.g2_offsets[person_idx];
         let count = self.state.person_counts[person_idx].1 as usize;
         &self.state.all_g2_indices[start..start + count]
