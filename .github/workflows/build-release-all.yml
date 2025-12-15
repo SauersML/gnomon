@@ -31,7 +31,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: gnomon
             asset_name: gnomon-macos-arm64
-            use_cross: false
             cpu: apple-m1
 
           # MacOS Intel
@@ -39,7 +38,6 @@ jobs:
             target: x86_64-apple-darwin
             artifact_name: gnomon
             asset_name: gnomon-macos-intel
-            use_cross: false
             cpu: x86-64-v3
 
           # Linux x86_64
@@ -47,15 +45,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: gnomon
             asset_name: gnomon-linux-x64
-            use_cross: false
             cpu: x86-64-v3
 
-          # Linux ARM64 (cross-compile from x86 runner)
-          - os: ubuntu-latest
+          # Linux ARM64 (native ARM runner)
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: gnomon
             asset_name: gnomon-linux-arm64
-            use_cross: true
             cpu: neoverse-n1
 
           # Windows x86_64
@@ -63,7 +59,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: gnomon.exe
             asset_name: gnomon-windows-x64
-            use_cross: false
             cpu: x86-64-v3
 
           # Windows ARM64
@@ -71,7 +66,6 @@ jobs:
             target: aarch64-pc-windows-msvc
             artifact_name: gnomon.exe
             asset_name: gnomon-windows-arm64
-            use_cross: false
             cpu: cortex-a76
 
     steps:
@@ -92,26 +86,13 @@ jobs:
         shell: bash
         run: rm -f .cargo/config.toml
 
-      - name: Install Cross
-        if: matrix.use_cross
-        shell: bash
-        run: |
-            curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-            cargo binstall cross -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Build
         shell: bash
         env:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
           GNOMON_SKIP_LINT_CHECKS: "1"
-        run: |
-          if [ "${{ matrix.use_cross }}" == "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
