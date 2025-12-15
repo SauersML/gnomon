@@ -26,8 +26,20 @@ ICON_ROCK="${GREEN}🚀${RESET}"
 # --- Configuration ---
 REPO_OWNER="SauersML"
 REPO_NAME="gnomon"
-INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="gnomon"
+
+# Determine install directory: prefer /usr/local/bin if writable, else ~/.local/bin
+if [ -w "/usr/local/bin" ]; then
+    INSTALL_DIR="/usr/local/bin"
+elif [ -d "$HOME/.local/bin" ] && [ -w "$HOME/.local/bin" ]; then
+    INSTALL_DIR="$HOME/.local/bin"
+elif [ -w "/usr/local/bin" ] || command -v sudo >/dev/null 2>&1; then
+    # Will try sudo later if needed
+    INSTALL_DIR="/usr/local/bin"
+else
+    # Fallback to user-local install
+    INSTALL_DIR="$HOME/.local/bin"
+fi
 
 log_info() { echo -e "${ICON_INFO}  $1"; }
 log_success() { echo -e "${ICON_CHECK}  $1"; }
@@ -229,6 +241,14 @@ fi
 # --- 4. Verify ---
 log_header "Verification"
 
+# Check if we installed to a user-local directory that might not be in PATH
+NEED_PATH_HINT=false
+if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]] || [[ "$INSTALL_DIR" == "$HOME/bin" ]]; then
+    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        NEED_PATH_HINT=true
+    fi
+fi
+
 if command -v "${BINARY_NAME}" >/dev/null 2>&1; then
     # Binary doesn't support --version, so we check help output
     if "${BINARY_NAME}" --help >/dev/null 2>&1; then
@@ -242,6 +262,13 @@ if command -v "${BINARY_NAME}" >/dev/null 2>&1; then
         log_error "Binary installed but failed to run."
         exit 1
     fi
+elif [ "$NEED_PATH_HINT" = true ]; then
+    log_success "Successfully installed gnomon to ${INSTALL_DIR}."
+    echo -e "\n${YELLOW}NOTE:${RESET} ${INSTALL_DIR} is not in your PATH."
+    echo -e "Add it by running:\n"
+    echo -e "  ${BOLD}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}\n"
+    echo -e "Or for this session only:\n"
+    echo -e "  ${BOLD}export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}\n"
 else
     log_error "Installation appeared to succeed, but 'gnomon' is not in your PATH."
     log_info "Ensure ${INSTALL_DIR} is in your PATH."
