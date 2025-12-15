@@ -68,6 +68,8 @@ struct KeyedScoreRecord<'arena> {
     other_allele: &'arena str,
     score_column_index: ScoreColumnIndex,
     weight: f32,
+    /// Index of the source file this record came from (0-indexed).
+    file_idx: usize,
 }
 
 // Manual implementation to handle f32 comparison correctly.
@@ -341,7 +343,8 @@ fn prepare_for_computation_with_retry(
 
     // These data structures will store the results of the merge-join.
     // Allele strings borrowed from the arena are stored here temporarily.
-    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, (f32, bool)>> =
+    // The tuple is (weight, is_flipped, file_idx).
+    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, (f32, bool, usize)>> =
         BTreeMap::new();
     // For complex rules, the key is the set of BIM contexts. The value is a tuple
     // containing the canonical chr:pos key for the locus and all score applications.
@@ -453,16 +456,33 @@ fn prepare_for_computation_with_retry(
                                 let score_map =
                                     simple_path_data.entry(bim_rec.bim_row_index).or_default();
 
-                                if score_map
-                                    .insert(
-                                        score_record.score_column_index,
-                                        (score_record.weight, is_flipped),
-                                    )
-                                    .is_some()
-                                {
+                                if let Some(prev) = score_map.insert(
+                                    score_record.score_column_index,
+                                    (score_record.weight, is_flipped, score_record.file_idx),
+                                ) {
+                                    let (prev_weight, _, prev_file_idx) = prev;
+                                    let curr_file_idx = score_record.file_idx;
+                                    let score_name = &score_names[score_record.score_column_index.0];
+                                    
+                                    let location_msg = if prev_file_idx == curr_file_idx {
+                                        format!(
+                                            "Duplicate found within file: '{}'",
+                                            sorted_score_files[curr_file_idx].display()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Conflict between files: '{}' (weight={}) and '{}' (weight={})",
+                                            sorted_score_files[prev_file_idx].display(),
+                                            prev_weight,
+                                            sorted_score_files[curr_file_idx].display(),
+                                            score_record.weight
+                                        )
+                                    };
+                                    
                                     return Err(PrepError::AmbiguousReconciliation(format!(
-                                        "Ambiguous input: The same variant appears multiple times with different weights for score '{}'. This can happen from duplicate rows in a single file, or across multiple files if they share the same score column name. Variant BIM index: {}",
-                                        score_names[score_record.score_column_index.0],
+                                        "Ambiguous input: The same variant appears multiple times with different weights for score '{}'. {}. Variant BIM index: {}",
+                                        score_name,
+                                        location_msg,
                                         bim_rec.bim_row_index.0
                                     )));
                                 }
@@ -665,7 +685,7 @@ fn prepare_for_computation_with_retry(
             |(reconciled_idx, ((weights_chunk, flip_chunk), vtsm_entry))| {
                 let bim_row_index = required_bim_indices[reconciled_idx];
                 if let Some(score_data_map) = simple_path_data.get(&bim_row_index) {
-                    for (&score_col_idx, &(weight, is_flipped)) in score_data_map.iter() {
+                    for (&score_col_idx, &(weight, is_flipped, _)) in score_data_map.iter() {
                         weights_chunk[score_col_idx.0] = weight;
                         flip_chunk[score_col_idx.0] = if is_flipped { 1 } else { 0 };
                     }
@@ -1402,6 +1422,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                 other_allele,
                 score_column_index,
                 weight,
+                file_idx,
             };
             heap.push(HeapItem { record, file_idx });
         }
