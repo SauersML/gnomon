@@ -40,15 +40,15 @@ jobs:
             asset_name: gnomon-macos-intel
             cpu: x86-64-v3
 
-          # Linux x86_64
-          - os: ubuntu-latest
+          # Linux x86_64 (ubuntu-22.04 for wider glibc compatibility)
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: gnomon
             asset_name: gnomon-linux-x64
             cpu: x86-64-v3
 
-          # Linux ARM64 (native ARM runner)
-          - os: ubuntu-24.04-arm
+          # Linux ARM64 (ubuntu-22.04 for wider glibc compatibility)
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: gnomon
             asset_name: gnomon-linux-arm64
