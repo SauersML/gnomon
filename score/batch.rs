@@ -18,274 +18,9 @@ use crate::score::types::{
     ReconciledVariantIndex,
 };
 use crossbeam_queue::ArrayQueue;
-use rayon::prelude::*;
 use std::error::Error;
-use std::marker::PhantomData;
 use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
-// --- State Markers (Zero-Sized Types) ---
-pub struct Ready;
-pub struct Counted;
-pub struct Allocated;
-pub struct Filled;
-
-// --- Data Structs For Each State ---
-pub struct ReadyData<'a> {
-    tile: &'a [EffectAlleleDosage],
-    num_people: usize,
-    mini_batch_size: usize,
-    variant_mini_batch_start: usize,
-}
-
-pub struct CountedData {
-    num_people: usize,
-    person_counts: Vec<(u32, u32)>,
-    missing_events: Vec<(usize, usize)>,
-}
-
-pub struct AllocatedData<'a> {
-    // We need to pass the tile reference through for the final fill pass.
-    tile: &'a [EffectAlleleDosage],
-    variant_mini_batch_start: usize,
-    mini_batch_size: usize,
-    num_people: usize,
-    person_counts: Vec<(u32, u32)>,
-    missing_events: Vec<(usize, usize)>,
-    g1_offsets: Vec<usize>,
-    g2_offsets: Vec<usize>,
-    // Using u16 instead of usize: indices are into a mini-batch of max 256 variants,
-    // so u16 is more than sufficient and reduces memory bandwidth by 4x.
-    all_g1_indices: Vec<u16>,
-    all_g2_indices: Vec<u16>,
-}
-
-pub struct FilledData {
-    pub person_counts: Vec<(u32, u32)>,
-    pub missing_events: Vec<(usize, usize)>,
-    pub g1_offsets: Vec<usize>,
-    pub g2_offsets: Vec<usize>,
-    // Using u16 instead of usize: indices are into a mini-batch of max 256 variants.
-    pub all_g1_indices: Vec<u16>,
-    pub all_g2_indices: Vec<u16>,
-}
-
-// --- The Main Builder Struct ---
-pub struct SparseIndexBuilder<'a, State> {
-    state: State,
-    marker: PhantomData<&'a ()>,
-}
-
-// ========================================================================================
-//                             Sparse index builder (typestate)
-// ========================================================================================
-
-impl<'a> SparseIndexBuilder<'a, ReadyData<'a>> {
-    /// Creates a new builder in the initial `Ready` state.
-    pub fn new(data: ReadyData<'a>) -> Self {
-        Self {
-            state: data,
-            marker: PhantomData,
-        }
-    }
-
-    /// PASS 1: Parallel Count.
-    pub fn count_dosages(self) -> SparseIndexBuilder<'a, CountedData> {
-        let variants_in_chunk = self.state.tile.len() / self.state.num_people;
-
-        let (person_counts, nested_missing_events): (Vec<(u32, u32)>, Vec<Vec<(usize, usize)>>) =
-            (0..self.state.num_people)
-                .into_par_iter()
-                .map(|person_idx| {
-                    let mut g1_count = 0;
-                    let mut g2_count = 0;
-                    let mut local_missing_events = Vec::new();
-
-                    let genotype_tile_row_offset = person_idx * variants_in_chunk;
-                    let mini_batch_genotype_start =
-                        genotype_tile_row_offset + self.state.variant_mini_batch_start;
-                    let genotype_row = &self.state.tile[mini_batch_genotype_start
-                        ..mini_batch_genotype_start + self.state.mini_batch_size];
-
-                    for (i, &dosage) in genotype_row.iter().enumerate() {
-                        match dosage.0 {
-                            1 => g1_count += 1,
-                            2 => g2_count += 1,
-                            3 => {
-                                let variant_idx_in_chunk = self.state.variant_mini_batch_start + i;
-                                local_missing_events.push((person_idx, variant_idx_in_chunk));
-                            }
-                            _ => (),
-                        }
-                    }
-                    ((g1_count, g2_count), local_missing_events)
-                })
-                .unzip();
-
-        let missing_events = nested_missing_events.into_iter().flatten().collect();
-
-        SparseIndexBuilder {
-            state: CountedData {
-                num_people: self.state.num_people,
-                person_counts,
-                missing_events,
-            },
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a> SparseIndexBuilder<'a, CountedData> {
-    /// PASS 2: Serial Allocation & Offset Calculation.
-    pub fn allocate_and_prepare(
-        self,
-        tile: &'a [EffectAlleleDosage],
-        variant_mini_batch_start: usize,
-        mini_batch_size: usize,
-    ) -> SparseIndexBuilder<'a, AllocatedData<'a>> {
-        let total_g1: usize = self
-            .state
-            .person_counts
-            .iter()
-            .map(|(g1, _)| *g1 as usize)
-            .sum();
-        let total_g2: usize = self
-            .state
-            .person_counts
-            .iter()
-            .map(|(_, g2)| *g2 as usize)
-            .sum();
-
-        let mut all_g1_indices = Vec::with_capacity(total_g1);
-        let mut all_g2_indices = Vec::with_capacity(total_g2);
-
-        // This is safe because we are creating uninitialized Vecs and will fill them completely.
-        unsafe {
-            all_g1_indices.set_len(total_g1);
-            all_g2_indices.set_len(total_g2);
-        }
-
-        let mut g1_offsets = Vec::with_capacity(self.state.num_people);
-        let mut g2_offsets = Vec::with_capacity(self.state.num_people);
-        let mut g1_running_total = 0;
-        let mut g2_running_total = 0;
-
-        for (g1_count, g2_count) in &self.state.person_counts {
-            g1_offsets.push(g1_running_total);
-            g2_offsets.push(g2_running_total);
-            g1_running_total += *g1_count as usize;
-            g2_running_total += *g2_count as usize;
-        }
-
-        SparseIndexBuilder {
-            state: AllocatedData {
-                tile,
-                variant_mini_batch_start,
-                mini_batch_size,
-                num_people: self.state.num_people,
-                person_counts: self.state.person_counts,
-                missing_events: self.state.missing_events,
-                g1_offsets,
-                g2_offsets,
-                all_g1_indices,
-                all_g2_indices,
-            },
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a> SparseIndexBuilder<'a, AllocatedData<'a>> {
-    /// PASS 3: Parallel Fill. This is where the single `unsafe` block lives.
-    pub fn parallel_fill(mut self) -> SparseIndexBuilder<'a, FilledData> {
-        let num_people = self.state.num_people;
-        let variants_in_chunk = self.state.tile.len() / num_people;
-
-        // Alternative pointer passing: Cast to usize to ensure Send + Sync for the captured variable.
-        let g1_ptr_addr = self.state.all_g1_indices.as_mut_ptr() as usize;
-        let g2_ptr_addr = self.state.all_g2_indices.as_mut_ptr() as usize;
-
-        // These variables are all thread-safe and can be captured by the closure.
-        let tile_ref = self.state.tile;
-        let variant_mini_batch_start_val = self.state.variant_mini_batch_start;
-        let mini_batch_size_val = self.state.mini_batch_size;
-        let person_counts_ref = &self.state.person_counts;
-        let g1_offsets_ref = &self.state.g1_offsets;
-        let g2_offsets_ref = &self.state.g2_offsets;
-
-        // The `move` closure will now capture `g1_ptr_wrapper` and `g2_ptr_wrapper`,
-        // which are Send+Sync, thus satisfying the compiler.
-        (0..num_people).into_par_iter().for_each(move |person_idx| {
-            let g1_offset = g1_offsets_ref[person_idx];
-            let g1_count = person_counts_ref[person_idx].0 as usize;
-            let g2_offset = g2_offsets_ref[person_idx];
-            let g2_count = person_counts_ref[person_idx].1 as usize;
-
-            // Inside the thread, cast usize back to raw pointer and use it.
-            // This is our promise to the compiler that this is safe because the underlying Vec lives.
-            let g1_ptr = g1_ptr_addr as *mut u16;
-            let g2_ptr = g2_ptr_addr as *mut u16;
-
-            let person_g1_slice =
-                unsafe { std::slice::from_raw_parts_mut(g1_ptr.add(g1_offset), g1_count) };
-            let person_g2_slice =
-                unsafe { std::slice::from_raw_parts_mut(g2_ptr.add(g2_offset), g2_count) };
-
-            let mut g1_written = 0;
-            let mut g2_written = 0;
-
-            let genotype_tile_row_offset = person_idx * variants_in_chunk;
-            let mini_batch_genotype_start = genotype_tile_row_offset + variant_mini_batch_start_val;
-            let genotype_row = &tile_ref
-                [mini_batch_genotype_start..mini_batch_genotype_start + mini_batch_size_val];
-
-            for (i, &dosage) in genotype_row.iter().enumerate() {
-                match dosage.0 {
-                    1 => {
-                        person_g1_slice[g1_written] = i as u16;
-                        g1_written += 1;
-                    }
-                    2 => {
-                        person_g2_slice[g2_written] = i as u16;
-                        g2_written += 1;
-                    }
-                    _ => (),
-                }
-            }
-        });
-
-        SparseIndexBuilder {
-            state: FilledData {
-                person_counts: self.state.person_counts,
-                missing_events: self.state.missing_events,
-                g1_offsets: self.state.g1_offsets,
-                g2_offsets: self.state.g2_offsets,
-                all_g1_indices: self.state.all_g1_indices,
-                all_g2_indices: self.state.all_g2_indices,
-            },
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a> SparseIndexBuilder<'a, FilledData> {
-    // Final safe getters
-    pub fn g1_slice_for_person(&self, person_idx: usize) -> &[u16] {
-        let start = self.state.g1_offsets[person_idx];
-        let count = self.state.person_counts[person_idx].0 as usize;
-        &self.state.all_g1_indices[start..start + count]
-    }
-    pub fn g2_slice_for_person(&self, person_idx: usize) -> &[u16] {
-        let start = self.state.g2_offsets[person_idx];
-        let count = self.state.person_counts[person_idx].1 as usize;
-        &self.state.all_g2_indices[start..start + count]
-    }
-    pub fn missing_events(&self) -> &[(usize, usize)] {
-        &self.state.missing_events
-    }
-    pub fn into_inner(self) -> FilledData {
-        self.state
-    }
-}
 
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
@@ -535,19 +270,6 @@ pub(crate) fn process_tile_impl<'a>(
             continue;
         }
 
-        // --- Execute the Type-Safe State Machine ---
-        let ready_data = ReadyData {
-            tile,
-            num_people: num_people_in_block,
-            mini_batch_size,
-            variant_mini_batch_start,
-        };
-
-        let filled_builder = SparseIndexBuilder::new(ready_data)
-            .count_dosages()
-            .allocate_and_prepare(tile, variant_mini_batch_start, mini_batch_size)
-            .parallel_fill();
-
         // --- Create Kernel Input Views ---
         let matrix_slice_start = variant_mini_batch_start * stride;
         let matrix_slice_end = matrix_slice_start + (mini_batch_size * stride);
@@ -577,55 +299,79 @@ pub(crate) fn process_tile_impl<'a>(
                 .unwrap_unchecked()
         };
 
-        // --- Dispatch to Kernel and Accumulate Results ---
-        block_scores_out
-            .chunks_exact_mut(num_scores)
-            .enumerate()
-            .for_each(|(person_idx, scores_out_slice)| {
-                let g1_slice = filled_builder.g1_slice_for_person(person_idx);
-                let g2_slice = filled_builder.g2_slice_for_person(person_idx);
+        // --- Single-Pass Stack-Buffered Processing ---
+        // Instead of the 3-pass SparseIndexBuilder (count → allocate → fill), we now:
+        // 1. Iterate over each person
+        // 2. Scan their dosage row into stack-allocated arrays (512 bytes each, fits in L1)
+        // 3. Call the kernel immediately
+        // This eliminates all Vec allocations and reduces buffer passes from 3 to 1.
+        for person_idx in 0..num_people_in_block {
+            // Stack-allocated buffers for variant indices (max 256 variants per mini-batch)
+            let mut g1_indices: [u16; KERNEL_MINI_BATCH_SIZE] = [0; KERNEL_MINI_BATCH_SIZE];
+            let mut g2_indices: [u16; KERNEL_MINI_BATCH_SIZE] = [0; KERNEL_MINI_BATCH_SIZE];
+            let mut g1_count = 0usize;
+            let mut g2_count = 0usize;
 
-                let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
-                    &weights,
-                    &flip_flags,
-                    g1_slice,
-                    g2_slice,
-                );
+            // Single-pass scan of this person's dosage row for this mini-batch
+            let row_start = person_idx * variants_in_chunk + variant_mini_batch_start;
+            let dosage_row = &tile[row_start..row_start + mini_batch_size];
 
-                for i in 0..num_accumulator_lanes {
-                    let scores_offset = i * SIMD_LANES;
-                    let adjustments_f32x8 = kernel_result_buffer[i];
-                    accumulate_simd_lane(
-                        scores_out_slice,
-                        adjustments_f32x8,
-                        scores_offset,
-                        num_scores,
-                    );
-                }
-            });
-
-        // --- Process Deferred Missing Events ---
-        for &(person_idx, variant_idx_in_chunk) in filled_builder.missing_events() {
-            let global_matrix_row_idx =
-                reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
-            let scores_for_this_variant = &prep_result.variant_to_scores_map[global_matrix_row_idx];
-            let weight_row_offset = variant_idx_in_chunk * stride;
-            let weight_row = &weights_for_batch[weight_row_offset..weight_row_offset + num_scores];
-            let flip_row = &flips_for_batch[weight_row_offset..weight_row_offset + num_scores];
-            let person_scores_slice =
-                &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
-            let person_missing_counts_slice = &mut block_missing_counts_out
-                [person_idx * num_scores..(person_idx + 1) * num_scores];
-
-            for &score_idx in scores_for_this_variant {
-                let score_col = score_idx.0;
-                unsafe {
-                    *person_missing_counts_slice.get_unchecked_mut(score_col) += 1;
-                    if flip_row[score_col] == 1 {
-                        *person_scores_slice.get_unchecked_mut(score_col) -=
-                            2.0 * (weight_row[score_col] as f64);
+            for (i, &dosage) in dosage_row.iter().enumerate() {
+                match dosage.0 {
+                    1 => {
+                        g1_indices[g1_count] = i as u16;
+                        g1_count += 1;
                     }
+                    2 => {
+                        g2_indices[g2_count] = i as u16;
+                        g2_count += 1;
+                    }
+                    3 => {
+                        // Handle missing genotype inline
+                        let variant_idx_in_chunk = variant_mini_batch_start + i;
+                        let global_matrix_row_idx =
+                            reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
+                        let scores_for_this_variant =
+                            &prep_result.variant_to_scores_map[global_matrix_row_idx];
+                        let weight_row_offset = i * stride;
+                        let person_scores_slice = &mut block_scores_out
+                            [person_idx * num_scores..(person_idx + 1) * num_scores];
+                        let person_missing_counts_slice = &mut block_missing_counts_out
+                            [person_idx * num_scores..(person_idx + 1) * num_scores];
+
+                        for &score_idx in scores_for_this_variant {
+                            let score_col = score_idx.0;
+                            person_missing_counts_slice[score_col] += 1;
+                            if flip_flags_chunk[weight_row_offset + score_col] == 1 {
+                                person_scores_slice[score_col] -=
+                                    2.0 * (weights_chunk[weight_row_offset + score_col] as f64);
+                            }
+                        }
+                    }
+                    _ => (),
                 }
+            }
+
+            // Call kernel with stack slices
+            let kernel_result_buffer = kernel::accumulate_adjustments_for_person(
+                &weights,
+                &flip_flags,
+                &g1_indices[..g1_count],
+                &g2_indices[..g2_count],
+            );
+
+            // Accumulate results into output buffer
+            let scores_out_slice =
+                &mut block_scores_out[person_idx * num_scores..(person_idx + 1) * num_scores];
+            for i in 0..num_accumulator_lanes {
+                let scores_offset = i * SIMD_LANES;
+                let adjustments_f32x8 = kernel_result_buffer[i];
+                accumulate_simd_lane(
+                    scores_out_slice,
+                    adjustments_f32x8,
+                    scores_offset,
+                    num_scores,
+                );
             }
         }
     }
@@ -827,15 +573,27 @@ pub fn run_variant_major_path(
     // This single loop iterates only over the individuals we need to score.
     // This is the core optimization that eliminates the massive allocation and
     // redundant work of the previous implementation.
+    
+    // Cache the last-read byte to avoid redundant memory reads. When output_idx_to_fam_idx
+    // is sorted (which it typically is), consecutive people often share the same byte.
+    let mut cached_byte_idx = usize::MAX;
+    let mut cached_byte = 0u8;
+
     for out_idx in 0..prep_result.num_people_to_score {
         // Use a pre-computed map to find the original .fam index for this output slot.
         let original_fam_idx = prep_result.output_idx_to_fam_idx[out_idx] as usize;
 
-        // --- On-the-fly Genotype Decoding ---
-        // This is very fast (a few bitwise operations) and allocation-free.
+        // --- On-the-fly Genotype Decoding with Byte Caching ---
+        // Only re-read the byte if we've moved to a new position. This reduces
+        // memory reads by ~75% since 4 people share each byte.
         let byte_index = original_fam_idx / 4;
+        if byte_index != cached_byte_idx {
+            cached_byte = variant_data[byte_index];
+            cached_byte_idx = byte_index;
+        }
+        
         let bit_offset = (original_fam_idx % 4) * 2;
-        let packed_val = (variant_data[byte_index] >> bit_offset) & 0b11;
+        let packed_val = (cached_byte >> bit_offset) & 0b11;
 
         // The logic for all dosage states is handled in a single, efficient match.
         match packed_val {
