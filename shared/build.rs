@@ -875,12 +875,25 @@ fn main() {
     update_stage("initialization");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Emit build timestamp for version command (always, even when lint checks are skipped)
+    let build_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=GNOMON_BUILD_TIMESTAMP={}", build_time);
+
+    // Capture release tag if provided by CI
+    if let Ok(release_tag) = std::env::var("GNOMON_RELEASE_TAG") {
+        println!("cargo:rustc-env=GNOMON_RELEASE_TAG={}", release_tag);
+    }
+
     // Skip lint checks during release builds or cross-compilation
     // (the grep crate won't be available in target deps during cross-compile)
     if std::env::var("GNOMON_SKIP_LINT_CHECKS").is_ok() {
         update_stage("skipping lint checks (GNOMON_SKIP_LINT_CHECKS set)");
         return;
     }
+
 
     // Manually check for unused variables in the build script
     update_stage("manual lint self-check");

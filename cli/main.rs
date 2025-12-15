@@ -759,6 +759,10 @@ enum Commands {
     /// Apply trained calibration model to new data
     #[command(about = "Apply calibration model to new data (outputs: predictions.tsv)")]
     Infer(InferArgs),
+
+    /// Display version and build information
+    #[command(about = "Display version and build information")]
+    Version,
 }
 
 fn main() {
@@ -786,6 +790,10 @@ fn main() {
         Some(Commands::Terms(args)) => run_terms(args),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
+        Some(Commands::Version) => {
+            print_version_info();
+            Ok(())
+        }
         None => {
             Cli::command().print_help().expect("print help");
             println!();
@@ -799,7 +807,67 @@ fn main() {
     }
 }
 
+/// Format seconds into a human-readable duration like "2.4 hours ago"
+fn format_duration_ago(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+
+    if seconds < MINUTE {
+        format!("{} seconds ago", seconds)
+    } else if seconds < HOUR {
+        let mins = seconds as f64 / MINUTE as f64;
+        format!("{:.1} minutes ago", mins)
+    } else if seconds < DAY {
+        let hours = seconds as f64 / HOUR as f64;
+        format!("{:.1} hours ago", hours)
+    } else if seconds < WEEK {
+        let days = seconds as f64 / DAY as f64;
+        format!("{:.1} days ago", days)
+    } else if seconds < MONTH {
+        let weeks = seconds as f64 / WEEK as f64;
+        format!("{:.1} weeks ago", weeks)
+    } else if seconds < YEAR {
+        let months = seconds as f64 / MONTH as f64;
+        format!("{:.1} months ago", months)
+    } else {
+        let years = seconds as f64 / YEAR as f64;
+        format!("{:.1} years ago", years)
+    }
+}
+
+fn print_version_info() {
+    let version = env!("CARGO_PKG_VERSION");
+    let release_tag = option_env!("GNOMON_RELEASE_TAG");
+    let build_timestamp: u64 = env!("GNOMON_BUILD_TIMESTAMP").parse().unwrap_or(0);
+
+    println!("gnomon {}", version);
+
+    match release_tag {
+        Some(tag) => println!("Release: {}", tag),
+        None => println!("Release: development build"),
+    }
+
+    if build_timestamp > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if now > build_timestamp {
+            let age = now - build_timestamp;
+            println!("Built: {}", format_duration_ago(age));
+        } else {
+            println!("Built: just now");
+        }
+    }
+}
+
 fn run_map_fit(
+
     genotype_path: PathBuf,
     list: Option<PathBuf>,
     components: usize,

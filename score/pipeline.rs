@@ -492,7 +492,11 @@ fn run_single_file_pipeline(
                 spool_bytes_per_variant,
                 dense_map,
             );
-            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+            if let Err(e) = resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts) {
+                // Cleanup spool before propagating error
+                let _ = fs::remove_file(&spool_file_path);
+                return Err(e);
+            }
             let keep_spool = env::var("GNOMON_KEEP_SPOOL")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
@@ -829,7 +833,11 @@ fn run_multi_file_pipeline(
                 spool_bytes_per_variant,
                 dense_map,
             );
-            resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts)?;
+            if let Err(e) = resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts) {
+                // Cleanup spool before propagating error
+                let _ = fs::remove_file(&spool_file_path);
+                return Err(e);
+            }
             let keep_spool = env::var("GNOMON_KEEP_SPOOL")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);

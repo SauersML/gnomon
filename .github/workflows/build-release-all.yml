@@ -92,7 +92,10 @@ jobs:
           # Use specific CPU target instead of 'native' to fix ring#2527 while keeping max optimization
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
           GNOMON_SKIP_LINT_CHECKS: "1"
+          # Embed release tag in binary for version command
+          GNOMON_RELEASE_TAG: "auto-${{ github.run_id }}-${{ github.run_number }}"
         run: cargo build --release --target ${{ matrix.target }}
+
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
