@@ -181,7 +181,7 @@ fn process_block<'a>(
     // If huge pages are not available, this is a no-op.
     #[cfg(target_os = "linux")]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
         }
         const MADV_HUGEPAGE: i32 = 14;
