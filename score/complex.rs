@@ -631,6 +631,7 @@ impl ResolverPipeline {
             Heuristic::PreferMatchingAlleleStructure,
 
 
+            Heuristic::ConsistentDosage,
             Heuristic::IndelAnchorBase,
             Heuristic::PreferHeterozygous,
         ];
