@@ -1466,9 +1466,41 @@ fn resolve_matches_for_score_line<'a, 'arena>(
 
     let mut simple_matches = BTreeMap::new();
     for record_tuple in bim_records_for_position {
-        if record_tuple.allele1 == score_record.effect_allele
-            || record_tuple.allele2 == score_record.effect_allele
-        {
+        let bim_a1 = record_tuple.allele1;
+        let bim_a2 = record_tuple.allele2;
+        let score_eff = score_record.effect_allele;
+        let score_other = score_record.other_allele;
+
+        // Strict matching: Check both alleles.
+        // case 1: exact match (A1=Eff, A2=Other)
+        // case 2: swap match (A2=Eff, A1=Other) -- usually implies strand flip or just ref/alt swap through mismatch
+        // Note: score_other can be "N" or empty, in which case we might be more lenient? 
+        // For now, let's allow "N" to match anything, but if it's specific, it must match.
+        
+        let other_is_wildcard = score_other.is_empty() || score_other == "N";
+        
+        // Check effect allele match
+        let eff_matches_a1 = bim_a1 == score_eff;
+        let eff_matches_a2 = bim_a2 == score_eff;
+
+        if !eff_matches_a1 && !eff_matches_a2 {
+            continue;
+        }
+
+        // Check other allele match
+        let matches_strict = if other_is_wildcard {
+             true
+        } else {
+            let score_o = score_other;
+            if eff_matches_a1 {
+                bim_a2 == score_o
+            } else {
+                // eff_matches_a2
+                bim_a1 == score_o
+            }
+        };
+
+        if matches_strict {
             simple_matches.insert(record_tuple.bim_row_index, record_tuple);
         }
     }
