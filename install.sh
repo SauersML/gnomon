@@ -228,11 +228,26 @@ if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
         echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
     else
-        echo -e "\n${YELLOW}NOTE:${RESET} ${INSTALL_DIR} is not in your PATH."
-        echo -e "Add it by running:\n"
-        echo -e "  ${BOLD}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}\n"
-        echo -e "Or for this session only:\n"
-        echo -e "  ${BOLD}export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}\n"
+        # Auto-add to PATH in shell config
+        PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+        
+        # Determine which shell config to update
+        if [ -n "$ZSH_VERSION" ] || [[ "$SHELL" == *"zsh"* ]]; then
+            SHELL_RC="$HOME/.zshrc"
+        else
+            SHELL_RC="$HOME/.bashrc"
+        fi
+        
+        # Check if already in config (avoid duplicates)
+        if ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+            echo "" >> "$SHELL_RC"
+            echo "# Added by gnomon installer" >> "$SHELL_RC"
+            echo "$PATH_LINE" >> "$SHELL_RC"
+            log_success "Added ${INSTALL_DIR} to PATH in ${SHELL_RC}"
+        fi
+        
+        echo -e "\n${ICON_ROCK}  ${BOLD}Restart your terminal or run: source ${SHELL_RC}${RESET}"
+        echo -e "    Then run: ${BOLD}gnomon --help${RESET}\n"
     fi
 else
     log_error "Binary installed but failed to run."
