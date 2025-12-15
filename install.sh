@@ -218,36 +218,24 @@ chmod +x "${INSTALL_DIR}/${DEST_BINARY_NAME}"
 # --- 4. Verify ---
 log_header "Verification"
 
-# Check if we installed to a user-local directory that might not be in PATH
-NEED_PATH_HINT=false
-if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]] || [[ "$INSTALL_DIR" == "$HOME/bin" ]]; then
-    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        NEED_PATH_HINT=true
-    fi
-fi
+INSTALLED_BIN="${INSTALL_DIR}/${DEST_BINARY_NAME}"
 
-if command -v "${BINARY_NAME}" >/dev/null 2>&1; then
-    # Binary doesn't support --version, so we check help output
-    if "${BINARY_NAME}" --help >/dev/null 2>&1; then
-        log_success "Successfully installed gnomon!"
+# Test the binary directly from install path
+if [ -x "$INSTALLED_BIN" ] && "$INSTALLED_BIN" --help >/dev/null 2>&1; then
+    log_success "Successfully installed gnomon!"
+    
+    # Check if install dir is in PATH
+    if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
         echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
-    elif [ "$OS" = "windows" ]; then
-         # On Windows, newly added path might not be available in current shell session immediately
-         log_success "Successfully installed gnomon to ${INSTALL_DIR}."
-         echo -e "Note: You may need to restart your terminal or run: export PATH=\"\$HOME/bin:\$PATH\""
     else
-        log_error "Binary installed but failed to run."
-        exit 1
+        echo -e "\n${YELLOW}NOTE:${RESET} ${INSTALL_DIR} is not in your PATH."
+        echo -e "Add it by running:\n"
+        echo -e "  ${BOLD}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}\n"
+        echo -e "Or for this session only:\n"
+        echo -e "  ${BOLD}export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}\n"
     fi
-elif [ "$NEED_PATH_HINT" = true ]; then
-    log_success "Successfully installed gnomon to ${INSTALL_DIR}."
-    echo -e "\n${YELLOW}NOTE:${RESET} ${INSTALL_DIR} is not in your PATH."
-    echo -e "Add it by running:\n"
-    echo -e "  ${BOLD}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${RESET}\n"
-    echo -e "Or for this session only:\n"
-    echo -e "  ${BOLD}export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}\n"
 else
-    log_error "Installation appeared to succeed, but 'gnomon' is not in your PATH."
-    log_info "Ensure ${INSTALL_DIR} is in your PATH."
+    log_error "Binary installed but failed to run."
+    log_info "Try running: ${INSTALLED_BIN} --help"
     exit 1
 fi
