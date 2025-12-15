@@ -65,6 +65,7 @@ case "$OS" in
         ;;
     mingw*|msys*|cygwin*)
         OS="windows"
+        INSTALL_DIR="$HOME/bin"
         case "$ARCH" in
             x86_64) TARGET_ASSET="gnomon-windows-x64.zip" ;;
             aarch64) TARGET_ASSET="gnomon-windows-arm64.zip" ;;
@@ -212,6 +213,10 @@ if command -v "${BINARY_NAME}" >/dev/null 2>&1; then
     if "${BINARY_NAME}" --help >/dev/null 2>&1; then
         log_success "Successfully installed gnomon!"
         echo -e "\n${ICON_ROCK}  ${BOLD}Run 'gnomon --help' to get started!${RESET}\n"
+    elif [ "$OS" = "windows" ]; then
+         # On Windows, newly added path might not be available in current shell session immediately
+         log_success "Successfully installed gnomon to ${INSTALL_DIR}."
+         echo -e "Note: You may need to restart your terminal or run: export PATH=\"\$HOME/bin:\$PATH\""
     else
         log_error "Binary installed but failed to run."
         exit 1
