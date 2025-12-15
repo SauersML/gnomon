@@ -691,7 +691,10 @@ pub fn sort_plink_fileset(
         });
     }
 
-    let parent_dir = bed_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent_dir = match bed_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
     let stem = bed_path
         .file_stem()
         .ok_or_else(|| ReformatError::InvalidPlinkFileset {

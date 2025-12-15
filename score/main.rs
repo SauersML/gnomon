@@ -150,7 +150,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     .to_string_lossy()
                     .starts_with("gs://")
                     .then(|| Path::new(".").to_path_buf())
-                    .unwrap_or_else(|| p0.parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
+                    .unwrap_or_else(|| {
+                        match p0.parent() {
+                            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                            _ => Path::new(".").to_path_buf(),
+                        }
+                    });
                 parent_local.join("gnomon_score_cache")
             };
 
@@ -360,8 +365,11 @@ fn run_preparation_phase(
             }
             Ok(false) => {
                 // Not in native format. Reformat it.
-                let output_dir = score_file_path.parent().unwrap_or_else(|| Path::new("."));
-                fs::create_dir_all(output_dir)?;
+                let output_dir = match score_file_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => Path::new(".").to_path_buf(),
+                };
+                fs::create_dir_all(&output_dir)?;
 
                 let new_path = score_file_path.with_extension("gnomon.tsv");
                 

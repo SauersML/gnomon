@@ -871,10 +871,10 @@ fn derive_spool_destination(base_path: &Path) -> (PathBuf, String) {
     {
         (Path::new(".").to_path_buf(), stem)
     } else {
-        let dir = base_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let dir = match base_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => Path::new(".").to_path_buf(),
+        };
         (dir, stem)
     }
 }
