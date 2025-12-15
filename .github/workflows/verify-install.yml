@@ -34,9 +34,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./install.sh
 
-      - name: Add to PATH (Windows)
-        if: runner.os == 'Windows'
-        run: echo "$HOME/bin" >> $GITHUB_PATH
+      - name: Add to PATH
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            echo "$HOME/bin" >> $GITHUB_PATH
+          else
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          fi
 
       - name: Verify Installation
         run: |
