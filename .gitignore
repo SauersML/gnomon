@@ -11,3 +11,13 @@ calibrate/tests/bench_workdir/
 report.md
 diff.txt
 .devcontainer/
+
+# Lean
+.lake/
+lake-manifest.json
+
+# Jules automation
+jules.patch
+
+# Temporary tools
+gh_*/

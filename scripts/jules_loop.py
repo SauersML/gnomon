@@ -30,39 +30,83 @@ def run_command(cmd, check=False):
         sys.exit(result.returncode)
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
+def fetch_logs(run_id):
+    """Fetches logs for a specific workflow run."""
+    print(f"Fetching logs for run {run_id}...")
+    out, err, code = run_command(f"gh run view {run_id} --log")
+    if code == 0:
+        # Strip ANSI codes to make logs cleaner for the LLM
+        logs = strip_ansi(out)
+        print(f"Logs fetched. Length: {len(logs)} characters.")
+        if len(logs) > 50000:
+            print("Truncating logs to last 50,000 characters...")
+            logs = logs[-50000:]
+        return logs
+    else:
+        print(f"Failed to fetch logs: {err}")
+        return f"Failed to fetch logs: {err}"
+
 def get_previous_run_info():
-    """Retrieves status and logs from the workflow run that triggered this script."""
+    """Retrieves status and logs from the workflow run that triggered this script, or the latest run."""
+    print("\n--- Getting Previous Run Info ---")
     event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not event_path:
-        print("Warning: GITHUB_EVENT_PATH not set. Not triggered by workflow_run?")
+
+    # 1. Try to use the triggering workflow run info
+    if event_path:
+        print(f"Reading event from {event_path}")
+        try:
+            with open(event_path) as f:
+                event = json.load(f)
+
+            run = event.get("workflow_run")
+            if run:
+                conclusion = run.get("conclusion")
+                run_id = run.get("id")
+                workflow_id = run.get("workflow_id") # Use ID to re-trigger same workflow
+                print(f"Triggering run {run_id} found in event. Conclusion: {conclusion}")
+
+                logs = ""
+                if conclusion != "success":
+                    logs = fetch_logs(run_id)
+                else:
+                    logs = "Build passed successfully."
+
+                return conclusion, logs, workflow_id
+            else:
+                print("No 'workflow_run' found in event payload.")
+        except Exception as e:
+            print(f"Warning: Failed to read or parse GITHUB_EVENT_PATH: {e}")
+
+    # 2. Fallback: Fetch latest run of prover.yml via gh
+    print("No triggering workflow_run found. Fetching latest 'Lean Prover CI' (prover.yml) run via gh...")
+
+    out, err, code = run_command(["gh", "run", "list", "--workflow", "prover.yml", "--limit", "1", "--json", "conclusion,databaseId,status"])
+
+    if code != 0 or not out:
+        print(f"Failed to fetch runs: {err}")
         return None, None, None
 
-    with open(event_path) as f:
-        event = json.load(f)
-
-    run = event.get("workflow_run")
-    if not run:
-        print("No workflow_run in event.")
+    try:
+        runs = json.loads(out)
+    except json.JSONDecodeError:
+        print(f"Failed to decode gh output: {out}")
         return None, None, None
 
-    conclusion = run.get("conclusion")
-    run_id = run.get("id")
-    workflow_id = run.get("workflow_id") # Use ID to re-trigger same workflow
+    if not runs:
+        print("No runs found for prover.yml")
+        return None, None, None
+
+    latest_run = runs[0]
+    conclusion = latest_run.get("conclusion")
+    run_id = latest_run.get("databaseId")
+    # Use filename as workflow_id for re-triggering
+    workflow_id = "prover.yml"
+
+    print(f"Latest run {run_id} status: {latest_run.get('status')}, conclusion: {conclusion}")
 
     logs = ""
-    print(f"Run {run_id} concluded with: {conclusion}")
-
     if conclusion != "success":
-        print("Fetching logs for failed run...")
-        out, err, code = run_command(f"gh run view {run_id} --log")
-        if code == 0:
-            # Strip ANSI codes to make logs cleaner for the LLM
-            logs = strip_ansi(out)
-            if len(logs) > 50000:
-                print("Truncating logs...")
-                logs = logs[-50000:]
-        else:
-            logs = f"Failed to fetch logs: {err}"
+        logs = fetch_logs(run_id)
     else:
         logs = "Build passed successfully."
 
@@ -77,17 +121,24 @@ def call_jules(prompt):
         print("Error: JULES_API_KEY not set.")
         sys.exit(1)
 
-    print("Creating Jules session...")
+    print("\n--- Initializing Jules Session ---")
+
+    payload = {
+        "prompt": prompt,
+        "sourceContext": {
+            "source": f"sources/github/{repo}",
+            "githubRepoContext": {"startingBranch": "main"}
+        }
+    }
+
+    # Print the payload being sent (truncate prompt for readability if needed, but user wants verbosity)
+    print("Sending payload to Jules API:")
+    print(json.dumps(payload, indent=2))
+
     resp = requests.post(
         f"{JULES_API_URL}/v1alpha/sessions",
         headers={"X-Goog-Api-Key": api_key},
-        json={
-            "prompt": prompt,
-            "sourceContext": {
-                "source": f"sources/github/{repo}",
-                "githubRepoContext": {"startingBranch": "main"}
-            }
-        }
+        json=payload
     )
     if resp.status_code != 200:
         print(f"Failed to create session: {resp.text}")
@@ -100,9 +151,9 @@ def call_jules(prompt):
     max_retries = 60 # 10 minutes
     seen_ids = set()
 
-    for _ in range(max_retries):
+    for i in range(max_retries):
         time.sleep(10)
-        print("Polling activities...")
+        print(f"Polling activities... (Attempt {i+1}/{max_retries})")
 
         r = requests.get(
             f"{JULES_API_URL}/v1alpha/{session_name}/activities",
@@ -125,13 +176,6 @@ def call_jules(prompt):
             seen_ids.add(act_id)
 
             originator = act.get("originator", "UNKNOWN")
-            # act_type = "Activity"
-            # if "planGenerated" in act:
-            #     act_type = "Plan Generated"
-            # elif "progressUpdated" in act:
-            #     act_type = "Progress Update"
-            # elif "sessionCompleted" in act:
-            #     act_type = "Session Completed"
 
             print(f"\n--- New Activity ({originator}) ---")
 
@@ -193,7 +237,7 @@ def main():
             "IMPORTANT: Ensure your changes compile and that all proofs are valid."
         )
 
-    print(f"Prompting Jules with:\n{prompt}\n")
+    print(f"\nPrompting Jules with:\n{prompt}\n")
 
     changeset = call_jules(prompt)
 
@@ -204,7 +248,9 @@ def main():
         print("Jules returned a ChangeSet but no unidiffPatch.")
         sys.exit(0)
 
-    print("Applying patch...")
+    print("\n--- Applying Patch ---")
+    print(f"Patch content:\n{patch}\n")
+
     with open("jules.patch", "w") as f:
         f.write(patch)
 
@@ -229,14 +275,16 @@ def main():
         print("No changes to commit after applying patch.")
         sys.exit(0)
 
-    print("Committing changes...")
+    print("\n--- Committing and Pushing ---")
+    print(f"Commit message: {msg}")
+
     # Use list args to avoid shell injection in commit message
     run_command(['git', 'commit', '-m', msg], check=True)
 
     print("Pushing changes...")
     run_command("git push origin main", check=True)
 
-    print("Triggering Lean Prover CI...")
+    print(f"\n--- Triggering Next Workflow ({workflow_id}) ---")
     # Use workflow_id if available, else fallback to prover.yml
     target_workflow = workflow_id if workflow_id else "prover.yml"
     run_command(f"gh workflow run {target_workflow}", check=True)
