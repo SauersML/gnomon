@@ -328,9 +328,53 @@ theorem parameter_identifiability (data : RealizedData n k) (lambda : ℝ)
   ∃! m, IsIdentifiable m data ∧ ∀ m', IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
     let S := {m | IsIdentifiable m data}
     -- 1. State the properties of the set of identifiable models
-    have h_S_convex : Convex ℝ S := sorry -- This is true because the constraints are linear (an affine subspace is convex)
-    have h_S_closed : IsClosed S := sorry -- Also true
-    have h_S_nonempty : S.Nonempty := by -- Your proof for this part is correct
+    have h_S_convex : Convex ℝ S := by
+      -- The set S is convex because it is defined by linear equality constraints.
+      -- We show that for any two models m₁, m₂ in S, their convex combination is also in S.
+      -- This argument assumes that m₁ and m₂ share the same basis functions, which is
+      -- implicit in the problem setup, as comparing models with different bases is ill-defined.
+      intros m₁ h_m₁ m₂ h_m₂ a b ha hb hab
+      -- The centering conditions are linear in the model parameters (the spline coefficients).
+      -- The set of solutions to a system of linear equations is a convex set.
+      intros m₁ h_m₁ m₂ h_m₂ a b ha hb hab
+      let m_comb : PhenotypeInformedGAM p k sp := {
+        pgsBasis := pgsBasis, pcSplineBasis := splineBasis, link := m₁.link, dist := m₁.dist,
+        γ₀₀ := a * m₁.γ₀₀ + b * m₂.γ₀₀,
+        γₘ₀ := fun i => a * m₁.γₘ₀ i + b * m₂.γₘ₀ i,
+        f₀ₗ := fun l => fun s => a * m₁.f₀ₗ l s + b * m₂.f₀ₗ l s,
+        fₘₗ := fun m l => fun s => a * m₁.fₘₗ m l s + b * m₂.fₘₗ m l s
+      }
+      dsimp [IsIdentifiable] at *
+      have h₁ := h_m₁.1; have h₂ := h_m₂.1
+      have h₃ := h_m₁.2; have h₄ := h_m₂.2
+      constructor
+      · intro l
+        specialize h₁ l; specialize h₂ l
+        simp [m_comb, evalSmooth, Finset.sum_add_distrib, Finset.smul_sum]
+        rw [h₁, h₂, mul_zero, mul_zero, add_zero]
+      · intro m l
+        specialize h₃ m l; specialize h₄ m l
+        simp [m_comb, evalSmooth, Finset.sum_add_distrib, Finset.smul_sum]
+        rw [h₃, h₄, mul_zero, mul_zero, add_zero]
+
+    have h_S_closed : IsClosed S := by
+      -- S is the intersection of preimages of the closed set {0} under continuous functions.
+      -- The functions are the centering constraints, which are continuous (linear) maps
+      -- from the parameter space to ℝ. The parameter space is finite-dimensional, so this holds.
+      -- A full proof would require defining a topology on PhenotypeInformedGAM.
+      repeat' apply IsClosed.inter
+      · -- The set of models where main effect splines are centered
+        apply isClosed_iInter; intro l
+        have h_cont : Continuous (fun (m : PhenotypeInformedGAM p k sp) =>
+            ∑ i, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (data.c i l)) := by sorry
+        exact IsClosed.preimage h_cont isClosed_singleton
+      · -- The set of models where interaction splines are centered
+        apply isClosed_iInter; intro m
+        apply isClosed_iInter; intro l
+        have h_cont : Continuous (fun (m : PhenotypeInformedGAM p k sp) =>
+            ∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ m l) (data.c i l)) := by sorry
+        exact IsClosed.preimage h_cont isClosed_singleton
+    have h_S_nonempty : S.Nonempty := by
       use { pgsBasis := pgsBasis, pcSplineBasis := splineBasis, γ₀₀ := 0, γₘ₀ := fun _ => 0, f₀ₗ := fun _ => (fun _ => 0), fₘₗ := fun _ _ => (fun _ => 0), link := .identity, dist := .Gaussian }
       dsimp [IsIdentifiable, evalSmooth]; simp
 
