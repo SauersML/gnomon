@@ -295,27 +295,39 @@ def trigger_next_cycle(workflow_id):
 def main():
     conclusion, logs, workflow_id = get_previous_run_info()
 
+    # Common restrictions for all prompts
+    version_restriction = (
+        "\n\nCRITICAL RESTRICTIONS:\n"
+        "- DO NOT modify 'lean-toolchain' - the Lean version is intentionally pinned\n"
+        "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version)\n"
+        "- Focus ONLY on proofs/*.lean files for improvements\n"
+    )
+
     # Build the prompt based on previous run status
     if conclusion == "success":
         prompt = (
             "The previous Lean Proof GHA run passed successfully. "
-            "Please find one thing to do, improve, fix, or strengthen in the Lean files "
-            "(e.g., lakefile.lean or files in proofs/). "
-            "You can optimize code, add comments, strengthen proofs, or refactor. "
+            "Please find one thing to do, improve, fix, or strengthen in the Lean proof files "
+            "(specifically files in proofs/). "
+            "You can optimize code, add comments, strengthen proofs, replace 'sorry' with actual proofs, or refactor. "
             "IMPORTANT: Ensure your changes compile and that all proofs are valid. "
             "Do not break existing functionality."
+            + version_restriction
         )
     elif conclusion:
         prompt = (
             f"The previous Lean Proof GHA run failed. "
             f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
-            "Please analyze the logs and fix the errors in the Lean files. "
+            "Please analyze the logs and fix the errors in the Lean proof files. "
             "IMPORTANT: Ensure your changes compile and that all proofs are valid."
+            + version_restriction
         )
     else:
         prompt = (
-            "Please find one thing to improve, fix, or strengthen in the Lean files. "
+            "Please find one thing to improve, fix, or strengthen in the Lean proof files "
+            "(specifically files in proofs/). "
             "IMPORTANT: Ensure your changes compile and that all proofs are valid."
+            + version_restriction
         )
 
     print(f"\nPrompting Jules with:\n{prompt}\n")
