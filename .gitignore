@@ -18,6 +18,7 @@ lake-manifest.json
 
 # Jules automation
 jules.patch
+build.log
 
 # Temporary tools
 gh_*/
