@@ -5,8 +5,14 @@ import json
 import time
 import subprocess
 import requests
+import re
 
 JULES_API_URL = "https://jules.googleapis.com"
+
+def strip_ansi(text):
+    """Removes ANSI escape codes from text."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
 def run_command(cmd, check=False):
     # Support both string (shell=True) and list (shell=False)
@@ -50,7 +56,8 @@ def get_previous_run_info():
         print("Fetching logs for failed run...")
         out, err, code = run_command(f"gh run view {run_id} --log")
         if code == 0:
-            logs = out
+            # Strip ANSI codes to make logs cleaner for the LLM
+            logs = strip_ansi(out)
             if len(logs) > 50000:
                 print("Truncating logs...")
                 logs = logs[-50000:]
@@ -122,18 +129,21 @@ def main():
             "The previous Lean Proof GHA run passed successfully. "
             "Please find one thing to do, improve, fix, or strengthen in the Lean files "
             "(e.g., lakefile.lean or files in proofs/). "
-            "You can optimize code, add comments, strengthen proofs, or refactor."
+            "You can optimize code, add comments, strengthen proofs, or refactor. "
+            "IMPORTANT: Ensure your changes compile and that all proofs are valid. Do not break existing functionality."
         )
     elif conclusion:
         prompt = (
             f"The previous Lean Proof GHA run failed. "
-            f"Here are the logs from the run:\n\n{logs}\n\n"
-            "Please analyze the logs and fix the errors in the Lean files."
+            f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
+            "Please analyze the logs and fix the errors in the Lean files. "
+            "IMPORTANT: Ensure your changes compile and that all proofs are valid."
         )
     else:
-        prompt = "Please find one thing to improve, fix, or strengthen in the Lean files."
-        # If manual run, we assume main branch or we need to find the workflow to trigger.
-        # We'll use 'prover.yml' as fallback if workflow_id is None.
+        prompt = (
+            "Please find one thing to improve, fix, or strengthen in the Lean files. "
+            "IMPORTANT: Ensure your changes compile and that all proofs are valid."
+        )
 
     print(f"Prompting Jules with: {prompt[:200]}...")
 
