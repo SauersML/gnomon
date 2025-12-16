@@ -396,9 +396,11 @@ def main():
     print("Pushing changes...")
     run_command("git push origin main", check=True)
 
-    # Note: We don't need to trigger prover.yml manually here because
-    # the push to main will automatically trigger it via the 'push' event.
-    print("\nLoop iteration complete. Push will trigger prover.yml automatically.")
+    # IMPORTANT: Pushes made with GITHUB_TOKEN do NOT trigger other workflows
+    # (GitHub's infinite loop prevention). We must explicitly trigger prover.yml.
+    print("\n--- Triggering Prover Workflow ---")
+    run_command("gh workflow run prover.yml", check=True)
+    print("Loop iteration complete. Prover workflow triggered.")
 
 
 if __name__ == "__main__":
