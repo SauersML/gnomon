@@ -41,12 +41,40 @@ def run_command(cmd, check=False):
         print(result.stderr)
         sys.exit(result.returncode)
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+def filter_noise(logs):
+    """
+    Remove noisy lines that don't help with debugging.
+    These are mostly cache replay messages from Lake.
+    """
+    noise_patterns = [
+        "Replayed Mathlib.",
+        "Replayed Batteries.",
+        "Replayed Qq.",
+        "Replayed Aesop.",
+        "Replayed ProofWidgets.",
+        "Replayed LeanSearchClient.",
+        "Replayed Plausible.",
+        "Replayed ImportGraph.",
+        "Replayed Cli.",
+        "✔ [",  # Progress indicators like "✔ [649/918]"
+        "Building ",  # "Building Mathlib.Order.Interval..."
+        "Compiling ",  # "Compiling Mathlib..."
+    ]
+    
+    filtered_lines = []
+    for line in logs.split('\n'):
+        # Skip lines that match any noise pattern
+        is_noise = any(pattern in line for pattern in noise_patterns)
+        if not is_noise:
+            filtered_lines.append(line)
+    
+    return '\n'.join(filtered_lines)
 
 
 def fetch_logs(run_id):
     """
     Fetches logs for a specific workflow run.
-    Prioritizes important steps first: Deep Debug Information and Build dependencies.
+    Filters out noisy cache replay lines and prioritizes error information.
     """
     print(f"Fetching logs for run {run_id}...")
     out, err, code = run_command(f"gh run view {run_id} --log")
@@ -55,47 +83,18 @@ def fetch_logs(run_id):
         return f"Failed to fetch logs: {err}"
     
     raw_logs = strip_ansi(out)
-    print(f"Logs fetched. Length: {len(raw_logs)} characters.")
+    print(f"Raw logs fetched. Length: {len(raw_logs)} characters.")
     
-    # Prioritize important steps by extracting them first
-    important_steps = [
-        "Deep Debug Information",
-        "Build all dependencies",
-    ]
+    # Filter out noisy cache replay lines
+    filtered_logs = filter_noise(raw_logs)
+    print(f"After filtering noise: {len(filtered_logs)} characters.")
     
-    prioritized_logs = []
-    remaining_logs = raw_logs
-    
-    for step_name in important_steps:
-        # Try to find the step section in logs
-        # GitHub Actions logs have format: "step-name\t<timestamp>\t<content>"
-        step_marker = step_name
-        if step_marker in raw_logs:
-            # Find the section for this step
-            start_idx = raw_logs.find(step_marker)
-            if start_idx != -1:
-                # Find the next step (lines starting without tab after content)
-                end_idx = len(raw_logs)
-                # Look for next step header pattern
-                next_step_idx = raw_logs.find("\nprove\t", start_idx + len(step_marker))
-                if next_step_idx != -1:
-                    end_idx = next_step_idx
-                
-                step_content = raw_logs[start_idx:end_idx]
-                prioritized_logs.append(f"=== PRIORITY: {step_name} ===\n{step_content}\n")
-    
-    # Combine prioritized logs first, then remaining
-    if prioritized_logs:
-        logs = "\n".join(prioritized_logs) + "\n\n=== FULL LOGS ===\n" + raw_logs
-    else:
-        logs = raw_logs
-    
-    # Truncate to 300k chars if needed
-    if len(logs) > 300000:
+    # Truncate to 300k chars if still too long
+    if len(filtered_logs) > 300000:
         print("Truncating logs to 300,000 characters...")
-        logs = logs[:300000]
+        filtered_logs = filtered_logs[:300000]
     
-    return logs
+    return filtered_logs
 
 
 def get_previous_run_info():
