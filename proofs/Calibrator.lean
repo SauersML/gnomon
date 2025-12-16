@@ -116,12 +116,12 @@ def IsIdentifiable {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype
   (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
 
 noncomputable def fit {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  admit
+  sorry
 
 theorem fit_minimizes_loss {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (data : RealizedData n k) (lambda : ℝ) :
   (∀ m, empiricalLoss (fit data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
-  IsIdentifiable (fit data lambda) data := by admit
+  IsIdentifiable (fit data lambda) data := by sorry
 
 def IsRawScoreModel {p k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)](m : PhenotypeInformedGAM p k sp) : Prop :=
   (∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0) ∧ (∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0)
@@ -130,22 +130,22 @@ def IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [F
   ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
 noncomputable def fitRaw {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  admit
+  sorry
 
 theorem fitRaw_minimizes_loss {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw data lambda) ∧
   ∀ m (h_m : IsRawScoreModel m),
-    empiricalLoss (fitRaw data lambda) data lambda ≤ empiricalLoss m data lambda := by admit
+    empiricalLoss (fitRaw data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 noncomputable def fitNormalized {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  admit
+  sorry
 
 theorem fitNormalized_minimizes_loss {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized data lambda) ∧
   ∀ m (h_m : IsNormalizedScoreModel m),
-    empiricalLoss (fitNormalized data lambda) data lambda ≤ empiricalLoss m data lambda := by admit
+    empiricalLoss (fitNormalized data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 /-!
 =================================================================
@@ -228,7 +228,7 @@ theorem l2_projection_of_additive_is_additive [Fintype (Fin k)] [Fintype (Fin p)
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
   (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
   (proj : PhenotypeInformedGAM p k sp) (h_optimal : isBayesOptimalInClass dgp proj) :
-  IsNormalizedScoreModel proj := by admit
+  IsNormalizedScoreModel proj := by sorry
 
 theorem independence_implies_no_interaction [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k)
@@ -253,7 +253,7 @@ theorem prediction_causality_tradeoff_linear_case {p sp : ℕ} [Fintype (Fin p)]
     (h_confounding : ∫ pc, pc.1 * (pc.2 ⟨0, by norm_num⟩) ∂dgp_env.to_dgp.jointMeasure ≠ 0)
     (model : PhenotypeInformedGAM p 1 sp)
     (h_opt : isBayesOptimalInClass dgp_env.to_dgp model) :
-    model.γₘ₀ ⟨0, hp_pos⟩ ≠ 2 := by admit
+    model.γₘ₀ ⟨0, hp_pos⟩ ≠ 2 := by sorry
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
@@ -291,7 +291,7 @@ theorem parameter_identifiability [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis hp hk hsp) = total_params p k sp) :
   ∃! m, IsIdentifiable m data ∧ ∀ m', IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
-  admit
+  sorry
 
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
   dgp.trueExpectation p_val c_val - f p_val c_val
@@ -306,13 +306,13 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val ⟨0, by norm_num⟩ := by
-  admit
+  sorry
 
 def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
 notation:50 a " ≈ " b => approxEq a b 0.01
 
-noncomputable def rsquared [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := admit
-noncomputable def var [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := admit
+noncomputable def rsquared [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
+noncomputable def var [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
 
 theorem quantitative_error_of_normalization [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
@@ -322,7 +322,7 @@ theorem quantitative_error_of_normalization [MeasurableSingletonBorel (Fin k →
   let predict_norm := fun p c => linearPredictor model_norm p c
   let predict_oracle := fun p c => linearPredictor model_oracle p c
   expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
-  = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by admit
+  = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by sorry
 
 noncomputable def dgpMultiplicativeBias [Fintype (Fin k)] (k : ℕ) (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
@@ -331,7 +331,7 @@ theorem multiplicative_bias_correction [Fintype (Fin k)]
     (k : ℕ) (scaling_func : (Fin k → ℝ) → ℝ) (h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias k scaling_func) model) :
   ∀ l : Fin k, (evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 1 - evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 0)
-    ≈ (scaling_func (fun i => if i = l then 1 else 0) - scaling_func (fun _ => 0)) := by admit
+    ≈ (scaling_func (fun i => if i = l then 1 else 0) - scaling_func (fun _ => 0)) := by sorry
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -343,19 +343,19 @@ theorem shrinkage_effect [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
     (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) (hp_one : p = 1) :
   ∀ c : Fin k → ℝ, (model.γₘ₀ ⟨0, by {rw [hp_one]; norm_num}⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by {rw [hp_one]; norm_num}⟩ l) (c l))
-    ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by admit
+    ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by sorry
 
 theorem prediction_is_invariant_to_affine_pc_transform [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit data lambda; let model' := fit data' lambda
-  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc ≈ predict model' pgs (A.mulVec pc + b) := by admit
+  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc ≈ predict model' pgs (A.mulVec pc + b) := by sorry
 
-noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ := admit
+noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ := sorry
 
 theorem extrapolation_risk [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ) :
   ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit data lambda) 0 c_new - dgp.trueExpectation 0 c_new| ≤
-    f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by admit
+    f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by sorry
 
 theorem context_specificity [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp1 dgp2 : DGPWithEnvironment k)
@@ -372,7 +372,7 @@ theorem context_specificity [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp
       have := congr_fun (congr_fun h_eq_fn 0) c
       simp at this; exact this
     exact h_diff_env this
-  admit
+  sorry
 
 end AllClaims
 end Calibrator

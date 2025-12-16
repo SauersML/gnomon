@@ -1,0 +1,3056 @@
+✔ [0/513] Ran calibration:extraDep
+✔ [1/513] Ran mathlib:extraDep
+✔ [2/513] Replayed Mathlib.Tactic.Linter.DirectoryDependency
+✔ [3/513] Replayed Mathlib.Tactic.Linter.Header
+✔ [4/513] Replayed Mathlib.Tactic.Linter.DeprecatedSyntaxLinter
+✔ [5/513] Replayed Mathlib.Tactic.Linter.DocPrime
+✔ [6/513] Replayed Mathlib.Tactic.Linter.DocString
+✔ [7/513] Replayed Mathlib.Tactic.Linter.GlobalAttributeIn
+✔ [8/513] Replayed Mathlib.Tactic.Linter.HashCommandLinter
+✔ [9/513] Replayed Mathlib.Tactic.Linter.FlexibleLinter
+✔ [10/513] Ran batteries:extraDep
+✔ [11/513] Replayed Batteries.Tactic.Lint.Basic
+✔ [12/513] Replayed Batteries.Tactic.Lint.Misc
+✔ [13/513] Replayed Batteries.Tactic.OpenPrivate
+✔ [14/513] Replayed Batteries.Util.LibraryNote
+✔ [15/513] Replayed Batteries.Tactic.Lint.Simp
+✔ [16/513] Replayed Batteries.Tactic.Lint.TypeClass
+✔ [17/513] Replayed Batteries.Tactic.Lint.Frontend
+✔ [18/513] Replayed Batteries.Tactic.Lint
+✔ [19/513] Replayed Mathlib.Tactic.DeclarationNames
+✔ [20/513] Replayed Mathlib.Tactic.Linter.Lint
+✔ [21/513] Replayed Mathlib.Tactic.Linter.Multigoal
+✔ [22/513] Replayed Mathlib.Tactic.Linter.OldObtain
+✔ [23/513] Replayed Mathlib.Tactic.Linter.UnusedTacticExtension
+✔ [24/513] Replayed Batteries.Tactic.Unreachable
+✔ [25/513] Replayed Mathlib.Tactic.Linter.UnusedTactic
+✔ [26/513] Replayed Mathlib.Tactic.Linter.Style
+✔ [27/513] Ran importGraph:extraDep
+✔ [28/513] Replayed Batteries.Data.NameSet
+✔ [29/513] Replayed ImportGraph.RequiredModules
+✔ [30/513] Replayed ImportGraph.Imports
+✔ [31/513] Replayed Mathlib.Tactic.MinImports
+✔ [32/513] Replayed Mathlib.Init
+✔ [33/513] Replayed Mathlib.Tactic.Lemma
+✔ [34/513] Replayed Mathlib.Tactic.TypeStar
+✔ [35/513] Replayed Mathlib.Data.Nat.Notation
+✔ [36/513] Replayed Mathlib.Data.String.Defs
+✔ [37/513] Replayed Mathlib.Data.Array.Defs
+✔ [38/513] Replayed Mathlib.Util.MemoFix
+✔ [39/513] Replayed Mathlib.Lean.Expr.ReplaceRec
+✔ [40/513] Replayed Mathlib.Lean.EnvExtension
+✔ [41/513] Replayed Mathlib.Lean.Meta.Simp
+✔ [42/513] Replayed Mathlib.Lean.Name
+✔ [43/513] Replayed Batteries.Lean.NameMapAttribute
+✔ [44/513] Replayed Batteries.CodeAction.Attr
+✔ [45/513] Replayed Batteries.CodeAction.Basic
+✔ [46/513] Replayed Batteries.CodeAction.Deprecated
+✔ [47/513] Replayed Batteries.Tactic.Alias
+✔ [48/513] Replayed Batteries.Tactic.Trans
+✔ [49/513] Replayed Mathlib.Tactic.Eqns
+✔ [50/513] Replayed Mathlib.Tactic.Simps.NotationClass
+✔ [51/513] Replayed Mathlib.Lean.Expr.Basic
+✔ [52/513] Replayed Mathlib.Tactic.Simps.Basic
+✔ [53/513] Replayed Mathlib.Tactic.ToAdditive.Frontend
+✔ [54/513] Replayed Mathlib.Tactic.ToAdditive
+✔ [55/513] Replayed Mathlib.Util.AssertExistsExt
+✔ [56/513] Replayed Mathlib.Util.AssertExists
+✔ [57/513] Replayed Mathlib.Algebra.Notation.Defs
+✔ [58/513] Replayed Mathlib.Data.Int.Notation
+✔ [59/513] Replayed Mathlib.Data.Nat.BinaryRec
+✔ [60/513] Replayed Mathlib.Tactic.AdaptationNote
+✔ [61/513] Replayed Mathlib.Tactic.Attr.Register
+✔ [62/513] Replayed Batteries.Logic
+✔ [63/513] Replayed Mathlib.Logic.Function.Defs
+✔ [64/513] Replayed Mathlib.Tactic.OfNat
+✔ [65/513] Replayed Mathlib.Algebra.Group.Defs
+✔ [66/513] Replayed Mathlib.Logic.Nontrivial.Defs
+✔ [67/513] Replayed Mathlib.Tactic.Core
+✔ [68/513] Replayed Mathlib.Tactic.SplitIfs
+✔ [69/513] Replayed Mathlib.Tactic.PPWithUniv
+✔ [70/513] Replayed Mathlib.Tactic.ExtendDoc
+✔ [71/513] Replayed Mathlib.Tactic.Simproc.ExistsAndEq
+✔ [72/513] Replayed Mathlib.Tactic.Basic
+✔ [73/513] Replayed Mathlib.Logic.Basic
+✔ [74/513] Replayed Mathlib.Algebra.GroupWithZero.Defs
+✔ [75/513] Replayed Mathlib.Data.Nat.Cast.Defs
+✔ [76/513] Replayed Mathlib.Data.Int.Cast.Defs
+✔ [77/513] Replayed Mathlib.Tactic.Spread
+✔ [78/513] Replayed Mathlib.Tactic.StacksAttribute
+✔ [79/513] Replayed Mathlib.Algebra.Ring.Defs
+✔ [80/513] Replayed Batteries.Data.Nat.Gcd
+✔ [81/513] Replayed Batteries.Data.Rat.Basic
+✔ [82/513] Replayed Batteries.Classes.RatCast
+✔ [83/513] Replayed Mathlib.Data.Rat.Init
+✔ [84/513] Replayed Mathlib.Algebra.Field.Defs
+✔ [85/513] Replayed Batteries.Util.ExtendedBinder
+✔ [86/513] Replayed Mathlib.Data.Set.Defs
+✔ [87/513] Replayed Mathlib.Order.Defs.Unbundled
+✔ [88/513] Replayed Mathlib.Algebra.Group.Semiconj.Defs
+✔ [89/513] Replayed Mathlib.Algebra.Ring.Semiconj
+✔ [90/513] Replayed Batteries.Tactic.SeqFocus
+✔ [91/513] Replayed Batteries.Classes.Order
+✔ [92/513] Replayed Mathlib.Data.Ordering.Basic
+✔ [93/513] Replayed Mathlib.Order.Defs.PartialOrder
+✔ [94/513] Replayed Mathlib.Order.Defs.LinearOrder
+✔ [95/513] Replayed Mathlib.Data.Bool.Basic
+✔ [96/513] Replayed Mathlib.Logic.ExistsUnique
+✔ [97/513] Replayed Mathlib.Logic.Nonempty
+✔ [98/513] Replayed Batteries.Tactic.Init
+✔ [99/513] Replayed Mathlib.Logic.Function.Basic
+✔ [100/513] Replayed Mathlib.Util.CompileInductive
+✔ [101/513] Replayed Mathlib.Data.FunLike.Basic
+✔ [102/513] Replayed Mathlib.Data.FunLike.Embedding
+✔ [103/513] Replayed Mathlib.Data.FunLike.Equiv
+✔ [104/513] Replayed Mathlib.Logic.Relator
+✔ [105/513] Replayed Mathlib.Tactic.WithoutCDot
+✔ [106/513] Replayed Mathlib.Tactic.Use
+✔ [107/513] Replayed Batteries.Lean.Position
+✔ [108/513] Replayed Batteries.CodeAction.Misc
+✔ [109/513] Replayed Batteries.CodeAction
+✔ [110/513] Replayed Mathlib.Lean.Meta
+✔ [111/513] Replayed Mathlib.Tactic.MkIffOfInductiveProp
+✔ [112/513] Replayed Mathlib.Tactic.SimpRw
+✔ [113/513] Replayed Mathlib.Logic.Relation
+✔ [114/513] Replayed Mathlib.Logic.IsEmpty
+✔ [115/513] Replayed Mathlib.Tactic.Inhabit
+✔ [116/513] Replayed Mathlib.Logic.Unique
+✔ [117/513] Replayed Mathlib.Lean.Elab.Term
+✔ [118/513] Replayed Mathlib.Lean.PrettyPrinter.Delaborator
+✔ [119/513] Replayed Mathlib.Util.WithWeakNamespace
+✔ [120/513] Replayed Mathlib.Tactic.ScopedNS
+✔ [121/513] Replayed Batteries.Linter.UnreachableTactic
+✔ [122/513] Replayed Batteries.Lean.Syntax
+✔ [123/513] Replayed Mathlib.Util.Notation3
+✔ [124/513] Replayed Mathlib.Data.Quot
+✔ [125/513] Replayed Mathlib.Data.Subtype
+✔ [126/513] Replayed Mathlib.Tactic.Conv
+✔ [127/513] Replayed Mathlib.Tactic.Substs
+✔ [128/513] Replayed Mathlib.Logic.Equiv.Defs
+✔ [129/513] Replayed Mathlib.Logic.Function.Conjugate
+✔ [130/513] Replayed Mathlib.Logic.Function.Iterate
+✔ [131/513] Ran aesop:extraDep
+✔ [132/513] Replayed Aesop.Check
+✔ [133/513] Replayed Aesop.Options.Public
+✔ [134/513] Replayed Aesop.Options.Internal
+✔ [135/513] Replayed Aesop.Options
+✔ [136/513] Replayed Aesop.Forward.PremiseIndex
+✔ [137/513] Replayed Aesop.Forward.SlotIndex
+✔ [138/513] Replayed Aesop.Forward.LevelIndex
+✔ [139/513] Replayed Aesop.RPINF.Basic
+✔ [140/513] Replayed Aesop.Index.DiscrTreeConfig
+✔ [141/513] Replayed Aesop.Nanos
+✔ [142/513] Replayed Batteries.Data.Array.Merge
+✔ [143/513] Replayed Aesop.Util.UnorderedArraySet
+✔ [144/513] Replayed Batteries.Lean.Expr
+✔ [145/513] Replayed Batteries.Data.String.Basic
+✔ [146/513] Replayed Aesop.Util.Basic
+✔ [147/513] Replayed Aesop.Forward.Substitution
+✔ [148/513] Replayed Aesop.Rule.Name
+✔ [149/513] Replayed Batteries.Data.Array.Init.Lemmas
+✔ [150/513] Replayed Batteries.Data.Array.Basic
+✔ [151/513] Replayed Aesop.Tracing
+✔ [152/513] Replayed Aesop.Stats.Basic
+✔ [153/513] Replayed Aesop.RulePattern.Cache
+✔ [154/513] Replayed Aesop.BaseM
+✔ [155/513] Replayed Aesop.RPINF
+✔ [156/513] Replayed Aesop.RulePattern
+✔ [157/513] Replayed Aesop.Util.UnionFind
+✔ [158/513] Replayed Aesop.Forward.RuleInfo
+✔ [159/513] Replayed Aesop.Percent
+✔ [160/513] Replayed Aesop.RuleTac.RuleTerm
+✔ [161/513] Replayed Aesop.Rule.Forward
+✔ [162/513] Replayed Aesop.Forward.Match.Types
+✔ [163/513] Replayed Aesop.Index.Basic
+✔ [164/513] Replayed Aesop.RuleTac.FVarIdSubst
+✔ [165/513] Replayed Aesop.RuleTac.GoalDiff
+✔ [166/513] Replayed Aesop.Script.CtorNames
+✔ [167/513] Replayed Batteries.Lean.Meta.Basic
+✔ [168/513] Replayed Aesop.Util.EqualUpToIds
+✔ [169/513] Replayed Aesop.Script.Tactic
+✔ [170/513] Replayed Aesop.Script.GoalWithMVars
+✔ [171/513] Replayed Aesop.Script.TacticState
+✔ [172/513] Replayed Batteries.Lean.MonadBacktrack
+✔ [173/513] Replayed Batteries.Lean.Meta.SavedState
+✔ [174/513] Replayed Aesop.Script.Util
+✔ [175/513] Replayed Batteries.Data.List.Init.Lemmas
+✔ [176/513] Replayed Batteries.Data.List.Basic
+✔ [177/513] Replayed Batteries.Tactic.PermuteGoals
+✔ [178/513] Replayed Aesop.Script.Step
+✔ [179/513] Replayed Aesop.RuleTac.Basic
+✔ [180/513] Replayed Aesop.RuleTac.Descr
+✔ [181/513] Replayed Aesop.Rule.Basic
+✔ [182/513] Replayed Aesop.Rule
+✔ [183/513] Replayed Aesop.ElabM
+✔ [184/513] Replayed Aesop.RuleTac.ElabRuleTerm
+✔ [185/513] Replayed Aesop.RuleTac.Forward.Basic
+✔ [186/513] Replayed Aesop.Util.Tactic
+✔ [187/513] Replayed Aesop.Util.Tactic.Ext
+✔ [188/513] Replayed Aesop.Util.Tactic.Unfold
+✔ [189/513] Replayed Aesop.Script.ScriptM
+✔ [190/513] Replayed Batteries.Lean.Meta.Inaccessible
+✔ [191/513] Replayed Aesop.Script.SpecificTactics
+✔ [192/513] Replayed Batteries.Lean.Meta.UnusedNames
+✔ [193/513] Replayed Aesop.Forward.Match
+✔ [194/513] Replayed Batteries.Lean.Meta.Expr
+✔ [195/513] Replayed Batteries.Lean.PersistentHashMap
+✔ [196/513] Replayed Batteries.Lean.Meta.DiscrTree
+✔ [197/513] Replayed Aesop.Index.RulePattern
+✔ [198/513] Replayed Batteries.Lean.Meta.InstantiateMVars
+✔ [199/513] Replayed Batteries.Lean.PersistentHashSet
+✔ [200/513] Replayed Aesop.Index
+✔ [201/513] Replayed Aesop.Index.Forward
+✔ [202/513] Replayed Aesop.RuleSet.Name
+✔ [203/513] Replayed Aesop.RuleSet.Filter
+✔ [204/513] Replayed Aesop.RuleSet.Member
+✔ [205/513] Replayed Aesop.Tree.Data.ForwardRuleMatches
+✔ [206/513] Replayed Aesop.RuleSet
+✔ [207/513] Replayed Aesop.Script.UScript
+✔ [208/513] Replayed Aesop.Script.Check
+✔ [209/513] Replayed Aesop.Script.SScript
+✔ [210/513] Replayed Aesop.Script.UScriptToSScript
+✔ [211/513] Replayed Aesop.Script.StructureDynamic
+✔ [212/513] Replayed Aesop.Script.StructureStatic
+✔ [213/513] Replayed Aesop.Script.OptimizeSyntax
+✔ [214/513] Replayed Aesop.Script.Main
+✔ [215/513] Replayed Aesop.Forward.State
+✔ [216/513] Replayed Aesop.Forward.State.ApplyGoalDiff
+✔ [217/513] Replayed Aesop.RuleTac.Apply
+✔ [218/513] Replayed Aesop.RuleTac.Cases
+✔ [219/513] Replayed Aesop.RuleTac.Forward
+✔ [220/513] Replayed Aesop.RuleTac.Preprocess
+✔ [221/513] Replayed Aesop.RuleTac.Tactic
+✔ [222/513] Replayed Aesop.RuleTac
+✔ [223/513] Replayed Aesop.Search.Expansion.Basic
+✔ [224/513] Replayed Aesop.Search.Expansion.Simp
+✔ [225/513] Replayed Aesop.Constants
+✔ [226/513] Replayed Aesop.Tree.UnsafeQueue
+✔ [227/513] Replayed Aesop.Tree.Data
+✔ [228/513] Replayed Aesop.Tree.RunMetaM
+✔ [229/513] Replayed Aesop.Search.Queue.Class
+✔ [230/513] Replayed Aesop.Forward.State.Initial
+✔ [231/513] Replayed Aesop.Tree.TreeM
+✔ [232/513] Replayed Aesop.Search.SearchM
+✔ [233/513] Replayed Aesop.Search.RuleSelection
+✔ [234/513] Replayed Aesop.Tree.Traversal
+✔ [235/513] Replayed Aesop.Tree.State
+✔ [236/513] Replayed Batteries.Lean.HashSet
+✔ [237/513] Replayed Aesop.Search.Expansion.Norm
+✔ [238/513] Replayed Aesop.Tree.AddRapp
+✔ [239/513] Replayed Aesop.Search.Expansion
+✔ [240/513] Replayed Aesop.Exception
+✔ [241/513] Replayed Aesop.Search.ExpandSafePrefix
+✔ [242/513] Replayed Aesop.Tree.Check
+✔ [243/513] Replayed Aesop.Tree.ExtractProof
+✔ [244/513] Replayed Aesop.Tree.ExtractScript
+✔ [245/513] Replayed Aesop.Tree.Free
+✔ [246/513] Replayed Aesop.Tree.Tracing
+✔ [247/513] Replayed Aesop.Tree
+✔ [248/513] Replayed Batteries.Control.ForInStep.Basic
+✔ [249/513] Replayed Batteries.Data.BinomialHeap.Basic
+✔ [250/513] Replayed Aesop.Search.Queue
+✔ [251/513] Replayed Aesop.Frontend.Extension.Init
+✔ [252/513] Replayed Aesop.Frontend.Extension
+✔ [253/513] Replayed Aesop.Search.Main
+✔ [254/513] Replayed Aesop.Builder.Basic
+✔ [255/513] Replayed Aesop.Builder.Cases
+✔ [256/513] Replayed Aesop.Builder.Constructors
+✔ [257/513] Replayed Aesop.Builder.NormSimp
+✔ [258/513] Replayed Aesop.Builder.Tactic
+✔ [259/513] Replayed Aesop.Builder.Apply
+✔ [260/513] Replayed Aesop.Builder.Default
+✔ [261/513] Replayed Aesop.Builder.Forward
+✔ [262/513] Replayed Aesop.Builder.Unfold
+✔ [263/513] Replayed Aesop.Frontend.RuleExpr
+✔ [264/513] Replayed Aesop.Frontend.Tactic
+✔ [265/513] Replayed Aesop.Stats.Extension
+✔ [266/513] Replayed Aesop.Main
+✔ [267/513] Replayed Aesop.Frontend.Basic
+✔ [268/513] Replayed Aesop.Stats.Report
+✔ [269/513] Replayed Aesop.Frontend.Command
+✔ [270/513] Replayed Aesop.Saturate
+✔ [271/513] Replayed Aesop.Frontend.Saturate
+✔ [272/513] Replayed Aesop.Frontend.Attribute
+✔ [273/513] Replayed Aesop.BuiltinRules.Assumption
+✔ [274/513] Replayed Aesop.BuiltinRules.ApplyHyps
+✔ [275/513] Replayed Aesop.BuiltinRules.DestructProducts
+✔ [276/513] Replayed Aesop.BuiltinRules.Ext
+✔ [277/513] Replayed Aesop.BuiltinRules.Intros
+✔ [278/513] Replayed Aesop.BuiltinRules.Rfl
+✔ [279/513] Replayed Aesop.BuiltinRules.Split
+✔ [280/513] Replayed Aesop.BuiltinRules.Subst
+✔ [281/513] Replayed Aesop.BuiltinRules
+✔ [282/513] Replayed Aesop
+✔ [283/513] Replayed Mathlib.Data.Prod.Basic
+✔ [284/513] Replayed Mathlib.Logic.Nontrivial.Basic
+✔ [285/513] Replayed Mathlib.Algebra.Opposites
+✔ [286/513] Replayed Mathlib.Data.Int.Init
+✔ [287/513] Replayed Mathlib.Algebra.Group.Basic
+✔ [288/513] Replayed Mathlib.Data.Nat.Init
+✔ [289/513] Replayed Mathlib.Tactic.Push
+✔ [290/513] Replayed Mathlib.Tactic.Contrapose
+✔ [291/513] Replayed Batteries.Lean.Except
+✔ [292/513] Replayed Batteries.Tactic.Exact
+✔ [293/513] Replayed Batteries.Lean.TagAttribute
+✔ [294/513] Replayed Batteries.Lean.AttributeExtra
+✔ [295/513] Replayed Batteries.Linter.UnnecessarySeqFocus
+✔ [296/513] Replayed Batteries.Linter
+✔ [297/513] Replayed Batteries.Util.ProofWanted
+✔ [298/513] Replayed Batteries.Tactic.Basic
+✔ [299/513] Replayed Mathlib.Tactic.GCongr.ForwardAttr
+✔ [300/513] Replayed Mathlib.Tactic.GCongr.Core
+✔ [301/513] Replayed Mathlib.Tactic.GCongr.CoreAttrs
+✔ [302/513] Replayed Mathlib.Data.Nat.Basic
+✔ [303/513] Replayed Mathlib.Data.Int.Cast.Basic
+✔ [304/513] Replayed Mathlib.Algebra.Group.InjSurj
+✔ [305/513] Replayed Mathlib.Algebra.NeZero
+✔ [306/513] Replayed Mathlib.Algebra.GroupWithZero.NeZero
+✔ [307/513] Replayed Mathlib.Algebra.GroupWithZero.InjSurj
+✔ [308/513] Replayed Mathlib.Algebra.Ring.InjSurj
+✔ [309/513] Replayed Mathlib.Algebra.Notation.Pi
+✔ [310/513] Replayed Mathlib.Algebra.Group.Hom.Defs
+✔ [311/513] Replayed Mathlib.Algebra.Group.Commute.Defs
+✔ [312/513] Replayed Mathlib.Algebra.Group.Units.Defs
+✔ [313/513] Ran Qq:extraDep
+✔ [314/513] Replayed Qq.ForLean.ReduceEval
+✔ [315/513] Replayed Qq.ForLean.ToExpr
+✔ [316/513] Replayed Qq.Typ
+✔ [317/513] Replayed Qq.Macro
+✔ [318/513] Replayed Qq.Delab
+✔ [319/513] Replayed Qq.MetaM
+✔ [320/513] Replayed Mathlib.Tactic.Attr.Core
+✔ [321/513] Replayed Mathlib.Tactic.Nontriviality.Core
+✔ [322/513] Replayed Mathlib.Tactic.Nontriviality
+✔ [323/513] Replayed Mathlib.Tactic.Lift
+✔ [324/513] Replayed Mathlib.Tactic.Subsingleton
+✔ [325/513] Replayed Mathlib.Algebra.Group.Units.Basic
+✔ [326/513] Replayed Mathlib.Algebra.Group.Units.Hom
+✔ [327/513] Replayed Mathlib.Algebra.Group.Hom.Basic
+✔ [328/513] Replayed Mathlib.Algebra.GroupWithZero.Basic
+✔ [329/513] Replayed Mathlib.Algebra.GroupWithZero.Hom
+✔ [330/513] Replayed Mathlib.Algebra.Group.Hom.Instances
+✔ [331/513] Replayed Mathlib.Algebra.Ring.Basic
+✔ [332/513] Replayed Mathlib.Algebra.Ring.Hom.Defs
+✔ [333/513] Replayed Mathlib.Algebra.Ring.Units
+✔ [334/513] Replayed Mathlib.Data.Bracket
+✔ [335/513] Replayed Mathlib.Algebra.Ring.Commute
+✔ [336/513] Replayed Mathlib.Algebra.Group.Semiconj.Units
+✔ [337/513] Replayed Mathlib.Algebra.Group.Commute.Units
+✔ [338/513] Replayed Mathlib.Algebra.Group.Invertible.Defs
+✔ [339/513] Replayed Mathlib.Algebra.Group.Invertible.Basic
+✔ [340/513] Replayed Mathlib.Lean.Meta.CongrTheorems
+✔ [341/513] Replayed Mathlib.Tactic.CongrExclamation
+✔ [342/513] Replayed Mathlib.Tactic.Convert
+✔ [343/513] Replayed Mathlib.Data.Int.Basic
+✔ [344/513] Replayed Mathlib.Algebra.GroupWithZero.Units.Basic
+✔ [345/513] Replayed Mathlib.Algebra.GroupWithZero.Invertible
+✔ [346/513] Replayed Mathlib.Algebra.Ring.Invertible
+✔ [347/513] Replayed Qq.Simp
+✔ [348/513] Replayed Qq.ForLean.Do
+✔ [349/513] Replayed Qq.SortLocalDecls
+✔ [350/513] Replayed Qq.Match
+✔ [351/513] Replayed Qq.AssertInstancesCommute
+✔ [352/513] Replayed Qq
+✔ [353/513] Replayed Mathlib.Order.Notation
+✔ [354/513] Replayed Mathlib.Order.Basic
+✔ [355/513] Replayed Mathlib.Order.Synonym
+✔ [356/513] Replayed Mathlib.Algebra.Field.Basic
+✔ [357/513] Replayed Mathlib.Tactic.Monotonicity.Attr
+✔ [358/513] Replayed Mathlib.Tactic.SetLike
+✔ [359/513] Replayed Mathlib.Data.Set.CoeSort
+✔ [360/513] Replayed Mathlib.Util.WhatsNew
+✔ [361/513] Replayed Mathlib.Tactic.ToExpr
+✔ [362/513] Replayed Mathlib.Tactic.FBinop
+✔ [363/513] Replayed Mathlib.Data.SProd
+✔ [364/513] Replayed Mathlib.Data.Set.Operations
+✔ [365/513] Replayed Mathlib.Order.Max
+✔ [366/513] Replayed Mathlib.Logic.Function.ULift
+✔ [367/513] Replayed Mathlib.Order.ULift
+✔ [368/513] Replayed Mathlib.Tactic.Finiteness.Attr
+✔ [369/513] Replayed Mathlib.Order.BoundedOrder.Basic
+✔ [370/513] Replayed Mathlib.Data.Int.Order.Basic
+✔ [371/513] Replayed Mathlib.Order.Compare
+✔ [372/513] Replayed Mathlib.Tactic.Coe
+✔ [373/513] Replayed Mathlib.Order.Monotone.Defs
+✔ [374/513] Replayed Batteries.WF
+✔ [375/513] Replayed Mathlib.Order.RelClasses
+✔ [376/513] Replayed Mathlib.Util.Tactic
+✔ [377/513] Replayed Mathlib.Tactic.Choose
+✔ [378/513] Replayed Mathlib.Order.Monotone.Basic
+✔ [379/513] Replayed Mathlib.Order.Lattice
+✔ [380/513] Replayed Mathlib.Order.BoundedOrder.Lattice
+✔ [381/513] Replayed Mathlib.Order.Disjoint
+✔ [382/513] Replayed Mathlib.Order.PropInstances
+✔ [383/513] Replayed Mathlib.Order.GaloisConnection.Defs
+✔ [384/513] Replayed Mathlib.Order.Heyting.Basic
+✔ [385/513] Replayed Mathlib.Order.BooleanAlgebra
+✔ [386/513] Replayed Mathlib.Tactic.CasesM
+✔ [387/513] Replayed Mathlib.Lean.Elab.Tactic.Basic
+✔ [388/513] Replayed Mathlib.Tactic.Tauto
+✔ [389/513] Replayed Mathlib.Tactic.ByContra
+✔ [390/513] Replayed Mathlib.Util.PPOptions
+✔ [391/513] Replayed Mathlib.Util.Delaborators
+✔ [392/513] Replayed Mathlib.Data.Set.Basic
+✔ [393/513] Replayed Mathlib.Data.SetLike.Basic
+✔ [394/513] Replayed Mathlib.Tactic.FastInstance
+✔ [395/513] Replayed Mathlib.Algebra.Group.Subsemigroup.Defs
+✔ [396/513] Replayed Mathlib.Data.Set.Disjoint
+✔ [397/513] Replayed Mathlib.Data.Set.Insert
+✔ [398/513] Replayed Mathlib.Algebra.Group.Submonoid.Defs
+✔ [399/513] Replayed Mathlib.RingTheory.NonUnitalSubsemiring.Defs
+✔ [400/513] Replayed Mathlib.Algebra.Ring.Subsemiring.Defs
+✔ [401/513] Replayed Mathlib.Data.Set.Inclusion
+✔ [402/513] Ran plausible:extraDep
+✔ [403/513] Replayed Plausible.Random
+✔ [404/513] Replayed Plausible.Gen
+✔ [405/513] Replayed Plausible.Sampleable
+✔ [406/513] Replayed Plausible.Testable
+✔ [407/513] Replayed Plausible.Functions
+✔ [408/513] Replayed Plausible.Attr
+✔ [409/513] Replayed Plausible.Tactic
+✔ [410/513] Replayed Plausible
+✔ [411/513] Replayed Batteries.Tactic.HelpCmd
+✔ [412/513] Ran LeanSearchClient:extraDep
+✔ [413/513] Replayed LeanSearchClient.Basic
+✔ [414/513] Replayed LeanSearchClient.Syntax
+✔ [415/513] Replayed LeanSearchClient.LoogleSyntax
+✔ [416/513] Replayed LeanSearchClient
+✔ [417/513] Replayed Mathlib.Tactic.ApplyCongr
+✔ [418/513] Replayed Mathlib.Lean.Meta.Basic
+✔ [419/513] Replayed Mathlib.Tactic.ApplyAt
+✔ [420/513] Replayed Mathlib.Tactic.ApplyWith
+✔ [421/513] Replayed Mathlib.Tactic.Cases
+✔ [422/513] Replayed Mathlib.Tactic.Check
+✔ [423/513] Replayed Mathlib.Tactic.ClearExclamation
+✔ [424/513] Replayed Mathlib.Tactic.ClearExcept
+✔ [425/513] Replayed Mathlib.Tactic.Clear_
+✔ [426/513] Replayed Mathlib.Tactic.TermCongr
+✔ [427/513] Replayed Mathlib.Tactic.CongrM
+✔ [428/513] Replayed Mathlib.Tactic.Constructor
+✔ [429/513] Replayed Mathlib.Tactic.DefEqTransformations
+✔ [430/513] Replayed Mathlib.Tactic.DeprecateTo
+✔ [431/513] Replayed Mathlib.Tactic.ErwQuestion
+✔ [432/513] Replayed Mathlib.Tactic.ExistsI
+✔ [433/513] Replayed Mathlib.Tactic.ExtractGoal
+✔ [434/513] Replayed Mathlib.Tactic.FailIfNoProgress
+✔ [435/513] Replayed Batteries.Util.Cache
+✔ [436/513] Replayed Mathlib.Tactic.Find
+✔ [437/513] Replayed Mathlib.Tactic.GeneralizeProofs
+✔ [438/513] Replayed Mathlib.Tactic.GuardGoalNums
+✔ [439/513] Replayed Mathlib.Tactic.GuardHypNums
+✔ [440/513] Replayed Mathlib.Tactic.HigherOrder
+✔ [441/513] Replayed Batteries.Data.MLList.Basic
+✔ [442/513] Replayed Batteries.Control.Nondet.Basic
+✔ [443/513] Replayed Mathlib.Tactic.Hint
+✔ [444/513] Replayed Mathlib.Tactic.InferParam
+✔ [445/513] Replayed Mathlib.Util.TermReduce
+✔ [446/513] Replayed Mathlib.Tactic.IrreducibleDef
+✔ [447/513] Replayed Mathlib.Tactic.Linter.DeprecatedModule
+✔ [448/513] Replayed Mathlib.Tactic.Linter.HaveLetLinter
+✔ [449/513] Replayed Mathlib.Tactic.Linter.MinImports
+✔ [450/513] Replayed Mathlib.Tactic.Linter.PPRoundtrip
+✔ [451/513] Replayed Mathlib.Tactic.Linter.UpstreamableDecl
+✔ [452/513] Replayed Mathlib.Tactic.Linter
+✔ [453/513] Replayed Mathlib.Tactic.NthRewrite
+✔ [454/513] Replayed Mathlib.Tactic.Observe
+✔ [455/513] Replayed Mathlib.Tactic.Propose
+✔ [456/513] Replayed Mathlib.Tactic.RSuffices
+✔ [457/513] Replayed Mathlib.Tactic.Recover
+✔ [458/513] Replayed Mathlib.Tactic.Relation.Rfl
+✔ [459/513] Replayed Mathlib.Tactic.Rename
+✔ [460/513] Replayed Mathlib.Tactic.RenameBVar
+✔ [461/513] Replayed Mathlib.Tactic.Says
+✔ [462/513] Replayed Mathlib.Tactic.Set
+✔ [463/513] Replayed Mathlib.Tactic.SimpIntro
+✔ [464/513] Replayed Mathlib.Tactic.SuccessIfFailWithMsg
+✔ [465/513] Replayed Mathlib.Tactic.SudoSetOption
+✔ [466/513] Replayed Mathlib.Tactic.SwapVar
+✔ [467/513] Replayed Mathlib.Tactic.ToLevel
+✔ [468/513] Replayed Mathlib.Tactic.Trace
+✔ [469/513] Replayed Mathlib.Tactic.TypeCheck
+✔ [470/513] Replayed Mathlib.Tactic.UnsetOption
+✔ [471/513] Replayed Mathlib.Tactic.Variable
+✔ [472/513] Ran proofwidgets:extraDep
+ℹ [473/513] Replayed proofwidgets/widgetPackageLock
+trace: ././widget> npm install
+trace: stdout:
+added 1 package, changed 2 packages, and audited 367 packages in 2s
+
+67 packages are looking for funding
+  run `npm fund` for details
+
+1 moderate severity vulnerability
+
+To address all issues, run:
+  npm audit fix
+
+Run `npm audit` for details.
+ℹ [474/513] Replayed proofwidgets/widgetJsAll
+trace: /home/runner/work/ProofWidgets4/ProofWidgets4/widget> npm clean-install
+trace: stdout:
+added 365 packages, and audited 366 packages in 7s
+
+68 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+trace: stderr:
+npm warn deprecated three-mesh-bvh@0.7.8: Deprecated due to three.js version incompatibility. Please use v0.8.0, instead.
+trace: /home/runner/work/ProofWidgets4/ProofWidgets4/widget> npm run build
+trace: stdout:
+> @leanprover-community/proofwidgets4@0.1.0 build
+> npx tsc && rollup --environment NODE_ENV:production --config
+trace: stderr:
+[36m
+[1mdist/rubiks.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m9.3s[22m[39m
+[36m
+[1mdist/recharts.js[22m → [1m../.lake/build/js[22m...[39m
+[1m[33m(!) Circular dependencies[39m[22m
+node_modules/d3-interpolate/src/value.js -> node_modules/d3-interpolate/src/array.js -> node_modules/d3-interpolate/src/value.js
+node_modules/d3-interpolate/src/value.js -> node_modules/d3-interpolate/src/object.js -> node_modules/d3-interpolate/src/value.js
+node_modules/recharts/es6/util/ChartUtils.js -> node_modules/recharts/es6/util/getLegendProps.js -> node_modules/recharts/es6/util/ChartUtils.js
+[32mcreated [1m../.lake/build/js[22m in [1m6.4s[22m[39m
+[36m
+[1mdist/rbTree.js[22m → [1m../.lake/build/js[22m...[39m
+[1m[33m(!) Circular dependencies[39m[22m
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/select.js -> node_modules/d3-selection/src/selection/index.js
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/selectAll.js -> node_modules/d3-selection/src/selection/index.js
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/filter.js -> node_modules/d3-selection/src/selection/index.js
+...and 12 more
+[32mcreated [1m../.lake/build/js[22m in [1m1.6s[22m[39m
+[36m
+[1mdist/presentSelection.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m162ms[22m[39m
+[36m
+[1mdist/penroseDisplay.js[22m → [1m../.lake/build/js[22m...[39m
+[1m[33m(!) Circular dependencies[39m[22m
+node_modules/true-myth/dist/es/maybe.js -> node_modules/true-myth/dist/es/result.js -> node_modules/true-myth/dist/es/maybe.js
+node_modules/@penrose/core/dist/engine/EngineUtils.js -> node_modules/@penrose/core/dist/utils/Util.js -> node_modules/@penrose/core/dist/engine/EngineUtils.js
+node_modules/@penrose/core/dist/engine/BBox.js -> node_modules/@penrose/core/dist/contrib/Queries.js -> node_modules/@penrose/core/dist/engine/BBox.js
+...and 14 more
+[32mcreated [1m../.lake/build/js[22m in [1m13.6s[22m[39m
+[36m
+[1mdist/penroseCanvas.js[22m → [1m../.lake/build/js[22m...[39m
+[1m[33m(!) Circular dependencies[39m[22m
+node_modules/true-myth/dist/es/maybe.js -> node_modules/true-myth/dist/es/result.js -> node_modules/true-myth/dist/es/maybe.js
+node_modules/@penrose/core/dist/engine/EngineUtils.js -> node_modules/@penrose/core/dist/utils/Util.js -> node_modules/@penrose/core/dist/engine/EngineUtils.js
+node_modules/@penrose/core/dist/engine/BBox.js -> node_modules/@penrose/core/dist/contrib/Queries.js -> node_modules/@penrose/core/dist/engine/BBox.js
+...and 14 more
+[32mcreated [1m../.lake/build/js[22m in [1m13.1s[22m[39m
+[36m
+[1mdist/ofRpcMethod.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m192ms[22m[39m
+[36m
+[1mdist/makeEditLink.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m103ms[22m[39m
+[36m
+[1mdist/interactiveSvg.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m154ms[22m[39m
+[36m
+[1mdist/interactiveExpr.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m127ms[22m[39m
+[36m
+[1mdist/index.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m126ms[22m[39m
+[36m
+[1mdist/htmlDisplayPanel.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m128ms[22m[39m
+[36m
+[1mdist/htmlDisplay.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m122ms[22m[39m
+[36m
+[1mdist/goalTypePanel.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m164ms[22m[39m
+[36m
+[1mdist/filterDetails.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m130ms[22m[39m
+[36m
+[1mdist/exprPresentation.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m145ms[22m[39m
+[36m
+[1mdist/d3Graph.js[22m → [1m../.lake/build/js[22m...[39m
+[1m[33m(!) Circular dependencies[39m[22m
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/select.js -> node_modules/d3-selection/src/selection/index.js
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/selectAll.js -> node_modules/d3-selection/src/selection/index.js
+node_modules/d3-selection/src/selection/index.js -> node_modules/d3-selection/src/selection/filter.js -> node_modules/d3-selection/src/selection/index.js
+...and 12 more
+[32mcreated [1m../.lake/build/js[22m in [1m2.7s[22m[39m
+[36m
+[1mdist/cancellable.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m113ms[22m[39m
+[36m
+[1mdist/animatedHtml.js[22m → [1m../.lake/build/js[22m...[39m
+[32mcreated [1m../.lake/build/js[22m in [1m133ms[22m[39m
+✔ [475/513] Replayed ProofWidgets.Compat
+✔ [476/513] Replayed ProofWidgets.Component.Basic
+✔ [477/513] Replayed ProofWidgets.Component.MakeEditLink
+✔ [478/513] Replayed ProofWidgets.Util
+✔ [479/513] Replayed ProofWidgets.Data.Html
+✔ [480/513] Replayed ProofWidgets.Cancellable
+✔ [481/513] Replayed ProofWidgets.Component.OfRpcMethod
+✔ [482/513] Replayed Mathlib.Tactic.Widget.SelectInsertParamsClass
+✔ [483/513] Replayed Mathlib.Tactic.Widget.SelectPanelUtils
+✔ [484/513] Replayed Mathlib.Tactic.Widget.Calc
+✔ [485/513] Replayed Mathlib.Tactic.Widget.CongrM
+✔ [486/513] Replayed Mathlib.Tactic.Widget.Conv
+✔ [487/513] Replayed Mathlib.Tactic.WLOG
+✔ [488/513] Replayed Mathlib.Util.CountHeartbeats
+✔ [489/513] Replayed Mathlib.Util.TransImports
+✔ [490/513] Replayed Mathlib.Tactic.Common
+✔ [491/513] Replayed Mathlib.Algebra.Group.Subgroup.Defs
+✔ [492/513] Replayed Mathlib.RingTheory.NonUnitalSubring.Defs
+✔ [493/513] Replayed Mathlib.Algebra.Ring.Subring.Defs
+✔ [494/513] Replayed Mathlib.Algebra.Group.Equiv.Defs
+✔ [495/513] Replayed Mathlib.Data.Sum.Basic
+✔ [496/513] Replayed Mathlib.Control.EquivFunctor
+✔ [497/513] Replayed Mathlib.Control.Combinators
+✔ [498/513] Replayed Mathlib.Data.Option.Defs
+✔ [499/513] Replayed Mathlib.Data.Option.Basic
+✔ [500/513] Replayed Mathlib.Logic.Equiv.Option
+✔ [501/513] Replayed Mathlib.Data.Sigma.Basic
+✔ [502/513] Replayed Mathlib.Logic.Equiv.Prod
+✔ [503/513] Replayed Mathlib.Logic.Equiv.Sum
+✔ [504/513] Replayed Mathlib.Tactic.CC.Datatypes
+✔ [505/513] Replayed Mathlib.Tactic.CC.Lemmas
+✔ [506/513] Replayed Mathlib.Tactic.Relation.Symm
+✔ [507/513] Replayed Mathlib.Tactic.CC.MkProof
+✔ [508/513] Replayed Mathlib.Tactic.CC.Addition
+✔ [509/513] Replayed Mathlib.Tactic.CC
+✔ [510/513] Replayed Mathlib.Logic.Equiv.Basic
+✔ [511/513] Replayed Mathlib.Algebra.Group.Opposite
+✔ [512/962] Replayed Mathlib.Algebra.Group.Equiv.Basic
+✔ [513/962] Replayed Mathlib.Algebra.Group.Equiv.Opposite
+✔ [514/962] Replayed Mathlib.Algebra.Group.Pi.Basic
+✔ [515/962] Replayed Mathlib.Algebra.Group.Torsion
+✔ [516/962] Replayed Mathlib.Algebra.Group.TypeTags.Basic
+✔ [517/962] Replayed Mathlib.Algebra.Group.Even
+✔ [518/962] Replayed Mathlib.Algebra.Group.Units.Equiv
+✔ [519/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.Defs
+✔ [520/962] Replayed Mathlib.Logic.OpClass
+✔ [521/962] Replayed Mathlib.Order.MinMax
+✔ [522/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.Basic
+✔ [523/962] Replayed Mathlib.Algebra.Order.Sub.Defs
+✔ [524/962] Replayed Mathlib.Algebra.Order.Group.Unbundled.Basic
+✔ [525/962] Replayed Mathlib.Data.Prod.PProd
+✔ [526/962] Replayed Mathlib.Logic.Embedding.Basic
+✔ [527/962] Replayed Mathlib.Order.RelIso.Basic
+✔ [528/962] Replayed Mathlib.Order.Hom.Basic
+✔ [529/962] Replayed Mathlib.Algebra.Order.Group.OrderIso
+✔ [530/962] Replayed Mathlib.Algebra.Order.Group.Lattice
+✔ [531/962] Replayed Mathlib.Algebra.Order.Group.Unbundled.Abs
+✔ [532/962] Replayed Mathlib.Algebra.CharZero.Defs
+✔ [533/962] Replayed Mathlib.Algebra.Group.Int.Defs
+✔ [534/962] Replayed Mathlib.Algebra.Ring.Int.Defs
+✔ [535/962] Replayed Batteries.Data.Rat.Lemmas
+✔ [536/962] Replayed Mathlib.Data.Rat.Defs
+✔ [537/962] Replayed Mathlib.Algebra.Group.Nat.Defs
+✔ [538/962] Replayed Mathlib.Algebra.Ring.Rat
+✔ [539/962] Replayed Mathlib.Algebra.Order.Ring.Unbundled.Rat
+✔ [540/962] Replayed Mathlib.Algebra.Field.Subfield.Defs
+✔ [541/962] Replayed Mathlib.Algebra.Group.Action.Defs
+✔ [542/962] Replayed Mathlib.Algebra.Notation.Prod
+✔ [543/962] Replayed Mathlib.Algebra.Group.Prod
+✔ [544/962] Replayed Mathlib.Algebra.Order.Group.Synonym
+✔ [545/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.OrderDual
+✔ [546/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.Pow
+✔ [547/962] Replayed Batteries.Tactic.Congr
+✔ [548/962] Replayed Mathlib.Data.Set.Subsingleton
+✔ [549/962] Replayed Mathlib.Order.SymmDiff
+✔ [550/962] Replayed Mathlib.Data.Set.SymmDiff
+✔ [551/962] Replayed Mathlib.Data.Set.Image
+✔ [552/962] Replayed Mathlib.Data.Set.Prod
+✔ [553/962] Replayed Mathlib.Data.Set.NAry
+✔ [554/962] Replayed Mathlib.Algebra.Group.Pointwise.Set.Basic
+✔ [555/962] Replayed Mathlib.Algebra.Group.Pointwise.Set.Scalar
+✔ [556/962] Replayed Mathlib.Algebra.GroupWithZero.Semiconj
+✔ [557/962] Replayed Mathlib.Algebra.GroupWithZero.Commute
+✔ [558/962] Replayed Mathlib.Algebra.GroupWithZero.Units.Lemmas
+✔ [559/962] Replayed Mathlib.Algebra.Order.Monoid.Defs
+✔ [560/962] Replayed Mathlib.Algebra.Order.Group.Defs
+✔ [561/962] Replayed Mathlib.Algebra.Order.Group.Abs
+✔ [562/962] Replayed Mathlib.Algebra.Order.GroupWithZero.Unbundled.Defs
+✔ [563/962] Replayed Mathlib.Algebra.Order.ZeroLEOne
+✔ [564/962] Replayed Mathlib.Tactic.Bound.Init
+✔ [565/962] Replayed Mathlib.Tactic.Bound.Attribute
+✔ [566/962] Replayed Mathlib.Algebra.Order.GroupWithZero.Unbundled.Basic
+✔ [567/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.ExistsOfLE
+✔ [568/962] Replayed Mathlib.Algebra.Order.Monoid.NatCast
+✔ [569/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.MinMax
+✔ [570/962] Replayed Mathlib.Algebra.Order.Ring.Unbundled.Basic
+✔ [571/962] Replayed Mathlib.Algebra.Order.Ring.Defs
+✔ [572/962] Replayed Batteries.Data.Nat.Basic
+✔ [573/962] Replayed Mathlib.Data.Nat.Sqrt
+✔ [574/962] Replayed Mathlib.Algebra.Group.Nat.Even
+✔ [575/962] Replayed Mathlib.Algebra.Divisibility.Basic
+✔ [576/962] Replayed Mathlib.Algebra.Divisibility.Hom
+✔ [577/962] Replayed Mathlib.Algebra.Group.TypeTags.Hom
+✔ [578/962] Replayed Mathlib.Algebra.Group.Nat.Hom
+✔ [579/962] Replayed Mathlib.Algebra.GroupWithZero.Nat
+✔ [580/962] Replayed Mathlib.Algebra.Ring.Nat
+✔ [581/962] Replayed Mathlib.Data.Nat.Cast.Basic
+✔ [582/962] Replayed Mathlib.Data.Nat.Cast.Commute
+✔ [583/962] Replayed Mathlib.Algebra.Ring.Parity
+✔ [584/962] Replayed Mathlib.Algebra.Order.Ring.Basic
+✔ [585/962] Replayed Mathlib.Algebra.Order.Group.Int
+✔ [586/962] Replayed Mathlib.Algebra.Order.Group.Unbundled.Int
+✔ [587/962] Replayed Mathlib.Data.Int.Sqrt
+✔ [588/962] Replayed Mathlib.Algebra.Group.Int.Even
+✔ [589/962] Replayed Mathlib.Algebra.Ring.Int.Parity
+✔ [590/962] Replayed Mathlib.Algebra.Order.Ring.Int
+✔ [591/962] Replayed Mathlib.Algebra.Ring.Divisibility.Basic
+✔ [592/962] Replayed Mathlib.Algebra.Group.Nat.Units
+✔ [593/962] Replayed Mathlib.Algebra.Group.Int.Units
+✔ [594/962] Replayed Mathlib.Algebra.Ring.Int.Units
+✔ [595/962] Replayed Mathlib.Algebra.Order.Monoid.Canonical.Defs
+✔ [596/962] Replayed Mathlib.Algebra.Order.Group.Nat
+✔ [597/962] Replayed Mathlib.Algebra.GroupWithZero.Units.Equiv
+✔ [598/962] Replayed Mathlib.Algebra.Group.WithOne.Defs
+✔ [599/962] Replayed Mathlib.Algebra.GroupWithZero.Equiv
+✔ [600/962] Replayed Mathlib.Data.Option.NAry
+✔ [601/962] Replayed Mathlib.Algebra.GroupWithZero.WithZero
+✔ [602/962] Replayed Mathlib.Order.TypeTags
+✔ [603/962] Replayed Mathlib.Order.WithBot
+✔ [604/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.WithTop
+✔ [605/962] Replayed Mathlib.Algebra.Order.Monoid.WithTop
+✔ [606/962] Replayed Mathlib.Algebra.Order.AddGroupWithTop
+✔ [607/962] Replayed Mathlib.Algebra.Order.GroupWithZero.Unbundled.OrderIso
+✔ [608/962] Replayed Mathlib.Algebra.Order.Monoid.Basic
+✔ [609/962] Replayed Mathlib.Algebra.Order.Monoid.OrderDual
+✔ [610/962] Replayed Mathlib.Algebra.Order.Monoid.Unbundled.TypeTags
+✔ [611/962] Replayed Mathlib.Algebra.Order.Monoid.TypeTags
+✔ [612/962] Replayed Mathlib.Algebra.Order.GroupWithZero.Canonical
+✔ [613/962] Replayed Mathlib.Algebra.Order.Ring.Nat
+✔ [614/962] Replayed Mathlib.Algebra.Order.Sub.Unbundled.Basic
+✔ [615/962] Replayed Mathlib.Algebra.Order.Sub.Basic
+✔ [616/962] Replayed Mathlib.Data.Nat.Cast.NeZero
+✔ [617/962] Replayed Mathlib.Data.Nat.Cast.Order.Basic
+✔ [618/962] Replayed Mathlib.Data.Nat.Cast.Order.Ring
+✔ [619/962] Replayed Mathlib.Algebra.Order.Ring.Abs
+✔ [620/962] Replayed Mathlib.Data.Set.Restrict
+✔ [621/962] Replayed Mathlib.Data.Set.Function
+✔ [622/962] Replayed Mathlib.Data.Set.Monotone
+✔ [623/962] Replayed Mathlib.Order.Bounds.Defs
+✔ [624/962] Replayed Mathlib.Order.Directed
+✔ [625/962] Replayed Mathlib.Order.BoundedOrder.Monotone
+✔ [626/962] Replayed Mathlib.Order.Interval.Set.Defs
+✔ [627/962] Replayed Mathlib.Order.Interval.Set.Basic
+✔ [628/962] Replayed Mathlib.Order.Bounds.Basic
+✔ [629/962] Replayed Mathlib.Order.Bounds.Image
+✔ [630/962] Replayed Mathlib.Logic.Equiv.Set
+✔ [631/962] Replayed Mathlib.Order.WellFounded
+✔ [632/962] Replayed Mathlib.Order.Hom.Set
+✔ [633/962] Replayed Mathlib.Order.Bounds.OrderIso
+✔ [634/962] Replayed Mathlib.Lean.Expr.Rat
+✔ [635/962] Replayed Mathlib.Tactic.NormNum.Result
+✔ [636/962] Replayed Mathlib.Util.Qq
+✔ [637/962] Replayed Mathlib.Tactic.NormNum.Core
+✔ [638/962] Replayed Mathlib.Tactic.HaveI
+✔ [639/962] Replayed Mathlib.Algebra.Order.Invertible
+✔ [640/962] Replayed Mathlib.Algebra.Order.Ring.Cast
+✔ [641/962] Replayed Mathlib.Control.Basic
+✔ [642/962] Replayed Mathlib.Tactic.Positivity.Core
+✔ [643/962] Replayed Mathlib.Algebra.Order.Field.Basic
+✔ [644/962] Replayed Mathlib.Algebra.Order.Group.MinMax
+✔ [645/962] Replayed Mathlib.Algebra.Order.Interval.Set.Monoid
+✔ [646/962] Replayed Mathlib.Order.Interval.Set.OrderIso
+✔ [647/962] Replayed Mathlib.Data.Set.Order
+✔ [648/962] Replayed Mathlib.Order.Interval.Set.Image
+✔ [649/962] Replayed Mathlib.Order.Interval.Set.LinearOrder
+✔ [650/962] Replayed Mathlib.Order.Interval.Set.UnorderedInterval
+✔ [651/962] Replayed Mathlib.Algebra.Order.Group.Pointwise.Interval
+✔ [652/962] Replayed Mathlib.Algebra.Group.Action.Opposite
+✔ [653/962] Replayed Mathlib.Algebra.GroupWithZero.Opposite
+✔ [654/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Defs
+✔ [655/962] Replayed Mathlib.Algebra.Module.Defs
+✔ [656/962] Replayed Mathlib.Algebra.Ring.Hom.Basic
+✔ [657/962] Replayed Mathlib.Data.Int.Cast.Lemmas
+✔ [658/962] Replayed Mathlib.Algebra.Module.NatInt
+✔ [659/962] Replayed Mathlib.Algebra.Group.Action.TypeTags
+✔ [660/962] Replayed Mathlib.Algebra.Group.Action.Pretransitive
+✔ [661/962] Replayed Mathlib.Algebra.Group.Action.Hom
+✔ [662/962] Replayed Mathlib.Algebra.Group.Action.Faithful
+✔ [663/962] Replayed Mathlib.Algebra.Group.Action.Units
+✔ [664/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Units
+✔ [665/962] Replayed Mathlib.Algebra.GroupWithZero.Action.End
+✔ [666/962] Replayed Mathlib.Algebra.Module.RingHom
+✔ [667/962] Replayed Mathlib.Algebra.Ring.Equiv
+✔ [668/962] Replayed Mathlib.Algebra.Ring.CompTypeclasses
+✔ [669/962] Replayed Mathlib.Logic.Function.CompTypeclasses
+✔ [670/962] Replayed Mathlib.Algebra.Group.Hom.CompTypeclasses
+✔ [671/962] Replayed Mathlib.Algebra.Group.Action.Basic
+✔ [672/962] Replayed Mathlib.Algebra.Ring.Action.Basic
+✔ [673/962] Replayed Mathlib.GroupTheory.GroupAction.Hom
+✔ [674/962] Replayed Mathlib.Algebra.Module.LinearMap.Defs
+✔ [675/962] Replayed Mathlib.Algebra.Algebra.Defs
+✔ [676/962] Replayed Mathlib.Algebra.Group.Equiv.TypeTags
+✔ [677/962] Replayed Mathlib.Algebra.Group.End
+✔ [678/962] Replayed Mathlib.Algebra.Group.Action.End
+✔ [679/962] Replayed Mathlib.Algebra.Group.Action.Prod
+✔ [680/962] Replayed Mathlib.Algebra.GroupWithZero.Prod
+✔ [681/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Basic
+✔ [682/962] Replayed Mathlib.Algebra.Module.Equiv.Defs
+✔ [683/962] Replayed Mathlib.Algebra.Group.Hom.End
+✔ [684/962] Replayed Mathlib.Algebra.Module.End
+✔ [685/962] Replayed Mathlib.Algebra.Ring.Opposite
+✔ [686/962] Replayed Mathlib.Data.Set.Piecewise
+✔ [687/962] Replayed Mathlib.Logic.Pairwise
+✔ [688/962] Replayed Mathlib.Algebra.Group.Pi.Lemmas
+✔ [689/962] Replayed Mathlib.GroupTheory.GroupAction.DomAct.Basic
+✔ [690/962] Replayed Mathlib.Algebra.Module.Hom
+✔ [691/962] Replayed Mathlib.Algebra.NoZeroSMulDivisors.Defs
+✔ [692/962] Replayed Mathlib.Algebra.Group.Action.Pi
+✔ [693/962] Replayed Mathlib.Algebra.NoZeroSMulDivisors.Pi
+✔ [694/962] Replayed Mathlib.Algebra.Module.LinearMap.Basic
+✔ [695/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Opposite
+✔ [696/962] Replayed Mathlib.Algebra.Module.Opposite
+✔ [697/962] Replayed Mathlib.Algebra.Module.Equiv.Opposite
+✔ [698/962] Replayed Mathlib.Algebra.Module.LinearMap.End
+✔ [699/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Pi
+✔ [700/962] Replayed Mathlib.Algebra.Regular.Basic
+✔ [701/962] Replayed Mathlib.Algebra.Regular.SMul
+✔ [702/962] Replayed Mathlib.Algebra.GroupWithZero.Pi
+✔ [703/962] Replayed Mathlib.Algebra.Ring.Pi
+✔ [704/962] Replayed Mathlib.Algebra.Module.Pi
+✔ [705/962] Replayed Mathlib.Algebra.GroupWithZero.Action.Prod
+✔ [706/962] Replayed Mathlib.Algebra.Module.Prod
+✔ [707/962] Replayed Mathlib.Algebra.Module.Equiv.Basic
+✔ [708/962] Replayed Mathlib.Data.Bool.Set
+✔ [709/962] Replayed Mathlib.Data.Nat.Set
+✔ [710/962] Replayed Mathlib.Control.ULift
+✔ [711/962] Replayed Mathlib.Data.ULift
+✔ [712/962] Replayed Mathlib.Order.SetNotation
+✔ [713/962] Replayed Mathlib.Order.CompleteLattice.Defs
+✔ [714/962] Replayed Mathlib.Order.CompleteLattice.Basic
+✔ [715/962] Replayed Mathlib.Order.CompleteLattice.Lemmas
+✔ [716/962] Replayed Mathlib.Order.GaloisConnection.Basic
+✔ [717/962] Replayed Mathlib.Order.CompleteBooleanAlgebra
+✔ [718/962] Replayed Mathlib.Data.Set.BooleanAlgebra
+✔ [719/962] Replayed Mathlib.Data.Set.Lattice
+✔ [720/962] Replayed Mathlib.Data.Set.Lattice.Image
+✔ [721/962] Replayed Mathlib.Algebra.Group.Subsemigroup.Basic
+✔ [722/962] Replayed Mathlib.Algebra.Group.Submonoid.Basic
+✔ [723/962] Replayed Mathlib.Algebra.Group.Submonoid.MulAction
+✔ [724/962] Replayed Mathlib.Algebra.Group.Submonoid.Operations
+✔ [725/962] Replayed Mathlib.Algebra.Group.Subgroup.Lattice
+✔ [726/962] Replayed Mathlib.Algebra.Group.Subgroup.Map
+✔ [727/962] Replayed Mathlib.Tactic.ApplyFun
+✔ [728/962] Replayed Mathlib.Algebra.Group.Subgroup.Ker
+✔ [729/962] Replayed Mathlib.Algebra.Group.Support
+✔ [730/962] Replayed Mathlib.Algebra.BigOperators.Group.List.Defs
+✔ [731/962] Replayed Batteries.Control.ForInStep.Lemmas
+✔ [732/962] Replayed Batteries.Data.List.Lemmas
+✔ [733/962] Replayed Batteries.Data.List.Count
+✔ [734/962] Replayed Batteries.Data.List.Pairwise
+✔ [735/962] Replayed Batteries.Data.List.Perm
+✔ [736/962] Replayed Mathlib.Control.Functor
+✔ [737/962] Replayed Mathlib.Data.List.Defs
+✔ [738/962] Replayed Mathlib.Data.List.Monad
+✔ [739/962] Replayed Mathlib.Data.List.Basic
+✔ [740/962] Replayed Mathlib.Data.List.Perm.Subperm
+✔ [741/962] Replayed Mathlib.Data.Multiset.Defs
+✔ [742/962] Replayed Mathlib.Data.Multiset.ZeroCons
+✔ [743/962] Replayed Mathlib.Data.Multiset.Basic
+✔ [744/962] Replayed Mathlib.Data.List.Forall2
+✔ [745/962] Replayed Mathlib.Data.List.InsertIdx
+✔ [746/962] Replayed Mathlib.Data.List.Perm.Basic
+✔ [747/962] Replayed Mathlib.Data.List.Nodup
+✔ [748/962] Replayed Mathlib.Data.Multiset.Count
+✔ [749/962] Replayed Mathlib.Data.List.Count
+✔ [750/962] Replayed Mathlib.Data.Multiset.AddSub
+✔ [751/962] Replayed Mathlib.Data.Multiset.Replicate
+✔ [752/962] Replayed Mathlib.Data.Set.List
+✔ [753/962] Replayed Mathlib.Data.Multiset.MapFold
+✔ [754/962] Replayed Mathlib.Data.Multiset.Filter
+✔ [755/962] Replayed Mathlib.Algebra.BigOperators.Group.Multiset.Defs
+✔ [756/962] Replayed Mathlib.Data.Set.Pairwise.Basic
+✔ [757/962] Replayed Mathlib.Data.Finset.Defs
+✔ [758/962] Replayed Mathlib.Data.Finset.Attach
+✔ [759/962] Replayed Mathlib.Data.Finset.Attr
+✔ [760/962] Replayed Mathlib.Data.List.Lattice
+✔ [761/962] Replayed Mathlib.Data.List.Dedup
+✔ [762/962] Replayed Mathlib.Data.List.TakeDrop
+✔ [763/962] Replayed Mathlib.Data.List.Perm.Lattice
+✔ [764/962] Replayed Mathlib.Data.Multiset.UnionInter
+✔ [765/962] Replayed Mathlib.Data.Multiset.Dedup
+✔ [766/962] Replayed Mathlib.Data.Finset.Dedup
+✔ [767/962] Replayed Mathlib.Data.Finset.Empty
+✔ [768/962] Replayed Mathlib.Data.List.Induction
+✔ [769/962] Replayed Mathlib.Data.List.Infix
+✔ [770/962] Replayed Mathlib.Data.Multiset.FinsetOps
+✔ [771/962] Replayed Mathlib.Data.Finset.Insert
+✔ [772/962] Replayed Mathlib.Data.Finset.Disjoint
+✔ [773/962] Replayed Mathlib.Data.Finset.Erase
+✔ [774/962] Replayed Mathlib.Data.Finset.Filter
+✔ [775/962] Replayed Mathlib.Data.Multiset.Range
+✔ [776/962] Replayed Mathlib.Data.Finset.Range
+✔ [777/962] Replayed Mathlib.Data.Finset.Lattice.Basic
+✔ [778/962] Replayed Mathlib.Data.Finset.Lattice.Lemmas
+✔ [779/962] Replayed Mathlib.Data.Finset.SDiff
+✔ [780/962] Replayed Mathlib.Data.Finset.Basic
+✔ [781/962] Replayed Mathlib.Data.Finset.Image
+✔ [782/962] Replayed Mathlib.Data.Finite.Defs
+✔ [783/962] Replayed Mathlib.Data.Fintype.Defs
+✔ [784/962] Replayed Mathlib.Data.Finset.BooleanAlgebra
+✔ [785/962] Replayed Mathlib.Data.Finset.SymmDiff
+✔ [786/962] Replayed Mathlib.Data.Fintype.OfMap
+✔ [787/962] Replayed Mathlib.Data.Fintype.Sets
+✔ [788/962] Replayed Mathlib.Algebra.BigOperators.Group.List.Basic
+✔ [789/962] Replayed Mathlib.Data.List.Flatten
+✔ [790/962] Replayed Mathlib.Data.List.Pairwise
+✔ [791/962] Replayed Mathlib.Data.List.Lex
+✔ [792/962] Replayed Mathlib.Data.List.Chain
+✔ [793/962] Replayed Mathlib.Data.List.Range
+✔ [794/962] Replayed Mathlib.Data.List.Rotate
+✔ [795/962] Replayed Mathlib.Data.List.ProdSigma
+✔ [796/962] Replayed Mathlib.Algebra.BigOperators.Group.List.Lemmas
+✔ [797/962] Replayed Mathlib.Data.Multiset.Fold
+✔ [798/962] Replayed Mathlib.Algebra.Order.Group.Multiset
+✔ [799/962] Replayed Mathlib.Algebra.BigOperators.Group.Multiset.Basic
+✔ [800/962] Replayed Mathlib.Data.Multiset.Bind
+✔ [801/962] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Defs
+✔ [802/962] Replayed Mathlib.Data.Finset.Card
+✔ [803/962] Replayed Mathlib.Data.Finset.Fold
+✔ [804/962] Replayed Mathlib.Data.Finset.Union
+✔ [805/962] Replayed Mathlib.Data.Finset.Prod
+✔ [806/962] Replayed Mathlib.Data.Multiset.Sum
+✔ [807/962] Replayed Mathlib.Data.Finset.Sum
+✔ [808/962] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Basic
+✔ [809/962] Replayed Mathlib.Algebra.Group.Commute.Hom
+✔ [810/962] Replayed Mathlib.Data.Int.DivMod
+✔ [811/962] Replayed Mathlib.Data.Fin.Basic
+✔ [812/962] Replayed Mathlib.Data.Fin.Rev
+✔ [813/962] Replayed Mathlib.Data.Nat.Find
+✔ [814/962] Replayed Mathlib.Order.Fin.Basic
+✔ [815/962] Replayed Mathlib.Data.Fin.Tuple.Basic
+✔ [816/962] Replayed Mathlib.Data.List.OfFn
+✔ [817/962] Replayed Mathlib.Data.List.FinRange
+✔ [818/962] Replayed Mathlib.Data.Fintype.Basic
+✔ [819/962] Replayed Mathlib.Data.Finset.NoncommProd
+✔ [820/962] Replayed Mathlib.Algebra.Group.Submonoid.BigOperators
+✔ [821/962] Replayed Mathlib.Data.Setoid.Basic
+✔ [822/962] Replayed Mathlib.GroupTheory.GroupAction.Defs
+✔ [823/962] Replayed Mathlib.GroupTheory.GroupAction.SubMulAction
+✔ [824/962] Replayed Mathlib.Algebra.Module.Submodule.Defs
+✔ [825/962] Replayed Mathlib.Algebra.Module.Submodule.Basic
+✔ [826/962] Replayed Mathlib.Algebra.FreeMonoid.Basic
+✔ [827/962] Replayed Mathlib.Algebra.Group.Idempotent
+✔ [828/962] Replayed Mathlib.Algebra.Group.Submonoid.MulOpposite
+✔ [829/962] Replayed Mathlib.Data.Fintype.Card
+✔ [830/962] Replayed Mathlib.Data.List.Duplicate
+✔ [831/962] Replayed Mathlib.Data.List.TakeWhile
+✔ [832/962] Replayed Mathlib.Data.List.Sort
+✔ [833/962] Replayed Mathlib.Data.List.NodupEquivFin
+✔ [834/962] Replayed Mathlib.Data.Fintype.EquivFin
+✔ [835/962] Replayed Mathlib.Algebra.Group.Submonoid.Membership
+✔ [836/962] Replayed Mathlib.Algebra.Group.PUnit
+✔ [837/962] Replayed Mathlib.Algebra.Ring.PUnit
+✔ [838/962] Replayed Mathlib.Algebra.Module.PUnit
+✔ [839/962] Replayed Mathlib.Data.Multiset.Lattice
+✔ [840/962] Replayed Mathlib.Order.Hom.Bounded
+✔ [841/962] Replayed Mathlib.Order.Hom.Lattice
+✔ [842/962] Replayed Mathlib.Order.Hom.BoundedLattice
+✔ [843/962] Replayed Mathlib.Order.Nat
+✔ [844/962] Replayed Mathlib.Data.Finset.Lattice.Fold
+✔ [845/962] Replayed Mathlib.Order.ConditionallyCompleteLattice.Defs
+✔ [846/962] Replayed Mathlib.Order.ConditionallyCompleteLattice.Basic
+✔ [847/962] Replayed Mathlib.Algebra.Module.Submodule.Lattice
+✔ [848/962] Replayed Mathlib.Algebra.Module.Submodule.LinearMap
+✔ [849/962] Replayed Mathlib.Algebra.Module.Submodule.Map
+✔ [850/962] Replayed Mathlib.Algebra.Module.Submodule.Ker
+✔ [851/962] Replayed Mathlib.Order.Hom.CompleteLattice
+✔ [852/962] Replayed Mathlib.Algebra.Module.Submodule.RestrictScalars
+✔ [853/962] Replayed Mathlib.Algebra.Group.ULift
+✔ [854/962] Replayed Mathlib.Algebra.GroupWithZero.ULift
+✔ [855/962] Replayed Mathlib.Algebra.Ring.ULift
+✔ [856/962] Replayed Mathlib.Algebra.Module.ULift
+✔ [857/962] Replayed Mathlib.Algebra.Ring.CharZero
+✔ [858/962] Replayed Mathlib.Algebra.Group.Conj
+✔ [859/962] Replayed Mathlib.Algebra.Group.Subgroup.Basic
+✔ [860/962] Replayed Mathlib.Algebra.Group.Submonoid.DistribMulAction
+✔ [861/962] Replayed Mathlib.Algebra.Ring.Action.Subobjects
+✔ [862/962] Replayed Mathlib.Data.Nat.Cast.Prod
+✔ [863/962] Replayed Mathlib.Data.Int.Cast.Prod
+✔ [864/962] Replayed Mathlib.Algebra.Ring.Prod
+✔ [865/962] Replayed Mathlib.Algebra.Group.Center
+✔ [866/962] Replayed Mathlib.GroupTheory.Subsemigroup.Center
+✔ [867/962] Replayed Mathlib.GroupTheory.Subsemigroup.Centralizer
+✔ [868/962] Replayed Mathlib.GroupTheory.Submonoid.Center
+✔ [869/962] Replayed Mathlib.GroupTheory.Submonoid.Centralizer
+✔ [870/962] Replayed Mathlib.Algebra.Group.Subsemigroup.Membership
+✔ [871/962] Replayed Mathlib.Algebra.Group.Subsemigroup.Operations
+✔ [872/962] Replayed Mathlib.Algebra.GroupWithZero.Center
+✔ [873/962] Replayed Mathlib.Algebra.Ring.Center
+✔ [874/962] Replayed Mathlib.Algebra.Ring.Centralizer
+✔ [875/962] Replayed Mathlib.Algebra.Ring.Submonoid.Basic
+✔ [876/962] Replayed Mathlib.Data.Set.Finite.Range
+✔ [877/962] Replayed Mathlib.RingTheory.NonUnitalSubsemiring.Basic
+✔ [878/962] Replayed Mathlib.Algebra.Ring.Subsemiring.Basic
+✔ [879/962] Replayed Mathlib.Data.Set.Finite.Basic
+✔ [880/962] Replayed Mathlib.Algebra.Ring.Subring.Basic
+✔ [881/962] Replayed Mathlib.Data.Int.Cast.Field
+✔ [882/962] Replayed Mathlib.Data.Int.Cast.Pi
+✔ [883/962] Replayed Mathlib.Data.Int.CharZero
+✔ [884/962] Replayed Mathlib.Algebra.Algebra.Basic
+✔ [885/962] Replayed Mathlib.Algebra.Algebra.Hom
+✔ [886/962] Replayed Mathlib.Algebra.Ring.Action.Group
+✔ [887/962] Replayed Mathlib.Algebra.Algebra.Equiv
+✔ [888/962] Replayed Mathlib.Algebra.Algebra.NonUnitalHom
+✔ [889/962] Replayed Mathlib.Data.Set.UnionLift
+✔ [890/962] Replayed Mathlib.Algebra.Group.Action.Pointwise.Set.Basic
+✔ [891/962] Replayed Mathlib.Algebra.Module.Submodule.EqLocus
+✔ [892/962] Replayed Mathlib.Algebra.Module.Submodule.Range
+✔ [893/962] Replayed Mathlib.Algebra.Module.Submodule.Equiv
+✔ [894/962] Replayed Mathlib.Algebra.NoZeroSMulDivisors.Basic
+✔ [895/962] Replayed Mathlib.LinearAlgebra.Span.Defs
+✔ [896/962] Replayed Mathlib.Order.Antisymmetrization
+✔ [897/962] Replayed Mathlib.Order.Hom.WithTopBot
+✔ [898/962] Replayed Mathlib.Order.Interval.Set.OrderEmbedding
+✔ [899/962] Replayed Mathlib.Order.Preorder.Chain
+✔ [900/962] Replayed Mathlib.Order.Antichain
+✔ [901/962] Replayed Mathlib.Order.Interval.Set.OrdConnected
+✔ [902/962] Replayed Mathlib.Order.Interval.Set.WithBotTop
+✔ [903/962] Replayed Mathlib.Order.Cover
+✔ [904/962] Replayed Mathlib.Order.LatticeIntervals
+✔ [905/962] Replayed Mathlib.Order.ModularLattice
+✔ [906/962] Replayed Mathlib.Order.Iterate
+✔ [907/962] Replayed Mathlib.Order.SuccPred.Basic
+✔ [908/962] Replayed Mathlib.Order.ConditionallyCompleteLattice.Indexed
+✔ [909/962] Replayed Mathlib.Order.Atoms
+✔ [910/962] Replayed Mathlib.Data.Set.Accumulate
+✔ [911/962] Replayed Mathlib.Data.Finset.Max
+✔ [912/962] Replayed Mathlib.Data.Set.Sigma
+✔ [913/962] Replayed Mathlib.Data.Finset.Option
+✔ [914/962] Replayed Mathlib.Order.CompleteLattice.Finset
+✔ [915/962] Replayed Mathlib.Data.Finset.Sigma
+✔ [916/962] Replayed Mathlib.Data.Fintype.Sigma
+✔ [917/962] Replayed Mathlib.Data.Finite.Sigma
+✔ [918/962] Replayed Mathlib.Data.Finset.Lattice.Union
+✔ [919/962] Replayed Mathlib.Data.Nat.Factorial.Basic
+✔ [920/962] Replayed Mathlib.Data.Nat.Choose.Basic
+✔ [921/962] Replayed Mathlib.Data.List.Sublists
+✔ [922/962] Replayed Mathlib.Data.List.Zip
+✔ [923/962] Replayed Mathlib.Data.Multiset.Powerset
+✔ [924/962] Replayed Mathlib.Data.Set.Pairwise.Lattice
+✔ [925/962] Replayed Mathlib.Data.Finset.Powerset
+✔ [926/962] Replayed Mathlib.Data.Set.Finite.Powerset
+✔ [927/962] Replayed Mathlib.Data.Set.Finite.Lattice
+✔ [928/962] Replayed Mathlib.Order.ConditionallyCompleteLattice.Finset
+✔ [929/962] Replayed Mathlib.Algebra.Group.Embedding
+✔ [930/962] Replayed Mathlib.Data.Multiset.Pi
+✔ [931/962] Replayed Mathlib.Logic.Function.DependsOn
+✔ [932/962] Replayed Mathlib.Data.Finset.Pi
+✔ [933/962] Replayed Mathlib.Data.Finset.Preimage
+✔ [934/962] Replayed Mathlib.Order.Interval.Finset.Defs
+✔ [935/962] Replayed Mathlib.Order.Interval.Set.SuccPred
+✔ [936/962] Replayed Mathlib.Order.Interval.Finset.SuccPred
+✔ [937/962] Replayed Mathlib.Order.Minimal
+✔ [938/962] Replayed Mathlib.Order.Preorder.Finite
+✔ [939/962] Replayed Mathlib.Order.Interval.Finset.Basic
+✔ [940/962] Replayed Mathlib.Order.Interval.Multiset
+✔ [941/962] Replayed Mathlib.Order.Interval.Finset.Nat
+✔ [942/962] Replayed Mathlib.Data.Nat.Lattice
+✔ [943/962] Replayed Mathlib.Data.List.MinMax
+✔ [944/962] Replayed Mathlib.Data.Nat.Order.Lemmas
+✔ [945/962] Replayed Mathlib.Data.Countable.Defs
+✔ [946/962] Replayed Mathlib.Data.PNat.Notation
+✔ [947/962] Replayed Mathlib.Data.PNat.Defs
+✔ [948/962] Replayed Mathlib.Data.PNat.Equiv
+✔ [949/962] Replayed Mathlib.Data.Nat.Bits
+✔ [950/962] Replayed Mathlib.Data.Nat.Pairing
+✔ [951/962] Replayed Mathlib.Logic.Equiv.Nat
+✔ [952/962] Replayed Mathlib.Logic.Encodable.Basic
+✔ [953/962] Replayed Mathlib.Logic.Denumerable
+✔ [954/962] Replayed Mathlib.Order.OrderIsoNat
+✔ [955/962] Replayed Mathlib.Lean.Expr.ExtraRecognizers
+✔ [956/962] Replayed Mathlib.Data.Set.Notation
+✔ [957/962] Replayed Mathlib.Logic.Embedding.Set
+✔ [958/962] Replayed Mathlib.Order.RelIso.Set
+✔ [959/962] Replayed Mathlib.Data.Finset.Lattice.Prod
+✔ [960/962] Replayed Mathlib.Order.Closure
+✔ [961/962] Replayed Mathlib.Order.SupClosed
+✔ [962/1415] Replayed Mathlib.Data.Set.Pairwise.List
+✔ [963/1415] Replayed Mathlib.Data.Finset.Pairwise
+✔ [964/1415] Replayed Mathlib.Order.CompleteLatticeIntervals
+✔ [965/1415] Replayed Mathlib.Order.SupIndep
+✔ [966/1415] Replayed Mathlib.Order.CompleteLattice.Chain
+✔ [967/1415] Replayed Mathlib.Order.Zorn
+✔ [968/1415] Replayed Mathlib.Data.Finset.Order
+✔ [969/1415] Replayed Mathlib.Data.Finite.Set
+✔ [970/1415] Replayed Mathlib.Util.AtomM
+✔ [971/1415] Replayed Mathlib.Data.List.TFAE
+✔ [972/1415] Replayed Mathlib.Tactic.TFAE
+✔ [973/1415] Replayed Mathlib.Order.CompactlyGenerated.Basic
+✔ [974/1415] Replayed Mathlib.Control.Monad.Basic
+✔ [975/1415] Replayed Mathlib.Dynamics.FixedPoints.Basic
+✔ [976/1415] Replayed Mathlib.Data.Part
+✔ [977/1415] Replayed Mathlib.Order.Part
+✔ [978/1415] Replayed Mathlib.Order.ScottContinuity
+✔ [979/1415] Replayed Mathlib.Order.OmegaCompletePartialOrder
+✔ [980/1415] Replayed Mathlib.LinearAlgebra.Span.Basic
+✔ [981/1415] Replayed Mathlib.RingTheory.NonUnitalSubring.Basic
+✔ [982/1415] Replayed Mathlib.Algebra.Algebra.NonUnitalSubalgebra
+✔ [983/1415] Replayed Mathlib.Tactic.NormNum.Basic
+✔ [984/1415] Replayed Mathlib.Tactic.TryThis
+✔ [985/1415] Replayed Mathlib.Tactic.Abel
+✔ [986/1415] Replayed Mathlib.GroupTheory.Congruence.Defs
+✔ [987/1415] Replayed Mathlib.GroupTheory.Congruence.Hom
+✔ [988/1415] Replayed Mathlib.GroupTheory.Congruence.Basic
+✔ [989/1415] Replayed Mathlib.RingTheory.Congruence.Defs
+✔ [990/1415] Replayed Mathlib.RingTheory.Congruence.Basic
+✔ [991/1415] Replayed Mathlib.GroupTheory.Congruence.Opposite
+✔ [992/1415] Replayed Mathlib.RingTheory.Congruence.Opposite
+✔ [993/1415] Replayed Mathlib.RingTheory.TwoSidedIdeal.Basic
+✔ [994/1415] Replayed Mathlib.RingTheory.TwoSidedIdeal.Lattice
+✔ [995/1415] Replayed Mathlib.RingTheory.SimpleRing.Defs
+✔ [996/1415] Replayed Mathlib.RingTheory.TwoSidedIdeal.Kernel
+✔ [997/1415] Replayed Mathlib.RingTheory.SimpleRing.Basic
+✔ [998/1415] Replayed Mathlib.Algebra.Algebra.Subalgebra.Basic
+✔ [999/1415] Replayed Mathlib.Algebra.Order.GroupWithZero.Synonym
+✔ [1000/1415] Replayed Mathlib.Algebra.Order.GroupWithZero.Action.Synonym
+✔ [1001/1415] Replayed Mathlib.Tactic.GCongr
+✔ [1002/1415] Replayed Mathlib.Algebra.Order.Module.Defs
+✔ [1003/1415] Replayed Mathlib.Algebra.Order.Module.OrderedSMul
+✔ [1004/1415] Replayed Mathlib.Algebra.Order.Floor.Defs
+✔ [1005/1415] Replayed Mathlib.Data.Nat.Cast.Order.Field
+✔ [1006/1415] Replayed Mathlib.Data.Ineq
+✔ [1007/1415] Replayed Mathlib.Tactic.Linarith.Lemmas
+✔ [1008/1415] Replayed Mathlib.Util.SynthesizeUsing
+✔ [1009/1415] Replayed Mathlib.Tactic.Linarith.Datatypes
+✔ [1010/1415] Replayed Mathlib.Tactic.Linarith.Parsing
+✔ [1011/1415] Replayed Mathlib.Tactic.Linarith.Verification
+✔ [1012/1415] Replayed Mathlib.Tactic.Zify
+✔ [1013/1415] Replayed Mathlib.Data.Tree.Basic
+✔ [1014/1415] Replayed Mathlib.Tactic.CancelDenoms.Core
+✔ [1015/1415] Replayed Mathlib.Tactic.Linarith.Preprocessing
+✔ [1016/1415] Replayed Mathlib.Tactic.Linarith.Oracle.SimplexAlgorithm.Datatypes
+✔ [1017/1415] Replayed Mathlib.Tactic.Linarith.Oracle.SimplexAlgorithm.SimplexAlgorithm
+✔ [1018/1415] Replayed Mathlib.Tactic.Linarith.Oracle.SimplexAlgorithm.Gauss
+✔ [1019/1415] Replayed Mathlib.Tactic.Linarith.Oracle.SimplexAlgorithm.PositiveVector
+✔ [1020/1415] Replayed Mathlib.Tactic.Linarith.Oracle.SimplexAlgorithm
+✔ [1021/1415] Replayed Mathlib.Algebra.Order.Nonneg.Basic
+✔ [1022/1415] Replayed Mathlib.Data.NNRat.Defs
+✔ [1023/1415] Replayed Mathlib.Algebra.Field.Rat
+✔ [1024/1415] Replayed Mathlib.Algebra.Group.Semiconj.Basic
+✔ [1025/1415] Replayed Mathlib.Algebra.Group.Commute.Basic
+✔ [1026/1415] Replayed Mathlib.Algebra.Divisibility.Units
+✔ [1027/1415] Replayed Mathlib.Algebra.GroupWithZero.Divisibility
+✔ [1028/1415] Replayed Mathlib.Data.Rat.Lemmas
+✔ [1029/1415] Replayed Mathlib.Data.Rat.Cast.Defs
+✔ [1030/1415] Replayed Mathlib.Data.Rat.Cast.CharZero
+✔ [1031/1415] Replayed Mathlib.Tactic.NormNum.Inv
+✔ [1032/1415] Replayed Mathlib.Tactic.NormNum.Pow
+✔ [1033/1415] Replayed Mathlib.Tactic.Ring.Basic
+✔ [1034/1415] Replayed Mathlib.Tactic.Linarith.Frontend
+✔ [1035/1415] Replayed Mathlib.Algebra.Order.Field.Defs
+✔ [1036/1415] Replayed Mathlib.Algebra.Order.Ring.Canonical
+✔ [1037/1415] Replayed Mathlib.Algebra.Order.Field.Canonical
+✔ [1038/1415] Replayed Mathlib.Algebra.Order.Nonneg.Lattice
+✔ [1039/1415] Replayed Mathlib.Algebra.Order.Ring.InjSurj
+✔ [1040/1415] Replayed Mathlib.Algebra.Order.Nonneg.Ring
+✔ [1041/1415] Replayed Mathlib.Algebra.Order.Nonneg.Field
+✔ [1042/1415] Replayed Mathlib.Algebra.Notation
+✔ [1043/1415] Replayed Mathlib.Algebra.Order.Group.PosPart
+✔ [1044/1415] Replayed Mathlib.Tactic.Positivity.Basic
+✔ [1045/1415] Replayed Mathlib.Data.Rat.Cast.Lemmas
+✔ [1046/1415] Replayed Mathlib.Tactic.NormNum.OfScientific
+✔ [1047/1415] Replayed Mathlib.Tactic.NormNum.Eq
+✔ [1048/1415] Replayed Mathlib.Tactic.NormNum.Ineq
+✔ [1049/1415] Replayed Mathlib.Tactic.NormNum.DivMod
+✔ [1050/1415] Replayed Mathlib.Algebra.Order.Ring.Rat
+✔ [1051/1415] Replayed Mathlib.Algebra.Order.Field.Rat
+✔ [1052/1415] Replayed Mathlib.Data.Rat.Cast.Order
+✔ [1053/1415] Replayed Mathlib.Tactic.NormNum
+✔ [1054/1415] Replayed Mathlib.Tactic.Linarith
+✔ [1055/1415] Replayed Mathlib.Algebra.Order.Floor.Semiring
+✔ [1056/1415] Replayed Mathlib.Algebra.Order.Monoid.Units
+✔ [1057/1415] Replayed Mathlib.Algebra.Order.Ring.Pow
+✔ [1058/1415] Replayed Mathlib.Data.Int.LeastGreatest
+✔ [1059/1415] Replayed Mathlib.Util.DischargerAsTactic
+✔ [1060/1415] Replayed Mathlib.Tactic.FieldSimp
+✔ [1061/1415] Replayed Mathlib.Algebra.Order.Floor.Ring
+✔ [1062/1415] Replayed Mathlib.Algebra.Order.Group.Basic
+✔ [1063/1415] Replayed Mathlib.Algebra.Order.Interval.Set.Group
+✔ [1064/1415] Replayed Mathlib.Algebra.Order.Round
+✔ [1065/1415] Replayed Mathlib.Tactic.Ring.RingNF
+✔ [1066/1415] Replayed Mathlib.Algebra.Order.Positive.Ring
+✔ [1067/1415] Replayed Mathlib.Data.PNat.Basic
+✔ [1068/1415] Replayed Mathlib.Tactic.Ring.PNat
+✔ [1069/1415] Replayed Mathlib.Tactic.Ring
+✔ [1070/1415] Replayed Mathlib.Data.Rat.Floor
+✔ [1071/1415] Replayed Mathlib.Algebra.Order.Archimedean.Basic
+✔ [1072/1415] Replayed Mathlib.Algebra.Order.Group.Pointwise.Bounds
+✔ [1073/1415] Replayed Mathlib.Algebra.Order.Hom.Basic
+✔ [1074/1415] Replayed Mathlib.Algebra.Order.AbsoluteValue.Basic
+✔ [1075/1415] Replayed Mathlib.GroupTheory.GroupAction.Ring
+✔ [1076/1415] Replayed Mathlib.Algebra.Order.CauSeq.Basic
+✔ [1077/1415] Replayed Mathlib.Algebra.Ring.Action.Rat
+✔ [1078/1415] Replayed Mathlib.Algebra.Order.CauSeq.Completion
+✔ [1079/1415] Replayed Mathlib.Data.Real.Basic
+✔ [1080/1415] Replayed Mathlib.Order.Interval.Set.Disjoint
+✔ [1081/1415] Replayed Mathlib.Data.Real.Archimedean
+✔ [1082/1415] Replayed Mathlib.Data.NNReal.Defs
+✔ [1083/1415] Replayed Mathlib.Order.ConditionallyCompleteLattice.Group
+✔ [1084/1415] Replayed Mathlib.Analysis.Normed.Group.Seminorm
+✔ [1085/1415] Replayed Mathlib.Algebra.Algebra.Rat
+✔ [1086/1415] Replayed Mathlib.Algebra.BigOperators.GroupWithZero.Finset
+✔ [1087/1415] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Lemmas
+✔ [1088/1415] Replayed Mathlib.Data.Finset.Piecewise
+✔ [1089/1415] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Piecewise
+✔ [1090/1415] Replayed Mathlib.Algebra.Group.Indicator
+✔ [1091/1415] Replayed Mathlib.Algebra.BigOperators.Pi
+✔ [1092/1415] Replayed Mathlib.Algebra.Group.FiniteSupport
+✔ [1093/1415] Replayed Mathlib.Algebra.Order.BigOperators.Group.List
+✔ [1094/1415] Replayed Mathlib.Algebra.Order.BigOperators.Group.Multiset
+✔ [1095/1415] Replayed Mathlib.Data.Multiset.OrderedMonoid
+✔ [1096/1415] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Sigma
+✔ [1097/1415] Replayed Mathlib.Algebra.Order.BigOperators.Group.Finset
+✔ [1098/1415] Replayed Mathlib.Algebra.BigOperators.Finprod
+✔ [1099/1415] Replayed Mathlib.Algebra.BigOperators.GroupWithZero.Action
+✔ [1100/1415] Replayed Mathlib.Data.Fintype.Pi
+✔ [1101/1415] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Pi
+✔ [1102/1415] Replayed Mathlib.Algebra.BigOperators.Ring.List
+✔ [1103/1415] Replayed Mathlib.Data.Multiset.Antidiagonal
+✔ [1104/1415] Replayed Mathlib.Data.Multiset.Sections
+✔ [1105/1415] Replayed Mathlib.Algebra.BigOperators.Ring.Multiset
+✔ [1106/1415] Replayed Mathlib.Data.Fintype.Powerset
+✔ [1107/1415] Replayed Mathlib.Algebra.BigOperators.Ring.Finset
+✔ [1108/1415] Replayed Mathlib.Data.NNRat.Order
+✔ [1109/1415] Replayed Mathlib.Data.Finset.Density
+✔ [1110/1415] Replayed Mathlib.Algebra.BigOperators.Option
+✔ [1111/1415] Replayed Mathlib.Data.Fintype.Option
+✔ [1112/1415] Replayed Mathlib.Data.Fintype.Prod
+✔ [1113/1415] Replayed Mathlib.Data.Fintype.Sum
+✔ [1114/1415] Replayed Mathlib.Data.Vector.Defs
+✔ [1115/1415] Replayed Mathlib.Data.List.Scan
+✔ [1116/1415] Replayed Mathlib.Control.Applicative
+✔ [1117/1415] Replayed Mathlib.Control.Traversable.Basic
+✔ [1118/1415] Replayed Mathlib.Data.Vector.Basic
+✔ [1119/1415] Replayed Mathlib.Data.Sym.Basic
+✔ [1120/1415] Replayed Mathlib.Data.Fintype.Vector
+✔ [1121/1415] Replayed Mathlib.Data.Fintype.BigOperators
+✔ [1122/1415] Replayed Mathlib.Data.Finite.Prod
+✔ [1123/1415] Replayed Mathlib.Algebra.Group.Pointwise.Set.Finite
+✔ [1124/1415] Replayed Mathlib.Algebra.Group.Pointwise.Set.ListOfFn
+✔ [1125/1415] Replayed Mathlib.Data.Finset.NAry
+✔ [1126/1415] Replayed Mathlib.Algebra.Group.Pointwise.Finset.Basic
+✔ [1127/1415] Replayed Mathlib.Algebra.BigOperators.Expect
+✔ [1128/1415] Replayed Mathlib.Algebra.Order.BigOperators.Ring.List
+✔ [1129/1415] Replayed Mathlib.Algebra.Order.BigOperators.Ring.Multiset
+✔ [1130/1415] Replayed Mathlib.Algebra.Order.BigOperators.Ring.Finset
+✔ [1131/1415] Replayed Mathlib.Algebra.Order.Nonneg.Floor
+✔ [1132/1415] Replayed Mathlib.Algebra.GroupWithZero.Pointwise.Set.Basic
+✔ [1133/1415] Replayed Mathlib.Algebra.GroupWithZero.Action.Pointwise.Set
+✔ [1134/1415] Replayed Mathlib.Algebra.Order.Module.Pointwise
+✔ [1135/1415] Replayed Mathlib.Data.Real.Pointwise
+✔ [1136/1415] Replayed Mathlib.Data.NNReal.Basic
+✔ [1137/1415] Replayed Mathlib.Algebra.GroupWithZero.Indicator
+✔ [1138/1415] Replayed Mathlib.Algebra.Module.Basic
+✔ [1139/1415] Replayed Mathlib.Tactic.Continuity.Init
+✔ [1140/1415] Replayed Mathlib.Tactic.Continuity
+✔ [1141/1415] Replayed Mathlib.Tactic.FunProp.Decl
+✔ [1142/1415] Replayed Mathlib.Tactic.FunProp.ToBatteries
+✔ [1143/1415] Replayed Mathlib.Tactic.FunProp.Mor
+✔ [1144/1415] Replayed Mathlib.Tactic.FunProp.FunctionData
+✔ [1145/1415] Replayed Mathlib.Tactic.FunProp.Types
+✔ [1146/1415] Replayed Mathlib.Lean.Meta.RefinedDiscrTree.Pi
+✔ [1147/1415] Replayed Mathlib.Lean.Meta.RefinedDiscrTree.Basic
+✔ [1148/1415] Replayed Mathlib.Tactic.FunProp.StateList
+✔ [1149/1415] Replayed Mathlib.Lean.Meta.RefinedDiscrTree.Encode
+✔ [1150/1415] Replayed Mathlib.Lean.Meta.RefinedDiscrTree
+✔ [1151/1415] Replayed Mathlib.Lean.Meta.RefinedDiscrTree.Lookup
+✔ [1152/1415] Replayed Mathlib.Tactic.FunProp.Theorems
+✔ [1153/1415] Replayed Mathlib.Tactic.FunProp.Attr
+✔ [1154/1415] Replayed Mathlib.Tactic.FunProp.Core
+✔ [1155/1415] Replayed Mathlib.Tactic.FunProp.Elab
+✔ [1156/1415] Replayed Mathlib.Tactic.FunProp
+✔ [1157/1415] Replayed Mathlib.Topology.Defs.Basic
+✔ [1158/1415] Replayed Mathlib.Topology.ContinuousMap.Defs
+✔ [1159/1415] Replayed Mathlib.Order.Filter.Defs
+✔ [1160/1415] Replayed Mathlib.Order.Filter.Basic
+✔ [1161/1415] Replayed Mathlib.Order.Filter.Map
+✔ [1162/1415] Replayed Mathlib.Order.Filter.Bases.Basic
+✔ [1163/1415] Replayed Mathlib.Order.Filter.AtTopBot.Defs
+✔ [1164/1415] Replayed Mathlib.Order.Filter.AtTopBot.Disjoint
+✔ [1165/1415] Replayed Mathlib.Order.Filter.Tendsto
+✔ [1166/1415] Replayed Mathlib.Order.Filter.AtTopBot.Tendsto
+✔ [1167/1415] Replayed Mathlib.Order.Filter.AtTopBot.Basic
+✔ [1168/1415] Replayed Mathlib.Order.Filter.Prod
+✔ [1169/1415] Replayed Mathlib.Order.Filter.Finite
+✔ [1170/1415] Replayed Mathlib.Order.Filter.Lift
+✔ [1171/1415] Replayed Mathlib.Topology.Defs.Filter
+✔ [1172/1415] Replayed Mathlib.Topology.Basic
+✔ [1173/1415] Replayed Mathlib.Topology.Closure
+✔ [1174/1415] Replayed Mathlib.Topology.Neighborhoods
+✔ [1175/1415] Replayed Mathlib.Topology.ClusterPt
+✔ [1176/1415] Replayed Mathlib.Topology.Continuous
+✔ [1177/1415] Replayed Mathlib.Topology.Defs.Induced
+✔ [1178/1415] Replayed Mathlib.Topology.Order
+✔ [1179/1415] Replayed Mathlib.Topology.Maps.Basic
+✔ [1180/1415] Replayed Mathlib.Topology.Homeomorph.Defs
+✔ [1181/1415] Replayed Mathlib.Data.Set.Constructions
+✔ [1182/1415] Replayed Mathlib.Data.Set.Finite.Lemmas
+✔ [1183/1415] Replayed Mathlib.Order.Filter.Bases.Finite
+✔ [1184/1415] Replayed Mathlib.Order.Filter.AtTopBot.Finite
+✔ [1185/1415] Replayed Mathlib.Order.Filter.AtTopBot.Prod
+✔ [1186/1415] Replayed Mathlib.Data.ENat.Defs
+✔ [1187/1415] Replayed Mathlib.Data.Countable.Basic
+✔ [1188/1415] Replayed Mathlib.Logic.Equiv.List
+✔ [1189/1415] Replayed Mathlib.Data.Set.Countable
+✔ [1190/1415] Replayed Mathlib.Order.Filter.CountablyGenerated
+✔ [1191/1415] Replayed Mathlib.Order.Filter.AtTopBot.CountablyGenerated
+✔ [1192/1415] Replayed Mathlib.Data.Fin.VecNotation
+✔ [1193/1415] Replayed Mathlib.Order.Filter.Ker
+✔ [1194/1415] Replayed Mathlib.Order.Filter.Pi
+✔ [1195/1415] Replayed Mathlib.Order.Filter.Cofinite
+✔ [1196/1415] Replayed Mathlib.Order.Filter.Curry
+✔ [1197/1415] Replayed Mathlib.Topology.Constructions.SumProd
+✔ [1198/1415] Replayed Mathlib.Topology.NhdsSet
+✔ [1199/1415] Replayed Mathlib.Topology.Constructions
+✔ [1200/1415] Replayed Mathlib.Topology.ContinuousOn
+✔ [1201/1415] Replayed Mathlib.Topology.Bases
+✔ [1202/1415] Replayed Mathlib.Topology.Bornology.Basic
+✔ [1203/1415] Replayed Mathlib.Order.ZornAtoms
+✔ [1204/1415] Replayed Mathlib.Order.Filter.Ultrafilter.Defs
+✔ [1205/1415] Replayed Mathlib.Order.Filter.Ultrafilter.Basic
+✔ [1206/1415] Replayed Mathlib.Topology.Ultrafilter
+✔ [1207/1415] Replayed Mathlib.Topology.Defs.Ultrafilter
+✔ [1208/1415] Replayed Mathlib.Topology.Compactness.Compact
+✔ [1209/1415] Replayed Mathlib.Topology.Compactness.LocallyCompact
+✔ [1210/1415] Replayed Mathlib.Order.Filter.SmallSets
+✔ [1211/1415] Replayed Mathlib.Topology.LocallyFinite
+✔ [1212/1415] Replayed Mathlib.Topology.Compactness.LocallyFinite
+✔ [1213/1415] Replayed Mathlib.Topology.Compactness.SigmaCompact
+✔ [1214/1415] Replayed Mathlib.Topology.Irreducible
+✔ [1215/1415] Replayed Mathlib.Order.UpperLower.Basic
+✔ [1216/1415] Replayed Mathlib.Order.UpperLower.CompleteLattice
+✔ [1217/1415] Replayed Mathlib.Order.UpperLower.Principal
+✔ [1218/1415] Replayed Mathlib.Order.UpperLower.Closure
+✔ [1219/1415] Replayed Mathlib.Order.UpperLower.Fibration
+✔ [1220/1415] Replayed Mathlib.Topology.Maps.OpenQuotient
+✔ [1221/1415] Replayed Mathlib.Topology.Inseparable
+✔ [1222/1415] Replayed Mathlib.Topology.Piecewise
+✔ [1223/1415] Replayed Mathlib.Topology.Separation.SeparatedNhds
+✔ [1224/1415] Replayed Mathlib.Topology.Separation.Basic
+✔ [1225/1415] Replayed Mathlib.Topology.Separation.Hausdorff
+✔ [1226/1415] Replayed Mathlib.Topology.Algebra.Support
+✔ [1227/1415] Replayed Mathlib.Algebra.Order.Ring.WithTop
+✔ [1228/1415] Replayed Mathlib.Algebra.Order.Sub.WithTop
+✔ [1229/1415] Replayed Mathlib.Tactic.Finiteness
+✔ [1230/1415] Replayed Mathlib.Data.ENNReal.Basic
+✔ [1231/1415] Replayed Mathlib.Data.ENNReal.Real
+✔ [1232/1415] Replayed Mathlib.Order.SuccPred.Archimedean
+✔ [1233/1415] Replayed Mathlib.Order.SuccPred.Limit
+✔ [1234/1415] Replayed Mathlib.Order.SuccPred.WithBot
+✔ [1235/1415] Replayed Mathlib.Algebra.Order.SuccPred
+✔ [1236/1415] Replayed Mathlib.Algebra.Order.Interval.Finset.SuccPred
+✔ [1237/1415] Replayed Mathlib.Data.Nat.SuccPred
+✔ [1238/1415] Replayed Mathlib.Data.ENNReal.Operations
+✔ [1239/1415] Replayed Mathlib.Data.ENNReal.Inv
+✔ [1240/1415] Replayed Mathlib.Tactic.Monotonicity.Basic
+✔ [1241/1415] Replayed Mathlib.Topology.UniformSpace.Defs
+✔ [1242/1415] Replayed Mathlib.Topology.UniformSpace.Basic
+✔ [1243/1415] Replayed Mathlib.Topology.UniformSpace.OfFun
+✔ [1244/1415] Replayed Mathlib.Topology.EMetricSpace.Defs
+✔ [1245/1415] Replayed Mathlib.Topology.UniformSpace.Compact
+✔ [1246/1415] Replayed Mathlib.Topology.Algebra.Constructions
+✔ [1247/1415] Replayed Mathlib.Topology.UniformSpace.Cauchy
+✔ [1248/1415] Replayed Mathlib.Topology.UniformSpace.UniformConvergence
+✔ [1249/1415] Replayed Mathlib.Topology.UniformSpace.LocallyUniformConvergence
+✔ [1250/1415] Replayed Mathlib.Order.Filter.CountableInter
+✔ [1251/1415] Replayed Mathlib.Topology.Compactness.Lindelof
+✔ [1252/1415] Replayed Mathlib.Data.Set.Functor
+✔ [1253/1415] Replayed Mathlib.Data.Set.Subset
+✔ [1254/1415] Replayed Mathlib.Data.Set.BoolIndicator
+✔ [1255/1415] Replayed Mathlib.Topology.Clopen
+✔ [1256/1415] Replayed Mathlib.Order.SuccPred.Relation
+✔ [1257/1415] Replayed Mathlib.Topology.Connected.Basic
+✔ [1258/1415] Replayed Mathlib.Topology.Connected.Clopen
+✔ [1259/1415] Replayed Mathlib.Topology.Separation.Regular
+✔ [1260/1415] Replayed Mathlib.Topology.UniformSpace.Separation
+✔ [1261/1415] Replayed Mathlib.Topology.DenseEmbedding
+✔ [1262/1415] Replayed Mathlib.Topology.UniformSpace.UniformEmbedding
+✔ [1263/1415] Replayed Mathlib.Topology.EMetricSpace.Basic
+✔ [1264/1415] Replayed Mathlib.Topology.MetricSpace.Pseudo.Defs
+✔ [1265/1415] Replayed Mathlib.Topology.MetricSpace.Pseudo.Basic
+✔ [1266/1415] Replayed Mathlib.Topology.Bornology.Constructions
+✔ [1267/1415] Replayed Mathlib.Topology.MetricSpace.Pseudo.Constructions
+✔ [1268/1415] Replayed Mathlib.Algebra.Ring.Pointwise.Set
+✔ [1269/1415] Replayed Mathlib.Order.Filter.AtTopBot.CompleteLattice
+✔ [1270/1415] Replayed Mathlib.Order.Filter.AtTopBot.Map
+✔ [1271/1415] Replayed Mathlib.Order.Filter.AtTopBot.Monoid
+✔ [1272/1415] Replayed Mathlib.Order.Filter.AtTopBot.Group
+✔ [1273/1415] Replayed Mathlib.Order.Filter.Interval
+✔ [1274/1415] Replayed Mathlib.Order.Interval.Set.Pi
+✔ [1275/1415] Replayed Mathlib.Order.OrdContinuous
+✔ [1276/1415] Replayed Mathlib.Topology.Order.LeftRight
+✔ [1277/1415] Replayed Mathlib.Topology.Order.OrderClosed
+✔ [1278/1415] Replayed Mathlib.Topology.Order.Basic
+✔ [1279/1415] Replayed Mathlib.Topology.Order.LeftRightNhds
+✔ [1280/1415] Replayed Mathlib.Topology.Order.IsLUB
+✔ [1281/1415] Replayed Mathlib.Topology.Order.DenselyOrdered
+✔ [1282/1415] Replayed Mathlib.Topology.MetricSpace.Pseudo.Lemmas
+✔ [1283/1415] Replayed Mathlib.Data.ENNReal.Lemmas
+✔ [1284/1415] Replayed Mathlib.Topology.UniformSpace.Pi
+✔ [1285/1415] Replayed Mathlib.Topology.EMetricSpace.Pi
+✔ [1286/1415] Replayed Mathlib.Topology.MetricSpace.Pseudo.Pi
+✔ [1287/1415] Replayed Mathlib.Topology.MetricSpace.Defs
+✔ [1288/1415] Replayed Mathlib.Topology.MetricSpace.Basic
+✔ [1289/1415] Replayed Mathlib.Data.EReal.Basic
+✔ [1290/1415] Replayed Mathlib.Order.Interval.Set.OrdConnectedComponent
+✔ [1291/1415] Replayed Mathlib.Topology.Order.T5
+✔ [1292/1415] Replayed Mathlib.Topology.Order.Real
+✔ [1293/1415] Replayed Mathlib.Analysis.Normed.Group.Basic
+✔ [1294/1415] Replayed Mathlib.Analysis.Normed.Group.Constructions
+✔ [1295/1415] Replayed Mathlib.Analysis.Normed.Group.Subgroup
+✔ [1296/1415] Replayed Mathlib.Analysis.Normed.Group.Submodule
+✔ [1297/1415] Replayed Mathlib.Analysis.Normed.Ring.Basic
+✔ [1298/1415] Replayed Mathlib.Analysis.Normed.Field.Basic
+✔ [1299/1415] Replayed Mathlib.Analysis.Asymptotics.Defs
+✔ [1300/1415] Replayed Mathlib.Data.EReal.Operations
+✔ [1301/1415] Replayed Mathlib.Order.Filter.AtTopBot.Ring
+✔ [1302/1415] Replayed Mathlib.Order.Filter.AtTopBot.Field
+✔ [1303/1415] Replayed Mathlib.Order.Filter.NAry
+✔ [1304/1415] Replayed Mathlib.Order.Filter.Pointwise
+✔ [1305/1415] Replayed Mathlib.Algebra.AddTorsor.Defs
+✔ [1306/1415] Replayed Mathlib.Algebra.Group.Pointwise.Set.Lattice
+✔ [1307/1415] Replayed Mathlib.Topology.Algebra.ConstMulAction
+✔ [1308/1415] Replayed Mathlib.Topology.Algebra.MulAction
+✔ [1309/1415] Replayed Mathlib.Topology.Algebra.Monoid.Defs
+✔ [1310/1415] Replayed Mathlib.Topology.Algebra.Monoid
+✔ [1311/1415] Replayed Mathlib.Topology.Algebra.GroupWithZero
+✔ [1312/1415] Replayed Mathlib.Algebra.Group.Subgroup.MulOpposite
+✔ [1313/1415] Replayed Mathlib.Algebra.Group.Subgroup.MulOppositeLemmas
+✔ [1314/1415] Replayed Mathlib.Data.Prod.Lex
+✔ [1315/1415] Replayed Mathlib.Data.Sigma.Lex
+✔ [1316/1415] Replayed Mathlib.Order.WellQuasiOrder
+✔ [1317/1415] Replayed Mathlib.Order.WellFoundedSet
+✔ [1318/1415] Replayed Mathlib.Algebra.Group.Submonoid.Pointwise
+✔ [1319/1415] Replayed Mathlib.Algebra.Group.Subgroup.ZPowers.Basic
+✔ [1320/1415] Replayed Mathlib.GroupTheory.Subgroup.Center
+✔ [1321/1415] Replayed Mathlib.GroupTheory.Subgroup.Centralizer
+✔ [1322/1415] Replayed Mathlib.GroupTheory.GroupAction.ConjAct
+✔ [1323/1415] Replayed Mathlib.Algebra.Group.Subgroup.Pointwise
+✔ [1324/1415] Replayed Mathlib.Topology.Algebra.Group.Defs
+✔ [1325/1415] Replayed Mathlib.Logic.Equiv.Fin.Basic
+✔ [1326/1415] Replayed Mathlib.Topology.Connected.LocallyConnected
+✔ [1327/1415] Replayed Mathlib.Topology.Connected.TotallyDisconnected
+✔ [1328/1415] Replayed Mathlib.Topology.Homeomorph.Lemmas
+✔ [1329/1415] Replayed Mathlib.Topology.Algebra.Group.Basic
+✔ [1330/1415] Replayed Mathlib.Topology.Algebra.Group.GroupTopology
+✔ [1331/1415] Replayed Mathlib.Topology.Algebra.Ring.Basic
+✔ [1332/1415] Replayed Mathlib.Order.Filter.Extr
+✔ [1333/1415] Replayed Mathlib.Topology.Order.LocalExtr
+✔ [1334/1415] Replayed Mathlib.Topology.Algebra.Field
+✔ [1335/1415] Replayed Mathlib.Topology.Algebra.Order.Group
+✔ [1336/1415] Replayed Mathlib.Topology.Algebra.Order.Field
+✔ [1337/1415] Replayed Mathlib.Topology.Algebra.IsUniformGroup.Defs
+✔ [1338/1415] Replayed Mathlib.Topology.Order.Monotone
+✔ [1339/1415] Replayed Mathlib.Topology.Order.IntermediateValue
+✔ [1340/1415] Replayed Mathlib.Topology.Order.Compact
+✔ [1341/1415] Replayed Mathlib.Topology.MetricSpace.ProperSpace
+✔ [1342/1415] Replayed Mathlib.Topology.MetricSpace.Cauchy
+✔ [1343/1415] Replayed Mathlib.Topology.EMetricSpace.Diam
+✔ [1344/1415] Replayed Mathlib.Topology.MetricSpace.Bounded
+✔ [1345/1415] Replayed Mathlib.Topology.Order.Bornology
+✔ [1346/1415] Replayed Mathlib.Topology.Bornology.Real
+✔ [1347/1415] Replayed Mathlib.Data.Int.Interval
+✔ [1348/1415] Replayed Mathlib.Data.Int.ConditionallyCompleteOrder
+✔ [1349/1415] Replayed Mathlib.Data.Fintype.Pigeonhole
+✔ [1350/1415] Replayed Mathlib.Order.SuccPred.LinearLocallyFinite
+✔ [1351/1415] Replayed Mathlib.Topology.Instances.Discrete
+✔ [1352/1415] Replayed Mathlib.Order.Filter.AtTopBot.Archimedean
+✔ [1353/1415] Replayed Mathlib.Topology.Instances.Int
+✔ [1354/1415] Replayed Mathlib.Topology.Order.MonotoneContinuity
+✔ [1355/1415] Replayed Mathlib.Topology.ContinuousMap.Basic
+✔ [1356/1415] Replayed Mathlib.Topology.UniformSpace.Real
+✔ [1357/1415] Replayed Mathlib.Topology.Algebra.Ring.Real
+✔ [1358/1415] Replayed Mathlib.Topology.Metrizable.Basic
+✔ [1359/1415] Replayed Mathlib.Topology.Metrizable.Uniformity
+✔ [1360/1415] Replayed Mathlib.Topology.Defs.Sequences
+✔ [1361/1415] Replayed Mathlib.Topology.Sequences
+✔ [1362/1415] Replayed Mathlib.Analysis.Normed.Group.Continuity
+✔ [1363/1415] Replayed Mathlib.Analysis.Normed.Group.Bounded
+✔ [1364/1415] Replayed Mathlib.Algebra.Order.Interval.Finset.Basic
+✔ [1365/1415] Replayed Mathlib.Algebra.BigOperators.Intervals
+✔ [1366/1415] Replayed Mathlib.Topology.UniformSpace.CompleteSeparated
+✔ [1367/1415] Replayed Mathlib.Topology.Coherent
+✔ [1368/1415] Replayed Mathlib.Topology.UniformSpace.Equiv
+✔ [1369/1415] Replayed Mathlib.Topology.UniformSpace.UniformApproximation
+✔ [1370/1415] Replayed Mathlib.Topology.UniformSpace.UniformConvergenceTopology
+✔ [1371/1415] Replayed Mathlib.Topology.UniformSpace.Equicontinuity
+✔ [1372/1415] Replayed Mathlib.Topology.UniformSpace.HeineCantor
+✔ [1373/1415] Replayed Mathlib.Algebra.Group.Subgroup.Actions
+✔ [1374/1415] Replayed Mathlib.Algebra.Group.Subgroup.ZPowers.Lemmas
+✔ [1375/1415] Replayed Mathlib.Data.List.Lemmas
+✔ [1376/1415] Replayed Mathlib.Data.List.Permutation
+✔ [1377/1415] Replayed Mathlib.Data.Fintype.List
+✔ [1378/1415] Replayed Mathlib.Data.List.Cycle
+✔ [1379/1415] Replayed Mathlib.Dynamics.PeriodicPts.Defs
+✔ [1380/1415] Replayed Mathlib.Algebra.Group.Commutator
+✔ [1381/1415] Replayed Mathlib.GroupTheory.Commutator.Basic
+✔ [1382/1415] Replayed Mathlib.Algebra.Quotient
+✔ [1383/1415] Replayed Mathlib.GroupTheory.Coset.Defs
+✔ [1384/1415] Replayed Mathlib.GroupTheory.Coset.Basic
+✔ [1385/1415] Replayed Mathlib.GroupTheory.GroupAction.Basic
+✔ [1386/1415] Replayed Mathlib.GroupTheory.GroupAction.Quotient
+✔ [1387/1415] Replayed Mathlib.GroupTheory.QuotientGroup.Defs
+✔ [1388/1415] Replayed Mathlib.Topology.Algebra.Group.Pointwise
+✔ [1389/1415] Replayed Mathlib.Topology.Algebra.Group.Quotient
+✔ [1390/1415] Replayed Mathlib.Tactic.TautoSet
+✔ [1391/1415] Replayed Mathlib.Topology.DiscreteSubset
+✔ [1392/1415] Replayed Mathlib.Topology.Algebra.IsUniformGroup.Basic
+✔ [1393/1415] Replayed Mathlib.Data.Finsupp.Defs
+✔ [1394/1415] Replayed Mathlib.Algebra.Group.Finsupp
+✔ [1395/1415] Replayed Mathlib.Data.Finsupp.Single
+✔ [1396/1415] Replayed Mathlib.Data.Finsupp.Ext
+✔ [1397/1415] Replayed Mathlib.Data.Finsupp.Indicator
+✔ [1398/1415] Replayed Mathlib.Algebra.BigOperators.Finsupp.Basic
+✔ [1399/1415] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Preimage
+✔ [1400/1415] Replayed Mathlib.Data.Rat.BigOperators
+✔ [1401/1415] Replayed Mathlib.Data.Finsupp.Basic
+✔ [1402/1415] Replayed Mathlib.Data.Finsupp.SMulWithZero
+✔ [1403/1415] Replayed Mathlib.Data.Finsupp.SMul
+✔ [1404/1415] Replayed Mathlib.LinearAlgebra.Finsupp.Defs
+✔ [1405/1415] Replayed Mathlib.LinearAlgebra.Finsupp.LSum
+✔ [1406/1415] Replayed Mathlib.LinearAlgebra.Finsupp.Supported
+✔ [1407/1415] Replayed Mathlib.LinearAlgebra.Finsupp.LinearCombination
+✔ [1408/1415] Replayed Mathlib.Algebra.Group.Fin.Tuple
+✔ [1409/1415] Replayed Mathlib.Algebra.Algebra.Prod
+✔ [1410/1415] Replayed Mathlib.Algebra.Group.Graph
+✔ [1411/1415] Replayed Mathlib.LinearAlgebra.Prod
+✔ [1412/1415] Replayed Mathlib.LinearAlgebra.Pi
+✔ [1413/1415] Replayed Mathlib.LinearAlgebra.Quotient.Defs
+✔ [1414/1415] Replayed Mathlib.Topology.Algebra.Module.Basic
+✔ [1415/1862] Replayed Mathlib.Topology.Algebra.ContinuousMonoidHom
+✔ [1416/1862] Replayed Mathlib.GroupTheory.QuotientGroup.Basic
+✔ [1417/1862] Replayed Mathlib.Algebra.Group.Fin.Basic
+✔ [1418/1862] Replayed Mathlib.Algebra.Ring.GrindInstances
+✔ [1419/1862] Replayed Mathlib.Data.Int.GCD
+✔ [1420/1862] Replayed Mathlib.Data.Nat.GCD.Basic
+✔ [1421/1862] Replayed Mathlib.Data.Nat.ModEq
+✔ [1422/1862] Replayed Mathlib.Data.ZMod.Defs
+✔ [1423/1862] Replayed Mathlib.Algebra.Order.Hom.Monoid
+✔ [1424/1862] Replayed Mathlib.Algebra.Order.Hom.Ring
+✔ [1425/1862] Replayed Mathlib.Data.ENat.Basic
+✔ [1426/1862] Replayed Mathlib.Logic.Small.Defs
+✔ [1427/1862] Replayed Mathlib.Logic.Small.Basic
+✔ [1428/1862] Replayed Mathlib.Data.Countable.Small
+✔ [1429/1862] Replayed Mathlib.Logic.Small.Set
+✔ [1430/1862] Replayed Mathlib.Logic.UnivLE
+✔ [1431/1862] Replayed Mathlib.Data.Sum.Order
+✔ [1432/1862] Replayed Mathlib.Order.InitialSeg
+✔ [1433/1862] Replayed Mathlib.Order.SuccPred.CompleteLinearOrder
+✔ [1434/1862] Replayed Mathlib.SetTheory.Cardinal.Defs
+✔ [1435/1862] Replayed Mathlib.Order.Hom.Order
+✔ [1436/1862] Replayed Mathlib.Order.FixedPoints
+✔ [1437/1862] Replayed Mathlib.SetTheory.Cardinal.SchroederBernstein
+✔ [1438/1862] Replayed Mathlib.SetTheory.Cardinal.Order
+✔ [1439/1862] Replayed Mathlib.SetTheory.Cardinal.Basic
+✔ [1440/1862] Replayed Mathlib.SetTheory.Cardinal.ENat
+✔ [1441/1862] Replayed Mathlib.SetTheory.Cardinal.ToNat
+✔ [1442/1862] Replayed Mathlib.SetTheory.Cardinal.Finite
+✔ [1443/1862] Replayed Mathlib.LinearAlgebra.Quotient.Basic
+✔ [1444/1862] Replayed Mathlib.LinearAlgebra.Projection
+✔ [1445/1862] Replayed Mathlib.Topology.Algebra.Module.LinearMap
+✔ [1446/1862] Replayed Mathlib.Topology.Algebra.SeparationQuotient.Basic
+✔ [1447/1862] Replayed Mathlib.Topology.UniformSpace.AbstractCompletion
+✔ [1448/1862] Replayed Mathlib.Topology.UniformSpace.Completion
+✔ [1449/1862] Replayed Mathlib.Topology.Algebra.UniformMulAction
+✔ [1450/1862] Replayed Mathlib.Order.Interval.Set.ProjIcc
+✔ [1451/1862] Replayed Mathlib.Topology.Bornology.Hom
+✔ [1452/1862] Replayed Mathlib.Topology.EMetricSpace.Lipschitz
+✔ [1453/1862] Replayed Mathlib.Order.Interval.Set.Monotone
+✔ [1454/1862] Replayed Mathlib.Topology.Filter
+✔ [1455/1862] Replayed Mathlib.Topology.Maps.Proper.Basic
+✔ [1456/1862] Replayed Mathlib.Topology.MetricSpace.Lipschitz
+✔ [1457/1862] Replayed Mathlib.Topology.MetricSpace.Algebra
+✔ [1458/1862] Replayed Mathlib.Data.Fintype.Lattice
+✔ [1459/1862] Replayed Mathlib.Topology.MetricSpace.Antilipschitz
+✔ [1460/1862] Replayed Mathlib.Topology.MetricSpace.Isometry
+✔ [1461/1862] Replayed Mathlib.Topology.MetricSpace.IsometricSMul
+✔ [1462/1862] Replayed Mathlib.Analysis.Normed.Group.Uniform
+✔ [1463/1862] Replayed Mathlib.Logic.Encodable.Lattice
+✔ [1464/1862] Replayed Mathlib.Order.Filter.AtTopBot.Finset
+✔ [1465/1862] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Indicator
+✔ [1466/1862] Replayed Mathlib.Order.Filter.AtTopBot.BigOperators
+✔ [1467/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Defs
+✔ [1468/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Basic
+✔ [1469/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Group
+✔ [1470/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.NatInt
+✔ [1471/1862] Replayed Mathlib.Topology.Order.MonotoneConvergence
+✔ [1472/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Order
+✔ [1473/1862] Replayed Mathlib.Algebra.Order.Antidiag.Prod
+✔ [1474/1862] Replayed Mathlib.Data.List.NatAntidiagonal
+✔ [1475/1862] Replayed Mathlib.Data.Multiset.NatAntidiagonal
+✔ [1476/1862] Replayed Mathlib.Data.Finset.NatAntidiagonal
+✔ [1477/1862] Replayed Mathlib.Algebra.BigOperators.NatAntidiagonal
+✔ [1478/1862] Replayed Mathlib.Algebra.Ring.Aut
+✔ [1479/1862] Replayed Mathlib.Algebra.Star.Basic
+✔ [1480/1862] Replayed Mathlib.Algebra.Star.Pi
+✔ [1481/1862] Replayed Mathlib.Algebra.Star.Prod
+✔ [1482/1862] Replayed Mathlib.Topology.Algebra.Star
+✔ [1483/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Constructions
+✔ [1484/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Ring
+✔ [1485/1862] Replayed Mathlib.Topology.Instances.NNReal.Lemmas
+✔ [1486/1862] Replayed Mathlib.Analysis.Normed.Group.InfiniteSum
+✔ [1487/1862] Replayed Mathlib.Data.ENNReal.Action
+✔ [1488/1862] Replayed Mathlib.Analysis.Normed.MulAction
+✔ [1489/1862] Replayed Mathlib.Algebra.Order.Group.DenselyOrdered
+✔ [1490/1862] Replayed Mathlib.Order.Filter.IsBounded
+✔ [1491/1862] Replayed Mathlib.Order.LiminfLimsup
+✔ [1492/1862] Replayed Mathlib.Topology.Algebra.Order.LiminfLimsup
+✔ [1493/1862] Replayed Mathlib.Logic.Equiv.PartialEquiv
+✔ [1494/1862] Replayed Mathlib.Topology.Compactness.Bases
+✔ [1495/1862] Replayed Mathlib.Order.Copy
+✔ [1496/1862] Replayed Mathlib.Topology.Sets.Opens
+✔ [1497/1862] Replayed Mathlib.Topology.PartialHomeomorph
+✔ [1498/1862] Replayed Mathlib.Analysis.Asymptotics.Lemmas
+✔ [1499/1862] Replayed Mathlib.Algebra.Notation.Lemmas
+✔ [1500/1862] Replayed Mathlib.Algebra.Order.Pi
+✔ [1501/1862] Replayed Mathlib.Algebra.Order.Ring.Synonym
+✔ [1502/1862] Replayed Mathlib.Algebra.Order.Module.Synonym
+✔ [1503/1862] Replayed Mathlib.Algebra.Ring.Action.Pointwise.Set
+✔ [1504/1862] Replayed Mathlib.Algebra.Module.LinearMap.Prod
+✔ [1505/1862] Replayed Mathlib.LinearAlgebra.BilinearMap
+✔ [1506/1862] Replayed Mathlib.Algebra.AddTorsor.Basic
+✔ [1507/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Defs
+✔ [1508/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.AffineMap
+✔ [1509/1862] Replayed Mathlib.LinearAlgebra.GeneralLinearGroup
+✔ [1510/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.AffineEquiv
+✔ [1511/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Midpoint
+✔ [1512/1862] Replayed Mathlib.Data.Finset.Fin
+✔ [1513/1862] Replayed Mathlib.Order.Interval.Set.Fin
+✔ [1514/1862] Replayed Mathlib.Order.Interval.Finset.Fin
+✔ [1515/1862] Replayed Mathlib.Data.Fintype.Fin
+✔ [1516/1862] Replayed Mathlib.Algebra.BigOperators.Fin
+✔ [1517/1862] Replayed Mathlib.Data.Fin.Tuple.Reflection
+✔ [1518/1862] Replayed Mathlib.LinearAlgebra.Finsupp.SumProd
+✔ [1519/1862] Replayed Mathlib.LinearAlgebra.LinearIndependent.Defs
+✔ [1520/1862] Replayed Mathlib.LinearAlgebra.LinearIndependent.Basic
+✔ [1521/1862] Replayed Mathlib.Logic.Equiv.Fin.Rotate
+✔ [1522/1862] Replayed Mathlib.Tactic.FinCases
+✔ [1523/1862] Replayed Mathlib.Tactic.LinearCombination.Lemmas
+✔ [1524/1862] Replayed Mathlib.Tactic.Ring.Compare
+✔ [1525/1862] Replayed Mathlib.Tactic.LinearCombination
+✔ [1526/1862] Replayed Mathlib.Algebra.Algebra.Tower
+✔ [1527/1862] Replayed Mathlib.Tactic.Module
+✔ [1528/1862] Replayed Mathlib.Tactic.NoncommRing
+✔ [1529/1862] Replayed Mathlib.LinearAlgebra.LinearIndependent.Lemmas
+✔ [1530/1862] Replayed Mathlib.Algebra.Order.Module.Algebra
+✔ [1531/1862] Replayed Mathlib.Algebra.Order.GroupWithZero.Submonoid
+✔ [1532/1862] Replayed Mathlib.Algebra.Ring.Subring.Units
+✔ [1533/1862] Replayed Mathlib.LinearAlgebra.Ray
+✔ [1534/1862] Replayed Mathlib.Analysis.Convex.Segment
+✔ [1535/1862] Replayed Mathlib.Analysis.Convex.Star
+✔ [1536/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.AffineSubspace.Defs
+✔ [1537/1862] Replayed Mathlib.Analysis.Convex.Basic
+✔ [1538/1862] Replayed Mathlib.Analysis.Convex.Function
+✔ [1539/1862] Replayed Mathlib.Analysis.Convex.Hull
+✔ [1540/1862] Replayed Mathlib.Algebra.Algebra.Opposite
+✔ [1541/1862] Replayed Mathlib.Algebra.Algebra.Pi
+✔ [1542/1862] Replayed Mathlib.Algebra.Algebra.RestrictScalars
+✔ [1543/1862] Replayed Mathlib.Algebra.Module.Rat
+✔ [1544/1862] Replayed Mathlib.Analysis.Normed.Group.Int
+✔ [1545/1862] Replayed Mathlib.Algebra.Group.Subgroup.Order
+✔ [1546/1862] Replayed Mathlib.GroupTheory.Archimedean
+✔ [1547/1862] Replayed Mathlib.Topology.Algebra.Order.Archimedean
+✔ [1548/1862] Replayed Mathlib.Topology.Instances.Nat
+✔ [1549/1862] Replayed Mathlib.Topology.Instances.Rat
+✔ [1550/1862] Replayed Mathlib.Analysis.Normed.Group.Rat
+✔ [1551/1862] Replayed Mathlib.Algebra.Ring.Regular
+✔ [1552/1862] Replayed Mathlib.Algebra.Equiv.TransferInstance
+✔ [1553/1862] Replayed Mathlib.Algebra.Group.AddChar
+✔ [1554/1862] Replayed Mathlib.Algebra.Group.TypeTags.Finite
+✔ [1555/1862] Replayed Mathlib.Algebra.Order.GroupWithZero.Finset
+✔ [1556/1862] Replayed Mathlib.Algebra.Group.Irreducible.Defs
+✔ [1557/1862] Replayed Mathlib.Algebra.Prime.Defs
+✔ [1558/1862] Replayed Mathlib.Data.Nat.Prime.Defs
+✔ [1559/1862] Replayed Mathlib.Algebra.CharP.Defs
+✔ [1560/1862] Replayed Mathlib.Data.Finite.Card
+✔ [1561/1862] Replayed Mathlib.Algebra.Group.Subgroup.Finite
+✔ [1562/1862] Replayed Mathlib.Algebra.Order.Group.Action
+✔ [1563/1862] Replayed Mathlib.Data.Int.ModEq
+✔ [1564/1862] Replayed Mathlib.Algebra.Group.Irreducible.Lemmas
+✔ [1565/1862] Replayed Mathlib.Algebra.Prime.Lemmas
+✔ [1566/1862] Replayed Mathlib.Algebra.GroupWithZero.Associated
+✔ [1567/1862] Replayed Mathlib.Data.Nat.Prime.Basic
+✔ [1568/1862] Replayed Mathlib.Dynamics.PeriodicPts.Lemmas
+✔ [1569/1862] Replayed Mathlib.Algebra.GroupWithZero.Submonoid.Pointwise
+✔ [1570/1862] Replayed Mathlib.Algebra.GroupWithZero.Subgroup
+✔ [1571/1862] Replayed Mathlib.Data.Set.Card
+✔ [1572/1862] Replayed Mathlib.GroupTheory.Coset.Card
+✔ [1573/1862] Replayed Mathlib.GroupTheory.Index
+✔ [1574/1862] Replayed Mathlib.Algebra.IsPrimePow
+✔ [1575/1862] Replayed Mathlib.Data.List.Prime
+✔ [1576/1862] Replayed Mathlib.Data.Nat.Factors
+✔ [1577/1862] Replayed Mathlib.Data.Nat.Prime.Infinite
+✔ [1578/1862] Replayed Mathlib.Data.Nat.PrimeFin
+✔ [1579/1862] Replayed Mathlib.NumberTheory.Divisors
+✔ [1580/1862] Replayed Mathlib.Order.Interval.Set.Infinite
+✔ [1581/1862] Replayed Mathlib.GroupTheory.OrderOfElement
+✔ [1582/1862] Replayed Mathlib.Topology.MetricSpace.Dilation
+✔ [1583/1862] Replayed Mathlib.Analysis.Normed.Ring.Lemmas
+✔ [1584/1862] Replayed Mathlib.Topology.MetricSpace.DilationEquiv
+✔ [1585/1862] Replayed Mathlib.Analysis.Normed.Field.Lemmas
+✔ [1586/1862] Replayed Mathlib.Analysis.Normed.Module.Basic
+✔ [1587/1862] Replayed Mathlib.Topology.Bornology.Absorbs
+✔ [1588/1862] Replayed Mathlib.Analysis.LocallyConvex.Basic
+✔ [1589/1862] Replayed Mathlib.Analysis.Seminorm
+✔ [1590/1862] Replayed Mathlib.GroupTheory.GroupAction.Pointwise
+✔ [1591/1862] Replayed Mathlib.Analysis.Convex.EGauge
+✔ [1592/1862] Replayed Mathlib.Analysis.LocallyConvex.BalancedCoreHull
+✔ [1593/1862] Replayed Mathlib.Tactic.Peel
+✔ [1594/1862] Replayed Mathlib.Algebra.BigOperators.WithTop
+✔ [1595/1862] Replayed Mathlib.Data.ENNReal.BigOperators
+✔ [1596/1862] Replayed Mathlib.Topology.MetricSpace.Pseudo.Real
+✔ [1597/1862] Replayed Mathlib.Data.Rat.Encodable
+✔ [1598/1862] Replayed Mathlib.Topology.MetricSpace.ProperSpace.Real
+✔ [1599/1862] Replayed Mathlib.Topology.Instances.ENNReal.Lemmas
+✔ [1600/1862] Replayed Mathlib.Topology.Algebra.Module.LinearMapPiProd
+✔ [1601/1862] Replayed Mathlib.Analysis.Asymptotics.TVS
+✔ [1602/1862] Replayed Mathlib.Analysis.Calculus.FDeriv.Defs
+✔ [1603/1862] Replayed Mathlib.Data.Multiset.Sort
+✔ [1604/1862] Replayed Mathlib.Data.Finset.Sort
+✔ [1605/1862] Replayed Mathlib.Tactic.ProxyType
+✔ [1606/1862] Replayed Mathlib.Tactic.DeriveFintype
+✔ [1607/1862] Replayed Mathlib.Data.Sign
+✔ [1608/1862] Replayed Mathlib.Algebra.Module.BigOperators
+✔ [1609/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.AffineSubspace.Basic
+✔ [1610/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Combination
+✔ [1611/1862] Replayed Mathlib.Data.Finsupp.Fintype
+✔ [1612/1862] Replayed Mathlib.LinearAlgebra.Basis.Defs
+✔ [1613/1862] Replayed Mathlib.LinearAlgebra.Basis.Basic
+✔ [1614/1862] Replayed Mathlib.LinearAlgebra.FreeModule.Basic
+✔ [1615/1862] Replayed Mathlib.LinearAlgebra.LinearPMap
+✔ [1616/1862] Replayed Mathlib.LinearAlgebra.Basis.VectorSpace
+✔ [1617/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Independent
+✔ [1618/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Pointwise
+✔ [1619/1862] Replayed Mathlib.LinearAlgebra.Basis.SMul
+✔ [1620/1862] Replayed Mathlib.LinearAlgebra.AffineSpace.Basis
+✔ [1621/1862] Replayed Mathlib.Analysis.Convex.Combination
+✔ [1622/1862] Replayed Mathlib.Analysis.Convex.Strict
+✔ [1623/1862] Replayed Mathlib.Topology.Algebra.Affine
+✔ [1624/1862] Replayed Mathlib.Algebra.Order.Interval.Set.Instances
+✔ [1625/1862] Replayed Mathlib.Topology.UnitInterval
+✔ [1626/1862] Replayed Mathlib.Analysis.Convex.Topology
+✔ [1627/1862] Replayed Mathlib.Algebra.Group.NatPowAssoc
+✔ [1628/1862] Replayed Mathlib.Algebra.GeomSum
+✔ [1629/1862] Replayed Mathlib.Algebra.Module.Submodule.Bilinear
+✔ [1630/1862] Replayed Mathlib.Tactic.SuppressCompilation
+✔ [1631/1862] Replayed Mathlib.LinearAlgebra.TensorProduct.Basic
+✔ [1632/1862] Replayed Mathlib.Algebra.Algebra.Bilinear
+✔ [1633/1862] Replayed Mathlib.Algebra.Group.Pointwise.Set.BigOperators
+✔ [1634/1862] Replayed Mathlib.Algebra.Module.Submodule.Pointwise
+✔ [1635/1862] Replayed Mathlib.Algebra.GroupWithZero.NonZeroDivisors
+✔ [1636/1862] Replayed Mathlib.Algebra.Ring.NonZeroDivisors
+✔ [1637/1862] Replayed Mathlib.Algebra.Ring.Submonoid.Pointwise
+✔ [1638/1862] Replayed Mathlib.Algebra.Order.Kleene
+✔ [1639/1862] Replayed Mathlib.Data.Set.Semiring
+✔ [1640/1862] Replayed Mathlib.GroupTheory.GroupAction.SubMulAction.Pointwise
+✔ [1641/1862] Replayed Mathlib.Algebra.Algebra.Operations
+✔ [1642/1862] Replayed Mathlib.Algebra.Algebra.Subalgebra.Lattice
+✔ [1643/1862] Replayed Mathlib.Topology.Algebra.Algebra
+✔ [1644/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Real
+✔ [1645/1862] Replayed Mathlib.Data.EReal.Inv
+✔ [1646/1862] Replayed Mathlib.Topology.Semicontinuous
+✔ [1647/1862] Replayed Mathlib.Topology.Instances.EReal.Lemmas
+✔ [1648/1862] Replayed Mathlib.Analysis.SpecificLimits.Basic
+✔ [1649/1862] Replayed Mathlib.Analysis.Calculus.TangentCone
+✔ [1650/1862] Replayed Mathlib.Analysis.LocallyConvex.Bounded
+✔ [1651/1862] Replayed Mathlib.Data.Real.Sqrt
+✔ [1652/1862] Replayed Mathlib.Topology.Algebra.UniformConvergence
+✔ [1653/1862] Replayed Mathlib.Topology.Algebra.Equicontinuity
+✔ [1654/1862] Replayed Mathlib.Topology.MetricSpace.Equicontinuity
+✔ [1655/1862] Replayed Mathlib.Topology.Algebra.FilterBasis
+✔ [1656/1862] Replayed Mathlib.Topology.Order.ProjIcc
+✔ [1657/1862] Replayed Mathlib.Topology.Hom.ContinuousEvalConst
+✔ [1658/1862] Replayed Mathlib.Topology.Hom.ContinuousEval
+✔ [1659/1862] Replayed Mathlib.Topology.CompactOpen
+✔ [1660/1862] Replayed Mathlib.Topology.Path
+✔ [1661/1862] Replayed Mathlib.Topology.Connected.PathConnected
+✔ [1662/1862] Replayed Mathlib.Topology.Connected.LocPathConnected
+✔ [1663/1862] Replayed Mathlib.Analysis.Convex.PathConnected
+✔ [1664/1862] Replayed Mathlib.Topology.Algebra.Module.LocallyConvex
+✔ [1665/1862] Replayed Mathlib.Analysis.LocallyConvex.WithSeminorms
+✔ [1666/1862] Replayed Mathlib.Topology.Algebra.Module.Equiv
+✔ [1667/1862] Replayed Mathlib.Topology.Algebra.Module.UniformConvergence
+✔ [1668/1862] Replayed Mathlib.Data.DFinsupp.Defs
+✔ [1669/1862] Replayed Mathlib.Data.DFinsupp.Module
+✔ [1670/1862] Replayed Mathlib.Data.List.Pi
+✔ [1671/1862] Replayed Mathlib.Data.Fintype.Quotient
+✔ [1672/1862] Replayed Mathlib.Data.DFinsupp.Sigma
+✔ [1673/1862] Replayed Mathlib.Data.DFinsupp.Ext
+✔ [1674/1862] Replayed Mathlib.Data.DFinsupp.BigOperators
+✔ [1675/1862] Replayed Mathlib.Data.DFinsupp.Submonoid
+✔ [1676/1862] Replayed Mathlib.Algebra.DirectSum.Basic
+✔ [1677/1862] Replayed Mathlib.Data.Finsupp.ToDFinsupp
+✔ [1678/1862] Replayed Mathlib.LinearAlgebra.DFinsupp
+✔ [1679/1862] Replayed Mathlib.Algebra.DirectSum.Module
+✔ [1680/1862] Replayed Mathlib.Algebra.DirectSum.Finsupp
+✔ [1681/1862] Replayed Mathlib.LinearAlgebra.TensorProduct.Associator
+✔ [1682/1862] Replayed Mathlib.LinearAlgebra.TensorProduct.Tower
+✔ [1683/1862] Replayed Mathlib.LinearAlgebra.DirectSum.TensorProduct
+✔ [1684/1862] Replayed Mathlib.LinearAlgebra.DirectSum.Finsupp
+✔ [1685/1862] Replayed Mathlib.LinearAlgebra.Finsupp.VectorSpace
+✔ [1686/1862] Replayed Mathlib.LinearAlgebra.TensorProduct.Basis
+✔ [1687/1862] Replayed Mathlib.Algebra.Module.Projective
+✔ [1688/1862] Replayed Mathlib.Topology.Algebra.SeparationQuotient.Section
+✔ [1689/1862] Replayed Mathlib.Topology.Algebra.Module.StrongTopology
+✔ [1690/1862] Replayed Mathlib.Analysis.Normed.Operator.LinearIsometry
+✔ [1691/1862] Replayed Mathlib.Analysis.Normed.Operator.ContinuousLinearMap
+✔ [1692/1862] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.Basic
+✔ [1693/1862] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.Asymptotics
+✔ [1694/1862] Replayed Mathlib.Analysis.Calculus.FDeriv.Basic
+✔ [1695/1862] Replayed Mathlib.Analysis.Calculus.FDeriv.Congr
+✔ [1696/1862] Replayed Mathlib.Analysis.Calculus.FDeriv.Const
+✔ [1697/1862] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.Bilinear
+✔ [1698/1862] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.NNNorm
+✔ [1699/1862] Replayed Mathlib.Analysis.Normed.Module.Span
+✔ [1700/1862] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.NormedSpace
+✔ [1701/1862] Replayed Mathlib.Analysis.Calculus.Deriv.Basic
+✔ [1702/1862] Replayed Mathlib.Algebra.BigOperators.Field
+✔ [1703/1862] Replayed Mathlib.Algebra.Algebra.Field
+✔ [1704/1862] Replayed Mathlib.Algebra.BigOperators.Balance
+✔ [1705/1862] Replayed Mathlib.Data.NNRat.Lemmas
+✔ [1706/1862] Replayed Mathlib.Algebra.Order.Module.Rat
+✔ [1707/1862] Replayed Mathlib.Algebra.Order.BigOperators.Expect
+✔ [1708/1862] Replayed Mathlib.Algebra.Order.Group.Opposite
+✔ [1709/1862] Replayed Mathlib.Algebra.Field.Opposite
+✔ [1710/1862] Replayed Mathlib.Algebra.Star.Rat
+✔ [1711/1862] Replayed Mathlib.Algebra.Star.SelfAdjoint
+✔ [1712/1862] Replayed Mathlib.Algebra.Star.StarRingHom
+✔ [1713/1862] Replayed Mathlib.Tactic.ContinuousFunctionalCalculus
+✔ [1714/1862] Replayed Mathlib.Algebra.Order.Star.Basic
+✔ [1715/1862] Replayed Mathlib.Analysis.Normed.Group.Hom
+✔ [1716/1862] Replayed Mathlib.Algebra.Module.LinearMap.Star
+✔ [1717/1862] Replayed Mathlib.Algebra.Star.Module
+✔ [1718/1862] Replayed Mathlib.Algebra.Star.StarAlgHom
+✔ [1719/1862] Replayed Mathlib.Algebra.Star.Pointwise
+✔ [1720/1862] Replayed Mathlib.Algebra.Star.Center
+✔ [1721/1862] Replayed Mathlib.Algebra.Star.NonUnitalSubalgebra
+✔ [1722/1862] Replayed Mathlib.Algebra.Star.Subalgebra
+✔ [1723/1862] Replayed Mathlib.RingTheory.Coprime.Basic
+✔ [1724/1862] Replayed Mathlib.RingTheory.Coprime.Lemmas
+✔ [1725/1862] Replayed Mathlib.Algebra.Field.IsField
+✔ [1726/1862] Replayed Mathlib.Data.Nat.Choose.Sum
+✔ [1727/1862] Replayed Mathlib.RingTheory.Ideal.Defs
+✔ [1728/1862] Replayed Mathlib.RingTheory.Ideal.Lattice
+✔ [1729/1862] Replayed Mathlib.RingTheory.Ideal.Prime
+✔ [1730/1862] Replayed Mathlib.Algebra.GroupWithZero.Idempotent
+✔ [1731/1862] Replayed Mathlib.Algebra.Ring.Idempotent
+✔ [1732/1862] Replayed Mathlib.RingTheory.Ideal.Span
+✔ [1733/1862] Replayed Mathlib.RingTheory.Ideal.Maximal
+✔ [1734/1862] Replayed Mathlib.RingTheory.Ideal.Basic
+✔ [1735/1862] Replayed Mathlib.RingTheory.Nilpotent.Defs
+✔ [1736/1862] Replayed Mathlib.RingTheory.Ideal.Operations
+✔ [1737/1862] Replayed Mathlib.RingTheory.Ideal.Maps
+✔ [1738/1862] Replayed Mathlib.RingTheory.Ideal.Nonunits
+✔ [1739/1862] Replayed Mathlib.Algebra.Algebra.Spectrum.Basic
+✔ [1740/1862] Replayed Mathlib.Algebra.Star.Unitary
+✔ [1741/1862] Replayed Mathlib.Data.Real.Star
+✔ [1742/1862] Replayed Mathlib.Topology.Algebra.Module.Star
+✔ [1743/1862] Replayed Mathlib.Analysis.CStarAlgebra.Basic
+✔ [1744/1862] Replayed Mathlib.Analysis.RCLike.Basic
+✔ [1745/1862] Replayed Mathlib.Data.Complex.Basic
+✔ [1746/1862] Replayed Mathlib.Data.Complex.BigOperators
+✔ [1747/1862] Replayed Mathlib.Algebra.CharP.Invertible
+✔ [1748/1862] Replayed Mathlib.Algebra.Algebra.Subalgebra.Tower
+✔ [1749/1862] Replayed Mathlib.Data.Finite.Sum
+✔ [1750/1862] Replayed Mathlib.Algebra.BigOperators.RingEquiv
+✔ [1751/1862] Replayed Mathlib.Data.Matrix.Defs
+✔ [1752/1862] Replayed Mathlib.Data.Matrix.Diagonal
+✔ [1753/1862] Replayed Mathlib.Data.Matrix.Mul
+✔ [1754/1862] Replayed Mathlib.Data.Matrix.Basic
+✔ [1755/1862] Replayed Mathlib.Data.Matrix.Basis
+✔ [1756/1862] Replayed Mathlib.Data.Matrix.Composition
+✔ [1757/1862] Replayed Mathlib.Algebra.Star.BigOperators
+✔ [1758/1862] Replayed Mathlib.Data.Matrix.ConjTranspose
+✔ [1759/1862] Replayed Mathlib.Data.Matrix.Block
+✔ [1760/1862] Replayed Mathlib.Data.Matrix.RowCol
+✔ [1761/1862] Replayed Mathlib.Data.Matrix.Notation
+✔ [1762/1862] Replayed Mathlib.LinearAlgebra.Basis.Fin
+✔ [1763/1862] Replayed Mathlib.LinearAlgebra.Basis.Prod
+✔ [1764/1862] Replayed Mathlib.LinearAlgebra.StdBasis
+✔ [1765/1862] Replayed Mathlib.LinearAlgebra.Matrix.StdBasis
+✔ [1766/1862] Replayed Mathlib.RingTheory.AlgebraTower
+✔ [1767/1862] Replayed Mathlib.LinearAlgebra.Matrix.ToLin
+✔ [1768/1862] Replayed Mathlib.Data.Complex.Module
+✔ [1769/1862] Replayed Mathlib.Data.Complex.Norm
+✔ [1770/1862] Replayed Mathlib.Data.Complex.Order
+✔ [1771/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Field
+✔ [1772/1862] Replayed Mathlib.Topology.Algebra.InfiniteSum.Module
+✔ [1773/1862] Replayed Mathlib.Topology.Instances.RealVectorSpace
+✔ [1774/1862] Replayed Mathlib.Analysis.Complex.Basic
+✔ [1775/1862] Replayed Mathlib.Algebra.QuadraticDiscriminant
+✔ [1776/1862] Replayed Mathlib.Analysis.InnerProductSpace.Defs
+✔ [1777/1862] Replayed Mathlib.Analysis.InnerProductSpace.Basic
+✔ [1778/1862] Replayed Mathlib.Analysis.Asymptotics.Theta
+✔ [1779/1862] Replayed Mathlib.Analysis.Complex.Asymptotics
+✔ [1780/1862] Replayed Mathlib.Algebra.BigOperators.Module
+✔ [1781/1862] Replayed Mathlib.Algebra.Order.Field.Power
+✔ [1782/1862] Replayed Mathlib.Algebra.MonoidAlgebra.Defs
+✔ [1783/1862] Replayed Mathlib.Algebra.MonoidAlgebra.Support
+✔ [1784/1862] Replayed Mathlib.Algebra.Polynomial.Basic
+✔ [1785/1862] Replayed Mathlib.Algebra.Polynomial.Coeff
+✔ [1786/1862] Replayed Mathlib.Algebra.MonoidAlgebra.Degree
+✔ [1787/1862] Replayed Mathlib.Data.Nat.Cast.WithTop
+✔ [1788/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Definitions
+✔ [1789/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Operations
+✔ [1790/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Support
+✔ [1791/1862] Replayed Mathlib.Algebra.Polynomial.Degree.TrailingDegree
+✔ [1792/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Domain
+✔ [1793/1862] Replayed Mathlib.Data.Nat.WithBot
+✔ [1794/1862] Replayed Mathlib.Algebra.Polynomial.Degree.SmallDegree
+✔ [1795/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Units
+✔ [1796/1862] Replayed Mathlib.Algebra.Polynomial.Eval.Defs
+✔ [1797/1862] Replayed Mathlib.Algebra.Polynomial.Eval.Coeff
+✔ [1798/1862] Replayed Mathlib.Algebra.Polynomial.Eval.Degree
+✔ [1799/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Lemmas
+✔ [1800/1862] Replayed Mathlib.Algebra.Polynomial.Monomial
+✔ [1801/1862] Replayed Mathlib.Algebra.Polynomial.Degree.Monomial
+✔ [1802/1862] Replayed Mathlib.Algebra.Polynomial.EraseLead
+✔ [1803/1862] Replayed Mathlib.Algebra.Polynomial.Reverse
+✔ [1804/1862] Replayed Mathlib.Algebra.Polynomial.Monic
+✔ [1805/1862] Replayed Mathlib.Analysis.Normed.Ring.InfiniteSum
+✔ [1806/1862] Replayed Mathlib.Topology.Order.Lattice
+✔ [1807/1862] Replayed Mathlib.Analysis.Normed.Order.Lattice
+✔ [1808/1862] Replayed Mathlib.Data.Nat.Choose.Bounds
+✔ [1809/1862] Replayed Mathlib.Order.Filter.AtTopBot.ModEq
+✔ [1810/1862] Replayed Mathlib.Algebra.Polynomial.Eval.Algebra
+✔ [1811/1862] Replayed Mathlib.RingTheory.Polynomial.Pochhammer
+✔ [1812/1862] Replayed Mathlib.Analysis.SpecificLimits.Normed
+✔ [1813/1862] Replayed Mathlib.Algebra.Order.CauSeq.BigOperators
+✔ [1814/1862] Replayed Mathlib.Data.Complex.Exponential
+✔ [1815/1862] Replayed Mathlib.Data.Complex.Trigonometric
+✔ [1816/1862] Replayed Mathlib.Analysis.SpecialFunctions.Exp
+✔ [1817/1862] Replayed Mathlib.Algebra.Order.Group.Finset
+✔ [1818/1862] Replayed Mathlib.Data.Finsupp.Order
+✔ [1819/1862] Replayed Mathlib.Data.Finsupp.Multiset
+✔ [1820/1862] Replayed Mathlib.RingTheory.Multiplicity
+✔ [1821/1862] Replayed Mathlib.NumberTheory.Padics.PadicVal.Defs
+✔ [1822/1862] Replayed Mathlib.Data.Nat.Factorization.Defs
+✔ [1823/1862] Replayed Mathlib.Analysis.NormedSpace.Real
+✔ [1824/1862] Replayed Mathlib.Analysis.SpecialFunctions.Log.Basic
+✔ [1825/1862] Replayed Mathlib.Algebra.Group.UniqueProds.Basic
+✔ [1826/1862] Replayed Mathlib.Algebra.FreeMonoid.UniqueProds
+✔ [1827/1862] Replayed Mathlib.Algebra.MonoidAlgebra.MapDomain
+✔ [1828/1862] Replayed Mathlib.Algebra.MonoidAlgebra.Basic
+✔ [1829/1862] Replayed Mathlib.Algebra.MonoidAlgebra.NoZeroDivisors
+✔ [1830/1862] Replayed Mathlib.Algebra.FreeAlgebra
+✔ [1831/1862] Replayed Mathlib.Algebra.Polynomial.AlgebraMap
+✔ [1832/1862] Replayed Mathlib.RingTheory.Adjoin.Polynomial
+✔ [1833/1862] Replayed Mathlib.Algebra.EuclideanDomain.Defs
+✔ [1834/1862] Replayed Mathlib.Algebra.EuclideanDomain.Int
+✔ [1835/1862] Replayed Mathlib.Algebra.Regular.Pow
+✔ [1836/1862] Replayed Mathlib.Data.Finsupp.Antidiagonal
+✔ [1837/1862] Replayed Mathlib.Algebra.MvPolynomial.Basic
+✔ [1838/1862] Replayed Mathlib.Algebra.MvPolynomial.Eval
+✔ [1839/1862] Replayed Mathlib.Algebra.Algebra.Subalgebra.Prod
+✔ [1840/1862] Replayed Mathlib.RingTheory.Adjoin.Basic
+✔ [1841/1862] Replayed Mathlib.Order.PiLex
+✔ [1842/1862] Replayed Mathlib.Algebra.Order.Group.PiLex
+✔ [1843/1862] Replayed Mathlib.Data.DFinsupp.Order
+✔ [1844/1862] Replayed Mathlib.Data.DFinsupp.NeLocus
+✔ [1845/1862] Replayed Mathlib.Data.DFinsupp.Lex
+✔ [1846/1862] Replayed Mathlib.Data.Finsupp.Lex
+✔ [1847/1862] Replayed Mathlib.Algebra.MvPolynomial.Rename
+✔ [1848/1862] Replayed Mathlib.Algebra.MvPolynomial.Degrees
+✔ [1849/1862] Replayed Mathlib.Algebra.MvPolynomial.Variables
+✔ [1850/1862] Replayed Mathlib.Algebra.MvPolynomial.CommRing
+✔ [1851/1862] Replayed Mathlib.Data.Finsupp.Fin
+✔ [1852/1862] Replayed Mathlib.Algebra.BigOperators.Finsupp.Fin
+✔ [1853/1862] Replayed Mathlib.Algebra.MvPolynomial.Equiv
+✔ [1854/1862] Replayed Mathlib.Algebra.Polynomial.BigOperators
+✔ [1855/1862] Replayed Mathlib.Order.PartialSups
+✔ [1856/1862] Replayed Mathlib.Algebra.Order.PartialSups
+✔ [1857/1862] Replayed Mathlib.GroupTheory.Finiteness
+✔ [1858/1862] Replayed Mathlib.Tactic.Algebraize
+✔ [1859/1862] Replayed Mathlib.RingTheory.Finiteness.Defs
+✔ [1860/1862] Replayed Mathlib.RingTheory.Finiteness.Basic
+✔ [1861/1862] Replayed Mathlib.RingTheory.Noetherian.Defs
+✔ [1862/2290] Replayed Mathlib.SetTheory.Ordinal.Basic
+✔ [1863/2290] Replayed Mathlib.SetTheory.Cardinal.UnivLE
+✔ [1864/2290] Replayed Mathlib.Order.SuccPred.InitialSeg
+✔ [1865/2290] Replayed Mathlib.SetTheory.Ordinal.Arithmetic
+✔ [1866/2290] Replayed Mathlib.SetTheory.Ordinal.Family
+✔ [1867/2290] Replayed Mathlib.SetTheory.Ordinal.Enum
+✔ [1868/2290] Replayed Mathlib.SetTheory.Cardinal.Aleph
+✔ [1869/2290] Replayed Mathlib.SetTheory.Cardinal.Arithmetic
+✔ [1870/2290] Replayed Mathlib.Logic.Small.List
+✔ [1871/2290] Replayed Mathlib.SetTheory.Ordinal.Exponential
+✔ [1872/2290] Replayed Mathlib.SetTheory.Ordinal.FixedPoint
+✔ [1873/2290] Replayed Mathlib.SetTheory.Cardinal.Cofinality
+✔ [1874/2290] Replayed Mathlib.SetTheory.Cardinal.Regular
+✔ [1875/2290] Replayed Mathlib.SetTheory.Cardinal.Pigeonhole
+✔ [1876/2290] Replayed Mathlib.LinearAlgebra.Basis.Cardinality
+✔ [1877/2290] Replayed Mathlib.LinearAlgebra.Isomorphisms
+✔ [1878/2290] Replayed Mathlib.RingTheory.Finiteness.Cardinality
+✔ [1879/2290] Replayed Mathlib.RingTheory.Finiteness.Finsupp
+✔ [1880/2290] Replayed Mathlib.RingTheory.Ideal.Prod
+✔ [1881/2290] Replayed Mathlib.RingTheory.Noetherian.Basic
+✔ [1882/2290] Replayed Mathlib.RingTheory.Polynomial.Basic
+✔ [1883/2290] Replayed Mathlib.Algebra.EuclideanDomain.Basic
+✔ [1884/2290] Replayed Mathlib.Algebra.EuclideanDomain.Field
+✔ [1885/2290] Replayed Mathlib.Algebra.Ring.Associated
+✔ [1886/2290] Replayed Mathlib.Algebra.GCDMonoid.Basic
+✔ [1887/2290] Replayed Mathlib.Algebra.GroupWithZero.Submonoid.Primal
+✔ [1888/2290] Replayed Mathlib.RingTheory.UniqueFactorizationDomain.Defs
+✔ [1889/2290] Replayed Mathlib.RingTheory.UniqueFactorizationDomain.Ideal
+✔ [1890/2290] Replayed Mathlib.RingTheory.Noetherian.UniqueFactorizationDomain
+✔ [1891/2290] Replayed Mathlib.RingTheory.PrincipalIdealDomain
+✔ [1892/2290] Replayed Mathlib.RingTheory.Adjoin.FG
+✔ [1893/2290] Replayed Mathlib.RingTheory.Adjoin.Tower
+✔ [1894/2290] Replayed Mathlib.Algebra.Ring.Action.Submonoid
+✔ [1895/2290] Replayed Mathlib.Algebra.Algebra.Subalgebra.Operations
+✔ [1896/2290] Replayed Mathlib.Algebra.Ring.Fin
+✔ [1897/2290] Replayed Mathlib.GroupTheory.QuotientGroup.Finite
+✔ [1898/2290] Replayed Mathlib.RingTheory.Ideal.Quotient.Defs
+✔ [1899/2290] Replayed Mathlib.RingTheory.Ideal.Quotient.Basic
+✔ [1900/2290] Replayed Mathlib.RingTheory.Ideal.Quotient.Operations
+✔ [1901/2290] Replayed Mathlib.Algebra.Module.Submodule.IterateMapComap
+✔ [1902/2290] Replayed Mathlib.RingTheory.OrzechProperty
+✔ [1903/2290] Replayed Mathlib.RingTheory.Noetherian.Orzech
+✔ [1904/2290] Replayed Mathlib.RingTheory.FiniteType
+✔ [1905/2290] Replayed Mathlib.LinearAlgebra.Finsupp.Pi
+✔ [1906/2290] Replayed Mathlib.LinearAlgebra.InvariantBasisNumber
+✔ [1907/2290] Replayed Mathlib.LinearAlgebra.FreeModule.StrongRankCondition
+✔ [1908/2290] Replayed Mathlib.Algebra.GCDMonoid.Multiset
+✔ [1909/2290] Replayed Mathlib.Algebra.GCDMonoid.Nat
+✔ [1910/2290] Replayed Mathlib.Combinatorics.Enumerative.Composition
+✔ [1911/2290] Replayed Mathlib.Combinatorics.Enumerative.Partition
+✔ [1912/2290] Replayed Mathlib.GroupTheory.Perm.Basic
+✔ [1913/2290] Replayed Mathlib.GroupTheory.Perm.Support
+✔ [1914/2290] Replayed Mathlib.Data.Fintype.Inv
+✔ [1915/2290] Replayed Mathlib.Logic.Equiv.Fintype
+✔ [1916/2290] Replayed Mathlib.GroupTheory.Perm.Finite
+✔ [1917/2290] Replayed Mathlib.GroupTheory.Perm.List
+✔ [1918/2290] Replayed Mathlib.Data.Fintype.Perm
+✔ [1919/2290] Replayed Mathlib.Data.Int.Order.Units
+✔ [1920/2290] Replayed Mathlib.GroupTheory.Perm.Sign
+✔ [1921/2290] Replayed Mathlib.GroupTheory.Perm.Cycle.Basic
+✔ [1922/2290] Replayed Mathlib.GroupTheory.Perm.Closure
+✔ [1923/2290] Replayed Mathlib.Data.List.Iterate
+✔ [1924/2290] Replayed Mathlib.Data.Nat.GCD.BigOperators
+✔ [1925/2290] Replayed Mathlib.GroupTheory.NoncommPiCoprod
+✔ [1926/2290] Replayed Mathlib.Tactic.Group
+✔ [1927/2290] Replayed Mathlib.GroupTheory.Perm.Cycle.Factors
+✔ [1928/2290] Replayed Mathlib.Tactic.NormNum.GCD
+✔ [1929/2290] Replayed Mathlib.GroupTheory.Perm.Cycle.Type
+✔ [1930/2290] Replayed Mathlib.GroupTheory.Perm.Option
+✔ [1931/2290] Replayed Mathlib.GroupTheory.Perm.Fin
+✔ [1932/2290] Replayed Mathlib.Algebra.BigOperators.Group.Finset.Powerset
+✔ [1933/2290] Replayed Mathlib.LinearAlgebra.Multilinear.Basic
+✔ [1934/2290] Replayed Mathlib.LinearAlgebra.Multilinear.Basis
+✔ [1935/2290] Replayed Mathlib.LinearAlgebra.Alternating.Basic
+✔ [1936/2290] Replayed Mathlib.LinearAlgebra.Matrix.SemiringInverse
+✔ [1937/2290] Replayed Mathlib.LinearAlgebra.Matrix.Determinant.Basic
+✔ [1938/2290] Replayed Mathlib.LinearAlgebra.Matrix.Reindex
+✔ [1939/2290] Replayed Mathlib.Data.Matrix.Invertible
+✔ [1940/2290] Replayed Mathlib.LinearAlgebra.Matrix.Trace
+✔ [1941/2290] Replayed Mathlib.RingTheory.TensorProduct.Basic
+✔ [1942/2290] Replayed Mathlib.Data.Matrix.Kronecker
+✔ [1943/2290] Replayed Mathlib.LinearAlgebra.Basis.Submodule
+✔ [1944/2290] Replayed Mathlib.LinearAlgebra.Dimension.Basic
+✔ [1945/2290] Replayed Mathlib.LinearAlgebra.Dimension.Finrank
+✔ [1946/2290] Replayed Mathlib.LinearAlgebra.Dimension.StrongRankCondition
+✔ [1947/2290] Replayed Mathlib.LinearAlgebra.FreeModule.Finite.Basic
+✔ [1948/2290] Replayed Mathlib.SetTheory.Cardinal.Finsupp
+✔ [1949/2290] Replayed Mathlib.LinearAlgebra.Dimension.Free
+✔ [1950/2290] Replayed Mathlib.LinearAlgebra.Dimension.Constructions
+✔ [1951/2290] Replayed Mathlib.LinearAlgebra.Dimension.Subsingleton
+✔ [1952/2290] Replayed Mathlib.LinearAlgebra.Dimension.Finite
+✔ [1953/2290] Replayed Mathlib.LinearAlgebra.FiniteDimensional.Defs
+✔ [1954/2290] Replayed Mathlib.LinearAlgebra.FiniteDimensional.Basic
+✔ [1955/2290] Replayed Mathlib.LinearAlgebra.Matrix.MvPolynomial
+✔ [1956/2290] Replayed Mathlib.Tactic.ComputeDegree
+✔ [1957/2290] Replayed Mathlib.LinearAlgebra.Matrix.Polynomial
+✔ [1958/2290] Replayed Mathlib.LinearAlgebra.Matrix.Adjugate
+✔ [1959/2290] Replayed Mathlib.LinearAlgebra.Matrix.NonsingularInverse
+✔ [1960/2290] Replayed Mathlib.LinearAlgebra.Matrix.Basis
+✔ [1961/2290] Replayed Mathlib.LinearAlgebra.Determinant
+✔ [1962/2290] Replayed Mathlib.Algebra.Field.Subfield.Basic
+✔ [1963/2290] Replayed Mathlib.Logic.Equiv.Multiset
+✔ [1964/2290] Replayed Mathlib.Logic.Equiv.Finset
+✔ [1965/2290] Replayed Mathlib.Logic.Encodable.Pi
+✔ [1966/2290] Replayed Mathlib.Data.W.Basic
+✔ [1967/2290] Replayed Mathlib.Data.W.Cardinal
+✔ [1968/2290] Replayed Mathlib.SetTheory.Cardinal.Subfield
+✔ [1969/2290] Replayed Mathlib.LinearAlgebra.Dimension.ErdosKaplansky
+✔ [1970/2290] Replayed Mathlib.LinearAlgebra.Dual.Defs
+✔ [1971/2290] Replayed Mathlib.LinearAlgebra.Dual.Basis
+✔ [1972/2290] Replayed Mathlib.LinearAlgebra.Dimension.RankNullity
+✔ [1973/2290] Replayed Mathlib.LinearAlgebra.Dimension.DivisionRing
+✔ [1974/2290] Replayed Mathlib.LinearAlgebra.Dimension.FreeAndStrongRankCondition
+✔ [1975/2290] Replayed Mathlib.Tactic.IntervalCases
+✔ [1976/2290] Replayed Mathlib.LinearAlgebra.FiniteDimensional.Lemmas
+✔ [1977/2290] Replayed Mathlib.LinearAlgebra.Matrix.InvariantBasisNumber
+✔ [1978/2290] Replayed Mathlib.LinearAlgebra.SesquilinearForm
+✔ [1979/2290] Replayed Mathlib.RingTheory.Finiteness.Projective
+✔ [1980/2290] Replayed Mathlib.RingTheory.LocalRing.Defs
+✔ [1981/2290] Replayed Mathlib.RingTheory.LocalRing.Basic
+✔ [1982/2290] Replayed Mathlib.LinearAlgebra.Dual.Lemmas
+✔ [1983/2290] Replayed Mathlib.LinearAlgebra.Dimension.LinearMap
+✔ [1984/2290] Replayed Mathlib.LinearAlgebra.Matrix.Diagonal
+✔ [1985/2290] Replayed Mathlib.LinearAlgebra.Matrix.DotProduct
+✔ [1986/2290] Replayed Mathlib.LinearAlgebra.Matrix.Dual
+✔ [1987/2290] Replayed Mathlib.Data.Matrix.Rank
+✔ [1988/2290] Replayed Mathlib.Logic.Equiv.Embedding
+✔ [1989/2290] Replayed Mathlib.Data.Fintype.CardEmbedding
+✔ [1990/2290] Replayed Mathlib.Topology.Algebra.Module.Multilinear.Basic
+✔ [1991/2290] Replayed Mathlib.Topology.Algebra.Module.Multilinear.Bounded
+✔ [1992/2290] Replayed Mathlib.Topology.Algebra.Module.Multilinear.Topology
+✔ [1993/2290] Replayed Mathlib.Analysis.NormedSpace.Multilinear.Basic
+✔ [1994/2290] Replayed Mathlib.Topology.Algebra.Ring.Ideal
+✔ [1995/2290] Replayed Mathlib.Analysis.Normed.Ring.Units
+✔ [1996/2290] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.Mul
+✔ [1997/2290] Replayed Mathlib.Analysis.Normed.Operator.BoundedLinearMaps
+✔ [1998/2290] Replayed Mathlib.Analysis.InnerProductSpace.Continuous
+✔ [1999/2290] Replayed Mathlib.Analysis.InnerProductSpace.LinearMap
+✔ [2000/2290] Replayed Mathlib.Algebra.Order.Group.Indicator
+✔ [2001/2290] Replayed Mathlib.Analysis.NormedSpace.IndicatorFunction
+✔ [2002/2290] Replayed Mathlib.Data.Fintype.Order
+✔ [2003/2290] Replayed Mathlib.Data.Finset.Update
+✔ [2004/2290] Replayed Mathlib.Data.Prod.TProd
+✔ [2005/2290] Replayed Mathlib.Tactic.Measurability.Init
+✔ [2006/2290] Replayed Mathlib.Tactic.Measurability
+✔ [2007/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Defs
+✔ [2008/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Basic
+✔ [2009/2290] Replayed Mathlib.GroupTheory.GroupAction.IterateAct
+✔ [2010/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Instances
+✔ [2011/2290] Replayed Mathlib.Order.Disjointed
+✔ [2012/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Constructions
+✔ [2013/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Embedding
+✔ [2014/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.MeasurablyGenerated
+✔ [2015/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.EventuallyMeasurable
+✔ [2016/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.Defs
+✔ [2017/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.Basic
+✔ [2018/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.Operations
+✔ [2019/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.OfFunction
+✔ [2020/2290] Replayed Mathlib.MeasureTheory.PiSystem
+✔ [2021/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.Caratheodory
+✔ [2022/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.Induced
+✔ [2023/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.AE
+✔ [2024/2290] Replayed Mathlib.MeasureTheory.Measure.MeasureSpaceDef
+✔ [2025/2290] Replayed Mathlib.MeasureTheory.Measure.AEDisjoint
+✔ [2026/2290] Replayed Mathlib.MeasureTheory.Measure.NullMeasurable
+✔ [2027/2290] Replayed Mathlib.MeasureTheory.Measure.MeasureSpace
+✔ [2028/2290] Replayed Mathlib.MeasureTheory.Measure.Map
+✔ [2029/2290] Replayed Mathlib.MeasureTheory.Measure.AbsolutelyContinuous
+✔ [2030/2290] Replayed Mathlib.MeasureTheory.OuterMeasure.BorelCantelli
+✔ [2031/2290] Replayed Mathlib.MeasureTheory.Measure.QuasiMeasurePreserving
+✔ [2032/2290] Replayed Mathlib.MeasureTheory.Measure.Comap
+✔ [2033/2290] Replayed Mathlib.MeasureTheory.Measure.Restrict
+✔ [2034/2290] Replayed Mathlib.MeasureTheory.Measure.Typeclasses.Finite
+✔ [2035/2290] Replayed Mathlib.MeasureTheory.Measure.Typeclasses.SFinite
+✔ [2036/2290] Replayed Mathlib.MeasureTheory.Measure.Trim
+✔ [2037/2290] Replayed Mathlib.Data.Set.MemPartition
+✔ [2038/2290] Replayed Mathlib.Order.Filter.CountableSeparatingOn
+✔ [2039/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.CountablyGenerated
+✔ [2040/2290] Replayed Mathlib.MeasureTheory.Measure.AEMeasurable
+✔ [2041/2290] Replayed Mathlib.Order.Filter.Subsingleton
+✔ [2042/2290] Replayed Mathlib.Order.Filter.EventuallyConst
+✔ [2043/2290] Replayed Mathlib.Dynamics.Ergodic.MeasurePreserving
+✔ [2044/2290] Replayed Mathlib.MeasureTheory.Function.AEMeasurableSequence
+✔ [2045/2290] Replayed Mathlib.MeasureTheory.Order.Lattice
+✔ [2046/2290] Replayed Mathlib.MeasureTheory.Group.Arithmetic
+✔ [2047/2290] Replayed Mathlib.Topology.MetricSpace.HausdorffDistance
+✔ [2048/2290] Replayed Mathlib.Topology.GDelta.Basic
+✔ [2049/2290] Replayed Mathlib.Topology.Separation.GDelta
+✔ [2050/2290] Replayed Mathlib.Topology.GDelta.MetrizableSpace
+✔ [2051/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
+✔ [2052/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Order
+✔ [2053/2290] Replayed Mathlib.MeasureTheory.Function.SimpleFunc
+✔ [2054/2290] Replayed Mathlib.Topology.MetricSpace.Thickening
+✔ [2055/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Metric
+✔ [2056/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Prod
+✔ [2057/2290] Replayed Mathlib.MeasureTheory.Measure.Typeclasses.NoAtoms
+✔ [2058/2290] Replayed Mathlib.Algebra.CharP.Basic
+✔ [2059/2290] Replayed Mathlib.Data.Fintype.Units
+✔ [2060/2290] Replayed Mathlib.Data.ZMod.Basic
+✔ [2061/2290] Replayed Mathlib.Data.ZMod.IntUnitsPower
+✔ [2062/2290] Replayed Mathlib.Algebra.Ring.NegOnePow
+✔ [2063/2290] Replayed Mathlib.Algebra.Ring.Periodic
+✔ [2064/2290] Replayed Mathlib.Algebra.Field.Periodic
+✔ [2065/2290] Replayed Mathlib.Topology.Instances.Real.Lemmas
+✔ [2066/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Real
+✔ [2067/2290] Replayed Mathlib.Topology.Metrizable.Real
+✔ [2068/2290] Replayed Mathlib.Topology.IndicatorConstPointwise
+✔ [2069/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Metrizable
+✔ [2070/2290] Replayed Mathlib.MeasureTheory.Function.SimpleFuncDense
+✔ [2071/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.Basic
+✔ [2072/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.AEStronglyMeasurable
+✔ [2073/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Basic
+✔ [2074/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Add
+✔ [2075/2290] Replayed Mathlib.Order.Filter.Germ.Basic
+✔ [2076/2290] Replayed Mathlib.Topology.UniformSpace.CompactConvergence
+✔ [2077/2290] Replayed Mathlib.Topology.ContinuousMap.Algebra
+✔ [2078/2290] Replayed Mathlib.MeasureTheory.Function.AEEqFun
+✔ [2079/2290] Replayed Mathlib.Algebra.Field.NegOnePow
+✔ [2080/2290] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic
+✔ [2081/2290] Replayed Mathlib.Analysis.Normed.Group.Quotient
+✔ [2082/2290] Replayed Mathlib.Analysis.Normed.Group.Pointwise
+✔ [2083/2290] Replayed Mathlib.Analysis.NormedSpace.Pointwise
+✔ [2084/2290] Replayed Mathlib.Algebra.ModEq
+✔ [2085/2290] Replayed Mathlib.Data.Int.SuccPred
+✔ [2086/2290] Replayed Mathlib.Tactic.Order.CollectFacts
+✔ [2087/2290] Replayed Mathlib.Tactic.Order.Preprocessing
+✔ [2088/2290] Replayed Mathlib.Tactic.Order.Graph.Basic
+✔ [2089/2290] Replayed Mathlib.Tactic.Order.Graph.Tarjan
+✔ [2090/2290] Replayed Mathlib.Tactic.Order
+✔ [2091/2290] Replayed Mathlib.Order.Circular
+✔ [2092/2290] Replayed Mathlib.Algebra.Order.ToIntervalMod
+✔ [2093/2290] Replayed Mathlib.Algebra.Group.Units.Opposite
+✔ [2094/2290] Replayed Mathlib.Algebra.Ring.AddAut
+✔ [2095/2290] Replayed Mathlib.Data.Nat.Log
+✔ [2096/2290] Replayed Mathlib.Data.List.Palindrome
+✔ [2097/2290] Replayed Mathlib.Data.Nat.Digits
+✔ [2098/2290] Replayed Mathlib.Data.Nat.Multiplicity
+✔ [2099/2290] Replayed Mathlib.Algebra.CharP.Lemmas
+✔ [2100/2290] Replayed Mathlib.Algebra.CharP.Two
+✔ [2101/2290] Replayed Mathlib.Data.Nat.Cast.Field
+✔ [2102/2290] Replayed Mathlib.Data.Nat.Factorization.Basic
+✔ [2103/2290] Replayed Mathlib.Data.Nat.Factorization.Induction
+✔ [2104/2290] Replayed Mathlib.Algebra.Group.Nat.Range
+✔ [2105/2290] Replayed Mathlib.Data.Nat.Count
+✔ [2106/2290] Replayed Mathlib.Data.Nat.Periodic
+✔ [2107/2290] Replayed Mathlib.Data.Nat.Totient
+✔ [2108/2290] Replayed Mathlib.GroupTheory.Divisible
+✔ [2109/2290] Replayed Mathlib.Topology.SeparatedMap
+✔ [2110/2290] Replayed Mathlib.Topology.IsLocalHomeomorph
+✔ [2111/2290] Replayed Mathlib.Topology.Instances.ZMultiples
+✔ [2112/2290] Replayed Mathlib.Topology.Instances.AddCircle
+✔ [2113/2290] Replayed Mathlib.Analysis.Normed.Group.AddCircle
+✔ [2114/2290] Replayed Mathlib.Algebra.CharZero.Quotient
+✔ [2115/2290] Replayed Mathlib.Topology.Instances.Sign
+✔ [2116/2290] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Angle
+✔ [2117/2290] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Inverse
+✔ [2118/2290] Replayed Mathlib.Analysis.SpecialFunctions.Complex.Arg
+✔ [2119/2290] Replayed Mathlib.Analysis.SpecialFunctions.Complex.Log
+✔ [2120/2290] Replayed Mathlib.Analysis.SpecialFunctions.Pow.Complex
+✔ [2121/2290] Replayed Mathlib.Analysis.SpecialFunctions.Pow.Real
+✔ [2122/2290] Replayed Mathlib.Analysis.SpecialFunctions.Pow.NNReal
+✔ [2123/2290] Replayed Mathlib.MeasureTheory.Measure.MutuallySingular
+✔ [2124/2290] Replayed Mathlib.MeasureTheory.Measure.Typeclasses.Probability
+✔ [2125/2290] Replayed Mathlib.MeasureTheory.Measure.Dirac
+✔ [2126/2290] Replayed Mathlib.Data.Real.ENatENNReal
+✔ [2127/2290] Replayed Mathlib.Topology.Algebra.InfiniteSum.ENNReal
+✔ [2128/2290] Replayed Mathlib.MeasureTheory.Measure.Count
+✔ [2129/2290] Replayed Mathlib.Order.Filter.ENNReal
+✔ [2130/2290] Replayed Mathlib.Probability.ConditionalProbability
+✔ [2131/2290] Replayed Mathlib.Probability.UniformOn
+✔ [2132/2290] Replayed Mathlib.MeasureTheory.Function.EssSup
+✔ [2133/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.Defs
+✔ [2134/2290] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.Complex
+✔ [2135/2290] Replayed Mathlib.MeasureTheory.Function.SpecialFunctions.Basic
+✔ [2136/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Map
+✔ [2137/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Markov
+✔ [2138/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Countable
+✔ [2139/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Sub
+✔ [2140/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.Basic
+✔ [2141/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.ChebyshevMarkov
+✔ [2142/2290] Replayed Mathlib.Data.ENNReal.Holder
+✔ [2143/2290] Replayed Mathlib.Analysis.Convex.Jensen
+✔ [2144/2290] Replayed Mathlib.Analysis.Convex.Slope
+✔ [2145/2290] Replayed Mathlib.Analysis.Convex.SpecificFunctions.Basic
+✔ [2146/2290] Replayed Mathlib.Data.Real.ConjExponents
+✔ [2147/2290] Replayed Mathlib.Analysis.MeanInequalities
+✔ [2148/2290] Replayed Mathlib.Order.Monotone.Monovary
+✔ [2149/2290] Replayed Mathlib.Algebra.Order.Monovary
+✔ [2150/2290] Replayed Mathlib.Analysis.Convex.Mul
+✔ [2151/2290] Replayed Mathlib.Analysis.MeanInequalitiesPow
+✔ [2152/2290] Replayed Mathlib.MeasureTheory.Integral.MeanInequalities
+✔ [2153/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.CompareExp
+✔ [2154/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.TriangleInequality
+✔ [2155/2290] Replayed Mathlib.MeasureTheory.Function.LpSpace.Basic
+✔ [2156/2290] Replayed Mathlib.MeasureTheory.Measure.OpenPos
+✔ [2157/2290] Replayed Mathlib.Algebra.Module.MinimalAxioms
+✔ [2158/2290] Replayed Mathlib.Topology.Algebra.Indicator
+✔ [2159/2290] Replayed Mathlib.Topology.Bornology.BoundedOperation
+✔ [2160/2290] Replayed Mathlib.Topology.ContinuousMap.Bounded.Basic
+✔ [2161/2290] Replayed Mathlib.Topology.ContinuousMap.Bounded.Normed
+✔ [2162/2290] Replayed Mathlib.Topology.ContinuousMap.Star
+✔ [2163/2290] Replayed Mathlib.Topology.ContinuousMap.Bounded.Star
+✔ [2164/2290] Replayed Mathlib.Topology.Sets.Closeds
+✔ [2165/2290] Replayed Mathlib.Topology.NoetherianSpace
+✔ [2166/2290] Replayed Mathlib.Topology.QuasiSeparated
+✔ [2167/2290] Replayed Mathlib.Topology.Sets.Compacts
+✔ [2168/2290] Replayed Mathlib.Topology.ContinuousMap.Compact
+✔ [2169/2290] Replayed Mathlib.MeasureTheory.Function.LpSpace.ContinuousFunctions
+✔ [2170/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.Inner
+✔ [2171/2290] Replayed Mathlib.Geometry.Convex.Cone.Basic
+✔ [2172/2290] Replayed Mathlib.Analysis.Convex.Cone.Extension
+✔ [2173/2290] Replayed Mathlib.Analysis.NormedSpace.RCLike
+✔ [2174/2290] Replayed Mathlib.Analysis.NormedSpace.Extend
+✔ [2175/2290] Replayed Mathlib.Analysis.Asymptotics.AsymptoticEquivalent
+✔ [2176/2290] Replayed Mathlib.Analysis.Normed.Group.Lemmas
+✔ [2177/2290] Replayed Mathlib.Analysis.Normed.Group.AddTorsor
+✔ [2178/2290] Replayed Mathlib.Analysis.Normed.Affine.AddTorsor
+✔ [2179/2290] Replayed Mathlib.LinearAlgebra.AffineSpace.Restrict
+✔ [2180/2290] Replayed Mathlib.Analysis.Normed.Affine.Isometry
+✔ [2181/2290] Replayed Mathlib.Analysis.NormedSpace.RieszLemma
+✔ [2182/2290] Replayed Mathlib.LinearAlgebra.FreeModule.Finite.Matrix
+✔ [2183/2290] Replayed Mathlib.Topology.Algebra.Module.Determinant
+✔ [2184/2290] Replayed Mathlib.LinearAlgebra.Finsupp.Span
+✔ [2185/2290] Replayed Mathlib.Order.Atoms.Finite
+✔ [2186/2290] Replayed Mathlib.Order.CompactlyGenerated.Intervals
+✔ [2187/2290] Replayed Mathlib.Control.Bifunctor
+✔ [2188/2290] Replayed Mathlib.Logic.Equiv.Functor
+✔ [2189/2290] Replayed Mathlib.Data.Rel
+✔ [2190/2290] Replayed Mathlib.Order.RelSeries
+✔ [2191/2290] Replayed Mathlib.Order.JordanHolder
+✔ [2192/2290] Replayed Mathlib.RingTheory.Ideal.Colon
+✔ [2193/2290] Replayed Mathlib.RingTheory.SimpleModule.Basic
+✔ [2194/2290] Replayed Mathlib.Topology.Algebra.Module.Simple
+✔ [2195/2290] Replayed Mathlib.Topology.Algebra.Module.FiniteDimension
+✔ [2196/2290] Replayed Mathlib.Topology.Instances.Matrix
+✔ [2197/2290] Replayed Mathlib.Analysis.Normed.Module.FiniteDimension
+✔ [2198/2290] Replayed Mathlib.Analysis.RCLike.Lemmas
+✔ [2199/2290] Replayed Mathlib.Analysis.NormedSpace.HahnBanach.Extension
+✔ [2200/2290] Replayed Mathlib.Analysis.Convex.Gauge
+✔ [2201/2290] Replayed Mathlib.Analysis.NormedSpace.HahnBanach.Separation
+✔ [2202/2290] Replayed Mathlib.Analysis.NormedSpace.HahnBanach.SeparatingDual
+✔ [2203/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.DominatedConvergence
+✔ [2204/2290] Replayed Mathlib.MeasureTheory.Integral.Lebesgue.Norm
+✔ [2205/2290] Replayed Mathlib.MeasureTheory.Measure.Decomposition.Exhaustion
+✔ [2206/2290] Replayed Mathlib.MeasureTheory.Measure.GiryMonad
+✔ [2207/2290] Replayed Mathlib.MeasureTheory.Measure.Prod
+✔ [2208/2290] Replayed Mathlib.MeasureTheory.Measure.WithDensity
+✔ [2209/2290] Replayed Mathlib.MeasureTheory.Function.L1Space.HasFiniteIntegral
+✔ [2210/2290] Replayed Mathlib.MeasureTheory.Function.Egorov
+✔ [2211/2290] Replayed Mathlib.Analysis.SpecialFunctions.Pow.Asymptotics
+✔ [2212/2290] Replayed Mathlib.Analysis.SpecialFunctions.Pow.Continuity
+✔ [2213/2290] Replayed Mathlib.MeasureTheory.Function.LpSpace.Complete
+✔ [2214/2290] Replayed Mathlib.MeasureTheory.Function.ConvergenceInMeasure
+✔ [2215/2290] Replayed Mathlib.MeasureTheory.Function.LpOrder
+✔ [2216/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.Lemmas
+✔ [2217/2290] Replayed Mathlib.MeasureTheory.Function.L1Space.Integrable
+✔ [2218/2290] Replayed Mathlib.MeasureTheory.Measure.Real
+✔ [2219/2290] Replayed Mathlib.Order.Filter.IndicatorFunction
+✔ [2220/2290] Replayed Mathlib.MeasureTheory.Function.LpSpace.Indicator
+✔ [2221/2290] Replayed Mathlib.MeasureTheory.Integral.IntegrableOn
+✔ [2222/2290] Replayed Mathlib.MeasureTheory.Function.LocallyIntegrable
+✔ [2223/2290] Replayed Mathlib.MeasureTheory.Group.MeasurableEquiv
+✔ [2224/2290] Replayed Mathlib.MeasureTheory.Function.L1Space.AEEqFun
+✔ [2225/2290] Replayed Mathlib.MeasureTheory.Function.SimpleFuncDenseLp
+✔ [2226/2290] Replayed Mathlib.MeasureTheory.Integral.FinMeasAdditive
+✔ [2227/2290] Replayed Mathlib.Analysis.NormedSpace.OperatorNorm.Completeness
+✔ [2228/2290] Replayed Mathlib.MeasureTheory.Integral.SetToL1
+✔ [2229/2290] Replayed Mathlib.MeasureTheory.Integral.Bochner.L1
+✔ [2230/2290] Replayed Mathlib.MeasureTheory.Integral.Bochner.Basic
+✔ [2231/2290] Replayed Mathlib.Topology.MetricSpace.ThickenedIndicator
+✔ [2232/2290] Replayed Mathlib.MeasureTheory.Integral.Bochner.Set
+✔ [2233/2290] Replayed Mathlib.Topology.ContinuousMap.ContinuousMapZero
+✔ [2234/2290] Replayed Mathlib.MeasureTheory.Integral.Bochner.ContinuousLinearMap
+✔ [2235/2290] Replayed Mathlib.MeasureTheory.Function.L2Space
+✔ [2236/2290] Replayed Mathlib.Algebra.Group.Pointwise.Set.Card
+✔ [2237/2290] Replayed Mathlib.Dynamics.Minimal
+✔ [2238/2290] Replayed Mathlib.MeasureTheory.Measure.Regular
+✔ [2239/2290] Replayed Mathlib.MeasureTheory.Group.Defs
+✔ [2240/2290] Replayed Mathlib.MeasureTheory.Group.Action
+✔ [2241/2290] Replayed Mathlib.Topology.ContinuousMap.CocompactMap
+✔ [2242/2290] Replayed Mathlib.MeasureTheory.Group.Measure
+✔ [2243/2290] Replayed Mathlib.MeasureTheory.MeasurableSpace.Pi
+✔ [2244/2290] Replayed Mathlib.MeasureTheory.Constructions.Pi
+✔ [2245/2290] Replayed Mathlib.Analysis.InnerProductSpace.Orthonormal
+✔ [2246/2290] Replayed Mathlib.Analysis.InnerProductSpace.Subspace
+✔ [2247/2290] Replayed Mathlib.Analysis.InnerProductSpace.Orthogonal
+✔ [2248/2290] Replayed Mathlib.Topology.Baire.Lemmas
+✔ [2249/2290] Replayed Mathlib.Topology.Baire.CompleteMetrizable
+✔ [2250/2290] Replayed Mathlib.Analysis.Normed.Operator.Banach
+✔ [2251/2290] Replayed Mathlib.Analysis.InnerProductSpace.Symmetric
+✔ [2252/2290] Replayed Mathlib.Algebra.DirectSum.Decomposition
+✔ [2253/2290] Replayed Mathlib.Analysis.InnerProductSpace.Projection
+✔ [2254/2290] Replayed Mathlib.Topology.Algebra.Module.WeakBilin
+✔ [2255/2290] Replayed Mathlib.Analysis.LocallyConvex.Polar
+✔ [2256/2290] Replayed Mathlib.Analysis.Convex.TotallyBounded
+✔ [2257/2290] Replayed Mathlib.Analysis.LocallyConvex.AbsConvex
+✔ [2258/2290] Replayed Mathlib.Analysis.Normed.Module.Convex
+✔ [2259/2290] Replayed Mathlib.Analysis.Normed.Module.Dual
+✔ [2260/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.ENNReal
+✔ [2261/2290] Replayed Mathlib.MeasureTheory.Function.AEEqOfLIntegral
+✔ [2262/2290] Replayed Mathlib.MeasureTheory.Function.StronglyMeasurable.Lp
+✔ [2263/2290] Replayed Mathlib.Order.Filter.Germ.OrderedMonoid
+✔ [2264/2290] Replayed Mathlib.Order.Filter.Ring
+✔ [2265/2290] Replayed Mathlib.MeasureTheory.Function.AEEqOfIntegral
+✔ [2266/2290] Replayed Mathlib.MeasureTheory.Function.LpSeminorm.Trim
+✔ [2267/2290] Replayed Mathlib.MeasureTheory.Function.ConditionalExpectation.AEMeasurable
+✔ [2268/2290] Replayed Mathlib.MeasureTheory.Function.ConditionalExpectation.Unique
+✔ [2269/2290] Replayed Mathlib.MeasureTheory.Function.ConditionalExpectation.CondexpL2
+✔ [2270/2290] Replayed Mathlib.MeasureTheory.Function.ConditionalExpectation.CondexpL1
+✔ [2271/2290] Replayed Mathlib.MeasureTheory.Function.ConditionalExpectation.Basic
+✔ [2272/2290] Replayed Mathlib.MeasureTheory.Measure.Decomposition.Hahn
+✔ [2273/2290] Replayed Mathlib.MeasureTheory.Measure.Sub
+✔ [2274/2290] Replayed Mathlib.MeasureTheory.Measure.Decomposition.Lebesgue
+✔ [2275/2290] Replayed Mathlib.Probability.Notation
+✔ [2276/2290] Replayed Mathlib.Probability.Kernel.Defs
+✔ [2277/2290] Replayed Mathlib.Probability.Kernel.Basic
+✔ [2278/2290] Replayed Mathlib.Probability.Kernel.Composition.CompNotation
+✔ [2279/2290] Replayed Mathlib.Probability.Kernel.Composition.MapComap
+✔ [2280/2290] Replayed Mathlib.Probability.Kernel.MeasurableLIntegral
+✔ [2281/2290] Replayed Mathlib.Probability.Kernel.Composition.CompProd
+✔ [2282/2290] Replayed Mathlib.Probability.Kernel.Composition.MeasureCompProd
+✔ [2283/2290] Replayed Mathlib.Probability.Kernel.Composition.Comp
+✔ [2284/2290] Replayed Mathlib.Probability.Kernel.Composition.CompMap
+✔ [2285/2290] Replayed Mathlib.Probability.Kernel.Composition.Prod
+✔ [2286/2290] Replayed Mathlib.Probability.Kernel.Composition.MeasureComp
+✔ [2287/2290] Replayed Mathlib.Probability.Independence.Kernel
+✔ [2288/2290] Replayed Mathlib.Probability.Independence.Basic
+✔ [2289/2290] Replayed Mathlib.Probability.ConditionalExpectation
+✔ [2290/2566] Ran job computation
+✔ [2291/2566] Replayed Mathlib.Data.Fintype.Sort
+✔ [2292/2566] Replayed Mathlib.LinearAlgebra.Multilinear.Curry
+✔ [2293/2566] Replayed Mathlib.Analysis.NormedSpace.Multilinear.Curry
+✔ [2294/2566] Replayed Mathlib.Analysis.Calculus.FormalMultilinearSeries
+✔ [2295/2566] Replayed Mathlib.Analysis.Analytic.Basic
+✔ [2296/2566] Replayed Mathlib.Analysis.Analytic.Composition
+✔ [2297/2566] Replayed Mathlib.Analysis.Analytic.ChangeOrigin
+✔ [2298/2566] Replayed Mathlib.Analysis.Analytic.CPolynomialDef
+✔ [2299/2566] Replayed Mathlib.Analysis.Analytic.Linear
+✔ [2300/2566] Replayed Mathlib.Analysis.Analytic.OfScalars
+✔ [2301/2566] Replayed Mathlib.Analysis.Analytic.Constructions
+✔ [2302/2566] Replayed Mathlib.Analysis.Analytic.CPolynomial
+✔ [2303/2566] Replayed Mathlib.Tactic.Positivity.Finset
+✔ [2304/2566] Replayed Mathlib.Tactic.Positivity
+✔ [2305/2566] Replayed Mathlib.Analysis.Analytic.Inverse
+✔ [2306/2566] Replayed Mathlib.Analysis.Analytic.Within
+✔ [2307/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Linear
+✔ [2308/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Comp
+✔ [2309/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Add
+✔ [2310/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Equiv
+✔ [2311/2566] Replayed Mathlib.Data.ENat.Lattice
+✔ [2312/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.FTaylorSeries
+✔ [2313/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Prod
+✔ [2314/2566] Replayed Mathlib.Topology.Algebra.GroupCompletion
+✔ [2315/2566] Replayed Mathlib.Topology.MetricSpace.Completion
+✔ [2316/2566] Replayed Mathlib.Analysis.Normed.Group.Completion
+✔ [2317/2566] Replayed Mathlib.Topology.Algebra.UniformRing
+✔ [2318/2566] Replayed Mathlib.Topology.Algebra.UniformField
+✔ [2319/2566] Replayed Mathlib.Analysis.Normed.Module.Completion
+✔ [2320/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Analytic
+✔ [2321/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Bilinear
+✔ [2322/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Mul
+✔ [2323/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Mul
+✔ [2324/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.RestrictScalars
+✔ [2325/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Comp
+✔ [2326/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Pow
+✔ [2327/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Inv
+✔ [2328/2566] Replayed Mathlib.Analysis.Calculus.Deriv.ZPow
+✔ [2329/2566] Replayed Mathlib.Analysis.Calculus.LogDeriv
+✔ [2330/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.Defs
+✔ [2331/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Add
+✔ [2332/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Linear
+✔ [2333/2566] Replayed Mathlib.Analysis.Calculus.Deriv.AffineMap
+✔ [2334/2566] Replayed Mathlib.LinearAlgebra.AffineSpace.Slope
+✔ [2335/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Slope
+✔ [2336/2566] Replayed Mathlib.Topology.LocallyConstant.Basic
+✔ [2337/2566] Replayed Mathlib.Analysis.Calculus.MeanValue
+✔ [2338/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.RCLike
+✔ [2339/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.FaaDiBruno
+✔ [2340/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.Basic
+✔ [2341/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Inverse
+✔ [2342/2566] Replayed Mathlib.Analysis.Calculus.ContDiff.Operations
+✔ [2343/2566] Replayed Mathlib.Analysis.Calculus.Deriv.CompMul
+✔ [2344/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Shift
+✔ [2345/2566] Replayed Mathlib.Analysis.Calculus.IteratedDeriv.Defs
+✔ [2346/2566] Replayed Mathlib.Analysis.Calculus.IteratedDeriv.Lemmas
+✔ [2347/2566] Replayed Mathlib.Analysis.Complex.RealDeriv
+✔ [2348/2566] Replayed Mathlib.Algebra.Ring.Action.ConjAct
+✔ [2349/2566] Replayed Mathlib.Data.Nat.Factorial.Cast
+✔ [2350/2566] Replayed Mathlib.Data.Nat.Choose.Cast
+✔ [2351/2566] Replayed Mathlib.Analysis.SpecificLimits.RCLike
+✔ [2352/2566] Replayed Mathlib.Analysis.Normed.Algebra.Exponential
+✔ [2353/2566] Replayed Mathlib.Topology.MetricSpace.CauSeqFilter
+✔ [2354/2566] Replayed Mathlib.Analysis.SpecialFunctions.Exponential
+✔ [2355/2566] Replayed Mathlib.Analysis.SpecialFunctions.ExpDeriv
+✔ [2356/2566] Replayed Mathlib.Analysis.SpecialFunctions.Log.Deriv
+✔ [2357/2566] Replayed Mathlib.Analysis.Calculus.LocalExtr.Basic
+✔ [2358/2566] Replayed Mathlib.Topology.ExtendFrom
+✔ [2359/2566] Replayed Mathlib.Topology.Order.ExtendFrom
+✔ [2360/2566] Replayed Mathlib.Topology.Order.Rolle
+✔ [2361/2566] Replayed Mathlib.Analysis.Calculus.LocalExtr.Rolle
+✔ [2362/2566] Replayed Mathlib.Analysis.Calculus.Deriv.MeanValue
+✔ [2363/2566] Replayed Mathlib.Analysis.Convex.Deriv
+✔ [2364/2566] Replayed Mathlib.Analysis.SpecialFunctions.Log.NegMulLog
+✔ [2365/2566] Replayed Mathlib.MeasureTheory.Constructions.BorelSpace.ContinuousLinearMap
+✔ [2366/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Measurable
+✔ [2367/2566] Replayed Mathlib.MeasureTheory.Integral.Bochner.FundThmCalculus
+✔ [2368/2566] Replayed Mathlib.MeasureTheory.Integral.Bochner.VitaliCaratheodory
+✔ [2369/2566] Replayed Mathlib.Data.Matrix.DMatrix
+✔ [2370/2566] Replayed Mathlib.LinearAlgebra.Matrix.Transvection
+✔ [2371/2566] Replayed Mathlib.MeasureTheory.Group.LIntegral
+✔ [2372/2566] Replayed Mathlib.MeasureTheory.Integral.Marginal
+✔ [2373/2566] Replayed Mathlib.Topology.Order.LeftRightLim
+✔ [2374/2566] Replayed Mathlib.MeasureTheory.Measure.Stieltjes
+✔ [2375/2566] Replayed Mathlib.MeasureTheory.Measure.Content
+✔ [2376/2566] Replayed Mathlib.MeasureTheory.Group.Prod
+✔ [2377/2566] Replayed Mathlib.Topology.Algebra.Group.Compact
+✔ [2378/2566] Replayed Mathlib.MeasureTheory.Measure.Haar.Basic
+✔ [2379/2566] Replayed Mathlib.Analysis.Normed.Lp.WithLp
+✔ [2380/2566] Replayed Mathlib.Analysis.Normed.Lp.ProdLp
+✔ [2381/2566] Replayed Mathlib.Analysis.Normed.Lp.PiLp
+✔ [2382/2566] Replayed Mathlib.LinearAlgebra.UnitaryGroup
+✔ [2383/2566] Replayed Mathlib.Util.Superscript
+✔ [2384/2566] Replayed Mathlib.Analysis.InnerProductSpace.PiL2
+✔ [2385/2566] Replayed Mathlib.MeasureTheory.Measure.Haar.OfBasis
+✔ [2386/2566] Replayed Mathlib.MeasureTheory.Measure.Lebesgue.Basic
+✔ [2387/2566] Replayed Mathlib.MeasureTheory.Topology
+✔ [2388/2566] Replayed Mathlib.MeasureTheory.Integral.IntervalIntegral.Basic
+✔ [2389/2566] Replayed Mathlib.MeasureTheory.Integral.DominatedConvergence
+✔ [2390/2566] Replayed Mathlib.MeasureTheory.Integral.IntervalIntegral.FundThmCalculus
+✔ [2391/2566] Replayed Mathlib.Analysis.SpecialFunctions.NonIntegrable
+✔ [2392/2566] Replayed Mathlib.Analysis.Calculus.InverseFunctionTheorem.ApproximatesLinearOn
+✔ [2393/2566] Replayed Mathlib.Analysis.Calculus.InverseFunctionTheorem.FDeriv
+✔ [2394/2566] Replayed Mathlib.Analysis.Calculus.InverseFunctionTheorem.Deriv
+✔ [2395/2566] Replayed Mathlib.Analysis.SpecialFunctions.Complex.LogDeriv
+✔ [2396/2566] Replayed Mathlib.Analysis.Calculus.FDeriv.Extend
+✔ [2397/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Prod
+✔ [2398/2566] Replayed Mathlib.Order.Monotone.Union
+✔ [2399/2566] Replayed Mathlib.Order.Monotone.Odd
+✔ [2400/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Deriv
+✔ [2401/2566] Replayed Mathlib.Analysis.SpecialFunctions.Pow.Deriv
+✔ [2402/2566] Replayed Mathlib.Analysis.SpecialFunctions.Sqrt
+✔ [2403/2566] Replayed Mathlib.Analysis.Convex.SpecificFunctions.Deriv
+✔ [2404/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Complex
+✔ [2405/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Arctan
+✔ [2406/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.ComplexDeriv
+✔ [2407/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.ArctanDeriv
+✔ [2408/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Bounds
+✔ [2409/2566] Replayed Mathlib.Analysis.Calculus.DSlope
+✔ [2410/2566] Replayed Mathlib.Analysis.SpecialFunctions.Trigonometric.Sinc
+✔ [2411/2566] Replayed Mathlib.MeasureTheory.Integral.IntervalIntegral.IntegrationByParts
+✔ [2412/2566] Replayed Mathlib.Analysis.SpecialFunctions.Integrals
+✔ [2413/2566] Replayed Mathlib.MeasureTheory.Group.Pointwise
+✔ [2414/2566] Replayed Mathlib.Data.Int.Log
+✔ [2415/2566] Replayed Mathlib.Analysis.SpecialFunctions.Log.Base
+✔ [2416/2566] Replayed Mathlib.MeasureTheory.Measure.Doubling
+✔ [2417/2566] Replayed Mathlib.MeasureTheory.Measure.Lebesgue.EqHaar
+✔ [2418/2566] Replayed Mathlib.MeasureTheory.Integral.Layercake
+✔ [2419/2566] Replayed Mathlib.Analysis.SpecialFunctions.JapaneseBracket
+✔ [2420/2566] Replayed Mathlib.MeasureTheory.Group.Integral
+✔ [2421/2566] Replayed Mathlib.Analysis.Calculus.Deriv.Support
+✔ [2422/2566] Replayed Mathlib.MeasureTheory.Covering.VitaliFamily
+✔ [2423/2566] Replayed Mathlib.MeasureTheory.Function.AEMeasurableOrder
+✔ [2424/2566] Replayed Mathlib.MeasureTheory.Integral.Average
+✔ [2425/2566] Replayed Mathlib.MeasureTheory.Covering.Differentiation
+✔ [2426/2566] Replayed Mathlib.MeasureTheory.Covering.Besicovitch
+✔ [2427/2566] Replayed Mathlib.MeasureTheory.Covering.BesicovitchVectorSpace
+✔ [2428/2566] Replayed Mathlib.Topology.Perfect
+✔ [2429/2566] Replayed Mathlib.Topology.MetricSpace.PiNat
+✔ [2430/2566] Replayed Mathlib.Topology.MetricSpace.Gluing
+✔ [2431/2566] Replayed Mathlib.Topology.Metrizable.CompletelyMetrizable
+✔ [2432/2566] Replayed Mathlib.Topology.MetricSpace.Polish
+✔ [2433/2566] Replayed Mathlib.Topology.MetricSpace.CantorScheme
+✔ [2434/2566] Replayed Mathlib.Topology.MetricSpace.Perfect
+✔ [2435/2566] Replayed Mathlib.Topology.Separation.CountableSeparatingOn
+✔ [2436/2566] Replayed Mathlib.MeasureTheory.Constructions.Polish.Basic
+✔ [2437/2566] Replayed Mathlib.MeasureTheory.Function.Jacobian
+✔ [2438/2566] Replayed Mathlib.LinearAlgebra.Matrix.Block
+✔ [2439/2566] Replayed Mathlib.Analysis.InnerProductSpace.GramSchmidtOrtho
+✔ [2440/2566] Replayed Mathlib.LinearAlgebra.Orientation
+✔ [2441/2566] Replayed Mathlib.Analysis.InnerProductSpace.Orientation
+✔ [2442/2566] Replayed Mathlib.MeasureTheory.Measure.Haar.InnerProductSpace
+✔ [2443/2566] Replayed Mathlib.MeasureTheory.Measure.Haar.NormedSpace
+✔ [2444/2566] Replayed Mathlib.MeasureTheory.Integral.Prod
+✔ [2445/2566] Replayed Mathlib.Analysis.NormedSpace.FunctionSeries
+✔ [2446/2566] Replayed Mathlib.LinearAlgebra.AffineSpace.Ordered
+✔ [2447/2566] Replayed Mathlib.Topology.UrysohnsLemma
+✔ [2448/2566] Replayed Mathlib.MeasureTheory.Measure.EverywherePos
+✔ [2449/2566] Replayed Mathlib.Topology.Metrizable.Urysohn
+✔ [2450/2566] Replayed Mathlib.Topology.ContinuousMap.Ordered
+✔ [2451/2566] Replayed Mathlib.MeasureTheory.Measure.Haar.Unique
+✔ [2452/2566] Replayed Mathlib.MeasureTheory.Integral.IntegralEqImproper
+✔ [2453/2566] Replayed Mathlib.MeasureTheory.Measure.Lebesgue.Integral
+✔ [2454/2566] Replayed Mathlib.Analysis.SpecialFunctions.ImproperIntegrals
+✔ [2455/2566] Replayed Mathlib.MeasureTheory.Integral.Asymptotics
+✔ [2456/2566] Replayed Mathlib.MeasureTheory.Integral.ExpDecay
+✔ [2457/2566] Replayed Mathlib.Analysis.SpecialFunctions.Gamma.Basic
+✔ [2458/2566] Replayed Mathlib.MeasureTheory.Measure.Lebesgue.Complex
+✔ [2459/2566] Replayed Mathlib.Analysis.SpecialFunctions.PolarCoord
+✔ [2460/2566] Replayed Mathlib.Topology.FiberBundle.IsHomeomorphicTrivialBundle
+✔ [2461/2566] Replayed Mathlib.Analysis.Complex.ReImTopology
+✔ [2462/2566] Replayed Mathlib.Analysis.Complex.Convex
+✔ [2463/2566] Replayed Mathlib.Data.Nat.Factorial.DoubleFactorial
+✔ [2464/2566] Replayed Mathlib.Analysis.SpecialFunctions.Gaussian.GaussianIntegral
+✔ [2465/2566] Replayed Mathlib.Analysis.Analytic.Uniqueness
+✔ [2466/2566] Replayed Mathlib.Analysis.Calculus.DiffContOnCl
+✔ [2467/2566] Replayed Mathlib.Algebra.CharZero.Infinite
+✔ [2468/2566] Replayed Mathlib.Data.Rat.Cardinal
+✔ [2469/2566] Replayed Mathlib.SetTheory.Cardinal.Continuum
+✔ [2470/2566] Replayed Mathlib.Data.Real.Cardinality
+✔ [2471/2566] Replayed Mathlib.Analysis.Analytic.IsolatedZeros
+✔ [2472/2566] Replayed Mathlib.Analysis.SpecialFunctions.Complex.CircleMap
+✔ [2473/2566] Replayed Mathlib.MeasureTheory.Integral.CircleIntegral
+✔ [2474/2566] Replayed Mathlib.Order.Fin.Tuple
+✔ [2475/2566] Replayed Mathlib.Analysis.BoxIntegral.Box.Basic
+✔ [2476/2566] Replayed Mathlib.Analysis.BoxIntegral.Box.SubboxInduction
+✔ [2477/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Basic
+✔ [2478/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Tagged
+✔ [2479/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.SubboxInduction
+✔ [2480/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Split
+✔ [2481/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Filter
+✔ [2482/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Additive
+✔ [2483/2566] Replayed Mathlib.Analysis.BoxIntegral.Partition.Measure
+✔ [2484/2566] Replayed Mathlib.Analysis.Oscillation
+✔ [2485/2566] Replayed Mathlib.Analysis.BoxIntegral.Basic
+✔ [2486/2566] Replayed Mathlib.Analysis.BoxIntegral.DivergenceTheorem
+✔ [2487/2566] Replayed Mathlib.Tactic.Generalize
+✔ [2488/2566] Replayed Mathlib.Analysis.BoxIntegral.Integrability
+✔ [2489/2566] Replayed Mathlib.MeasureTheory.Integral.DivergenceTheorem
+✔ [2490/2566] Replayed Mathlib.Analysis.Complex.CauchyIntegral
+✔ [2491/2566] Replayed Mathlib.MeasureTheory.Integral.Pi
+✔ [2492/2566] Replayed Mathlib.Analysis.Normed.Group.BallSphere
+✔ [2493/2566] Replayed Mathlib.Analysis.Normed.Field.UnitBall
+✔ [2494/2566] Replayed Mathlib.Analysis.Complex.Circle
+✔ [2495/2566] Replayed Mathlib.Analysis.Fourier.FourierTransform
+✔ [2496/2566] Replayed Mathlib.Analysis.SpecialFunctions.Gaussian.FourierTransform
+✔ [2497/2566] Replayed Mathlib.MeasureTheory.Group.Convolution
+✔ [2498/2566] Replayed Mathlib.Analysis.Calculus.ParametricIntegral
+✔ [2499/2566] Replayed Mathlib.Analysis.Fourier.BoundedContinuousFunctionChar
+✔ [2500/2566] Replayed Mathlib.Analysis.Normed.Group.NullSubmodule
+✔ [2501/2566] Replayed Mathlib.Analysis.InnerProductSpace.Dual
+✔ [2502/2566] Replayed Mathlib.MeasureTheory.Group.IntegralConvolution
+✔ [2503/2566] Replayed Mathlib.Analysis.RCLike.BoundedContinuous
+✔ [2504/2566] Replayed Mathlib.Analysis.SpecialFunctions.MulExpNegMulSq
+✔ [2505/2566] Replayed Mathlib.Analysis.SpecialFunctions.Complex.LogBounds
+✔ [2506/2566] Replayed Mathlib.MeasureTheory.Integral.BoundedContinuousFunction
+✔ [2507/2566] Replayed Mathlib.MeasureTheory.Measure.RegularityCompacts
+✔ [2508/2566] Replayed Mathlib.Data.NNReal.Star
+✔ [2509/2566] Replayed Mathlib.Topology.Algebra.Star.Real
+✔ [2510/2566] Replayed Mathlib.Topology.Algebra.StarSubalgebra
+✔ [2511/2566] Replayed Mathlib.Topology.ContinuousMap.Lattice
+✔ [2512/2566] Replayed Mathlib.Algebra.MvPolynomial.Supported
+✔ [2513/2566] Replayed Mathlib.Algebra.Polynomial.Derivative
+✔ [2514/2566] Replayed Mathlib.RingTheory.Derivation.Basic
+✔ [2515/2566] Replayed Mathlib.Algebra.MvPolynomial.Derivation
+✔ [2516/2566] Replayed Mathlib.Algebra.MvPolynomial.PDeriv
+✔ [2517/2566] Replayed Mathlib.Algebra.Polynomial.Eval.SMul
+✔ [2518/2566] Replayed Mathlib.RingTheory.Polynomial.Bernstein
+✔ [2519/2566] Replayed Mathlib.Algebra.MonoidAlgebra.Division
+✔ [2520/2566] Replayed Mathlib.Algebra.Polynomial.Inductions
+✔ [2521/2566] Replayed Mathlib.Algebra.Polynomial.Div
+✔ [2522/2566] Replayed Mathlib.Algebra.Polynomial.RingDivision
+✔ [2523/2566] Replayed Mathlib.Algebra.Field.Equiv
+✔ [2524/2566] Replayed Mathlib.GroupTheory.OreLocalization.OreSet
+✔ [2525/2566] Replayed Mathlib.GroupTheory.OreLocalization.Basic
+✔ [2526/2566] Replayed Mathlib.GroupTheory.MonoidLocalization.Basic
+✔ [2527/2566] Replayed Mathlib.RingTheory.OreLocalization.Basic
+✔ [2528/2566] Replayed Mathlib.GroupTheory.MonoidLocalization.MonoidWithZero
+✔ [2529/2566] Replayed Mathlib.RingTheory.OreLocalization.Ring
+✔ [2530/2566] Replayed Mathlib.RingTheory.Localization.Defs
+✔ [2531/2566] Replayed Mathlib.RingTheory.Localization.Basic
+✔ [2532/2566] Replayed Mathlib.RingTheory.Localization.FractionRing
+✔ [2533/2566] Replayed Mathlib.Algebra.Polynomial.Roots
+✔ [2534/2566] Replayed Mathlib.RingTheory.EuclideanDomain
+✔ [2535/2566] Replayed Mathlib.Algebra.BigOperators.Associated
+✔ [2536/2566] Replayed Mathlib.RingTheory.UniqueFactorizationDomain.Basic
+✔ [2537/2566] Replayed Mathlib.RingTheory.UniqueFactorizationDomain.NormalizedFactors
+✔ [2538/2566] Replayed Mathlib.Algebra.Polynomial.FieldDivision
+✔ [2539/2566] Replayed Mathlib.Algebra.Polynomial.Eval.Subring
+✔ [2540/2566] Replayed Mathlib.Algebra.Polynomial.Lifts
+✔ [2541/2566] Replayed Mathlib.RingTheory.Polynomial.Tower
+✔ [2542/2566] Replayed Mathlib.Algebra.Polynomial.Splits
+✔ [2543/2566] Replayed Mathlib.RingTheory.MvPolynomial.Symmetric.Defs
+✔ [2544/2566] Replayed Mathlib.RingTheory.Polynomial.Vieta
+✔ [2545/2566] Replayed Mathlib.Topology.Algebra.Polynomial
+✔ [2546/2566] Replayed Mathlib.Topology.ContinuousMap.Polynomial
+✔ [2547/2566] Replayed Mathlib.Analysis.SpecialFunctions.Bernstein
+✔ [2548/2566] Replayed Mathlib.Topology.ContinuousMap.Weierstrass
+✔ [2549/2566] Replayed Mathlib.Topology.ContinuousMap.StoneWeierstrass
+✔ [2550/2566] Replayed Mathlib.Analysis.SpecialFunctions.MulExpNegMulSqIntegral
+✔ [2551/2566] Replayed Mathlib.MeasureTheory.Measure.HasOuterApproxClosed
+✔ [2552/2566] Replayed Mathlib.MeasureTheory.Measure.FiniteMeasureExt
+✔ [2553/2566] Replayed Mathlib.MeasureTheory.Measure.CharacteristicFunction
+✔ [2554/2566] Replayed Mathlib.Probability.Integration
+✔ [2555/2566] Replayed Mathlib.Probability.Moments.Variance
+✔ [2556/2566] Replayed Mathlib.MeasureTheory.Function.UniformIntegrable
+✔ [2557/2566] Replayed Mathlib.Probability.IdentDistrib
+✔ [2558/2566] Replayed Mathlib.Probability.Moments.Basic
+✔ [2559/2566] Replayed Mathlib.MeasureTheory.Order.Group.Lattice
+✔ [2560/2566] Replayed Mathlib.Probability.Moments.IntegrableExpMul
+✔ [2561/2566] Replayed Mathlib.Probability.Moments.ComplexMGF
+✔ [2562/2566] Replayed Mathlib.Analysis.SpecialFunctions.Complex.Analytic
+✔ [2563/2566] Replayed Mathlib.Probability.Moments.MGFAnalytic
+✔ [2564/2566] Replayed Mathlib.Probability.Distributions.Gaussian.Real
+✖ [2565/2566] Building Calibrator
+trace: .> LEAN_PATH=/home/runner/work/gnomon/gnomon/.lake/packages/Cli/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/batteries/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/Qq/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/aesop/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/importGraph/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/plausible/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/packages/mathlib/.lake/build/lib/lean:/home/runner/work/gnomon/gnomon/.lake/build/lib/lean /home/runner/.elan/toolchains/leanprover--lean4---v4.20.1/bin/lean /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean -R /home/runner/work/gnomon/gnomon/proofs -o /home/runner/work/gnomon/gnomon/.lake/build/lib/lean/Calibrator.olean -i /home/runner/work/gnomon/gnomon/.lake/build/lib/lean/Calibrator.ilean -c /home/runner/work/gnomon/gnomon/.lake/build/ir/Calibrator.c --json
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:119:2: unknown identifier 'admit'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:124:2: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.16378)
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:133:2: unknown identifier 'admit'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:139:53: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.17070)
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:142:2: unknown identifier 'admit'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:148:60: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.17636)
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:176:9: unexpected token '('; expected ','
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:187:8: numerals are data in Lean, but the expected type is a proposition
+  hasInteraction (dgpScenario1 k).trueExpectation : Prop
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:187:11: too many arguments supplied to `use`
+warning: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:195:13: declaration uses 'sorry'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:217:9: application type mismatch
+  And.intro h_distinct.left
+argument
+  h_distinct.left
+has type
+  hasInteraction (@dgpScenario1 1 (Fin.fintype 1)).trueExpectation : Prop
+but is expected to have type
+  hasInteraction (@dgpScenario1 1 this).trueExpectation : Prop
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:224:45: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.20984)
+warning: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:226:8: declaration uses 'sorry'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:235:58: function expected at
+  f
+term has type
+  ?m.21915
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:235:69: function expected at
+  g
+term has type
+  ?m.23395 f
+warning: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:248:8: declaration uses 'sorry'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:268:32: linarith failed to find a contradiction
+case h
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ↑j < 1 + p
+a✝ : ↑j - 1 ≥ p + 1
+⊢ False failed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:271:41: linarith failed to find a contradiction
+case h
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p)
+a✝ : idx ≥ k * sp
+⊢ False failed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:273:42: tactic 'rewrite' failed, did not find instance of the pattern in the target expression
+  ?n * ?m
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p)
+h_idx_ub : idx < k * sp
+h_sp_pos : 0 < sp
+⊢ idx / sp < k
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:278:45: linarith failed to find a contradiction
+case h
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ¬↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p + k * sp)
+a✝ : idx ≥ p * k * sp
+⊢ False failed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:279:40: linarith failed to find a contradiction
+case h
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ¬↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p + k * sp)
+h_idx_ub : idx < p * k * sp
+a✝ : 0 ≥ k * sp
+⊢ False failed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:281:40: tactic 'rewrite' failed, did not find instance of the pattern in the target expression
+  ?n * ?m
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ¬↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p + k * sp)
+h_idx_ub : idx < p * k * sp
+h_ksp_pos : 0 < k * sp
+m_val : ℕ := idx / (k * sp)
+⊢ m_val < p
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:285:42: tactic 'rewrite' failed, did not find instance of the pattern in the target expression
+  ?n * ?m
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+data : RealizedData n k
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+hp : p > 0
+hk : k > 0
+hsp : sp > 0
+i : Fin n
+j : Fin (total_params p k sp)
+p_val : ℝ := data.p i
+c_val : Fin k → ℝ := data.c i
+h_j_lt_1 : ¬↑j < 1
+h_j_lt_gam : ¬↑j < 1 + p
+h_j_lt_f0 : ¬↑j < 1 + p + k * sp
+idx : ℕ := ↑j - (1 + p + k * sp)
+h_idx_ub : idx < p * k * sp
+h_ksp_pos : 0 < k * sp
+m_val : ℕ := idx / (k * sp)
+hm_ub : m_val < p
+m : Fin p := ⟨m_val, hm_ub⟩
+rem : ℕ := idx % (k * sp)
+h_rem_ub : rem < k * sp
+⊢ rem / sp < k
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:293:93: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin (?m.151767 m))
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:303:47: don't know how to synthesize implicit argument 'sp'
+  @isBayesOptimalInClass (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) (Fin.fintype 1)
+    (Fin.fintype (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4))
+    (Fin.fintype (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)) dgp4 m
+context:
+Ω : Type u_1
+inst✝² : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝¹ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝ : Fact (p = 1)
+model_raw : PhenotypeInformedGAM 1 1 1
+h_raw_struct : IsRawScoreModel model_raw
+h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun x => 1
+dgp4 : DataGeneratingProcess 1
+h_s4 : dgp4.trueExpectation = fun p c => p - 0.8 * c ⟨0, ⋯⟩
+m :
+  PhenotypeInformedGAM (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)
+hm : IsRawScoreModel m
+⊢ ℕ
+when the resulting type of a declaration is explicitly provided, all holes (e.g., `_`) in the header are resolved before the declaration body is processed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:303:47: don't know how to synthesize implicit argument 'p'
+  @isBayesOptimalInClass (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) (Fin.fintype 1)
+    (Fin.fintype (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4))
+    (Fin.fintype (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)) dgp4 m
+context:
+Ω : Type u_1
+inst✝² : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝¹ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝ : Fact (p = 1)
+model_raw : PhenotypeInformedGAM 1 1 1
+h_raw_struct : IsRawScoreModel model_raw
+h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun x => 1
+dgp4 : DataGeneratingProcess 1
+h_s4 : dgp4.trueExpectation = fun p c => p - 0.8 * c ⟨0, ⋯⟩
+m :
+  PhenotypeInformedGAM (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)
+hm : IsRawScoreModel m
+⊢ ℕ
+when the resulting type of a declaration is explicitly provided, all holes (e.g., `_`) in the header are resolved before the declaration body is processed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:303:27: don't know how to synthesize implicit argument 'sp'
+  @IsRawScoreModel (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) (Fin.fintype 1)
+    (Fin.fintype (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4))
+    (Fin.fintype (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)) m
+context:
+Ω : Type u_1
+inst✝² : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝¹ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝ : Fact (p = 1)
+model_raw : PhenotypeInformedGAM 1 1 1
+h_raw_struct : IsRawScoreModel model_raw
+h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun x => 1
+dgp4 : DataGeneratingProcess 1
+h_s4 : dgp4.trueExpectation = fun p c => p - 0.8 * c ⟨0, ⋯⟩
+m :
+  PhenotypeInformedGAM (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)
+⊢ ℕ
+when the resulting type of a declaration is explicitly provided, all holes (e.g., `_`) in the header are resolved before the declaration body is processed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:303:27: don't know how to synthesize implicit argument 'p'
+  @IsRawScoreModel (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) (Fin.fintype 1)
+    (Fin.fintype (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4))
+    (Fin.fintype (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)) m
+context:
+Ω : Type u_1
+inst✝² : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝¹ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝ : Fact (p = 1)
+model_raw : PhenotypeInformedGAM 1 1 1
+h_raw_struct : IsRawScoreModel model_raw
+h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun x => 1
+dgp4 : DataGeneratingProcess 1
+h_s4 : dgp4.trueExpectation = fun p c => p - 0.8 * c ⟨0, ⋯⟩
+m :
+  PhenotypeInformedGAM (?m.153723 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4) 1
+    (?m.153725 model_raw h_raw_struct h_pgs_basis_linear dgp4 h_s4)
+⊢ ℕ
+when the resulting type of a declaration is explicitly provided, all holes (e.g., `_`) in the header are resolved before the declaration body is processed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:303:19: failed to infer binder type
+when the resulting type of a declaration is explicitly provided, all holes (e.g., `_`) in the header are resolved before the declaration body is processed
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:314:28: invalid binder annotation, type is not a class instance
+  ?m.155697
+use the command `set_option checkBinderAnnotations false` to disable the check
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:315:23: invalid binder annotation, type is not a class instance
+  ?m.155744
+use the command `set_option checkBinderAnnotations false` to disable the check
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:317:45: invalid binder annotation, type is not a class instance
+  ?m.155791
+use the command `set_option checkBinderAnnotations false` to disable the check
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:332:73: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.156663)
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:345:42: tactic 'rewrite' failed, did not find instance of the pattern in the target expression
+  p
+Ω : Type u_1
+inst✝⁴ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝³ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+dgp_latent : DGPWithLatentRisk k
+model : PhenotypeInformedGAM 1 k sp
+h_opt : isBayesOptimalInClass dgp_latent.to_dgp model
+hp_one : p = 1
+c : Fin k → ℝ
+⊢ 0 < 1
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:345:123: tactic 'rewrite' failed, did not find instance of the pattern in the target expression
+  p
+Ω : Type u_1
+inst✝⁴ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝³ : IsProbabilityMeasure ℙ
+p k sp n : ℕ
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+dgp_latent : DGPWithLatentRisk k
+model : PhenotypeInformedGAM 1 k sp
+h_opt : isBayesOptimalInClass dgp_latent.to_dgp model
+hp_one : p = 1
+c : Fin k → ℝ
+l : Fin k
+⊢ 0 < 1
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:352:55: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin ?m.160340)
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:354:90: unknown identifier 'admit'
+error: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:357:31: typeclass instance problem is stuck, it is often due to metavariables
+  Fintype (Fin (?m.160828 f))
+warning: /home/runner/work/gnomon/gnomon/proofs/Calibrator.lean:360:8: declaration uses 'sorry'
+error: Lean exited with code 1
+✔ [2566/2566] Ran calibration/Calibrator:default
+Some required builds logged failures:
+- Calibrator
+error: build failed
