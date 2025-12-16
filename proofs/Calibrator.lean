@@ -73,8 +73,8 @@ structure PhenotypeInformedGAM (p k sp : ℕ) where
   pcSplineBasis : SplineBasis sp
   γ₀₀ : ℝ
   γₘ₀ : Fin p → ℝ
-  f₀ₗ : Fin k → SmoothFunction pcSplineBasis
-  fₘₗ : Fin p → Fin k → SmoothFunction pcSplineBasis
+  f₀ₗ : Fin k → SmoothFunction sp
+  fₘₗ : Fin p → Fin k → SmoothFunction sp
   link : LinkFunction
   dist : DistributionFamily
 
@@ -123,11 +123,11 @@ theorem fit_minimizes_loss {p k sp n : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] 
   (∀ m, empiricalLoss (fit data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
   IsIdentifiable (fit data lambda) data := by sorry
 
-def IsRawScoreModel {p k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin p)] (m : PhenotypeInformedGAM p k sp) : Prop :=
-  (∀ l s, m.f₀ₗ l s = 0) ∧ (∀ i l s, m.fₘₗ i l s = 0)
+def IsRawScoreModel {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp) : Prop :=
+  (∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0) ∧ (∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0)
 
-def IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ i l s, m.fₘₗ i l s = 0
+def IsNormalizedScoreModel {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp) : Prop :=
+  ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
 noncomputable def fitRaw {p k sp n : ℕ} [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
   sorry
@@ -157,17 +157,17 @@ section AllClaims
 
 variable {p k sp n : ℕ}
 
-noncomputable def dgpScenario1 (k : ℕ) : DataGeneratingProcess k := {
+noncomputable def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
 
-noncomputable def dgpScenario3 (k : ℕ) : DataGeneratingProcess k := {
+noncomputable def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
 
-noncomputable def dgpScenario4 (k : ℕ) : DataGeneratingProcess k := {
+noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
