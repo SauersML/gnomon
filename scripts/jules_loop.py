@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Jules Optimizer Loop - Infinite improvement cycle for Lean proofs.
+Jules Optimizer Loop - Continuous improvement cycle for Lean proofs.
 
-This script is part of an infinite loop:
-  prover.yml (validates Lean) → jules_loop.yml (improves Lean) → push → repeat
+This script runs within the 'jules_loop.yml' workflow.
+It analyzes the build log from the current run (or a provided log file),
+decides on improvements, sends a request to the Jules API, applies the patch,
+and pushes the changes.
 
-The loop should NEVER stop except for API rate limits. All other failures trigger retries.
+It runs on a schedule (CRON), so it does NOT trigger the next workflow itself.
 """
 import os
 import sys
@@ -41,6 +43,8 @@ def run_command(cmd, check=False):
         print(result.stderr)
         sys.exit(result.returncode)
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
 def filter_noise(logs):
     """
     Remove noisy lines that don't help with debugging.
@@ -71,99 +75,43 @@ def filter_noise(logs):
     return '\n'.join(filtered_lines)
 
 
-def fetch_logs(run_id):
+def get_run_info():
     """
-    Fetches logs for a specific workflow run.
-    Filters out noisy cache replay lines and prioritizes error information.
+    Retrieves status and logs.
+    First checks for local environment variables provided by the workflow.
+    Falls back to fetching from GitHub API (legacy behavior, or for manual runs).
     """
-    print(f"Fetching logs for run {run_id}...")
-    out, err, code = run_command(f"gh run view {run_id} --log")
-    if code != 0:
-        print(f"Failed to fetch logs: {err}")
-        return f"Failed to fetch logs: {err}"
+    print("\n--- Getting Run Info ---")
     
-    raw_logs = strip_ansi(out)
-    print(f"Raw logs fetched. Length: {len(raw_logs)} characters.")
+    # Check for local log file and status provided by the calling workflow
+    local_log_file = os.environ.get("LOCAL_LOG_FILE")
+    local_status = os.environ.get("LOCAL_BUILD_STATUS")
     
-    # Filter out noisy cache replay lines
-    filtered_logs = filter_noise(raw_logs)
-    print(f"After filtering noise: {len(filtered_logs)} characters.")
-    
-    # Truncate to 300k chars if still too long
-    if len(filtered_logs) > 300000:
-        print("Truncating logs to 300,000 characters...")
-        filtered_logs = filtered_logs[:300000]
-    
-    return filtered_logs
-
-
-def get_previous_run_info():
-    """Retrieves status and logs from the workflow run that triggered this script."""
-    print("\n--- Getting Previous Run Info ---")
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-
-    # Try to use the triggering workflow run info
-    if event_path:
-        print(f"Reading event from {event_path}")
+    if local_log_file and local_status:
+        print(f"Using local log file: {local_log_file} with status: {local_status}")
         try:
-            with open(event_path) as f:
-                event = json.load(f)
+            with open(local_log_file, 'r') as f:
+                raw_logs = f.read()
 
-            run = event.get("workflow_run")
-            if run:
-                conclusion = run.get("conclusion")
-                run_id = run.get("id")
-                workflow_id = run.get("workflow_id")
-                print(f"Triggering run {run_id} found in event. Conclusion: {conclusion}")
+            # If status is success, we might not need logs, but we'll process them anyway
+            logs = filter_noise(strip_ansi(raw_logs))
 
-                logs = ""
-                if conclusion != "success":
-                    logs = fetch_logs(run_id)
-                else:
-                    logs = "Build passed successfully."
+            if len(logs) > 300000:
+                print("Truncating logs to 300,000 characters...")
+                logs = logs[:300000]
 
-                return conclusion, logs, workflow_id
-            else:
-                print("No 'workflow_run' found in event payload.")
+            return local_status, logs
         except Exception as e:
-            print(f"Warning: Failed to read or parse GITHUB_EVENT_PATH: {e}")
+            print(f"Error reading local log file: {e}")
+            # Fall through to API fetch if local read fails?
+            # Probably better to fail or just assume no logs.
+            return local_status, f"Error reading log file: {e}"
 
-    # Fallback: Fetch latest run of prover.yml via gh
-    print("No triggering workflow_run found. Fetching latest 'Lean Prover CI' run...")
-
-    out, err, code = run_command(
-        ["gh", "run", "list", "--workflow", "prover.yml", "--limit", "1", 
-         "--json", "conclusion,databaseId,status"]
-    )
-
-    if code != 0 or not out:
-        print(f"Failed to fetch runs: {err}")
-        return None, None, None
-
-    try:
-        runs = json.loads(out)
-    except json.JSONDecodeError:
-        print(f"Failed to decode gh output: {out}")
-        return None, None, None
-
-    if not runs:
-        print("No runs found for prover.yml")
-        return None, None, None
-
-    latest_run = runs[0]
-    conclusion = latest_run.get("conclusion")
-    run_id = latest_run.get("databaseId")
-    workflow_id = "prover.yml"
-
-    print(f"Latest run {run_id} status: {latest_run.get('status')}, conclusion: {conclusion}")
-
-    logs = ""
-    if conclusion != "success":
-        logs = fetch_logs(run_id)
-    else:
-        logs = "Build passed successfully."
-
-    return conclusion, logs, workflow_id
+    # Fallback to fetching via GH CLI (Legacy/Fallback)
+    # This might not work well if we are currently running inside the job we want logs for,
+    # unless we target a different workflow.
+    print("No local log file provided. This script is expected to run with LOCAL_LOG_FILE set.")
+    return "unknown", "No logs available."
 
 
 def call_jules(prompt, attempt=1):
@@ -280,19 +228,8 @@ def call_jules(prompt, attempt=1):
     return None
 
 
-def trigger_next_cycle(workflow_id):
-    """Trigger the next prover.yml run to continue the loop."""
-    target_workflow = workflow_id if workflow_id else "prover.yml"
-    print(f"\n--- Triggering Next Workflow ({target_workflow}) ---")
-    out, err, code = run_command(f"gh workflow run {target_workflow}")
-    if code == 0:
-        print("Successfully triggered next cycle.")
-    else:
-        print(f"Failed to trigger next cycle: {err}")
-
-
 def main():
-    conclusion, logs, workflow_id = get_previous_run_info()
+    conclusion, logs = get_run_info()
 
     # Common restrictions for all prompts
     version_restriction = (
@@ -305,7 +242,7 @@ def main():
     # Build the prompt based on previous run status
     if conclusion == "success":
         prompt = (
-            "The previous Lean Proof GHA run passed successfully. "
+            "The Lean Proof build passed successfully. "
             "Please find one thing to do, improve, fix, or strengthen in the Lean proof files "
             "(specifically files in proofs/). "
             "You can optimize code, add comments, strengthen proofs, replace 'sorry' with actual proofs, or refactor. "
@@ -313,18 +250,12 @@ def main():
             "Do not break existing functionality."
             + version_restriction
         )
-    elif conclusion:
+    else:
+        # Failure case
         prompt = (
-            f"The previous Lean Proof GHA run failed. "
+            f"The Lean Proof build failed. "
             f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
             "Please analyze the logs and fix the errors in the Lean proof files. "
-            "IMPORTANT: Ensure your changes compile and that all proofs are valid."
-            + version_restriction
-        )
-    else:
-        prompt = (
-            "Please find one thing to improve, fix, or strengthen in the Lean proof files "
-            "(specifically files in proofs/). "
             "IMPORTANT: Ensure your changes compile and that all proofs are valid."
             + version_restriction
         )
@@ -343,17 +274,13 @@ def main():
 
     if not changeset:
         print("\nJules failed to produce a changeset after all retries.")
-        print("Triggering next cycle to keep the loop alive...")
-        trigger_next_cycle(workflow_id)
-        sys.exit(0)  # Exit gracefully, the triggered workflow continues the loop
+        sys.exit(0)
 
     patch = changeset.get("gitPatch", {}).get("unidiffPatch")
     msg = changeset.get("gitPatch", {}).get("suggestedCommitMessage", "Jules Improvement")
 
     if not patch:
         print("\nJules returned a ChangeSet but no unidiffPatch.")
-        print("Triggering next cycle to keep the loop alive...")
-        trigger_next_cycle(workflow_id)
         sys.exit(0)
 
     print("\n--- Applying Patch ---")
@@ -369,8 +296,7 @@ def main():
     out, err, code = run_command("git apply jules.patch")
     if code != 0:
         print(f"Failed to apply patch: {err}")
-        print("Patch may be malformed. Triggering next cycle to keep the loop alive...")
-        trigger_next_cycle(workflow_id)
+        print("Patch may be malformed.")
         sys.exit(0)
 
     run_command('git config user.name "Jules Bot"')
@@ -381,8 +307,6 @@ def main():
 
     if code == 0:
         print("\nNo changes to commit after applying patch.")
-        print("Triggering next cycle to keep the loop alive...")
-        trigger_next_cycle(workflow_id)
         sys.exit(0)
 
     print("\n--- Committing and Pushing ---")
@@ -396,11 +320,8 @@ def main():
     print("Pushing changes...")
     run_command("git push origin main", check=True)
 
-    # IMPORTANT: Pushes made with GITHUB_TOKEN do NOT trigger other workflows
-    # (GitHub's infinite loop prevention). We must explicitly trigger prover.yml.
-    print("\n--- Triggering Prover Workflow ---")
-    run_command("gh workflow run prover.yml", check=True)
-    print("Loop iteration complete. Prover workflow triggered.")
+    # We do NOT trigger any further workflows. The CRON schedule handles the loop.
+    print("Push complete. Waiting for next CRON schedule.")
 
 
 if __name__ == "__main__":
