@@ -44,7 +44,7 @@ def Phenotype := Ω → ℝ
 def PGS := Ω → ℝ
 def PC (k : ℕ) := Ω → (Fin k → ℝ)
 
-variable {k p sp n : ℕ} -- k: num PCs, p: num PGS basis funcs, sp: num spline basis funcs, n: sample size
+variable {k p sp n : ℕ} [Fintype (Fin k)] [MeasurableSingletonBorel (Fin k → ℝ)]
 variable {Y : Phenotype} (hY : Measurable Y)
 variable {P : PGS} (hP : Measurable P)
 variable {C : PC k} (hC : Measurable C)
@@ -59,7 +59,7 @@ structure RealizedData (n k : ℕ) where
 -- Concrete measure for example DGPs.
 -- Note: The proof that this is a probability measure requires showing that the product of
 -- probability measures is a probability measure, which holds by Mathlib's `MeasureTheory.Measure.prod`.
-noncomputable def stdNormalProdMeasure {k : ℕ} [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
+noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
   (ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))
 
 instance stdNormalProdMeasure_is_prob {k : ℕ} [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
@@ -108,7 +108,7 @@ structure PhenotypeInformedGAM (p k spline_p : ℕ) where
 -- MODEL IMPLEMENTATION
 -- This version is a direct translation of the expanded formula (Eq. 6) from the paper.
 -- It is much clearer and less error-prone than the original summation.
-noncomputable def linearPredictor (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
+noncomputable def linearPredictor {p k sp : ℕ} (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   -- Term 1: Ancestry-specific baseline (γ₀₀ + ∑ f₀ₗ(PCₗ))
   let baseline_effect := model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (pc_val l)
 
@@ -123,7 +123,7 @@ noncomputable def linearPredictor (model : PhenotypeInformedGAM p k sp) (pgs_val
 
   baseline_effect + pgs_related_effects
 
-noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
+noncomputable def predict {p k sp : ℕ} (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   let η := linearPredictor model pgs_val pc_val
   match model.link with
   | .logit => 1 / (1 + Real.exp (-η))
@@ -133,19 +133,19 @@ noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) 
 ### Section 1.3: Completed Fitting and Loss Definitions
 -/
 
-structure DataGeneratingProcess (k : ℕ) [Fintype (Fin k)] where
+structure DataGeneratingProcess (k : ℕ) where
   trueExpectation : ℝ → (Fin k → ℝ) → ℝ
   jointMeasure : Measure (ℝ × (Fin k → ℝ))
   is_prob : IsProbabilityMeasure jointMeasure
 
-instance (dgp : DataGeneratingProcess k) [Fintype (Fin k)] : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
+instance (dgp : DataGeneratingProcess k) : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
 
 noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : ℝ) : ℝ :=
   match dist with
   | .Gaussian => (y_obs - η)^2
   | .Bernoulli => Real.log (1 + Real.exp η) - y_obs * η
 
-noncomputable def empiricalLoss (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (lambda : ℝ)
+noncomputable def empiricalLoss {p k sp n : ℕ} (model : PhenotypeInformedGAM p k sp) (data : RealizedData n k) (lambda : ℝ)
     [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : ℝ :=
   (1 / n) * ∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))
   + lambda * ((∑ l, ∑ j, (model.f₀ₗ l j)^2) + (∑ m, ∑ l, ∑ j, (model.fₘₗ m l j)^2))
@@ -191,15 +191,15 @@ variable [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
 /-! ### Claim 1 & 2: Scenario Formalization and Necessity of Phenotype Data (PROVEN) -/
 noncomputable def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure,
+  jointMeasure := stdNormalProdMeasure k,
   is_prob := by infer_instance }
 noncomputable def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure,
+  jointMeasure := stdNormalProdMeasure k,
   is_prob := by infer_instance }
 noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure,
+  jointMeasure := stdNormalProdMeasure k,
   is_prob := by infer_instance }
 
 /-- A function has interaction if the effect of P depends on C.
