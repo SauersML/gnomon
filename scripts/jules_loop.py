@@ -9,8 +9,14 @@ import requests
 JULES_API_URL = "https://jules.googleapis.com"
 
 def run_command(cmd, check=False):
-    print(f"Running: {cmd}")
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Support both string (shell=True) and list (shell=False)
+    if isinstance(cmd, list):
+        print(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    else:
+        print(f"Running: {cmd}")
+        result = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+
     if check and result.returncode != 0:
         print(f"Error running command: {cmd}")
         print(result.stdout)
@@ -147,8 +153,8 @@ def main():
     # Ensure we are on the branch (detached HEAD fix)
     # We fetch origin main and checkout it.
     run_command("git fetch origin main")
-    run_command("git checkout main")
-    run_command("git pull origin main") # Ensure up to date
+    # Force checkout main to match origin/main, resetting any local divergence
+    run_command("git checkout -B main origin/main")
 
     out, err, code = run_command("git apply jules.patch")
     if code != 0:
@@ -166,7 +172,8 @@ def main():
         sys.exit(0)
 
     print("Committing changes...")
-    run_command(f'git commit -m "{msg}"', check=True)
+    # Use list args to avoid shell injection in commit message
+    run_command(['git', 'commit', '-m', msg], check=True)
 
     print("Pushing changes...")
     run_command("git push origin main", check=True)
