@@ -207,9 +207,12 @@ theorem scenarios_are_distinct (k : ℕ) (hk : k > 0) [Fintype (Fin k)] :
     have hp_ne : (0 : ℝ) ≠ 1 := by norm_num
     have hc_ne : (fun _ => 0) ≠ (fun l => if l = ⟨0, hk⟩ then 1 else 0) := by
       intro h_eq; have := congr_fun h_eq ⟨0, hk⟩; simp at this
-    repeat' apply And.intro; exact hp_ne; exact hc_ne
-    simp only [dgpScenario1_trueExpectation, Finset.sum_const_zero, mul_zero, add_zero, one_mul, Finset.sum_fin_ite, Finset.mem_univ, if_true, mul_one, div_one, sub_zero]
-    norm_num
+    constructor
+    · exact hp_ne
+    · constructor
+      · exact hc_ne
+      · simp only [dgpScenario1_trueExpectation, Finset.sum_const_zero, mul_zero, add_zero, one_mul, Finset.sum_fin_ite, Finset.mem_univ, if_true, mul_one, div_one, sub_zero]
+        norm_num
   have h_s3 : ¬ hasInteraction (dgpScenario3 k).trueExpectation := by
     dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario3_trueExpectation, add_sub_add_left_eq_sub, div_self hp_ne]
   have h_s4 : ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
