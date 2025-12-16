@@ -189,15 +189,18 @@ section AllClaims
 variable [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
 
 /-! ### Claim 1 & 2: Scenario Formalization and Necessity of Phenotype Data (PROVEN) -/
-def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+noncomputable def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k }
-def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+  jointMeasure := stdNormalProdMeasure k,
+  is_prob := by infer_instance }
+noncomputable def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k }
-def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+  jointMeasure := stdNormalProdMeasure k,
+  is_prob := by infer_instance }
+noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k }
+  jointMeasure := stdNormalProdMeasure k,
+  is_prob := by infer_instance }
 
 /-- A function has interaction if the effect of P depends on C.
     Formally: the partial derivative ∂f/∂P is not constant in C. -/
