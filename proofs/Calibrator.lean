@@ -59,10 +59,10 @@ structure RealizedData (n k : ℕ) where
 -- Concrete measure for example DGPs.
 -- Note: The proof that this is a probability measure requires showing that the product of
 -- probability measures is a probability measure, which holds by Mathlib's `MeasureTheory.Measure.prod`.
-noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
+noncomputable def stdNormalProdMeasure {k : ℕ} [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
   (ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))
 
-instance stdNormalProdMeasure_is_prob (k : ℕ) [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
+instance stdNormalProdMeasure_is_prob {k : ℕ} [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
   unfold stdNormalProdMeasure; infer_instance
 
 /-!
@@ -133,12 +133,12 @@ noncomputable def predict (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) 
 ### Section 1.3: Completed Fitting and Loss Definitions
 -/
 
-structure DataGeneratingProcess (k : ℕ) where
+structure DataGeneratingProcess (k : ℕ) [Fintype (Fin k)] where
   trueExpectation : ℝ → (Fin k → ℝ) → ℝ
   jointMeasure : Measure (ℝ × (Fin k → ℝ))
   is_prob : IsProbabilityMeasure jointMeasure
 
-instance (dgp : DataGeneratingProcess k) : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
+instance (dgp : DataGeneratingProcess k) [Fintype (Fin k)] : IsProbabilityMeasure dgp.jointMeasure := dgp.is_prob
 
 noncomputable def pointwiseNLL (dist : DistributionFamily) (y_obs : ℝ) (η : ℝ) : ℝ :=
   match dist with
@@ -191,20 +191,20 @@ variable [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
 /-! ### Claim 1 & 2: Scenario Formalization and Necessity of Phenotype Data (PROVEN) -/
 noncomputable def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k,
+  jointMeasure := stdNormalProdMeasure,
   is_prob := by infer_instance }
 noncomputable def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k,
+  jointMeasure := stdNormalProdMeasure,
   is_prob := by infer_instance }
 noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k,
+  jointMeasure := stdNormalProdMeasure,
   is_prob := by infer_instance }
 
 /-- A function has interaction if the effect of P depends on C.
     Formally: the partial derivative ∂f/∂P is not constant in C. -/
-def hasInteraction (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
+def hasInteraction {k : ℕ} (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
   ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
@@ -220,7 +220,8 @@ theorem scenarios_are_distinct (k : ℕ) (hk : k > 0) [Fintype (Fin k)] :
     · norm_num
     constructor
     · intro h_eq
-      have : (0 : ℝ) = if (⟨0, hk⟩ : Fin k) = ⟨0, hk⟩ then 1 else 0 := congr_fun h_eq ⟨0, hk⟩
+      have : (0 : ℝ) = if (⟨0, hk⟩ : Fin k) = ⟨0, hk⟩ then 1 else 0 := by
+        exact congr_fun h_eq ⟨0, hk⟩
       simp at this
     · simp only [dgpScenario1, mul_one, mul_zero, zero_mul, sub_zero, div_one]
       -- Left side: slope at c₁ = (fun _ => 0) is 1 + 0.1 * 0 = 1
@@ -252,8 +253,8 @@ theorem scenarios_are_distinct (k : ℕ) (hk : k > 0) [Fintype (Fin k)] :
       exact div_self (sub_ne_zero.mpr hp_ne)
     simp only [sub_sub_sub_cancel_left, this, h2, ne_eq, not_true_eq_false] at h_slopes_ne
 
-theorem necessity_of_phenotype_data [Fintype (Fin 1)] :
-  ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
+theorem necessity_of_phenotype_data :
+  ∃ (dgp_A dgp_B : @DataGeneratingProcess 1 (Fin.fintype 1)),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
   letI : Fintype (Fin 1) := Fin.fintype 1
   use dgpScenario1 1, dgpScenario4 1
@@ -264,10 +265,10 @@ theorem necessity_of_phenotype_data [Fintype (Fin 1)] :
 Under independence of P and C, if the true expectation is additive (no interaction),
 then the optimal model in our class also has no interaction terms.
 -/
-noncomputable def expectedSquaredError (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
+noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
-def isBayesOptimalInClass (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : Prop :=
+def isBayesOptimalInClass {k p sp : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) [Fintype (Fin p)] [Fintype (Fin sp)] : Prop :=
   ∀ m, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
@@ -277,35 +278,32 @@ This is a fundamental result from functional analysis: when X and Y are independ
 the L2 projection of h(X) + g(Y) onto a product function class decomposes into
 projections of h and g separately. The interaction terms vanish because
 E[X·Y] = E[X]·E[Y] under independence. -/
-axiom l2_projection_of_additive_is_additive
+axiom l2_projection_of_additive_is_additive {k p sp : ℕ} [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
   (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ)
   (dgp : DataGeneratingProcess k)
-  (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  let true_fn := fun p c => f p + ∑ i, g i (c i)
-  -- For any model that is optimal for true_fn, it has no interaction terms
-  ∀ (proj : PhenotypeInformedGAM p k sp),
-    (∀ m, expectedSquaredError dgp (fun p c => linearPredictor proj p c) ≤
-          expectedSquaredError dgp (fun p c => linearPredictor m p c)) →
-    dgp.trueExpectation = true_fn →
-    IsNormalizedScoreModel proj
+  (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
+  (true_fn : ℝ → (Fin k → ℝ) → ℝ)
+  (h_true_fn : true_fn = fun p c => f p + ∑ i, g i (c i))
+  (proj : PhenotypeInformedGAM p k sp)
+  (h_optimal : isBayesOptimalInClass dgp proj)
+  (h_dgp_true : dgp.trueExpectation = true_fn) :
+  IsNormalizedScoreModel proj
 
 -- Proof of Claim 3
-theorem independence_implies_no_interaction
+theorem independence_implies_no_interaction {k p sp : ℕ} [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k)
     (h_additive : ∃ f g, dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
   ∀ m (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
   intros m h_opt
-  -- Extract the additive structure from the hypothesis
   obtain ⟨f, g, h_fn_struct⟩ := h_additive
-  -- Apply the axiom: under independence and additive structure, optimal model is normalized
-  exact l2_projection_of_additive_is_additive f g dgp h_indep m h_opt h_fn_struct
+  exact l2_projection_of_additive_is_additive f g dgp h_indep (fun p c => f p + ∑ i, g i (c i)) h_fn_struct m h_opt h_fn_struct
 
 /-! ### Claim 4: Prediction-Causality Trade-off (Axiomatically Supported)
 
 When P and C are correlated (confounded), the prediction-optimal coefficient for P
 differs from the true causal effect. This is the classic omitted variable bias. -/
-structure DGPWithEnvironment (k : ℕ) where
+structure DGPWithEnvironment (k : ℕ) [Fintype (Fin k)] where
   to_dgp : DataGeneratingProcess k
   environmentalEffect : (Fin k → ℝ) → ℝ
   trueGeneticEffect : ℝ → ℝ
@@ -316,21 +314,21 @@ structure DGPWithEnvironment (k : ℕ) where
 For Y = βP + γC with correlated P and C, the OLS coefficient is:
   β_ols = β + γ * Cov(P,C) / Var(P)
 which equals β iff Cov(P,C) = 0. -/
-axiom optimal_linear_coeff_solution (dgp : DataGeneratingProcess 1)
-  (h_Y : dgp.trueExpectation = fun p c => 2*p + 3*(c 0)) :
-  ∀ (proj : PhenotypeInformedGAM 1 1 1),
-    (∀ m, expectedSquaredError dgp (fun p c => linearPredictor proj p c) ≤
-          expectedSquaredError dgp (fun p c => linearPredictor m p c)) →
-    (proj.γₘ₀ 0 ≠ 2) ↔ (∫ pc, pc.1 * (pc.2 0) ∂dgp.jointMeasure ≠ (0 : ℝ))
+axiom optimal_linear_coeff_solution {p sp : ℕ} [Fintype (Fin p)] [Fintype (Fin sp)]
+  (dgp : @DataGeneratingProcess 1 (Fin.fintype 1))
+  (h_Y : dgp.trueExpectation = fun p c => 2*p + 3*(c 0))
+  (proj : PhenotypeInformedGAM p 1 sp)
+  (h_optimal : isBayesOptimalInClass dgp proj) :
+  (proj.γₘ₀ ⟨0, by omega⟩ ≠ 2) ↔ (∫ pc, pc.1 * (pc.2 0) ∂dgp.jointMeasure ≠ (0 : ℝ))
 
-theorem prediction_causality_tradeoff_linear_case
+theorem prediction_causality_tradeoff_linear_case {p sp : ℕ} [Fintype (Fin p)] [Fintype (Fin sp)]
     (dgp_env : DGPWithEnvironment 1)
     (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
     (h_env : dgp_env.environmentalEffect = fun c => 3 * c 0)
     (h_confounding : ∫ pc, pc.1 * (pc.2 0) ∂dgp_env.to_dgp.jointMeasure ≠ (0 : ℝ))
-    (model : PhenotypeInformedGAM 1 1 1)
+    (model : PhenotypeInformedGAM p 1 sp)
     (h_opt : isBayesOptimalInClass dgp_env.to_dgp model) :
-    model.γₘ₀ 0 ≠ 2 := by
+    model.γₘ₀ ⟨0, by omega⟩ ≠ 2 := by
   letI : Fintype (Fin 1) := Fin.fintype 1
   have h_Y : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c 0 := by
     rw [dgp_env.is_additive_causal, h_gen, h_env]
