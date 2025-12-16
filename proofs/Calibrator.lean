@@ -11,6 +11,7 @@ import Mathlib.MeasureTheory.Constructions.Pi
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
+import Mathlib.Data.NNReal.Basic
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Probability.Integration
 import Mathlib.Probability.Moments.Variance
@@ -56,10 +57,10 @@ structure RealizedData (n k : ℕ) where
 
 -- Concrete measure for example DGPs.
 noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
-  (Measure.gaussian 0 1).prod (Measure.pi (fun (_ : Fin k) => Measure.gaussian 0 1))
+  (ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))
 instance stdNormalProdMeasure_is_prob (k : ℕ) [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
   constructor
-  simp [stdNormalProdMeasure, (Measure.gaussian 0 1).volume_val, Finset.prod_const_one]
+  simp [stdNormalProdMeasure, ProbabilityTheory.integral_gaussianPDFReal_eq_one (by norm_num), Finset.prod_const_one]
 
 /-!
 ### Section 1.2: Completed Model Specification (GAM)
