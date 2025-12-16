@@ -93,12 +93,14 @@ def get_run_info():
             with open(local_log_file, 'r') as f:
                 raw_logs = f.read()
 
-            # If status is success, we might not need logs, but we'll process them anyway
+            # Filter noise first
             logs = filter_noise(strip_ansi(raw_logs))
 
-            if len(logs) > 300000:
-                print("Truncating logs to 300,000 characters...")
-                logs = logs[:300000]
+            # Truncation logic: prioritize the END of the logs where errors usually are.
+            max_len = 300000
+            if len(logs) > max_len:
+                print(f"Log size {len(logs)} exceeds {max_len}. Keeping last {max_len} characters.")
+                logs = "..." + logs[-max_len:]
 
             return local_status, logs
         except Exception as e:
