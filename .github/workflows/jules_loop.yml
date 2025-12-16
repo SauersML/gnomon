@@ -1,20 +1,12 @@
 name: Jules Optimizer Loop
 
 on:
-  # Triggered when Lean Prover CI completes (success or failure) on main branch
-  workflow_run:
-    workflows: ["Lean Prover CI"]
-    types:
-      - completed
-    branches:
-      - main
+  # Daily CRON at every 20 minutes to maintain constant improvement
+  schedule:
+    - cron: '*/20 * * * *'
   
   # Manual trigger
   workflow_dispatch:
-  
-  # Daily CRON at 3 AM EST (8 AM UTC) to restart loop if it broke
-  schedule:
-    - cron: '0 8 * * *'
 
 permissions:
   contents: write
@@ -24,7 +16,7 @@ jobs:
   optimize:
     runs-on: ubuntu-latest
     # Increase timeout since Jules can take a while
-    timeout-minutes: 30
+    timeout-minutes: 45
     
     steps:
       - name: Checkout repository
@@ -32,11 +24,85 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history for git operations
           
-      - name: Debug - Show triggering event
+      # --- Lean Setup Steps (Copied from Prover CI) ---
+
+      - name: Install elan
         run: |
-          echo "Event name: ${{ github.event_name }}"
-          echo "Workflow run conclusion: ${{ github.event.workflow_run.conclusion }}"
-          echo "Workflow run id: ${{ github.event.workflow_run.id }}"
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Cache Lean toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
+
+      - name: Cache everything Lake-related
+        id: cache-lake-all
+        uses: actions/cache@v4
+        with:
+          path: |
+            .lake
+            lake-manifest.json
+          key: ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-v2
+          restore-keys: |
+            ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-
+            ${{ runner.os }}-lake-complete-
+
+      - name: Verify cache completeness
+        id: check-cache
+        run: |
+          echo "🔍 Checking cache completeness..."
+          if [ ! -f "lake-manifest.json" ] || [ ! -d ".lake" ]; then
+            echo "valid=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          EXPECTED_PACKAGES=("mathlib" "aesop" "batteries" "proofwidgets" "Qq" "plausible" "LeanSearchClient" "importGraph" "Cli")
+          ALL_FOUND=true
+          for pkg in "${EXPECTED_PACKAGES[@]}"; do
+            if [ ! -d ".lake/packages/$pkg" ]; then ALL_FOUND=false; fi
+          done
+
+          if [ "$ALL_FOUND" = true ]; then echo "valid=true" >> $GITHUB_OUTPUT; else echo "valid=false" >> $GITHUB_OUTPUT; fi
+
+      - name: Update and fetch dependencies (only if cache miss)
+        if: steps.check-cache.outputs.valid != 'true'
+        run: |
+          lake update
+          lake exe cache get || true
+
+      - name: Build all dependencies (only if cache miss)
+        if: steps.check-cache.outputs.valid != 'true'
+        run: |
+          lake build --no-build || true
+          lake build
+
+      # --- Verification Step with Log Capture ---
+
+      - name: Verify Proofs (Capture Output)
+        id: verify
+        run: |
+          echo "🚀 Building Calibrator..."
+          set +e # Don't exit on failure
+
+          # Run build and tee to log file
+          lake build -v Calibrator > build.log 2>&1
+          EXIT_CODE=$?
+
+          echo "Build finished with exit code $EXIT_CODE"
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+
+          # Print the last few lines for immediate visibility in GHA logs
+          echo "--- Tail of build.log ---"
+          tail -n 20 build.log
+
+      # --- Jules Optimization Step ---
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,4 +116,6 @@ jobs:
         env:
           JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_LOG_FILE: build.log
+          LOCAL_BUILD_STATUS: ${{ steps.verify.outputs.status }}
         run: python scripts/jules_loop.py

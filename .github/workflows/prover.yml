@@ -196,14 +196,3 @@ jobs:
             exit 1
           fi
           echo "================================================="
-
-      - name: Trigger Jules Loop
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🔄 Triggering Jules Optimizer Loop..."
-          # Explicitly trigger jules_loop.yml since workflow_run triggers
-          # from GITHUB_TOKEN-authenticated operations can be unreliable
-          gh workflow run jules_loop.yml || echo "Failed to trigger jules_loop.yml (may already be running)"
-          echo "✅ Jules Loop triggered"
