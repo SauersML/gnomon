@@ -59,7 +59,7 @@ structure RealizedData (n k : ℕ) where
 -- Note: The proof that this is a probability measure requires showing that the product of
 -- probability measures is a probability measure, which holds by Mathlib's `MeasureTheory.Measure.prod`.
 noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
-  (ProbabilityTheory.gaussianReal 0 1).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1))
+  (ProbabilityTheory.gaussianReal 0 (1 : NNReal)).prod (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 (1 : NNReal)))
 
 instance stdNormalProdMeasure_is_prob (k : ℕ) [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
   unfold stdNormalProdMeasure
