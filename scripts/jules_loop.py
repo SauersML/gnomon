@@ -98,6 +98,8 @@ def call_jules(prompt):
     print(f"Session created: {session_name}")
 
     max_retries = 60 # 10 minutes
+    seen_ids = set()
+
     for _ in range(max_retries):
         time.sleep(10)
         print("Polling activities...")
@@ -111,12 +113,58 @@ def call_jules(prompt):
             continue
 
         activities = r.json().get("activities", [])
-        for act in reversed(activities):
+        # Sort chronologically to print in order
+        activities.sort(key=lambda x: x.get("createTime", ""))
+
+        latest_changeset = None
+
+        for act in activities:
+            act_id = act.get("id")
+            if act_id in seen_ids:
+                continue
+            seen_ids.add(act_id)
+
+            originator = act.get("originator", "UNKNOWN")
+            # act_type = "Activity"
+            # if "planGenerated" in act:
+            #     act_type = "Plan Generated"
+            # elif "progressUpdated" in act:
+            #     act_type = "Progress Update"
+            # elif "sessionCompleted" in act:
+            #     act_type = "Session Completed"
+
+            print(f"\n--- New Activity ({originator}) ---")
+
+            if "planGenerated" in act:
+                print("Plan Generated:")
+                steps = act["planGenerated"].get("plan", {}).get("steps", [])
+                for step in steps:
+                    print(f"  {step.get('index', '?')}. {step.get('title', '')}")
+
+            if "progressUpdated" in act:
+                prog = act["progressUpdated"]
+                print(f"Status: {prog.get('title', '')}")
+                if "description" in prog:
+                    print(f"Details: {prog['description']}")
+
             if "artifacts" in act:
                 for art in act["artifacts"]:
+                    if "bashOutput" in art:
+                        bo = art["bashOutput"]
+                        print(f"Bash Command: {bo.get('command')}")
+                        print(f"Output:\n{bo.get('output')}")
                     if "changeSet" in art:
-                        print("Found ChangeSet!")
-                        return art["changeSet"]
+                        print("Artifact: ChangeSet found.")
+                        latest_changeset = art["changeSet"]
+                    if "pullRequest" in art:
+                        pr = art["pullRequest"]
+                        print(f"Pull Request: {pr.get('title')} - {pr.get('url')}")
+
+            if "sessionCompleted" in act:
+                print("Session Completed.")
+
+        if latest_changeset:
+            return latest_changeset
 
     print("Timed out waiting for Jules to produce a ChangeSet.")
     sys.exit(1)
@@ -145,7 +193,7 @@ def main():
             "IMPORTANT: Ensure your changes compile and that all proofs are valid."
         )
 
-    print(f"Prompting Jules with: {prompt[:200]}...")
+    print(f"Prompting Jules with:\n{prompt}\n")
 
     changeset = call_jules(prompt)
 
