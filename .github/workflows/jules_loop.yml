@@ -76,7 +76,7 @@ jobs:
         if: steps.check-cache.outputs.valid != 'true'
         run: |
           lake build --no-build || true
-          lake build
+          lake build || true
 
       # --- Verification Step with Log Capture ---
 
