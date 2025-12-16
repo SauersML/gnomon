@@ -16,6 +16,8 @@ import Mathlib.Probability.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 
+open MeasureTheory
+
 -- The project's root namespace, as defined in `lakefile.lean`.
 namespace Calibrator
 
@@ -33,7 +35,7 @@ provable, concrete basis functions. Every definition is fully implemented.
 -/
 
 -- The abstract probability space for theoretical results (convergence, expectation).
-variable {Ω : Type*} [MeasureSpace Ω] [IsProbabilityMeasure (ℙ : Measure Ω)]
+variable {Ω : Type*} [MeasureSpace Ω] {ℙ : Measure Ω} [IsProbabilityMeasure ℙ]
 
 -- Core types as random variables, for theoretical analysis.
 def Phenotype := Ω → ℝ
@@ -55,7 +57,9 @@ structure RealizedData (n k : ℕ) where
 -- Concrete measure for example DGPs.
 noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (ℝ × (Fin k → ℝ)) :=
   (Measure.gaussian 0 1).prod (Measure.pi (fun (_ : Fin k) => Measure.gaussian 0 1))
-axiom stdNormalProdMeasure_is_prob (k : ℕ) [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k)
+instance stdNormalProdMeasure_is_prob (k : ℕ) [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
+  constructor
+  simp [stdNormalProdMeasure, (Measure.gaussian 0 1).volume_val, Finset.prod_const_one]
 
 /-!
 ### Section 1.2: Completed Model Specification (GAM)
@@ -181,18 +185,15 @@ section AllClaims
 variable [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
 
 /-! ### Claim 1 & 2: Scenario Formalization and Necessity of Phenotype Data (PROVEN) -/
-@[simps]
 def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
-@[simps]
+  jointMeasure := stdNormalProdMeasure k }
 def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
-@[simps]
+  jointMeasure := stdNormalProdMeasure k }
 def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
-  jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
+  jointMeasure := stdNormalProdMeasure k }
 
 def hasInteraction (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
   ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
@@ -211,24 +212,26 @@ theorem scenarios_are_distinct (k : ℕ) (hk : k > 0) [Fintype (Fin k)] :
     · exact hp_ne
     · constructor
       · exact hc_ne
-      · simp only [dgpScenario1_trueExpectation, Finset.sum_const_zero, mul_zero, add_zero, one_mul, Finset.sum_fin_ite, Finset.mem_univ, if_true, mul_one, div_one, sub_zero]
+      · simp [dgpScenario1, Finset.sum_const_zero, mul_zero, add_zero, one_mul, Finset.sum_fin_ite, Finset.mem_univ, if_true, mul_one, div_one, sub_zero]
         norm_num
   have h_s3 : ¬ hasInteraction (dgpScenario3 k).trueExpectation := by
-    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario3_trueExpectation, add_sub_add_left_eq_sub, div_self hp_ne]
+    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario3, add_sub_add_left_eq_sub, div_self hp_ne]
   have h_s4 : ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
-    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario4_trueExpectation, sub_sub_sub_cancel_left, div_self hp_ne]
+    dsimp [hasInteraction]; push_neg; intros p₁ p₂ c₁ c₂ hp_ne _; simp [dgpScenario4, sub_sub_sub_cancel_left, div_self hp_ne]
   exact ⟨h_s1, h_s3, h_s4⟩
 
 theorem necessity_of_phenotype_data [Fintype (Fin 1)] :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-  use dgpScenario1 1, dgpScenario4 1; exact ⟨rfl, (scenarios_are_distinct 1 (by norm_num)).1, (scenarios_are_distinct 1 (by norm_num)).2.2⟩
+  letI : Fintype (Fin 1) := Fin.fintype 1
+  use dgpScenario1 1, dgpScenario4 1
+  exact ⟨rfl, (scenarios_are_distinct 1 (by norm_num)).1, (scenarios_are_distinct 1 (by norm_num)).2.2⟩
 
 /-! ### Claim 3: Independence Condition (Axiomatically Supported) -/
 noncomputable def expectedSquaredError (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
-def isBayesOptimalInClass (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
+def isBayesOptimalInClass (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] : Prop :=
   ∀ m, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
@@ -261,18 +264,19 @@ structure DGPWithEnvironment (k : ℕ) where
   trueGeneticEffect : ℝ → ℝ
   is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
 
-axiom optimal_linear_coeff_solution (dgp : DataGeneratingProcess k) [Fact (k=1)]
+axiom optimal_linear_coeff_solution (dgp : DataGeneratingProcess 1)
   (h_Y : dgp.trueExpectation = fun p c => 2*p + 3*(c 0)) :
-  let proj : PhenotypeInformedGAM 1 k 1 := sorry in -- The L2 projection
+  let proj : PhenotypeInformedGAM 1 1 1 := sorry in -- The L2 projection
   (proj.γₘ₀ 0 ≠ 2) ↔ (∫ pc, pc.1 * (pc.2 0) ∂dgp.jointMeasure ≠ (0 : ℝ))
 
 theorem prediction_causality_tradeoff_linear_case
-    (dgp_env : DGPWithEnvironment 1) [Fact (k=1)]
+    (dgp_env : DGPWithEnvironment 1)
     (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
     (h_env : dgp_env.environmentalEffect = fun c => 3 * c 0)
     (h_confounding : ∫ pc, pc.1 * (pc.2 0) ∂dgp_env.to_dgp.jointMeasure ≠ (0 : ℝ)) :
   let model : PhenotypeInformedGAM 1 1 1 := sorry in -- The optimal model
   (isBayesOptimalInClass dgp_env.to_dgp model) → model.γₘ₀ 0 ≠ 2 := by
+  letI : Fintype (Fin 1) := Fin.fintype 1
   intro h_opt
   have h_Y : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c 0 := by
     rw [dgp_env.is_additive_causal, h_gen, h_env]
@@ -392,21 +396,21 @@ def predictionBias (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) 
   dgp.trueExpectation p_val c_val - f p_val c_val
 
 lemma optimal_raw_coeffs_under_simplifying_assumptions
-    (dgp4 : DataGeneratingProcess 1) [Fact (p=1)]
+    (dgp4 : DataGeneratingProcess 1) (h_p_eq_one : p = 1)
     (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c 0))
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = (0 : ℝ) ∧ ∫ pc, pc.2 0 ∂dgp4.jointMeasure = (0 : ℝ))
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
-    let model_raw : PhenotypeInformedGAM 1 1 1 := sorry in
+    let model_raw : PhenotypeInformedGAM p 1 1 := sorry in
     (∀ m (hm : IsRawScoreModel m), expectedSquaredError dgp4 (fun p c => linearPredictor model_raw p c) ≤
                                   expectedSquaredError dgp4 (fun p c => linearPredictor m p c))
-    → model_raw.γₘ₀ 0 = 1 ∧ model_raw.γ₀₀ = 0 := by
+    → model_raw.γₘ₀ ⟨0, by rw [h_p_eq_one]; exact Nat.zero_lt_one⟩ = 1 ∧ model_raw.γ₀₀ = 0 := by
     -- This follows from solving the normal equations for OLS: E[Y - (β₀+β₁P)] = 0 and E[(Y - (β₀+β₁P))P] = 0.
     -- With Y = P - 0.8C and zero means, this gives β₀=0 and β₁ = E[YP]/E[P²] = E[P(P-0.8C)]/1 = E[P²]-0.8E[P]E[C] = 1-0 = 1.
     -- The formal proof requires calculus of variations on the expectedSquaredError, which we axiomize here for brevity.
     sorry
 
-theorem raw_score_bias_in_scenario4_simplified [Fact (p=1)]
+theorem raw_score_bias_in_scenario4_simplified (h_p_eq_one : p = 1)
     (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c 0))
@@ -417,7 +421,7 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p=1)]
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val 0 := by
-  have h_coeffs := optimal_raw_coeffs_under_simplifying_assumptions dgp4 h_s4 h_indep h_means_zero h_var_p_one h_opt_raw
+  have h_coeffs := optimal_raw_coeffs_under_simplifying_assumptions dgp4 (by simp [h_p_eq_one]) h_s4 h_indep h_means_zero h_var_p_one h_opt_raw
   intros p_val c_val
   rw [predictionBias, h_s4]
   have h_pred : linearPredictor model_raw p_val c_val = p_val := by
@@ -429,11 +433,11 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p=1)]
     -- Apply the optimal coefficient values
     simp only [h_coeffs.2, zero_add]
     -- The sum is over a singleton set `Fin 1`, whose only element is `0`.
-    rw [Finset.sum_singleton]
+    simp [Finset.sum_singleton]
     -- The expression is now: `(model_raw.γₘ₀ 0) * (model_raw.pgsBasis.B ⟨0 + 1, _⟩ p_val)`
     simp only [h_coeffs.1, one_mul]
     -- Use the fact that the basis function `B 1` is the identity function
-    rw [h_pgs_basis_linear.1, id_def]
+    rw [h_pgs_basis_linear.1]
   rw [h_pred]
   ring
 
@@ -449,7 +453,7 @@ theorem quantitative_error_of_normalization (dgp1 : DataGeneratingProcess k) (h_
   = rsquared dgp1 (fun p c => p) (fun p c => c) * var dgp1 (fun p c => p) := by sorry
 
 def dgpMultiplicativeBias (k : ℕ) [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
-  { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k, is_prob := by exact stdNormalProdMeasure_is_prob k }
+  { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
 
 theorem multiplicative_bias_correction (scaling_func : (Fin k → ℝ) → ℝ) (h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias k scaling_func) model) :
@@ -462,7 +466,7 @@ structure DGPWithLatentRisk (k : ℕ) where
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
 theorem shrinkage_effect (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) :
+    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) [Fintype (Fin sp)] :
   ∀ c, (model.γₘ₀ 0 + evalSmooth model.pcSplineBasis (model.fₘₗ 0 0) (c 0)) ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by sorry
 
 theorem prediction_is_invariant_to_affine_pc_transform
@@ -481,7 +485,7 @@ theorem context_specificity (dgp1 dgp2 : DGPWithEnvironment k)
     (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : isBayesOptimalInClass dgp1.to_dgp model1) :
   ¬ isBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
-  let f_pred := linearPredictor model1
+  let f_pred := fun p c => linearPredictor model1 p c
   have h_proj_unique : dgp1.to_dgp.trueExpectation =ᵐ[dgp1.to_dgp.jointMeasure] dgp2.to_dgp.trueExpectation := by
     -- L2 projection is unique. Since f_pred is the projection of both functions, the functions
     -- must be equal almost everywhere w.r.t the measure.
