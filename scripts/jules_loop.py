@@ -44,19 +44,58 @@ def run_command(cmd, check=False):
 
 
 def fetch_logs(run_id):
-    """Fetches logs for a specific workflow run."""
+    """
+    Fetches logs for a specific workflow run.
+    Prioritizes important steps first: Deep Debug Information and Build dependencies.
+    """
     print(f"Fetching logs for run {run_id}...")
     out, err, code = run_command(f"gh run view {run_id} --log")
-    if code == 0:
-        logs = strip_ansi(out)
-        print(f"Logs fetched. Length: {len(logs)} characters.")
-        if len(logs) > 50000:
-            print("Truncating logs to last 50,000 characters...")
-            logs = logs[-50000:]
-        return logs
-    else:
+    if code != 0:
         print(f"Failed to fetch logs: {err}")
         return f"Failed to fetch logs: {err}"
+    
+    raw_logs = strip_ansi(out)
+    print(f"Logs fetched. Length: {len(raw_logs)} characters.")
+    
+    # Prioritize important steps by extracting them first
+    important_steps = [
+        "Deep Debug Information",
+        "Build all dependencies",
+    ]
+    
+    prioritized_logs = []
+    remaining_logs = raw_logs
+    
+    for step_name in important_steps:
+        # Try to find the step section in logs
+        # GitHub Actions logs have format: "step-name\t<timestamp>\t<content>"
+        step_marker = step_name
+        if step_marker in raw_logs:
+            # Find the section for this step
+            start_idx = raw_logs.find(step_marker)
+            if start_idx != -1:
+                # Find the next step (lines starting without tab after content)
+                end_idx = len(raw_logs)
+                # Look for next step header pattern
+                next_step_idx = raw_logs.find("\nprove\t", start_idx + len(step_marker))
+                if next_step_idx != -1:
+                    end_idx = next_step_idx
+                
+                step_content = raw_logs[start_idx:end_idx]
+                prioritized_logs.append(f"=== PRIORITY: {step_name} ===\n{step_content}\n")
+    
+    # Combine prioritized logs first, then remaining
+    if prioritized_logs:
+        logs = "\n".join(prioritized_logs) + "\n\n=== FULL LOGS ===\n" + raw_logs
+    else:
+        logs = raw_logs
+    
+    # Truncate to 300k chars if needed
+    if len(logs) > 300000:
+        print("Truncating logs to 300,000 characters...")
+        logs = logs[:300000]
+    
+    return logs
 
 
 def get_previous_run_info():
