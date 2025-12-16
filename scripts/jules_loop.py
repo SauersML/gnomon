@@ -281,6 +281,9 @@ def main():
     # Use list args to avoid shell injection in commit message
     run_command(['git', 'commit', '-m', msg], check=True)
 
+    print("Pulling latest changes to avoid non-fast-forward...")
+    run_command("git pull --rebase origin main", check=True)
+
     print("Pushing changes...")
     run_command("git push origin main", check=True)
 
