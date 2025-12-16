@@ -1,11 +1,13 @@
 name: Jules Optimizer Loop
 
 on:
-  # Triggered when Lean Prover CI completes (success or failure)
+  # Triggered when Lean Prover CI completes (success or failure) on main branch
   workflow_run:
     workflows: ["Lean Prover CI"]
     types:
       - completed
+    branches:
+      - main
   
   # Manual trigger
   workflow_dispatch:
@@ -29,6 +31,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # Fetch all history for git operations
+          
+      - name: Debug - Show triggering event
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          echo "Workflow run conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Workflow run id: ${{ github.event.workflow_run.id }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
