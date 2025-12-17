@@ -7,8 +7,7 @@ use super::progress::{
 };
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::prelude::ReborrowMut;
-use faer::{Accum, Mat, MatMut, Par, unzip, zip};
+use faer::{Accum, Mat, MatMut, Par};
 use std::error::Error;
 
 pub struct HwePcaProjector<'model> {
@@ -306,27 +305,29 @@ impl<'model> HwePcaProjector<'model> {
                     let start = processed.min(weights.len());
                     let end = (processed + filled).min(weights.len());
                     let weight_slice = &weights[start..end];
-                    let mut row_idx = 0usize;
                     let weight_len = weight_slice.len();
-                    zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
-                        let value = *value;
-                        let weight_sq = if row_idx < weight_len {
-                            let weight = weight_slice[row_idx];
-                            weight * weight
-                        } else {
-                            1.0
-                        };
-                        *sq = weight_sq * value * value;
-                        row_idx += 1;
-                        if row_idx == filled {
-                            row_idx = 0;
+                    // Use explicit loops instead of zip! to avoid reliance on
+                    // unspecified iteration order (faer docs state order is unspecified)
+                    for col in 0..components {
+                        for row in 0..filled {
+                            let value = loadings_block[(row, col)];
+                            let weight_sq = if row < weight_len {
+                                let weight = weight_slice[row];
+                                weight * weight
+                            } else {
+                                1.0
+                            };
+                            sq_block[(row, col)] = weight_sq * value * value;
                         }
-                    });
+                    }
                 } else {
-                    zip!(sq_block.rb_mut(), loadings_block).for_each(|unzip!(sq, value)| {
-                        let value = *value;
-                        *sq = value * value;
-                    });
+                    // No LD weights - simple element-wise squaring
+                    for col in 0..components {
+                        for row in 0..filled {
+                            let value = loadings_block[(row, col)];
+                            sq_block[(row, col)] = value * value;
+                        }
+                    }
                 }
 
                 if let Some(ref mut r2) = alignment_r2 {

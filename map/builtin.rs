@@ -122,6 +122,12 @@ pub fn ensure_model(model: &BuiltinModel) -> Result<PathBuf, BuiltinModelError> 
     // Download to a temporary .zst file
     let cache = cache_dir()?;
     let zst_path = cache.join(format!("{}.json.zst", model.name));
+    // Use a temp path for decompression to avoid cache corruption
+    let json_temp_path = cache.join(format!("{}.json.tmp", model.name));
+
+    // Clean up any leftover temp files from previous failed attempts
+    let _ = fs::remove_file(&zst_path);
+    let _ = fs::remove_file(&json_temp_path);
 
     download_file(model.url, &zst_path)?;
     eprintln!("  Downloaded to: {}", zst_path.display());
@@ -131,7 +137,7 @@ pub fn ensure_model(model: &BuiltinModel) -> Result<PathBuf, BuiltinModelError> 
         eprintln!("  Verifying SHA256...");
         let actual = compute_sha256(&zst_path)?;
         if actual != model.sha256 {
-            fs::remove_file(&zst_path)?;
+            let _ = fs::remove_file(&zst_path);
             return Err(BuiltinModelError::HashMismatch {
                 expected: model.sha256.to_string(),
                 actual,
@@ -140,13 +146,21 @@ pub fn ensure_model(model: &BuiltinModel) -> Result<PathBuf, BuiltinModelError> 
         eprintln!("  Hash verified ✓");
     }
 
-    // Decompress
+    // Decompress to temp file first
     eprintln!("  Decompressing...");
-    decompress_zstd(&zst_path, &json_path)?;
+    if let Err(e) = decompress_zstd(&zst_path, &json_temp_path) {
+        // Clean up both files on failure
+        let _ = fs::remove_file(&zst_path);
+        let _ = fs::remove_file(&json_temp_path);
+        return Err(e);
+    }
+
+    // Atomic rename to final location (only after successful decompression)
+    fs::rename(&json_temp_path, &json_path)?;
     eprintln!("  Decompressed to: {}", json_path.display());
 
     // Clean up compressed file
-    fs::remove_file(&zst_path)?;
+    let _ = fs::remove_file(&zst_path);
 
     Ok(json_path)
 }
