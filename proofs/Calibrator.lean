@@ -183,7 +183,10 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
     use 0, 1, c₁, c₂
     simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
     constructor
-    · intro h_c_eq; simp [c₁, c₂] at h_c_eq; have := h_c_eq ⟨0, hk_pos⟩; simp at this
+    · intro h_c_eq
+      have h_contra := congr_fun h_c_eq ⟨0, hk_pos⟩
+      simp [c₁, c₂] at h_contra
+      contradiction
     · simp [dgpScenario1, Finset.sum_const_zero];
       have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by simp [c₂, Finset.sum_eq_single_of_mem, Fin.exists_fin_one, Finset.mem_univ];
       simp [h_sum_c₂]; norm_num
