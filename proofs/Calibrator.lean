@@ -196,22 +196,22 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
       simp [h_sum_c₂]
       norm_num
   · constructor
-  · intro h; simp [hasInteraction, dgpScenario3] at h
-    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-    have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-          field_simp [sub_ne_zero.mpr hp]; ring
-    have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-          field_simp [sub_ne_zero.mpr hp]; ring
-    rw [h_slope₁, h_slope₂] at h_neq
-    contradiction
-  · intro h; simp [hasInteraction, dgpScenario4] at h
-    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-    have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-          field_simp [sub_ne_zero.mpr hp]; ring
-    have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-          field_simp [sub_ne_zero.mpr hp]; ring
-    rw [h_slope₁, h_slope₂] at h_neq
-    contradiction
+    · intro h; simp [hasInteraction, dgpScenario3] at h
+      rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
+      have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
+            field_simp [sub_ne_zero.mpr hp]; ring
+      have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
+            field_simp [sub_ne_zero.mpr hp]; ring
+      rw [h_slope₁, h_slope₂] at h_neq
+      contradiction
+    · intro h; simp [hasInteraction, dgpScenario4] at h
+      rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
+      have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
+            field_simp [sub_ne_zero.mpr hp]; ring
+      have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
+            field_simp [sub_ne_zero.mpr hp]; ring
+      rw [h_slope₁, h_slope₂] at h_neq
+      contradiction
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
