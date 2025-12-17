@@ -331,13 +331,21 @@ impl<'model> HwePcaProjector<'model> {
                 let presence_block_ref = presence_block.as_ref();
 
                 // Pre-compute omega_base for each variant.
-                // NOTE ON MATH: Gnomon's loadings (L) are normalized in `fit.rs` such that Σ(w² L²) = 1.
-                // This means the basis is orthonormal in the w²-weighted metric.
-                // For the WLS projection s = (V^T Ω V)⁻¹ (V^T Ω x) to match the Standard Projection
-                // s = Σ(x w L) when data is perfect (q=1), the LHS Information Matrix (V^T Ω V) must
-                // simplify to Identity.
-                // Thus: Ω_LHS = w² matches Σ(w² L L^T) = I.
-                // This differs from Ω_RHS = w because the RHS projects x*w onto L.
+                //
+                // WLS mathematical consistency proof:
+                // 1. Consistency requirement: WLS must reduce to Standard Projection s = sum(x*w)*L when q=1.
+                //    Standard projection uses Euclidean dot product of weighted vector x*w onto L.
+                // 2. Normalization: In `fit.rs`, L is normalized such that sum(w^2 * L^2) = 1.
+                //    This means L is orthonormal in the w^2-weighted metric space.
+                // 3. LHS construction: To ensure s_WLS = s_STD when q=1:
+                //    We solve As = b.
+                //    b (RHS) = sum(x*q*w*L) -> sum(x*w*L) when q=1 (Matches Standard).
+                //    Therefore, A must be Identity when q=1.
+                //    Our LHS accumulation is sum(q * w^2 * L * L^t).
+                //    When q=1, A = sum(w^2 * L * L^t). Since sum(w^2 * L^2) = 1 everywhere (by fit.rs normalization), A = I.
+                //    If we used A = sum(L^2) (no w^2), A would be scaled by ~1/w^2, destroying the scale.
+                //
+                // Thus: LHS Omega = quality * w * w is mathematically required.
                 let omega_bases: Vec<f64> = (0..filled)
                     .map(|j| {
                         let j_global = processed + j;

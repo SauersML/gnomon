@@ -3389,6 +3389,9 @@ fn renormalize_variant_loadings(
     debug_assert_eq!(loadings.ncols(), singular_values.len());
     debug_assert_eq!(sample_scores.ncols(), singular_values.len());
 
+    // CRITICAL: We normalize loadings such that the weighted norm Σ(w² L²) = 1.
+    // This orthonormality in the weighted metric is what allows the projection phase
+    // (project.rs) to recover the Standard Projection when using WLS with an LHS weighted by w².
     let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), ld_weights);
 
     for (component, norm_sq) in norms_sq.iter_mut().enumerate() {
