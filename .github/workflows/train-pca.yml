@@ -90,9 +90,9 @@ jobs:
             --ld \
             2>&1 | tee fit.log
 
-          mv hwe.json map/models/hwe_1kg_hgdp.json
-          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_summary.tsv
-          [ -f samples.tsv ] && mv samples.tsv map/models/hwe_1kg_hgdp_samples.tsv
+          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp.json
+          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_summary.tsv
+          [ -f phased_haplotypes_v2.samples.tsv ] && mv phased_haplotypes_v2.samples.tsv map/models/hwe_1kg_hgdp_samples.tsv
 
       - name: Compress model
         run: |
@@ -139,8 +139,8 @@ jobs:
             --ld \
             2>&1 | tee fit.log
 
-          mv hwe.json map/models/hwe_1kg_hgdp_gsa_v2.json
-          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v2_summary.tsv
+          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp_gsa_v2.json
+          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v2_summary.tsv
 
       - name: Compress model
         run: zstd -19 --rm map/models/hwe_1kg_hgdp_gsa_v2.json
@@ -184,8 +184,8 @@ jobs:
             --ld \
             2>&1 | tee fit.log
 
-          mv hwe.json map/models/hwe_1kg_hgdp_gsa_v3.json
-          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v3_summary.tsv
+          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp_gsa_v3.json
+          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v3_summary.tsv
 
       - name: Compress model
         run: zstd -19 --rm map/models/hwe_1kg_hgdp_gsa_v3.json
@@ -229,8 +229,8 @@ jobs:
             --ld \
             2>&1 | tee fit.log
 
-          mv hwe.json map/models/hwe_1kg_hgdp_gda_v1.json
-          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gda_v1_summary.tsv
+          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp_gda_v1.json
+          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_gda_v1_summary.tsv
 
       - name: Compress model
         run: zstd -19 --rm map/models/hwe_1kg_hgdp_gda_v1.json
