@@ -184,8 +184,7 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
     simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
     constructor
     · intro h_c_eq
-      let x : Fin k := ⟨0, hk_pos⟩
-      have h_contra := congr_fun h_c_eq x
+          have h_contra := congr_fun h_c_eq (⟨0, hk_pos⟩ : Fin k)
       simp [c₁, c₂] at h_contra
       contradiction
     · simp [dgpScenario1, Finset.sum_const_zero]
@@ -199,17 +198,17 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
   · intro h; simp [hasInteraction, dgpScenario3] at h
     rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
     have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
+          field_simp [sub_ne_zero.mpr hp]; ring
     have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
+          field_simp [sub_ne_zero.mpr hp]; ring
     rw [h_slope₁, h_slope₂] at h_neq
     contradiction
   · intro h; simp [hasInteraction, dgpScenario4] at h
     rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
     have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
+          field_simp [sub_ne_zero.mpr hp]; ring
     have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
+          field_simp [sub_ne_zero.mpr hp]; ring
     rw [h_slope₁, h_slope₂] at h_neq
     contradiction
 
