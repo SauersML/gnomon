@@ -14,7 +14,7 @@ diff.txt
 
 # Lean
 .lake/
-lake-manifest.json
+
 
 # Jules automation
 jules.patch
