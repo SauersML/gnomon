@@ -252,7 +252,7 @@ def main():
             f"The Lean Proof build failed. "
             f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
             "Please analyze the logs and fix the errors in the Lean proof files. If the code does not compile, you can commit a small improvement even if it is not a complete fix. You can search the web to find the latest documentation for the dependencies/libraries you’re using. You can proactively find examples or code snippets that can help inform your edits. It's a good idea to web search."
-            "You should check if your changes compile and that all proofs are valid. However, if the code does not compile, improve what you can as much as possible before submitting. It's okay if it still fails to compile as long as it is in a better state. You can do it!"
+            "You should check if your changes compile and that all proofs are valid. However, if the code does not compile, improve what you can as much as possible before submitting. It's okay if it still fails to compile as long as it is in a better state. At the same time, feel free to fix multiple issues at once, and don't afraid to make big improvements. You can do it!"
             + version_restriction
         )
 
