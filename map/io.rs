@@ -2396,7 +2396,14 @@ impl VcfLikeVariantBlockSource {
                     }
                     return 0.0;
                 }
-                // No quality field found - assume hard call
+                // No quality field found. 
+                // Check if 'IMP' flag is present (indicating Imputed data).
+                // If imputed but missing quality scores, it's unsafe to assume perfection.
+                if info.get(header, "IMP").is_some() {
+                    return 0.0;
+                }
+
+                // No IMP flag -> Assume Genotyped (hard call)
                 1.0
             }
             Some(VariantFormat::Bcf) => {
