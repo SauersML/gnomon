@@ -28,6 +28,7 @@ use noodles_vcf::{
     self as vcf, Record as VcfRecord,
     variant::RecordBuf,
     variant::record::AlternateBases,
+    variant::record::{info::Info as VcfInfoTrait, info::field::Value as InfoValue},
     variant::record::samples::{
         keys::key,
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
@@ -1459,6 +1460,9 @@ pub struct VcfLikeVariantBlockSource {
     processed: usize,
     spool_entries: Vec<Option<Arc<SpoolEntry>>>,
     spool_root: Option<PathBuf>,
+    /// Per-variant imputation quality scores (INFO/R²/DR2) for the current block.
+    /// Values are in [0, 1] range where 1.0 = hard call, 0.0 = no information.
+    block_quality: Vec<f64>,
 }
 
 struct SpoolEntry {
@@ -2054,6 +2058,7 @@ impl VcfLikeVariantBlockSource {
             processed: 0,
             spool_entries: Vec::new(),
             spool_root: None,
+            block_quality: Vec::new(),
         };
         if !source.parts.is_empty() {
             source.open_part(0)?;
@@ -2259,6 +2264,16 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
         };
         Some((work_done, self.total_variants_hint))
     }
+
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        // Copy stored quality scores for the current block
+        // If we have fewer stored than requested, fill remaining with 1.0 (hard call)
+        let available = self.block_quality.len().min(filled);
+        storage[..available].copy_from_slice(&self.block_quality[..available]);
+        for value in storage.iter_mut().skip(available).take(filled - available) {
+            *value = 1.0;
+        }
+    }
 }
 
 impl VcfLikeVariantBlockSource {
@@ -2316,6 +2331,56 @@ impl VcfLikeVariantBlockSource {
         }
     }
 
+    /// Extract imputation quality score from the current variant's INFO field.
+    /// Looks for common INFO fields: R2, DR2, INFO (for imputation quality).
+    /// Returns 1.0 if no quality field is found (assumes hard call).
+    fn current_variant_quality(&self) -> f64 {
+        // VCF INFO field parsing requires header
+        let Some(header) = self.header.as_ref() else {
+            return 1.0;
+        };
+        
+        match self.format {
+            Some(VariantFormat::Vcf) => {
+                let info = self.vcf_record.info();
+                
+                // Try R2 first (minimac, Michigan Imputation Server)
+                if let Some(quality) = Self::get_info_float(&info, header, "R2") {
+                    return quality.clamp(0.0, 1.0);
+                }
+                // Try DR2 (BEAGLE style)
+                if let Some(quality) = Self::get_info_float(&info, header, "DR2") {
+                    return quality.clamp(0.0, 1.0);
+                }
+                // Try INFO (some pipelines use this key)
+                if let Some(quality) = Self::get_info_float(&info, header, "INFO") {
+                    return quality.clamp(0.0, 1.0);
+                }
+                // No quality field found - assume hard call
+                1.0
+            }
+            Some(VariantFormat::Bcf) => {
+                // BCF INFO parsing would follow similar pattern
+                // For now, return 1.0 (hard call)
+                1.0
+            }
+            None => 1.0,
+        }
+    }
+    
+    /// Helper to extract a float value from an INFO field.
+    fn get_info_float(info: &dyn VcfInfoTrait, header: &vcf::Header, key: &str) -> Option<f64> {
+        match info.get(header, key)? {
+            Ok(Some(value)) => match value {
+                InfoValue::Float(f) => Some(f as f64),
+                InfoValue::Integer(i) => Some(i as f64),
+                InfoValue::String(s) => s.parse::<f64>().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn current_variant_key(&self) -> Result<Option<VariantKey>, VariantIoError> {
         match self.format {
             Some(VariantFormat::Vcf) => {
@@ -2366,6 +2431,9 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
+        // Clear and prepare quality storage for this block
+        self.block_quality.clear();
+        
         let mut filled = 0usize;
         while filled < max_variants {
             let Some(_) = self.read_next_variant()? else {
@@ -2375,6 +2443,9 @@ impl VcfLikeVariantBlockSource {
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             self.decode_current_variant(dest)?;
+            
+            // Store imputation quality for this variant
+            self.block_quality.push(self.current_variant_quality());
             filled += 1;
         }
 
@@ -2392,6 +2463,9 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
+        // Clear and prepare quality storage for this block
+        self.block_quality.clear();
+        
         let target_total = indices.len();
         let mut filled = 0usize;
 
@@ -2413,6 +2487,8 @@ impl VcfLikeVariantBlockSource {
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             self.decode_current_variant(dest)?;
+            // Store imputation quality for this variant
+            self.block_quality.push(self.current_variant_quality());
             filled += 1;
         }
 
@@ -2433,6 +2509,9 @@ impl VcfLikeVariantBlockSource {
         max_variants: usize,
         storage: &mut [f64],
     ) -> Result<usize, VariantIoError> {
+        // Clear and prepare quality storage for this block
+        self.block_quality.clear();
+        
         let mut filled = 0usize;
         let target_total = if self.selection_finalized {
             self.filtered_variants_hint
@@ -2460,6 +2539,9 @@ impl VcfLikeVariantBlockSource {
                                 }
                             }
                         }
+                        
+                        // Store imputation quality for this variant
+                        self.block_quality.push(self.current_variant_quality());
 
                         if !self.selection_finalized {
                             self.matched_keys.push(key);

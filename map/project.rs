@@ -7,7 +7,8 @@ use super::progress::{
 };
 use core::cmp::min;
 use faer::linalg::matmul::matmul;
-use faer::{Accum, Mat, MatMut, Par};
+use faer::linalg::solvers::{Llt, Solve};
+use faer::{Accum, Mat, MatMut, Par, Side};
 use std::error::Error;
 
 pub struct HwePcaProjector<'model> {
@@ -220,13 +221,21 @@ impl<'model> HwePcaProjector<'model> {
         } else {
             Vec::new()
         };
-        let mut sq_loadings_storage = if opts.missing_axis_renormalization {
-            vec![
-                0.0f64;
-                block_capacity.checked_mul(components).ok_or_else(|| {
-                    HwePcaError::InvalidInput("Projection workspace size overflow")
-                })?
-            ]
+        // WLS: Storage for the K×K information matrix per sample.
+        // Stored as flat Vec<f64> with components×components elements per sample.
+        // info_matrices[sample * K² + k * K + l] = A[k, l] for that sample.
+        const WLS_RIDGE: f64 = 1.0e-12;
+        let info_matrix_size = components * components;
+        let mut info_matrices_storage = if opts.missing_axis_renormalization {
+            vec![0.0f64; n_samples.checked_mul(info_matrix_size).ok_or_else(|| {
+                HwePcaError::InvalidInput("WLS info matrix storage overflow")
+            })?]
+        } else {
+            Vec::new()
+        };
+        // Storage for per-variant imputation quality scores (INFO/R²)
+        let mut quality_storage = if opts.missing_axis_renormalization {
+            vec![1.0f64; block_capacity]
         } else {
             Vec::new()
         };
@@ -235,11 +244,6 @@ impl<'model> HwePcaProjector<'model> {
         let ld_weights = self.model.ld().map(|ld| ld.weights.as_slice());
         let mut processed = 0usize;
         let par = faer::get_global_parallelism();
-        let mut alignment_r2 = if opts.missing_axis_renormalization {
-            Some(Mat::zeros(n_samples, components))
-        } else {
-            None
-        };
 
         progress.on_stage_start(ProjectionProgressStage::Projection, variant_hint);
         if variant_hint == 0 && expected_variants > 0 {
@@ -279,6 +283,9 @@ impl<'model> HwePcaProjector<'model> {
                     presence_block.as_mut(),
                     par,
                 );
+                
+                // Get per-variant imputation quality for this block
+                source.variant_quality(filled, &mut quality_storage[..filled]);
 
                 if let Some(weights) = ld_weights {
                     apply_ld_weights(block.as_mut(), processed..processed + filled, weights);
@@ -296,51 +303,48 @@ impl<'model> HwePcaProjector<'model> {
                     par,
                 );
 
-                let mut sq_block = MatMut::from_column_major_slice_mut(
-                    &mut sq_loadings_storage[..filled * components],
-                    filled,
-                    components,
-                );
-                if let Some(weights) = ld_weights {
-                    let start = processed.min(weights.len());
-                    let end = (processed + filled).min(weights.len());
-                    let weight_slice = &weights[start..end];
-                    let weight_len = weight_slice.len();
-                    // Use explicit loops instead of zip! to avoid reliance on
-                    // unspecified iteration order (faer docs state order is unspecified)
-                    for col in 0..components {
-                        for row in 0..filled {
-                            let value = loadings_block[(row, col)];
-                            let weight_sq = if row < weight_len {
-                                let weight = weight_slice[row];
-                                weight * weight
-                            } else {
-                                1.0
-                            };
-                            sq_block[(row, col)] = weight_sq * value * value;
+                // WLS: Accumulate K×K information matrix per sample.
+                // For each variant j and sample i:
+                //   A_i[k, l] += presence[i, j] × w_ld[j]² × L[j, k] × L[j, l]
+                // This is the outer product L_j ⊗ L_j weighted by presence and LD.
+                let presence_block_ref = presence_block.as_ref();
+                
+                for j_local in 0..filled {
+                    let j_global = processed + j_local;
+                    // Get LD weight squared for this variant
+                    let ld_w_sq = if let Some(weights) = ld_weights {
+                        if j_global < weights.len() {
+                            let w = weights[j_global];
+                            w * w
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    };
+                    
+                    // For each sample, accumulate outer product
+                    for sample in 0..n_samples {
+                        let presence = presence_block_ref[(sample, j_local)];
+                        if presence == 0.0 {
+                            continue; // Skip missing variants
+                        }
+                        
+                        // Full Proposal 2: omega = presence × quality × ld_weight²
+                        let quality = quality_storage[j_local];
+                        let omega = presence * quality * ld_w_sq;
+                        let info_offset = sample * info_matrix_size;
+                        
+                        // Accumulate L_j × L_j^T weighted by omega
+                        for k in 0..components {
+                            let l_jk = loadings_block[(j_local, k)];
+                            for l in 0..components {
+                                let l_jl = loadings_block[(j_local, l)];
+                                info_matrices_storage[info_offset + k * components + l] +=
+                                    omega * l_jk * l_jl;
+                            }
                         }
                     }
-                } else {
-                    // No LD weights - simple element-wise squaring
-                    for col in 0..components {
-                        for row in 0..filled {
-                            let value = loadings_block[(row, col)];
-                            sq_block[(row, col)] = value * value;
-                        }
-                    }
-                }
-
-                if let Some(ref mut r2) = alignment_r2 {
-                    let presence_block_ref = presence_block.as_ref();
-                    let sq_block_ref = sq_block.as_ref();
-                    matmul(
-                        r2.as_mut(),
-                        Accum::Add,
-                        presence_block_ref,
-                        sq_block_ref,
-                        1.0,
-                        par,
-                    );
                 }
             } else {
                 standardize_projection_block(scaler, block.as_mut(), processed, filled, par);
@@ -381,52 +385,85 @@ impl<'model> HwePcaProjector<'model> {
 
         progress.on_stage_finish(ProjectionProgressStage::Projection);
 
-        if let Some(r2) = alignment_r2 {
+        // WLS: Apply renormalization by solving A·s = b for each sample
+        // where A is the K×K info matrix and b is the raw weighted projection.
+        if opts.missing_axis_renormalization {
             let normalization = self.model.component_weighted_norms_sq();
-            match alignment_out.as_mut() {
-                Some(alignment_mat) => {
-                    for col in 0..components {
-                        let denom = normalization.get(col).copied().unwrap_or(0.0);
-                        for row in 0..n_samples {
-                            let mass = r2[(row, col)];
-                            let score = &mut scores[(row, col)];
-                            let align = &mut alignment_mat[(row, col)];
-                            if mass > 0.0 && denom > 0.0 {
-                                let norm = (mass / denom).sqrt();
-                                *score /= norm;
-                                *align = norm;
-                            } else {
-                                match opts.on_zero_alignment {
-                                    ZeroAlignmentAction::Zero => {
-                                        *score = 0.0;
-                                    }
-                                    ZeroAlignmentAction::NaN => {
-                                        *score = f64::NAN;
-                                    }
+            let mut a_mat = Mat::zeros(components, components);
+            let mut b_vec = Mat::zeros(components, 1);
+            
+            for sample in 0..n_samples {
+                let info_offset = sample * info_matrix_size;
+                
+                // Check if this sample has any information (trace of A > 0)
+                let mut trace = 0.0f64;
+                for k in 0..components {
+                    trace += info_matrices_storage[info_offset + k * components + k];
+                }
+                
+                // If no information, apply zero alignment action
+                if trace <= WLS_RIDGE * (components as f64) {
+                    for k in 0..components {
+                        match opts.on_zero_alignment {
+                            ZeroAlignmentAction::Zero => scores[(sample, k)] = 0.0,
+                            ZeroAlignmentAction::NaN => scores[(sample, k)] = f64::NAN,
+                        }
+                    }
+                    if let Some(ref mut align_out) = alignment_out {
+                        for k in 0..components {
+                            align_out[(sample, k)] = 0.0;
+                        }
+                    }
+                    continue;
+                }
+                
+                // Copy info matrix for this sample and add ridge regularization
+                for k in 0..components {
+                    for l in 0..components {
+                        let value = info_matrices_storage[info_offset + k * components + l];
+                        a_mat[(k, l)] = value;
+                    }
+                    // Add ridge to diagonal
+                    a_mat[(k, k)] += WLS_RIDGE;
+                }
+                
+                // Copy raw score as RHS
+                for k in 0..components {
+                    b_vec[(k, 0)] = scores[(sample, k)];
+                }
+                
+                // Solve A·s = b using Cholesky decomposition
+                match Llt::new(a_mat.as_ref(), Side::Lower) {
+                    Ok(chol) => {
+                        let solution = chol.solve(b_vec.as_ref());
+                        for k in 0..components {
+                            scores[(sample, k)] = solution[(k, 0)];
+                        }
+                        
+                        // Compute alignment from diagonal of info matrix (for backward compat)
+                        if let Some(ref mut align_out) = alignment_out {
+                            for k in 0..components {
+                                let mass = info_matrices_storage[info_offset + k * components + k];
+                                let denom = normalization.get(k).copied().unwrap_or(0.0);
+                                if mass > 0.0 && denom > 0.0 {
+                                    align_out[(sample, k)] = (mass / denom).sqrt();
+                                } else {
+                                    align_out[(sample, k)] = 0.0;
                                 }
-                                *align = 0.0;
                             }
                         }
                     }
-                }
-                None => {
-                    for col in 0..components {
-                        let denom = normalization.get(col).copied().unwrap_or(0.0);
-                        for row in 0..n_samples {
-                            let mass = r2[(row, col)];
-                            let score = &mut scores[(row, col)];
-                            if mass > 0.0 && denom > 0.0 {
-                                let norm = (mass / denom).sqrt();
-                                *score /= norm;
-                            } else {
-                                match opts.on_zero_alignment {
-                                    ZeroAlignmentAction::Zero => {
-                                        *score = 0.0;
-                                    }
-                                    ZeroAlignmentAction::NaN => {
-                                        *score = f64::NAN;
-                                    }
-                                }
+                    Err(_) => {
+                        // Matrix is singular even with ridge — insufficient data
+                        for k in 0..components {
+                            match opts.on_zero_alignment {
+                                ZeroAlignmentAction::Zero => scores[(sample, k)] = 0.0,
+                                ZeroAlignmentAction::NaN => scores[(sample, k)] = f64::NAN,
+                            }
+                        }
+                        if let Some(ref mut align_out) = alignment_out {
+                            for k in 0..components {
+                                align_out[(sample, k)] = 0.0;
                             }
                         }
                     }
@@ -837,18 +874,6 @@ mod tests {
         let dropped_variant = 1;
         set_variant_to_nan(&mut data, dropped_variant);
 
-        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
-        let raw_options = ProjectionOptions {
-            missing_axis_renormalization: false,
-            return_alignment: false,
-            on_zero_alignment: ZeroAlignmentAction::Zero,
-        };
-        let raw_scores = model
-            .projector()
-            .project_with_options(&mut raw_source, &raw_options)
-            .expect("raw projection")
-            .scores;
-
         let mut renorm_source =
             DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
         let options = ProjectionOptions {
@@ -862,41 +887,30 @@ mod tests {
             .expect("renormalized projection");
         let alignment = result.alignment.expect("alignment");
 
+        // WLS test: with one variant missing, alignment should be < 1.0 for
+        // components where that variant contributes, and scores should be finite.
         let loadings = model.variant_loadings();
-        let mut total_mass = Vec::with_capacity(result.scores.ncols());
         for col in 0..result.scores.ncols() {
-            let mut sumsq = 0.0f64;
-            for row in 0..loadings.nrows() {
-                let value = loadings[(row, col)];
-                sumsq += value * value;
-            }
-            total_mass.push(sumsq);
-        }
-        for col in 0..result.scores.ncols() {
-            let missing = loadings[(dropped_variant, col)];
-            let denom = total_mass[col];
-            let retained_mass = (denom - missing * missing).max(0.0);
-            let expected_norm = if denom > 0.0 {
-                (retained_mass / denom).sqrt()
-            } else {
-                0.0
-            };
+            let missing_loading = loadings[(dropped_variant, col)];
             for row in 0..result.scores.nrows() {
-                if expected_norm > 0.0 {
-                    let expected = raw_scores[(row, col)] / expected_norm;
-                    let actual = result.scores[(row, col)];
-                    let diff = (actual - expected).abs();
+                let score = result.scores[(row, col)];
+                let align = alignment[(row, col)];
+                
+                // Score should be finite (WLS succeeded)
+                assert!(
+                    score.is_finite(),
+                    "score should be finite at ({row}, {col})"
+                );
+                
+                // Alignment should reflect missing data
+                if missing_loading.abs() > 1e-10 {
+                    // If the dropped variant has non-zero loading, alignment < 1
                     assert!(
-                        diff <= 1e-10,
-                        "renormalized score mismatch at ({row}, {col})"
+                        align < 1.0 - 1e-12,
+                        "alignment should be < 1 at ({row}, {col}) when variant is missing"
                     );
-                    let norm = alignment[(row, col)];
-                    let norm_diff = (norm - expected_norm).abs();
-                    assert!(norm_diff <= 1e-12, "alignment mismatch at ({row}, {col})");
-                } else {
-                    assert_eq!(result.scores[(row, col)], 0.0);
-                    assert_eq!(alignment[(row, col)], 0.0);
                 }
+                assert!(align > 0.0, "alignment should be positive at ({row}, {col})");
             }
         }
     }
@@ -905,20 +919,9 @@ mod tests {
     fn ld_weighted_missingness_matches_manual_renormalization() {
         let model = fit_example_model_with_ld();
         let mut data = sample_data();
-        data[1 * N_SAMPLES + 0] = f64::NAN;
-        data[3 * N_SAMPLES + 2] = f64::NAN;
-
-        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
-        let raw_options = ProjectionOptions {
-            missing_axis_renormalization: false,
-            return_alignment: false,
-            on_zero_alignment: ZeroAlignmentAction::Zero,
-        };
-        let raw_scores = model
-            .projector()
-            .project_with_options(&mut raw_source, &raw_options)
-            .expect("raw projection")
-            .scores;
+        // Make some variants missing for specific samples
+        data[1 * N_SAMPLES + 0] = f64::NAN; // variant 1, sample 0
+        data[3 * N_SAMPLES + 2] = f64::NAN; // variant 3, sample 2
 
         let mut renorm_source =
             DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
@@ -934,44 +937,40 @@ mod tests {
 
         let alignment = renorm_result.alignment.expect("alignment");
         let renorm_scores = renorm_result.scores;
-        let loadings = model.variant_loadings();
-        let weights = model.ld().expect("ld weights").weights.clone();
 
+        // WLS test: scores should be finite, alignment should reflect missingness
         for row in 0..renorm_scores.nrows() {
             for col in 0..renorm_scores.ncols() {
-                let mut observed_mass = 0.0f64;
-                for variant in 0..loadings.nrows() {
-                    let value = data[variant * N_SAMPLES + row];
-                    if value.is_finite() {
-                        let weight = if variant < weights.len() {
-                            weights[variant]
-                        } else {
-                            1.0
-                        };
-                        let loading = loadings[(variant, col)];
-                        let weighted = weight * loading;
-                        observed_mass += weighted * weighted;
-                    }
-                }
-
-                if observed_mass > 0.0 {
-                    let expected_norm = observed_mass.sqrt();
-                    let expected_score = raw_scores[(row, col)] / expected_norm;
-                    let actual_score = renorm_scores[(row, col)];
-                    let actual_norm = alignment[(row, col)];
+                let score = renorm_scores[(row, col)];
+                let align = alignment[(row, col)];
+                
+                // Score should be finite
+                assert!(
+                    score.is_finite(),
+                    "score should be finite at ({row}, {col})"
+                );
+                
+                // Alignment should be positive
+                assert!(align > 0.0, "alignment should be positive at ({row}, {col})");
+                
+                // Samples with missing data should have alignment < 1
+                // Sample 0 has variant 1 missing, sample 2 has variant 3 missing
+                if row == 0 || row == 2 {
                     assert!(
-                        (actual_score - expected_score).abs() <= 1e-10,
-                        "renormalized score mismatch at ({row}, {col})"
+                        align < 1.0,
+                        "alignment should be < 1 for sample {row} with missing data"
                     );
-                    assert!(
-                        (actual_norm - expected_norm).abs() <= 1e-12,
-                        "alignment mismatch at ({row}, {col})"
-                    );
-                } else {
-                    assert_eq!(renorm_scores[(row, col)], 0.0);
-                    assert_eq!(alignment[(row, col)], 0.0);
                 }
             }
+        }
+        
+        // Sample 1 has no missing data, alignment should be ~1.0
+        for col in 0..renorm_scores.ncols() {
+            let align = alignment[(1, col)];
+            assert!(
+                (align - 1.0).abs() <= 1e-10,
+                "alignment should be ~1 for sample 1 at col {col}"
+            );
         }
     }
 

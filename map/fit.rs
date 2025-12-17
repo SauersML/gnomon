@@ -383,6 +383,20 @@ pub trait VariantBlockSource {
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
         None
     }
+
+    /// Returns per-variant imputation quality scores for the most recently fetched block.
+    /// Quality values should be in [0, 1] range where:
+    /// - 1.0 = perfectly genotyped (hard call, no imputation uncertainty)
+    /// - 0.0 = completely uncertain (equivalent to missing)
+    /// - 0.0-1.0 = imputed with INFO/DR2/R² quality score
+    ///
+    /// The storage slice should have at least `filled` elements (from last next_block_into).
+    /// Default implementation returns 1.0 for all variants (assumes hard calls).
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        for value in storage.iter_mut().take(filled) {
+            *value = 1.0;
+        }
+    }
 }
 
 pub struct DenseBlockSource<'a> {
