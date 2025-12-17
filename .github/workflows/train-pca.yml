@@ -30,15 +30,15 @@ jobs:
 
           # GSA v2.0 (GRCh38)
           curl -L -o manifests/gsa2.zip \
-            "https://webdata.illumina.com/downloads/productfiles/global-screening-array-24/v2-0/infinium-global-screening-array-24-v2-0-a2-manifest-file-csv.zip"
+            "https://webdata.illumina.com/downloads/productfiles/global-screening-array/v2-0/infinium-global-screening-array-24-v2-0-a2-manifest-file-csv.zip"
 
           # GSA v3.0 (GRCh38)
           curl -L -o manifests/gsa3.zip \
-            "https://webdata.illumina.com/downloads/productfiles/global-screening-array-24/v3-0/GSA-24v3-0-A2-manifest-file-csv.zip"
+            "https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/global-screening-array-24/v3-0/GSA-24v3-0-A2-manifest-file-csv.zip"
 
           # GDA v1.0 D2 (GRCh38)
           curl -L -o manifests/gda.zip \
-            "https://webdata.illumina.com/downloads/productfiles/global-diversity-array-8/v1-0/infinium-global-diversity-array-8-v1-0-D2-manifest-file-csv.zip"
+            "https://webdata.illumina.com/downloads/productfiles/global-diversity-array/infinium-global-diversity-array-8-v1-0-D2-manifest-file-csv.zip"
 
       - name: Extract and parse manifests
         run: |
@@ -76,18 +76,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Build gnomon
-        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
       - name: Fit PCA
         run: |
           set -euo pipefail
           mkdir -p map/models
 
-          target/release/gnomon fit \
+          gnomon fit \
             gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
             --components ${{ env.COMPONENTS }} \
             --ld \
@@ -127,18 +124,15 @@ jobs:
           name: variant-lists
           path: manifests
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Build gnomon
-        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
       - name: Fit PCA
         run: |
           set -euo pipefail
           mkdir -p map/models
 
-          target/release/gnomon fit \
+          gnomon fit \
             gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
             --list manifests/gsa2_variants.tsv \
             --components ${{ env.COMPONENTS }} \
@@ -175,18 +169,15 @@ jobs:
           name: variant-lists
           path: manifests
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Build gnomon
-        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
       - name: Fit PCA
         run: |
           set -euo pipefail
           mkdir -p map/models
 
-          target/release/gnomon fit \
+          gnomon fit \
             gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
             --list manifests/gsa3_variants.tsv \
             --components ${{ env.COMPONENTS }} \
@@ -223,18 +214,15 @@ jobs:
           name: variant-lists
           path: manifests
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Build gnomon
-        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
       - name: Fit PCA
         run: |
           set -euo pipefail
           mkdir -p map/models
 
-          target/release/gnomon fit \
+          gnomon fit \
             gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
             --list manifests/gda_variants.tsv \
             --components ${{ env.COMPONENTS }} \
