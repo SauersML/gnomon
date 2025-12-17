@@ -177,7 +177,43 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
-  sorry
+  constructor
+  · -- Case 1: dgpScenario1 has interaction
+    unfold hasInteraction
+    -- We provide witnesses for p₁, p₂, c₁, and c₂.
+    -- p₁ and p₂ are real numbers. c₁ and c₂ are functions from Fin k to ℝ.
+    use 0, 1, (fun _ => 0), (fun i => if i = ⟨0, hk_pos⟩ then 1 else 0)
+    constructor; · norm_num -- Proves p₁ ≠ p₂
+    constructor
+    · -- Proves c₁ ≠ c₂ for any k > 0, including k=1
+      intro h_eq
+      -- If the functions are equal, they must be equal at the point ⟨0, hk_pos⟩.
+      -- We use `congr_fun` to apply this equality.
+      have := congr_fun h_eq ⟨0, hk_pos⟩
+      -- This simplifies to 0 = 1, a contradiction.
+      simp at this
+    · -- Proves the inequality
+      unfold dgpScenario1; dsimp
+      have h_sum_c2 : (∑ (l : Fin k), if l = ⟨0, hk_pos⟩ then 1 else 0) = 1 := by
+        -- The sum is 1 because the term is 1 only at i = ⟨0, hk_pos⟩ and 0 otherwise.
+        simp [Finset.sum_ite_eq', Finset.mem_univ]
+      -- Substitute the sum and simplify the expression
+      simp [Finset.sum_const_zero, h_sum_c2]; norm_num
+  · constructor
+    · -- Case 2: dgpScenario3 has no interaction
+      intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
+      unfold dgpScenario3 at h_neq
+      -- The terms with c₁ and c₂ cancel out, making the slope independent of c.
+      simp only [add_sub_add_right_eq_sub, div_self (sub_ne_zero.mpr hp_neq)] at h_neq
+      -- This leads to 1 ≠ 1, a contradiction.
+      contradiction
+    · -- Case 3: dgpScenario4 has no interaction
+      intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
+      unfold dgpScenario4 at h_neq
+      -- Similarly, the terms with c₁ and c₂ cancel out.
+      simp only [sub_sub_sub_cancel_right, div_self (sub_ne_zero.mpr hp_neq)] at h_neq
+      -- This leads to 1 ≠ 1, a contradiction.
+      contradiction
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
