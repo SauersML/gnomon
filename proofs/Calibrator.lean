@@ -185,9 +185,9 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
     simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
     constructor
     · intro h_c_eq
-      have : c₁ x₀ = c₂ x₀ := by rw [h_c_eq]
-      simp [c₁, c₂] at this
-      norm_num at this
+      have h_contra := congr_fun h_c_eq x₀
+      simp [c₁, c₂] at h_contra
+      norm_num at h_contra
     · simp [dgpScenario1, Finset.sum_const_zero]
       have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by
         simp [c₂]
@@ -195,7 +195,7 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
         simp
       simp [h_sum_c₂]
       norm_num
-  constructor
+  · constructor
   · intro h; simp [hasInteraction, dgpScenario3] at h
     rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
     have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
