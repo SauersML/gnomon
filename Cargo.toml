@@ -1,10 +1,3 @@
-# ========================================================================================
-#
-#                         THE CONSTITUTION OF PROJECT GNOMON
-#
-# ========================================================================================
-
-
 [workspace]
 
 [package]
@@ -50,6 +43,7 @@ polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"] }
 wolfe_bfgs = "0.1.6"
 log = "0.4.28"
 faer = "0.23.2"
+spindle = "0.2.6"
 dyn-stack = "0.13.2"
 noodles-bcf = "0.78.0"
 noodles-vcf = "0.81.0"
@@ -118,30 +112,4 @@ harness = false
 [[test]]
 name = "calibrate"
 path = "calibrate/tests/mod.rs"
-
-# =============================================================================
-# TEMPORARY PATCH: spindle Rust 1.94+ compatibility
-# =============================================================================
-#
-# ISSUE: Rust 1.94-nightly (Dec 2025) introduced a soundness fix that forbids
-# raw pointer casts which extend trait object lifetimes. This correctly rejects
-# code in spindle 0.2.5 that was previously (unsoundly) accepted.
-#
-# Error: "raw pointer casts of trait objects cannot extend lifetimes"
-# Tracking: https://github.com/rust-lang/rust/issues/141402
-#
-# spindle is a transitive dependency via: gnomon → faer → spindle
-#
-# FIX: PR sarah-quinones/spindle#2 replaces the cast with std::mem::transmute,
-# which is sound because the barrier mechanism guarantees worker threads
-# complete before the closure is dropped.
-#
-# TO REMOVE THIS PATCH:
-#   1. Check if spindle > 0.2.5 is published: `cargo search spindle`
-#   2. If yes, delete this entire [patch.crates-io] section
-#   3. Run `cargo update` and verify build succeeds
-#
-# =============================================================================
-[patch.crates-io]
-spindle = { git = "https://github.com/TKanX/spindle", rev = "88fa33fc64f57a69c58b5f9e7c3d3b7083f3238f" }
 
