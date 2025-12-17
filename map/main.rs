@@ -1,4 +1,5 @@
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
+use super::builtin::{self, BuiltinModelError};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
@@ -22,6 +23,7 @@ pub enum MapCommand {
     },
     Project {
         genotype_path: PathBuf,
+        model: Option<String>,
     },
 }
 
@@ -33,6 +35,7 @@ pub enum MapDriverError {
     Dataset(GenotypeIoError),
     Serialization(serde_json::Error),
     InvalidState(String),
+    BuiltinModel(BuiltinModelError),
 }
 
 impl fmt::Display for MapDriverError {
@@ -43,6 +46,7 @@ impl fmt::Display for MapDriverError {
             Self::Dataset(err) => write!(f, "genotype dataset error: {err}"),
             Self::Serialization(err) => write!(f, "serialization error: {err}"),
             Self::InvalidState(msg) => write!(f, "{msg}"),
+            Self::BuiltinModel(err) => write!(f, "built-in model error: {err}"),
         }
     }
 }
@@ -55,6 +59,7 @@ impl std::error::Error for MapDriverError {
             Self::Dataset(err) => Some(err),
             Self::Serialization(err) => Some(err),
             Self::InvalidState(_) => None,
+            Self::BuiltinModel(err) => Some(err),
         }
     }
 }
@@ -93,6 +98,12 @@ impl From<DatasetOutputError> for MapDriverError {
     }
 }
 
+impl From<BuiltinModelError> for MapDriverError {
+    fn from(value: BuiltinModelError) -> Self {
+        Self::BuiltinModel(value)
+    }
+}
+
 /// Execute the provided [`MapCommand`].
 pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
     match command {
@@ -102,7 +113,7 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             components,
             ld,
         } => run_fit(&genotype_path, variant_list.as_deref(), components, ld),
-        MapCommand::Project { genotype_path } => run_project(&genotype_path),
+        MapCommand::Project { genotype_path, model } => run_project(&genotype_path, model.as_deref()),
     }
 }
 
@@ -287,7 +298,7 @@ fn run_fit(
     Ok(())
 }
 
-fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
+fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), MapDriverError> {
     println!("=== Sample projection into PCA space ===");
     println!("Input genotype location: {}", genotype_path.display());
 
@@ -307,12 +318,23 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
         variant_display
     );
 
-    let model = load_hwe_model(&dataset)?;
+    // Load model: either from --model flag (built-in) or from adjacent hwe.json
+    let model = if let Some(name) = model_name {
+        load_builtin_model(name)?
+    } else {
+        load_hwe_model(&dataset)?
+    };
+
     println!(
         "Loaded model with {} principal components spanning {} variants",
         model.components(),
         model.n_variants()
     );
+
+    // Print genome build info if available
+    if let Some(build) = model.genome_build() {
+        println!("Model genome build: {}", build);
+    }
 
     let mut selection_plan = SelectionPlan::All;
 
@@ -393,6 +415,26 @@ fn run_project(genotype_path: &Path) -> Result<(), MapDriverError> {
 
 fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
     Ok(GenotypeDataset::open(path)?)
+}
+
+fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
+    // Look up the model
+    let model_info = builtin::lookup_model(name).ok_or_else(|| {
+        let available = builtin::list_model_names().join(", ");
+        MapDriverError::BuiltinModel(builtin::BuiltinModelError::UnknownModel(format!(
+            "'{name}'. Available models: {available}"
+        )))
+    })?;
+
+    // Download if needed (prints its own progress messages)
+    let model_path = builtin::ensure_model(model_info)?;
+
+    // Load the model
+    let file = std::fs::File::open(&model_path)?;
+    let reader = std::io::BufReader::new(file);
+    let model: HwePcaModel = serde_json::from_reader(reader)?;
+
+    Ok(model)
 }
 
 fn map_variant_list_error(path: &Path, err: VariantListError) -> MapDriverError {

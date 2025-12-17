@@ -746,6 +746,11 @@ enum Commands {
         /// Path to PLINK .bed file or directory containing .bed files
         #[arg(value_name = "GENOTYPE_PATH")]
         genotype_path: PathBuf,
+
+        /// Use a built-in pre-trained model (downloads from GitHub if needed)
+        /// Available models: hwe_1kg_hgdp_gsa_v2, hwe_1kg_hgdp_gsa_v3, hwe_1kg_hgdp_gda_v1
+        #[arg(long, value_name = "MODEL_NAME")]
+        model: Option<String>,
     },
 
     /// Infer sample-level terms from genotype data
@@ -786,7 +791,7 @@ fn main() {
             sites_window,
             bp_window,
         }) => run_map_fit(genotype_path, list, components, ld, sites_window, bp_window),
-        Some(Commands::Project { genotype_path }) => run_map_project(genotype_path),
+        Some(Commands::Project { genotype_path, model }) => run_map_project(genotype_path, model),
         Some(Commands::Terms(args)) => run_terms(args),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
@@ -907,8 +912,8 @@ fn run_map_fit(
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
-fn run_map_project(genotype_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    map_cli::run(map_cli::MapCommand::Project { genotype_path })
+fn run_map_project(genotype_path: PathBuf, model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Project { genotype_path, model })
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 

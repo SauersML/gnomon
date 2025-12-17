@@ -58,6 +58,13 @@ reqwest = { version = "0.12.9", default-features = false, features = ["blocking"
 serde_json = "1.0.145"
 sysinfo = "0.30.12"
 
+# Built-in model download and caching
+ureq = "2.10"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+dirs = "6.0"
+
 infer_sex = { git = "https://github.com/SauersML/infer_sex", branch = "main" }
 convert_genome = { git = "https://github.com/SauersML/convert_genome", branch = "main" }
 

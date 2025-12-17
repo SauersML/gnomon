@@ -74,7 +74,6 @@ GENOME_SOURCES: Tuple[Tuple[str, str], ...] = (
 @dataclass(frozen=True)
 class ToolPaths:
     convert_genome: Path
-    plink2: Path
     gnomon: Path
 
 
@@ -230,27 +229,7 @@ def download_pgs_score(
 # --------------------------------------------------------------------------------------
 
 
-def normalize_vcf_genotypes(vcf_path: Path) -> None:
-    """Fix genotype fields that some tools emit with leading separators."""
-
-    lines: List[str] = []
-    with vcf_path.open("r", encoding="utf-8") as handle:
-        for raw in handle:
-            if raw.startswith("#"):
-                lines.append(raw)
-                continue
-            parts = raw.rstrip("\n").split("\t")
-            if len(parts) > 4 and parts[4] == ".":
-                continue
-            for idx in range(9, len(parts)):
-                field = parts[idx]
-                if field and field[0] in {"/", "|"}:
-                    parts[idx] = field[1:]
-            lines.append("\t".join(parts) + "\n")
-    vcf_path.write_text("".join(lines), encoding="utf-8")
-
-
-def convert_genome_to_vcf(
+def convert_genome_to_plink(
     tool: Path,
     genome_path: Path,
     sample_id: str,
@@ -258,77 +237,38 @@ def convert_genome_to_vcf(
     output_dir: Path,
     assembly: str,
 ) -> Path:
-    """Invoke the ``convert_genome`` CLI."""
+    """Convert genome directly to PLINK format using convert_genome --format plink."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    vcf_path = output_dir / f"{genome_path.stem}.vcf"
-    if vcf_path.exists():
-        debug(f"Skipping conversion; VCF already exists: {vcf_path}")
-        return vcf_path
+    plink_prefix = output_dir / genome_path.stem
+    bed_path = plink_prefix.with_suffix(".bed")
+
+    if bed_path.exists():
+        debug(f"Skipping conversion; PLINK files already exist: {plink_prefix}")
+        return plink_prefix
 
     run_command(
         (
             tool,
+            "--input",
             genome_path,
+            "--reference",
             reference_fasta,
-            vcf_path,
+            "--output",
+            plink_prefix,
+            "--format",
+            "plink",
             "--sample",
             sample_id,
             "--assembly",
             assembly,
         )
     )
-    if not vcf_path.exists():
-        raise RuntimeError(f"convert_genome reported success but {vcf_path} was not created.")
-    normalize_vcf_genotypes(vcf_path)
-    return vcf_path
+    if not bed_path.exists():
+        raise RuntimeError(f"convert_genome reported success but {bed_path} was not created.")
+    return plink_prefix
 
 
-def vcf_to_plink(tool: Path, vcf_path: Path, output_dir: Path, sample_id: str) -> Path:
-    """Convert a VCF into a PLINK binary fileset using plink2."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = output_dir / vcf_path.stem
-    bed_path = prefix.with_suffix(".bed")
-    psam_path = prefix.with_suffix(".psam")
-
-    psam_path.write_text(
-        "#FID\tIID\tPAT\tMAT\tSEX\tPHENOTYPE\n"
-        f"{sample_id}\t{sample_id}\t0\t0\t0\t-9\n",
-        encoding="utf-8",
-    )
-
-    if bed_path.exists() and prefix.with_suffix(".bim").exists() and prefix.with_suffix(".fam").exists():
-        debug(f"PLINK files already exist for {vcf_path}; skipping conversion")
-        return prefix
-
-    run_command(
-        (
-            tool,
-            "--vcf",
-            vcf_path,
-            "--double-id",
-            "--keep-allele-order",
-            "--psam",
-            psam_path,
-            "--allow-no-sex",
-            "--split-par",
-            "b37",
-            "--max-alleles",
-            "2",
-            "--polyploid-mode",
-            "missing",
-            "--make-bed",
-            "--out",
-            prefix,
-        )
-    )
-
-    for ext in (".bed", ".bim", ".fam"):
-        expected = prefix.with_suffix(ext)
-        if not expected.exists():
-            raise RuntimeError(f"plink2 failed to produce {expected}")
-    return prefix
 
 
 def run_gnomon_score(
@@ -405,12 +345,10 @@ def derive_sample_id(filename: str, override: str | None = None) -> str:
 def orchestrate(args: argparse.Namespace) -> None:
     tools = ToolPaths(
         convert_genome=ensure_binary("convert_genome", args.convert_genome_bin),
-        plink2=ensure_binary("plink2", args.plink2_bin),
         gnomon=ensure_binary("gnomon", args.gnomon_bin or str(REPO_ROOT / "target" / "release" / "gnomon")),
     )
 
     output_dir = Path(args.output_dir).resolve()
-    vcf_dir = output_dir / "vcf"
     plink_dir = output_dir / "plink"
     score_cache = output_dir / "scores"
 
@@ -433,15 +371,14 @@ def orchestrate(args: argparse.Namespace) -> None:
 
     for genome_path, sample_id in genome_inputs:
         debug(f"Processing genome {genome_path.name} (sample {sample_id})")
-        vcf_path = convert_genome_to_vcf(
+        plink_prefix = convert_genome_to_plink(
             tools.convert_genome,
             genome_path,
             sample_id,
             reference_fasta,
-            vcf_dir,
+            plink_dir,
             args.assembly,
         )
-        plink_prefix = vcf_to_plink(tools.plink2, vcf_path, plink_dir, sample_id)
 
         for pgs_id in args.scores:
             score_path = download_pgs_score(pgs_id, score_cache, assembly=args.assembly)
@@ -514,11 +451,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--convert-genome-bin",
         default=None,
         help="Path to the convert_genome executable (defaults to PATH lookup)",
-    )
-    parser.add_argument(
-        "--plink2-bin",
-        default=None,
-        help="Path to the plink2 executable (defaults to PATH lookup)",
     )
     parser.add_argument(
         "--gnomon-bin",

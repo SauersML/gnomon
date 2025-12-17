@@ -399,7 +399,7 @@ pub fn save_projection_results(
         )));
     }
 
-    let scores_path = dataset.output_path("projection.scores.tsv");
+    let scores_path = dataset.output_path("projection_scores.tsv");
     prepare_output_path(&scores_path)?;
     let mut writer = BufWriter::new(File::create(&scores_path)?);
 
@@ -422,7 +422,7 @@ pub fn save_projection_results(
 
     let mut alignment_path = None;
     if let Some(alignment) = result.alignment.as_ref() {
-        let path = dataset.output_path("projection.alignment.tsv");
+        let path = dataset.output_path("projection_alignment.tsv");
         prepare_output_path(&path)?;
         let mut writer = BufWriter::new(File::create(&path)?);
 
@@ -479,7 +479,7 @@ pub fn save_fit_summary(
     dataset: &GenotypeDataset,
     model: &HwePcaModel,
 ) -> Result<PathBuf, DatasetOutputError> {
-    let summary_path = dataset.output_path("hwe.summary.tsv");
+    let summary_path = dataset.output_path("hwe_summary.tsv");
     prepare_output_path(&summary_path)?;
     let mut writer = BufWriter::new(File::create(&summary_path)?);
 

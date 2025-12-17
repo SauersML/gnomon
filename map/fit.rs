@@ -1227,6 +1227,7 @@ pub struct HwePcaModel {
     component_weighted_norms_sq: Vec<f64>,
     variant_keys: Option<Vec<VariantKey>>,
     ld: Option<LdWeights>,
+    genome_build: Option<String>,
 }
 
 impl HwePcaModel {
@@ -1428,6 +1429,7 @@ impl HwePcaModel {
             component_weighted_norms_sq,
             variant_keys: None,
             ld: ld_weights,
+            genome_build: None,
         })
     }
 
@@ -1512,6 +1514,14 @@ impl HwePcaModel {
 
     pub fn ld(&self) -> Option<&LdWeights> {
         self.ld.as_ref()
+    }
+
+    pub fn genome_build(&self) -> Option<&str> {
+        self.genome_build.as_deref()
+    }
+
+    pub fn set_genome_build(&mut self, build: Option<String>) {
+        self.genome_build = build;
     }
 }
 
@@ -3652,7 +3662,7 @@ impl Serialize for HwePcaModel {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("HwePcaModel", 11)?;
+        let mut state = serializer.serialize_struct("HwePcaModel", 12)?;
         state.serialize_field("n_samples", &self.n_samples)?;
         state.serialize_field("n_variants", &self.n_variants)?;
         state.serialize_field("scaler", &self.scaler)?;
@@ -3673,6 +3683,7 @@ impl Serialize for HwePcaModel {
         )?;
         state.serialize_field("variant_keys", &self.variant_keys)?;
         state.serialize_field("ld", &self.ld)?;
+        state.serialize_field("genome_build", &self.genome_build)?;
         state.end()
     }
 }
@@ -3698,6 +3709,8 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             variant_keys: Option<Vec<VariantKey>>,
             #[serde(default)]
             ld: Option<LdWeights>,
+            #[serde(default)]
+            genome_build: Option<String>,
         }
 
         let raw = ModelData::deserialize(deserializer)?;
@@ -3728,6 +3741,7 @@ impl<'de> Deserialize<'de> for HwePcaModel {
             component_weighted_norms_sq,
             variant_keys: raw.variant_keys,
             ld,
+            genome_build: raw.genome_build,
         })
     }
 }

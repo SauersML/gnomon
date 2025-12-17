@@ -1,0 +1,309 @@
+name: Train PCA and Commit Weights
+
+on:
+  workflow_dispatch:
+    inputs:
+      components:
+        description: 'Number of PCA components to fit'
+        required: false
+        default: '20'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  COMPONENTS: ${{ github.event.inputs.components || '20' }}
+
+jobs:
+  # Download and parse manifests (shared by array-specific jobs)
+  prepare-manifests:
+    name: Download and parse Illumina manifests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download manifests from Illumina
+        run: |
+          set -euo pipefail
+          mkdir -p manifests
+
+          # GSA v2.0 (GRCh38)
+          curl -L -o manifests/gsa2.zip \
+            "https://webdata.illumina.com/downloads/productfiles/global-screening-array-24/v2-0/infinium-global-screening-array-24-v2-0-a2-manifest-file-csv.zip"
+
+          # GSA v3.0 (GRCh38)
+          curl -L -o manifests/gsa3.zip \
+            "https://webdata.illumina.com/downloads/productfiles/global-screening-array-24/v3-0/GSA-24v3-0-A2-manifest-file-csv.zip"
+
+          # GDA v1.0 D2 (GRCh38)
+          curl -L -o manifests/gda.zip \
+            "https://webdata.illumina.com/downloads/productfiles/global-diversity-array-8/v1-0/infinium-global-diversity-array-8-v1-0-D2-manifest-file-csv.zip"
+
+      - name: Extract and parse manifests
+        run: |
+          set -euo pipefail
+
+          # Extract CSVs
+          unzip -p manifests/gsa2.zip > manifests/gsa2.csv
+          unzip -p manifests/gsa3.zip > manifests/gsa3.csv
+          unzip -p manifests/gda.zip > manifests/gda.csv
+
+          # Parse to variant lists
+          python scripts/parse_illumina_manifest.py manifests/gsa2.csv manifests/gsa2_variants.tsv
+          python scripts/parse_illumina_manifest.py manifests/gsa3.csv manifests/gsa3_variants.tsv
+          python scripts/parse_illumina_manifest.py manifests/gda.csv manifests/gda_variants.tsv
+
+          # Show counts
+          echo "GSA v2: $(wc -l < manifests/gsa2_variants.tsv) variants"
+          echo "GSA v3: $(wc -l < manifests/gsa3_variants.tsv) variants"
+          echo "GDA v1: $(wc -l < manifests/gda_variants.tsv) variants"
+
+      - name: Upload variant lists
+        uses: actions/upload-artifact@v4
+        with:
+          name: variant-lists
+          path: manifests/*_variants.tsv
+
+  # Fit on ALL variants (no --list)
+  fit-all:
+    name: Fit PCA (all variants)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build gnomon
+        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Fit PCA
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --components ${{ env.COMPONENTS }} \
+            --ld \
+            2>&1 | tee fit.log
+
+          mv hwe.json map/models/hwe_1kg_hgdp.json
+          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_summary.tsv
+          [ -f samples.tsv ] && mv samples.tsv map/models/hwe_1kg_hgdp_samples.tsv
+
+      - name: Compress model
+        run: |
+          set -euo pipefail
+          zstd -19 --rm map/models/hwe_1kg_hgdp.json
+          ls -lh map/models/
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-all
+          path: |
+            map/models/hwe_1kg_hgdp.*
+            fit.log
+
+  # Fit on GSA v2 variants
+  fit-gsa2:
+    name: Fit PCA (GSA v2)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    needs: prepare-manifests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download variant list
+        uses: actions/download-artifact@v4
+        with:
+          name: variant-lists
+          path: manifests
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build gnomon
+        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Fit PCA
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list manifests/gsa2_variants.tsv \
+            --components ${{ env.COMPONENTS }} \
+            --ld \
+            2>&1 | tee fit.log
+
+          mv hwe.json map/models/hwe_1kg_hgdp_gsa_v2.json
+          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v2_summary.tsv
+
+      - name: Compress model
+        run: zstd -19 --rm map/models/hwe_1kg_hgdp_gsa_v2.json
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-gsa2
+          path: |
+            map/models/hwe_1kg_hgdp_gsa_v2.*
+            fit.log
+
+  # Fit on GSA v3 variants
+  fit-gsa3:
+    name: Fit PCA (GSA v3)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    needs: prepare-manifests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download variant list
+        uses: actions/download-artifact@v4
+        with:
+          name: variant-lists
+          path: manifests
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build gnomon
+        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Fit PCA
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list manifests/gsa3_variants.tsv \
+            --components ${{ env.COMPONENTS }} \
+            --ld \
+            2>&1 | tee fit.log
+
+          mv hwe.json map/models/hwe_1kg_hgdp_gsa_v3.json
+          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gsa_v3_summary.tsv
+
+      - name: Compress model
+        run: zstd -19 --rm map/models/hwe_1kg_hgdp_gsa_v3.json
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-gsa3
+          path: |
+            map/models/hwe_1kg_hgdp_gsa_v3.*
+            fit.log
+
+  # Fit on GDA v1 variants
+  fit-gda:
+    name: Fit PCA (GDA v1)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    needs: prepare-manifests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download variant list
+        uses: actions/download-artifact@v4
+        with:
+          name: variant-lists
+          path: manifests
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build gnomon
+        run: RUSTFLAGS="-C target-cpu=native" cargo build --release --bin gnomon
+
+      - name: Fit PCA
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          target/release/gnomon fit \
+            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
+            --list manifests/gda_variants.tsv \
+            --components ${{ env.COMPONENTS }} \
+            --ld \
+            2>&1 | tee fit.log
+
+          mv hwe.json map/models/hwe_1kg_hgdp_gda_v1.json
+          [ -f hwe_summary.tsv ] && mv hwe_summary.tsv map/models/hwe_1kg_hgdp_gda_v1_summary.tsv
+
+      - name: Compress model
+        run: zstd -19 --rm map/models/hwe_1kg_hgdp_gda_v1.json
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-gda
+          path: |
+            map/models/hwe_1kg_hgdp_gda_v1.*
+            fit.log
+
+  # Commit all models after fits complete
+  commit-models:
+    name: Commit models to repository
+    runs-on: ubuntu-22.04
+    needs: [fit-all, fit-gsa2, fit-gsa3, fit-gda]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all models
+        uses: actions/download-artifact@v4
+        with:
+          pattern: model-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Organize models
+        run: |
+          set -euo pipefail
+          mkdir -p map/models
+
+          # Copy all model files
+          cp artifacts/model-all/map/models/* map/models/ 2>/dev/null || true
+          cp artifacts/model-gsa2/map/models/* map/models/ 2>/dev/null || true
+          cp artifacts/model-gsa3/map/models/* map/models/ 2>/dev/null || true
+          cp artifacts/model-gda/map/models/* map/models/ 2>/dev/null || true
+
+          ls -la map/models/
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add map/models/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update PCA models: ${{ env.COMPONENTS }} components with LD shrinkage
+
+          HWE-scaled PCA trained on gnomAD 1KG+HGDP phased reference panel.
+          Models: all variants, GSA v2, GSA v3, GDA v1
+          Run ID: ${{ github.run_id }}"
+
+          git push

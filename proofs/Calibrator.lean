@@ -115,9 +115,9 @@ def IsIdentifiable {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
   sorry
 
-theorem fit_minimizes_loss {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
-  (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
+  (∀ m, empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
   IsIdentifiable (fit p k sp n data lambda) data := by sorry
 
 def IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
@@ -129,19 +129,19 @@ def IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [F
 noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
   sorry
 
-theorem fitRaw_minimizes_loss {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
+  ∀ m (h_m : IsRawScoreModel m),
     empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
   sorry
 
-theorem fitNormalized_minimizes_loss {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
+  ∀ m (h_m : IsNormalizedScoreModel m),
     empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 /-!
@@ -170,80 +170,67 @@ noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProce
 }
 
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
-  ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
+  ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
-theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
+theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
+  haveI : Fintype (Fin k) := Fin.fintype k
   constructor
   · let c₁ : Fin k → ℝ := fun _ => 0
-    let x₀ : Fin k := ⟨0, hk_pos⟩
-    let c₂ : Fin k → ℝ := fun l => if l = x₀ then 1 else 0
-    use 0, 1, c₁, c₂
-    simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
-    constructor
-    · intro h_c_eq
-      have : c₁ x₀ = c₂ x₀ := by simp [h_c_eq]
-      simp [c₁, c₂] at this
-      norm_num at this
-      contradiction
-    · simp [dgpScenario1, Finset.sum_const_zero]
-      have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by
-        simp [c₂]
-        rw [Finset.sum_ite_eq]
-        simp
-      simp [h_sum_c₂]
-      norm_num
-  · constructor
-    · intro h; simp [hasInteraction, dgpScenario3] at h
-      rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-      have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-            field_simp [sub_ne_zero.mpr hp]; ring
-      have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-            field_simp [sub_ne_zero.mpr hp]; ring
-      rw [h_slope₁, h_slope₂] at h_neq
-      contradiction
-    · intro h; simp [hasInteraction, dgpScenario4] at h
-      rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-      have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-            field_simp [sub_ne_zero.mpr hp]; ring
-      have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-            field_simp [sub_ne_zero.mpr hp]; ring
-      rw [h_slope₁, h_slope₂] at h_neq
-      contradiction
+    let c₂ : Fin k → ℝ := fun l => if l = ⟨0, hk_pos⟩ then 1 else 0
+    refine ⟨0, 1, c₁, c₂, ?_, ?_, ?_⟩
+    · exact one_ne_zero
+    · intro h_c_eq; simp [c₁, c₂] at h_c_eq; have := h_c_eq ⟨0, hk_pos⟩; simp at this
+    · simp only [dgpScenario1, Finset.sum_const_zero]
+      have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by simp [c₂, Finset.sum_eq_single_of_mem, Fin.exists_fin_one, Finset.mem_univ]
+      simp [h_sum_c₂]; norm_num
+  constructor
+  · intro h; simp [hasInteraction, dgpScenario3] at h
+    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
+    have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
+      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
+    have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
+      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
+    rw [h_slope₁, h_slope₂] at h_neq; contradiction
+  · intro h; simp [hasInteraction, dgpScenario4] at h
+    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
+    have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
+      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
+    have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
+      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
+    rw [h_slope₁, h_slope₂] at h_neq; contradiction
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-  haveI : Fintype (Fin 1) := Fin.fintype 1
-  use dgpScenario1 1
-  use dgpScenario4 1
+  use dgpScenario1 1, dgpScenario4 1
   constructor; rfl
   have h_distinct := scenarios_are_distinct 1 (by norm_num)
-  exact And.intro h_distinct.left h_distinct.right.right
+  exact ⟨h_distinct.left, h_distinct.right.right⟩
 
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
 def isBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+  ∀ m, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
-theorem l2_projection_of_additive_is_additive {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
+theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
   (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
   (proj : PhenotypeInformedGAM p k sp) (h_optimal : isBayesOptimalInClass dgp proj) :
   IsNormalizedScoreModel proj := by sorry
 
-theorem independence_implies_no_interaction {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
-    (h_additive : ∃ f g, dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
+    (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
+  ∀ m (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
   intros m h_opt
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive h_indep h_fn_struct m h_opt
+  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m h_opt
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -251,7 +238,7 @@ structure DGPWithEnvironment (k : ℕ) where
   trueGeneticEffect : ℝ → ℝ
   is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
 
-theorem prediction_causality_tradeoff_linear_case {p sp : ℕ} [Fintype (Fin p)] [Fintype (Fin sp)] (dgp_env : DGPWithEnvironment 1)
+theorem prediction_causality_tradeoff_linear_case (p sp : ℕ) [Fintype (Fin p)] [Fintype (Fin sp)] (dgp_env : DGPWithEnvironment 1)
     (hp_pos : p > 0)
     (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
     (h_env : dgp_env.environmentalEffect = fun c => 3 * (c ⟨0, by norm_num⟩))
@@ -269,31 +256,30 @@ noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin 
     let c_val := data.c i
     if h_j_lt_1 : j.val < 1 then 1
     else if h_j_lt_gam : j.val < 1 + p then
-      pgsBasis.B ⟨j.val - 1, by { apply Nat.sub_lt_left_of_lt_add; linarith; linarith [j.isLt] }⟩ p_val
+      pgsBasis.B ⟨j.val - 1, by omega⟩ p_val
     else if h_j_lt_f0 : j.val < 1 + p + k*sp then
       let idx := j.val - (1 + p)
-      have h_idx_ub : idx < k * sp := by linarith [j.isLt, h_j_lt_f0]
-      have h_sp_pos : 0 < sp := hsp
-      let l : Fin k := ⟨idx / sp, by {rw [Nat.mul_comm]; exact Nat.div_lt_of_lt_mul h_idx_ub}⟩
+      have h_idx_ub : idx < k * sp := by omega
+      let l : Fin k := ⟨idx / sp, by exact Nat.div_lt_of_lt_mul (by omega : idx < sp * k)⟩
       let s : Fin sp := ⟨idx % sp, Nat.mod_lt _ hsp⟩
       splineBasis.b s (c_val l)
     else
       let idx := j.val - (1 + p + k*sp)
-      have h_idx_ub : idx < p * k * sp := by { simp [total_params]; linarith [j.isLt] }
-      have h_ksp_pos : 0 < k * sp := by linarith
+      have h_idx_ub : idx < p * k * sp := by simp only [total_params] at j; omega
+      have h_ksp_pos : 0 < k * sp := by omega
       let m_val := idx / (k*sp)
-      have hm_ub : m_val < p := by {rw [Nat.mul_comm p (k*sp)]; exact Nat.div_lt_of_lt_mul h_idx_ub}
+      have hm_ub : m_val < p := by exact Nat.div_lt_of_lt_mul (by ring_nf; ring_nf at h_idx_ub; omega : idx < (k * sp) * p)
       let m : Fin p := ⟨m_val, hm_ub⟩
       let rem := idx % (k*sp)
-      have h_rem_ub : rem < k * sp := Nat.mod_lt _ (by linarith)
-      let l : Fin k := ⟨rem / sp, by {rw [Nat.mul_comm k sp]; exact Nat.div_lt_of_lt_mul h_rem_ub}⟩
+      have h_rem_ub : rem < k * sp := Nat.mod_lt _ h_ksp_pos
+      let l : Fin k := ⟨rem / sp, by exact Nat.div_lt_of_lt_mul (by omega : rem < sp * k)⟩
       let s : Fin sp := ⟨rem % sp, Nat.mod_lt _ hsp⟩
-      (pgsBasis.B ⟨m.val + 1, by linarith [m.isLt, hp]⟩ p_val) * (splineBasis.b s (c_val l)))
+      (pgsBasis.B ⟨m.val + 1, by omega⟩ p_val) * (splineBasis.b s (c_val l)))
 
 theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis hp hk hsp) = total_params p k sp) :
-  ∃! (m : PhenotypeInformedGAM p k sp), IsIdentifiable m data ∧ ∀ (m' : PhenotypeInformedGAM p k sp), IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
+  ∃! (m : PhenotypeInformedGAM p k sp), IsIdentifiable m data ∧ ∀ m', IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
   sorry
 
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
@@ -314,10 +300,10 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
 def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
 notation:50 a " ≈ " b => approxEq a b 0.01
 
-noncomputable def rsquared {k : ℕ} [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
-noncomputable def var {k : ℕ} [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
+noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
+noncomputable def var {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
 
-theorem quantitative_error_of_normalization {p k sp : ℕ} [MeasurableSingletonBorel (Fin k → ℝ)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
     (hk_pos : k > 0)
     (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : isBayesOptimalInClass dgp1 model_norm)
@@ -330,7 +316,7 @@ theorem quantitative_error_of_normalization {p k sp : ℕ} [MeasurableSingletonB
 noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
 
-theorem multiplicative_bias_correction {k : ℕ} [Fintype (Fin k)]
+theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model) :
   ∀ l : Fin k, (evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 1 - evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 0)
@@ -342,9 +328,9 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
-theorem shrinkage_effect {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)] (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) :
-  ∀ c : Fin k → ℝ, (model.γₘ₀ ⟨0, by {rw [hp_one]; norm_num}⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by {rw [hp_one]; norm_num}⟩ l) (c l))
+theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
+    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) (hp_one : p = 1) :
+  ∀ c : Fin k → ℝ, (model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l))
     ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by sorry
 
 theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
