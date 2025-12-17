@@ -215,7 +215,7 @@ fn run_fit(
         fit_options.ld = Some(ld_config);
     }
 
-    let mut source = dataset.block_source_with_plan(selection_plan)?;
+    let mut source = dataset.block_source_with_plan(selection_plan.clone())?;
     let progress = fit_progress();
     let mut model = HwePcaModel::fit_k_with_options_and_progress(
         &mut source,
@@ -244,6 +244,16 @@ fn run_fit(
             ));
         }
         variant_keys = Some(Arc::new(outcome.matched_keys));
+    }
+
+    // CRITICAL: Ensure the model ALWAYS has variant keys.
+    // If we haven't already extracted keys (via --list or --ld), do it now.
+    // This prevents "anonymous" models that can silently project onto wrong variants.
+    if variant_keys.is_none() {
+        println!("Extracting variant keys from dataset to ensure model portability...");
+        // If selection_plan is All, this might take a moment for VCFs, but it's required for safety.
+        let keys = dataset.variant_keys_for_plan(&selection_plan)?;
+        variant_keys = Some(Arc::new(keys));
     }
 
     if let Some(keys_arc) = variant_keys {
