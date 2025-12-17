@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Jules Optimizer Loop - Continuous improvement cycle for Lean proofs.
 
@@ -6,8 +5,6 @@ This script runs within the 'jules_loop.yml' workflow.
 It analyzes the build log from the current run (or a provided log file),
 decides on improvements, sends a request to the Jules API, applies the patch,
 and pushes the changes.
-
-It runs on a schedule (CRON), so it does NOT trigger the next workflow itself.
 """
 import os
 import sys
@@ -105,13 +102,9 @@ def get_run_info():
             return local_status, logs
         except Exception as e:
             print(f"Error reading local log file: {e}")
-            # Fall through to API fetch if local read fails?
-            # Probably better to fail or just assume no logs.
             return local_status, f"Error reading log file: {e}"
 
-    # Fallback to fetching via GH CLI (Legacy/Fallback)
-    # This might not work well if we are currently running inside the job we want logs for,
-    # unless we target a different workflow.
+    # This might not work well if we are currently running inside the job we want logs for
     print("No local log file provided. This script is expected to run with LOCAL_LOG_FILE set.")
     return "unknown", "No logs available."
 
@@ -235,10 +228,11 @@ def main():
 
     # Common restrictions for all prompts
     version_restriction = (
-        "\n\nCRITICAL RESTRICTIONS:\n"
+        "\n\NOTE:\n"
         "- DO NOT modify 'lean-toolchain' - the Lean version is intentionally pinned\n"
         "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version)\n"
         "- Focus ONLY on proofs/*.lean files for improvements\n"
+        "- Always try to improve something--commit and finish. No further instruction will be given.\n"
     )
 
     # Build the prompt based on previous run status
@@ -257,8 +251,8 @@ def main():
         prompt = (
             f"The Lean Proof build failed. "
             f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
-            "Please analyze the logs and fix the errors in the Lean proof files. "
-            "IMPORTANT: Ensure your changes compile and that all proofs are valid."
+            "Please analyze the logs and fix the errors in the Lean proof files. If the code does not compile, you can commit a small improvement even if it is not a complete fix. You can search the web to find the latest documentation for the dependencies/libraries you’re using. You can proactively find examples or code snippets that can help inform your edits. It's a good idea to web search."
+            "You should check if your changes compile and that all proofs are valid. However, if the code does not compile, improve what you can as much as possible before submitting. It's okay if it still fails to compile as long as it is in a better state."
             + version_restriction
         )
 
@@ -322,7 +316,6 @@ def main():
     print("Pushing changes...")
     run_command("git push origin main", check=True)
 
-    # We do NOT trigger any further workflows. The CRON schedule handles the loop.
     print("Push complete. Waiting for next CRON schedule.")
 
 
