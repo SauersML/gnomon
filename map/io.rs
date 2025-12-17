@@ -2825,6 +2825,27 @@ fn print_variant_diagnostics(
     }
 }
 
+fn parse_vcf_gp(s: &str) -> Result<Option<f64>, VariantIoError> {
+    if s == "." {
+        return Ok(None);
+    }
+    let mut parts = s.split(',');
+    let p0_str = parts.next();
+    let p1_str = parts.next();
+    let p2_str = parts.next();
+
+    if let (Some(_), Some(p1), Some(p2)) = (p0_str, p1_str, p2_str) {
+        // We only need p1 (Het) and p2 (HomAlt) for dosage. 
+        // p0 is Ref probability (dosage 0).
+        let p1_val = p1.parse::<f64>().map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p1}")))?;
+        let p2_val = p2.parse::<f64>().map_err(|_| VariantIoError::Decode(format!("Invalid GP float: {p2}")))?;
+        Ok(Some(p1_val + 2.0 * p2_val))
+    } else {
+        // Malformed GP or not biallelic logic (ignore)
+        Ok(None)
+    }
+}
+
 fn decode_vcf_record(
     record: &VcfRecord,
     n_samples: usize,
@@ -2839,10 +2860,16 @@ fn decode_vcf_record(
     }
 
     let mut ds_index = None;
+    let mut gp_index = None;
     let mut gt_index = None;
     for (idx, key) in samples.keys().iter().enumerate() {
-        if prefer_ds && ds_index.is_none() && key == "DS" {
-            ds_index = Some(idx);
+        if prefer_ds {
+            if ds_index.is_none() && key == "DS" {
+                ds_index = Some(idx);
+            }
+            if gp_index.is_none() && key == "GP" {
+                gp_index = Some(idx);
+            }
         }
         if gt_index.is_none() && key == key::GENOTYPE {
             gt_index = Some(idx);
@@ -2857,11 +2884,17 @@ fn decode_vcf_record(
 
     for (sample_idx, sample) in samples.iter().enumerate().take(n_samples) {
         let mut ds_field: Option<&str> = None;
+        let mut gp_field: Option<&str> = None;
         let mut gt_field: Option<&str> = None;
 
         for (idx, field) in sample.as_ref().split(':').enumerate() {
-            if prefer_ds && ds_index == Some(idx) {
-                ds_field = Some(field);
+            if prefer_ds {
+                if ds_index == Some(idx) {
+                    ds_field = Some(field);
+                }
+                if gp_index == Some(idx) {
+                    gp_field = Some(field);
+                }
             }
             if idx == gt_idx {
                 gt_field = Some(field);
@@ -2871,6 +2904,13 @@ fn decode_vcf_record(
         if prefer_ds {
             if let Some(value) = ds_field {
                 if let Some(parsed) = parse_numeric_str(value)? {
+                    dest[sample_idx] = parsed;
+                    continue;
+                }
+            }
+            // Fallback to GP if DS is missing but preferred
+            if let Some(value) = gp_field {
+                if let Some(parsed) = parse_vcf_gp(value)? {
                     dest[sample_idx] = parsed;
                     continue;
                 }
@@ -2917,6 +2957,12 @@ fn decode_bcf_record(
         if prefer_ds && name == "DS" {
             decode_bcf_numeric_series(series, header, dest)?;
             used_ds = true;
+        } else if prefer_ds && name == "GP" {
+            // Decode GP only if DS hasn't been used yet.
+            // Note: If DS comes later in the file, it will overwrite this GP value (which is correct behavior).
+            if !used_ds {
+                decode_bcf_gp_series(series, header, dest)?;
+            }
         } else if name == key::GENOTYPE {
             decode_bcf_genotype_series(series, header, dest)?;
             saw_gt = true;
@@ -3233,6 +3279,45 @@ fn is_http_path(path: &Path) -> bool {
     path.to_str()
         .map(|s| s.starts_with("http://") || s.starts_with("https://"))
         .unwrap_or(false)
+}
+
+fn decode_bcf_gp_series(
+    series: noodles_bcf::record::samples::Series<'_>,
+    header: &vcf::Header,
+    dest: &mut [f64],
+) -> Result<(), VariantIoError> {
+    for (sample_idx, slot) in dest.iter_mut().enumerate() {
+        let Some(value) = series.get(header, sample_idx) else {
+             return Err(VariantIoError::Decode(
+                "BCF GP series shorter than expected".to_string(),
+            ));
+        };
+
+        match value {
+            Some(Ok(SeriesValue::Array(SeriesArray::Float(v)))) => {
+                let mut iter = v.iter();
+                // GP has 3 values: Ref, Het, Alt (0, 1, 2 copies of Alt).
+                // Dosage = Het + 2*Alt.
+                let _ = iter.next(); // Skip Ref
+                let p1 = iter.next();
+                let p2 = iter.next();
+                
+                if let (Some(Ok(Some(h))), Some(Ok(Some(a)))) = (p1, p2) {
+                    if h.is_finite() && a.is_finite() {
+                        *slot = (h + 2.0 * a) as f64;
+                    }
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(err)) => {
+                 return Err(VariantIoError::Decode(format!(
+                    "failed to decode BCF GP value: {err}"
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
