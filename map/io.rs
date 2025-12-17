@@ -27,6 +27,7 @@ use noodles_vcf::io::Reader as VcfReader;
 use noodles_vcf::{
     self as vcf, Record as VcfRecord,
     variant::RecordBuf,
+    variant::record::AlternateBases,
     variant::record::samples::{
         keys::key,
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
@@ -1319,7 +1320,9 @@ impl VcfLikeDataset {
                 };
                 let pos = position.get() as u64;
             let ref_allele = record.reference_bases().to_string();
-            let alt_allele = record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+            let alt_allele = record.alternate_bases().iter().next()
+                .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                .unwrap_or_else(|| ".".to_string());
             
             keys.push(VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele));
             }
@@ -1401,7 +1404,9 @@ impl VcfLikeDataset {
                 if let Some(position) = record.variant_start() {
                     let pos = position.get() as u64;
                     let ref_allele = record.reference_bases().to_string();
-                    let alt_allele = record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                    let alt_allele = record.alternate_bases().iter().next()
+                        .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                        .unwrap_or_else(|| ".".to_string());
                     let key = VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele);
                     if let Some(status) = filter.match_status(&key) {
                         if matched.insert(key.clone()) {
@@ -2322,7 +2327,9 @@ impl VcfLikeVariantBlockSource {
                     VariantIoError::Decode(format!("failed to read VCF position: {err}"))
                 })?;
                 let ref_allele = self.vcf_record.reference_bases().to_string();
-                let alt_allele = self.vcf_record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                let alt_allele = self.vcf_record.alternate_bases().iter().next()
+                    .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                    .unwrap_or_else(|| ".".to_string());
                 Ok(Some(VariantKey::new_with_alleles(&chrom, position.get() as u64, &ref_allele, &alt_allele)))
             }
             Some(VariantFormat::Bcf) => {
@@ -2344,8 +2351,10 @@ impl VcfLikeVariantBlockSource {
                 let position = start.map_err(|err| {
                     VariantIoError::Decode(format!("failed to read BCF position: {err}"))
                 })?;
-                let ref_allele = self.bcf_record.reference_bases().to_string();
-                let alt_allele = self.bcf_record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                let ref_allele = String::from_utf8_lossy(self.bcf_record.reference_bases().as_ref()).to_string();
+                let alt_allele = self.bcf_record.alternate_bases().iter().next()
+                    .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                    .unwrap_or_else(|| ".".to_string());
                 Ok(Some(VariantKey::new_with_alleles(chrom, position.get() as u64, &ref_allele, &alt_allele)))
             }
             None => Ok(None),
