@@ -179,12 +179,13 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
   constructor
   · let c₁ : Fin k → ℝ := fun _ => 0
-    let c₂ : Fin k → ℝ := fun l => if l = ⟨0, hk_pos⟩ then 1 else 0
+    let x₀ : Fin k := ⟨0, hk_pos⟩
+    let c₂ : Fin k → ℝ := fun l => if l = x₀ then 1 else 0
     use 0, 1, c₁, c₂
     simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
     constructor
     · intro h_c_eq
-      have h_contra := congr_fun h_c_eq (⟨0, hk_pos⟩ : Fin k)
+      have h_contra := congr_fun h_c_eq x₀
       simp [c₁, c₂] at h_contra
       contradiction
     · simp [dgpScenario1, Finset.sum_const_zero]
