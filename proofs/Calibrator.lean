@@ -184,12 +184,17 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
     simp only [ne_eq, one_ne_zero, not_false_eq_true, and_true]
     constructor
     · intro h_c_eq
-      have h_contra := congr_fun h_c_eq ⟨0, hk_pos⟩
+      let x : Fin k := ⟨0, hk_pos⟩
+      have h_contra := congr_fun h_c_eq x
       simp [c₁, c₂] at h_contra
       contradiction
-    · simp [dgpScenario1, Finset.sum_const_zero];
-      have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by simp [c₂, Finset.sum_eq_single_of_mem, Fin.exists_fin_one, Finset.mem_univ];
-      simp [h_sum_c₂]; norm_num
+    · simp [dgpScenario1, Finset.sum_const_zero]
+      have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by
+        simp [c₂]
+        rw [Finset.sum_ite_eq]
+        simp
+      simp [h_sum_c₂]
+      norm_num
   constructor
   · intro h; simp [hasInteraction, dgpScenario3] at h
     rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
@@ -197,14 +202,16 @@ theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
       rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
     have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
       rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
-    rw [h_slope₁, h_slope₂] at h_neq; contradiction
+    rw [h_slope₁, h_slope₂] at h_neq
+    contradiction
   · intro h; simp [hasInteraction, dgpScenario4] at h
     rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
     have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
       rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
     have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
       rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
-    rw [h_slope₁, h_slope₂] at h_neq; contradiction
+    rw [h_slope₁, h_slope₂] at h_neq
+    contradiction
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
