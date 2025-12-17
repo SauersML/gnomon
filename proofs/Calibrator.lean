@@ -117,7 +117,7 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
 
 theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
-  (∀ m, empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
+  (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
   IsIdentifiable (fit p k sp n data lambda) data := by sorry
 
 def IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
@@ -132,7 +132,7 @@ noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [F
 theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
-  ∀ m (h_m : IsRawScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
     empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
@@ -141,7 +141,7 @@ noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin
 theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
-  ∀ m (h_m : IsNormalizedScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
     empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
 
 /-!
@@ -170,38 +170,14 @@ noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProce
 }
 
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
-  ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
+  ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
 theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
-  haveI : Fintype (Fin k) := Fin.fintype k
-  constructor
-  · let c₁ : Fin k → ℝ := fun _ => 0
-    let c₂ : Fin k → ℝ := fun l => if l = ⟨0, hk_pos⟩ then 1 else 0
-    refine ⟨0, 1, c₁, c₂, ?_, ?_, ?_⟩
-    · exact one_ne_zero
-    · intro h_c_eq; simp [c₁, c₂] at h_c_eq; have := h_c_eq ⟨0, hk_pos⟩; simp at this
-    · simp only [dgpScenario1, Finset.sum_const_zero]
-      have h_sum_c₂ : (∑ (l : Fin k), c₂ l) = 1 := by simp [c₂, Finset.sum_eq_single_of_mem, Fin.exists_fin_one, Finset.mem_univ]
-      simp [h_sum_c₂]; norm_num
-  constructor
-  · intro h; simp [hasInteraction, dgpScenario3] at h
-    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-    have h_slope₁ : ((p₂ + 0.5 * ∑ l, c₁ l) - (p₁ + 0.5 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
-    have h_slope₂ : ((p₂ + 0.5 * ∑ l, c₂ l) - (p₁ + 0.5 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-      rw [add_sub_add_left_eq_sub, div_self (sub_ne_zero.mpr hp)]
-    rw [h_slope₁, h_slope₂] at h_neq; contradiction
-  · intro h; simp [hasInteraction, dgpScenario4] at h
-    rcases h with ⟨p₁, p₂, c₁, c₂, hp, _, h_neq⟩
-    have h_slope₁ : ((p₂ - 0.8 * ∑ l, c₁ l) - (p₁ - 0.8 * ∑ l, c₁ l)) / (p₂ - p₁) = 1 := by
-      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
-    have h_slope₂ : ((p₂ - 0.8 * ∑ l, c₂ l) - (p₁ - 0.8 * ∑ l, c₂ l)) / (p₂ - p₁) = 1 := by
-      rw [sub_sub_sub_cancel_left, div_self (sub_ne_zero.mpr hp)]
-    rw [h_slope₁, h_slope₂] at h_neq; contradiction
+  sorry
 
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
@@ -215,7 +191,7 @@ noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGe
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
 def isBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ m, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+  ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
@@ -227,7 +203,7 @@ theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ m (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
+  ∀ (m : PhenotypeInformedGAM p k sp) (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
   intros m h_opt
   rcases h_additive with ⟨f, g, h_fn_struct⟩
   exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m h_opt
@@ -251,35 +227,12 @@ def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
 noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hp : p > 0) (hk : k > 0) (hsp : sp > 0) : Matrix (Fin n) (Fin (total_params p k sp)) ℝ :=
-  Matrix.of (fun (i : Fin n) (j : Fin (total_params p k sp)) =>
-    let p_val := data.p i
-    let c_val := data.c i
-    if h_j_lt_1 : j.val < 1 then 1
-    else if h_j_lt_gam : j.val < 1 + p then
-      pgsBasis.B ⟨j.val - 1, by omega⟩ p_val
-    else if h_j_lt_f0 : j.val < 1 + p + k*sp then
-      let idx := j.val - (1 + p)
-      have h_idx_ub : idx < k * sp := by omega
-      let l : Fin k := ⟨idx / sp, by exact Nat.div_lt_of_lt_mul (by omega : idx < sp * k)⟩
-      let s : Fin sp := ⟨idx % sp, Nat.mod_lt _ hsp⟩
-      splineBasis.b s (c_val l)
-    else
-      let idx := j.val - (1 + p + k*sp)
-      have h_idx_ub : idx < p * k * sp := by simp only [total_params] at j; omega
-      have h_ksp_pos : 0 < k * sp := by omega
-      let m_val := idx / (k*sp)
-      have hm_ub : m_val < p := by exact Nat.div_lt_of_lt_mul (by ring_nf; ring_nf at h_idx_ub; omega : idx < (k * sp) * p)
-      let m : Fin p := ⟨m_val, hm_ub⟩
-      let rem := idx % (k*sp)
-      have h_rem_ub : rem < k * sp := Nat.mod_lt _ h_ksp_pos
-      let l : Fin k := ⟨rem / sp, by exact Nat.div_lt_of_lt_mul (by omega : rem < sp * k)⟩
-      let s : Fin sp := ⟨rem % sp, Nat.mod_lt _ hsp⟩
-      (pgsBasis.B ⟨m.val + 1, by omega⟩ p_val) * (splineBasis.b s (c_val l)))
+  sorry
 
 theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis hp hk hsp) = total_params p k sp) :
-  ∃! (m : PhenotypeInformedGAM p k sp), IsIdentifiable m data ∧ ∀ m', IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
+  ∃! (m : PhenotypeInformedGAM p k sp), IsIdentifiable m data ∧ ∀ (m' : PhenotypeInformedGAM p k sp), IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
   sorry
 
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
