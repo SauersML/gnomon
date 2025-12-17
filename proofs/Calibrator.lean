@@ -170,14 +170,13 @@ noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProce
 }
 
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
-  ∃ p₁ p₂ (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
+  ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
-theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
+theorem scenarios_are_distinct (k : ℕ) [Fintype (Fin k)] (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
-  haveI : Fintype (Fin k) := Fin.fintype k
   constructor
   · let c₁ : Fin k → ℝ := fun _ => 0
     let c₂ : Fin k → ℝ := fun l => if l = ⟨0, hk_pos⟩ then 1 else 0
@@ -208,7 +207,8 @@ theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
   haveI : Fintype (Fin 1) := Fin.fintype 1
-  use dgpScenario1 1, dgpScenario4 1
+  use dgpScenario1 1
+  use dgpScenario4 1
   constructor; rfl
   have h_distinct := scenarios_are_distinct 1 (by norm_num)
   exact And.intro h_distinct.left h_distinct.right.right
