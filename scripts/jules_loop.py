@@ -228,7 +228,7 @@ def main():
 
     # Common restrictions for all prompts
     version_restriction = (
-        "\n\NOTE:\n"
+        "\n\nNOTE:\n"
         "- DO NOT modify 'lean-toolchain' - the Lean version is intentionally pinned\n"
         "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version)\n"
         "- Focus ONLY on proofs/*.lean files for improvements\n"
