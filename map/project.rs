@@ -340,7 +340,7 @@ impl<'model> HwePcaProjector<'model> {
                         } else {
                             1.0
                         };
-                        quality * w
+                        quality * w * w
                     })
                     .collect();
 
@@ -791,11 +791,24 @@ mod tests {
         }
     }
 
+
+
     #[test]
-    #[test]
-    fn ld_weighted_wls_returns_finite_scores() {
+    fn ld_weighted_renormalization_matches_baseline_without_missingness() {
         let model = fit_example_model_with_ld();
         let data = sample_data();
+
+        let mut raw_source = DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("raw");
+        let raw_options = ProjectionOptions {
+            missing_axis_renormalization: false,
+            return_alignment: false,
+            on_zero_alignment: ZeroAlignmentAction::Zero,
+        };
+        let raw_scores = model
+            .projector()
+            .project_with_options(&mut raw_source, &raw_options)
+            .expect("raw projection")
+            .scores;
 
         let mut renorm_source =
             DenseBlockSource::new(&data, N_SAMPLES, N_VARIANTS).expect("renorm");
@@ -804,25 +817,23 @@ mod tests {
             return_alignment: true,
             on_zero_alignment: ZeroAlignmentAction::Zero,
         };
+        // With w^2 weighting in LHS, WLS should match standard projection for full data
         let renorm_result = model
             .projector()
             .project_with_options(&mut renorm_source, &renorm_options)
             .expect("renormalized projection");
 
-        // WLS scores should be finite
-        for row in 0..renorm_result.scores.nrows() {
-            for col in 0..renorm_result.scores.ncols() {
-                assert!(renorm_result.scores[(row, col)].is_finite());
-            }
-        }
+        // WLS includes a ridge (1e-5) not present in raw projection, so expect small deviation.
+        assert_mats_close(&raw_scores, &renorm_result.scores, 1e-4);
 
-        // Alignment should be finite and reasonable (0-2 range generally)
         let alignment = renorm_result.alignment.expect("alignment");
         for row in 0..alignment.nrows() {
             for col in 0..alignment.ncols() {
                 let norm = alignment[(row, col)];
-                assert!(norm.is_finite());
-                assert!(norm >= 0.0);
+                assert!(
+                    (norm - 1.0).abs() <= 1e-12,
+                    "alignment mismatch at ({row}, {col})"
+                );
             }
         }
     }

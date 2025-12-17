@@ -32,7 +32,11 @@ use noodles_vcf::{
         keys::key,
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
     },
-    variant::record::{info::Info as VcfInfoTrait, info::field::Value as InfoValue},
+    variant::record::{
+        info::Info as VcfInfoTrait,
+        info::field::Value as InfoValue,
+        info::field::value::Array as InfoArray,
+    },
 };
 use thiserror::Error;
 
@@ -2412,7 +2416,17 @@ impl VcfLikeVariantBlockSource {
                 InfoValue::Float(f) => Some(f as f64),
                 InfoValue::Integer(i) => Some(i as f64),
                 InfoValue::String(s) => s.parse::<f64>().ok(),
-                InfoValue::Array(_) => None, // TODO: Handle array values if needed
+                InfoValue::Array(arr) => match arr {
+                    InfoArray::Float(v) => match v.iter().next() {
+                        Some(Ok(Some(f))) => Some(f as f64),
+                        _ => None,
+                    },
+                    InfoArray::Integer(v) => match v.iter().next() {
+                        Some(Ok(Some(i))) => Some(i as f64),
+                        _ => None,
+                    },
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
