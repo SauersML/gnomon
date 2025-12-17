@@ -343,7 +343,7 @@ impl<'model> HwePcaProjector<'model> {
                 //    Our LHS accumulation is sum(q * L * L^t).
                 //    When q=1, A = sum(L * L^t). Since sum(L^2) = 1 (by fit.rs normalization), A = I.
                 //
-                // 4. STABILITY RATIONALE (Option B):
+                // 4. Stability rationale:
                 //    We chose Euclidean normalization over LD-weighted normalization to ensure that
                 //    the projected coordinates estimate the *same latent position* in the
                 //    reference space regardless of which SNPs are observed.
