@@ -949,8 +949,7 @@ fn detect_logit_instability(
 /// - Reuse a cached balanced penalty root when available to avoid repeated eigendecompositions
 ///
 /// This architecture ensures optimal numerical stability throughout the entire
-/// fitting process by working in a well-conditioned parameter space.  
-
+/// fitting process by working in a well-conditioned parameter space.
 pub fn fit_model_for_fixed_rho<'a>(
     rho_vec: ArrayView1<f64>,
     x: ArrayView2<'a, f64>,

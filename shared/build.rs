@@ -103,6 +103,7 @@ fn install_stage_panic_hook() {
     }));
 }
 
+#[allow(clippy::collapsible_if)]
 fn detect_total_memory_bytes() -> Option<u64> {
     if let Ok(forced) = std::env::var("GNOMON_FORCE_TOTAL_MEMORY_BYTES") {
         if let Ok(parsed) = forced.trim().parse::<u64>() {
@@ -586,7 +587,7 @@ fn tuple_pattern_is_fully_ignored(line_text: &str) -> bool {
 
     components
         .into_iter()
-        .all(|component| is_component_ignored(component))
+        .all(is_component_ignored)
 }
 
 fn extract_tuple_pattern(line_text: &str) -> Option<&str> {
@@ -659,7 +660,7 @@ fn is_component_ignored(component: &str) -> bool {
         return !inner_components.is_empty()
             && inner_components
                 .into_iter()
-                .all(|inner_component| is_component_ignored(inner_component));
+                .all(is_component_ignored);
     }
 
     if trimmed.contains('@') {
@@ -1098,7 +1099,7 @@ fn manually_check_for_unused_variables() {
         command_preview(&rustc_binary, &manual_lint_args)
     ));
 
-    if let Some(cwd) = std::env::current_dir().ok() {
+    if let Ok(cwd) = std::env::current_dir() {
         emit_stage_detail(&format!(
             "manual lint self-check: current dir before spawn: {:?}",
             cwd

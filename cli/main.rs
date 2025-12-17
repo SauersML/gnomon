@@ -693,7 +693,7 @@ enum Commands {
         #[arg(value_name = "SCORE_PATH")]
         score: PathBuf,
 
-        /// Path to PLINK .bed file or directory containing .bed files
+        /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, or BCF file)
         #[arg(value_name = "GENOTYPE_PATH")]
         input_path: PathBuf,
 

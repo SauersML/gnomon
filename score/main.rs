@@ -19,6 +19,7 @@ use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
+use gnomon::score::vcf_convert;
 use natord::compare;
 use std::collections::HashMap;
 use std::error::Error;
@@ -50,7 +51,7 @@ struct Args {
     #[clap(long)]
     keep: Option<PathBuf>,
 
-    /// Path to the PLINK .bed file, or a directory containing a single .bed file.
+    /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, or BCF file)
     #[clap(value_name = "GENOTYPE_PATH")]
     input_path: PathBuf,
 }
@@ -91,7 +92,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     let overall_start_time = Instant::now();
-    let fileset_prefixes = resolve_filesets(&args.input_path)?;
+
+    // --- VCF/BCF Conversion (if needed) ---
+    // Transparently convert VCF/BCF to PLINK format before proceeding.
+    let effective_input_path = vcf_convert::ensure_plink_format(&args.input_path)?;
+
+    let fileset_prefixes = resolve_filesets(&effective_input_path)?;
 
     // --- Output Naming & Safety Check ---
     // We derive a suffix from the score path (e.g. "my_scores.txt" -> "my_scores")

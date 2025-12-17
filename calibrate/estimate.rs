@@ -5562,11 +5562,11 @@ pub mod internal {
         /// * `intercept`: The baseline log-odds when the predictor is at its midpoint.
         /// * `noise_level`: The amount of random noise to add to the logit before converting to probability.
         ///                  Higher values create more class overlap.
-        /// * `rng`: A mutable reference to a random number generator for reproducibility.
+        /// - `rng`: A mutable reference to a random number generator for reproducibility.
         ///
         /// # Returns
         /// An `Array1<f64>` of binary outcomes (0.0 or 1.0).
-
+        ///
         /// Generates a non-separable binary outcome vector 'y' from a vector of logits.
         ///
         /// This is a simplified helper function that takes logits (log-odds) and produces
@@ -5579,7 +5579,7 @@ pub mod internal {
         ///
         /// Returns:
         /// - Array1<f64>: Binary outcome array (0.0 or 1.0 values)
-
+        ///
         /// Tests the inner P-IRLS fitting mechanism with fixed smoothing parameters.
         /// This test verifies that the coefficient estimation is correct for a known dataset
         /// and known smoothing parameters, without relying on the unstable outer BFGS optimization.

@@ -849,12 +849,12 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         );
     }
 
-    #[cfg(all(not(any(
+    #[cfg(not(any(
         target_arch = "x86",
         target_arch = "x86_64",
         target_arch = "aarch64",
         target_arch = "wasm32"
-    ))))]
+    )))]
     {
         return record_simd_lane_diagnostic("portable fallback", SimdLaneSelection::Lanes2);
     }
@@ -1157,12 +1157,12 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 return sum_and_count_finite_impl::<4>(values);
             }
 
-            #[cfg(all(not(any(
+            #[cfg(not(any(
                 target_arch = "x86",
                 target_arch = "x86_64",
                 target_arch = "aarch64",
                 target_arch = "wasm32"
-            ))))]
+            )))]
             {
                 log::warn!(
                     "Falling back to two-lane sum_and_count_finite implementation despite four-lane selection"
