@@ -869,10 +869,7 @@ impl TrainedModel {
             let (risk_val, mut grad_row) = match risk_type {
                 SurvivalRiskType::Net => {
                     let risk = survival::conditional_absolute_risk(
-                        entry_age,
-                        exit_age,
-                        &cov_row,
-                        artifacts,
+                        entry_age, exit_age, &cov_row, artifacts,
                     )?;
 
                     let eta_entry = design_entry.dot(coeffs);

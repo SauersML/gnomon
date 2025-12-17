@@ -168,8 +168,6 @@ impl PipelineContext {
     }
 }
 
-
-
 /// Executes the entire concurrent compute pipeline.
 ///
 /// This is the primary public entry point. It is synchronous and returns the
@@ -494,7 +492,12 @@ fn run_single_file_pipeline(
                 spool_bytes_per_variant,
                 dense_map,
             );
-            if let Err(e) = resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts) {
+            if let Err(e) = resolve_complex_variants(
+                &resolver,
+                prep_result,
+                &mut final_scores,
+                &mut final_counts,
+            ) {
                 // Cleanup spool before propagating error
                 let _ = fs::remove_file(&spool_file_path);
                 return Err(e);
@@ -835,7 +838,12 @@ fn run_multi_file_pipeline(
                 spool_bytes_per_variant,
                 dense_map,
             );
-            if let Err(e) = resolve_complex_variants(&resolver, prep_result, &mut final_scores, &mut final_counts) {
+            if let Err(e) = resolve_complex_variants(
+                &resolver,
+                prep_result,
+                &mut final_scores,
+                &mut final_counts,
+            ) {
                 // Cleanup spool before propagating error
                 let _ = fs::remove_file(&spool_file_path);
                 return Err(e);

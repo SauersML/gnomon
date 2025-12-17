@@ -518,7 +518,7 @@ impl Heuristic {
         // Check if we have valid conflicting homozygous alleles
         let first_allele = homozygous_alleles[0];
         let has_conflict = homozygous_alleles.iter().any(|&a| a != first_allele);
-        
+
         if !has_conflict {
             return None; // All homozygous calls agree, so this heuristic doesn't apply
         }
@@ -526,19 +526,21 @@ impl Heuristic {
         // We have conflicting homozygous calls. Check if they form a prefix relationship.
         // We require that ALL observed homozygous alleles can be explained by a single
         // pair of (Short, Long) alleles where Short is a prefix of Long.
-        
+
         // Find the shortest and longest alleles
         let shortest = homozygous_alleles.iter().min_by_key(|a| a.len()).unwrap();
         let longest = homozygous_alleles.iter().max_by_key(|a| a.len()).unwrap();
 
         // The prefix condition must hold
         if !longest.starts_with(shortest) {
-             return None;
+            return None;
         }
 
         // Also strictly require that every homozygous allele found is EITHER the short or the long one.
         // (No third unrelated allele allowed)
-        let clean_evidence = homozygous_alleles.iter().all(|&a| a == *shortest || a == *longest);
+        let clean_evidence = homozygous_alleles
+            .iter()
+            .all(|&a| a == *shortest || a == *longest);
         if !clean_evidence {
             return None;
         }
@@ -547,10 +549,10 @@ impl Heuristic {
         // This strongly suggests a Heterozygous genotype (Short/Long).
         // Since we are creating a synthetic Het call, the dosage of the effect allele is always 1.0,
         // (assuming the effect allele is one of the two).
-        
+
         // Sanity check: is the effect allele even involved?
         let effect = &context.score_info.effect_allele;
-        
+
         // The inferred genotype is Short/Long.
         // If Effect == Short or Effect == Long, dosage is 1.0.
         // If Effect is neither (weird?), dosage is 0.0.
@@ -559,8 +561,12 @@ impl Heuristic {
         // Inferred Genotype: { *shortest, *longest }
         // Dosage = count of Effect Allele in that set.
         let mut final_dosage = 0.0;
-        if effect == *shortest { final_dosage += 1.0; }
-        if effect == *longest { final_dosage += 1.0; }
+        if effect == *shortest {
+            final_dosage += 1.0;
+        }
+        if effect == *longest {
+            final_dosage += 1.0;
+        }
 
         Some(Resolution {
             chosen_dosage: final_dosage,
@@ -629,8 +635,6 @@ impl ResolverPipeline {
             Heuristic::ExactScoreAlleleMatch,
             Heuristic::PrioritizeUnambiguousGenotype,
             Heuristic::PreferMatchingAlleleStructure,
-
-
             Heuristic::ConsistentDosage,
             Heuristic::IndelAnchorBase,
             Heuristic::PreferHeterozygous,
@@ -1060,12 +1064,12 @@ fn format_critical_integrity_warning(data: &CriticalIntegrityWarningInfo) -> Str
             ResolutionMethod::IndelAnchorBase { .. } => {
                 // For indel anchor base, we "chose" the homozygous rows that contributed
                 // to the inference.
-                 match conflict.genotype_bits {
+                match conflict.genotype_bits {
                     0b00 => true, // Contributed evidence if hom
-                    0b11 => true, 
+                    0b11 => true,
                     _ => false,
-                 }
-            },
+                }
+            }
         }
     };
 

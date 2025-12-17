@@ -791,7 +791,10 @@ fn main() {
             sites_window,
             bp_window,
         }) => run_map_fit(genotype_path, list, components, ld, sites_window, bp_window),
-        Some(Commands::Project { genotype_path, model }) => run_map_project(genotype_path, model),
+        Some(Commands::Project {
+            genotype_path,
+            model,
+        }) => run_map_project(genotype_path, model),
         Some(Commands::Terms(args)) => run_terms(args),
         Some(Commands::Train(args)) => train(args),
         Some(Commands::Infer(args)) => infer(args),
@@ -872,7 +875,6 @@ fn print_version_info() {
 }
 
 fn run_map_fit(
-
     genotype_path: PathBuf,
     list: Option<PathBuf>,
     components: usize,
@@ -912,9 +914,15 @@ fn run_map_fit(
     .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
-fn run_map_project(genotype_path: PathBuf, model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    map_cli::run(map_cli::MapCommand::Project { genotype_path, model })
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+fn run_map_project(
+    genotype_path: PathBuf,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    map_cli::run(map_cli::MapCommand::Project {
+        genotype_path,
+        model,
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
 fn run_terms(args: TermsArgs) -> Result<(), Box<dyn std::error::Error>> {

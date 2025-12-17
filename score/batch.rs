@@ -21,7 +21,6 @@ use crossbeam_queue::ArrayQueue;
 use std::error::Error;
 use std::simd::{Simd, cmp::SimdPartialEq, num::SimdUint};
 
-
 // --- SIMD & Engine Tuning Parameters ---
 const SIMD_LANES: usize = 8;
 type U64xN = Simd<u64, SIMD_LANES>;
@@ -177,7 +176,6 @@ fn process_block<'a>(
     tile.clear();
     tile.resize(tile_size, EffectAlleleDosage::default());
 
-
     // This pivot function has a single, clear responsibility.
     pivot_tile(
         variant_major_data,
@@ -323,8 +321,9 @@ pub(crate) fn process_tile_impl<'a>(
             //
             // Safety: This transmutation requires EffectAlleleDosage to be exactly 1 byte.
             const _: () = assert!(std::mem::size_of::<EffectAlleleDosage>() == 1);
-            let dosage_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(dosage_row.as_ptr() as *const u8, dosage_row.len()) };
+            let dosage_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(dosage_row.as_ptr() as *const u8, dosage_row.len())
+            };
 
             let chunks = dosage_bytes.chunks_exact(32);
             let remainder_start = chunks.len() * 32;
@@ -348,7 +347,7 @@ pub(crate) fn process_tile_impl<'a>(
                 while m != 0 {
                     let bit_idx = m.trailing_zeros() as usize;
                     let i = base_idx + bit_idx;
-                    
+
                     // Cache-hot load: this byte was just in the SIMD register
                     match dosage_bytes[i] {
                         1 => {
@@ -362,8 +361,9 @@ pub(crate) fn process_tile_impl<'a>(
                         3 => {
                             // Handle missing genotype inline
                             let variant_idx_in_chunk = variant_mini_batch_start + i;
-                            let global_matrix_row_idx =
-                                reconciled_variant_indices_for_batch[variant_idx_in_chunk].0 as usize;
+                            let global_matrix_row_idx = reconciled_variant_indices_for_batch
+                                [variant_idx_in_chunk]
+                                .0 as usize;
                             let scores_for_this_variant =
                                 &prep_result.variant_to_scores_map[global_matrix_row_idx];
                             let weight_row_offset = i * stride;
@@ -647,7 +647,7 @@ pub fn run_variant_major_path(
     // This single loop iterates only over the individuals we need to score.
     // This is the core optimization that eliminates the massive allocation and
     // redundant work of the previous implementation.
-    
+
     // Cache the last-read byte to avoid redundant memory reads. When output_idx_to_fam_idx
     // is sorted (which it typically is), consecutive people often share the same byte.
     let mut cached_byte_idx = usize::MAX;
@@ -665,7 +665,7 @@ pub fn run_variant_major_path(
             cached_byte = variant_data[byte_index];
             cached_byte_idx = byte_index;
         }
-        
+
         let bit_offset = (original_fam_idx % 4) * 2;
         let packed_val = (cached_byte >> bit_offset) & 0b11;
 

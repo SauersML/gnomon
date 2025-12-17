@@ -2372,11 +2372,7 @@ pub fn delta_method_standard_errors(
                 for r in 0..dim {
                     // Safe slicing: factor.lower is dim x dim, y is dim.
                     // We need dot product of row r of L (up to r) and y (up to r).
-                    let sum = factor
-                        .lower
-                        .row(r)
-                        .slice(s![..r])
-                        .dot(&y.slice(s![..r]));
+                    let sum = factor.lower.row(r).slice(s![..r]).dot(&y.slice(s![..r]));
                     y[r] = g_perm[r] - sum;
                 }
 
@@ -2866,8 +2862,14 @@ mod tests {
         }
     }
 
-    trait LogitExt { fn logit(self) -> f64; }
-    impl LogitExt for f64 { fn logit(self) -> f64 { (self / (1.0 - self)).ln() } }
+    trait LogitExt {
+        fn logit(self) -> f64;
+    }
+    impl LogitExt for f64 {
+        fn logit(self) -> f64 {
+            (self / (1.0 - self)).ln()
+        }
+    }
 
     #[test]
     fn logit_extension_behaves() {
@@ -3110,8 +3112,7 @@ mod tests {
         let covs = Array1::<f64>::zeros(layout.static_covariates.ncols());
 
         let via_companion = conditional_absolute_risk(55.0, 60.0, &covs, &base_artifacts).unwrap();
-        let direct =
-            conditional_absolute_risk(55.0, 60.0, &covs, &registry["companion"]).unwrap();
+        let direct = conditional_absolute_risk(55.0, 60.0, &covs, &registry["companion"]).unwrap();
         assert_abs_diff_eq!(via_companion, direct, epsilon = 1e-12);
     }
 
@@ -3866,5 +3867,4 @@ mod tests {
             assert_abs_diff_eq!(se_observed[i], se_expected[i], epsilon = 1e-10);
         }
     }
-    
 }

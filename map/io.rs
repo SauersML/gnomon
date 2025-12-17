@@ -28,11 +28,11 @@ use noodles_vcf::{
     self as vcf, Record as VcfRecord,
     variant::RecordBuf,
     variant::record::AlternateBases,
-    variant::record::{info::Info as VcfInfoTrait, info::field::Value as InfoValue},
     variant::record::samples::{
         keys::key,
         series::{self, Value as SeriesValue, value::Array as SeriesArray},
     },
+    variant::record::{info::Info as VcfInfoTrait, info::field::Value as InfoValue},
 };
 use thiserror::Error;
 
@@ -261,7 +261,11 @@ impl GenotypeDataset {
         let original_kinds = std::mem::take(&mut selection.match_kinds);
 
         let mut matched = HashMap::with_capacity(original_keys.len());
-        for ((index, key), kind) in original_indices.into_iter().zip(original_keys.into_iter()).zip(original_kinds.into_iter()) {
+        for ((index, key), kind) in original_indices
+            .into_iter()
+            .zip(original_keys.into_iter())
+            .zip(original_kinds.into_iter())
+        {
             matched.insert(key.clone(), (index, key, kind));
         }
 
@@ -1018,7 +1022,10 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 self.buffer.resize(needed, 0);
                 self.bed.read_at(offset, &mut self.buffer[..])?;
 
-                let kinds_slice = self.match_kinds.as_ref().map(|k| &k[self.cursor..self.cursor + ncols]);
+                let kinds_slice = self
+                    .match_kinds
+                    .as_ref()
+                    .map(|k| &k[self.cursor..self.cursor + ncols]);
 
                 for local in 0..run {
                     let bytes_start = local * self.bytes_per_variant;
@@ -1029,13 +1036,13 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                     decode_plink_variant(bytes, dest, nrows, table);
 
                     if let Some(kinds) = kinds_slice {
-                         if kinds[emitted + local] == MatchKind::Swap {
+                        if kinds[emitted + local] == MatchKind::Swap {
                             for val in dest.iter_mut() {
                                 if !val.is_nan() {
                                     *val = 2.0 - *val;
                                 }
                             }
-                         }
+                        }
                     }
                 }
 
@@ -1320,12 +1327,23 @@ impl VcfLikeDataset {
                     ));
                 };
                 let pos = position.get() as u64;
-            let ref_allele = record.reference_bases().to_string();
-            let alt_allele = record.alternate_bases().iter().next()
-                .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
-                .unwrap_or_else(|| ".".to_string());
-            
-            keys.push(VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele));
+                let ref_allele = record.reference_bases().to_string();
+                let alt_allele = record
+                    .alternate_bases()
+                    .iter()
+                    .next()
+                    .map(|res| {
+                        res.map(|s| s.to_string())
+                            .unwrap_or_else(|_| ".".to_string())
+                    })
+                    .unwrap_or_else(|| ".".to_string());
+
+                keys.push(VariantKey::new_with_alleles(
+                    &chrom,
+                    pos,
+                    &ref_allele,
+                    &alt_allele,
+                ));
             }
         }
 
@@ -1405,8 +1423,14 @@ impl VcfLikeDataset {
                 if let Some(position) = record.variant_start() {
                     let pos = position.get() as u64;
                     let ref_allele = record.reference_bases().to_string();
-                    let alt_allele = record.alternate_bases().iter().next()
-                        .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                    let alt_allele = record
+                        .alternate_bases()
+                        .iter()
+                        .next()
+                        .map(|res| {
+                            res.map(|s| s.to_string())
+                                .unwrap_or_else(|_| ".".to_string())
+                        })
                         .unwrap_or_else(|| ".".to_string());
                     let key = VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele);
                     if let Some(status) = filter.match_status(&key) {
@@ -2268,9 +2292,12 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
     fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
         // Copy stored quality scores for the current block
         // If we have fewer stored than requested, fill remaining with 1.0 (hard call)
-        let available = self.block_quality.len().min(filled);
+        let storage_len = storage.len();
+        let limit = filled.min(storage_len);
+        let available = self.block_quality.len().min(limit);
+
         storage[..available].copy_from_slice(&self.block_quality[..available]);
-        for value in storage.iter_mut().skip(available).take(filled - available) {
+        for value in storage.iter_mut().skip(available).take(limit - available) {
             *value = 1.0;
         }
     }
@@ -2339,22 +2366,31 @@ impl VcfLikeVariantBlockSource {
         let Some(header) = self.header.as_ref() else {
             return 1.0;
         };
-        
+
         match self.format {
             Some(VariantFormat::Vcf) => {
                 let info = self.vcf_record.info();
-                
+
                 // Try R2 first (minimac, Michigan Imputation Server)
                 if let Some(quality) = Self::get_info_float(&info, header, "R2") {
-                    return quality.clamp(0.0, 1.0);
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0; // Conservative fallback for NaN/Inf
                 }
                 // Try DR2 (BEAGLE style)
                 if let Some(quality) = Self::get_info_float(&info, header, "DR2") {
-                    return quality.clamp(0.0, 1.0);
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0;
                 }
                 // Try INFO (some pipelines use this key)
                 if let Some(quality) = Self::get_info_float(&info, header, "INFO") {
-                    return quality.clamp(0.0, 1.0);
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0;
                 }
                 // No quality field found - assume hard call
                 1.0
@@ -2367,14 +2403,16 @@ impl VcfLikeVariantBlockSource {
             None => 1.0,
         }
     }
-    
+
     /// Helper to extract a float value from an INFO field.
+    /// Handles scalars and arrays (taking first element).
     fn get_info_float(info: &dyn VcfInfoTrait, header: &vcf::Header, key: &str) -> Option<f64> {
         match info.get(header, key)? {
             Ok(Some(value)) => match value {
                 InfoValue::Float(f) => Some(f as f64),
                 InfoValue::Integer(i) => Some(i as f64),
                 InfoValue::String(s) => s.parse::<f64>().ok(),
+                InfoValue::Array(_) => None, // TODO: Handle array values if needed
                 _ => None,
             },
             _ => None,
@@ -2392,10 +2430,22 @@ impl VcfLikeVariantBlockSource {
                     VariantIoError::Decode(format!("failed to read VCF position: {err}"))
                 })?;
                 let ref_allele = self.vcf_record.reference_bases().to_string();
-                let alt_allele = self.vcf_record.alternate_bases().iter().next()
-                    .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                let alt_allele = self
+                    .vcf_record
+                    .alternate_bases()
+                    .iter()
+                    .next()
+                    .map(|res| {
+                        res.map(|s| s.to_string())
+                            .unwrap_or_else(|_| ".".to_string())
+                    })
                     .unwrap_or_else(|| ".".to_string());
-                Ok(Some(VariantKey::new_with_alleles(&chrom, position.get() as u64, &ref_allele, &alt_allele)))
+                Ok(Some(VariantKey::new_with_alleles(
+                    &chrom,
+                    position.get() as u64,
+                    &ref_allele,
+                    &alt_allele,
+                )))
             }
             Some(VariantFormat::Bcf) => {
                 let header = self
@@ -2416,11 +2466,24 @@ impl VcfLikeVariantBlockSource {
                 let position = start.map_err(|err| {
                     VariantIoError::Decode(format!("failed to read BCF position: {err}"))
                 })?;
-                let ref_allele = String::from_utf8_lossy(self.bcf_record.reference_bases().as_ref()).to_string();
-                let alt_allele = self.bcf_record.alternate_bases().iter().next()
-                    .map(|res| res.map(|s| s.to_string()).unwrap_or_else(|_| ".".to_string()))
+                let ref_allele =
+                    String::from_utf8_lossy(self.bcf_record.reference_bases().as_ref()).to_string();
+                let alt_allele = self
+                    .bcf_record
+                    .alternate_bases()
+                    .iter()
+                    .next()
+                    .map(|res| {
+                        res.map(|s| s.to_string())
+                            .unwrap_or_else(|_| ".".to_string())
+                    })
                     .unwrap_or_else(|| ".".to_string());
-                Ok(Some(VariantKey::new_with_alleles(chrom, position.get() as u64, &ref_allele, &alt_allele)))
+                Ok(Some(VariantKey::new_with_alleles(
+                    chrom,
+                    position.get() as u64,
+                    &ref_allele,
+                    &alt_allele,
+                )))
             }
             None => Ok(None),
         }
@@ -2433,7 +2496,7 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
-        
+
         let mut filled = 0usize;
         while filled < max_variants {
             let Some(_) = self.read_next_variant()? else {
@@ -2443,7 +2506,7 @@ impl VcfLikeVariantBlockSource {
             let offset = filled * self.n_samples;
             let dest = &mut storage[offset..offset + self.n_samples];
             self.decode_current_variant(dest)?;
-            
+
             // Store imputation quality for this variant
             self.block_quality.push(self.current_variant_quality());
             filled += 1;
@@ -2465,7 +2528,7 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
-        
+
         let target_total = indices.len();
         let mut filled = 0usize;
 
@@ -2511,7 +2574,7 @@ impl VcfLikeVariantBlockSource {
     ) -> Result<usize, VariantIoError> {
         // Clear and prepare quality storage for this block
         self.block_quality.clear();
-        
+
         let mut filled = 0usize;
         let target_total = if self.selection_finalized {
             self.filtered_variants_hint
@@ -2539,7 +2602,7 @@ impl VcfLikeVariantBlockSource {
                                 }
                             }
                         }
-                        
+
                         // Store imputation quality for this variant
                         self.block_quality.push(self.current_variant_quality());
 
@@ -3226,10 +3289,10 @@ mod tests {
     }
     #[test]
     fn test_allele_aware_projection_logic() {
-        use std::sync::Arc;
-        use crate::map::variant_filter::{VariantKey, VariantFilter};
-        use crate::map::io::{VcfLikeDataset, SelectionPlan};
         use crate::map::fit::VariantBlockSource;
+        use crate::map::io::{SelectionPlan, VcfLikeDataset};
+        use crate::map::variant_filter::{VariantFilter, VariantKey};
+        use std::sync::Arc;
 
         let dir = tempdir().unwrap();
         let vcf_path = dir.path().join("test.vcf");
@@ -3246,26 +3309,35 @@ mod tests {
         }
 
         let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
-        
+
         let keys = vec![
             VariantKey::new_with_alleles("1", 100, "A", "G"), // Exact match (File 0/0 -> 0.0)
             VariantKey::new_with_alleles("1", 200, "C", "T"), // Swapped (File T/C=0/0 -> 0.0). Flip -> 2.0.
             VariantKey::new_with_alleles("1", 300, "G", "T"), // Mismatch (File G/C). Excluded.
         ];
-        
+
         // Use into_iter() to create filter
         let filter = VariantFilter::from_keys(keys.into_iter());
         let plan = SelectionPlan::ByKeys(Arc::new(filter));
-        
+
         let mut source = dataset.block_source_with_plan(plan).unwrap();
-        let mut storage = vec![0.0; 100]; 
-        
+        let mut storage = vec![0.0; 100];
+
         let filled = source.next_block_into(10, &mut storage).unwrap();
-        
-        assert_eq!(filled, 2, "Should select 2 variants (Exact, Swapped) and exclude 1 (Mismatch)");
-        
-        let values = &storage[..2]; 
-        assert!((values[0] - 0.0).abs() < 1e-6, "Expected dosage 0.0 for exact match");
-        assert!((values[1] - 2.0).abs() < 1e-6, "Expected dosage 2.0 for swapped match (from 0.0)");
+
+        assert_eq!(
+            filled, 2,
+            "Should select 2 variants (Exact, Swapped) and exclude 1 (Mismatch)"
+        );
+
+        let values = &storage[..2];
+        assert!(
+            (values[0] - 0.0).abs() < 1e-6,
+            "Expected dosage 0.0 for exact match"
+        );
+        assert!(
+            (values[1] - 2.0).abs() < 1e-6,
+            "Expected dosage 2.0 for swapped match (from 0.0)"
+        );
     }
 }

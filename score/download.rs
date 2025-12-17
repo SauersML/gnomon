@@ -6,19 +6,17 @@
 
 use crate::score::reformat;
 use crate::score::types::{GenomicRegion, parse_chromosome_label};
-use reqwest::blocking::Client;
-use std::io::Write;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use reqwest::blocking::Client;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-
 
 // ========================================================================================
 //                              Public API

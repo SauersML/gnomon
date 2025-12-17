@@ -1,5 +1,5 @@
-use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::builtin::{self, BuiltinModelError};
+use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
     load_hwe_model, save_fit_summary, save_hwe_model, save_projection_results,
@@ -113,7 +113,10 @@ pub fn run(command: MapCommand) -> Result<(), MapDriverError> {
             components,
             ld,
         } => run_fit(&genotype_path, variant_list.as_deref(), components, ld),
-        MapCommand::Project { genotype_path, model } => run_project(&genotype_path, model.as_deref()),
+        MapCommand::Project {
+            genotype_path,
+            model,
+        } => run_project(&genotype_path, model.as_deref()),
     }
 }
 

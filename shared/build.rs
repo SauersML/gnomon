@@ -585,9 +585,7 @@ fn tuple_pattern_is_fully_ignored(line_text: &str) -> bool {
         return false;
     }
 
-    components
-        .into_iter()
-        .all(is_component_ignored)
+    components.into_iter().all(is_component_ignored)
 }
 
 fn extract_tuple_pattern(line_text: &str) -> Option<&str> {
@@ -658,9 +656,7 @@ fn is_component_ignored(component: &str) -> bool {
         let inner = &trimmed[1..trimmed.len() - 1];
         let inner_components = split_top_level_components(inner);
         return !inner_components.is_empty()
-            && inner_components
-                .into_iter()
-                .all(is_component_ignored);
+            && inner_components.into_iter().all(is_component_ignored);
     }
 
     if trimmed.contains('@') {
@@ -894,7 +890,6 @@ fn main() {
         update_stage("skipping lint checks (GNOMON_SKIP_LINT_CHECKS set)");
         return;
     }
-
 
     // Manually check for unused variables in the build script
     update_stage("manual lint self-check");

@@ -8,8 +8,8 @@
 // use with the gnomon scoring pipeline. It includes caching to avoid re-conversion
 // on repeated runs.
 
-use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 use convert_genome::input::InputFormat as ConvertInputFormat;
+use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,42 +30,40 @@ pub enum InputFormat {
 /// Returns `None` if the format cannot be determined.
 pub fn detect_input_format(path: &Path) -> Option<InputFormat> {
     let path_str = path.to_string_lossy().to_lowercase();
-    
+
     // Check for PLINK format (by extension or existence of .bed/.bim/.fam)
     if path_str.ends_with(".bed") {
         return Some(InputFormat::Plink);
     }
-    
+
     // Check if it's a prefix pointing to PLINK files
-    if !path_str.ends_with(".vcf") 
-        && !path_str.ends_with(".vcf.gz")
-        && !path_str.ends_with(".bcf")
+    if !path_str.ends_with(".vcf") && !path_str.ends_with(".vcf.gz") && !path_str.ends_with(".bcf")
     {
         // Check if PLINK files exist
         let bed_path = path.with_extension("bed");
         let bim_path = path.with_extension("bim");
         let fam_path = path.with_extension("fam");
-        
+
         if bed_path.exists() && bim_path.exists() && fam_path.exists() {
             return Some(InputFormat::Plink);
         }
     }
-    
+
     // Check for VCF format
     if path_str.ends_with(".vcf") || path_str.ends_with(".vcf.gz") {
         return Some(InputFormat::Vcf);
     }
-    
+
     // Check for BCF format
     if path_str.ends_with(".bcf") {
         return Some(InputFormat::Bcf);
     }
-    
+
     // Directory (could contain PLINK files)
     if path.is_dir() {
         return Some(InputFormat::Plink);
     }
-    
+
     None
 }
 
@@ -87,29 +85,29 @@ fn get_cache_dir(vcf_path: &Path) -> PathBuf {
             }
         })
         .unwrap_or_else(|| "converted".to_string());
-    
+
     parent.join(format!("{}.gnomon_cache", stem))
 }
 
 /// Checks if the cache is valid (source file not modified since conversion).
 fn is_cache_valid(source_path: &Path, cache_dir: &Path) -> bool {
     let cache_bed = cache_dir.join("genotypes.bed");
-    
+
     if !cache_bed.exists() {
         return false;
     }
-    
+
     // Compare modification times
     let source_mtime = match fs::metadata(source_path).and_then(|m| m.modified()) {
         Ok(t) => t,
         Err(_) => return false,
     };
-    
+
     let cache_mtime = match fs::metadata(&cache_bed).and_then(|m| m.modified()) {
         Ok(t) => t,
         Err(_) => return false,
     };
-    
+
     // Cache is valid if it was created after the source was last modified
     cache_mtime > source_mtime
 }
@@ -122,9 +120,7 @@ fn is_cache_valid(source_path: &Path, cache_dir: &Path) -> bool {
 /// # Returns
 /// * `Ok(PathBuf)` - Path to the PLINK prefix (either original or converted)
 /// * `Err` - If conversion fails
-pub fn ensure_plink_format(
-    input_path: &Path,
-) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+pub fn ensure_plink_format(input_path: &Path) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let format = detect_input_format(input_path).ok_or_else(|| {
         format!(
             "Could not determine input format for '{}'. \
@@ -132,7 +128,7 @@ pub fn ensure_plink_format(
             input_path.display()
         )
     })?;
-    
+
     match format {
         InputFormat::Plink => {
             // Already PLINK format, return the prefix
@@ -147,7 +143,7 @@ pub fn ensure_plink_format(
             // Check cache validity
             let cache_dir = get_cache_dir(input_path);
             let cache_prefix = cache_dir.join("genotypes");
-            
+
             if is_cache_valid(input_path, &cache_dir) {
                 eprintln!(
                     "> Using cached PLINK conversion from '{}'",
@@ -155,22 +151,19 @@ pub fn ensure_plink_format(
                 );
                 return Ok(cache_prefix);
             }
-            
+
             // Create cache directory
             fs::create_dir_all(&cache_dir)?;
-            
-            eprintln!(
-                "> Converting {} to PLINK format...",
-                input_path.display()
-            );
-            
+
+            eprintln!("> Converting {} to PLINK format...", input_path.display());
+
             // Set up conversion config
             let input_format = match format {
                 InputFormat::Vcf => ConvertInputFormat::Vcf,
                 InputFormat::Bcf => ConvertInputFormat::Bcf,
                 _ => unreachable!(),
             };
-            
+
             // No reference needed - convert_genome uses natural chromosome ordering
             let config = ConversionConfig {
                 input: input_path.to_path_buf(),
@@ -191,15 +184,15 @@ pub fn ensure_plink_format(
                 standardize: false,
                 panel: None,
             };
-            
+
             // Run conversion
             convert_dtc_file(config)?;
-            
+
             eprintln!(
                 "> Conversion complete. Cache stored at '{}'",
                 cache_dir.display()
             );
-            
+
             Ok(cache_prefix)
         }
     }

@@ -85,7 +85,10 @@ pub fn list_model_names() -> Vec<&'static str> {
 /// Get the cache directory for gnomon models.
 pub fn cache_dir() -> io::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "could not determine home directory")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not determine home directory",
+        )
     })?;
     let cache = home.join(".gnomon").join("models");
     fs::create_dir_all(&cache)?;

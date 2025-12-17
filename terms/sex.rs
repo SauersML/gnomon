@@ -176,7 +176,7 @@ fn collect_inference(
     let mut processed = 0usize;
 
     while processed < total_variants {
-        eprintln!("{}% complete...", {(processed / total_variants)*100});
+        eprintln!("{}% complete...", { (processed / total_variants) * 100 });
         let capacity = block_capacity.min(total_variants - processed);
         let slice_len = capacity * n_samples;
         let filled = block_source.next_block_into(capacity, &mut storage[..slice_len])?;

@@ -23,7 +23,12 @@ impl VariantKey {
         }
     }
 
-    pub fn new_with_alleles(chromosome: &str, position: u64, ref_allele: &str, alt_allele: &str) -> Self {
+    pub fn new_with_alleles(
+        chromosome: &str,
+        position: u64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> Self {
         let chromosome = normalize_chromosome(chromosome);
         Self {
             chromosome,
@@ -34,8 +39,6 @@ impl VariantKey {
 }
 
 // ... existing code ...
-
-
 
 fn normalize_chromosome(chromosome: &str) -> String {
     let mut normalized = chromosome.trim().to_string();
@@ -175,7 +178,7 @@ impl VariantFilter {
             if self.unique.contains(&wildcard) {
                 return Some(MatchKind::Wildcard);
             }
-            
+
             let swapped = VariantKey {
                 chromosome: key.chromosome.clone(),
                 position: key.position,

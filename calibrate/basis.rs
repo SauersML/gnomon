@@ -1617,16 +1617,14 @@ pub fn evaluate_bspline_basis_scalar(
         // For performance in this hot path, we could panic or return error.
         // Since BasisError doesn't have a DimensionMismatch for this specific case, reusing a generic one or just Linalg.
         // Let's panic for now as this is a logic error in the caller.
-        panic!("Output buffer length {} does not match number of basis functions {}", out.len(), num_basis);
+        panic!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        );
     }
 
-    internal::evaluate_splines_at_point_into(
-        x,
-        degree,
-        knot_vector,
-        out,
-        &mut scratch.inner,
-    );
+    internal::evaluate_splines_at_point_into(x, degree, knot_vector, out, &mut scratch.inner);
 
     Ok(())
 }

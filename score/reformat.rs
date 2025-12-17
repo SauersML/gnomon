@@ -331,13 +331,17 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(|s| {
-                    // Smart Fallback: If parent directory exists, prepend it to avoid collisions 
+                    // Smart Fallback: If parent directory exists, prepend it to avoid collisions
                     // like "positive/score.txt" vs "negative/score.txt" -> "score" vs "score".
                     // Result: "positive_score" vs "negative_score".
-                    if let Some(parent_name) = input_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-                         if parent_name != "." && parent_name != "/" {
-                             return format!("{}_{}", parent_name, s);
-                         }
+                    if let Some(parent_name) = input_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                    {
+                        if parent_name != "." && parent_name != "/" {
+                            return format!("{}_{}", parent_name, s);
+                        }
                     }
                     s.to_string()
                 })

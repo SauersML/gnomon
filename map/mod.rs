@@ -1,5 +1,5 @@
-pub mod fit;
 pub mod builtin;
+pub mod fit;
 pub mod io;
 pub mod main;
 pub mod progress;

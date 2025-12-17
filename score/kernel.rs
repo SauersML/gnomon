@@ -180,4 +180,3 @@ pub fn accumulate_adjustments_for_person(
 
     accumulator_buffer
 }
-

@@ -102,7 +102,8 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     // --- Output Naming & Safety Check ---
     // We derive a suffix from the score path (e.g. "my_scores.txt" -> "my_scores")
     // and append it to the genotype prefix to create a unique output name.
-    let out_suffix = args.score
+    let out_suffix = args
+        .score
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "scores".to_string());
@@ -110,9 +111,10 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         let output_prefix = &fileset_prefixes[0];
         let (output_dir, mut out_stem) = if output_prefix.to_string_lossy().starts_with("gs://") {
-            let stem = output_prefix
-                .file_name()
-                .map_or_else(|| std::ffi::OsString::from("gnomon_results"), std::ffi::OsString::from);
+            let stem = output_prefix.file_name().map_or_else(
+                || std::ffi::OsString::from("gnomon_results"),
+                std::ffi::OsString::from,
+            );
             (std::path::Path::new(".").to_path_buf(), stem)
         } else {
             let parent = output_prefix.parent();
@@ -136,7 +138,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
         output_path.set_extension("sscore");
 
         if output_path.exists() {
-             return Err(format!(
+            return Err(format!(
                 "Output file '{}' already exists. Gnomon will not overwrite it. Please remove it or rename it before running.",
                 output_path.display()
             )
@@ -156,11 +158,9 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     .to_string_lossy()
                     .starts_with("gs://")
                     .then(|| Path::new(".").to_path_buf())
-                    .unwrap_or_else(|| {
-                        match p0.parent() {
-                            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                            _ => Path::new(".").to_path_buf(),
-                        }
+                    .unwrap_or_else(|| match p0.parent() {
+                        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                        _ => Path::new(".").to_path_buf(),
                     });
                 parent_local.join("gnomon_score_cache")
             };
@@ -175,36 +175,47 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                     .map(|entry| entry.path())
                     .filter(|p| p.is_file())
                     .collect();
-                
+
                 // O(n) pre-pass: build HashMap of stem -> source file mtime
                 // This avoids O(n²) nested loops when checking cache freshness
-                let source_mtimes: std::collections::HashMap<String, std::time::SystemTime> = all_files.iter()
-                    .filter(|p| !p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
-                    .filter_map(|p| {
-                        let stem = p.file_stem()?.to_string_lossy().to_string();
-                        let mtime = fs::metadata(p).and_then(|m| m.modified()).ok()?;
-                        Some((stem, mtime))
-                    })
-                    .collect();
-                
+                let source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
+                    all_files
+                        .iter()
+                        .filter(|p| {
+                            !p.file_name()
+                                .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
+                        })
+                        .filter_map(|p| {
+                            let stem = p.file_stem()?.to_string_lossy().to_string();
+                            let mtime = fs::metadata(p).and_then(|m| m.modified()).ok()?;
+                            Some((stem, mtime))
+                        })
+                        .collect();
+
                 // O(n) pass: check which caches are fresh
-                let fresh_cache_stems: std::collections::HashSet<String> = all_files.iter()
-                    .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv")))
+                let fresh_cache_stems: std::collections::HashSet<String> = all_files
+                    .iter()
+                    .filter(|p| {
+                        p.file_name()
+                            .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
+                    })
                     .filter_map(|cache_path| {
                         let name = cache_path.file_name()?.to_string_lossy();
                         let stem = name.strip_suffix(".gnomon.tsv")?;
-                        
+
                         // O(1) lookup instead of O(n) scan
                         let source_mtime = source_mtimes.get(stem);
-                        
+
                         if source_mtime.is_none() {
                             // No source file, cache is standalone (keep it)
                             return Some(stem.to_string());
                         }
-                        
-                        let cache_mtime = fs::metadata(cache_path).and_then(|m| m.modified()).ok()?;
-                        let source_is_newer = source_mtime.map_or(false, |&src_time| src_time > cache_mtime);
-                        
+
+                        let cache_mtime =
+                            fs::metadata(cache_path).and_then(|m| m.modified()).ok()?;
+                        let source_is_newer =
+                            source_mtime.map_or(false, |&src_time| src_time > cache_mtime);
+
                         if source_is_newer {
                             None // Cache is stale, don't skip source
                         } else {
@@ -212,11 +223,15 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                     })
                     .collect();
-                
+
                 // O(n) final filter
-                all_files.into_iter()
+                all_files
+                    .into_iter()
                     .filter(|p| {
-                        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
                         if name.ends_with(".gnomon.tsv") {
                             let stem = name.strip_suffix(".gnomon.tsv").unwrap_or(&name);
                             return fresh_cache_stems.contains(stem);
@@ -307,8 +322,8 @@ fn run_preparation_phase(
     /// Reads the score label from a cached .gnomon.tsv file by parsing its header.
     /// Format: variant_id\teffect_allele\tother_allele\tSCORE_LABEL\n
     fn read_label_from_cached_file(path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
-        use std::io::{BufRead, BufReader};
         use std::fs::File;
+        use std::io::{BufRead, BufReader};
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
@@ -344,7 +359,8 @@ fn run_preparation_phase(
 
     let mut native_score_files = Vec::with_capacity(score_files.len());
     // Track (label, source_path) for duplicate detection
-    let mut label_to_path: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut label_to_path: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
 
     for score_file_path in score_files {
         match reformat::is_gnomon_native_format(score_file_path) {
@@ -372,12 +388,12 @@ fn run_preparation_phase(
                 fs::create_dir_all(&output_dir)?;
 
                 let new_path = score_file_path.with_extension("gnomon.tsv");
-                
+
                 // Smart cache check: only reformat if source is newer than existing cache
                 let should_reformat = if new_path.exists() {
                     let source_meta = fs::metadata(score_file_path).and_then(|m| m.modified());
                     let cache_meta = fs::metadata(&new_path).and_then(|m| m.modified());
-                    
+
                     match (source_meta, cache_meta) {
                         (Ok(src_time), Ok(cache_time)) => src_time > cache_time,
                         _ => true, // Fallback to safe reformat on any error
@@ -391,7 +407,7 @@ fn run_preparation_phase(
                         "> Info: Score file '{}' is not in native format. Attempting conversion...",
                         score_file_path.display()
                     );
-                    
+
                     match reformat::reformat_pgs_file(score_file_path, &new_path) {
                         Ok(lbl) => {
                             eprintln!("> Success: Converted to '{}'.", new_path.display());
@@ -403,7 +419,10 @@ fn run_preparation_phase(
                         }
                     }
                 } else {
-                    eprintln!("> Info: Using cached converted file '{}'.", new_path.display());
+                    eprintln!(
+                        "> Info: Using cached converted file '{}'.",
+                        new_path.display()
+                    );
                     native_score_files.push(new_path.clone());
                     read_label_from_cached_file(&new_path)?
                 };

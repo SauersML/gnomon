@@ -499,8 +499,8 @@ fn default_beta_guess(
                 total_weight += wi;
             }
             if total_weight > 0.0 {
-                let prevalence = ((weighted_sum + 0.5) / (total_weight + 1.0))
-                    .clamp(1e-6, 1.0 - 1e-6);
+                let prevalence =
+                    ((weighted_sum + 0.5) / (total_weight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
                 beta[layout.intercept_col] = (prevalence / (1.0 - prevalence)).ln();
             }
         }
@@ -595,7 +595,10 @@ where
                 if let Some(err) = last_error {
                     return Err(err);
                 }
-                log::warn!("P-IRLS step halving exhausted at iter {}; returning current state.", iter);
+                log::warn!(
+                    "P-IRLS step halving exhausted at iter {}; returning current state.",
+                    iter
+                );
                 status = PirlsStatus::StalledAtValidMinimum;
                 final_state = Some(state);
                 break 'pirls_loop;

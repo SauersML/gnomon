@@ -9,13 +9,13 @@ use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
 
-use ndarray::parallel::prelude::*;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve};
 use faer::{Accum, Par};
+use ndarray::parallel::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -1032,8 +1032,7 @@ pub fn build_calibrator_design(
         );
     }
 
-    let use_wiggle_only_dist =
-        !distance_enabled ||
+    let use_wiggle_only_dist = !distance_enabled ||
         // Basic criteria:
         dist_std_raw < 1e-6_f64 ||                  // Low variance
         dist_raw.len() == 0 ||                 // Empty data
@@ -2207,37 +2206,35 @@ pub fn fit_calibrator(
         )));
     }
 
-    let firth_fallback = spec
-        .firth
-        .as_ref()
-        .filter(|cfg| cfg.enabled);
+    let firth_fallback = spec.firth.as_ref().filter(|cfg| cfg.enabled);
     if matches!(link, LinkFunction::Logit) && firth_fallback.is_none() {
         eprintln!("[CAL] Firth penalization disabled for calibrator fit");
     }
 
-    let attempt_fit = |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
-        let opts = ExternalOptimOptions {
-            link,
-            max_iter: 75,
-            tol: 1e-3,
-            nullspace_dims: active_null_dims.clone(),
-            firth: firth_override.cloned(),
-        };
-        if matches!(link, LinkFunction::Logit) {
-            match firth_override {
-                Some(_) => eprintln!("[CAL] Firth penalization active for calibrator fit"),
-                None => eprintln!("[CAL] Firth penalization disabled for calibrator fit"),
+    let attempt_fit =
+        |firth_override: Option<&FirthSpec>| -> Result<ExternalOptimResult, EstimationError> {
+            let opts = ExternalOptimOptions {
+                link,
+                max_iter: 75,
+                tol: 1e-3,
+                nullspace_dims: active_null_dims.clone(),
+                firth: firth_override.cloned(),
+            };
+            if matches!(link, LinkFunction::Logit) {
+                match firth_override {
+                    Some(_) => eprintln!("[CAL] Firth penalization active for calibrator fit"),
+                    None => eprintln!("[CAL] Firth penalization disabled for calibrator fit"),
+                }
             }
-        }
-        eprintln!(
-            "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
-            x.nrows(),
-            x.ncols(),
-            active_penalty_count,
-            link
-        );
-        optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)
-    };
+            eprintln!(
+                "[CAL] fit: starting external REML/BFGS on X=[{}×{}], penalties={} (link={:?})",
+                x.nrows(),
+                x.ncols(),
+                active_penalty_count,
+                link
+            );
+            optimize_external_design(y, prior_weights, x, offset, &active_penalties, &opts)
+        };
 
     fn pirls_status_stable(status: &PirlsStatus) -> bool {
         matches!(

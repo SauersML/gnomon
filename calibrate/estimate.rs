@@ -359,9 +359,7 @@ fn run_gradient_check(
         .zip(g_fd.iter())
         .map(|(&a, &f): (&f64, &f64)| -> f64 { a.abs().max(f.abs()) })
         .collect();
-    let g_inf = g_ref
-        .iter()
-        .fold(0.0_f64, |m: f64, &v| m.max(v));
+    let g_inf = g_ref.iter().fold(0.0_f64, |m: f64, &v| m.max(v));
     let tau_abs = 1e-6_f64;
     let tau_rel = 1e-3_f64 * g_inf;
     let mask: Vec<bool> = g_ref
@@ -2049,17 +2047,23 @@ pub fn train_survival_model(
     let mut companions = HashMap::new();
 
     for (kind, data_ref) in targets {
-        let label_prefix = if kind == "primary" { "[Primary]" } else { "[Mortality]" };
+        let label_prefix = if kind == "primary" {
+            "[Primary]"
+        } else {
+            "[Mortality]"
+        };
         eprintln!("\n{} Starting fit...", label_prefix);
 
         // STAGE 2: Optimization
         if layout.penalties.blocks.is_empty() {
-            eprintln!("{} [STAGE 2/3] No penalties detected; skipping optimization.", label_prefix);
+            eprintln!(
+                "{} [STAGE 2/3] No penalties detected; skipping optimization.",
+                label_prefix
+            );
         } else {
             // Let's reset to initial seeds.
-            let initial_lambda = Array1::<f64>::from_vec(
-                layout.penalties.blocks.iter().map(|b| b.lambda).collect()
-            );
+            let initial_lambda =
+                Array1::<f64>::from_vec(layout.penalties.blocks.iter().map(|b| b.lambda).collect());
             let initial_rho = initial_lambda.mapv(|lambda| (lambda.max(1e-12)).ln());
             let initial_z = to_z_from_rho(&initial_rho);
 
@@ -2085,14 +2089,25 @@ pub fn train_survival_model(
             let solution = match solver.run() {
                 Ok(sol) => sol,
                 Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => {
-                    eprintln!("{} [Stage2] Line search failed; using best-known.", label_prefix);
+                    eprintln!(
+                        "{} [Stage2] Line search failed; using best-known.",
+                        label_prefix
+                    );
                     *last_solution
                 }
                 Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => {
-                    eprintln!("{} [Stage2] Max iterations reached; using best-known.", label_prefix);
+                    eprintln!(
+                        "{} [Stage2] Max iterations reached; using best-known.",
+                        label_prefix
+                    );
                     *last_solution
                 }
-                Err(err) => return Err(EstimationError::RemlOptimizationFailed(format!("{} Optimizer failed: {:?}", label_prefix, err))),
+                Err(err) => {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "{} Optimizer failed: {:?}",
+                        label_prefix, err
+                    )));
+                }
             };
 
             if let Some(err) = optimizer.take_last_error() {
@@ -2112,13 +2127,21 @@ pub fn train_survival_model(
             }
 
             let lambda_summary: Vec<f64> = final_lambda.iter().copied().collect();
-            eprintln!("{} [Stage2] Optimized λ: {:?}", label_prefix, lambda_summary);
+            eprintln!(
+                "{} [Stage2] Optimized λ: {:?}",
+                label_prefix, lambda_summary
+            );
         }
 
         // STAGE 3: Final Fit
         eprintln!("{} [STAGE 3/3] Fitting final model...", label_prefix);
-        let mut model = WorkingModelSurvival::new(layout.clone(), &data_ref, monotonicity.clone(), survival_spec)
-            .map_err(map_error)?;
+        let mut model = WorkingModelSurvival::new(
+            layout.clone(),
+            &data_ref,
+            monotonicity.clone(),
+            survival_spec,
+        )
+        .map_err(map_error)?;
 
         let p = layout.combined_exit.ncols();
         let pirls_outcome = crate::calibrate::pirls::run_working_model_pirls(
@@ -2126,8 +2149,11 @@ pub fn train_survival_model(
             Array1::<f64>::zeros(p),
             &options,
             |info| {
-                 eprintln!("{}   [Iter {:>3}] deviance = {:.6e}, |grad| = {:.3e}", label_prefix, info.iteration, info.deviance, info.gradient_norm);
-            }
+                eprintln!(
+                    "{}   [Iter {:>3}] deviance = {:.6e}, |grad| = {:.3e}",
+                    label_prefix, info.iteration, info.deviance, info.gradient_norm
+                );
+            },
         )?;
 
         match pirls_outcome.status {
@@ -2152,13 +2178,23 @@ pub fn train_survival_model(
             _ => {}
         }
 
-        let crate::calibrate::pirls::WorkingModelPirlsResult { beta, state: final_state, .. } = pirls_outcome;
+        let crate::calibrate::pirls::WorkingModelPirlsResult {
+            beta,
+            state: final_state,
+            ..
+        } = pirls_outcome;
 
-        let hessian_factor = factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
+        let hessian_factor =
+            factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
 
         // Restore FULL Calibrator Logic for the primary model
-        let calibrator_opt_local = if kind == "primary" && crate::calibrate::model::calibrator_enabled() {
-            eprintln!("{} [CAL] Calibrator enabled; extracting survival calibration features...", label_prefix);
+        let calibrator_opt_local = if kind == "primary"
+            && crate::calibrate::model::calibrator_enabled()
+        {
+            eprintln!(
+                "{} [CAL] Calibrator enabled; extracting survival calibration features...",
+                label_prefix
+            );
             use crate::calibrate::calibrator as cal;
 
             let n = data_ref.age_entry.len();
@@ -2175,7 +2211,8 @@ pub fn train_survival_model(
 
                 if !eta_entry.is_finite() || !eta_exit.is_finite() {
                     return Err(EstimationError::CalibratorTrainingFailed(
-                        "non-finite linear predictor during calibrator feature extraction".to_string(),
+                        "non-finite linear predictor during calibrator feature extraction"
+                            .to_string(),
                     ));
                 }
 
@@ -2209,7 +2246,8 @@ pub fn train_survival_model(
                 let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
                 let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
                 let dden = -d_f_entry;
-                let dr_deta_entry = if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
+                let dr_deta_entry = if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON
+                {
                     (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
                 } else {
                     0.0
@@ -2274,8 +2312,8 @@ pub fn train_survival_model(
                 firth: cal::CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
             };
 
-            let (x_cal, penalties_cal, schema, offset) = cal::build_calibrator_design(&features, &spec)
-                .map_err(|e| {
+            let (x_cal, penalties_cal, schema, offset) =
+                cal::build_calibrator_design(&features, &spec).map_err(|e| {
                     EstimationError::CalibratorTrainingFailed(format!(
                         "survival calibrator design build failed: {}",
                         e
@@ -2283,10 +2321,15 @@ pub fn train_survival_model(
                 })?;
 
             if x_cal.ncols() == 0 {
-                eprintln!("[CAL] Survival calibrator design has zero columns; skipping calibration.",);
+                eprintln!(
+                    "[CAL] Survival calibrator design has zero columns; skipping calibration.",
+                );
                 None
             } else {
-                eprintln!("{} [CAL] Fitting survival logit-risk calibrator...", label_prefix);
+                eprintln!(
+                    "{} [CAL] Fitting survival logit-risk calibrator...",
+                    label_prefix
+                );
                 let penalty_nullspace_dims =
                     cal::active_penalty_nullspace_dims(&schema, &penalties_cal);
                 let outcomes = data_ref.event_target.mapv(|value| f64::from(value));
@@ -2426,14 +2469,20 @@ pub fn train_survival_model(
         if kind == "primary" {
             primary_artifacts = Some(artifacts);
             primary_lambdas = lambdas_vec;
-            primary_hessian = if final_state.hessian.is_empty() { None } else { Some(final_state.hessian.clone()) };
+            primary_hessian = if final_state.hessian.is_empty() {
+                None
+            } else {
+                Some(final_state.hessian.clone())
+            };
         } else {
             companions.insert("__internal_mortality".to_string(), artifacts);
         }
     }
 
     // Assemble Final Primary Model
-    let mut final_artifacts = primary_artifacts.ok_or(EstimationError::InvalidInput("Primary model fit failed".to_string()))?;
+    let mut final_artifacts = primary_artifacts.ok_or(EstimationError::InvalidInput(
+        "Primary model fit failed".to_string(),
+    ))?;
 
     // Register companions
     for key in companions.keys() {
@@ -2446,9 +2495,10 @@ pub fn train_survival_model(
 
     // Re-map coefficients for the primary model (for saving/viewing)
     let mut mapped_coefficients = crate::calibrate::model::MappedCoefficients::default();
-    mapped_coefficients
-        .interaction_effects
-        .insert("survival::raw_coefficients".to_string(), final_artifacts.coefficients.to_vec());
+    mapped_coefficients.interaction_effects.insert(
+        "survival::raw_coefficients".to_string(),
+        final_artifacts.coefficients.to_vec(),
+    );
 
     Ok(TrainedModel {
         config,
@@ -2850,10 +2900,7 @@ fn compute_fd_gradient(
             let rel_gap = (d_small - d_big).abs() / denom;
             let same_sign = fd_same_sign(d_small, d_big);
 
-            if same_sign
-                && rel_gap > FD_REL_GAP_THRESHOLD
-                && base_h * 0.5 >= FD_MIN_BASE_STEP
-            {
+            if same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP {
                 base_h *= 0.5;
                 log_lines.push(format!(
                     "[FD RIDGE]    rel_gap={:.3e} > {:.2}; reducing h to {:.3e} for coordinate {}",
@@ -2945,8 +2992,7 @@ pub fn evaluate_external_gradients(
     )?;
 
     let analytic_grad = reml_state.with_warm_start_disabled(|| reml_state.compute_gradient(rho))?;
-    let fd_grad =
-        reml_state.with_warm_start_disabled(|| compute_fd_gradient(&reml_state, rho))?;
+    let fd_grad = reml_state.with_warm_start_disabled(|| compute_fd_gradient(&reml_state, rho))?;
 
     Ok((analytic_grad, fd_grad))
 }
@@ -3371,8 +3417,8 @@ pub mod internal {
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RefCell::new(None),
                 warm_start_enabled: Cell::new(true),
-        })
-    }
+            })
+        }
 
         /// Creates a sanitized cache key from rho values.
         /// Returns None if any component is NaN, which indicates that caching should be skipped.
@@ -3485,9 +3531,7 @@ pub mod internal {
             match pr.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     let beta_original = pr.reparam_result.qs.dot(&pr.beta_transformed);
-                    self.warm_start_beta
-                        .borrow_mut()
-                        .replace(beta_original);
+                    self.warm_start_beta.borrow_mut().replace(beta_original);
                 }
                 _ => {
                     self.warm_start_beta.borrow_mut().take();
@@ -3828,8 +3872,7 @@ pub mod internal {
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
             let warm_start_holder = self.warm_start_beta.borrow();
-            let warm_start_ref = warm_start_holder
-                .as_ref();
+            let warm_start_ref = warm_start_holder.as_ref();
             let pirls_result = pirls::fit_model_for_fixed_rho(
                 rho.view(),
                 self.x,
@@ -3894,7 +3937,10 @@ pub mod internal {
                         })
                     } else {
                         // Gradient is acceptable, treat as converged but with warning if needed
-                        log::warn!("P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.", pirls_result.last_gradient_norm);
+                        log::warn!(
+                            "P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
+                            pirls_result.last_gradient_norm
+                        );
                         Ok(pirls_result)
                     }
                 }

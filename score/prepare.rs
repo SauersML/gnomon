@@ -344,8 +344,10 @@ fn prepare_for_computation_with_retry(
     // These data structures will store the results of the merge-join.
     // Allele strings borrowed from the arena are stored here temporarily.
     // The tuple is (weight, is_flipped, file_idx).
-    let mut simple_path_data: BTreeMap<BimRowIndex, BTreeMap<ScoreColumnIndex, (f32, bool, usize)>> =
-        BTreeMap::new();
+    let mut simple_path_data: BTreeMap<
+        BimRowIndex,
+        BTreeMap<ScoreColumnIndex, (f32, bool, usize)>,
+    > = BTreeMap::new();
     // For complex rules, the key is the set of BIM contexts. The value is a tuple
     // containing the canonical chr:pos key for the locus and all score applications.
     let mut intermediate_complex_rules: BTreeMap<
@@ -462,8 +464,9 @@ fn prepare_for_computation_with_retry(
                                 ) {
                                     let (prev_weight, _, prev_file_idx) = prev;
                                     let curr_file_idx = score_record.file_idx;
-                                    let score_name = &score_names[score_record.score_column_index.0];
-                                    
+                                    let score_name =
+                                        &score_names[score_record.score_column_index.0];
+
                                     let location_msg = if prev_file_idx == curr_file_idx {
                                         format!(
                                             "Duplicate found within file: '{}'",
@@ -478,12 +481,10 @@ fn prepare_for_computation_with_retry(
                                             score_record.weight
                                         )
                                     };
-                                    
+
                                     return Err(PrepError::AmbiguousReconciliation(format!(
                                         "Ambiguous input: The same variant appears multiple times with different weights for score '{}'. {}. Variant BIM index: {}",
-                                        score_name,
-                                        location_msg,
-                                        bim_rec.bim_row_index.0
+                                        score_name, location_msg, bim_rec.bim_row_index.0
                                     )));
                                 }
                             }

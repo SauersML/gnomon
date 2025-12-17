@@ -694,8 +694,6 @@ impl FitProgressObserver for CiFitProgress {
     }
 }
 
-
-
 enum ProjectionStageBar {
     Determinate {
         total: u64,

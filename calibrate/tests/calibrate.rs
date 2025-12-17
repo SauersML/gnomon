@@ -19,11 +19,7 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
-fn auc_lower_confidence_bound(
-    num_positive: usize,
-    num_negative: usize,
-    z_value: f64,
-) -> f64 {
+fn auc_lower_confidence_bound(num_positive: usize, num_negative: usize, z_value: f64) -> f64 {
     assert!(num_positive > 0 && num_negative > 0);
     let n_pos = num_positive as f64;
     let n_neg = num_negative as f64;
@@ -331,7 +327,8 @@ fn cli_train_large_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     // Calculate exact target prevalence
     const TARGET_PREVALENCE: f64 = (MALE_CASES + FEMALE_CASES) as f64 / TOTAL_ROWS as f64;
     // Calculate exact ratio based on integer counts
-    const MALE_TO_FEMALE_RATIO: f64 = ((MALE_CASES as f64) / (MALE_ROWS as f64)) / ((FEMALE_CASES as f64) / (FEMALE_ROWS as f64));
+    const MALE_TO_FEMALE_RATIO: f64 =
+        ((MALE_CASES as f64) / (MALE_ROWS as f64)) / ((FEMALE_CASES as f64) / (FEMALE_ROWS as f64));
     const SCORE_EFFECT: f64 = 0.9;
 
     let mut rng = StdRng::seed_from_u64(7_316_511);
@@ -467,8 +464,8 @@ fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
     const MALE_CASES: usize = 54;
     const FEMALE_CASES: usize = 26;
     const TARGET_PREVALENCE: f64 = 80.0 / 3_300.0;
-    const MALE_TO_FEMALE_RATIO: f64 = (MALE_CASES as f64 / MALE_ROWS as f64)
-        / (FEMALE_CASES as f64 / FEMALE_ROWS as f64);
+    const MALE_TO_FEMALE_RATIO: f64 =
+        (MALE_CASES as f64 / MALE_ROWS as f64) / (FEMALE_CASES as f64 / FEMALE_ROWS as f64);
     const SCORE_EFFECT: f64 = 1.4;
 
     let mut rng = StdRng::seed_from_u64(7_316_511);
@@ -599,14 +596,12 @@ fn cli_train_small_zero_pc_dataset_produces_model_impl() -> Result<(), Box<dyn s
 
 mod calibrate {
     #[test]
-    fn cli_train_large_zero_pc_dataset_produces_model(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cli_train_large_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
         super::cli_train_large_zero_pc_dataset_produces_model_impl()
     }
 
     #[test]
-    fn cli_train_small_zero_pc_dataset_produces_model(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cli_train_small_zero_pc_dataset_produces_model() -> Result<(), Box<dyn std::error::Error>> {
         super::cli_train_small_zero_pc_dataset_produces_model_impl()
     }
 }
