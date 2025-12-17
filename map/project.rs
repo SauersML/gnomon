@@ -330,7 +330,14 @@ impl<'model> HwePcaProjector<'model> {
                 // Parallelized over samples for performance.
                 let presence_block_ref = presence_block.as_ref();
 
-                // Pre-compute omega_base for each variant
+                // Pre-compute omega_base for each variant.
+                // NOTE ON MATH: Gnomon's loadings (L) are normalized in `fit.rs` such that Σ(w² L²) = 1.
+                // This means the basis is orthonormal in the w²-weighted metric.
+                // For the WLS projection s = (V^T Ω V)⁻¹ (V^T Ω x) to match the Standard Projection
+                // s = Σ(x w L) when data is perfect (q=1), the LHS Information Matrix (V^T Ω V) must
+                // simplify to Identity.
+                // Thus: Ω_LHS = w² matches Σ(w² L L^T) = I.
+                // This differs from Ω_RHS = w because the RHS projects x*w onto L.
                 let omega_bases: Vec<f64> = (0..filled)
                     .map(|j| {
                         let j_global = processed + j;
