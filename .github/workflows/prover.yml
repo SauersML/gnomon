@@ -46,9 +46,9 @@ jobs:
           path: |
             .lake
             lake-manifest.json
-          key: ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-v2
+          key: ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-v3
           restore-keys: |
-            ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-
+            ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-
             ${{ runner.os }}-lake-complete-
             
       - name: Verify cache completeness
@@ -109,7 +109,7 @@ jobs:
         if: steps.check-cache.outputs.valid != 'true'
         run: |
           echo "📦 Cache miss - updating dependencies..."
-          lake update
+          # lake update  <-- REMOVED: Do not update dependencies, use the lockfile!
           echo "📥 Downloading mathlib cache..."
           # The '|| true' is important as this step can fail if no cache exists,
           # which is not a critical error.
