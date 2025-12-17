@@ -334,29 +334,25 @@ impl<'model> HwePcaProjector<'model> {
                 //
                 // WLS mathematical consistency proof:
                 // 1. Consistency requirement: WLS must reduce to Standard Projection s = sum(x*w)*L when q=1.
-                //    Standard projection uses Euclidean dot product of weighted vector x*w onto L.
-                // 2. Normalization: In `fit.rs`, L is normalized such that sum(w^2 * L^2) = 1.
-                //    This means L is orthonormal in the w^2-weighted metric space.
+                // 2. Normalization: In `fit.rs`, L is normalized such that sum(L^2) = 1 (Euclidean).
+                //    This means L is orthonormal in the Euclidean metric space.
                 // 3. LHS construction: To ensure s_WLS = s_STD when q=1:
                 //    We solve As = b.
                 //    b (RHS) = sum(x*q*w*L) -> sum(x*w*L) when q=1 (Matches Standard).
                 //    Therefore, A must be Identity when q=1.
-                //    Our LHS accumulation is sum(q * w^2 * L * L^t).
-                //    When q=1, A = sum(w^2 * L * L^t). Since sum(w^2 * L^2) = 1 everywhere (by fit.rs normalization), A = I.
-                //    If we used A = sum(L^2) (no w^2), A would be scaled by ~1/w^2, destroying the scale.
+                //    Our LHS accumulation is sum(q * L * L^t).
+                //    When q=1, A = sum(L * L^t). Since sum(L^2) = 1 (by fit.rs normalization), A = I.
                 //
-                // Thus: LHS Omega = quality * w * w is mathematically required.
+                // 4. STABILITY RATIONALE (Option B):
+                //    We chose Euclidean normalization over LD-weighted normalization to ensure that
+                //    the projected coordinates estimate the *same latent position* in the
+                //    reference space regardless of which SNPs are observed.
+                //    Evaluating in the weighted metric (Option A/w^2 LHS) would cause platform-dependent
+                //    drift in scores, hurting systematic calibration for disease risk models.
+                //
+                // Thus: LHS Omega = quality (without w^2) is mathematically required.
                 let omega_bases: Vec<f64> = (0..filled)
-                    .map(|j| {
-                        let j_global = processed + j;
-                        let quality = quality_storage[j];
-                        let w = if j_global < weights_slice.len() {
-                            weights_slice[j_global]
-                        } else {
-                            1.0
-                        };
-                        quality * w * w
-                    })
+                    .map(|j| quality_storage[j])
                     .collect();
 
                 // Parallelize over samples (each sample's info matrix is independent)
@@ -663,16 +659,13 @@ mod tests {
 
     fn recompute_component_norms_sq(model: &HwePcaModel) -> Vec<f64> {
         let loadings = model.variant_loadings();
-        let ld_weights = model.ld().map(|ld| ld.weights.as_slice());
-        let weights = ld_weights.unwrap_or(&[]);
-        let n_weights = weights.len();
         let mut result = Vec::with_capacity(loadings.ncols());
 
         for col in 0..loadings.ncols() {
             let mut sum = 0.0f64;
             let mut compensation = 0.0f64;
             for row in 0..loadings.nrows() {
-                let weight = if row < n_weights { weights[row] } else { 1.0 };
+                let weight = 1.0;
                 let value = loadings[(row, col)];
                 let weighted = weight * value;
                 let square = weighted * weighted;

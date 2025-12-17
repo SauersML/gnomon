@@ -1428,7 +1428,6 @@ impl HwePcaModel {
             loadings.as_mut(),
             &mut singular_values,
             sample_scores.as_mut(),
-            ld_weights_arc.as_deref(),
         );
 
         Ok(Self {
@@ -3384,15 +3383,12 @@ fn renormalize_variant_loadings(
     mut loadings: MatMut<'_, f64>,
     singular_values: &mut [f64],
     mut sample_scores: MatMut<'_, f64>,
-    ld_weights: Option<&[f64]>,
 ) -> Vec<f64> {
-    debug_assert_eq!(loadings.ncols(), singular_values.len());
-    debug_assert_eq!(sample_scores.ncols(), singular_values.len());
-
-    // CRITICAL: We normalize loadings such that the weighted norm Σ(w² L²) = 1.
-    // This orthonormality in the weighted metric is what allows the projection phase
-    // (project.rs) to recover the Standard Projection when using WLS with an LHS weighted by w².
-    let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), ld_weights);
+    // CRITICAL: We normalize loadings in Euclidean space so that Σ(L²) = 1.
+    // This Euclidean orthonormality ensures that the WLS projection (which minimizes error in weighted space)
+    // simplifies to the Standard Projection (s = Σ x·w·L) when q=1, because LHS = Σ L L^T = I.
+    // We pass `None` for weights to force Euclidean normalization.
+    let mut norms_sq = compute_component_weighted_norms_sq(loadings.as_ref(), None);
 
     for (component, norm_sq) in norms_sq.iter_mut().enumerate() {
         let norm = (*norm_sq).sqrt();
