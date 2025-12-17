@@ -5,6 +5,12 @@ This script runs within the 'jules_loop.yml' workflow.
 It analyzes the build log from the current run (or a provided log file),
 decides on improvements, sends a request to the Jules API, applies the patch,
 and pushes the changes.
+
+REGRESSION PROTECTION:
+- If the Lean build was PASSING before Jules' changes, we verify it still passes
+  after applying the patch. If the build now fails (regression), we abort.
+- If the Lean build was already FAILING, we allow commits even if still failing,
+  as any progress is better than no progress.
 """
 import os
 import sys
@@ -107,6 +113,24 @@ def get_run_info():
     # This might not work well if we are currently running inside the job we want logs for
     print("No local log file provided. This script is expected to run with LOCAL_LOG_FILE set.")
     return "unknown", "No logs available."
+
+
+def verify_lean_build():
+    """
+    Run the Lean build and return True if it passes, False otherwise.
+    """
+    print("\n--- Verifying Lean Build ---")
+    
+    # Run the build
+    stdout, stderr, code = run_command("lake build Calibrator")
+    
+    if code == 0:
+        print("✅ Lean build passed.")
+        return True
+    else:
+        print("❌ Lean build failed.")
+        print(f"stderr: {stderr[:2000]}" if stderr else "")
+        return False
 
 
 def call_jules(prompt, attempt=1):
@@ -305,6 +329,29 @@ def main():
     if code == 0:
         print("\nNo changes to commit after applying patch.")
         sys.exit(0)
+
+    # --- Regression Check ---
+    # If build was passing before (conclusion == "success"), verify it still passes.
+    # If build was already failing, we allow commits even if still failing (progress is progress).
+    was_passing_before = (conclusion == "success")
+    
+    if was_passing_before:
+        print("\n--- Regression Check (build was passing before) ---")
+        build_passes_now = verify_lean_build()
+        
+        if not build_passes_now:
+            print("\n🚫 REGRESSION DETECTED: Build was passing, but Jules' changes broke it!")
+            print("Reverting changes and aborting commit.")
+            run_command("git checkout -- .")
+            run_command("git clean -fd")
+            sys.exit(0)
+        else:
+            print("✅ Regression check passed: build still works.")
+    else:
+        print("\n--- Skipping regression check (build was already failing) ---")
+        print("Jules' changes will be committed even if build still fails.")
+        # Optionally verify to log current state
+        verify_lean_build()
 
     print("\n--- Committing and Pushing ---")
     print(f"Commit message: {msg}")
