@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
-use crate::map::variant_filter::{VariantFilter, VariantKey, VariantSelection};
+use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
 use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
@@ -214,14 +214,17 @@ impl GenotypeDataset {
                 Ok(DatasetBlockSource::Plink(dataset.block_source()))
             }
             (Self::Plink(dataset), SelectionPlan::ByIndices(indices)) => Ok(
-                DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices))),
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(Some(indices), None)),
             ),
             (Self::Plink(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset
                     .select_variants(filter.as_ref())
                     .map_err(GenotypeIoError::from)?;
                 Ok(DatasetBlockSource::Plink(
-                    dataset.block_source_with_selection(Some(selection.indices)),
+                    dataset.block_source_with_selection(
+                        Some(selection.indices),
+                        Some(selection.match_kinds),
+                    ),
                 ))
             }
             (Self::Variants(dataset), plan) => Ok(DatasetBlockSource::Variants(
@@ -253,24 +256,28 @@ impl GenotypeDataset {
 
         let original_indices = std::mem::take(&mut selection.indices);
         let original_keys = std::mem::take(&mut selection.keys);
+        let original_kinds = std::mem::take(&mut selection.match_kinds);
 
         let mut matched = HashMap::with_capacity(original_keys.len());
-        for (index, key) in original_indices.into_iter().zip(original_keys.into_iter()) {
-            matched.insert(key.clone(), (index, key));
+        for ((index, key), kind) in original_indices.into_iter().zip(original_keys.into_iter()).zip(original_kinds.into_iter()) {
+            matched.insert(key.clone(), (index, key, kind));
         }
 
         let mut ordered_indices = Vec::with_capacity(matched.len());
         let mut ordered_keys = Vec::with_capacity(matched.len());
+        let mut ordered_kinds = Vec::with_capacity(matched.len());
 
         for key in keys {
-            if let Some((index, stored_key)) = matched.remove(key) {
+            if let Some((index, stored_key, kind)) = matched.remove(key) {
                 ordered_indices.push(index);
                 ordered_keys.push(stored_key);
+                ordered_kinds.push(kind);
             }
         }
 
         selection.indices = ordered_indices;
         selection.keys = ordered_keys;
+        selection.match_kinds = ordered_kinds;
         Ok(selection)
     }
 
@@ -691,7 +698,12 @@ impl PlinkDataset {
                             record.position, record.identifier
                         ),
                     })?;
-            let key = VariantKey::new(&record.chromosome, position);
+            let key = VariantKey::new_with_alleles(
+                &record.chromosome,
+                position,
+                &record.allele2,
+                &record.allele1,
+            );
             keys.push(key);
         }
         Ok(keys)
@@ -704,16 +716,18 @@ impl PlinkDataset {
             self.samples.len(),
             self.n_variants,
             None,
+            None,
         )
     }
 
     pub fn block_source(&self) -> PlinkVariantBlockSource {
-        self.block_source_with_selection(None)
+        self.block_source_with_selection(None, None)
     }
 
     pub fn block_source_with_selection(
         &self,
         selection: Option<Vec<usize>>,
+        match_kinds: Option<Vec<MatchKind>>,
     ) -> PlinkVariantBlockSource {
         PlinkVariantBlockSource::new(
             self.bed.clone(),
@@ -721,6 +735,7 @@ impl PlinkDataset {
             self.samples.len(),
             self.n_variants,
             selection,
+            match_kinds,
         )
     }
 
@@ -733,6 +748,7 @@ impl PlinkDataset {
         let mut iter = self.variant_records()?;
         let mut indices = Vec::new();
         let mut keys = Vec::new();
+        let mut match_kinds = Vec::new();
         let mut matched = HashSet::new();
         let mut index = 0usize;
 
@@ -751,10 +767,18 @@ impl PlinkDataset {
                         ),
                     })?;
 
-            let key = VariantKey::new(&record.chromosome, position);
-            if filter.contains(&key) && matched.insert(key.clone()) {
-                indices.push(index);
-                keys.push(key);
+            let key = VariantKey::new_with_alleles(
+                &record.chromosome,
+                position,
+                &record.allele2,
+                &record.allele1,
+            );
+            if let Some(status) = filter.match_status(&key) {
+                if matched.insert(key.clone()) {
+                    indices.push(index);
+                    keys.push(key);
+                    match_kinds.push(status);
+                }
             }
             index += 1;
         }
@@ -763,6 +787,7 @@ impl PlinkDataset {
         Ok(VariantSelection {
             indices,
             keys,
+            match_kinds,
             missing,
             requested_unique: filter.requested_unique(),
         })
@@ -880,6 +905,7 @@ pub struct PlinkVariantBlockSource {
     n_samples: usize,
     total_variants: usize,
     selection: Option<Vec<usize>>,
+    match_kinds: Option<Vec<MatchKind>>,
     cursor: usize,
     buffer: Vec<u8>,
 }
@@ -891,6 +917,7 @@ impl PlinkVariantBlockSource {
         n_samples: usize,
         n_variants: usize,
         selection: Option<Vec<usize>>,
+        match_kinds: Option<Vec<MatchKind>>,
     ) -> Self {
         Self {
             bed,
@@ -898,6 +925,7 @@ impl PlinkVariantBlockSource {
             n_samples,
             total_variants: n_variants,
             selection,
+            match_kinds,
             cursor: 0,
             buffer: Vec::new(),
         }
@@ -988,6 +1016,8 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                 self.buffer.resize(needed, 0);
                 self.bed.read_at(offset, &mut self.buffer[..])?;
 
+                let kinds_slice = self.match_kinds.as_ref().map(|k| &k[self.cursor..self.cursor + ncols]);
+
                 for local in 0..run {
                     let bytes_start = local * self.bytes_per_variant;
                     let bytes_end = bytes_start + self.bytes_per_variant;
@@ -995,6 +1025,16 @@ impl VariantBlockSource for PlinkVariantBlockSource {
                     let dest_offset = (emitted + local) * nrows;
                     let dest = &mut storage[dest_offset..dest_offset + nrows];
                     decode_plink_variant(bytes, dest, nrows, table);
+
+                    if let Some(kinds) = kinds_slice {
+                         if kinds[emitted + local] == MatchKind::Swap {
+                            for val in dest.iter_mut() {
+                                if !val.is_nan() {
+                                    *val = 2.0 - *val;
+                                }
+                            }
+                         }
+                    }
                 }
 
                 emitted += run;
@@ -1278,7 +1318,10 @@ impl VcfLikeDataset {
                     ));
                 };
                 let pos = position.get() as u64;
-                keys.push(VariantKey::new(&chrom, pos));
+            let ref_allele = record.reference_bases().to_string();
+            let alt_allele = record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+            
+            keys.push(VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele));
             }
         }
 
@@ -1309,6 +1352,7 @@ impl VcfLikeDataset {
 
         let mut indices = Vec::new();
         let mut keys = Vec::new();
+        let mut match_kinds = Vec::new();
         let mut matched = HashSet::new();
         let mut record_idx = 0usize;
         let mut record = RecordBuf::default();
@@ -1356,10 +1400,15 @@ impl VcfLikeDataset {
                 let chrom = record.reference_sequence_name().to_string();
                 if let Some(position) = record.variant_start() {
                     let pos = position.get() as u64;
-                    let key = VariantKey::new(&chrom, pos);
-                    if filter.contains(&key) && matched.insert(key.clone()) {
-                        indices.push(record_idx);
-                        keys.push(key);
+                    let ref_allele = record.reference_bases().to_string();
+                    let alt_allele = record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                    let key = VariantKey::new_with_alleles(&chrom, pos, &ref_allele, &alt_allele);
+                    if let Some(status) = filter.match_status(&key) {
+                        if matched.insert(key.clone()) {
+                            indices.push(record_idx);
+                            keys.push(key);
+                            match_kinds.push(status);
+                        }
                     }
                 }
                 record_idx += 1;
@@ -1370,6 +1419,7 @@ impl VcfLikeDataset {
         Ok(VariantSelection {
             indices,
             keys,
+            match_kinds,
             missing,
             requested_unique: filter.requested_unique(),
         })
@@ -2271,7 +2321,9 @@ impl VcfLikeVariantBlockSource {
                 let position = start.map_err(|err| {
                     VariantIoError::Decode(format!("failed to read VCF position: {err}"))
                 })?;
-                Ok(Some(VariantKey::new(&chrom, position.get() as u64)))
+                let ref_allele = self.vcf_record.reference_bases().to_string();
+                let alt_allele = self.vcf_record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                Ok(Some(VariantKey::new_with_alleles(&chrom, position.get() as u64, &ref_allele, &alt_allele)))
             }
             Some(VariantFormat::Bcf) => {
                 let header = self
@@ -2292,7 +2344,9 @@ impl VcfLikeVariantBlockSource {
                 let position = start.map_err(|err| {
                     VariantIoError::Decode(format!("failed to read BCF position: {err}"))
                 })?;
-                Ok(Some(VariantKey::new(chrom, position.get() as u64)))
+                let ref_allele = self.bcf_record.reference_bases().to_string();
+                let alt_allele = self.bcf_record.alternate_bases().iter().next().map(|s| s.to_string()).unwrap_or_else(|| ".".to_string());
+                Ok(Some(VariantKey::new_with_alleles(chrom, position.get() as u64, &ref_allele, &alt_allele)))
             }
             None => Ok(None),
         }
@@ -2383,12 +2437,21 @@ impl VcfLikeVariantBlockSource {
             };
 
             if let Some(key) = self.current_variant_key()? {
-                if filter.contains(&key) {
+                if let Some(status) = filter.match_status(&key) {
                     let is_new_match = self.matched_seen.insert(key.clone());
                     if is_new_match {
                         let offset = filled * self.n_samples;
                         let dest = &mut storage[offset..offset + self.n_samples];
                         self.decode_current_variant(dest)?;
+
+                        if status == MatchKind::Swap {
+                            for val in dest.iter_mut() {
+                                if !val.is_nan() {
+                                    *val = 2.0 - *val;
+                                }
+                            }
+                        }
+
                         if !self.selection_finalized {
                             self.matched_keys.push(key);
                         }
@@ -3069,5 +3132,49 @@ mod tests {
         let bytes = read_all(source);
 
         assert_eq!(bytes, expected);
+    }
+    #[test]
+    fn test_allele_aware_projection_logic() {
+        use std::sync::Arc;
+        use crate::map::variant_filter::{VariantKey, VariantFilter};
+        use crate::map::io::{VcfLikeDataset, SelectionPlan};
+        use crate::map::fit::VariantBlockSource;
+
+        let dir = tempdir().unwrap();
+        let vcf_path = dir.path().join("test.vcf");
+        let vcf_content = "\
+##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1
+1\t100\tvar1\tA\tG\t.\tPASS\t.\tGT\t0/0
+1\t200\tvar2\tT\tC\t.\tPASS\t.\tGT\t0/0
+1\t300\tvar3\tG\tC\t.\tPASS\t.\tGT\t0/1
+";
+        {
+            let mut file = File::create(&vcf_path).unwrap();
+            file.write_all(vcf_content.as_bytes()).unwrap();
+        }
+
+        let dataset = VcfLikeDataset::open(&vcf_path).unwrap();
+        
+        let keys = vec![
+            VariantKey::new_with_alleles("1", 100, "A", "G"), // Exact match (File 0/0 -> 0.0)
+            VariantKey::new_with_alleles("1", 200, "C", "T"), // Swapped (File T/C=0/0 -> 0.0). Flip -> 2.0.
+            VariantKey::new_with_alleles("1", 300, "G", "T"), // Mismatch (File G/C). Excluded.
+        ];
+        
+        // Use into_iter() to create filter
+        let filter = VariantFilter::from_keys(keys.into_iter());
+        let plan = SelectionPlan::ByKeys(Arc::new(filter));
+        
+        let mut source = dataset.block_source_with_plan(plan).unwrap();
+        let mut storage = vec![0.0; 100]; 
+        
+        let filled = source.next_block_into(10, &mut storage).unwrap();
+        
+        assert_eq!(filled, 2, "Should select 2 variants (Exact, Swapped) and exclude 1 (Mismatch)");
+        
+        let values = &storage[..2]; 
+        assert!((values[0] - 0.0).abs() < 1e-6, "Expected dosage 0.0 for exact match");
+        assert!((values[1] - 2.0).abs() < 1e-6, "Expected dosage 2.0 for swapped match (from 0.0)");
     }
 }

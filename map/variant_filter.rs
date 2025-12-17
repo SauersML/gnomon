@@ -9,6 +9,8 @@ use std::path::Path;
 pub struct VariantKey {
     pub chromosome: String,
     pub position: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alleles: Option<(String, String)>,
 }
 
 impl VariantKey {
@@ -17,9 +19,23 @@ impl VariantKey {
         Self {
             chromosome,
             position,
+            alleles: None,
+        }
+    }
+
+    pub fn new_with_alleles(chromosome: &str, position: u64, ref_allele: &str, alt_allele: &str) -> Self {
+        let chromosome = normalize_chromosome(chromosome);
+        Self {
+            chromosome,
+            position,
+            alleles: Some((ref_allele.to_string(), alt_allele.to_string())),
         }
     }
 }
+
+// ... existing code ...
+
+
 
 fn normalize_chromosome(chromosome: &str) -> String {
     let mut normalized = chromosome.trim().to_string();
@@ -53,6 +69,13 @@ impl From<PipelineError> for VariantListError {
 #[derive(Clone, Debug)]
 pub struct VariantFilter {
     unique: HashSet<VariantKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Exact,
+    Wildcard,
+    Swap,
 }
 
 impl VariantFilter {
@@ -139,8 +162,34 @@ impl VariantFilter {
         Self { unique }
     }
 
+    pub fn match_status(&self, key: &VariantKey) -> Option<MatchKind> {
+        if self.unique.contains(key) {
+            return Some(MatchKind::Exact);
+        }
+        if let Some((ref r, ref a)) = key.alleles {
+            let wildcard = VariantKey {
+                chromosome: key.chromosome.clone(),
+                position: key.position,
+                alleles: None,
+            };
+            if self.unique.contains(&wildcard) {
+                return Some(MatchKind::Wildcard);
+            }
+            
+            let swapped = VariantKey {
+                chromosome: key.chromosome.clone(),
+                position: key.position,
+                alleles: Some((a.clone(), r.clone())),
+            };
+            if self.unique.contains(&swapped) {
+                return Some(MatchKind::Swap);
+            }
+        }
+        None
+    }
+
     pub fn contains(&self, key: &VariantKey) -> bool {
-        self.unique.contains(key)
+        self.match_status(key).is_some()
     }
 
     pub fn requested_unique(&self) -> usize {
@@ -160,6 +209,7 @@ impl VariantFilter {
 pub struct VariantSelection {
     pub indices: Vec<usize>,
     pub keys: Vec<VariantKey>,
+    pub match_kinds: Vec<MatchKind>,
     pub missing: Vec<VariantKey>,
     pub requested_unique: usize,
 }
