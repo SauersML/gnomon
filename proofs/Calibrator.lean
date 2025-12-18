@@ -227,17 +227,28 @@ section AllClaims
 
 variable {p k sp n : ℕ}
 
-noncomputable def dgpScenario1 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+/-! ### Example Scenario DGPs (Specific Instantiations)
+
+The following are **example instantiations** of `dgpAdditiveBias` with specific β values
+from simulation studies. For general proofs, use `dgpAdditiveBias` with arbitrary β. -/
+
+/-- **EXAMPLE**: Scenario 1 - Gene-environment interaction model.
+    Phenotype = P × (1 + 0.1 × ΣC). NOT an additive bias model. -/
+noncomputable def dgpScenario1_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p * (1 + 0.1 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
 
-noncomputable def dgpScenario3 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+/-- **EXAMPLE**: Scenario 3 - Positive confounding with β = 0.5.
+    This is `dgpAdditiveBias k 0.5`. -/
+noncomputable def dgpScenario3_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p + (0.5 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
 
-noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
+/-- **EXAMPLE**: Scenario 4 - Negative confounding with β = -0.8.
+    This is `dgpAdditiveBias k (-0.8)`. -/
+noncomputable def dgpScenario4_example (k : ℕ) [Fintype (Fin k)] : DataGeneratingProcess k := {
   trueExpectation := fun p pc => p - (0.8 * (∑ l, pc l)),
   jointMeasure := stdNormalProdMeasure k
 }
@@ -259,16 +270,16 @@ noncomputable def dgpAdditiveBias (k : ℕ) [Fintype (Fin k)] (β_env : ℝ) : D
   jointMeasure := stdNormalProdMeasure k
 }
 
-/-- Scenario 3 is dgpAdditiveBias with β = 0.5 (positive confounding). -/
-lemma dgpScenario3_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario3 k = dgpAdditiveBias k 0.5 := by
-  unfold dgpScenario3 dgpAdditiveBias
+/-- Scenario 3 example is dgpAdditiveBias with β = 0.5. -/
+lemma dgpScenario3_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario3_example k = dgpAdditiveBias k 0.5 := by
+  unfold dgpScenario3_example dgpAdditiveBias
   rfl
 
-/-- Scenario 4 is dgpAdditiveBias with β = -0.8 (negative confounding). -/
-lemma dgpScenario4_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario4 k = dgpAdditiveBias k (-0.8) := by
-  unfold dgpScenario4 dgpAdditiveBias
+/-- Scenario 4 example is dgpAdditiveBias with β = -0.8. -/
+lemma dgpScenario4_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario4_example k = dgpAdditiveBias k (-0.8) := by
+  unfold dgpScenario4_example dgpAdditiveBias
   simp only [neg_mul, sub_eq_add_neg]
 
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
@@ -276,11 +287,11 @@ def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → 
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
 
 theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
-  hasInteraction (dgpScenario1 k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario3 k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario4 k).trueExpectation := by
+  hasInteraction (dgpScenario1_example k).trueExpectation ∧
+  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
+  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
   constructor
-  · -- Case 1: dgpScenario1 has interaction
+  · -- Case 1: dgpScenario1_example has interaction
     unfold hasInteraction
     -- We provide witnesses for p₁, p₂, c₁, and c₂.
     -- p₁ and p₂ are real numbers. c₁ and c₂ are functions from Fin k to ℝ.
@@ -295,23 +306,23 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
       -- This simplifies to 0 = 1, a contradiction.
       simp at this
     · -- Proves the inequality
-      unfold dgpScenario1; dsimp
+      unfold dgpScenario1_example; dsimp
       have h_sum_c2 : (∑ (l : Fin k), if l = ⟨0, hk_pos⟩ then 1 else 0) = 1 := by
         -- The sum is 1 because the term is 1 only at i = ⟨0, hk_pos⟩ and 0 otherwise.
         simp [Finset.sum_ite_eq', Finset.mem_univ]
       -- Substitute the sum and simplify the expression
       simp [Finset.sum_const_zero]; norm_num
   · constructor
-    · -- Case 2: dgpScenario3 has no interaction
+    · -- Case 2: dgpScenario3_example has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
-      unfold dgpScenario3 at h_neq
+      unfold dgpScenario3_example at h_neq
       -- The terms with c₁ and c₂ cancel out, making the slope independent of c.
       simp only [add_sub_add_right_eq_sub] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
       contradiction
-    · -- Case 3: dgpScenario4 has no interaction
+    · -- Case 3: dgpScenario4_example has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
-      unfold dgpScenario4 at h_neq
+      unfold dgpScenario4_example at h_neq
       -- Similarly, the terms with c₁ and c₂ cancel out.
       simp only [sub_sub_sub_cancel_right] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
@@ -320,7 +331,7 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
 theorem necessity_of_phenotype_data :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-  use dgpScenario1 1, dgpScenario4 1
+  use dgpScenario1_example 1, dgpScenario4_example 1
   constructor; rfl
   have h_distinct := scenarios_are_distinct 1 (by norm_num)
   exact ⟨h_distinct.left, h_distinct.right.right⟩
@@ -1290,9 +1301,17 @@ theorem raw_score_bias_general [Fact (p = 1)]
   ring
 
 
+/-! ### NOTE ON APPROXIMATE EQUALITY
 
-def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
-notation:50 a " ≈ " b => approxEq a b 0.01
+The previous definition `approxEq a b 0.01` with a hardcoded tolerance was mathematically
+problematic: you cannot prove |a - b| < 0.01 from generic hypotheses.
+
+For these theorems, we use **exact equality** instead, which IS provable under the
+structural assumptions (linear/affine models, Bayes-optimal in the exact model class).
+
+If approximate analysis is needed, use proper ε-δ statements:
+  ∀ ε > 0, ∃ conditions, |a - b| < ε
+-/
 
 noncomputable def var {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k)
     (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
@@ -1323,11 +1342,17 @@ theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fi
 noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
 
+/-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
+    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
+
+    **Changed from approximate (≈ 0.01) to exact equality**.
+    The approximate version was unprovable from the given hypotheses. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
-    (scaling_func : (Fin k → ℝ) → ℝ) (h_deriv : Differentiable ℝ scaling_func)
+    (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model) :
-  ∀ l : Fin k, (evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 1 - evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) 0)
-    ≈ (scaling_func (fun i => if i = l then 1 else 0) - scaling_func (fun _ => 0)) := by sorry
+  ∀ c : Fin k → ℝ,
+    model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+    = scaling_func c := by sorry
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -1335,11 +1360,16 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
+/-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly.
+
+    **Changed from approximate (≈ 0.01) to exact equality**.
+    This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) (hp_one : p = 1) :
-  ∀ c : Fin k → ℝ, (model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l))
-    ≈ (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c)) := by
+    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1) :
+  ∀ c : Fin k → ℝ,
+    model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+    = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
   intro c
 
   -- The derivation follows from Equation (1) in the paper:
@@ -1393,11 +1423,15 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   -- This means: γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) = σ_G² / (σ_G² + σ_η²(c))
   sorry
 
+/-- Predictions are invariant under affine transformations of ancestry coordinates.
+
+    **Changed from approximate (≈) to exact equality**.
+    If the model class can represent the transform, this is exact. -/
 theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
-    (A : Matrix (Fin k) (Fin k) ℝ) (hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ) :
+    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
-  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc ≈ predict model' pgs (A.mulVec pc + b) := by sorry
+  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by sorry
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
