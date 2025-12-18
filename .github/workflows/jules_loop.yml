@@ -43,17 +43,20 @@ jobs:
         with:
           path: |
             .lake
-            lake-manifest.json
-          key: ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-v2
+          key: ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
           restore-keys: |
-            ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lakefile.lean') }}-
-            ${{ runner.os }}-lake-complete-
+            ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain') }}-
+
+      - name: Enforce manifest integrity
+        run: |
+          # Failsafe: Ensure the cache never overwrites our locked dependencies.
+          git restore lake-manifest.json
 
       - name: Verify cache completeness
         id: check-cache
         run: |
           echo "🔍 Checking cache completeness..."
-          if [ ! -f "lake-manifest.json" ] || [ ! -d ".lake" ]; then
+          if [ ! -d ".lake" ]; then
             echo "valid=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -69,14 +72,14 @@ jobs:
       - name: Update and fetch dependencies (only if cache miss)
         if: steps.check-cache.outputs.valid != 'true'
         run: |
-          lake update
-          lake exe cache get || true
+          # Do NOT run lake update - use the lockfile!
+          echo "📥 Downloading mathlib cache..."
+          lake exe cache get
 
       - name: Build all dependencies (only if cache miss)
         if: steps.check-cache.outputs.valid != 'true'
         run: |
-          lake build --no-build || true
-          lake build || true
+          lake build
 
       # --- Verification Step with Log Capture ---
 
