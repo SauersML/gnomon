@@ -568,7 +568,26 @@ lemma optimal_slope_eq_covariance_of_normalized_p
   linarith [h0, hLinPInt]
 
 /-- The key bridge: isBayesOptimalInRawClass implies the orthogonality conditions.
-    This uses the variational characterization of L² projection. -/
+
+    **Variational Proof (Fundamental Theorem of Least Squares)**:
+    If Ŷ minimizes E[(Y - Ŷ)²] over the class of affine functions of P,
+    then for any perturbation direction v ∈ span{1, P}, the directional derivative
+    of the loss at Ŷ in direction v must be zero.
+
+    Define L(ε) = E[(Y - (Ŷ + ε·v))²]
+                = E[(Y - Ŷ)²] - 2ε·E[(Y - Ŷ)·v] + ε²·E[v²]
+
+    For L(ε) ≥ L(0) for all ε (by optimality), the linear coefficient must vanish:
+        E[(Y - Ŷ)·v] = 0
+
+    Taking v = 1 gives: E[Y - Ŷ] = 0 (first normal equation)
+    Taking v = P gives: E[(Y - Ŷ)·P] = 0 (second normal equation)
+
+    **FUTURE**:
+    - Unify empirical and theoretical loss via measure theory: treat both as L²(μ)
+      for different measures μ (population vs empirical 1/n Σδᵢ)
+    - Abstract the parameter space to any [InnerProductSpace ℝ P], not just ParamIx
+    - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
     (h_opt : isBayesOptimalInRawClass dgp model)
@@ -580,7 +599,19 @@ lemma rawOptimal_implies_orthogonality
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
     -- Orthogonality with P:
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  -- Proof omitted to restore compilation
+  -- The variational characterization: optimality ⟹ orthogonality
+  -- For any affine perturbation δa + δb·P, the derivative of the loss at (a, b)
+  -- in directions (1, 0) and (0, P) must be zero.
+  --
+  -- This is equivalent to the normal equations:
+  --   ⟨residual, 1⟩ = 0  and  ⟨residual, P⟩ = 0
+  --
+  -- The proof would expand isBayesOptimalInRawClass to get:
+  --   ∀ model' in raw class, E[(Y - pred(model))²] ≤ E[(Y - pred(model'))²]
+  -- Then construct competitor models with (a + ε, b) and (a, b + ε) and
+  -- take the derivative at ε = 0.
+  --
+  -- Technical requirements: integrability of Y, P, Y·P, etc.
   sorry
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
@@ -947,18 +978,50 @@ def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
     3. S is positive semidefinite by assumption (hS)
     4. λ > 0 means λS is positive semidefinite
     5. (PosDef) + (PosSemidef) = (PosDef)
-    6. A quadratic with positive definite Hessian is strictly convex -/
+    6. A quadratic with positive definite Hessian is strictly convex
+
+    **FUTURE:**
+    - Use Mathlib's Matrix.PosDef API directly for cleaner integration
+    - Abstract to LinearMap for kernel/image reasoning -/
 lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
     (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = Fintype.card ι) (_hS : IsPosSemidef S) :
     StrictConvexOn ℝ Set.univ (gaussianPenalizedLoss X y S lam) := by
-  -- The full proof requires:
-  -- 1. Showing the Hessian H = (1/n)XᵀX + λS is positive definite
-  -- 2. Using mathlib's PosDef → StrictConvexOn for quadratics
-  --
-  -- The positive definiteness of XᵀX when X has full rank follows from
-  -- transpose_mul_self_posDef above. Combined with hS and hlam > 0,
-  -- the sum H is positive definite, hence the quadratic is strictly convex.
+  -- The Hessian is H = (2/n)XᵀX + 2λS
+  -- For v ≠ 0: vᵀHv = (2/n)‖Xv‖² + 2λ·vᵀSv
+  --                 ≥ (2/n)‖Xv‖² (since S is PSD and λ > 0)
+  --                 > 0 (since X has full rank, so Xv ≠ 0)
+  -- Therefore H is positive definite, and the quadratic is strictly convex.
+  sorry
+
+/-- The penalized loss is coercive: L(β) → ∞ as ‖β‖ → ∞.
+
+    **Proof**: The penalty term λ·βᵀSβ dominates as ‖β‖ → ∞.
+    Even if S is only PSD, as long as λ > 0 and S has nontrivial action,
+    or if we use ridge penalty (S = I), coercivity holds.
+
+    For ridge penalty specifically: L(β) ≥ λ·‖β‖² → ∞. -/
+lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    [DecidableEq ι]
+    (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
+  -- For S = I (ridge): βᵀSβ = βᵀβ = ‖β‖²
+  -- So L(β) ≥ λ·‖β‖² → ∞ as ‖β‖ → ∞
+  sorry
+
+/-- Existence of minimizer: coercivity + continuity implies minimum exists.
+
+    This uses the Weierstrass extreme value theorem: a continuous function
+    that tends to infinity at infinity achieves its minimum on ℝⁿ. -/
+lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    [DecidableEq ι]
+    (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    ∃ β : ι → ℝ, ∀ β' : ι → ℝ, gaussianPenalizedLoss X y S lam β ≤ gaussianPenalizedLoss X y S lam β' := by
+  -- By coercivity (gaussianPenalizedLoss_coercive) and continuity,
+  -- Mathlib's Continuous.exists_forall_le_of_hasCompactMulSupport or
+  -- IsCompact.exists_isMinOn on sublevel sets gives existence.
   sorry
 
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
@@ -968,12 +1031,27 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     - `apply_sum_to_zero_constraint` ensures spline contributions average to zero
     - `apply_weighted_orthogonality_constraint` removes collinearity with lower-order terms
 
-    The proof uses Route B: strict convexity. -/
+    **Proof Strategy (Coercivity + Strict Convexity)**:
+
+    **Existence (Weierstrass)**: The loss function L(β) is:
+    - Continuous (composition of continuous operations)
+    - Coercive (L(β) → ∞ as ‖β‖ → ∞ due to ridge penalty λ‖β‖²)
+    Therefore by the extreme value theorem, a minimum exists.
+
+    **Uniqueness (Strict Convexity)**: The loss function is strictly convex when:
+    - X has full column rank (XᵀX is positive definite)
+    - λ > 0 (penalty adds strictly positive term)
+    A strictly convex function has at most one minimizer.
+
+    **FUTURE REFACTORING (v2.0)**:
+    - Unify empirical/theoretical loss via L²(μ) for different measures
+    - Use abstract [InnerProductSpace ℝ P] instead of concrete ParamIx
+    - Define constraint as LinearMap kernel for cleaner affine subspace handling -/
 theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
     [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
-    (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
+    (_hp : p > 0) (_hk : k > 0) (_hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
     (h_lambda_pos : lambda > 0) :
   ∃! (m : PhenotypeInformedGAM p k sp),
@@ -983,22 +1061,22 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
       InModelClass m' pgsBasis splineBasis →
       IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
 
-  -- **Proof Strategy (Route B: Strict Convexity)**
-  --
-  -- 1. Vectorize: Let β = packParams(m), so the problem becomes
-  --    minimizing L(β) = (1/n)‖y - Xβ‖² + λ βᵀSβ over {β : Cβ = 0}
-  --
-  -- 2. Strict convexity: By gaussianPenalizedLoss_strictConvex, L is strictly convex
-  --    on the whole space. Restricting to the affine subspace {Cβ = 0} preserves
-  --    strict convexity.
-  --
-  -- 3. Uniqueness: A strictly convex function on a convex set has at most one minimizer.
-  --
-  -- 4. Existence: L is coercive (goes to ∞ as ‖β‖ → ∞ due to the penalty term)
-  --    and continuous. By Weierstrass, a minimum exists on any closed bounded set,
-  --    and coercivity implies the minimum is achieved.
-  --
-  -- 5. Translate back: The unique minimizing β corresponds to a unique m via unpackParams.
+  -- Step 1: Reduce to vector optimization via packParams
+  -- The problem: minimize L(β) = (1/n)‖y - Xβ‖² + λβᵀSβ subject to Cβ = 0
+  -- where β = packParams(m)
+
+  -- Step 2: Existence via coercivity
+  -- L is continuous and coercive (L → ∞ as ‖β‖ → ∞ due to λ > 0)
+  -- The constraint set {β : Cβ = 0} is a closed linear subspace
+  -- By Weierstrass, a minimum exists on any closed set where L is coercive
+
+  -- Step 3: Uniqueness via strict convexity
+  -- L is strictly convex (XᵀX is PD from full rank, plus λS with λ > 0)
+  -- A strictly convex function on a convex set (linear subspace) has ≤ 1 minimizer
+  -- Combined with existence: exactly 1 minimizer
+
+  -- Step 4: Translate back via unpackParams
+  -- The unique minimizing β gives a unique m = unpackParams(β)
 
   sorry
 
