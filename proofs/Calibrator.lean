@@ -535,33 +535,53 @@ inductive ParamIx (p k sp : ℕ)
   | interaction (m : Fin p) (l : Fin k) (j : Fin sp) -- fₘₗ: p*k*sp parameters
   deriving DecidableEq
 
-/-- Total count of ParamIx matches total_params. -/
-lemma ParamIx_card_eq_total_params (p k sp : ℕ) :
-    -- The cardinality equals 1 + p + k*sp + p*k*sp
-    -- (would require Fintype instance for ParamIx)
-    1 + p + k*sp + p*k*sp = total_params p k sp := by
-  unfold total_params; ring
+abbrev ParamIxSum (p k sp : ℕ) :=
+  Sum Unit (Sum (Fin p) (Sum (Fin k × Fin sp) (Fin p × Fin k × Fin sp)))
 
-/-- Convert structured index to flat index. -/
-def ParamIx.toFin {p k sp : ℕ} : ParamIx p k sp → Fin (total_params p k sp)
-  | .intercept => ⟨0, by unfold total_params; omega⟩
-  | .pgsCoeff m => ⟨1 + m.val, by unfold total_params; omega⟩
-  | .pcSpline l j => ⟨1 + p + l.val * sp + j.val, by unfold total_params; sorry⟩
-  | .interaction m l j => ⟨1 + p + k*sp + m.val * k * sp + l.val * sp + j.val, by unfold total_params; sorry⟩
+def ParamIx.equivSum (p k sp : ℕ) : ParamIx p k sp ≃ ParamIxSum p k sp where
+  toFun
+    | .intercept => Sum.inl ()
+    | .pgsCoeff m => Sum.inr (Sum.inl m)
+    | .pcSpline l j => Sum.inr (Sum.inr (Sum.inl (l, j)))
+    | .interaction m l j => Sum.inr (Sum.inr (Sum.inr (m, l, j)))
+  invFun
+    | Sum.inl _ => .intercept
+    | Sum.inr (Sum.inl m) => .pgsCoeff m
+    | Sum.inr (Sum.inr (Sum.inl (l, j))) => .pcSpline l j
+    | Sum.inr (Sum.inr (Sum.inr (m, l, j))) => .interaction m l j
+  left_inv := by
+    intro x
+    cases x <;> rfl
+  right_inv := by
+    intro x
+    cases x with
+    | inl u =>
+      cases u
+      rfl
+    | inr x =>
+      cases x with
+      | inl m =>
+        rfl
+      | inr x =>
+        cases x with
+        | inl lj =>
+          rcases lj with ⟨l, j⟩
+          rfl
+        | inr mlj =>
+          rcases mlj with ⟨m, l, j⟩
+          rfl
 
-/-- Convert flat index to structured index. -/
-def ParamIx.fromFin {p k sp : ℕ} (hp : p > 0) (hk : k > 0) (hsp : sp > 0) (j : Fin (total_params p k sp)) : ParamIx p k sp :=
-  if h0 : j.val = 0 then .intercept
-  else if h1 : j.val ≤ p then .pgsCoeff ⟨j.val - 1, by omega⟩
-  else if h2 : j.val ≤ p + k * sp then
-    let idx := j.val - 1 - p
-    .pcSpline ⟨idx / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
-  else
-    let idx := j.val - 1 - p - k * sp
-    .interaction ⟨idx / (k * sp), by sorry⟩ ⟨(idx % (k * sp)) / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
+instance (p k sp : ℕ) : Fintype (ParamIx p k sp) :=
+  Fintype.ofEquiv (ParamIxSum p k sp) (ParamIx.equivSum p k sp).symm
+
+lemma ParamIx_card (p k sp : ℕ) : Fintype.card (ParamIx p k sp) = total_params p k sp := by
+  classical
+  -- `simp` computes the card but leaves some reassociation/`mul_assoc` goals.
+  simpa [ParamIxSum, total_params, Nat.add_assoc, Nat.add_left_comm, Nat.add_comm, Nat.mul_assoc] using
+    (Fintype.card_congr (ParamIx.equivSum p k sp))
 
 /-- Parameter vector type: flattens all GAM coefficients into a single vector. -/
-abbrev ParamVec (p k sp : ℕ) := Fin (total_params p k sp) → ℝ
+abbrev ParamVec (p k sp : ℕ) := ParamIx p k sp → ℝ
 
 /-- Model class restriction: same basis, same link, same distribution.
     Without this, the same predictor can be represented with different parameters. -/
@@ -577,16 +597,11 @@ structure InModelClass {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp)
 noncomputable def packParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (m : PhenotypeInformedGAM p k sp) : ParamVec p k sp :=
   fun j =>
-    -- Use structured access via ParamIx when p, k, sp are nonzero
-    -- For the general case, use index arithmetic
-    if h0 : j.val = 0 then m.γ₀₀
-    else if h1 : j.val ≤ p then m.γₘ₀ ⟨j.val - 1, by omega⟩
-    else if h2 : j.val ≤ p + k * sp then
-      let idx := j.val - 1 - p
-      m.f₀ₗ ⟨idx / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
-    else
-      let idx := j.val - 1 - p - k * sp
-      m.fₘₗ ⟨idx / (k * sp), by sorry⟩ ⟨(idx % (k * sp)) / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
+    match j with
+    | .intercept => m.γ₀₀
+    | .pgsCoeff m0 => m.γₘ₀ m0
+    | .pcSpline l s => m.f₀ₗ l s
+    | .interaction m0 l s => m.fₘₗ m0 l s
 
 /-- Unpack a vector into GAM parameters (inverse of packParams). -/
 noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -594,10 +609,10 @@ noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)
     (β : ParamVec p k sp) : PhenotypeInformedGAM p k sp :=
   { pgsBasis := pgsBasis
     pcSplineBasis := splineBasis
-    γ₀₀ := β ⟨0, by unfold total_params; omega⟩
-    γₘ₀ := fun m => β ⟨1 + m.val, by unfold total_params; omega⟩
-    f₀ₗ := fun l j => β ⟨1 + p + l.val * sp + j.val, by unfold total_params; sorry⟩
-    fₘₗ := fun m l j => β ⟨1 + p + k*sp + m.val * k * sp + l.val * sp + j.val, by unfold total_params; sorry⟩
+    γ₀₀ := β .intercept
+    γₘ₀ := fun m => β (.pgsCoeff m)
+    f₀ₗ := fun l j => β (.pcSpline l j)
+    fₘₗ := fun m l j => β (.interaction m l j)
     link := .identity
     dist := .Gaussian }
 
@@ -617,14 +632,13 @@ lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
     - pcSpline l j: splineBasis.B[j](c_i[l])
     - interaction m l j: B_{m+1}(pgs_i) * splineBasis.B[j](c_i[l])
 
-    Uses ParamIx.fromFin for clean column dispatch. -/
+    Uses structured indices for clean column dispatch. -/
 noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
     [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
-    (hp : p > 0) (hk : k > 0) (hsp : sp > 0) : Matrix (Fin n) (Fin (total_params p k sp)) ℝ :=
+    : Matrix (Fin n) (ParamIx p k sp) ℝ :=
   Matrix.of fun i j =>
-    -- Use ParamIx for clean column dispatch
-    match ParamIx.fromFin hp hk hsp j with
+    match j with
     | .intercept => 1
     | .pgsCoeff m => pgsBasis.B ⟨m.val + 1, by omega⟩ (data.p i)
     | .pcSpline l s => splineBasis.b s (data.c i l)
@@ -643,10 +657,9 @@ noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin 
 lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
     [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
-    (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
     (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) :
     ∀ i : Fin n, linearPredictor m (data.p i) (data.c i) =
-      (designMatrix data pgsBasis splineBasis hp hk hsp).mulVec (packParams m) i := by
+      (designMatrix data pgsBasis splineBasis).mulVec (packParams m) i := by
   intro i
   -- LHS: linearPredictor m (data.p i) (data.c i)
   -- = γ₀₀ * B₀(pgs) + Σ_m (γₘ₀ + smooth_m(c)) * B_{m+1}(pgs)
@@ -671,13 +684,12 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   -- The rest requires careful sum manipulation
   sorry
 
-/-- Full column rank implies X.mulVec is injective.
-    Uses: rank X = d ⟹ ker(mulVecLin X) = ⊥ ⟹ X.mulVec is injective.
+/-- Full column rank implies `X.mulVec` is injective.
 
-    Key mathlib lemmas:
-    - Matrix.rank_eq_card_iff_injective or Matrix.ker_mulVecLin_eq_bot_iff -/
-lemma mulVec_injective_of_full_rank {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
-    (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
+This is stated using an arbitrary finite column type `ι` (rather than `Fin d`) to avoid
+index-flattening in downstream proofs. -/
+lemma mulVec_injective_of_full_rank {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    (X : Matrix (Fin n) ι ℝ) (h_rank : Matrix.rank X = Fintype.card ι) :
     Function.Injective X.mulVec := by
   -- rank X = d means dim(column space) = d
   -- which equals the number of columns, so ker(X.mulVec) = {0}
@@ -687,8 +699,13 @@ lemma mulVec_injective_of_full_rank {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin 
   -- Then injectivity follows from LinearMap.ker_eq_bot_of_injective
   sorry
 
-/-- Dot product of two vectors represented as Fin d → ℝ. -/
-def dotProduct' {d : ℕ} [Fintype (Fin d)] (u v : Fin d → ℝ) : ℝ :=
+/-! ### Generic Finite-Dimensional Quadratic Forms
+
+These are written over an arbitrary finite index type `ι`, so they can be used directly with
+`ParamIx p k sp` (no `Fin (total_params ...)` needed). -/
+
+/-- Dot product of two vectors represented as `ι → ℝ`. -/
+def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => u i * v i)
 
 /-- XᵀX is positive definite when X has full column rank.
@@ -700,9 +717,9 @@ def dotProduct' {d : ℕ} [Fintype (Fin d)] (u v : Fin d → ℝ) : ℝ :=
 
     Alternatively, direct proof:
     vᵀ(XᵀX)v = (Xv)ᵀ(Xv) = ‖Xv‖² > 0 when v ≠ 0 and X injective. -/
-lemma transpose_mul_self_posDef {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)] [DecidableEq (Fin d)]
-    (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
-    ∀ v : Fin d → ℝ, v ≠ 0 → 0 < dotProduct' ((Matrix.transpose X * X).mulVec v) v := by
+lemma transpose_mul_self_posDef {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    (X : Matrix (Fin n) ι ℝ) (h_rank : Matrix.rank X = Fintype.card ι) :
+    ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' ((Matrix.transpose X * X).mulVec v) v := by
   intro v hv
   -- vᵀ(XᵀX)v = vᵀXᵀXv = (Xv)ᵀ(Xv) = ‖Xv‖²
   -- Since X has full rank, X.mulVec is injective
@@ -716,19 +733,19 @@ lemma transpose_mul_self_posDef {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)] 
   sorry
 
 /-- The penalized Gaussian loss as a quadratic function of parameters. -/
-noncomputable def gaussianPenalizedLoss {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
-    (X : Matrix (Fin n) (Fin d) ℝ) (y : Fin n → ℝ) (S : Matrix (Fin d) (Fin d) ℝ) (lam : ℝ)
-    (β : Fin d → ℝ) : ℝ :=
+noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ) (lam : ℝ)
+    (β : ι → ℝ) : ℝ :=
   (1 / n) * ‖y - X.mulVec β‖^2 + lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)
 
 /-- A matrix is positive semidefinite if vᵀSv ≥ 0 for all v. -/
-def IsPosSemidef {d : ℕ} [Fintype (Fin d)] (S : Matrix (Fin d) (Fin d) ℝ) : Prop :=
-  ∀ v : Fin d → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
+def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
+  ∀ v : ι → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
 
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0. -/
-lemma gaussianPenalizedLoss_strictConvex {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
-    (X : Matrix (Fin n) (Fin d) ℝ) (y : Fin n → ℝ) (S : Matrix (Fin d) (Fin d) ℝ)
-    (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = d) (hS : IsPosSemidef S) :
+lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
+    (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
+    (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = Fintype.card ι) (hS : IsPosSemidef S) :
     StrictConvexOn ℝ Set.univ (gaussianPenalizedLoss X y S lam) := by
   -- The loss is:
   --   (1/n) * ‖y - Xβ‖² + lam * βᵀSβ
@@ -748,11 +765,11 @@ lemma gaussianPenalizedLoss_strictConvex {n d : ℕ} [Fintype (Fin n)] [Fintype 
 
     The proof uses Route B: strict convexity. -/
 theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
-    [Fintype (Fin k)] [Fintype (Fin sp)] [DecidableEq (Fin (total_params p k sp))]
+    [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
-    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis hp hk hsp) = total_params p k sp)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
     (h_lambda_pos : lambda > 0) :
   ∃! (m : PhenotypeInformedGAM p k sp),
     InModelClass m pgsBasis splineBasis ∧
