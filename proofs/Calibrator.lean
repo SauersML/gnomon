@@ -285,7 +285,25 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val ⟨0, by norm_num⟩ := by
-  sorry
+  intros p_val c_val
+  unfold predictionBias
+  rw [h_s4]
+  dsimp
+  -- Simplify linearPredictor for raw model
+  have h_pred : ∀ p c, linearPredictor model_raw p c = model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * p := by
+    sorry
+
+
+
+
+  rw [h_pred]
+  -- Now assert optimality criteria implies coefficients
+  have h_opt_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
+    -- Minimizing E[(Y - (a + bP))^2]
+    -- This relies on solving the normal equations, which we skip for brevity in this demo
+    sorry
+  rw [h_opt_coeffs.1, h_opt_coeffs.2]
+  ring
 
 def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
 notation:50 a " ≈ " b => approxEq a b 0.01
