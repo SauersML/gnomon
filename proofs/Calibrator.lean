@@ -355,6 +355,90 @@ def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (F
     expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
+/-! ### L² Orthogonality Characterization
+
+In L²(μ), the minimizer of ‖Y - Ŷ‖² over a linear subspace W satisfies the
+**normal equations**: the residual Y - Ŷ is orthogonal to W.
+
+For raw models, W = span{1, P}, so the optimality conditions are:
+  ⟪Y - (a + bP), 1⟫ = 0   ⟹   E[Y] - a - b·E[P] = 0
+  ⟪Y - (a + bP), P⟫ = 0   ⟹   E[YP] - a·E[P] - b·E[P²] = 0
+
+Under E[P] = 0 and E[P²] = 1, these simplify to:
+  a = E[Y]
+  b = E[YP]
+-/
+
+/-- First normal equation: optimality implies a = E[Y] (when E[P] = 0).
+    This is the orthogonality condition ⟪residual, 1⟫ = 0. -/
+lemma optimal_intercept_eq_mean_of_zero_mean_p
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (h_orth_1 : ∫ pc, (Y pc - (a + b * pc.1)) ∂μ = 0) :
+    a = ∫ pc, Y pc ∂μ := by
+  -- From h_orth_1: E[Y] - E[a + bP] = 0
+  -- E[a + bP] = a·E[1] + b·E[P] = a + b·0 = a
+  -- So E[Y] = a
+  sorry
+
+/-- Second normal equation: optimality implies b = E[YP] (when E[P] = 0, E[P²] = 1).
+    This is the orthogonality condition ⟪residual, P⟫ = 0. -/
+lemma optimal_slope_eq_covariance_of_normalized_p
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (h_orth_P : ∫ pc, (Y pc - (a + b * pc.1)) * pc.1 ∂μ = 0) :
+    b = ∫ pc, Y pc * pc.1 ∂μ := by
+  -- From h_orth_P: E[(Y - a - bP)·P] = 0
+  -- E[YP] - a·E[P] - b·E[P²] = 0
+  -- E[YP] - a·0 - b·1 = 0
+  -- So b = E[YP]
+  sorry
+
+/-- The key bridge: isBayesOptimalInRawClass implies the orthogonality conditions.
+    This uses the variational characterization of L² projection. -/
+lemma rawOptimal_implies_orthogonality
+    (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
+    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_raw : IsRawScoreModel model)
+    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1) :
+    let a := model.γ₀₀
+    let b := model.γₘ₀ ⟨0, by norm_num⟩
+    -- Orthogonality with 1:
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
+    -- Orthogonality with P:
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
+  -- This follows from the first-order optimality conditions:
+  -- If model minimizes ‖Y - Ŷ‖² over the affine class, then
+  -- ∂/∂a E[(Y - a - bP)²] = 0  ⟹  E[Y - a - bP] = 0
+  -- ∂/∂b E[(Y - a - bP)²] = 0  ⟹  E[(Y - a - bP)·P] = 0
+  sorry
+
+/-- Combine the normal equations to get the optimal coefficients for additive bias DGP. -/
+lemma optimal_coefficients_for_additive_dgp
+    (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
+    (dgp : DataGeneratingProcess 1)
+    (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
+    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_raw : IsRawScoreModel model)
+    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂dgp.jointMeasure = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
+    model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
+  -- From the orthogonality lemma + the specific form of Y = P + β·C:
+  --
+  -- a = E[Y] = E[P] + β·E[C] = 0 + β·0 = 0
+  --
+  -- b = E[YP] = E[P² + β·P·C]
+  --           = E[P²] + β·E[P·C]
+  --           = 1 + β·E[P]·E[C]    (by independence)
+  --           = 1 + β·0·0 = 1
+  sorry
+
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
   (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
