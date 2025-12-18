@@ -550,21 +550,41 @@ lemma linearPredictor_eq_affine_of_raw
   rw [h_base, h_slope]
 
 /-- **Lemma B**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
-    Uses Fubini (integral_prod) to factor the expectation. -/
+    Uses Fubini (integral_prod) to factor the expectation.
+
+    Key insight: If μ = μ_P ⊗ μ_C (product measure), then
+      ∫ f(p) * g(c) dμ = (∫ f dμ_P) * (∫ g dμ_C)
+    Since E[P] = 0 or E[C] = 0, the product is 0. -/
 lemma integral_mul_fst_snd_eq_zero
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
     ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-  -- Rewrite μ as product measure, apply Fubini:
-  -- ∫ p*c dμ = ∫∫ p*c d(μ_P)d(μ_C) = (∫ p dμ_P) * (∫ c dμ_C) = 0 * 0 = 0
+  -- The proof uses:
+  -- 1. Rewrite μ as product measure: μ = μ_P ⊗ μ_C
+  -- 2. Apply Fubini/Tonelli to factor the integral
+  -- 3. Use that one of the marginal integrals is 0
+  --
+  -- ∫ p*c dμ = ∫∫ p*c d(μ_P)d(μ_C)
+  --          = (∫ p dμ_P) * (∫ c dμ_C)
+  --          = 0 * _ = 0   OR   _ * 0 = 0
   sorry
 
 /-- **Lemma C**: Closed-form L² risk for affine predictors in Scenario 4.
     For Y = P - 0.8C and predictor Ŷ = a + b*P:
       E[(Y - Ŷ)²] = a² + (1-b)² · E[P²] + 0.64 · E[C²]
-    when E[P] = E[C] = 0 and P ⊥ C. -/
+    when E[P] = E[C] = 0 and P ⊥ C.
+
+    Proof strategy:
+    1. Let u = (1-b), so Y - Ŷ = u*P - 0.8*C - a
+    2. Expand the square: (uP - 0.8C - a)² = u²P² + 0.64C² + a² + 2u·P·(-0.8C) + 2u·P·(-a) + 2·(-0.8C)·(-a)
+    3. Take expectations and use linearity
+    4. Cross terms vanish:
+       - E[P] = 0 kills the 2ua·P and 2·(-0.8)·a·C terms (via hP0, hC0)
+       - E[PC] = 0 (Lemma B) kills the -1.6u·PC term
+    5. Main terms: u²·E[P²] + 0.64·E[C²] + a²·E[1]
+       With E[P²] = 1 and E[1] = 1 (probability measure): u² + 0.64·E[C²] + a² -/
 lemma risk_affine_scenario4
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
@@ -574,12 +594,17 @@ lemma risk_affine_scenario4
     (a b : ℝ) :
     ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-  -- Expand: (Y - (a + bP))² = ((1-b)P - 0.8C - a)²
-  --       = (1-b)²P² + 0.64C² + a² + cross-terms
-  -- Cross-terms vanish by:
-  --   - E[P] = 0 kills a*P term
-  --   - E[C] = 0 kills a*C term
-  --   - E[PC] = 0 (Lemma B) kills P*C term
+  -- Set u = 1 - b for clarity
+  set u := 1 - b with hu
+
+  -- The integrand simplifies to: (u*P - 0.8*C - a)²
+  -- Expanding and taking expectations, cross-terms vanish by:
+  --   - Lemma B: E[PC] = 0
+  --   - hP0: E[P] = 0
+  --   - hC0: E[C] = 0
+  -- Leaving: u²·E[P²] + 0.64·E[C²] + a²
+
+  -- Apply integral linearity and the zero-mean/independence facts
   sorry
 
 /-- **Lemma D**: Uniqueness of minimizer for Scenario 4 risk.
