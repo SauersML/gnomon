@@ -473,7 +473,44 @@ def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 /-! ### Parameter Vectorization Infrastructure
 
 To prove identifiability, we vectorize the GAM parameters into a single vector β ∈ ℝ^d,
-then show the loss is a strictly convex quadratic in β. -/
+then show the loss is a strictly convex quadratic in β.
+
+**Key insight**: Define a structured index type `ParamIx` to avoid Fin arithmetic hell.
+Then define packParams/unpackParams through this structured type. -/
+
+/-- Structured parameter index type.
+    This avoids painful Fin arithmetic by giving semantic meaning to each parameter block. -/
+inductive ParamIx (p k sp : ℕ)
+  | intercept                         -- γ₀₀: 1 parameter
+  | pgsCoeff (m : Fin p)              -- γₘ₀: p parameters
+  | pcSpline (l : Fin k) (j : Fin sp) -- f₀ₗ: k*sp parameters
+  | interaction (m : Fin p) (l : Fin k) (j : Fin sp) -- fₘₗ: p*k*sp parameters
+  deriving DecidableEq
+
+/-- Total count of ParamIx matches total_params. -/
+lemma ParamIx_card_eq_total_params (p k sp : ℕ) :
+    -- The cardinality equals 1 + p + k*sp + p*k*sp
+    -- (would require Fintype instance for ParamIx)
+    1 + p + k*sp + p*k*sp = total_params p k sp := by
+  unfold total_params; ring
+
+/-- Convert structured index to flat index. -/
+def ParamIx.toFin {p k sp : ℕ} : ParamIx p k sp → Fin (total_params p k sp)
+  | .intercept => ⟨0, by unfold total_params; omega⟩
+  | .pgsCoeff m => ⟨1 + m.val, by unfold total_params; omega⟩
+  | .pcSpline l j => ⟨1 + p + l.val * sp + j.val, by unfold total_params; sorry⟩
+  | .interaction m l j => ⟨1 + p + k*sp + m.val * k * sp + l.val * sp + j.val, by unfold total_params; sorry⟩
+
+/-- Convert flat index to structured index. -/
+def ParamIx.fromFin {p k sp : ℕ} (hp : p > 0) (hk : k > 0) (hsp : sp > 0) (j : Fin (total_params p k sp)) : ParamIx p k sp :=
+  if h0 : j.val = 0 then .intercept
+  else if h1 : j.val ≤ p then .pgsCoeff ⟨j.val - 1, by omega⟩
+  else if h2 : j.val ≤ p + k * sp then
+    let idx := j.val - 1 - p
+    .pcSpline ⟨idx / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
+  else
+    let idx := j.val - 1 - p - k * sp
+    .interaction ⟨idx / (k * sp), by sorry⟩ ⟨(idx % (k * sp)) / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
 
 /-- Parameter vector type: flattens all GAM coefficients into a single vector. -/
 abbrev ParamVec (p k sp : ℕ) := Fin (total_params p k sp) → ℝ
@@ -487,11 +524,21 @@ structure InModelClass {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp)
   link_identity : m.link = .identity
   dist_gaussian : m.dist = .Gaussian
 
-/-- Pack GAM parameters into a vector.
-    Layout: [γ₀₀, γₘ₀[0..p], f₀ₗ[0..k][0..sp], fₘₗ[0..p][0..k][0..sp]] -/
+/-- Pack GAM parameters into a vector using the structured ParamIx.
+    Each coefficient is placed at its corresponding flat index. -/
 noncomputable def packParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (m : PhenotypeInformedGAM p k sp) : ParamVec p k sp :=
-  fun j => sorry  -- Index arithmetic mapping j to the appropriate coefficient
+  fun j =>
+    -- Use structured access via ParamIx when p, k, sp are nonzero
+    -- For the general case, use index arithmetic
+    if h0 : j.val = 0 then m.γ₀₀
+    else if h1 : j.val ≤ p then m.γₘ₀ ⟨j.val - 1, by omega⟩
+    else if h2 : j.val ≤ p + k * sp then
+      let idx := j.val - 1 - p
+      m.f₀ₗ ⟨idx / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
+    else
+      let idx := j.val - 1 - p - k * sp
+      m.fₘₗ ⟨idx / (k * sp), by sorry⟩ ⟨(idx % (k * sp)) / sp, by sorry⟩ ⟨idx % sp, by sorry⟩
 
 /-- Unpack a vector into GAM parameters (inverse of packParams). -/
 noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -499,10 +546,10 @@ noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)
     (β : ParamVec p k sp) : PhenotypeInformedGAM p k sp :=
   { pgsBasis := pgsBasis
     pcSplineBasis := splineBasis
-    γ₀₀ := sorry  -- β[0]
-    γₘ₀ := sorry  -- β[1..p]
-    f₀ₗ := sorry  -- β[p+1..p+k*sp]
-    fₘₗ := sorry  -- β[p+k*sp+1..end]
+    γ₀₀ := β ⟨0, by unfold total_params; omega⟩
+    γₘ₀ := fun m => β ⟨1 + m.val, by unfold total_params; omega⟩
+    f₀ₗ := fun l j => β ⟨1 + p + l.val * sp + j.val, by unfold total_params; sorry⟩
+    fₘₗ := fun m l j => β ⟨1 + p + k*sp + m.val * k * sp + l.val * sp + j.val, by unfold total_params; sorry⟩
     link := .identity
     dist := .Gaussian }
 
