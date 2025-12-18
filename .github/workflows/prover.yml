@@ -110,17 +110,21 @@ jobs:
         run: |
           echo "📦 Cache miss - updating dependencies..."
           # lake update  <-- REMOVED: Do not update dependencies, use the lockfile!
+          
+          echo "⬇️ Fetching dependencies first..."
+          lake build --no-build
+          
           echo "📥 Downloading mathlib cache..."
-          # The '|| true' is important as this step can fail if no cache exists,
-          # which is not a critical error.
-          lake exe cache get || true
+          # The '|| true' is REMOVED. We MUST succeed in getting the cache
+          # because building Mathlib from source is not viable in CI.
+          lake exe cache get
           
       - name: Build all dependencies (only if cache miss)
         if: steps.check-cache.outputs.valid != 'true'
         run: |
           echo "🔨 Building ALL dependencies (this will take a few minutes)..."
-          # First, ensure all dependencies are fetched
-          lake build --no-build || true
+          # First, ensure all dependencies are fetched (already done above, but safe to repeat)
+          # lake build --no-build || true  <-- Moved up
           # Then build everything to populate the cache
           lake build
           echo "✅ All dependencies built and ready for caching!"
