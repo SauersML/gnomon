@@ -1183,20 +1183,63 @@ lemma linearPredictor_eq_affine_of_raw
 
 
 
-/-- **Lemma C**: Closed-form L² risk for affine predictors in Scenario 4.
-    For Y = P - 0.8C and predictor Ŷ = a + b*P:
-      E[(Y - Ŷ)²] = a² + (1-b)² · E[P²] + 0.64 · E[C²]
-    when E[P] = E[C] = 0 and P ⊥ C.
+/-- **General Risk Formula for Affine Predictors** (THE KEY LEMMA)
 
-    Proof strategy:
-    1. Let u = (1-b), so Y - Ŷ = u*P - 0.8*C - a
-    2. Expand the square: (uP - 0.8C - a)² = u²P² + 0.64C² + a² + 2u·P·(-0.8C) + 2u·P·(-a) + 2·(-0.8C)·(-a)
-    3. Take expectations and use linearity
-    4. Cross terms vanish:
-       - E[P] = 0 kills the 2ua·P and 2·(-0.8)·a·C terms (via hP0, hC0)
-       - E[PC] = 0 (Lemma B) kills the -1.6u·PC term
-    5. Main terms: u²·E[P²] + 0.64·E[C²] + a²·E[1]
-       With E[P²] = 1 and E[1] = 1 (probability measure): u² + 0.64·E[C²] + a² -/
+    For DGP Y = P + β·C and affine predictor Ŷ = a + b·P:
+      R(a,b) = E[(Y - Ŷ)²] = a² + (1-b)²·E[P²] + β²·E[C²]
+
+    when E[P] = E[C] = 0 and E[PC] = 0 (independence).
+
+    **Proof Strategy (Direct Expansion)**:
+    1. Let u = 1 - b. Then Y - Ŷ = (P + βC) - (a + bP) = uP + βC - a
+    2. Expand: (uP + βC - a)² = u²P² + β²C² + a² + 2uβPC - 2uaP - 2aβC
+    3. Integrate term-by-term:
+       - E[u²P²] = u²·E[P²]
+       - E[2uβPC] = 0 (by independence/orthogonality)
+       - E[-2uaP] = -2ua·E[P] = 0
+       - E[-2aβC] = -2aβ·E[C] = 0
+    4. Result: u²·E[P²] + β²·E[C²] + a² = a² + (1-b)²·E[P²] + β²·E[C²]
+
+    This is the cleanest path to proving raw score bias: compare risks directly,
+    no need for normal equations or Hilbert projection machinery.
+
+    **Alternative approach (avoided)**: Prove via orthogonality conditions (normal equations).
+    That requires formalizing isBayesOptimalInRawClass → orthogonality, which is harder. -/
+lemma risk_affine_additive
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (_h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
+    (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (β a b : ℝ) :
+    ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
+      a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
+  -- Let u = 1 - b
+  set u := 1 - b with hu
+
+  -- The integrand is: (uP + βC - a)²
+  -- = u²P² + β²C² + a² + 2uβPC - 2uaP - 2aβC
+  --
+  -- Integrating term by term:
+  -- ∫ u²P² = u² ∫ P² = u² · 1 = (1-b)²
+  -- ∫ β²C² = β² ∫ C²
+  -- ∫ a² = a² (since μ is prob measure)
+  -- ∫ 2uβPC = 2uβ · 0 = 0 (by hPC0)
+  -- ∫ -2uaP = -2ua · 0 = 0 (by hP0)
+  -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
+
+  -- The formal proof requires:
+  -- 1. Rewriting the integrand as a sum of terms
+  -- 2. Applying integral_add for each term (requires integrability)
+  -- 3. Using the moment hypotheses to simplify
+
+  -- For now, we leave this with a sketch. The algebraic manipulations are tedious
+  -- but purely mechanical once integrability is established.
+  sorry
+
+/-- Corollary: Risk formula for Scenario 4 (β = -0.8).
+    This is just `risk_affine_additive` with β = -0.8. -/
 lemma risk_affine_scenario4
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
@@ -1206,18 +1249,25 @@ lemma risk_affine_scenario4
     (a b : ℝ) :
     ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-  -- Set u = 1 - b for clarity
-  set u := 1 - b with hu
+  -- p - 0.8*c = p + (-0.8)*c, so this is risk_affine_additive with β = -0.8
+  have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 :=
+    integral_mul_fst_snd_eq_zero μ h_indep hP0 hC0
 
-  -- The integrand simplifies to: (u*P - 0.8*C - a)²
-  -- Expanding and taking expectations, cross-terms vanish by:
-  --   - Lemma B: E[PC] = 0
-  --   - hP0: E[P] = 0
-  --   - hC0: E[C] = 0
-  -- Leaving: u²·E[P²] + 0.64·E[C²] + a²
+  -- Rewrite to match risk_affine_additive form
+  have h_rewrite : ∀ pc : ℝ × (Fin 1 → ℝ),
+      (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) =
+      (pc.1 + (-0.8) * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) := by
+    intro pc; ring
 
-  -- Apply integral linearity and the zero-mean/independence facts
-  sorry
+  simp_rw [h_rewrite]
+
+  -- Apply the general lemma
+  have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 (-0.8) a b
+
+  -- Simplify (-0.8)² = 0.64
+  simp only [neg_mul] at h_gen ⊢
+  convert h_gen using 2
+  ring
 
 /-- **Lemma D**: Uniqueness of minimizer for Scenario 4 risk.
     The affine risk a² + (1-b)² + const is uniquely minimized at a=0, b=1. -/
