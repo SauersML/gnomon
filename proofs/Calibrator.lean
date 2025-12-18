@@ -366,11 +366,103 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
   dgp.trueExpectation p_val c_val - f p_val c_val
 
+/-! ### Helper Lemmas for Scenario 4 (Raw Score Bias)
+
+The following lemmas support the main theorem `raw_score_bias_in_scenario4_simplified`.
+They formalize the L²-projection structure: raw model = projection onto {1, P} subspace. -/
+
+/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p.
+    This is the key structural simplification. -/
+lemma linearPredictor_eq_affine_of_raw
+    (model_raw : PhenotypeInformedGAM 1 1 1)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * p := by
+  intros p_val c_val
+  unfold linearPredictor
+  -- For raw model: f₀ₗ = 0 and fₘₗ = 0 for all indices
+  -- So evalSmooth(...) = Σᵢ 0 * bᵢ(x) = 0
+  have h_f0l_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.f₀ₗ l) (c_val l) = 0 := by
+    intro l
+    unfold evalSmooth
+    simp only [h_raw.1 l, zero_mul, Finset.sum_const_zero]
+  have h_fml_zero : ∀ m l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ m l) (c_val l) = 0 := by
+    intros m l
+    unfold evalSmooth
+    simp only [h_raw.2 m l, zero_mul, Finset.sum_const_zero]
+  -- Collapse sums over Fin 1 and apply spline zeros + linear basis
+  -- Result: γ₀₀ + γₘ₀[0] * id(p) = γ₀₀ + γₘ₀[0] * p
+  sorry
+
+/-- **Lemma B**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
+    Uses Fubini (integral_prod) to factor the expectation. -/
+lemma integral_mul_fst_snd_eq_zero
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
+    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
+  -- Rewrite μ as product measure, apply Fubini:
+  -- ∫ p*c dμ = ∫∫ p*c d(μ_P)d(μ_C) = (∫ p dμ_P) * (∫ c dμ_C) = 0 * 0 = 0
+  sorry
+
+/-- **Lemma C**: Closed-form L² risk for affine predictors in Scenario 4.
+    For Y = P - 0.8C and predictor Ŷ = a + b*P:
+      E[(Y - Ŷ)²] = a² + (1-b)² · E[P²] + 0.64 · E[C²]
+    when E[P] = E[C] = 0 and P ⊥ C. -/
+lemma risk_affine_scenario4
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (a b : ℝ) :
+    ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
+      a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
+  -- Expand: (Y - (a + bP))² = ((1-b)P - 0.8C - a)²
+  --       = (1-b)²P² + 0.64C² + a² + cross-terms
+  -- Cross-terms vanish by:
+  --   - E[P] = 0 kills a*P term
+  --   - E[C] = 0 kills a*C term
+  --   - E[PC] = 0 (Lemma B) kills P*C term
+  sorry
+
+/-- **Lemma D**: Uniqueness of minimizer for Scenario 4 risk.
+    The affine risk a² + (1-b)² + const is uniquely minimized at a=0, b=1. -/
+lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (hconst : const ≥ 0) :
+    a^2 + (1 - b)^2 + const ≥ const ∧
+    (a^2 + (1 - b)^2 + const = const ↔ a = 0 ∧ b = 1) := by
+  constructor
+  · -- a² + (1-b)² ≥ 0
+    nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
+  · constructor
+    · intro h
+      have h1 : a^2 + (1 - b)^2 = 0 := by linarith
+      have ha : a^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
+      have hb : (1 - b)^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
+      constructor
+      · exact sq_eq_zero_iff.mp ha
+      · have : 1 - b = 0 := sq_eq_zero_iff.mp hb
+        linarith
+    · rintro ⟨rfl, rfl⟩
+      simp
+
+/-! ### Main Theorem: Raw Score Bias in Scenario 4 -/
+
+/-- **Raw Score Bias Theorem**: In Scenario 4 (neutral ancestry differences),
+    using a raw score model (ignoring ancestry) produces prediction bias = -0.8 * c.
+
+    This validates why the calibrator in `calibrator.rs` includes PC main effects (f₀ₗ)
+    and not just PGS×PC interactions. Even with no true gene-environment interaction,
+    population drift creates systematic bias that must be corrected. -/
 theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
-    (h_opt_raw : ∀ (m : PhenotypeInformedGAM 1 1 1) (hm : IsRawScoreModel m), isBayesOptimalInClass dgp4 m)
+    -- Fixed: specialized to model_raw, not quantified over all raw models
+    (h_opt_raw : isBayesOptimalInClass dgp4 model_raw)
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
@@ -381,53 +473,17 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
   rw [h_s4]
   dsimp
 
-  -- Step 1: Simplify linear predictor for raw model
-  -- A raw model has f₀ₗ = 0 and fₘₗ = 0 for all indices
-  -- So linearPredictor reduces to: γ₀₀ + γₘ₀[0] * B[1](pgs)
-  -- With linear basis B[1] = id, this is: γ₀₀ + γₘ₀[0] * p
-  have h_pred : ∀ p_in c_in, linearPredictor model_raw p_in c_in = model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * p_in := by
-    intros p_in c_in
-    unfold linearPredictor
-    -- Raw model: all smooth functions are zero
-    have h_f0l_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.f₀ₗ l) (c_in l) = 0 := by
-      intro l
-      unfold evalSmooth
-      simp only [h_raw_struct.1 l, zero_mul, Finset.sum_const_zero]
-    have h_fml_zero : ∀ m l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ m l) (c_in l) = 0 := by
-      intros m l
-      unfold evalSmooth
-      simp only [h_raw_struct.2 m l, zero_mul, Finset.sum_const_zero]
-    -- The remaining simplification follows from:
-    -- 1. Baseline effect: γ₀₀ + Σₗ f₀ₗ(cₗ) = γ₀₀ + 0 = γ₀₀
-    -- 2. PGS effect: Σₘ (γₘ₀[m] + Σₗ fₘₗ(cₗ)) * B[m+1](p) = (γₘ₀[0] + 0) * p
-    -- 3. Linear basis: B[1](p) = id(p) = p
-    sorry
-
+  -- Step 1: Apply Lemma A to simplify the raw predictor
+  have h_pred := linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
   rw [h_pred]
 
   -- Step 2: Derive optimal coefficients from Bayes optimality
-  -- Under h_indep (P ⊥ C) and h_means_zero (E[P] = E[C] = 0):
-  --   True model: Y = P - 0.8*C
-  --   Raw model predicts: a + b*P (ignoring C)
-  --   Optimal least squares: b = Cov(Y,P)/Var(P), a = E[Y] - b*E[P]
-  --   Since P ⊥ C: Cov(Y,P) = Cov(P - 0.8*C, P) = Var(P) - 0.8*Cov(C,P) = Var(P)
-  --   Therefore: b = Var(P)/Var(P) = 1
-  --   And: a = E[P - 0.8*C] - 1*E[P] = E[P] - 0.8*E[C] - E[P] = -0.8*0 = 0
+  -- By Lemma C + D, the unique minimizer is a=0, b=1
   have h_opt_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-    -- This follows from:
-    -- 1. model_raw is Bayes-optimal among raw models (h_opt_raw)
-    -- 2. The unique minimizer of E[(Y-(a+bP))²] under independence has b=1, a=0
-    -- 3. Normal equations: b = Cov(Y,P)/Var(P), a = E[Y] - b*E[P]
-    --
-    -- Key calculation using independence (h_indep):
-    --   Cov(Y,P) = E[YP] - E[Y]E[P]
-    --            = E[(P - 0.8C)P] - 0
-    --            = E[P²] - 0.8*E[CP]
-    --            = E[P²] - 0.8*E[C]*E[P]  (by independence)
-    --            = 1 - 0.8*0*0 = 1
-    --   Var(P) = E[P²] - E[P]² = 1 - 0 = 1
-    --   Therefore b = 1/1 = 1
-    --   And a = E[Y] - 1*E[P] = E[P] - 0.8*E[C] - E[P] = 0
+    -- h_opt_raw says model_raw minimizes E[(Y - Ŷ)²] over all models
+    -- Lemma C gives the closed form: a² + (1-b)² + const
+    -- Lemma D says minimum is at a=0, b=1
+    -- Since model_raw is optimal, its coefficients must be 0 and 1
     sorry
 
   rw [h_opt_coeffs.1, h_opt_coeffs.2]
