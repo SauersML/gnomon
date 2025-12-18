@@ -115,8 +115,7 @@ jobs:
           echo "📦 Cache miss - updating dependencies..."
           # lake update  <-- REMOVED: Do not update dependencies, use the lockfile!
           
-          echo "⬇️ Fetching dependencies first..."
-          lake build --no-build
+
           
           echo "📥 Downloading mathlib cache..."
           # The '|| true' is REMOVED. We MUST succeed in getting the cache
