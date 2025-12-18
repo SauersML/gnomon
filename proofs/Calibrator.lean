@@ -563,24 +563,24 @@ lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
 
-    Block structure (columns):
-    1. Intercept (1 column): constant 1
-    2. PGS main effects (p columns): B_m(pgs) for m = 1..p
-    3. PC smooth main effects (k*sp columns): for each PC l, sp spline basis values
-    4. PGS×PC interactions (p*k*sp columns): for each PGS basis m and PC l, sp spline values
+    Block structure (columns indexed by ParamIx):
+    - intercept: constant 1
+    - pgsCoeff m: B_{m+1}(pgs_i)
+    - pcSpline l j: splineBasis.B[j](c_i[l])
+    - interaction m l j: B_{m+1}(pgs_i) * splineBasis.B[j](c_i[l])
 
-    Constructed via `Matrix.of` as recommended by mathlib. -/
+    Uses ParamIx.fromFin for clean column dispatch. -/
 noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
     [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hp : p > 0) (hk : k > 0) (hsp : sp > 0) : Matrix (Fin n) (Fin (total_params p k sp)) ℝ :=
   Matrix.of fun i j =>
-    -- Index j maps to columns:
-    -- j = 0: intercept (constant 1)
-    -- j ∈ [1, p]: PGS basis B[j](pgs_i)
-    -- j ∈ [p+1, p+k*sp]: PC spline s[j'](c_i[l])
-    -- j ∈ [p+k*sp+1, end]: interaction B[m](pgs) * s[j'](c_i[l])
-    sorry
+    -- Use ParamIx for clean column dispatch
+    match ParamIx.fromFin hp hk hsp j with
+    | .intercept => 1
+    | .pgsCoeff m => pgsBasis.B ⟨m.val + 1, by omega⟩ (data.p i)
+    | .pcSpline l s => splineBasis.b s (data.c i l)
+    | .interaction m l s => pgsBasis.B ⟨m.val + 1, by omega⟩ (data.p i) * splineBasis.b s (data.c i l)
 
 /-- **Key Lemma**: Linear predictor equals design matrix times parameter vector.
     This is the bridge between the GAM structure and linear algebra. -/
