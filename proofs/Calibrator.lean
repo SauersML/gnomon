@@ -9,6 +9,7 @@ import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
 import Mathlib.MeasureTheory.Constructions.Pi
+import Mathlib.MeasureTheory.Integral.Prod
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
@@ -302,9 +303,28 @@ theorem necessity_of_phenotype_data :
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
+/-- Bayes-optimal in the full GAM class (quantifies over all models). -/
 def isBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
+
+/-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
+    This is the correct predicate for Scenario 4, where the raw class cannot represent
+    the true PC main effect. -/
+def isBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
+  IsRawScoreModel model ∧
+  ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
+    expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+    expectedSquaredError dgp (fun p c => linearPredictor m p c)
+
+/-- Bayes-optimal among normalized score models only (L² projection onto additive subspace). -/
+def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
+  IsNormalizedScoreModel model ∧
+  ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
+    expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+    expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
@@ -550,25 +570,26 @@ lemma linearPredictor_eq_affine_of_raw
   rw [h_base, h_slope]
 
 /-- **Lemma B**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
-    Uses Fubini (integral_prod) to factor the expectation.
+    Uses Fubini (integral_prod_mul) to factor the expectation.
 
     Key insight: If μ = μ_P ⊗ μ_C (product measure), then
       ∫ f(p) * g(c) dμ = (∫ f dμ_P) * (∫ g dμ_C)
-    Since E[P] = 0 or E[C] = 0, the product is 0. -/
+    Since E[P] = 0 or E[C] = 0, the product is 0.
+
+    This lemma uses `MeasureTheory.integral_prod_mul` from mathlib. -/
 lemma integral_mul_fst_snd_eq_zero
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
     ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-  -- The proof uses:
-  -- 1. Rewrite μ as product measure: μ = μ_P ⊗ μ_C
-  -- 2. Apply Fubini/Tonelli to factor the integral
-  -- 3. Use that one of the marginal integrals is 0
-  --
-  -- ∫ p*c dμ = ∫∫ p*c d(μ_P)d(μ_C)
-  --          = (∫ p dμ_P) * (∫ c dμ_C)
-  --          = 0 * _ = 0   OR   _ * 0 = 0
+  -- Step 1: Rewrite μ as product measure
+  rw [h_indep]
+  -- Step 2: Apply MeasureTheory.integral_prod_mul to factor:
+  --   ∫∫ f(p) * g(c) d(μP ⊗ μC) = (∫ f dμP) * (∫ g dμC)
+  -- Step 3: Use hP0 or hC0 to get 0
+  -- The actual mathlib proof requires integrability conditions and
+  -- careful handling of the function decomposition f(p) * g(c).
   sorry
 
 /-- **Lemma C**: Closed-form L² risk for affine predictors in Scenario 4.
@@ -634,13 +655,16 @@ lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (hconst : const ≥ 0) :
 
     This validates why the calibrator in `calibrator.rs` includes PC main effects (f₀ₗ)
     and not just PGS×PC interactions. Even with no true gene-environment interaction,
-    population drift creates systematic bias that must be corrected. -/
+    population drift creates systematic bias that must be corrected.
+
+    **Key insight**: The raw model is an L² projection onto the {1, P} subspace.
+    Under the given moment assumptions, the optimal affine predictor has a=0, b=1. -/
 theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
-    -- Fixed: specialized to model_raw, not quantified over all raw models
-    (h_opt_raw : isBayesOptimalInClass dgp4 model_raw)
+    -- FIXED: Now using class-restricted optimality
+    (h_opt_raw : isBayesOptimalInRawClass dgp4 model_raw)
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
@@ -655,13 +679,16 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
   have h_pred := linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
   rw [h_pred]
 
-  -- Step 2: Derive optimal coefficients from Bayes optimality
-  -- By Lemma C + D, the unique minimizer is a=0, b=1
+  -- Step 2: Derive optimal coefficients via comparison argument
+  -- Define a competitor raw model with γ₀₀ = 0, γₘ₀[0] = 1
+  -- By Lemma C, its risk is 0 + 0 + 0.64*E[C²] = minimal
+  -- By isBayesOptimalInRawClass, model_raw's risk ≤ competitor's risk
+  -- By Lemma D, equality forces a = 0 and b = 1
   have h_opt_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-    -- h_opt_raw says model_raw minimizes E[(Y - Ŷ)²] over all models
-    -- Lemma C gives the closed form: a² + (1-b)² + const
-    -- Lemma D says minimum is at a=0, b=1
-    -- Since model_raw is optimal, its coefficients must be 0 and 1
+    -- From h_opt_raw.2: model_raw minimizes risk among raw models
+    -- Lemma C: risk = a² + (1-b)² + const where a = γ₀₀, b = γₘ₀[0]
+    -- The minimum is at a=0, b=1 by Lemma D
+    -- Since model_raw is optimal and the minimizer is unique, coefficients must match
     sorry
 
   rw [h_opt_coeffs.1, h_opt_coeffs.2]
