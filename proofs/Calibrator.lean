@@ -1,7 +1,11 @@
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
-import Mathlib.Analysis.InnerProductSpace.Projection
+import Mathlib.Analysis.InnerProductSpace.Projection.Basic
+import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
+import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
+import Mathlib.Analysis.InnerProductSpace.Projection.Reflection
+import Mathlib.Analysis.InnerProductSpace.Projection.Submodule
 import Mathlib.Analysis.SpecialFunctions.Log.Basic
 import Mathlib.Data.Fin.Basic
 import Mathlib.LinearAlgebra.Matrix.Rank
@@ -106,16 +110,12 @@ noncomputable def predictorBase {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)
     For a p=1 model with linear PGS basis: slope(c) = γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) -/
 noncomputable def predictorSlope {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
-  model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (pc_val l)
+  model.γₘ₀ 0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ 0 l) (pc_val l)
 
 /-- Helper: sum over Fin 1 collapses to the single term. -/
 lemma Fin1_sum_eq {α : Type*} [AddCommMonoid α] (f : Fin 1 → α) :
-    ∑ m : Fin 1, f m = f ⟨0, by norm_num⟩ := by
-  have h : Finset.univ = ({⟨0, by norm_num⟩} : Finset (Fin 1)) := by
-    ext x
-    simp only [Finset.mem_univ, Finset.mem_singleton, true_iff]
-    exact Fin.ext_iff.mpr (Nat.lt_one_iff.mp x.isLt)
-  rw [h, Finset.sum_singleton]
+    ∑ m : Fin 1, f m = f 0 := by
+  simp
 
 /-- **Predictor Decomposition Lemma**: For a p=1 model with linear PGS basis (B[1] = id),
     the linear predictor decomposes as: linearPredictor(p, c) = base(c) + slope(c) * p.
@@ -129,39 +129,31 @@ theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
   classical
   intro pgs_val pc_val
-  -- Expand everything so we can rewrite the Fin 1 sum
   unfold linearPredictor predictorBase predictorSlope
-
-  -- Collapse the sum over m : Fin 1 using Fin1_sum_eq
+  -- Expand the `let`s and rewrite the `Fin 1` sum to the single `m = 0` term.
+  dsimp
   have hsum :
       (∑ m : Fin 1,
-        (let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+          let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+          let pgs_coeff :=
+            model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
+          pgs_coeff * pgs_basis_val) =
+        (let m0 : Fin 1 := 0
+         let pgs_basis_val := model.pgsBasis.B ⟨m0.val + 1, by linarith [m0.isLt]⟩ pgs_val
          let pgs_coeff :=
-           model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
-         pgs_coeff * pgs_basis_val))
-    =
-      (let m0 : Fin 1 := ⟨0, by norm_num⟩
-       (let pgs_basis_val := model.pgsBasis.B ⟨m0.val + 1, by linarith [m0.isLt]⟩ pgs_val
-        let pgs_coeff :=
-          model.γₘ₀ m0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m0 l) (pc_val l)
-        pgs_coeff * pgs_basis_val)) := by
-    simpa using
-      (Fin1_sum_eq (f := fun m : Fin 1 =>
-        (let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
-         let pgs_coeff :=
-           model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
-         pgs_coeff * pgs_basis_val)))
-
-  -- Apply the collapse
+           model.γₘ₀ m0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m0 l) (pc_val l)
+         pgs_coeff * pgs_basis_val) := by
+    simp
   rw [hsum]
-
-  -- Now we have the single m0 term. Use h_linear_basis.
-  -- Fix Fin 2 index proof mismatch via Fin.ext
-  have hidx : (⟨(0 : Nat) + 1, by norm_num⟩ : Fin 2) = ⟨1, by norm_num⟩ := by
-    ext; simp
-
-  -- simp reduces m0.val to 0, turns B⟨0+1,_⟩ into B⟨1,_⟩, applies h_linear_basis
-  simp only [h_linear_basis, hidx, id_eq]
+  -- Simplify the remaining `let`s, then use the linear-basis hypothesis to rewrite the basis evaluation.
+  dsimp
+  have hB : model.pgsBasis.B (1 : Fin 2) pgs_val = pgs_val := by
+    have hidx1 : (1 : Fin 2) = ⟨1, by norm_num⟩ := by
+      ext; simp
+    rw [hidx1, h_linear_basis]
+    rfl
+  -- Replace `B[1] p` by `p`; the remaining goal is definitional.
+  rw [hB]
 
 
 noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
@@ -380,15 +372,15 @@ This gives orthogonality of residual FOR FREE via mathlib's
 abbrev L2Space (μ : Measure (ℝ × (Fin 1 → ℝ))) := Lp ℝ 2 μ
 
 /-- Feature function: constant 1 (for intercept). -/
-def featureOne (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+def featureOne (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
   fun _ => 1
 
 /-- Feature function: P (the PGS value). -/
-def featureP (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+def featureP (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
   fun pc => pc.1
 
 /-- Feature function: C (the first PC value). -/
-def featureC (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+def featureC (_μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
   fun pc => pc.2 ⟨0, by norm_num⟩
 
 /-- **Helper Lemma**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
@@ -504,10 +496,10 @@ theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
-  intros m h_opt
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
+  intros m _h_opt
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m h_opt
+  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m _h_opt
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -806,7 +798,7 @@ lemma linearPredictor_eq_affine_of_raw
     (h_raw : IsRawScoreModel model_raw)
     (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
     ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * p := by
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
   intros p_val c_val
 
   -- Step 1: Use linearPredictor_decomp to get base + slope * p form
@@ -824,14 +816,14 @@ lemma linearPredictor_eq_affine_of_raw
     simp only [h_f0l_zero, Finset.sum_const_zero, add_zero]
 
   -- Step 3: Show slope reduces to γₘ₀[0] for raw model
-  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ ⟨0, by norm_num⟩ := by
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
     unfold predictorSlope
     -- All fₘₗ terms are zero for raw model
-    have h_fml_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ ⟨0, by norm_num⟩ l) (c_val l) = 0 := by
+    have h_fml_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ 0 l) (c_val l) = 0 := by
       intro l
       unfold evalSmooth
-      simp only [h_raw.2 ⟨0, by norm_num⟩ l, zero_mul, Finset.sum_const_zero]
-    simp only [h_fml_zero, Finset.sum_const_zero, add_zero]
+      simp only [h_raw.2 0 l, zero_mul, Finset.sum_const_zero]
+    simp [h_fml_zero]
 
   rw [h_base, h_slope]
 
@@ -876,7 +868,7 @@ lemma risk_affine_scenario4
 
 /-- **Lemma D**: Uniqueness of minimizer for Scenario 4 risk.
     The affine risk a² + (1-b)² + const is uniquely minimized at a=0, b=1. -/
-lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (hconst : const ≥ 0) :
+lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
     a^2 + (1 - b)^2 + const ≥ const ∧
     (a^2 + (1 - b)^2 + const = const ↔ a = 0 ∧ b = 1) := by
   constructor
@@ -1195,6 +1187,8 @@ theorem constraint_projection_correctness
   -- (BZ)ᵀ W C = Zᵀ Bᵀ W C = Zᵀ (Bᵀ W C) = 0 by nullspace definition
   sorry
 
+omit [Fintype (Fin n)] [Fintype (Fin k)] [DecidableEq (Fin n)] [DecidableEq (Fin m)]
+    [DecidableEq (Fin k)] in
 /-- The constrained basis preserves the column space spanned by valid coefficients. -/
 theorem constrained_basis_spans_subspace
     (B : Matrix (Fin n) (Fin m) ℝ)
@@ -1262,10 +1256,11 @@ theorem reparameterization_equivalence
   -- 2. (Qβ')ᵀS(Qβ') = β'ᵀ(QᵀSQ)β'
   sorry
 
+omit [Fintype (Fin n)] [DecidableEq (Fin n)] in
 /-- The fitted values are invariant under reparameterization. -/
 theorem fitted_values_invariant
     (X : Matrix (Fin n) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
-    (β : Fin p → ℝ) (h_orth : IsOrthogonal Q)
+    (β : Fin p → ℝ) (_h_orth : IsOrthogonal Q)
     (β' : Fin p → ℝ) (h_relation : β = Q.mulVec β') :
     X.mulVec β = (X * Q).mulVec β' := by
   rw [h_relation]
@@ -1306,4 +1301,3 @@ theorem optimal_solution_transforms
 end WoodReparameterization
 
 end Calibrator
-
