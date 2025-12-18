@@ -623,13 +623,20 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   -- The rest requires careful sum manipulation
   sorry
 
-/-- Full column rank implies X.mulVec is injective. -/
+/-- Full column rank implies X.mulVec is injective.
+    Uses: rank X = d ⟹ ker(mulVecLin X) = ⊥ ⟹ X.mulVec is injective.
+
+    Key mathlib lemmas:
+    - Matrix.rank_eq_card_iff_injective or Matrix.ker_mulVecLin_eq_bot_iff -/
 lemma mulVec_injective_of_full_rank {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
     (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
     Function.Injective X.mulVec := by
-  -- rank X = d means the column space has dimension d
-  -- which is the full column count, so columns are linearly independent
+  -- rank X = d means dim(column space) = d
+  -- which equals the number of columns, so ker(X.mulVec) = {0}
   -- hence X.mulVec is injective
+  --
+  -- In mathlib: use `Matrix.mulVecLin` and show its kernel is trivial
+  -- Then injectivity follows from LinearMap.ker_eq_bot_of_injective
   sorry
 
 /-- Dot product of two vectors represented as Fin d → ℝ. -/
@@ -637,12 +644,27 @@ def dotProduct' {d : ℕ} [Fintype (Fin d)] (u v : Fin d → ℝ) : ℝ :=
   Finset.univ.sum (fun i => u i * v i)
 
 /-- XᵀX is positive definite when X has full column rank.
-    This is the algebraic foundation for uniqueness of least squares. -/
+    This is the algebraic foundation for uniqueness of least squares.
+
+    Key mathlib lemma:
+    - Matrix.posDef_conjTranspose_mul_self_iff_injective
+    Over ℝ, conjTranspose = transpose, so this gives exactly what we need.
+
+    Alternatively, direct proof:
+    vᵀ(XᵀX)v = (Xv)ᵀ(Xv) = ‖Xv‖² > 0 when v ≠ 0 and X injective. -/
 lemma transpose_mul_self_posDef {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)] [DecidableEq (Fin d)]
     (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
     ∀ v : Fin d → ℝ, v ≠ 0 → 0 < dotProduct' ((Matrix.transpose X * X).mulVec v) v := by
-  -- Uses the fact that Aᴴ*A is PosDef iff A.mulVec is injective
-  -- (over ℝ, conjTranspose = transpose)
+  intro v hv
+  -- vᵀ(XᵀX)v = vᵀXᵀXv = (Xv)ᵀ(Xv) = ‖Xv‖²
+  -- Since X has full rank, X.mulVec is injective
+  -- So v ≠ 0 ⟹ Xv ≠ 0 ⟹ ‖Xv‖² > 0
+  have h_inj := mulVec_injective_of_full_rank X h_rank
+  have h_Xv_ne : X.mulVec v ≠ 0 := by
+    intro h_eq
+    apply hv
+    exact h_inj (h_eq.trans (X.mulVec_zero).symm)
+  -- Now show dotProduct' (XᵀX).mulVec v v = ‖Xv‖² > 0
   sorry
 
 /-- The penalized Gaussian loss as a quadratic function of parameters. -/
