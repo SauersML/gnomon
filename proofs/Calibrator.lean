@@ -87,6 +87,43 @@ noncomputable def linearPredictor {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin
     pgs_coeff * pgs_basis_val
   baseline_effect + pgs_related_effects
 
+/-! ### Predictor Decomposition for p=1 Models
+
+For models with a single PGS basis function (p=1), we can decompose the linear predictor
+into `base(c) + slope(c) * p`, which is the natural form for L² projection / normal equations.
+This decomposition is the gateway to proving shrinkage_effect and raw_score_bias theorems. -/
+
+/-- The intercept term of the predictor (not multiplied by p).
+    For a p=1 model: base(c) = γ₀₀ + Σₗ evalSmooth(f₀ₗ[l], c[l]) -/
+noncomputable def predictorBase {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
+  model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (pc_val l)
+
+/-- The slope coefficient in front of p.
+    For a p=1 model with linear PGS basis: slope(c) = γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) -/
+noncomputable def predictorSlope {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
+  model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (pc_val l)
+
+/-- **Predictor Decomposition Lemma**: For a p=1 model with linear PGS basis (B[1] = id),
+    the linear predictor decomposes as: linearPredictor(p, c) = base(c) + slope(c) * p.
+
+    This is the key lemma that reduces the GAM structure to a 2-parameter linear form in p,
+    enabling L² projection / normal equations analysis. -/
+theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp)
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
+  ∀ pgs_val pc_val, linearPredictor model pgs_val pc_val =
+    predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
+  intros pgs_val pc_val
+  unfold linearPredictor predictorBase predictorSlope
+  -- For p=1: the sum over m has a single term (m=0)
+  -- Apply h_linear_basis: B[1](pgs) = pgs
+  -- Then ring to finish the algebraic manipulation
+  sorry
+
+
+
 noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
   let η := linearPredictor model pgs_val pc_val
   match model.link with
