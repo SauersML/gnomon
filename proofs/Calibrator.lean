@@ -125,13 +125,41 @@ theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
   ∀ pgs_val pc_val, linearPredictor model pgs_val pc_val =
     predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
-  intros pgs_val pc_val
+  classical
+  intro pgs_val pc_val
+  -- Expand everything so we can rewrite the Fin 1 sum
   unfold linearPredictor predictorBase predictorSlope
-  -- The proof follows from:
-  -- 1. Sum over Fin 1 collapses: Σ m : Fin 1, F(m) = F(0)
-  -- 2. h_linear_basis: B[1](pgs) = id(pgs) = pgs
-  -- 3. Ring algebra to rearrange terms
-  sorry
+
+  -- Collapse the sum over m : Fin 1 using Fin1_sum_eq
+  have hsum :
+      (∑ m : Fin 1,
+        (let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+         let pgs_coeff :=
+           model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
+         pgs_coeff * pgs_basis_val))
+    =
+      (let m0 : Fin 1 := ⟨0, by norm_num⟩
+       (let pgs_basis_val := model.pgsBasis.B ⟨m0.val + 1, by linarith [m0.isLt]⟩ pgs_val
+        let pgs_coeff :=
+          model.γₘ₀ m0 + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m0 l) (pc_val l)
+        pgs_coeff * pgs_basis_val)) := by
+    simpa using
+      (Fin1_sum_eq (f := fun m : Fin 1 =>
+        (let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ pgs_val
+         let pgs_coeff :=
+           model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (pc_val l)
+         pgs_coeff * pgs_basis_val)))
+
+  -- Apply the collapse
+  rw [hsum]
+
+  -- Now we have the single m0 term. Use h_linear_basis.
+  -- Fix Fin 2 index proof mismatch via Fin.ext
+  have hidx : (⟨(0 : Nat) + 1, by norm_num⟩ : Fin 2) = ⟨1, by norm_num⟩ := by
+    ext; simp
+
+  -- simp reduces m0.val to 0, turns B⟨0+1,_⟩ into B⟨1,_⟩, applies h_linear_basis
+  simp only [h_linear_basis, hidx, id_eq]
 
 
 noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
