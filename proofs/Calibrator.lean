@@ -27,6 +27,7 @@ import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
+import Mathlib.Topology.MetricSpace.HausdorffDistance
 
 open MeasureTheory
 
@@ -1030,8 +1031,21 @@ theorem raw_score_bias_general [Fact (p = 1)]
 def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
 notation:50 a " ≈ " b => approxEq a b 0.01
 
-noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
-noncomputable def var {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ := sorry
+noncomputable def var {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k)
+    (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
+  let μ := dgp.jointMeasure
+  let m : ℝ := ∫ pc, f pc.1 pc.2 ∂μ
+  ∫ pc, (f pc.1 pc.2 - m) ^ 2 ∂μ
+
+noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k)
+    (f g : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
+  let μ := dgp.jointMeasure
+  let mf : ℝ := ∫ pc, f pc.1 pc.2 ∂μ
+  let mg : ℝ := ∫ pc, g pc.1 pc.2 ∂μ
+  let vf : ℝ := ∫ pc, (f pc.1 pc.2 - mf) ^ 2 ∂μ
+  let vg : ℝ := ∫ pc, (g pc.1 pc.2 - mg) ^ 2 ∂μ
+  let cov : ℝ := ∫ pc, (f pc.1 pc.2 - mf) * (g pc.1 pc.2 - mg) ∂μ
+  if vf = 0 ∨ vg = 0 then 0 else (cov ^ 2) / (vf * vg)
 
 theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
@@ -1122,7 +1136,8 @@ theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype
   let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
   ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc ≈ predict model' pgs (A.mulVec pc + b) := by sorry
 
-noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ := sorry
+noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
+  Metric.infDist c supp
 
 theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ) :
   ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit p k sp n data lambda) 0 c_new - dgp.trueExpectation 0 c_new| ≤
