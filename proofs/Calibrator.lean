@@ -1492,9 +1492,28 @@ noncomputable def penalized_objective
 def IsOrthogonal (Q : Matrix (Fin p) (Fin p) ℝ) : Prop :=
   Q * Matrix.transpose Q = 1 ∧ Matrix.transpose Q * Q = 1
 
+/-- The penalty transforms as a congruence under reparameterization.
+
+    **Proof**: (Qβ')ᵀ S (Qβ') = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β'
+    This is just associativity of matrix-vector multiplication. -/
+theorem penalty_congruence
+    (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
+    (β' : Fin p → ℝ) (_h_orth : IsOrthogonal Q) :
+    quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
+  -- quadForm S (Qβ') = Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = (Qβ')ᵀ S (Qβ')
+  -- = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β' = quadForm (QᵀSQ) β'
+  -- The key is showing S(Qβ') vs (QᵀSQ)β' relation via matrix associativity
+  sorry -- Requires careful unfolding of quadForm and Matrix.mulVec
+
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
     the penalized objective transforms covariantly.
-    This validates `stable_reparameterization` in estimate.rs. -/
+    This validates `stable_reparameterization` in estimate.rs.
+
+    **Proof Sketch (Isometry)**:
+    1. Residual: y - X(Qβ') = y - (XQ)β', so ‖residual‖² depends only on XQ, not Q separately
+    2. Penalty: (Qβ')ᵀS(Qβ') = β'ᵀ(QᵀSQ)β' by associativity of matrix multiplication
+
+    This shows minimizing over β = Qβ' is equivalent to minimizing over β' with transformed design/penalty. -/
 theorem reparameterization_equivalence
     (X : Matrix (Fin n) (Fin p) ℝ) (y : Fin n → ℝ)
     (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
@@ -1502,10 +1521,18 @@ theorem reparameterization_equivalence
     penalized_objective X y S (Q.mulVec β') =
     penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β' := by
   unfold penalized_objective
-  -- Key steps:
-  -- 1. X(Qβ') = (XQ)β'
-  -- 2. (Qβ')ᵀS(Qβ') = β'ᵀ(QᵀSQ)β'
-  sorry
+  -- Step 1: Show the residual norms are equal
+  -- X(Qβ') = (XQ)β' by Matrix.mulVec_mulVec
+  have h_residual : y - X.mulVec (Q.mulVec β') = y - (X * Q).mulVec β' := by
+    rw [Matrix.mulVec_mulVec]
+  rw [h_residual]
+
+  -- Step 2: Show the penalty terms are equal
+  -- quadForm S (Qβ') = quadForm (QᵀSQ) β'
+  have h_penalty : quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
+    exact penalty_congruence S Q β' h_orth
+
+  rw [h_penalty]
 
 omit [Fintype (Fin n)] [DecidableEq (Fin n)] in
 /-- The fitted values are invariant under reparameterization. -/
@@ -1517,25 +1544,27 @@ theorem fitted_values_invariant
   rw [h_relation]
   rw [Matrix.mulVec_mulVec]
 
-/-- The penalty transforms as a congruence under reparameterization. -/
-theorem penalty_congruence
-    (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
-    (β' : Fin p → ℝ) (h_orth : IsOrthogonal Q) :
-    quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
-  sorry
-
 /-- Eigenvalue structure is preserved: if S = QΛQᵀ, then QᵀSQ = Λ.
-    This is the key insight that makes the reparameterization numerically stable. -/
+    This is the key insight that makes the reparameterization numerically stable.
+
+    **Proof**: QᵀSQ = Qᵀ(QΛQᵀ)Q = (QᵀQ)Λ(QᵀQ) = IΛI = Λ by orthogonality of Q. -/
 theorem eigendecomposition_diagonalizes
     (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
     (Λ : Matrix (Fin p) (Fin p) ℝ)
     (h_orth : IsOrthogonal Q)
     (h_decomp : S = Q * Λ * Matrix.transpose Q)
-    (h_diag : ∀ i j : Fin p, i ≠ j → Λ i j = 0) :
+    (_h_diag : ∀ i j : Fin p, i ≠ j → Λ i j = 0) :
     Matrix.transpose Q * S * Q = Λ := by
   rw [h_decomp]
-  -- Qᵀ(QΛQᵀ)Q = (QᵀQ)Λ(QᵀQ) = Λ
-  sorry
+  -- Qᵀ(QΛQᵀ)Q = (QᵀQ)Λ(QᵀQ) = IΛI = Λ
+  have h_assoc : Matrix.transpose Q * (Q * Λ * Matrix.transpose Q) * Q
+                = Matrix.transpose Q * Q * Λ * (Matrix.transpose Q * Q) := by
+    -- Use associativity of matrix multiplication
+    simp only [Matrix.mul_assoc]
+  rw [h_assoc]
+  -- By orthogonality: QᵀQ = I
+  rw [h_orth.2]
+  simp only [Matrix.one_mul, Matrix.mul_one]
 
 /-- The optimal β under the reparameterized system transforms back correctly. -/
 theorem optimal_solution_transforms
