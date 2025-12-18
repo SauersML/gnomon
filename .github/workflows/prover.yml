@@ -33,6 +33,12 @@ jobs:
           curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
           echo "$HOME/.elan/bin" >> $GITHUB_PATH
           
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+          
       - name: Cache Lean toolchain
         uses: actions/cache@v4
         with:
@@ -45,23 +51,15 @@ jobs:
         with:
           path: |
             .lake
-            lake-manifest.json
-          key: ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-v3
+          key: ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
           restore-keys: |
-            ${{ runner.os }}-lake-complete-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}-
-            ${{ runner.os }}-lake-complete-
+            ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
+            ${{ runner.os }}-lake-v5-
             
       - name: Verify cache completeness
         id: check-cache
         run: |
           echo "🔍 Checking cache completeness..."
-          
-          # Check if lake manifest exists
-          if [ ! -f "lake-manifest.json" ]; then
-            echo "valid=false" >> $GITHUB_OUTPUT
-            echo "❌ No lake-manifest.json found"
-            exit 0
-          fi
           
           # Check if .lake directory exists
           if [ ! -d ".lake" ]; then
