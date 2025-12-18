@@ -583,7 +583,15 @@ noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin 
     | .interaction m l s => pgsBasis.B ⟨m.val + 1, by omega⟩ (data.p i) * splineBasis.b s (data.c i l)
 
 /-- **Key Lemma**: Linear predictor equals design matrix times parameter vector.
-    This is the bridge between the GAM structure and linear algebra. -/
+    This is the bridge between the GAM structure and linear algebra.
+
+    Proof strategy: Both sides compute the same sum over parameter blocks:
+    - γ₀₀ * 1 (intercept)
+    - Σ_m γₘ₀ * B_{m+1}(pgs) (PGS main effects)
+    - Σ_l Σ_j f₀ₗ[l,j] * spline_j(c[l]) (PC main effects)
+    - Σ_m Σ_l Σ_j fₘₗ[m,l,j] * B_{m+1}(pgs) * spline_j(c[l]) (interactions)
+
+    The key is that packParams and designMatrix are defined consistently via ParamIx. -/
 lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
     [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
@@ -592,7 +600,27 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
     ∀ i : Fin n, linearPredictor m (data.p i) (data.c i) =
       (designMatrix data pgsBasis splineBasis hp hk hsp).mulVec (packParams m) i := by
   intro i
-  -- Expand linearPredictor and designMatrix, show they compute the same value
+  -- LHS: linearPredictor m (data.p i) (data.c i)
+  -- = γ₀₀ * B₀(pgs) + Σ_m (γₘ₀ + smooth_m(c)) * B_{m+1}(pgs)
+  -- = γ₀₀ + Σ_m γₘ₀ * B_{m+1}(pgs) + Σ_m Σ_l evalSmooth(fₘₗ, c[l]) * B_{m+1}(pgs)
+  --
+  -- RHS: (X * β)[i] = Σ_j X[i,j] * β[j]
+  -- By ParamIx structure, this splits into four blocks matching above.
+  --
+  -- The proof requires:
+  -- 1. Unfold definitions of linearPredictor, designMatrix, packParams
+  -- 2. Use hm to substitute the model's bases with the given bases
+  -- 3. Show the sums match by regrouping
+
+  -- Step 1: Substitute model bases using hm
+  have h_pgs := hm.basis_match
+  have h_spline := hm.spline_match
+
+  -- Step 2: Unfold and compute
+  unfold Matrix.mulVec designMatrix packParams
+  simp only [Matrix.of_apply]
+
+  -- The rest requires careful sum manipulation
   sorry
 
 /-- Full column rank implies X.mulVec is injective. -/
