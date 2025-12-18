@@ -610,20 +610,62 @@ lemma rawOptimal_implies_orthogonality
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
     -- Orthogonality with P:
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  -- The variational characterization: optimality ⟹ orthogonality
-  -- For any affine perturbation δa + δb·P, the derivative of the loss at (a, b)
-  -- in directions (1, 0) and (0, P) must be zero.
+
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  set μ := dgp.jointMeasure with hμ_def
+  set Y := dgp.trueExpectation with hY_def
+
+  -- The residual function
+  set residual : ℝ × (Fin 1 → ℝ) → ℝ := fun pc => Y pc.1 pc.2 - (a + b * pc.1) with hres_def
+
+  -- **Proof Strategy**:
+  -- By h_opt, model minimizes expectedSquaredError over all raw models.
+  -- We construct competitor models with perturbed intercept (a + ε) and slope (b + ε)
+  -- and show that the optimality condition forces the orthogonality.
+
+  -- **Claim 1**: E[residual · 1] = 0
+  -- Consider the competitor model with intercept (a + ε) for small ε.
+  -- The competitor's squared error is:
+  --   L(ε) = E[(Y - ((a + ε) + b*P))²]
+  --        = E[(Y - a - b*P - ε)²]
+  --        = E[(residual - ε)²]
+  --        = E[residual²] - 2ε·E[residual] + ε²
   --
-  -- This is equivalent to the normal equations:
-  --   ⟨residual, 1⟩ = 0  and  ⟨residual, P⟩ = 0
+  -- Since L(0) ≤ L(ε) for all ε (optimality), L'(0) = 0.
+  -- L'(ε) = -2·E[residual] + 2ε
+  -- L'(0) = -2·E[residual] = 0
+  -- Therefore E[residual] = 0, i.e., E[residual · 1] = 0.
+
+  -- **Claim 2**: E[residual · P] = 0
+  -- Consider the competitor model with slope (b + ε).
+  -- The competitor's squared error is:
+  --   L(ε) = E[(Y - (a + (b + ε)*P))²]
+  --        = E[(Y - a - b*P - ε*P)²]
+  --        = E[(residual - ε*P)²]
+  --        = E[residual²] - 2ε·E[residual·P] + ε²·E[P²]
   --
-  -- The proof would expand isBayesOptimalInRawClass to get:
-  --   ∀ model' in raw class, E[(Y - pred(model))²] ≤ E[(Y - pred(model'))²]
-  -- Then construct competitor models with (a + ε, b) and (a, b + ε) and
-  -- take the derivative at ε = 0.
-  --
-  -- Technical requirements: integrability of Y, P, Y·P, etc.
-  sorry
+  -- Since L(0) ≤ L(ε) for all ε (optimality), L'(0) = 0.
+  -- L'(ε) = -2·E[residual·P] + 2ε·E[P²]
+  -- L'(0) = -2·E[residual·P] = 0
+  -- Therefore E[residual · P] = 0.
+
+  -- The formal proof requires constructing the competitor models and using
+  -- h_opt.2 to get the inequality, then taking the limit as ε → 0.
+  -- This involves Calculus (derivatives of integrals) or the algebraic
+  -- manipulation shown above.
+
+  constructor
+  · -- Orthogonality with 1
+    -- We need: ∫ pc, residual pc ∂μ = 0
+    -- By the variational argument above, this follows from the fact that
+    -- perturbing the intercept a → a + ε increases the loss unless E[residual] = 0.
+    sorry
+  · -- Orthogonality with P
+    -- We need: ∫ pc, residual pc * pc.1 ∂μ = 0
+    -- By the variational argument above, this follows from the fact that
+    -- perturbing the slope b → b + ε increases the loss unless E[residual·P] = 0.
+    sorry
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
