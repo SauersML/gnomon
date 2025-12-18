@@ -106,6 +106,15 @@ noncomputable def predictorSlope {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp
     (model : PhenotypeInformedGAM 1 k sp) (pc_val : Fin k → ℝ) : ℝ :=
   model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (pc_val l)
 
+/-- Helper: sum over Fin 1 collapses to the single term. -/
+lemma Fin1_sum_eq {α : Type*} [AddCommMonoid α] (f : Fin 1 → α) :
+    ∑ m : Fin 1, f m = f ⟨0, by norm_num⟩ := by
+  have h : Finset.univ = ({⟨0, by norm_num⟩} : Finset (Fin 1)) := by
+    ext x
+    simp only [Finset.mem_univ, Finset.mem_singleton, true_iff]
+    exact Fin.ext_iff.mpr (Nat.lt_one_iff.mp x.isLt)
+  rw [h, Finset.sum_singleton]
+
 /-- **Predictor Decomposition Lemma**: For a p=1 model with linear PGS basis (B[1] = id),
     the linear predictor decomposes as: linearPredictor(p, c) = base(c) + slope(c) * p.
 
@@ -118,11 +127,11 @@ theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
   intros pgs_val pc_val
   unfold linearPredictor predictorBase predictorSlope
-  -- For p=1: the sum over m has a single term (m=0)
-  -- Apply h_linear_basis: B[1](pgs) = pgs
-  -- Then ring to finish the algebraic manipulation
+  -- The proof follows from:
+  -- 1. Sum over Fin 1 collapses: Σ m : Fin 1, F(m) = F(0)
+  -- 2. h_linear_basis: B[1](pgs) = id(pgs) = pgs
+  -- 3. Ring algebra to rearrange terms
   sorry
-
 
 
 noncomputable def predict {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (model : PhenotypeInformedGAM p k sp) (pgs_val : ℝ) (pc_val : Fin k → ℝ) : ℝ :=
