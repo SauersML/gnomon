@@ -536,57 +536,66 @@ impl HweScaler {
         let start = variant_range.start;
         let end = variant_range.end;
         let freqs = &self.frequencies[start..end];
-        let filled = freqs.len();
-
-        debug_assert_eq!(filled, block.ncols());
-        debug_assert_eq!(filled, presence_out.ncols());
-        debug_assert_eq!(block.nrows(), presence_out.nrows());
-
         let scales = &self.scales[start..end];
-        debug_assert_eq!(filled, scales.len());
+        standardize_block_with_mask_from_stats(block, presence_out, freqs, scales, par);
+    }
+}
 
-        let mut block = block.subcols_mut(0, filled);
-        let mut presence_out = presence_out.subcols_mut(0, filled);
+fn standardize_block_with_mask_from_stats(
+    block: MatMut<'_, f64>,
+    presence_out: MatMut<'_, f64>,
+    freqs: &[f64],
+    scales: &[f64],
+    par: Par,
+) {
+    let filled = freqs.len();
 
-        let apply_standardization =
-            |column: ColMut<'_, f64>, presence_col: ColMut<'_, f64>, mean: f64, inv: f64| {
-                let contiguous_values = column
-                    .try_as_col_major_mut()
-                    .expect("projection block column must be contiguous");
-                let contiguous_mask = presence_col
-                    .try_as_col_major_mut()
-                    .expect("projection mask column must be contiguous");
-                let values = contiguous_values.as_slice_mut();
-                let mask = contiguous_mask.as_slice_mut();
-                standardize_column_with_mask(values, mask, mean, inv);
-            };
+    debug_assert_eq!(filled, block.ncols());
+    debug_assert_eq!(filled, presence_out.ncols());
+    debug_assert_eq!(block.nrows(), presence_out.nrows());
+    debug_assert_eq!(filled, scales.len());
 
-        let use_parallel = filled >= 32 && par.degree() > 1;
+    let mut block = block.subcols_mut(0, filled);
+    let mut presence_out = presence_out.subcols_mut(0, filled);
 
-        if use_parallel {
-            presence_out
-                .par_col_iter_mut()
-                .zip(block.par_col_iter_mut())
-                .enumerate()
-                .for_each(|(idx, (presence_col, column))| {
-                    let freq = freqs[idx];
-                    let scale = scales[idx];
-                    let mean = 2.0 * freq;
-                    let denom = scale.max(HWE_SCALE_FLOOR);
-                    let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-                    apply_standardization(column, presence_col, mean, inv);
-                });
-        } else {
-            for idx in 0..filled {
-                let presence_col = presence_out.rb_mut().col_mut(idx);
-                let column = block.rb_mut().col_mut(idx);
+    let apply_standardization =
+        |column: ColMut<'_, f64>, presence_col: ColMut<'_, f64>, mean: f64, inv: f64| {
+            let contiguous_values = column
+                .try_as_col_major_mut()
+                .expect("projection block column must be contiguous");
+            let contiguous_mask = presence_col
+                .try_as_col_major_mut()
+                .expect("projection mask column must be contiguous");
+            let values = contiguous_values.as_slice_mut();
+            let mask = contiguous_mask.as_slice_mut();
+            standardize_column_with_mask(values, mask, mean, inv);
+        };
+
+    let use_parallel = filled >= 32 && par.degree() > 1;
+
+    if use_parallel {
+        presence_out
+            .par_col_iter_mut()
+            .zip(block.par_col_iter_mut())
+            .enumerate()
+            .for_each(|(idx, (presence_col, column))| {
                 let freq = freqs[idx];
                 let scale = scales[idx];
                 let mean = 2.0 * freq;
                 let denom = scale.max(HWE_SCALE_FLOOR);
                 let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
                 apply_standardization(column, presence_col, mean, inv);
-            }
+            });
+    } else {
+        for idx in 0..filled {
+            let presence_col = presence_out.rb_mut().col_mut(idx);
+            let column = block.rb_mut().col_mut(idx);
+            let freq = freqs[idx];
+            let scale = scales[idx];
+            let mean = 2.0 * freq;
+            let denom = scale.max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            apply_standardization(column, presence_col, mean, inv);
         }
     }
 }
@@ -1303,32 +1312,37 @@ impl HwePcaModel {
         } else {
             DEFAULT_BLOCK_WIDTH.max(1)
         };
-        progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
-        let stats_progress =
-            StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
-        let (scaler, observed_variants) = compute_variant_statistics(
-            source,
-            block_capacity,
-            par,
-            stats_progress,
-            n_variants_hint,
-        )?;
+        let ld_hint = if n_variants_hint > 0 {
+            n_variants_hint
+        } else if let Some(keys) = options
+            .ld
+            .as_ref()
+            .and_then(|cfg| cfg.variant_keys.as_ref())
+        {
+            keys.len()
+        } else {
+            0
+        };
 
-        let ld_config = options.resolved_ld(observed_variants)?;
-        let ld_weights = if let Some(ld_cfg) = ld_config {
-            Some(compute_ld_weights(
+        let ld_config = options.resolved_ld(ld_hint)?;
+
+        let (scaler, observed_variants, ld_weights) = if let Some(ld_cfg) = ld_config {
+            compute_stats_and_ld_weights(
                 source,
-                &scaler,
-                observed_variants,
                 block_capacity,
                 ld_cfg,
                 n_variants_hint,
                 progress,
                 par,
-            )?)
+            )
+            .map(|(scaler, observed, weights)| (scaler, observed, Some(weights)))
         } else {
-            None
-        };
+            progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
+            let stats_progress =
+                StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+            compute_variant_statistics(source, block_capacity, par, stats_progress, n_variants_hint)
+                .map(|(scaler, observed)| (scaler, observed, None))
+        }?;
 
         let ld_weights_arc = ld_weights
             .as_ref()
@@ -2604,6 +2618,173 @@ where
     Ok((scaler, processed))
 }
 
+fn compute_stats_and_ld_weights<S, P>(
+    source: &mut S,
+    block_capacity: usize,
+    config: LdResolvedConfig,
+    n_variants_hint: usize,
+    progress: &Arc<P>,
+    par: Par,
+) -> Result<(HweScaler, usize, LdWeights), HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let n_samples = source.n_samples();
+    let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+    let mut presence_storage = vec![0.0f64; n_samples * block_capacity];
+    let window_capacity = config.window_capacity().max(1);
+    let mut ring = LdRingBuffer::new(n_samples, window_capacity);
+    let mut weights: Vec<f64> = Vec::with_capacity(n_variants_hint.max(block_capacity));
+    let mut next_weight = 0usize;
+
+    progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
+    let stats_progress =
+        StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+
+    progress.on_stage_start(FitProgressStage::LdWeights, n_variants_hint);
+    let ld_progress = StageProgressHandle::new(Arc::clone(progress), FitProgressStage::LdWeights);
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    let mut processed = 0usize;
+    let mut used_source_progress = false;
+
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if n_variants_hint > 0 && processed + filled > n_variants_hint {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource returned more variants than reported hint",
+            ));
+        }
+
+        let mut block = MatMut::from_column_major_slice_mut(
+            &mut block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+        let mut presence = MatMut::from_column_major_slice_mut(
+            &mut presence_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+
+        let variant_range = processed..processed + filled;
+        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+
+        let freqs = &stats.frequencies[variant_range.clone()];
+        let scales = &stats.scales[variant_range.clone()];
+        standardize_block_with_mask_from_stats(
+            block.as_mut(),
+            presence.as_mut(),
+            freqs,
+            scales,
+            par,
+        );
+
+        weights.resize(processed + filled, 1.0);
+
+        for (local_idx, (column, present)) in block
+            .as_ref()
+            .col_iter()
+            .zip(presence.as_ref().col_iter())
+            .enumerate()
+        {
+            let slot = ring.push_slot();
+            {
+                let dst_col = ring.values_mut().col_mut(slot);
+                zip!(dst_col, column).for_each(|unzip!(dst, src)| {
+                    *dst = *src;
+                });
+            }
+            {
+                let mask_slice = ring.mask_slice_mut(slot);
+                for (dst, &src) in mask_slice.iter_mut().zip(present.iter()) {
+                    *dst = if src != 0.0 { 1u8 } else { 0u8 };
+                }
+            }
+            ring.indices_mut()[slot] = processed + local_idx;
+            assign_ready_weights(
+                &mut ring,
+                &mut weights,
+                &mut next_weight,
+                &config,
+                &ld_progress,
+                par,
+            )?;
+        }
+
+        processed += filled;
+
+        if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
+            used_source_progress = true;
+            stats_progress.advance_bytes(bytes_read, total_bytes);
+        } else if let Some((work_done, total_work)) = source.progress_variants() {
+            used_source_progress = true;
+            if let Some(total) = total_work {
+                stats_progress.set_total(total);
+            } else if n_variants_hint > 0 {
+                stats_progress.estimate(n_variants_hint);
+            }
+            stats_progress.advance(work_done);
+        } else {
+            stats_progress.advance(processed);
+        }
+    }
+
+    assign_ready_weights(
+        &mut ring,
+        &mut weights,
+        &mut next_weight,
+        &config,
+        &ld_progress,
+        par,
+    )?;
+
+    if processed == 0 {
+        stats_progress.finish();
+        ld_progress.finish();
+        return Err(HwePcaError::InvalidInput(
+            "VariantBlockSource yielded no variants",
+        ));
+    }
+
+    if let Some((_, Some(total))) = source.progress_variants() {
+        stats_progress.set_total(total);
+    } else if !used_source_progress {
+        stats_progress.set_total(processed);
+    }
+
+    stats.finalize();
+    let scaler = stats
+        .into_scaler()
+        .expect("finalized statistics must produce a scaler");
+    stats_progress.finish();
+
+    ld_progress.set_total(processed);
+    ld_progress.finish();
+
+    let weights = LdWeights {
+        weights,
+        window: config.window_capacity().max(1),
+        bp_window: config.bp_window(),
+        ridge: config.ridge,
+    };
+
+    Ok((scaler, processed, weights))
+}
+
 struct LdRingBuffer {
     values: Mat<f64>,
     masks: Vec<u8>,
@@ -2629,12 +2810,12 @@ impl LdRingBuffer {
         self.indices.len()
     }
 
-    fn len(&self) -> usize {
-        self.len
+    fn n_samples(&self) -> usize {
+        self.n_samples
     }
 
-    fn values(&self) -> MatRef<'_, f64> {
-        self.values.as_ref()
+    fn len(&self) -> usize {
+        self.len
     }
 
     fn values_mut(&mut self) -> MatMut<'_, f64> {
@@ -2711,292 +2892,111 @@ impl LdRingBuffer {
             }
         }
     }
-}
 
-struct LdWindowStats {
-    gram: Mat<f64>,
-    counts: Mat<f64>,
-    sums: Mat<f64>,
-    squared_sums: Mat<f64>,
-    len: usize,
-    head: usize,
-    tail: usize,
-    n_samples: usize,
-}
-
-impl LdWindowStats {
-    fn new(n_samples: usize, capacity: usize) -> Self {
-        Self {
-            gram: Mat::zeros(capacity, capacity),
-            counts: Mat::zeros(capacity, capacity),
-            sums: Mat::zeros(capacity, capacity),
-            squared_sums: Mat::zeros(capacity, capacity),
-            len: 0,
-            head: 0,
-            tail: 0,
-            n_samples,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn capacity(&self) -> usize {
-        self.gram.nrows()
-    }
-
-    fn slot_at(&self, offset: usize) -> usize {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            0
-        } else {
-            (self.head + offset) % capacity
-        }
-    }
-
-    fn update_tail(&mut self) {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            self.tail = 0;
-        } else {
-            self.tail = (self.head + self.len) % capacity;
-        }
-    }
-
-    fn zero_slot(&mut self, slot: usize) {
-        let capacity = self.capacity();
-        if capacity == 0 {
-            return;
-        }
-        for idx in 0..capacity {
-            self.gram[(slot, idx)] = 0.0;
-            self.gram[(idx, slot)] = 0.0;
-            self.counts[(slot, idx)] = 0.0;
-            self.counts[(idx, slot)] = 0.0;
-            self.sums[(slot, idx)] = 0.0;
-            self.sums[(idx, slot)] = 0.0;
-            self.squared_sums[(slot, idx)] = 0.0;
-            self.squared_sums[(idx, slot)] = 0.0;
-        }
-    }
-
-    fn add_variant(&mut self, ring: &LdRingBuffer) {
-        let ring_len = ring.len();
-        if ring_len == 0 {
-            return;
-        }
-
-        debug_assert_eq!(ring_len, self.len + 1);
-
-        let new_offset = ring_len - 1;
-        let new_ring_slot = ring.slot_at(new_offset);
-        let new_stats_slot = self.slot_at(new_offset);
-        let values = ring.values().col(new_ring_slot);
-        let mask = ring.mask_slice(new_ring_slot);
-
-        let mut gram_diag = 0.0;
-        let mut count_diag = 0.0;
-        let mut sum_diag = 0.0;
-        let mut sq_diag = 0.0;
-
-        for row in 0..self.n_samples {
-            let value = values[row];
-            let mask_value = f64::from(mask[row]);
-            gram_diag += value * value;
-            count_diag += mask_value;
-            sum_diag += value * mask_value;
-            sq_diag += value * value * mask_value;
-        }
-
-        self.gram[(new_stats_slot, new_stats_slot)] = gram_diag;
-        self.counts[(new_stats_slot, new_stats_slot)] = count_diag;
-        self.sums[(new_stats_slot, new_stats_slot)] = sum_diag;
-        self.squared_sums[(new_stats_slot, new_stats_slot)] = sq_diag;
-
-        for existing in 0..self.len {
-            let existing_ring_slot = ring.slot_at(existing);
-            let existing_stats_slot = self.slot_at(existing);
-            let existing_values = ring.values().col(existing_ring_slot);
-            let existing_mask = ring.mask_slice(existing_ring_slot);
-
-            let mut gram_value = 0.0;
-            let mut count_value = 0.0;
-            let mut sum_row = 0.0;
-            let mut sum_col = 0.0;
-            let mut sq_row = 0.0;
-            let mut sq_col = 0.0;
-
-            for row in 0..self.n_samples {
-                let value_new = values[row];
-                let value_existing = existing_values[row];
-                let mask_new = f64::from(mask[row]);
-                let mask_existing = f64::from(existing_mask[row]);
-
-                gram_value += value_new * value_existing;
-                count_value += mask_new * mask_existing;
-                sum_row += value_new * mask_existing;
-                sum_col += value_existing * mask_new;
-                sq_row += value_new * value_new * mask_existing;
-                sq_col += value_existing * value_existing * mask_new;
-            }
-
-            self.gram[(new_stats_slot, existing_stats_slot)] = gram_value;
-            self.gram[(existing_stats_slot, new_stats_slot)] = gram_value;
-            self.counts[(new_stats_slot, existing_stats_slot)] = count_value;
-            self.counts[(existing_stats_slot, new_stats_slot)] = count_value;
-            self.sums[(new_stats_slot, existing_stats_slot)] = sum_row;
-            self.sums[(existing_stats_slot, new_stats_slot)] = sum_col;
-            self.squared_sums[(new_stats_slot, existing_stats_slot)] = sq_row;
-            self.squared_sums[(existing_stats_slot, new_stats_slot)] = sq_col;
-        }
-
-        self.len += 1;
-        self.update_tail();
-    }
-
-    fn remove_front(&mut self) {
-        if self.len == 0 {
-            return;
-        }
-
-        let capacity = self.capacity();
-        if capacity == 0 {
-            self.len = 0;
-            self.head = 0;
-            self.tail = 0;
-            return;
-        }
-
-        let slot = self.head;
-        self.zero_slot(slot);
-        self.head = (self.head + 1) % capacity;
-        self.len -= 1;
-        self.update_tail();
-    }
-
-    fn truncate_front(&mut self, count: usize) {
-        let to_remove = count.min(self.len);
-        let capacity = self.capacity();
-        if capacity == 0 {
-            self.len = 0;
-            self.head = 0;
-            self.tail = 0;
-            return;
-        }
-
-        for _ in 0..to_remove {
-            let slot = self.head;
-            self.zero_slot(slot);
-            self.head = (self.head + 1) % capacity;
-        }
-        self.len -= to_remove;
-        self.update_tail();
-    }
-
-    fn view<'a>(
+    fn window<'a>(
         &'a self,
         start: usize,
         len: usize,
-        scratch: &'a mut LdWindowStatsScratch,
-    ) -> LdWindowStatsView<'a> {
-        debug_assert!(start <= self.len);
+        scratch: &'a mut LdWindowScratch,
+    ) -> LdWindowView<'a> {
         debug_assert!(start + len <= self.len);
-        if len == 0 {
-            return LdWindowStatsView {
-                gram: scratch.gram.as_ref().submatrix(0, 0, 0, 0),
-                counts: scratch.counts.as_ref().submatrix(0, 0, 0, 0),
-                sums: scratch.sums.as_ref().submatrix(0, 0, 0, 0),
-                squared_sums: scratch.squared_sums.as_ref().submatrix(0, 0, 0, 0),
+        let capacity = self.capacity();
+        if capacity == 0 || len == 0 {
+            return LdWindowView {
+                values: scratch.values.as_ref().submatrix(0, 0, self.n_samples, 0),
+                masks: &[],
             };
         }
 
-        let mut contiguous = true;
-        let mut prev_slot = self.slot_at(start);
-        for offset in (start + 1)..(start + len) {
-            let slot = self.slot_at(offset);
-            if slot != prev_slot + 1 {
-                contiguous = false;
-                break;
-            }
-            prev_slot = slot;
-        }
+        let start_slot = self.slot_at(start);
+        let contiguous = start_slot + len <= capacity;
 
         if contiguous {
-            let start_slot = self.slot_at(start);
-            return LdWindowStatsView {
-                gram: self
-                    .gram
+            let mask_start = start_slot * self.n_samples;
+            return LdWindowView {
+                values: self
+                    .values
                     .as_ref()
-                    .submatrix(start_slot, start_slot, len, len),
-                counts: self
-                    .counts
-                    .as_ref()
-                    .submatrix(start_slot, start_slot, len, len),
-                sums: self
-                    .sums
-                    .as_ref()
-                    .submatrix(start_slot, start_slot, len, len),
-                squared_sums: self
-                    .squared_sums
-                    .as_ref()
-                    .submatrix(start_slot, start_slot, len, len),
+                    .submatrix(0, start_slot, self.n_samples, len),
+                masks: &self.masks[mask_start..mask_start + self.n_samples * len],
             };
         }
 
-        {
-            let mut gram_scratch = scratch.gram.as_mut().submatrix_mut(0, 0, len, len);
-            let mut count_scratch = scratch.counts.as_mut().submatrix_mut(0, 0, len, len);
-            let mut sum_scratch = scratch.sums.as_mut().submatrix_mut(0, 0, len, len);
-            let mut sq_scratch = scratch.squared_sums.as_mut().submatrix_mut(0, 0, len, len);
+        let mut dst_values = scratch
+            .values
+            .as_mut()
+            .submatrix_mut(0, 0, self.n_samples, len);
+        let dst_masks = &mut scratch.masks[..self.n_samples * len];
 
-            for row in 0..len {
-                let row_slot = self.slot_at(start + row);
-                for col in 0..len {
-                    let col_slot = self.slot_at(start + col);
-                    gram_scratch[(row, col)] = self.gram[(row_slot, col_slot)];
-                    count_scratch[(row, col)] = self.counts[(row_slot, col_slot)];
-                    sum_scratch[(row, col)] = self.sums[(row_slot, col_slot)];
-                    sq_scratch[(row, col)] = self.squared_sums[(row_slot, col_slot)];
-                }
+        for offset in 0..len {
+            let slot = self.slot_at(start + offset);
+            {
+                let src = self.values.as_ref().col(slot);
+                let dst = dst_values.rb_mut().col_mut(offset);
+                zip!(dst, src).for_each(|unzip!(dst, src)| {
+                    *dst = *src;
+                });
+            }
+            {
+                let src = self.mask_slice(slot);
+                let dst = &mut dst_masks[offset * self.n_samples..(offset + 1) * self.n_samples];
+                dst.copy_from_slice(src);
             }
         }
 
-        let scratch_ref: &'a LdWindowStatsScratch = &*scratch;
-        LdWindowStatsView {
-            gram: scratch_ref.gram.as_ref().submatrix(0, 0, len, len),
-            counts: scratch_ref.counts.as_ref().submatrix(0, 0, len, len),
-            sums: scratch_ref.sums.as_ref().submatrix(0, 0, len, len),
-            squared_sums: scratch_ref.squared_sums.as_ref().submatrix(0, 0, len, len),
+        let values_view = scratch.values.as_ref().submatrix(0, 0, self.n_samples, len);
+
+        LdWindowView {
+            values: values_view,
+            masks: &scratch.masks[..self.n_samples * len],
         }
     }
 }
 
-struct LdWindowStatsView<'a> {
-    gram: MatRef<'a, f64>,
-    counts: MatRef<'a, f64>,
-    sums: MatRef<'a, f64>,
-    squared_sums: MatRef<'a, f64>,
+struct LdWindowView<'a> {
+    values: MatRef<'a, f64>,
+    masks: &'a [u8],
 }
 
-struct LdWindowStatsScratch {
+struct LdWindowScratch {
+    values: Mat<f64>,
+    masks: Vec<u8>,
+}
+
+struct LdThreadScratch {
+    window: LdWindowScratch,
+    mask_f64: Mat<f64>,
     gram: Mat<f64>,
     counts: Mat<f64>,
     sums: Mat<f64>,
     squared_sums: Mat<f64>,
+    system: Mat<f64>,
+    rhs: Mat<f64>,
+    sums_vec: Vec<f64>,
+    squared_vec: Vec<f64>,
 }
 
-impl LdWindowStatsScratch {
-    fn new(capacity: usize) -> Self {
+impl LdThreadScratch {
+    fn new(n_samples: usize, window_capacity: usize) -> Self {
         Self {
-            gram: Mat::zeros(capacity, capacity),
-            counts: Mat::zeros(capacity, capacity),
-            sums: Mat::zeros(capacity, capacity),
-            squared_sums: Mat::zeros(capacity, capacity),
+            window: LdWindowScratch {
+                values: Mat::zeros(n_samples, window_capacity),
+                masks: vec![0u8; n_samples * window_capacity],
+            },
+            mask_f64: Mat::zeros(n_samples, window_capacity),
+            gram: Mat::zeros(window_capacity, window_capacity),
+            counts: Mat::zeros(window_capacity, window_capacity),
+            sums: Mat::zeros(window_capacity, window_capacity),
+            squared_sums: Mat::zeros(window_capacity, window_capacity),
+            system: Mat::zeros(window_capacity, window_capacity),
+            rhs: Mat::zeros(window_capacity, 1),
+            sums_vec: vec![0.0; window_capacity],
+            squared_vec: vec![0.0; window_capacity],
         }
     }
 }
 
+#[cfg(test)]
 fn compute_ld_weights<S, P>(
     source: &mut S,
     scaler: &HweScaler,
@@ -3033,11 +3033,6 @@ where
     let window_capacity = config.window_capacity().max(1);
     let mut ring = LdRingBuffer::new(n_samples, window_capacity);
     let mut next_weight = 0usize;
-
-    let mut window_stats = LdWindowStats::new(n_samples, window_capacity);
-    let mut stats_scratch = LdWindowStatsScratch::new(window_capacity);
-    let mut system_scratch = Mat::zeros(window_capacity, window_capacity);
-    let mut rhs_scratch = Mat::zeros(window_capacity, 1);
 
     source
         .reset()
@@ -3084,11 +3079,7 @@ where
             .zip(presence.as_ref().col_iter())
             .enumerate()
         {
-            let was_full = ring.len() == ring.capacity();
             let slot = ring.push_slot();
-            if was_full {
-                window_stats.remove_front();
-            }
             {
                 let dst_col = ring.values_mut().col_mut(slot);
                 zip!(dst_col, column).for_each(|unzip!(dst, src)| {
@@ -3102,17 +3093,13 @@ where
                 }
             }
             ring.indices_mut()[slot] = processed + local_idx;
-            window_stats.add_variant(&ring);
             assign_ready_weights(
                 &mut ring,
                 &mut weights,
                 &mut next_weight,
                 &config,
-                &mut window_stats,
-                &mut stats_scratch,
-                &mut system_scratch,
-                &mut rhs_scratch,
                 &stage_progress,
+                par,
             )?;
         }
 
@@ -3124,11 +3111,8 @@ where
         &mut weights,
         &mut next_weight,
         &config,
-        &mut window_stats,
-        &mut stats_scratch,
-        &mut system_scratch,
-        &mut rhs_scratch,
         &stage_progress,
+        par,
     )?;
 
     stage_progress.set_total(observed_variants);
@@ -3142,33 +3126,198 @@ where
     })
 }
 
+#[derive(Clone, Copy)]
+struct LdWeightJob {
+    start_offset: usize,
+    window_len: usize,
+    center: usize,
+    keep_from: usize,
+}
+
 fn assign_ready_weights<P: FitProgressObserver>(
     ring: &mut LdRingBuffer,
     weights: &mut [f64],
     next_weight: &mut usize,
     config: &LdResolvedConfig,
-    stats: &mut LdWindowStats,
-    stats_scratch: &mut LdWindowStatsScratch,
-    system_scratch: &mut Mat<f64>,
-    rhs_scratch: &mut Mat<f64>,
     progress: &StageProgressHandle<P>,
+    par: Par,
 ) -> Result<(), HwePcaError> {
+    let window_capacity = config.window_capacity().max(1);
+
     while *next_weight < weights.len() {
-        debug_assert_eq!(stats.len(), ring.len());
-
-        let position = match ring.position_of(*next_weight) {
-            Some(pos) => pos,
-            None => break,
-        };
-
-        let available = ring.len();
-        if available == 0 {
+        if ring.len() == 0 {
             break;
         }
 
+        let jobs = collect_ready_jobs(ring, *next_weight, config, window_capacity)?;
+        if jobs.is_empty() {
+            break;
+        }
+
+        let start_idx = *next_weight;
+        let end_idx = start_idx + jobs.len();
+        {
+            let ring_ref: &LdRingBuffer = &*ring;
+            let weight_slice = &mut weights[start_idx..end_idx];
+            weight_slice
+                .par_iter_mut()
+                .zip_eq(jobs.clone().into_par_iter())
+                .map_init(
+                    || LdThreadScratch::new(ring_ref.n_samples(), window_capacity),
+                    |scratch, (slot, job)| {
+                        let weight = compute_ld_weight(
+                            ring_ref,
+                            job.start_offset,
+                            job.window_len,
+                            job.center,
+                            config.ridge,
+                            scratch,
+                            par,
+                        );
+                        *slot = weight;
+                    },
+                )
+                .for_each(|_| {});
+        }
+
+        progress.advance(end_idx);
+        *next_weight = end_idx;
+        if let Some(last_keep) = jobs.last().map(|job| job.keep_from) {
+            ring.truncate_front(last_keep);
+        }
+    }
+
+    Ok(())
+}
+
+fn compute_ld_weight(
+    ring: &LdRingBuffer,
+    start: usize,
+    window_len: usize,
+    center: usize,
+    ridge: f64,
+    scratch: &mut LdThreadScratch,
+    par: Par,
+) -> f64 {
+    let window = ring.window(start, window_len, &mut scratch.window);
+    let values = window.values;
+    let masks = window.masks;
+
+    let mut mask_mat = scratch
+        .mask_f64
+        .as_mut()
+        .submatrix_mut(0, 0, ring.n_samples(), window_len);
+    for col in 0..window_len {
+        let src = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
+        let dst = mask_mat.rb_mut().col_mut(col);
+        for (dst, &src_val) in dst.iter_mut().zip(src.iter()) {
+            *dst = src_val as f64;
+        }
+    }
+    let mask_view = mask_mat.as_ref();
+
+    let mut gram = scratch
+        .gram
+        .as_mut()
+        .submatrix_mut(0, 0, window_len, window_len);
+    gram.fill(0.0);
+    matmul(
+        gram.as_mut(),
+        Accum::Replace,
+        values.transpose(),
+        values,
+        1.0,
+        par,
+    );
+
+    let mut counts = scratch
+        .counts
+        .as_mut()
+        .submatrix_mut(0, 0, window_len, window_len);
+    counts.fill(0.0);
+    matmul(
+        counts.as_mut(),
+        Accum::Replace,
+        mask_view.transpose(),
+        mask_view,
+        1.0,
+        par,
+    );
+
+    let sums_vec = &mut scratch.sums_vec[..window_len];
+    let squared_vec = &mut scratch.squared_vec[..window_len];
+
+    for col in 0..window_len {
+        let values_slice = values
+            .col(col)
+            .try_as_col_major()
+            .expect("LD window column must be contiguous")
+            .as_slice();
+        let mask_slice = &masks[col * ring.n_samples()..(col + 1) * ring.n_samples()];
+        let mut sum = 0.0;
+        let mut sq_sum = 0.0;
+        for (&value, &mask) in values_slice.iter().zip(mask_slice.iter()) {
+            if mask != 0 {
+                sum += value;
+                sq_sum += value * value;
+            }
+        }
+        sums_vec[col] = sum;
+        squared_vec[col] = sq_sum;
+    }
+
+    let mut sums = scratch
+        .sums
+        .as_mut()
+        .submatrix_mut(0, 0, window_len, window_len);
+    let mut squared_sums = scratch
+        .squared_sums
+        .as_mut()
+        .submatrix_mut(0, 0, window_len, window_len);
+    for row in 0..window_len {
+        for col in 0..window_len {
+            sums[(row, col)] = sums_vec[col];
+            squared_sums[(row, col)] = squared_vec[col];
+        }
+    }
+
+    let mut system = scratch
+        .system
+        .as_mut()
+        .submatrix_mut(0, 0, window_len, window_len);
+    let mut rhs = scratch.rhs.as_mut().submatrix_mut(0, 0, window_len, 1);
+
+    solve_ld_window_from_stats(
+        gram.as_ref(),
+        sums.as_ref(),
+        squared_sums.as_ref(),
+        counts.as_ref(),
+        center,
+        ridge,
+        system.as_mut(),
+        rhs.as_mut(),
+    )
+}
+
+fn collect_ready_jobs(
+    ring: &LdRingBuffer,
+    start_index: usize,
+    config: &LdResolvedConfig,
+    window_capacity: usize,
+) -> Result<Vec<LdWeightJob>, HwePcaError> {
+    let mut jobs = Vec::new();
+    let mut next = start_index;
+
+    loop {
+        let Some(position) = ring.position_of(next) else {
+            break;
+        };
+
         let window_params = match &config.window {
             LdResolvedWindow::Sites { size } => {
-                let window_size = (*size).min(available).max(1);
+                let window_size = (*size).max(1).min(window_capacity);
+                let available = ring.len();
+                let window_size = window_size.min(available).max(1);
                 let half_window = window_size / 2;
                 let start = if available <= window_size {
                     0
@@ -3184,12 +3333,12 @@ fn assign_ready_weights<P: FitProgressObserver>(
                     None
                 } else {
                     let center = position - start;
-                    let keep_from = next_weight.saturating_sub(window_size / 2);
+                    let keep_from = next.saturating_sub(window_size / 2);
                     Some((start, window_len, center, keep_from))
                 }
             }
             LdResolvedWindow::BasePairs { ranges, .. } => {
-                let range = &ranges[*next_weight];
+                let range = &ranges[next];
                 if range.end <= range.start {
                     return Err(HwePcaError::InvalidInput(
                         "LD base-pair window produced an empty range",
@@ -3215,36 +3364,16 @@ fn assign_ready_weights<P: FitProgressObserver>(
             break;
         };
 
-        debug_assert!(start + window_len <= stats.len());
-
-        let stats_view = stats.view(start, window_len, stats_scratch);
-        let mut system_view = system_scratch
-            .as_mut()
-            .submatrix_mut(0, 0, window_len, window_len);
-        let mut rhs_view = rhs_scratch.as_mut().submatrix_mut(0, 0, window_len, 1);
-        let weight = solve_ld_window_from_stats(
-            stats_view.gram,
-            stats_view.sums,
-            stats_view.squared_sums,
-            stats_view.counts,
+        jobs.push(LdWeightJob {
+            start_offset: start,
+            window_len,
             center,
-            config.ridge,
-            system_view.as_mut(),
-            rhs_view.as_mut(),
-        );
-        weights[*next_weight] = weight;
-        progress.advance(*next_weight + 1);
-        *next_weight += 1;
-
-        let before_len = ring.len();
-        ring.truncate_front(keep_from);
-        let removed = before_len.saturating_sub(ring.len());
-        if removed > 0 {
-            stats.truncate_front(removed);
-        }
+            keep_from,
+        });
+        next += 1;
     }
 
-    Ok(())
+    Ok(jobs)
 }
 
 fn solve_ld_window_from_stats(
@@ -3797,16 +3926,8 @@ mod tests {
         let mut weights = vec![1.0; observed_variants];
         let mut ring = LdRingBuffer::new(n_samples, capacity);
         let mut next_weight = 0usize;
-
-        let mut values_scratch = Mat::zeros(n_samples, capacity);
-        let mut mask_scratch = Mat::zeros(n_samples, capacity);
-        let mut square_scratch = Mat::zeros(n_samples, capacity);
-        let mut gram_scratch = Mat::zeros(capacity, capacity);
-        let mut count_scratch = Mat::zeros(capacity, capacity);
-        let mut sum_scratch = Mat::zeros(capacity, capacity);
-        let mut sq_scratch = Mat::zeros(capacity, capacity);
-        let mut system_scratch = Mat::zeros(capacity, capacity);
-        let mut rhs_scratch = Mat::zeros(capacity, 1);
+        let progress =
+            StageProgressHandle::new(Arc::new(NoopFitProgress), FitProgressStage::LdWeights);
 
         let block =
             MatMut::from_column_major_slice_mut(&mut standardized, n_samples, observed_variants);
@@ -3829,229 +3950,26 @@ mod tests {
                 }
             }
             ring.indices_mut()[slot] = idx;
-            assign_ready_weights_naive(
+            assign_ready_weights(
                 &mut ring,
                 &mut weights,
                 &mut next_weight,
                 config,
-                &mut values_scratch,
-                &mut mask_scratch,
-                &mut square_scratch,
-                &mut gram_scratch,
-                &mut count_scratch,
-                &mut sum_scratch,
-                &mut sq_scratch,
-                &mut system_scratch,
-                &mut rhs_scratch,
+                &progress,
+                Par::Seq,
             )?;
         }
 
-        assign_ready_weights_naive(
+        assign_ready_weights(
             &mut ring,
             &mut weights,
             &mut next_weight,
             config,
-            &mut values_scratch,
-            &mut mask_scratch,
-            &mut square_scratch,
-            &mut gram_scratch,
-            &mut count_scratch,
-            &mut sum_scratch,
-            &mut sq_scratch,
-            &mut system_scratch,
-            &mut rhs_scratch,
+            &progress,
+            Par::Seq,
         )?;
 
         Ok(weights)
-    }
-
-    fn assign_ready_weights_naive(
-        ring: &mut LdRingBuffer,
-        weights: &mut [f64],
-        next_weight: &mut usize,
-        config: &LdResolvedConfig,
-        values_scratch: &mut Mat<f64>,
-        mask_scratch: &mut Mat<f64>,
-        square_scratch: &mut Mat<f64>,
-        gram_scratch: &mut Mat<f64>,
-        count_scratch: &mut Mat<f64>,
-        sum_scratch: &mut Mat<f64>,
-        sq_scratch: &mut Mat<f64>,
-        system_scratch: &mut Mat<f64>,
-        rhs_scratch: &mut Mat<f64>,
-    ) -> Result<(), HwePcaError> {
-        let par = Par::Seq;
-        while *next_weight < weights.len() {
-            let position = match ring.position_of(*next_weight) {
-                Some(pos) => pos,
-                None => break,
-            };
-
-            let available = ring.len();
-            if available == 0 {
-                break;
-            }
-
-            let window_params = match &config.window {
-                LdResolvedWindow::Sites { size } => {
-                    let window_size = (*size).min(available).max(1);
-                    let half_window = window_size / 2;
-                    let start = if available <= window_size {
-                        0
-                    } else if position <= half_window {
-                        0
-                    } else {
-                        let tail_start = available.saturating_sub(window_size);
-                        min(position - half_window, tail_start)
-                    };
-                    let end = min(start + window_size, available);
-                    let window_len = end - start;
-                    if window_len == 0 {
-                        None
-                    } else {
-                        let center = position - start;
-                        let keep_from = next_weight.saturating_sub(window_size / 2);
-                        Some((start, window_len, center, keep_from))
-                    }
-                }
-                LdResolvedWindow::BasePairs { ranges, .. } => {
-                    let range = &ranges[*next_weight];
-                    if range.end <= range.start {
-                        return Err(HwePcaError::InvalidInput(
-                            "LD base-pair window produced an empty range",
-                        ));
-                    }
-                    let last_index = range.end - 1;
-                    match (ring.position_of(range.start), ring.position_of(last_index)) {
-                        (Some(start_offset), Some(end_offset)) => {
-                            let window_len = end_offset.saturating_sub(start_offset) + 1;
-                            if window_len == 0 {
-                                None
-                            } else {
-                                let center = position.saturating_sub(start_offset);
-                                Some((start_offset, window_len, center, range.start))
-                            }
-                        }
-                        _ => None,
-                    }
-                }
-            };
-
-            let Some((start, window_len, center, keep_from)) = window_params else {
-                break;
-            };
-
-            let values_ref = ring.values();
-            let first_slot = ring.slot_at(start);
-            let contiguous = first_slot + window_len <= ring.capacity();
-            let n_samples = values_ref.nrows();
-
-            for col in 0..window_len {
-                let slot = ring.slot_at(start + col);
-                let src = ring.mask_slice(slot);
-                let dst_col = mask_scratch.as_mut().col_mut(col);
-                for (dst_value, &src_value) in dst_col.iter_mut().zip(src.iter()) {
-                    *dst_value = f64::from(src_value);
-                }
-            }
-            let mask_view = mask_scratch.as_ref().submatrix(0, 0, n_samples, window_len);
-
-            let values_view = if contiguous {
-                values_ref.submatrix(0, first_slot, n_samples, window_len)
-            } else {
-                for col in 0..window_len {
-                    let slot = ring.slot_at(start + col);
-                    let src = values_ref.col(slot);
-                    let dst_col = values_scratch.as_mut().col_mut(col);
-                    zip!(dst_col, src).for_each(|unzip!(dst, src)| {
-                        *dst = *src;
-                    });
-                }
-                values_scratch
-                    .as_ref()
-                    .submatrix(0, 0, n_samples, window_len)
-            };
-
-            let mut gram_view = gram_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, window_len, window_len);
-            matmul(
-                gram_view.as_mut(),
-                Accum::Replace,
-                values_view.transpose(),
-                values_view,
-                1.0,
-                par,
-            );
-
-            let mut squared_view = square_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, n_samples, window_len);
-            for col in 0..window_len {
-                let src = values_view.col(col);
-                let dst_col = squared_view.rb_mut().col_mut(col);
-                zip!(dst_col, src).for_each(|unzip!(dst, src)| {
-                    *dst = src * src;
-                });
-            }
-
-            let mut count_view = count_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, window_len, window_len);
-            matmul(
-                count_view.as_mut(),
-                Accum::Replace,
-                mask_view.transpose(),
-                mask_view,
-                1.0,
-                par,
-            );
-
-            let mut sum_view = sum_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, window_len, window_len);
-            matmul(
-                sum_view.as_mut(),
-                Accum::Replace,
-                values_view.transpose(),
-                mask_view,
-                1.0,
-                par,
-            );
-
-            let mut sq_view = sq_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, window_len, window_len);
-            matmul(
-                sq_view.as_mut(),
-                Accum::Replace,
-                squared_view.as_ref().transpose(),
-                mask_view,
-                1.0,
-                par,
-            );
-
-            let mut system_view = system_scratch
-                .as_mut()
-                .submatrix_mut(0, 0, window_len, window_len);
-            let mut rhs_view = rhs_scratch.as_mut().submatrix_mut(0, 0, window_len, 1);
-            let weight = solve_ld_window_from_stats(
-                gram_view.as_ref(),
-                sum_view.as_ref(),
-                sq_view.as_ref(),
-                count_view.as_ref(),
-                center,
-                config.ridge,
-                system_view.as_mut(),
-                rhs_view.as_mut(),
-            );
-            weights[*next_weight] = weight;
-            *next_weight += 1;
-
-            ring.truncate_front(keep_from);
-        }
-
-        Ok(())
     }
 
     fn make_simple_scaler(data: &[f64], n_samples: usize) -> HweScaler {
