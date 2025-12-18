@@ -12,7 +12,7 @@ import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
 import Mathlib.Data.NNReal.Basic
-import Mathlib.Probability.Independence.Bonus
+
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
