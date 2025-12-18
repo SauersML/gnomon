@@ -53,8 +53,14 @@ jobs:
             .lake
           key: ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
           restore-keys: |
-            ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
-            ${{ runner.os }}-lake-v5-
+            ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain') }}-
+            
+      - name: Enforce manifest integrity
+        run: |
+          # Failsafe: Ensure the cache never overwrites our locked dependencies.
+          # Even if someone accidentally adds lake-manifest.json back to the cache paths,
+          # this un-does the damage immediately.
+          git restore lake-manifest.json
             
       - name: Verify cache completeness
         id: check-cache
