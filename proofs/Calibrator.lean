@@ -512,7 +512,9 @@ They formalize the L²-projection structure: raw model = projection onto {1, P} 
 
 /-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
     the linear predictor simplifies to an affine function: a + b*p.
-    This is the key structural simplification. -/
+    This is the key structural simplification.
+
+    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
 lemma linearPredictor_eq_affine_of_raw
     (model_raw : PhenotypeInformedGAM 1 1 1)
     (h_raw : IsRawScoreModel model_raw)
@@ -520,20 +522,32 @@ lemma linearPredictor_eq_affine_of_raw
     ∀ p c, linearPredictor model_raw p c =
       model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * p := by
   intros p_val c_val
-  unfold linearPredictor
-  -- For raw model: f₀ₗ = 0 and fₘₗ = 0 for all indices
-  -- So evalSmooth(...) = Σᵢ 0 * bᵢ(x) = 0
-  have h_f0l_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.f₀ₗ l) (c_val l) = 0 := by
-    intro l
-    unfold evalSmooth
-    simp only [h_raw.1 l, zero_mul, Finset.sum_const_zero]
-  have h_fml_zero : ∀ m l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ m l) (c_val l) = 0 := by
-    intros m l
-    unfold evalSmooth
-    simp only [h_raw.2 m l, zero_mul, Finset.sum_const_zero]
-  -- Collapse sums over Fin 1 and apply spline zeros + linear basis
-  -- Result: γ₀₀ + γₘ₀[0] * id(p) = γ₀₀ + γₘ₀[0] * p
-  sorry
+
+  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
+  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
+  rw [h_decomp]
+
+  -- Step 2: Show base reduces to γ₀₀ for raw model
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    -- All f₀ₗ terms are zero for raw model
+    have h_f0l_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.f₀ₗ l) (c_val l) = 0 := by
+      intro l
+      unfold evalSmooth
+      simp only [h_raw.1 l, zero_mul, Finset.sum_const_zero]
+    simp only [h_f0l_zero, Finset.sum_const_zero, add_zero]
+
+  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ ⟨0, by norm_num⟩ := by
+    unfold predictorSlope
+    -- All fₘₗ terms are zero for raw model
+    have h_fml_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ ⟨0, by norm_num⟩ l) (c_val l) = 0 := by
+      intro l
+      unfold evalSmooth
+      simp only [h_raw.2 ⟨0, by norm_num⟩ l, zero_mul, Finset.sum_const_zero]
+    simp only [h_fml_zero, Finset.sum_const_zero, add_zero]
+
+  rw [h_base, h_slope]
 
 /-- **Lemma B**: Under product measure (independence), E[P·C] = E[P]·E[C] = 0.
     Uses Fubini (integral_prod) to factor the expectation. -/
