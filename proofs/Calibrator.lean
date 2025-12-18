@@ -478,23 +478,94 @@ lemma optimal_coeffs_raw_additive_standalone
 lemma optimal_intercept_eq_mean_of_zero_mean_p
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (hY : Integrable Y μ)
+    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (h_orth_1 : ∫ pc, (Y pc - (a + b * pc.1)) ∂μ = 0) :
     a = ∫ pc, Y pc ∂μ := by
-  -- Proof omitted to restore compilation
-  sorry
+  have hLin : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) μ := by
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    simpa using ha.add hb
+  have h0 :
+      (∫ pc, Y pc ∂μ) - (∫ pc, (a + b * pc.1) ∂μ) = 0 := by
+    simpa [MeasureTheory.integral_sub hY hLin] using h_orth_1
+  have hLinInt : (∫ pc, (a + b * pc.1) ∂μ) = a := by
+    -- `E[a + bP] = a * E[1] + b * E[P] = a + b * 0 = a`
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    calc
+      (∫ pc, (a + b * pc.1) ∂μ) = (∫ pc, (a : ℝ) ∂μ) + ∫ pc, b * pc.1 ∂μ := by
+        simpa using (MeasureTheory.integral_add ha hb)
+      _ = a + b * (∫ pc, pc.1 ∂μ) := by
+        simp [MeasureTheory.integral_const, MeasureTheory.integral_const_mul]
+      _ = a := by simp [hP0]
+  -- Rearrangement: `E[Y] - a = 0`.
+  linarith [h0, hLinInt]
 
 /-- Second normal equation: optimality implies b = E[YP] (when E[P] = 0, E[P²] = 1).
     This is the orthogonality condition ⟪residual, P⟫ = 0. -/
 lemma optimal_slope_eq_covariance_of_normalized_p
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
+    (_hY : Integrable Y μ)
+    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
+    (hYP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1) μ)
+    (hP2i : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
     (h_orth_P : ∫ pc, (Y pc - (a + b * pc.1)) * pc.1 ∂μ = 0) :
     b = ∫ pc, Y pc * pc.1 ∂μ := by
-  -- Proof omitted to restore compilation
-  sorry
+  have hLin : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) μ := by
+    have ha : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) μ := by
+      simp
+    have hb : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1) μ := hP.const_mul b
+    simpa using ha.add hb
+  have hLinP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (a + b * pc.1) * pc.1) μ := by
+    -- Integrable because it's a linear combination of `pc.1` and `pc.1^2`.
+    -- `(a + bP) * P = a*P + b*P^2`
+    have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) μ := hP.const_mul a
+    have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * (pc.1 ^ 2)) μ := hP2i.const_mul b
+    -- rewrite and use `integrable_congr` to match `h1.add h2`
+    refine (h1.add h2).congr ?_
+    filter_upwards with pc
+    ring_nf
+    simp
+  have h0 :
+      (∫ pc, Y pc * pc.1 ∂μ) - (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = 0 := by
+    -- Expand the orthogonality condition using integral linearity.
+    have hSub : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1 - (a + b * pc.1) * pc.1) μ := by
+      exact hYP.sub hLinP
+    -- `(Y - (a+bP))*P = YP - (a+bP)P`
+    have hEq :
+        (fun pc : ℝ × (Fin 1 → ℝ) => (Y pc - (a + b * pc.1)) * pc.1) =
+          (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1 - (a + b * pc.1) * pc.1) := by
+      funext pc
+      ring_nf
+    -- Use the rewritten integrand.
+    have hOrth' : ∫ pc, (Y pc * pc.1 - (a + b * pc.1) * pc.1) ∂μ = 0 := by
+      simpa [hEq] using h_orth_P
+    simpa [MeasureTheory.integral_sub hYP hLinP] using hOrth'
+  have hLinPInt : (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = b := by
+    -- `E[(a+bP)P] = a*E[P] + b*E[P^2] = 0 + b*1 = b`
+    have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) μ := hP.const_mul a
+    have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * (pc.1 ^ 2)) μ := hP2i.const_mul b
+    have hsum : (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = (∫ pc, a * pc.1 + b * (pc.1 ^ 2) ∂μ) := by
+      refine MeasureTheory.integral_congr_ae ?_
+      filter_upwards with pc
+      ring_nf
+    rw [hsum]
+    calc
+      (∫ pc, a * pc.1 + b * (pc.1 ^ 2) ∂μ) =
+          (∫ pc, a * pc.1 ∂μ) + ∫ pc, b * (pc.1 ^ 2) ∂μ := by
+            simpa using (MeasureTheory.integral_add h1 h2)
+      _ = a * (∫ pc, pc.1 ∂μ) + b * (∫ pc, pc.1 ^ 2 ∂μ) := by
+            simp [MeasureTheory.integral_const_mul]
+      _ = b := by simp [hP0, hP2]
+  -- Rearrangement: `E[YP] - b = 0`.
+  linarith [h0, hLinPInt]
 
 /-- The key bridge: isBayesOptimalInRawClass implies the orthogonality conditions.
     This uses the variational characterization of L² projection. -/
