@@ -1426,7 +1426,21 @@ def SpansNullspace (Z : Matrix (Fin m) (Fin (m - k)) ℝ)
 
 /-- **Constraint Projection Correctness**: If Z spans the nullspace of BᵀWC,
     then B' = BZ is weighted-orthogonal to C.
-    This validates `apply_weighted_orthogonality_constraint` in basis.rs. -/
+    This validates `apply_weighted_orthogonality_constraint` in basis.rs.
+
+    **Proof**:
+    (BZ)ᵀ W C = Zᵀ (Bᵀ W C) = 0 because Z is in the nullspace of (Bᵀ W C)ᵀ.
+
+    More precisely:
+    - SpansNullspace Z M means M * Z = 0
+    - Here M = (Bᵀ W C)ᵀ = Cᵀ Wᵀ B = Cᵀ W B (if W is symmetric, which diagonal matrices are)
+    - We want: (BZ)ᵀ W C = Zᵀ Bᵀ W C
+    - By associativity: Zᵀ Bᵀ W C = (Bᵀ W C)ᵀ · Z = M · Z = 0 (by h_spans.1)
+
+    Wait, transpose swap: (Zᵀ (Bᵀ W C))ᵀ = (Bᵀ W C)ᵀ Z
+    Actually: Zᵀ · (Bᵀ W C) has shape (m-k) × k, while M · Z = 0 where M = (Bᵀ W C)ᵀ
+
+    The key relation is: Zᵀ · A = (Aᵀ · Z)ᵀ, so if Aᵀ · Z = 0, then Zᵀ · A = 0. -/
 theorem constraint_projection_correctness
     (B : Matrix (Fin n) (Fin m) ℝ)
     (C : Matrix (Fin n) (Fin k) ℝ)
@@ -1435,8 +1449,29 @@ theorem constraint_projection_correctness
     (h_spans : SpansNullspace Z (Matrix.transpose (Matrix.transpose B * W * C))) :
     IsWeightedOrthogonal (B * Z) C W := by
   unfold IsWeightedOrthogonal
-  -- (BZ)ᵀ W C = Zᵀ Bᵀ W C = Zᵀ (Bᵀ W C) = 0 by nullspace definition
-  sorry
+  -- Goal: Matrix.transpose (B * Z) * W * C = 0
+  -- Expand: (BZ)ᵀ W C = Zᵀ Bᵀ W C
+  have h1 : Matrix.transpose (B * Z) = Matrix.transpose Z * Matrix.transpose B := by
+    exact Matrix.transpose_mul B Z
+  rw [h1]
+  -- Now: Zᵀ Bᵀ W C
+  -- We need to show: Zᵀ * (Bᵀ W C) = 0
+  -- From h_spans: (Bᵀ W C)ᵀ * Z = 0
+  -- Taking transpose: Zᵀ * (Bᵀ W C) = ((Bᵀ W C)ᵀ * Z)ᵀ
+  -- If (Bᵀ W C)ᵀ * Z = 0, then Zᵀ * (Bᵀ W C) = 0ᵀ = 0
+  have h2 : Matrix.transpose Z * Matrix.transpose B * W * C =
+            Matrix.transpose Z * (Matrix.transpose B * W * C) := by
+    simp only [Matrix.mul_assoc]
+  rw [h2]
+  -- Now use the nullspace condition
+  have h3 : Matrix.transpose (Matrix.transpose B * W * C) * Z = 0 := h_spans.1
+  -- Taking transpose of both sides: Zᵀ * (Bᵀ W C) = 0
+  have h4 : Matrix.transpose Z * (Matrix.transpose B * W * C) =
+            Matrix.transpose (Matrix.transpose (Matrix.transpose B * W * C) * Z) := by
+    rw [Matrix.transpose_mul]
+    simp only [Matrix.transpose_transpose]
+  rw [h4, h3]
+  simp only [Matrix.transpose_zero]
 
 omit [Fintype (Fin n)] [Fintype (Fin k)] [DecidableEq (Fin n)] [DecidableEq (Fin m)]
     [DecidableEq (Fin k)] in
