@@ -10,6 +10,8 @@ import Mathlib.Analysis.SpecialFunctions.Log.Basic
 import Mathlib.Data.Fin.Basic
 import Mathlib.LinearAlgebra.Matrix.Rank
 import Mathlib.LinearAlgebra.Matrix.PosDef
+import Mathlib.LinearAlgebra.Matrix.ToLin
+import Mathlib.LinearAlgebra.Dimension.OrzechProperty
 import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
@@ -391,8 +393,46 @@ lemma integral_mul_fst_snd_eq_zero
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
     ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-  -- Proof omitted to restore compilation
-  sorry
+  classical
+  set μP : Measure ℝ := μ.map Prod.fst
+  set μC : Measure (Fin 1 → ℝ) := μ.map Prod.snd
+  haveI : IsProbabilityMeasure μP :=
+    Measure.isProbabilityMeasure_map (μ := μ) (f := Prod.fst) (by
+      simpa using measurable_fst.aemeasurable)
+  haveI : IsProbabilityMeasure μC :=
+    Measure.isProbabilityMeasure_map (μ := μ) (f := Prod.snd) (by
+      simpa using measurable_snd.aemeasurable)
+  have hP0' : (∫ p, p ∂μP) = 0 := by
+    have hP0_prod : (∫ pc, pc.1 ∂(μP.prod μC)) = 0 := by
+      have h := hP0
+      rw [h_indep] at h
+      simpa [μP, μC] using h
+    have hfst :
+        (∫ pc, pc.1 ∂(μP.prod μC)) = (μC.real Set.univ) • (∫ p, p ∂μP) := by
+      simpa using (MeasureTheory.integral_fun_fst (μ := μP) (ν := μC) (f := fun p : ℝ => p))
+    have hμC : μC.real Set.univ = (1 : ℝ) := by
+      simp
+    have : (μC.real Set.univ) • (∫ p, p ∂μP) = 0 := hfst.symm.trans hP0_prod
+    simpa [hμC] using this
+  have hC0' : (∫ c, c ⟨0, by norm_num⟩ ∂μC) = 0 := by
+    have hC0_prod : (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂(μP.prod μC)) = 0 := by
+      have h := hC0
+      rw [h_indep] at h
+      simpa [μP, μC] using h
+    have hsnd :
+        (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂(μP.prod μC)) =
+          (μP.real Set.univ) • (∫ c, c ⟨0, by norm_num⟩ ∂μC) := by
+      simpa using
+        (MeasureTheory.integral_fun_snd (μ := μP) (ν := μC)
+          (f := fun c : (Fin 1 → ℝ) => c ⟨0, by norm_num⟩))
+    have hμP : μP.real Set.univ = (1 : ℝ) := by
+      simp
+    have : (μP.real Set.univ) • (∫ c, c ⟨0, by norm_num⟩ ∂μC) = 0 := hsnd.symm.trans hC0_prod
+    simpa [hμP] using this
+  rw [h_indep]
+  simpa [μP, μC, hP0', hC0'] using
+    (MeasureTheory.integral_prod_mul (μ := μP) (ν := μC) (f := fun p : ℝ => p)
+      (g := fun c : (Fin 1 → ℝ) => c ⟨0, by norm_num⟩))
 
 /-- **Core Lemma**: Under independence + zero-mean, {1, P, C} form an orthogonal set in L².
     This is because:
@@ -621,7 +661,14 @@ lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
     (m : PhenotypeInformedGAM p k sp) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hm : InModelClass m pgsBasis splineBasis) :
     unpackParams pgsBasis splineBasis (packParams m) = m := by
-  sorry
+  cases m with
+  | mk m_pgsBasis m_splineBasis m_γ00 m_γm0 m_f0l m_fml m_link m_dist =>
+    rcases hm with ⟨hbasis, hspline, hlink, hdist⟩
+    cases hbasis
+    cases hspline
+    cases hlink
+    cases hdist
+    rfl
 
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
@@ -691,13 +738,14 @@ index-flattening in downstream proofs. -/
 lemma mulVec_injective_of_full_rank {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     (X : Matrix (Fin n) ι ℝ) (h_rank : Matrix.rank X = Fintype.card ι) :
     Function.Injective X.mulVec := by
-  -- rank X = d means dim(column space) = d
-  -- which equals the number of columns, so ker(X.mulVec) = {0}
-  -- hence X.mulVec is injective
-  --
-  -- In mathlib: use `Matrix.mulVecLin` and show its kernel is trivial
-  -- Then injectivity follows from LinearMap.ker_eq_bot_of_injective
-  sorry
+  classical
+  have hcols : LinearIndependent ℝ X.col := by
+    -- `rank` is the `finrank` of the span of columns, which is `(Set.range X.col).finrank`.
+    have hrank' : X.rank = (Set.range X.col).finrank ℝ := by
+      simpa [Set.finrank] using (X.rank_eq_finrank_span_cols (R := ℝ))
+    have hfin : Fintype.card ι = (Set.range X.col).finrank ℝ := h_rank.symm.trans hrank'
+    exact (linearIndependent_iff_card_eq_finrank_span (b := X.col)).2 hfin
+  exact (Matrix.mulVec_injective_iff (M := X)).2 hcols
 
 /-! ### Generic Finite-Dimensional Quadratic Forms
 
