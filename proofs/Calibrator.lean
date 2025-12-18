@@ -4,6 +4,7 @@ import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.SpecialFunctions.Log.Basic
 import Mathlib.Data.Fin.Basic
 import Mathlib.LinearAlgebra.Matrix.Rank
+import Mathlib.LinearAlgebra.Matrix.PosDef
 import Mathlib.Data.Matrix.Basic
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
@@ -299,6 +300,49 @@ theorem prediction_causality_tradeoff_linear_case (p sp : ℕ) [Fintype (Fin p)]
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
+/-! ### Parameter Vectorization Infrastructure
+
+To prove identifiability, we vectorize the GAM parameters into a single vector β ∈ ℝ^d,
+then show the loss is a strictly convex quadratic in β. -/
+
+/-- Parameter vector type: flattens all GAM coefficients into a single vector. -/
+abbrev ParamVec (p k sp : ℕ) := Fin (total_params p k sp) → ℝ
+
+/-- Model class restriction: same basis, same link, same distribution.
+    Without this, the same predictor can be represented with different parameters. -/
+structure InModelClass {p k sp : ℕ} (m : PhenotypeInformedGAM p k sp)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp) : Prop where
+  basis_match : m.pgsBasis = pgsBasis
+  spline_match : m.pcSplineBasis = splineBasis
+  link_identity : m.link = .identity
+  dist_gaussian : m.dist = .Gaussian
+
+/-- Pack GAM parameters into a vector.
+    Layout: [γ₀₀, γₘ₀[0..p], f₀ₗ[0..k][0..sp], fₘₗ[0..p][0..k][0..sp]] -/
+noncomputable def packParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (m : PhenotypeInformedGAM p k sp) : ParamVec p k sp :=
+  fun j => sorry  -- Index arithmetic mapping j to the appropriate coefficient
+
+/-- Unpack a vector into GAM parameters (inverse of packParams). -/
+noncomputable def unpackParams {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) : PhenotypeInformedGAM p k sp :=
+  { pgsBasis := pgsBasis
+    pcSplineBasis := splineBasis
+    γ₀₀ := sorry  -- β[0]
+    γₘ₀ := sorry  -- β[1..p]
+    f₀ₗ := sorry  -- β[p+1..p+k*sp]
+    fₘₗ := sorry  -- β[p+k*sp+1..end]
+    link := .identity
+    dist := .Gaussian }
+
+/-- Pack and unpack are inverses within the model class. -/
+lemma unpack_pack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (m : PhenotypeInformedGAM p k sp) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (hm : InModelClass m pgsBasis splineBasis) :
+    unpackParams pgsBasis splineBasis (packParams m) = m := by
+  sorry
+
 /-- The design matrix for the penalized GAM.
     This corresponds to the construction in `basis.rs` and `construction.rs`.
 
@@ -308,58 +352,116 @@ def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
     3. PC smooth main effects (k*sp columns): for each PC l, sp spline basis values
     4. PGS×PC interactions (p*k*sp columns): for each PGS basis m and PC l, sp spline values
 
-    The matrix has n rows (one per sample) and total_params columns.
-    Sum-to-zero constraints are applied via nullspace projection in basis.rs. -/
+    Constructed via `Matrix.of` as recommended by mathlib. -/
 noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
     [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hp : p > 0) (hk : k > 0) (hsp : sp > 0) : Matrix (Fin n) (Fin (total_params p k sp)) ℝ :=
-  fun i j =>
-    -- This is a placeholder; full implementation would compute:
-    -- - Intercept block: 1
-    -- - PGS main effect block: pgsBasis.B m (data.p i)
-    -- - PC spline block: splineBasis.b s (data.c i l)
-    -- - Interaction block: pgsBasis.B m (data.p i) * splineBasis.b s (data.c i l)
+  Matrix.of fun i j =>
+    -- Index j maps to columns:
+    -- j = 0: intercept (constant 1)
+    -- j ∈ [1, p]: PGS basis B[j](pgs_i)
+    -- j ∈ [p+1, p+k*sp]: PC spline s[j'](c_i[l])
+    -- j ∈ [p+k*sp+1, end]: interaction B[m](pgs) * s[j'](c_i[l])
     sorry
 
+/-- **Key Lemma**: Linear predictor equals design matrix times parameter vector.
+    This is the bridge between the GAM structure and linear algebra. -/
+lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
+    [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
+    (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) :
+    ∀ i : Fin n, linearPredictor m (data.p i) (data.c i) =
+      (designMatrix data pgsBasis splineBasis hp hk hsp).mulVec (packParams m) i := by
+  intro i
+  -- Expand linearPredictor and designMatrix, show they compute the same value
+  sorry
+
+/-- Full column rank implies X.mulVec is injective. -/
+lemma mulVec_injective_of_full_rank {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
+    (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
+    Function.Injective X.mulVec := by
+  -- rank X = d means the column space has dimension d
+  -- which is the full column count, so columns are linearly independent
+  -- hence X.mulVec is injective
+  sorry
+
+/-- Dot product of two vectors represented as Fin d → ℝ. -/
+def dotProduct' {d : ℕ} [Fintype (Fin d)] (u v : Fin d → ℝ) : ℝ :=
+  Finset.univ.sum (fun i => u i * v i)
+
+/-- XᵀX is positive definite when X has full column rank.
+    This is the algebraic foundation for uniqueness of least squares. -/
+lemma transpose_mul_self_posDef {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)] [DecidableEq (Fin d)]
+    (X : Matrix (Fin n) (Fin d) ℝ) (h_rank : Matrix.rank X = d) :
+    ∀ v : Fin d → ℝ, v ≠ 0 → 0 < dotProduct' ((Matrix.transpose X * X).mulVec v) v := by
+  -- Uses the fact that Aᴴ*A is PosDef iff A.mulVec is injective
+  -- (over ℝ, conjTranspose = transpose)
+  sorry
+
+/-- The penalized Gaussian loss as a quadratic function of parameters. -/
+noncomputable def gaussianPenalizedLoss {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
+    (X : Matrix (Fin n) (Fin d) ℝ) (y : Fin n → ℝ) (S : Matrix (Fin d) (Fin d) ℝ) (lam : ℝ)
+    (β : Fin d → ℝ) : ℝ :=
+  (1 / n) * ‖y - X.mulVec β‖^2 + lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)
+
+/-- A matrix is positive semidefinite if vᵀSv ≥ 0 for all v. -/
+def IsPosSemidef {d : ℕ} [Fintype (Fin d)] (S : Matrix (Fin d) (Fin d) ℝ) : Prop :=
+  ∀ v : Fin d → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
+
+/-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0. -/
+lemma gaussianPenalizedLoss_strictConvex {n d : ℕ} [Fintype (Fin n)] [Fintype (Fin d)]
+    (X : Matrix (Fin n) (Fin d) ℝ) (y : Fin n → ℝ) (S : Matrix (Fin d) (Fin d) ℝ)
+    (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = d) (hS : IsPosSemidef S) :
+    StrictConvexOn ℝ Set.univ (gaussianPenalizedLoss X y S lam) := by
+  -- The loss is:
+  --   (1/n) * ‖y - Xβ‖² + lam * βᵀSβ
+  -- = (1/n) * (yᵀy - 2yᵀXβ + βᵀXᵀXβ) + lam * βᵀSβ
+  -- = const + linear(β) + βᵀ((1/n)XᵀX + lam*S)β
+  --
+  -- Since XᵀX is PosDef (from full rank) and S is PosSemidef,
+  -- (1/n)XᵀX + lam*S is PosDef, making the quadratic term strictly convex.
+  sorry
+
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
-    then the penalized GAM has a unique solution satisfying the sum-to-zero constraints.
+    then the penalized GAM has a unique solution within the model class.
 
     This validates the constraint machinery in `basis.rs`:
     - `apply_sum_to_zero_constraint` ensures spline contributions average to zero
     - `apply_weighted_orthogonality_constraint` removes collinearity with lower-order terms
-    - `polynomial_constraint_matrix` builds constraints for ANOVA-style decomposition
 
-    The proof relies on:
-    1. Full rank implies the normal equations Xᵀ W X + λS has a unique solution
-    2. The constraints define a linear subspace, and uniqueness holds within it
-    3. The penalty matrix S is positive semi-definite on the null space complement -/
+    The proof uses Route B: strict convexity. -/
 theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
-    [Fintype (Fin k)] [Fintype (Fin sp)]
+    [Fintype (Fin k)] [Fintype (Fin sp)] [DecidableEq (Fin (total_params p k sp))]
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (hp : p > 0) (hk : k > 0) (hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis hp hk hsp) = total_params p k sp)
     (h_lambda_pos : lambda > 0) :
   ∃! (m : PhenotypeInformedGAM p k sp),
+    InModelClass m pgsBasis splineBasis ∧
     IsIdentifiable m data ∧
     ∀ (m' : PhenotypeInformedGAM p k sp),
+      InModelClass m' pgsBasis splineBasis →
       IsIdentifiable m' data → empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
 
-  -- The uniqueness proof follows from convexity of the penalized objective:
+  -- **Proof Strategy (Route B: Strict Convexity)**
   --
-  -- 1. The loss function L(β) = (1/n) Σᵢ ℓ(yᵢ, Xᵢβ) + λ βᵀSβ is strictly convex when:
-  --    a) The negative log-likelihood ℓ is convex (Gaussian: quadratic, Logistic: log-sum-exp)
-  --    b) The penalty λ βᵀSβ is convex (S is positive semi-definite)
-  --    c) X has full column rank (ensures strict convexity of the data term)
+  -- 1. Vectorize: Let β = packParams(m), so the problem becomes
+  --    minimizing L(β) = (1/n)‖y - Xβ‖² + λ βᵀSβ over {β : Cβ = 0}
   --
-  -- 2. A strictly convex function on a convex set (the constraint subspace) has
-  --    at most one minimizer.
+  -- 2. Strict convexity: By gaussianPenalizedLoss_strictConvex, L is strictly convex
+  --    on the whole space. Restricting to the affine subspace {Cβ = 0} preserves
+  --    strict convexity.
   --
-  -- 3. The constraint set {β : IsIdentifiable(decode(β))} is a linear subspace
-  --    defined by the sum-to-zero equations, which is convex.
+  -- 3. Uniqueness: A strictly convex function on a convex set has at most one minimizer.
   --
-  -- 4. Existence follows from coercivity: as ‖β‖ → ∞, the penalty term dominates.
+  -- 4. Existence: L is coercive (goes to ∞ as ‖β‖ → ∞ due to the penalty term)
+  --    and continuous. By Weierstrass, a minimum exists on any closed bounded set,
+  --    and coercivity implies the minimum is achieved.
+  --
+  -- 5. Translate back: The unique minimizing β corresponds to a unique m via unpackParams.
 
   sorry
 
