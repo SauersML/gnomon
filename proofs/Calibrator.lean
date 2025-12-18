@@ -12,8 +12,9 @@ import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
 import Mathlib.Data.NNReal.Basic
+import Mathlib.Probability.Independence.Bonus
 import Mathlib.Probability.Independence.Basic
-import Mathlib.Probability.Integration
+import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
@@ -198,20 +199,20 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
         -- The sum is 1 because the term is 1 only at i = ⟨0, hk_pos⟩ and 0 otherwise.
         simp [Finset.sum_ite_eq', Finset.mem_univ]
       -- Substitute the sum and simplify the expression
-      simp [Finset.sum_const_zero, h_sum_c2]; norm_num
+      simp [Finset.sum_const_zero]; norm_num
   · constructor
     · -- Case 2: dgpScenario3 has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
       unfold dgpScenario3 at h_neq
       -- The terms with c₁ and c₂ cancel out, making the slope independent of c.
-      simp only [add_sub_add_right_eq_sub, div_self (sub_ne_zero.mpr hp_neq)] at h_neq
+      simp only [add_sub_add_right_eq_sub] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
       contradiction
     · -- Case 3: dgpScenario4 has no interaction
       intro h; rcases h with ⟨p₁, p₂, c₁, c₂, hp_neq, _, h_neq⟩
       unfold dgpScenario4 at h_neq
       -- Similarly, the terms with c₁ and c₂ cancel out.
-      simp only [sub_sub_sub_cancel_right, div_self (sub_ne_zero.mpr hp_neq)] at h_neq
+      simp only [sub_sub_sub_cancel_right] at h_neq
       -- This leads to 1 ≠ 1, a contradiction.
       contradiction
 
