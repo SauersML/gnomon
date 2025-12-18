@@ -158,6 +158,25 @@ models add the calibrator's correction in linear space. Distance-to-hull checks
 run in the same order as training, ensuring extrapolation handling remains
 consistent.
 
+### Posterior-predictive uncertainty (sketch)
+
+The stored penalized Hessian already encodes local curvature around the fitted
+coefficients. Treating the coefficients as approximately
+`β ~ Normal(β̂, H⁻¹)` yields a lightweight posterior predictive routine:
+
+1. Compute a Cholesky factor of `H⁻¹` after training (or factor `H` and solve
+   for draws on demand).
+2. At inference, draw `β⁽¹⁾…β⁽M⁾` from that multivariate normal.
+3. For a new design vector `x`, evaluate `η⁽ᵐ⁾ = x'β⁽ᵐ⁾` and transform with
+   the link (e.g., `p⁽ᵐ⁾ = sigmoid(η⁽ᵐ⁾)` for logistic fits).
+4. Use the empirical quantiles of `{p⁽ᵐ⁾}` as credible intervals; the samples
+   themselves represent the full distribution of the individual's risk.
+
+This adds on the order of 50–100 lines of inference code (sampling, linkage,
+quantiles) and requires no access to the training data—only the fitted
+coefficients and Hessian. It inherits the standard large-sample assumptions of a
+Gaussian posterior around the optimum and ignores higher-order asymmetry.
+
 ## Expected data format
 
 Training and inference both operate on tab-separated value (TSV) files with a
