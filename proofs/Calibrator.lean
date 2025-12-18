@@ -1289,6 +1289,63 @@ lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
     · rintro ⟨rfl, rfl⟩
       simp
 
+/-- **THE CLEAN PROOF**: Optimal coefficients via direct risk comparison.
+
+    This lemma bypasses the orthogonality/normal equations approach entirely.
+    Instead, we:
+    1. Use `risk_affine_additive` to compute the risk of any (a,b)
+    2. Use `affine_risk_minimizer` to show the minimum is at (0,1)
+    3. Use optimality to conclude the model's coefficients equal (0,1)
+
+    **Why this is cleaner than orthogonality**:
+    - No need to prove `rawOptimal_implies_orthogonality` via derivatives
+    - No need for integral linearity lemmas (we just compare risks)
+    - The minimizer is OBVIOUS from the quadratic form -/
+lemma optimal_coefficients_via_risk
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (hC2_pos : 0 ≤ ∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
+    (β a b : ℝ)
+    -- Optimality: (a,b) achieves minimal risk among all affine predictors
+    (h_opt : ∀ a' b' : ℝ,
+      ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ ≤
+      ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a' + b' * pc.1))^2 ∂μ) :
+    a = 0 ∧ b = 1 := by
+
+  -- Get the orthogonality fact
+  have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 :=
+    integral_mul_fst_snd_eq_zero μ h_indep hP0 hC0
+
+  -- Abbreviate the C² integral
+  set C2 := ∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ with hC2_def
+
+  -- Step 1: Apply risk_affine_additive to get closed-form risks
+  have h_risk := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 β a b
+  have h_risk_ref := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 β 0 1
+
+  -- Step 2: Risk at (0,1) is the global minimum β²·C²
+  have h_ref_val : (0 : ℝ)^2 + (1 - 1)^2 + β^2 * C2 = β^2 * C2 := by ring
+
+  -- Step 3: By optimality, risk(a,b) ≤ risk(0,1)
+  have h_opt_01 := h_opt 0 1
+  rw [h_risk, h_risk_ref, h_ref_val] at h_opt_01
+
+  -- Step 4: Apply affine_risk_minimizer to get a=0, b=1
+  have h_min := affine_risk_minimizer a b (β^2 * C2) (by nlinarith [sq_nonneg β])
+
+  -- From h_min: risk ≥ β²C² and equality ↔ a=0 ∧ b=1
+  -- From h_opt_01: risk ≤ β²C²
+  -- Therefore: risk = β²C² and hence a=0 ∧ b=1
+
+  have h_eq : a^2 + (1 - b)^2 + β^2 * C2 = β^2 * C2 := by
+    have h_ge := h_min.1
+    linarith
+
+  exact h_min.2.1 h_eq
+
 /-! ### Main Theorem: Raw Score Bias in Scenario 4 -/
 
 /-- **Raw Score Bias Theorem**: In Scenario 4 (neutral ancestry differences),
