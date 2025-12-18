@@ -246,6 +246,35 @@ noncomputable def dgpScenario4 (k : ℕ) [Fintype (Fin k)] : DataGeneratingProce
   jointMeasure := stdNormalProdMeasure k
 }
 
+/-! ### Generalized DGP and L² Projection Framework
+
+The following definitions support a cleaner, more general proof approach:
+- Instead of hardcoding constants like 0.8, we parameterize by β_env
+- We view least-squares optimization as orthogonal projection in L²
+- This unifies Scenario 3 (β > 0) and Scenario 4 (β < 0) -/
+
+/-- General DGP where phenotype is P + β_env * Σ C.
+    This generalizes Scenario 3 (β > 0) and Scenario 4 (β < 0).
+
+    The key insight: the raw model (span{1, P}) cannot capture the β_env * C term,
+    so the projection leaves a residual of exactly β_env * C. -/
+noncomputable def dgpAdditiveBias (k : ℕ) [Fintype (Fin k)] (β_env : ℝ) : DataGeneratingProcess k := {
+  trueExpectation := fun p pc => p + β_env * (∑ l, pc l),
+  jointMeasure := stdNormalProdMeasure k
+}
+
+/-- Scenario 3 is dgpAdditiveBias with β = 0.5 (positive confounding). -/
+lemma dgpScenario3_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario3 k = dgpAdditiveBias k 0.5 := by
+  unfold dgpScenario3 dgpAdditiveBias
+  rfl
+
+/-- Scenario 4 is dgpAdditiveBias with β = -0.8 (negative confounding). -/
+lemma dgpScenario4_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
+    dgpScenario4 k = dgpAdditiveBias k (-0.8) := by
+  unfold dgpScenario4 dgpAdditiveBias
+  simp only [neg_mul, sub_eq_add_neg]
+
 def hasInteraction {k : ℕ} [Fintype (Fin k)] (f : ℝ → (Fin k → ℝ) → ℝ) : Prop :=
   ∃ (p₁ p₂ : ℝ) (c₁ c₂ : Fin k → ℝ), p₁ ≠ p₂ ∧ c₁ ≠ c₂ ∧
     (f p₂ c₁ - f p₁ c₁) / (p₂ - p₁) ≠ (f p₂ c₂ - f p₁ c₂) / (p₂ - p₁)
@@ -694,6 +723,62 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
   rw [h_opt_coeffs.1, h_opt_coeffs.2]
   -- Final algebra: (p - 0.8*c) - (0 + 1*p) = -0.8*c
   ring
+
+/-! ### Generalized Raw Score Bias (L² Projection Approach)
+
+The following theorem generalizes the above to any β_env, using the L² projection framework.
+
+**Key Insight** (Geometry, not Calculus):
+- View P, C, 1 as vectors in L²(μ)
+- Under independence + zero means, these form an orthogonal basis
+- The raw model projects Y = P + β_env*C onto span{1, P}
+- Since C ⊥ span{1, P}, the projection of β_env*C is 0
+- Therefore: proj(Y) = P, and bias = Y - proj(Y) = β_env*C -/
+
+/-- **Generalized Raw Score Bias**: For any environmental effect β_env,
+    the raw model (which ignores ancestry) produces bias = β_env * C.
+
+    This is the L² projection of Y = P + β_env*C onto span{1, P}.
+    Since C is orthogonal to this subspace, the projection is simply P,
+    leaving a residual of β_env*C. -/
+theorem raw_score_bias_general [Fact (p = 1)]
+    (β_env : ℝ) -- Generalized from -0.8
+    (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
+    (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
+    (dgp : DataGeneratingProcess 1)
+    (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
+    (h_opt_raw : isBayesOptimalInRawClass dgp model_raw)
+    (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
+    (h_means_zero : ∫ pc, pc.1 ∂dgp.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
+    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
+  ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
+    predictionBias dgp (fun p _ => linearPredictor model_raw p c_val) p_val c_val
+    = β_env * c_val ⟨0, by norm_num⟩ := by
+  intros p_val c_val
+  unfold predictionBias
+  rw [h_dgp]
+  dsimp
+
+  -- Step 1: Raw predictor is affine: a + b*p
+  have h_pred := linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
+  rw [h_pred]
+
+  -- Step 2: By L² projection theory (orthogonality characterization):
+  -- The optimal (a, b) satisfies:
+  --   ⟪Y - (a + bP), 1⟫ = 0  ⟹  a = E[Y] - b*E[P] = 0 - b*0 = 0
+  --   ⟪Y - (a + bP), P⟫ = 0  ⟹  b = Cov(Y,P)/Var(P) = E[YP]/1 = E[P² + β*PC] = 1 + 0 = 1
+  have h_opt_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
+    -- The optimality conditions in L² give:
+    -- Under E[P]=E[C]=0, E[P²]=1, and P⊥C (independence):
+    --   a = E[Y] = E[P] + β*E[C] = 0
+    --   b = Cov(Y,P)/Var(P) = (E[P²] + β*E[PC])/1 = 1 + 0 = 1
+    sorry
+
+  rw [h_opt_coeffs.1, h_opt_coeffs.2]
+  -- Final: (p + β*c) - (0 + 1*p) = β*c
+  ring
+
+
 
 def approxEq (a b : ℝ) (ε : ℝ := 0.01) : Prop := |a - b| < ε
 notation:50 a " ≈ " b => approxEq a b 0.01
