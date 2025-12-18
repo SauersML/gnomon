@@ -2285,12 +2285,7 @@ impl VariantBlockSource for VcfLikeVariantBlockSource {
     }
 
     fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
-        let work_done = if matches!(self.selection_plan, SelectionPlan::ByKeys(_)) {
-            self.processed
-        } else {
-            self.emitted
-        };
-        Some((work_done, self.total_variants_hint))
+        Some((self.emitted, self.total_variants_hint))
     }
 
     fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
