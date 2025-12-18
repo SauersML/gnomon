@@ -583,7 +583,18 @@ lemma rawOptimal_implies_orthogonality
   -- Proof omitted to restore compilation
   sorry
 
-/-- Combine the normal equations to get the optimal coefficients for additive bias DGP. -/
+/-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
+
+    **Proof Strategy (Orthogonality Principle)**:
+    The Bayes-optimal predictor Ŷ = a + b*P in the raw class satisfies
+    the normal equations (orthogonality with basis vectors 1 and P):
+      ⟨Y - Ŷ, 1⟩ = 0  ⟹  E[Y] = a + b*E[P] = a  (since E[P] = 0)
+      ⟨Y - Ŷ, P⟩ = 0  ⟹  E[YP] = a*E[P] + b*E[P²] = b  (since E[P]=0, E[P²]=1)
+
+    For Y = P + β*C:
+      E[Y] = E[P] + β*E[C] = 0 + β*0 = 0  ⟹  a = 0
+      E[YP] = E[P²] + β*E[PC] = 1 + β*0 = 1  ⟹  b = 1
+-/
 lemma optimal_coefficients_for_additive_dgp
     (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
     (dgp : DataGeneratingProcess 1)
@@ -596,8 +607,68 @@ lemma optimal_coefficients_for_additive_dgp
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  -- Proof omitted to restore compilation
-  sorry
+  -- Step 1: Get the orthogonality conditions from optimality
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_raw h_linear
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  obtain ⟨h_orth1, h_orthP⟩ := h_orth
+
+  -- Step 2: Compute E[PC] = 0 using independence
+  have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0 :=
+    integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+
+  -- Step 3: Compute E[Y] where Y = P + β*C
+  -- E[Y] = E[P] + β*E[C] = 0 + β*0 = 0
+  have hY_mean : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
+    -- E[P + β*C] = E[P] + β*E[C] = 0 + β*0 = 0 by hP0 and hC0
+    simp only [h_dgp]
+    sorry
+
+  -- Step 4: Compute E[YP] where Y = P + β*C
+  -- E[YP] = E[P²] + β*E[PC] = 1 + β*0 = 1
+  have hYP : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
+    -- E[(P + β*C)*P] = E[P²] + β*E[PC] = 1 + 0 = 1 by hP2 and hPC0
+    simp only [h_dgp]
+    sorry
+
+  -- Step 5: Apply the normal equations to extract a and b
+  -- From h_orth1: E[Y - (a + b*P)] = 0
+  -- ⟹ E[Y] - a - b*E[P] = 0
+  -- ⟹ 0 - a - 0 = 0  (using hY_mean=0, hP0=0)
+  -- ⟹ a = 0
+
+  -- From h_orthP: E[(Y - (a + b*P))*P] = 0
+  -- ⟹ E[YP] - a*E[P] - b*E[P²] = 0
+  -- ⟹ 1 - 0 - b = 0  (using hYP=1, hP0=0, hP2=1)
+  -- ⟹ b = 1
+
+  -- First, expand h_orth1 to get a = E[Y] = 0
+  have ha : a = 0 := by
+    -- By orthogonality: E[Y - (a + bP)] = 0
+    -- E[Y] - a - b*E[P] = 0
+    -- 0 - a - b*0 = 0 (by hY_mean, hP0)
+    -- a = 0
+    have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure
+                  = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
+      sorry -- Integral linearity
+    rw [h_expand, hY_mean, hP0] at h_orth1
+    linarith
+
+  -- Second, expand h_orthP to get b = 1
+  have hb : b = 1 := by
+    -- By orthogonality: E[(Y - (a + bP)) * P] = 0
+    -- E[YP] - a*E[P] - b*E[P²] = 0
+    -- 1 - 0 - b*1 = 0 (by hYP, hP0, hP2)
+    -- b = 1
+    have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure
+                  = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+                    - a * (∫ pc, pc.1 ∂dgp.jointMeasure)
+                    - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
+      sorry -- Integral linearity
+    rw [h_expand, hYP, hP0, hP2, ha] at h_orthP
+    linarith
+
+  exact ⟨ha, hb⟩
 
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
@@ -1054,10 +1125,23 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
   have h_pred := linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
   rw [h_pred]
 
-  -- Step 2: Derive optimal coefficients via comparison argument
-  -- Define a competitor raw model with γ₀₀ = 0, γₘ₀[0] = 1
-  -- Proof omitted to restore compilation
-  sorry
+  -- Step 2: Rewrite h_s4 to show it matches the additive bias DGP form with β = -0.8
+  -- p - 0.8*c = p + (-0.8)*c
+  have h_dgp_add : dgp4.trueExpectation = fun p c => p + (-0.8) * c ⟨0, by norm_num⟩ := by
+    simp only [h_s4]
+    funext p c
+    ring
+
+  -- Step 3: Apply the optimal coefficients lemma
+  have h_coeffs := optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add
+                     h_opt_raw h_raw_struct h_pgs_basis_linear h_indep
+                     h_means_zero.1 h_means_zero.2 h_var_p_one
+  obtain ⟨ha, hb⟩ := h_coeffs
+
+  -- Step 4: Substitute a=0, b=1 into the predictor
+  have hb' : model_raw.γₘ₀ 0 = 1 := hb
+  rw [ha, hb']
+  ring
 
 /-! ### Generalized Raw Score Bias (L² Projection Approach)
 
@@ -1094,8 +1178,24 @@ theorem raw_score_bias_general [Fact (p = 1)]
   rw [h_dgp]
   dsimp
 
-  -- Proof omitted to restore compilation
-  sorry
+  -- Step 1: Use Lemma A to simplify the linear predictor of a raw model
+  -- For a raw model with linear PGS basis, linearPredictor = γ₀₀ + γₘ₀[0] * p
+  have h_pred := linearPredictor_eq_affine_of_raw model_raw h_raw_struct h_pgs_basis_linear
+  rw [h_pred]
+
+  -- Step 2: Apply the optimal coefficients lemma to get γ₀₀ = 0, γₘ₀[0] = 1
+  have h_coeffs := optimal_coefficients_for_additive_dgp model_raw β_env dgp h_dgp
+                     h_opt_raw h_raw_struct h_pgs_basis_linear h_indep
+                     h_means_zero.1 h_means_zero.2 h_var_p_one
+  obtain ⟨ha, hb⟩ := h_coeffs
+
+  -- Step 3: Substitute a=0, b=1 into the predictor
+  -- linearPredictor = 0 + 1 * p = p
+  -- bias = (p + β*c) - p = β*c
+  -- Note: hb has γₘ₀ ⟨0, ⋯⟩ which is definitionally equal to γₘ₀ 0
+  have hb' : model_raw.γₘ₀ 0 = 1 := hb
+  rw [ha, hb']
+  ring
 
 
 
