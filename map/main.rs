@@ -1,4 +1,4 @@
-use super::builtin::{self, BuiltinModelError};
+use super::prefit::{self, BuiltinModelError};
 use super::fit::{FitOptions, HwePcaError, HwePcaModel, LdConfig, LdWindow};
 use super::io::{
     DatasetOutputError, GenotypeDataset, GenotypeIoError, ProjectionOutputPaths, SelectionPlan,
@@ -432,15 +432,15 @@ fn open_dataset(path: &Path) -> Result<GenotypeDataset, MapDriverError> {
 
 fn load_builtin_model(name: &str) -> Result<HwePcaModel, MapDriverError> {
     // Look up the model
-    let model_info = builtin::lookup_model(name).ok_or_else(|| {
-        let available = builtin::list_model_names().join(", ");
-        MapDriverError::BuiltinModel(builtin::BuiltinModelError::UnknownModel(format!(
+    let model_info = prefit::lookup_model(name).ok_or_else(|| {
+        let available = prefit::list_model_names().join(", ");
+        MapDriverError::BuiltinModel(prefit::BuiltinModelError::UnknownModel(format!(
             "'{name}'. Available models: {available}"
         )))
     })?;
 
     // Download if needed (prints its own progress messages)
-    let model_path = builtin::ensure_model(model_info)?;
+    let model_path = prefit::ensure_model(model_info)?;
 
     // Load the model
     let file = std::fs::File::open(&model_path)?;

@@ -1,4 +1,4 @@
-pub mod builtin;
+pub mod prefit;
 pub mod fit;
 pub mod io;
 pub mod main;
