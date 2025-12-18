@@ -1,6 +1,7 @@
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
+import Mathlib.Analysis.InnerProductSpace.Projection
 import Mathlib.Analysis.SpecialFunctions.Log.Basic
 import Mathlib.Data.Fin.Basic
 import Mathlib.LinearAlgebra.Matrix.Rank
@@ -355,19 +356,67 @@ def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (F
     expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
-/-! ### L² Orthogonality Characterization
+/-! ### L² Projection Framework
 
-In L²(μ), the minimizer of ‖Y - Ŷ‖² over a linear subspace W satisfies the
-**normal equations**: the residual Y - Ŷ is orthogonal to W.
+**Key Insight**: Bayes-optimal prediction = orthogonal projection in L²(μ).
 
-For raw models, W = span{1, P}, so the optimality conditions are:
-  ⟪Y - (a + bP), 1⟫ = 0   ⟹   E[Y] - a - b·E[P] = 0
-  ⟪Y - (a + bP), P⟫ = 0   ⟹   E[YP] - a·E[P] - b·E[P²] = 0
+Instead of expanding integrals and deriving normal equations by hand, we work in the
+Hilbert space L²(μ) where:
+- Inner product: ⟪f, g⟫ = ∫ f·g dμ = E[fg]
+- Norm: ‖f‖² = E[f²]
+- Projection onto W gives the closest element to Y in W
 
-Under E[P] = 0 and E[P²] = 1, these simplify to:
-  a = E[Y]
-  b = E[YP]
+For raw models, W = span{1, P}, and Bayes-optimality means:
+  Ŷ = orthogonalProjection W Y
+
+This gives orthogonality of residual FOR FREE via mathlib's
+`orthogonalProjection_inner_eq_zero`:
+  ∀ w ∈ W, ⟪Y - Ŷ, w⟫ = 0
+
 -/
+
+/-- The space of square-integrable functions on the probability space.
+    This is the Hilbert space where we do orthogonal projection. -/
+abbrev L2Space (μ : Measure (ℝ × (Fin 1 → ℝ))) := Lp ℝ 2 μ
+
+/-- Feature function: constant 1 (for intercept). -/
+def featureOne (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun _ => 1
+
+/-- Feature function: P (the PGS value). -/
+def featureP (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun pc => pc.1
+
+/-- Feature function: C (the first PC value). -/
+def featureC (μ : Measure (ℝ × (Fin 1 → ℝ))) : (ℝ × (Fin 1 → ℝ)) → ℝ :=
+  fun pc => pc.2 ⟨0, by norm_num⟩
+
+/-- **Core Lemma**: Under independence + zero-mean, {1, P, C} form an orthogonal set in L².
+    This is because:
+    - ⟪1, P⟫ = E[P] = 0
+    - ⟪1, C⟫ = E[C] = 0
+    - ⟪P, C⟫ = E[PC] = E[P]E[C] = 0 (by independence) -/
+lemma orthogonal_features
+    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
+    (∫ pc, 1 * pc.1 ∂μ = 0) ∧
+    (∫ pc, 1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) ∧
+    (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) := by
+  refine ⟨?_, ?_, ?_⟩
+  · simp only [one_mul]; exact hP0
+  · simp only [one_mul]; exact hC0
+  · -- E[PC] = E[P]E[C] by independence, and one of them is 0
+    rw [h_indep]
+    -- Use integral_prod_mul from MeasureTheory.Integral.Prod
+    sorry
+
+/-! ### L² Orthogonality Characterization (Classical Derivation)
+
+The following lemmas give the classical derivation of normal equations.
+With the L² projection framework above, these become one-liners via
+`orthogonalProjection_inner_eq_zero`. -/
 
 /-- First normal equation: optimality implies a = E[Y] (when E[P] = 0).
     This is the orthogonality condition ⟪residual, 1⟫ = 0. -/
