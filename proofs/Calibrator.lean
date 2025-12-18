@@ -1384,20 +1384,67 @@ noncomputable def bspline_basis_raw (t : ℕ → ℝ) : ℕ → ℕ → ℝ → 
                  else (t (i + p + 2) - x) / right_denom * bspline_basis_raw t (i + 1) p x
     left + right
 
+/-- Local support property: N_{i,p}(x) = 0 outside [t_i, t_{i+p+1}).
+
+    **Geometric insight**: The support of a B-spline grows by one knot interval with
+    each degree increase. N_{i,p} lives on [t_i, t_{i+p+1}). In the recursion for p+1,
+    we combine N_{i,p} (starts at t_i) and N_{i+1,p} (ends at t_{i+p+2}).
+    The union creates the new support [t_i, t_{i+p+2}).
+
+    **Proof by induction on p**:
+    - Base case (p=0): By definition, N_{i,0}(x) = 1 if t_i ≤ x < t_{i+1}, else 0.
+    - Inductive case (p+1): Cox-de Boor recursion combines N_{i,p} and N_{i+1,p}.
+      Both have zero support outside the required interval. -/
+theorem bspline_local_support (t : ℕ → ℝ)
+    (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
+    (i p : ℕ) (x : ℝ)
+    (h_outside : x < t i ∨ t (i + p + 1) ≤ x) :
+    bspline_basis_raw t i p x = 0 := by
+  induction p generalizing i with
+  | zero =>
+    simp only [bspline_basis_raw]
+    split_ifs with h_in
+    · obtain ⟨h_lo, h_hi⟩ := h_in
+      rcases h_outside with h_lt | h_ge
+      · exact absurd h_lo (not_le.mpr h_lt)
+      · simp only [add_zero] at h_ge
+        exact absurd h_hi (not_lt.mpr h_ge)
+    · rfl
+  | succ p ih =>
+    simp only [bspline_basis_raw]
+    rcases h_outside with h_lt | h_ge
+    · -- x < t_i: both terms zero
+      have h_left_zero : bspline_basis_raw t i p x = 0 := ih i (Or.inl h_lt)
+      have h_i1_le : t i ≤ t (i + 1) := h_sorted i (i + 1) (Nat.le_succ i)
+      have h_right_zero : bspline_basis_raw t (i + 1) p x = 0 :=
+        ih (i + 1) (Or.inl (lt_of_lt_of_le h_lt h_i1_le))
+      simp only [h_left_zero, h_right_zero, mul_zero, ite_self, add_zero]
+    · -- x ≥ t_{i+p+2}: both terms zero
+      have h_right_idx : i + 1 + p + 1 = i + p + 2 := by ring
+      have h_right_zero : bspline_basis_raw t (i + 1) p x = 0 := by
+        apply ih (i + 1); right; rw [h_right_idx]; exact h_ge
+      have h_mono : t (i + p + 1) ≤ t (i + p + 2) := h_sorted (i + p + 1) (i + p + 2) (Nat.le_succ _)
+      have h_left_zero : bspline_basis_raw t i p x = 0 := by
+        apply ih i; right; exact le_trans h_mono h_ge
+      simp only [h_left_zero, h_right_zero, mul_zero, ite_self, add_zero]
+
 /-- B-spline basis functions are non-negative everywhere.
+
+    **Geometry of the "Zero-Out" Property** (Key insight from user):
+    The Cox-de Boor recursion uses linear weights: (x - t_i) / (t_{i+p+1} - t_i).
+    These weights become NEGATIVE when x < t_i. The ONLY reason the spline remains
+    non-negative is that the lower-order basis function N_{i,p}(x) "turns off"
+    (becomes exactly zero) precisely when the weight becomes negative.
+
+    Therefore, bspline_local_support is a strict prerequisite for this proof.
 
     **Proof by induction on p**:
     - Base case (p=0): N_{i,0}(x) is either 0 or 1, both ≥ 0.
-    - Inductive case (p+1): The Cox-de Boor recursion is:
-      N_{i,p+1}(x) = α(x) * N_{i,p}(x) + β(x) * N_{i+1,p}(x)
-
-      The product of (non-negative quotient) × (non-negative basis by IH) is non-negative.
-      Outside the support, the basis function is 0.
-
-    Note: The full proof uses bspline_local_support which must be proved first. -/
+    - Inductive case (p+1): For each term α(x) * N_{i,p}(x):
+      * If x ∈ [t_i, t_{i+p+1}): α(x) ≥ 0 and N_{i,p}(x) ≥ 0 by IH
+      * If x ∉ [t_i, t_{i+p+1}): N_{i,p}(x) = 0 by local_support, so product = 0 -/
 theorem bspline_nonneg (t : ℕ → ℝ) (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
     (i p : ℕ) (x : ℝ) : 0 ≤ bspline_basis_raw t i p x := by
-  -- Full proof deferred to after bspline_local_support
   induction p generalizing i with
   | zero =>
     simp only [bspline_basis_raw]
@@ -1406,8 +1453,38 @@ theorem bspline_nonneg (t : ℕ → ℝ) (h_sorted : ∀ i j, i ≤ j → t i �
     · exact le_refl 0
   | succ p ih =>
     simp only [bspline_basis_raw]
-    apply add_nonneg <;> split_ifs <;>
-    · first | exact le_refl 0 | exact mul_nonneg (by sorry) (ih _)
+    apply add_nonneg
+    · -- Left term: (x - t_i) / (t_{i+p+1} - t_i) * N_{i,p}(x)
+      split_ifs with h_denom
+      · exact le_refl 0
+      · by_cases h_in_support : x < t i
+        · -- x < t_i: N_{i,p}(x) = 0 by local support, so product = 0
+          have : bspline_basis_raw t i p x = 0 :=
+            bspline_local_support t h_sorted i p x (Or.inl h_in_support)
+          simp only [this, mul_zero, le_refl]
+        · -- x ≥ t_i: weight (x - t_i)/denom ≥ 0, and N_{i,p}(x) ≥ 0 by IH
+          push_neg at h_in_support
+          have h_num_nn : 0 ≤ x - t i := sub_nonneg.mpr h_in_support
+          have h_denom_pos : 0 < t (i + p + 1) - t i := by
+            have h_le : t i ≤ t (i + p + 1) := h_sorted i (i + p + 1) (by omega)
+            exact lt_of_le_of_ne (sub_nonneg.mpr h_le) (ne_comm.mp h_denom)
+          exact mul_nonneg (div_nonneg h_num_nn (le_of_lt h_denom_pos)) (ih i)
+    · -- Right term: (t_{i+p+2} - x) / (t_{i+p+2} - t_{i+1}) * N_{i+1,p}(x)
+      split_ifs with h_denom
+      · exact le_refl 0
+      · by_cases h_in_support : t (i + p + 2) ≤ x
+        · -- x ≥ t_{i+p+2}: N_{i+1,p}(x) = 0 by local support
+          have h_idx : i + 1 + p + 1 = i + p + 2 := by ring
+          have : bspline_basis_raw t (i + 1) p x = 0 := by
+            apply bspline_local_support t h_sorted (i + 1) p x; right; rw [h_idx]; exact h_in_support
+          simp only [this, mul_zero, le_refl]
+        · -- x < t_{i+p+2}: weight (t_{i+p+2} - x)/denom ≥ 0, and N_{i+1,p}(x) ≥ 0 by IH
+          push_neg at h_in_support
+          have h_num_nn : 0 ≤ t (i + p + 2) - x := sub_nonneg.mpr (le_of_lt h_in_support)
+          have h_denom_pos : 0 < t (i + p + 2) - t (i + 1) := by
+            have h_le : t (i + 1) ≤ t (i + p + 2) := h_sorted (i + 1) (i + p + 2) (by omega)
+            exact lt_of_le_of_ne (sub_nonneg.mpr h_le) (ne_comm.mp h_denom)
+          exact mul_nonneg (div_nonneg h_num_nn (le_of_lt h_denom_pos)) (ih (i + 1))
 
 /-- **Partition of Unity**: B-spline basis functions sum to 1 within the valid domain.
     This is critical for the B-splines in basis.rs to produce valid probability adjustments.
@@ -1420,78 +1497,6 @@ theorem bspline_partition_of_unity (t : ℕ → ℝ) (num_basis : ℕ)
     (h_valid : num_basis > p) :
     (Finset.range num_basis).sum (fun i => bspline_basis_raw t i p x) = 1 := by
   sorry
-
-/-- Local support property: N_{i,p}(x) = 0 outside [t_i, t_{i+p+1}).
-
-    **Proof by induction on p**:
-    - Base case (p=0): By definition, N_{i,0}(x) = 1 if t_i ≤ x < t_{i+1}, else 0.
-      If x < t_i or x ≥ t_{i+1}, then by definition N_{i,0}(x) = 0.
-    - Inductive case (p+1): The Cox-de Boor recursion gives:
-      N_{i,p+1}(x) = α(x) * N_{i,p}(x) + β(x) * N_{i+1,p}(x)
-      where α and β are the linear blending functions.
-
-      By IH, N_{i,p}(x) = 0 outside [t_i, t_{i+p+1})
-              N_{i+1,p}(x) = 0 outside [t_{i+1}, t_{i+p+2})
-
-      If x < t_i: Both terms are 0 (x < t_i < t_{i+1} for sorted knots)
-      If x ≥ t_{i+p+2}: Both terms are 0 (x ≥ t_{i+p+2} > t_{i+p+1} for sorted knots) -/
-theorem bspline_local_support (t : ℕ → ℝ)
-    (h_sorted : ∀ i j, i ≤ j → t i ≤ t j)
-    (i p : ℕ) (x : ℝ)
-    (h_outside : x < t i ∨ t (i + p + 1) ≤ x) :
-    bspline_basis_raw t i p x = 0 := by
-  -- Proof by induction on p
-  induction p generalizing i with
-  | zero =>
-    -- Base case: N_{i,0}(x) = if t_i ≤ x < t_{i+1} then 1 else 0
-    simp only [bspline_basis_raw]
-    -- We need to show: if t_i ≤ x < t_{i+1} then 1 else 0 = 0
-    -- i.e., ¬(t_i ≤ x ∧ x < t_{i+1})
-    split_ifs with h_in
-    · -- Contradiction: h_in says t_i ≤ x < t_{i+1}, but h_outside says otherwise
-      obtain ⟨h_lo, h_hi⟩ := h_in
-      rcases h_outside with h_lt | h_ge
-      · -- x < t_i contradicts t_i ≤ x
-        exact absurd h_lo (not_le.mpr h_lt)
-      · -- t_{i+0+1} ≤ x means t_{i+1} ≤ x, contradicts x < t_{i+1}
-        simp only [add_zero] at h_ge
-        exact absurd h_hi (not_lt.mpr h_ge)
-    · rfl
-  | succ p ih =>
-    -- Inductive case: N_{i,p+1}(x) = left + right
-    simp only [bspline_basis_raw]
-    -- left = (x - t_i) / (t_{i+p+1} - t_i) * N_{i,p}(x)   if denom ≠ 0
-    -- right = (t_{i+p+2} - x) / (t_{i+p+2} - t_{i+1}) * N_{i+1,p}(x)   if denom ≠ 0
-    -- By IH: N_{i,p}(x) = 0 if x < t_i or x ≥ t_{i+p+1}
-    --        N_{i+1,p}(x) = 0 if x < t_{i+1} or x ≥ t_{i+p+2}
-    -- We have h_outside: x < t_i or x ≥ t_{i+(p+1)+1} = t_{i+p+2}
-
-    rcases h_outside with h_lt | h_ge
-    · -- Case: x < t_i
-      -- For left term: N_{i,p}(x) = 0 by IH since x < t_i
-      have h_left_zero : bspline_basis_raw t i p x = 0 :=
-        ih i (Or.inl h_lt)
-      -- For right term: N_{i+1,p}(x) = 0 by IH since x < t_i ≤ t_{i+1}
-      have h_i1_le : t i ≤ t (i + 1) := h_sorted i (i + 1) (Nat.le_succ i)
-      have h_right_zero : bspline_basis_raw t (i + 1) p x = 0 :=
-        ih (i + 1) (Or.inl (lt_of_lt_of_le h_lt h_i1_le))
-      simp only [h_left_zero, h_right_zero, mul_zero, ite_self, add_zero]
-    · -- Case: x ≥ t_{i+p+2}
-      -- For right term: N_{i+1,p}(x) = 0 by IH since x ≥ t_{i+p+2} = t_{(i+1)+p+1}
-      have h_right_idx : i + 1 + p + 1 = i + p + 2 := by ring
-      have h_right_zero : bspline_basis_raw t (i + 1) p x = 0 := by
-        apply ih (i + 1)
-        right
-        rw [h_right_idx]
-        exact h_ge
-      -- For left term: N_{i,p}(x) = 0 by IH since x ≥ t_{i+p+2} > t_{i+p+1}
-      have h_mono : t (i + p + 1) ≤ t (i + p + 2) :=
-        h_sorted (i + p + 1) (i + p + 2) (Nat.le_succ _)
-      have h_left_zero : bspline_basis_raw t i p x = 0 := by
-        apply ih i
-        right
-        exact le_trans h_mono h_ge
-      simp only [h_left_zero, h_right_zero, mul_zero, ite_self, add_zero]
 
 end BSplineFoundations
 
