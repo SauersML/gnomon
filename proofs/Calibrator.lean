@@ -933,18 +933,32 @@ noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)]
 def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
   ∀ v : ι → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
 
-/-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0. -/
+/-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
+
+    **Proof Strategy**: The loss function can be written as a quadratic:
+      L(β) = (1/n) * ‖y - Xβ‖² + λ * βᵀSβ
+           = const + linear(β) + βᵀ H β
+
+    where H = (1/n)XᵀX + λS is the Hessian.
+
+    **Key Steps**:
+    1. XᵀX is positive semidefinite (since vᵀ(XᵀX)v = ‖Xv‖² ≥ 0)
+    2. When X has full rank, XᵀX is actually positive DEFINITE (v≠0 ⟹ Xv≠0 ⟹ ‖Xv‖² > 0)
+    3. S is positive semidefinite by assumption (hS)
+    4. λ > 0 means λS is positive semidefinite
+    5. (PosDef) + (PosSemidef) = (PosDef)
+    6. A quadratic with positive definite Hessian is strictly convex -/
 lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = Fintype.card ι) (hS : IsPosSemidef S) :
+    (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = Fintype.card ι) (_hS : IsPosSemidef S) :
     StrictConvexOn ℝ Set.univ (gaussianPenalizedLoss X y S lam) := by
-  -- The loss is:
-  --   (1/n) * ‖y - Xβ‖² + lam * βᵀSβ
-  -- = (1/n) * (yᵀy - 2yᵀXβ + βᵀXᵀXβ) + lam * βᵀSβ
-  -- = const + linear(β) + βᵀ((1/n)XᵀX + lam*S)β
+  -- The full proof requires:
+  -- 1. Showing the Hessian H = (1/n)XᵀX + λS is positive definite
+  -- 2. Using mathlib's PosDef → StrictConvexOn for quadratics
   --
-  -- Since XᵀX is PosDef (from full rank) and S is PosSemidef,
-  -- (1/n)XᵀX + lam*S is PosDef, making the quadratic term strictly convex.
+  -- The positive definiteness of XᵀX when X has full rank follows from
+  -- transpose_mul_self_posDef above. Combined with hS and hlam > 0,
+  -- the sum H is positive definite, hence the quadratic is strictly convex.
   sorry
 
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
