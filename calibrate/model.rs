@@ -627,6 +627,39 @@ impl TrainedModel {
         };
 
         // --- Optional SE for eta using the penalized Hessian ---
+        //
+        // IMPORTANT: Smoothing bias limitation
+        //
+        // This computes the CONDITIONAL variance: Var(η̂ | u) = x' H⁻¹ x
+        // where H is the penalized Hessian and u represents the spline coefficients.
+        //
+        // This estimate does NOT account for smoothing bias. Penalized splines
+        // systematically:
+        //   - Flatten peaks (estimates too low at maxima)
+        //   - Fill valleys (estimates too high at minima)  
+        //   - Round sharp corners
+        //
+        // The conditional CI centered at η̂ ± 1.96·SE will:
+        //   - Have correct coverage where the true function is smooth
+        //   - UNDER-cover at peaks, valleys, and sharp features (bias pulls
+        //     the estimate away from truth, but SE doesn't account for this)
+        //
+        // The unconditional approach (averaging over u's prior) would give wider
+        // intervals but is "too large where bias is small and too small where
+        // bias is large" (Nychka 1988, RWC Ch. 6).
+        //
+        // For clinical use: treat these SEs as approximate. They are most reliable
+        // in smooth regions of the predictor space and may be overconfident at
+        // extremes of PGS or ancestry.
+        //
+        // See: Ruppert, Wand, Carroll "Semiparametric Regression" Ch. 6.6-6.9
+        //
+        // Note on ridge regularization: If the Hessian was ill-conditioned during
+        // fitting and ridge regularization was applied to make it invertible, the
+        // stored Hessian has artificially increased curvature. This causes the SE
+        // computed here to be a LOWER BOUND on true uncertainty. In sparse regions
+        // of covariate space, the reported SE may be overconfident.
+        //
         let se_eta_opt = if let Some(h) = &self.penalized_hessian {
             if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
                 None
@@ -691,6 +724,53 @@ impl TrainedModel {
         Ok(mean)
     }
 
+    /// Predicts outcomes using the posterior mean (via Gauss-Hermite quadrature).
+    ///
+    /// Unlike `predict` which returns g⁻¹(η̂) (the posterior mode), this method
+    /// returns E[g⁻¹(η)] where η ~ N(η̂, σ²). This is the Bayes-optimal predictor
+    /// that minimizes squared prediction error (Brier score).
+    ///
+    /// For the logit link, this means predictions at extreme values are pulled
+    /// slightly toward 50%, which is statistically correct behavior given
+    /// parameter uncertainty.
+    ///
+    /// Requires the penalized Hessian to be stored in the model. If unavailable,
+    /// falls back to mode-based predictions (equivalent to `predict`).
+    ///
+    /// For identity link (Gaussian), mean equals mode, so this is identical to `predict`.
+    pub fn predict_mean(
+        &self,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<Array1<f64>, ModelError> {
+        if matches!(self.config.model_family, ModelFamily::Survival(_)) {
+            return Err(ModelError::UnsupportedForSurvival("predict_mean"));
+        }
+
+        let (eta, mode_mean, _, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
+        let link_function = self.ensure_gam_link("predict_mean")?;
+
+        match link_function {
+            LinkFunction::Identity => {
+                // For identity link, mean = mode, no quadrature needed
+                Ok(mode_mean)
+            }
+            LinkFunction::Logit => {
+                // Use quadrature if SE is available
+                match se_eta_opt {
+                    Some(se_eta) => {
+                        Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(&eta, &se_eta))
+                    }
+                    None => {
+                        // No SE available, fall back to mode
+                        Ok(mode_mean)
+                    }
+                }
+            }
+        }
+    }
+
     /// Predicts outcomes applying the optional post-process calibrator.
     /// Baseline predictions are computed first, then the calibrator adjusts them.
     pub fn predict_calibrated(
@@ -718,6 +798,11 @@ impl TrainedModel {
             LinkFunction::Logit => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };
+        // NOTE: se_in is the conditional SE from the base model's Hessian.
+        // It does NOT account for smoothing bias (see comment in predict_detailed).
+        // The calibrator uses this as a feature but doesn't propagate its own
+        // coefficient uncertainty - the final prediction inherits only the base
+        // model's approximate uncertainty.
         let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
 
         let preds = crate::calibrate::calibrator::predict_calibrator(
