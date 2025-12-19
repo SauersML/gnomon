@@ -37,6 +37,43 @@ use std::sync::Arc;
 /// Backend type for NUTS - uses f64 for numerical precision
 pub type NutsBackend = Autodiff<NdArray<f64>>;
 
+/// Solve L^T * X = I where L is lower triangular.
+///
+/// Returns X = L^{-T} (the inverse transpose of L).
+/// Uses back-substitution since L^T is upper triangular.
+///
+/// This is the correct way to compute the whitening transform matrix:
+/// Given H = L L^T (Cholesky), we need W where W W^T = H^{-1}
+/// Since H^{-1} = L^{-T} L^{-1}, we have W = L^{-T}
+fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> {
+    // L^T is upper triangular, so we solve L^T * X = I via back-substitution
+    let mut result = Array2::<f64>::zeros((dim, dim));
+
+    // For each column of the identity (each column of result)
+    for col in 0..dim {
+        // Solve L^T * x = e_col (unit vector)
+        // Back-substitution: start from last row, work up
+        for i in (0..dim).rev() {
+            let mut sum = if i == col { 1.0 } else { 0.0 }; // e_col[i]
+
+            // Subtract contributions from already-solved entries
+            for j in (i + 1)..dim {
+                sum -= l[[j, i]] * result[[j, col]]; // L^T[i,j] = L[j,i]
+            }
+
+            // Divide by diagonal (L^T[i,i] = L[i,i])
+            let diag = l[[i, i]];
+            if diag.abs() < 1e-15 {
+                result[[i, col]] = 0.0; // Regularize near-zero diagonal
+            } else {
+                result[[i, col]] = sum / diag;
+            }
+        }
+    }
+
+    result
+}
+
 /// Shared data for NUTS posterior (wrapped in Arc to prevent cloning).
 ///
 /// This struct holds read-only data that is shared across all chains.
@@ -104,19 +141,21 @@ impl NutsPosterior {
         let dim = x.ncols();
 
         // Use faer for numerically stable Cholesky decomposition of H
-        // H = U U^T where U is lower triangular
+        // H = L_H L_H^T where L_H is lower triangular
         let hessian_owned = hessian.to_owned();
         let chol_factor = hessian_owned
             .cholesky(Side::Lower)
             .map_err(|e| format!("Hessian Cholesky decomposition failed: {:?}", e))?;
 
         // We need L where L L^T = H^{-1}
-        // Since H = U U^T, we have H^{-1} = U^{-T} U^{-1}
-        // So L = U^{-T} (the inverse transpose of the Cholesky factor)
-        // We compute this by solving U^T L = I
-        let identity = Array2::<f64>::eye(dim);
-        let l_inv_t = chol_factor.solve_mat(&identity);
-        let chol_t = l_inv_t.t().to_owned();
+        // Since H = L_H L_H^T, we have H^{-1} = L_H^{-T} L_H^{-1}
+        // So L = L_H^{-T} (the inverse transpose of the Cholesky factor)
+        //
+        // To get L_H^{-T}, we solve L_H^T * X = I using back-substitution
+        // Since L_H is lower triangular, L_H^T is upper triangular
+        let l_h = chol_factor.lower_triangular();
+        let chol = solve_upper_triangular_transpose(&l_h, dim);
+        let chol_t = chol.t().to_owned();
 
         let data = SharedData {
             x: Arc::new(x.to_owned()),
@@ -130,7 +169,7 @@ impl NutsPosterior {
 
         Ok(Self {
             data,
-            chol: l_inv_t,
+            chol,
             chol_t,
             is_logit,
         })
@@ -636,5 +675,42 @@ mod tests {
         // Verify Arc::ptr_eq - same underlying allocation
         assert!(Arc::ptr_eq(&target1.data.x, &target2.data.x));
         assert!(Arc::ptr_eq(&target1.data.y, &target2.data.y));
+    }
+
+    #[test]
+    fn test_whitening_transform_is_correct() {
+        // Create a non-trivial positive definite Hessian
+        let hessian = ndarray::array![[4.0, 1.0], [1.0, 3.0]];
+        let dim = 2;
+
+        // Compute the whitening transform via our function
+        let hessian_owned = hessian.clone();
+        let chol_factor = hessian_owned
+            .cholesky(faer::Side::Lower)
+            .expect("Cholesky should succeed");
+        let l_h = chol_factor.lower_triangular();
+        let chol = solve_upper_triangular_transpose(&l_h, dim);
+
+        // Verify: L L^T should equal H^{-1}
+        let llt = chol.dot(&chol.t());
+
+        // Compute H^{-1} explicitly for comparison
+        let det = 4.0 * 3.0 - 1.0 * 1.0; // = 11
+        let h_inv = ndarray::array![
+            [3.0 / det, -1.0 / det],
+            [-1.0 / det, 4.0 / det]
+        ];
+
+        // Check each element
+        for i in 0..dim {
+            for j in 0..dim {
+                let diff = (llt[[i, j]] - h_inv[[i, j]]).abs();
+                assert!(
+                    diff < 1e-10,
+                    "Whitening transform error at [{},{}]: got {}, expected {}",
+                    i, j, llt[[i, j]], h_inv[[i, j]]
+                );
+            }
+        }
     }
 }
