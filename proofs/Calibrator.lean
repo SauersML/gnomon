@@ -1203,7 +1203,11 @@ lemma linearPredictor_eq_affine_of_raw
     That requires formalizing IsBayesOptimalInRawClass → orthogonality, which is harder. -/
 lemma risk_affine_additive
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (_h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
@@ -1211,34 +1215,52 @@ lemma risk_affine_additive
     (β a b : ℝ) :
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-  -- Let u = 1 - b
-  set u := 1 - b with hu
-
-  -- The integrand is: (uP + βC - a)²
-  -- = u²P² + β²C² + a² + 2uβPC - 2uaP - 2aβC
-  --
-  -- Integrating term by term:
-  -- ∫ u²P² = u² ∫ P² = u² · 1 = (1-b)²
-  -- ∫ β²C² = β² ∫ C²
-  -- ∫ a² = a² (since μ is prob measure)
-  -- ∫ 2uβPC = 2uβ · 0 = 0 (by hPC0)
-  -- ∫ -2uaP = -2ua · 0 = 0 (by hP0)
-  -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
-
-  -- The formal proof requires:
-  -- 1. Rewriting the integrand as a sum of terms
-  -- 2. Applying integral_add for each term (requires integrability)
-  -- 3. Using the moment hypotheses to simplify
-
-  -- For now, we leave this with a sketch. The algebraic manipulations are tedious
-  -- but purely mechanical once integrability is established.
-  sorry
+  have h_integrand_sq :
+      Integrable (fun pc => (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) ^ 2) μ := by
+    let u := 1 - b
+    have h_expand : (fun pc => (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))) =
+                    (fun pc => u * pc.1 + β * pc.2 ⟨0, by norm_num⟩ - a) := by funext pc; ring
+    rw [h_expand]
+    let f1 := fun pc => u * pc.1
+    let f2 := fun pc => β * pc.2 ⟨0, by norm_num⟩
+    let f3 := fun _ => -a
+    have hf1 : Integrable f1 μ := hP_int.const_mul u
+    have hf2 : Integrable f2 μ := hC_int.const_mul β
+    have hf3 : Integrable f3 μ := integrable_const (-a)
+    exact (hf1.add hf2).add hf3 |>.pow 2
+  calc
+    ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ
+    = ∫ pc, ((1-b)*pc.1 + β*pc.2 ⟨0, by norm_num⟩ - a)^2 ∂μ := by
+        refine integral_congr_ae ?_; filter_upwards with pc; ring
+  _ = ∫ pc, (a^2 + (1-b)^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2
+             - 2*a*(1-b)*pc.1 - 2*a*β*pc.2 ⟨0, by norm_num⟩
+             + 2*(1-b)*β*pc.1*pc.2 ⟨0, by norm_num⟩) ∂μ := by
+        refine integral_congr_ae ?_; filter_upwards with pc; ring
+  _ = a^2 + (1-b)^2 + β^2*(∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
+        have h_const_a : Integrable (fun _ => a^2) μ := integrable_const _
+        have h_p2 : Integrable (fun pc => (1-b)^2 * pc.1^2) μ := hP2_int.const_mul _
+        have h_c2 : Integrable (fun pc => β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul _
+        have h_p : Integrable (fun pc => -2*a*(1-b)*pc.1) μ := hP_int.const_mul _
+        have h_c : Integrable (fun pc => -2*a*β*pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul _
+        have h_pc : Integrable (fun pc => 2*(1-b)*β*pc.1*pc.2 ⟨0, by norm_num⟩) μ := hPC_int.const_mul _
+        simp_rw [integral_add (h_p2.add h_c2) (h_const_a),
+                 integral_add h_p2 h_c2,
+                 integral_sub h_const_a (h_p.add h_c),
+                 integral_add h_p h_c,
+                 integral_add ((h_const_a.add h_p2).add h_c2)
+                              (((h_p.neg.add h_c.neg)).add h_pc)]
+        simp [integral_const, integral_const_mul, hP0, hC0, hPC0, hP2]
+        ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
 lemma risk_affine_scenario4
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
@@ -1248,17 +1270,24 @@ lemma risk_affine_scenario4
   -- p - 0.8*c = p + (-0.8)*c, so this is risk_affine_additive with β = -0.8
   have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 :=
     integral_mul_fst_snd_eq_zero μ h_indep hP0 hC0
+  have hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) μ := by
+    -- This should follow from independence and L2 integrability of P and C
+    let μP := μ.map Prod.fst
+    let μC := μ.map Prod.snd
+    haveI : IsProbabilityMeasure μP := Measure.isProbabilityMeasure_map measurable_fst.aemeasurable
+    haveI : IsProbabilityMeasure μC := Measure.isProbabilityMeasure_map measurable_snd.aemeasurable
+    rw [h_indep]
+    exact (hP_int.ae_strongly_measurable.prod_mul hC_int.ae_strongly_measurable).integrable
 
   -- Rewrite to match risk_affine_additive form
   have h_rewrite : ∀ pc : ℝ × (Fin 1 → ℝ),
       (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) =
       (pc.1 + (-0.8) * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) := by
     intro pc; ring
-
   simp_rw [h_rewrite]
 
   -- Apply the general lemma
-  have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 (-0.8) a b
+  have h_gen := risk_affine_additive μ hP_int hC_int hP2_int hC2_int hPC_int hP0 hC0 hPC0 hP2 (-0.8) a b
 
   -- Simplify (-0.8)² = 0.64
   simp only [neg_mul] at h_gen ⊢
