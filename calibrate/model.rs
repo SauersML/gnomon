@@ -172,6 +172,10 @@ pub struct ModelConfig {
     /// Null-space transformation matrices for PC main effects (unpenalized part).
     /// Maps PC name to Z_null (columns span the penalty null space after dropping intercept).
     pub pc_null_transforms: HashMap<String, Array2<f64>>,
+    /// Enable MCMC posterior sampling after PIRLS (expensive but honest uncertainty quantification).
+    /// When true, runs NUTS sampler to generate posterior samples stored in TrainedModel.
+    #[serde(default)]
+    pub mcmc_enabled: bool,
     #[serde(default)]
     pub survival: Option<SurvivalModelConfig>,
 }
@@ -207,6 +211,7 @@ impl ModelConfig {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         }
     }
@@ -254,6 +259,8 @@ struct ModelConfigSerde {
     interaction_orth_alpha: HashMap<String, Array2<f64>>,
     pc_null_transforms: HashMap<String, Array2<f64>>,
     #[serde(default)]
+    mcmc_enabled: bool,
+    #[serde(default)]
     survival: Option<SurvivalModelConfig>,
 }
 
@@ -279,6 +286,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            mcmc_enabled,
             survival,
         } = helper;
 
@@ -305,6 +313,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            mcmc_enabled,
             survival,
         }
     }
@@ -331,6 +340,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            mcmc_enabled,
             survival,
         } = config;
 
@@ -359,6 +369,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_centering_means,
             interaction_orth_alpha,
             pc_null_transforms,
+            mcmc_enabled,
             survival,
         }
     }
@@ -435,6 +446,10 @@ pub struct TrainedModel {
     /// Optional registry of companion survival models keyed by handle reference.
     #[serde(default)]
     pub survival_companions: HashMap<String, SurvivalModelArtifacts>,
+    /// Optional MCMC posterior samples [n_samples, n_coeffs] in original coefficient space.
+    /// Present when mcmc_enabled=true during training. Enables honest uncertainty quantification.
+    #[serde(default)]
+    pub mcmc_samples: Option<Array2<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1812,6 +1827,7 @@ mod tests {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+                mcmc_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -1831,6 +1847,7 @@ mod tests {
             calibrator: None,
             survival: None,
             survival_companions: HashMap::new(),
+            mcmc_samples: None,
         };
 
         // --- Define Test Points ---
@@ -1957,6 +1974,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
+            mcmc_enabled: false,
             survival: Some(SurvivalModelConfig {
                 baseline_basis: BasisConfig {
                     num_knots: basis.knot_vector.len(),
@@ -1979,6 +1997,7 @@ mod tests {
             calibrator: None,
             survival: Some(artifacts),
             survival_companions: HashMap::new(),
+            mcmc_samples: None,
         };
 
         let result = model
@@ -2042,6 +2061,7 @@ mod tests {
                 pc_null_transforms: HashMap::new(),
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
+                mcmc_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -2060,6 +2080,7 @@ mod tests {
             calibrator: None,
             survival: None,
             survival_companions: HashMap::new(),
+            mcmc_samples: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -2154,6 +2175,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -2242,6 +2264,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -2305,6 +2328,7 @@ mod tests {
                 pc_null_transforms: pc_null_transforms.clone(),
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
+                mcmc_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -2376,6 +2400,7 @@ mod tests {
             calibrator: None,
             survival: None,
             survival_companions: HashMap::new(),
+            mcmc_samples: None,
         };
 
         // Create a temporary file for testing

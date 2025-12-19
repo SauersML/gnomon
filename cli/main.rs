@@ -234,6 +234,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 pc_null_transforms: HashMap::new(),
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -322,6 +323,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 pc_null_transforms: HashMap::new(),
+                mcmc_enabled: false,
                 survival: Some(survival_config),
             };
 

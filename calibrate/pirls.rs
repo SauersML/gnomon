@@ -2767,6 +2767,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3387,6 +3388,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3521,6 +3523,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3656,6 +3659,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 

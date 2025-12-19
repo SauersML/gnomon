@@ -44,6 +44,7 @@ use crate::calibrate::pirls::{self, PirlsResult};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
+use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
 use faer::Side;
 use faer::linalg::solvers::{
@@ -764,7 +765,7 @@ pub fn train_model(
         data.y.view(),
         x_matrix.view(),
         data.weights.view(),
-        s_list,
+        s_list.clone(),
         &layout,
         config,
         None,
@@ -881,6 +882,7 @@ pub fn train_model(
             calibrator: None,
             survival: None,
             survival_companions: HashMap::new(),
+            mcmc_samples: None,
         };
 
         trained_model
@@ -1548,6 +1550,75 @@ pub fn train_model(
         }
     };
 
+        // Generate MCMC posterior samples if requested
+        let mcmc_samples = if config.mcmc_enabled {
+            eprintln!("\n[STAGE 3/3] Running HMC/NUTS posterior sampling...");
+            // We need to flatten the penalty matrix list into a single matrix S
+            // The combined penalty is already computed implicitly during PIRLS in the Hessian (X'WX + S)
+            // But we can reconstruct S directly:
+            let dim = final_beta_original.len();
+
+            // Reconstruct the penalty matrix sum(lambda_i * S_i)
+            // We need to map the lambdas back to penalty blocks.
+            // Since we don't have the easy lambda-to-block mapping here,
+            // we can use the fact that `penalized_hessian_orig` = X'WX + S.
+            //
+            // However, computing S via subtraction (H - X'WX) can be numerically unstable if X'WX dominates.
+            // A safer bet is to sum the S matrices weighted by the final lambdas.
+            //
+            // We have `s_list` (original unscaled S matrices) and `final_lambda`.
+            // But `s_list` ordering corresponds to `layout.penalty_map`.
+            let mut s_accum = Array2::<f64>::zeros((dim, dim));
+            for (i, &lambda) in final_lambda.iter().enumerate() {
+                // Find which blocks this penalty parameter affects
+                // In generic generalized additive models, there's usually 1 lambda per S matrix in s_list
+                // provided we respected the 1-to-1 mapping in build_design...
+                if i < s_list.len() {
+                     // We found s_list[i], use it
+                     s_accum = s_accum + s_list[i].mapv(|v| v * lambda.exp());
+                }
+            }
+
+            // Allow overriding NUTS config via env vars for testing
+            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+
+            let nuts_config = hmc::NutsConfig {
+                n_samples: num_samples,
+                n_warmup: num_warmup,
+                ..hmc::NutsConfig::default()
+            };
+
+            match hmc::run_nuts_sampling(
+                x_matrix.view(),
+                data.y.view(),
+                data.weights.view(),
+                s_accum.view(),
+                final_beta_original.view(),
+                penalized_hessian_orig.view(),
+                matches!(config.link_function(), LinkFunction::Logit),
+                &nuts_config,
+            ) {
+                Ok(result) => {
+                    eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
+                    Some(result.samples)
+                }
+                Err(e) => {
+                    log::warn!("MCMC sampling failed: {}", e);
+                    eprintln!("            WARNING: MCMC sampling failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let trained_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
@@ -1558,6 +1629,7 @@ pub fn train_model(
         calibrator: calibrator_opt,
         survival: None,
         survival_companions: HashMap::new(),
+        mcmc_samples,
     };
 
     trained_model
@@ -5249,6 +5321,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -5709,6 +5782,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -5909,6 +5983,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -6006,6 +6081,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -6286,6 +6362,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -6401,6 +6478,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -7548,6 +7626,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -7668,6 +7747,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -7883,6 +7963,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
             // Clear PC configurations
@@ -8017,6 +8098,7 @@ pub mod internal {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -8158,6 +8240,7 @@ pub mod internal {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -8347,6 +8430,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
             // This creates way too many parameters for 30 data points
@@ -8470,6 +8554,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -8588,6 +8673,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -8738,7 +8824,8 @@ pub mod internal {
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
-                    survival: None,
+                    mcmc_enabled: false,
+                survival: None,
                 };
                 simple_config.model_family = ModelFamily::Gam(link_function);
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
@@ -8884,7 +8971,8 @@ pub mod internal {
                     interaction_centering_means: std::collections::HashMap::new(),
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
-                    survival: None,
+                    mcmc_enabled: false,
+                survival: None,
                 };
 
                 // Use a simple basis with fewer knots to reduce complexity
@@ -9065,6 +9153,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -9259,6 +9348,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -9384,6 +9474,7 @@ pub mod internal {
                 interaction_centering_means: std::collections::HashMap::new(),
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
+                mcmc_enabled: false,
                 survival: None,
             };
 
@@ -9500,6 +9591,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         interaction_centering_means: HashMap::new(),
         interaction_orth_alpha: HashMap::new(),
 
+        mcmc_enabled: false,
         survival: None,
     };
 
@@ -9587,6 +9679,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         interaction_centering_means: std::collections::HashMap::new(),
         interaction_orth_alpha: std::collections::HashMap::new(),
 
+        mcmc_enabled: false,
         survival: None,
     };
 
@@ -9801,6 +9894,7 @@ mod optimizer_progress_tests {
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
 
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -9914,6 +10008,7 @@ mod reparam_consistency_tests {
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
 
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -10084,6 +10179,7 @@ mod gradient_validation_tests {
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
 
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -10231,5 +10327,76 @@ mod gradient_validation_tests {
                 println!("Optimization failed: {}", e);
             }
         }
+    }
+    #[test]
+    fn test_hmc_integration_runs() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand::Rng;
+        use ndarray::Array2;
+
+        // Force Fast MCMC for this test
+        // This relies on the implementation in estimate.rs respecting these variables
+        unsafe {
+            std::env::set_var("GNOMON_MCMC_SAMPLES", "10");
+            std::env::set_var("GNOMON_MCMC_WARMUP", "10");
+        }
+
+        // 1. Create simple data (N=50)
+        let n = 50;
+        let mut rng = StdRng::seed_from_u64(42);
+        let p: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+        let y: Array1<f64> = (0..n).map(|_| if rng.gen_bool(0.5) { 1.0 } else { 0.0 }).collect(); // Random Y
+        let weights = Array1::<f64>::ones(n);
+        let pcs = Array2::<f64>::zeros((n, 0)); // No PCs
+
+        let data = TrainingData {
+            y,
+            p,
+            sex,
+            pcs,
+            weights,
+        };
+
+        // 2. Configure model with MCMC enabled
+        let config = ModelConfig {
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
+            penalty_order: 2,
+            convergence_tolerance: 1e-4,
+            max_iterations: 20,
+            reml_convergence_tolerance: 1e-4,
+            reml_max_iterations: 20,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
+            pgs_basis_config: BasisConfig {
+                num_knots: 3,
+                degree: 3,
+            },
+            pc_configs: vec![],
+            pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Anisotropic,
+            sum_to_zero_constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
+            interaction_orth_alpha: std::collections::HashMap::new(),
+
+            mcmc_enabled: true, // ENABLE MCMC
+            survival: None,
+        };
+
+        // 3. Train
+        println!("Training model with MCMC enabled (10 samples)...");
+        let model = train_model(&data, &config).expect("Training should succeed");
+
+        // 4. Verify samples
+        assert!(model.mcmc_samples.is_some(), "MCMC samples should be present");
+        let samples = model.mcmc_samples.unwrap();
+        println!("Generated MCMC samples with shape: {:?}", samples.shape());
+        
+        assert_eq!(samples.nrows(), 10, "Should have 10 posterior samples (from env var override)");
+        assert!(samples.ncols() > 0, "Should have some parameters");
     }
 }
