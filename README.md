@@ -1,10 +1,6 @@
 # gnomon
 <img width="282" height="154" alt="Gnomon Logo" src="https://github.com/user-attachments/assets/73185e7e-09eb-4bc9-a82c-62d7102f4341" />
 
-**Calibrated polygenic scores at biobank scale**
-
-*The gnomon casts light on genetic risk*
-
 [![Lean Proofs](https://github.com/SauersML/gnomon/actions/workflows/prover.yml/badge.svg)](https://github.com/SauersML/gnomon/actions/workflows/prover.yml)
 
 </div>
