@@ -16,4 +16,5 @@ pub mod hull;
 pub mod model;
 pub mod pirls;
 pub mod survival;
-// No global functions here; settings are scoped to owning modules.
+pub mod quadrature;
+pub mod hmc;

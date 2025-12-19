@@ -85,6 +85,14 @@ default = []
 no-inline-profiling = []
 survival-data = []
 
+[dependencies.mini-mcmc]
+version = "0.8.0"
+
+[dependencies.burn]
+version = "0.18"
+default-features = false
+features = ["ndarray", "autodiff"]
+
 [lints.rust]
 unused_variables = "deny"
 dead_code = "deny"

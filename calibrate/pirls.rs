@@ -823,6 +823,15 @@ pub enum PirlsStatus {
 ///    - For `LinkFunction::Logit` (Binomial): This is -2 * log-likelihood, the binomial deviance.
 /// * `final_weights`: The final IRLS weights at convergence.
 /// * `reparam_result`: Contains the transformation matrix (`qs`) and other reparameterization data.
+///
+/// # Point Estimate: Posterior Mode (MAP)
+///
+/// The coefficients returned by PIRLS are the **posterior mode** (Maximum A Posteriori estimate),
+/// not the posterior mean. For risk predictions, the posterior mean is theoretically preferable
+/// because it minimizes Brier score / squared prediction error. If the posterior is symmetric,
+/// mode ≈ mean and it doesn't matter. For asymmetric posteriors (rare events, boundary effects),
+/// the mean would give more accurate calibrated probabilities. To obtain the posterior mean,
+/// one would need MCMC sampling from the posterior and average f(patient, β) over samples.
 #[derive(Clone)]
 pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
@@ -2758,6 +2767,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3378,6 +3388,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3512,6 +3523,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
@@ -3647,6 +3659,7 @@ mod tests {
             pc_null_transforms: HashMap::new(),
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None,
         };
 
