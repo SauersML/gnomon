@@ -356,7 +356,7 @@ def IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] 
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 /-- Bayes-optimal among normalized score models only (L² projection onto additive subspace). -/
-def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+def IsBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   IsNormalizedScoreModel model ∧
   ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
