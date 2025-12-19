@@ -193,8 +193,9 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
   (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
   IsIdentifiable (fit p k sp n data lambda) data := by sorry
 
-def IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
-  (∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0) ∧ (∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0)
+structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
+  f₀ₗ_zero : ∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0
+  fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
 def IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
   ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
@@ -340,14 +341,14 @@ noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGe
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
 /-- Bayes-optimal in the full GAM class (quantifies over all models). -/
-def isBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
+def IsBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   ∀ (m : PhenotypeInformedGAM p k sp), expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
         expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 /-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
     This is the correct predicate for Scenario 4, where the raw class cannot represent
     the true PC main effect. -/
-def isBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+def IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   IsRawScoreModel model ∧
   ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
@@ -355,7 +356,7 @@ def isBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] 
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 /-- Bayes-optimal among normalized score models only (L² projection onto additive subspace). -/
-def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+def IsBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   IsNormalizedScoreModel model ∧
   ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
@@ -601,7 +602,7 @@ lemma optimal_slope_eq_covariance_of_normalized_p
     - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
-    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
     (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1) :
     let a := model.γ₀₀
@@ -683,7 +684,7 @@ lemma optimal_coefficients_for_additive_dgp
     (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
     (dgp : DataGeneratingProcess 1)
     (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
-    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
     (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
@@ -757,13 +758,13 @@ lemma optimal_coefficients_for_additive_dgp
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
   (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
-  (proj : PhenotypeInformedGAM p k sp) (h_optimal : isBayesOptimalInClass dgp proj) :
+  (proj : PhenotypeInformedGAM p k sp) (h_optimal : IsBayesOptimalInClass dgp proj) :
   IsNormalizedScoreModel proj := by sorry
 
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : isBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : IsBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
   intros m _h_opt
   rcases h_additive with ⟨f, g, h_fn_struct⟩
   exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m _h_opt
@@ -780,7 +781,7 @@ theorem prediction_causality_tradeoff_linear_case (p sp : ℕ) [Fintype (Fin p)]
     (h_env : dgp_env.environmentalEffect = fun c => 3 * (c ⟨0, by norm_num⟩))
     (h_confounding : ∫ pc, pc.1 * (pc.2 ⟨0, by norm_num⟩) ∂dgp_env.to_dgp.jointMeasure ≠ 0)
     (model : PhenotypeInformedGAM p 1 sp)
-    (h_opt : isBayesOptimalInClass dgp_env.to_dgp model) :
+    (h_opt : IsBayesOptimalInClass dgp_env.to_dgp model) :
     model.γₘ₀ ⟨0, hp_pos⟩ ≠ 2 := by sorry
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
@@ -1362,7 +1363,7 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
     -- FIXED: Now using class-restricted optimality
-    (h_opt_raw : isBayesOptimalInRawClass dgp4 model_raw)
+    (h_opt_raw : IsBayesOptimalInRawClass dgp4 model_raw)
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
@@ -1418,7 +1419,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp : DataGeneratingProcess 1)
     (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
-    (h_opt_raw : isBayesOptimalInRawClass dgp model_raw)
+    (h_opt_raw : IsBayesOptimalInRawClass dgp model_raw)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
@@ -1481,8 +1482,8 @@ noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProc
 theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
     (hk_pos : k > 0)
-    (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : isBayesOptimalInClass dgp1 model_norm)
-    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : isBayesOptimalInClass dgp1 model_oracle) :
+    (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInClass dgp1 model_norm)
+    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle) :
   let predict_norm := fun p c => linearPredictor model_norm p c
   let predict_oracle := fun p c => linearPredictor model_oracle p c
   expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
@@ -1498,7 +1499,7 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     The approximate version was unprovable from the given hypotheses. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
-    (model : PhenotypeInformedGAM 1 k 1) (h_opt : isBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model) :
+    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by sorry
@@ -1515,7 +1516,7 @@ structure DGPWithLatentRisk (k : ℕ) where
     This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : isBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1) :
+    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
@@ -1592,8 +1593,8 @@ theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : isBayesOptimalInClass dgp1.to_dgp model1) :
-  ¬ isBayesOptimalInClass dgp2.to_dgp model1 := by
+    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1) :
+  ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
   have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
     intro h_eq_fn
