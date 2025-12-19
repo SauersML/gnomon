@@ -347,7 +347,7 @@ def isBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
 /-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
     This is the correct predicate for Scenario 4, where the raw class cannot represent
     the true PC main effect. -/
-def isBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+def IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   IsRawScoreModel model ∧
   ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
@@ -601,7 +601,7 @@ lemma optimal_slope_eq_covariance_of_normalized_p
     - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
-    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
     (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1) :
     let a := model.γ₀₀
@@ -683,7 +683,7 @@ lemma optimal_coefficients_for_additive_dgp
     (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
     (dgp : DataGeneratingProcess 1)
     (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
-    (h_opt : isBayesOptimalInRawClass dgp model)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
     (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
@@ -1362,7 +1362,7 @@ theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
     -- FIXED: Now using class-restricted optimality
-    (h_opt_raw : isBayesOptimalInRawClass dgp4 model_raw)
+    (h_opt_raw : IsBayesOptimalInRawClass dgp4 model_raw)
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
@@ -1418,7 +1418,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp : DataGeneratingProcess 1)
     (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
-    (h_opt_raw : isBayesOptimalInRawClass dgp model_raw)
+    (h_opt_raw : IsBayesOptimalInRawClass dgp model_raw)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
     (h_var_p_one : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
