@@ -17,45 +17,63 @@
 //! We override `unnorm_logp_and_grad` to compute gradients analytically using
 //! ndarray, avoiding burn's autodiff overhead. The gradient computation mirrors
 //! the true log-posterior gradient (not the PIRLS working gradient).
+//!
+//! # Memory Efficiency
+//!
+//! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
+//! sharing across chains without duplication when mini-mcmc clones the target.
 
 use burn::backend::{Autodiff, NdArray};
 use burn::prelude::*;
 use burn::tensor::TensorData;
+use crate::calibrate::faer_ndarray::FaerCholesky;
+use faer::Side;
 use mini_mcmc::distributions::GradientTarget;
 use mini_mcmc::nuts::NUTS;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Backend type for NUTS - uses f64 for numerical precision
 pub type NutsBackend = Autodiff<NdArray<f64>>;
 
-/// Whitened log-posterior target with analytical gradients.
+/// Shared data for NUTS posterior (wrapped in Arc to prevent cloning).
 ///
-/// Stores data as ndarray (f64) and computes gradients analytically,
-/// overriding mini-mcmc's default autodiff behavior.
+/// This struct holds read-only data that is shared across all chains.
+/// Using Arc prevents memory explosion when mini-mcmc clones the target.
 #[derive(Clone)]
-pub struct NutsPosterior {
+struct SharedData {
     /// Design matrix X [n_samples, dim]
-    x: Array2<f64>,
+    x: Arc<Array2<f64>>,
     /// Response vector y [n_samples]
-    y: Array1<f64>,
+    y: Arc<Array1<f64>>,
     /// Prior weights [n_samples]
-    weights: Array1<f64>,
+    weights: Arc<Array1<f64>>,
     /// Combined penalty matrix S [dim, dim]
-    penalty: Array2<f64>,
+    penalty: Arc<Array2<f64>>,
     /// MAP estimate (mode) μ [dim]
-    mode: Array1<f64>,
-    /// Precomputed transform: L where L L^T = H^{-1}
-    /// Used for z -> β: β = μ + L @ z
-    chol: Array2<f64>,
-    /// Precomputed L^T for gradient chain rule: ∇_z = L^T @ ∇_β
-    chol_t: Array2<f64>,
-    /// Link function type
-    is_logit: bool,
+    mode: Arc<Array1<f64>>,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
     dim: usize,
+}
+
+/// Whitened log-posterior target with analytical gradients.
+///
+/// Uses Arc for shared data to prevent memory explosion when cloned for chains.
+/// Uses faer for numerically stable Cholesky decomposition.
+#[derive(Clone)]
+pub struct NutsPosterior {
+    /// Shared read-only data (Arc prevents duplication)
+    data: SharedData,
+    /// Transform: L where L L^T = H^{-1} (computed from Hessian)
+    /// This is the inverse-transpose of the Cholesky of H.
+    chol: Array2<f64>,
+    /// L^T for gradient chain rule: ∇_z = L^T @ ∇_β
+    chol_t: Array2<f64>,
+    /// Link function type
+    is_logit: bool,
 }
 
 impl NutsPosterior {
@@ -67,36 +85,55 @@ impl NutsPosterior {
     /// * `weights` - Prior weights [n_samples]
     /// * `penalty_matrix` - Combined penalty S [dim, dim]
     /// * `mode` - MAP estimate μ [dim]
-    /// * `inv_hessian` - Inverse Hessian H^{-1} [dim, dim]
+    /// * `hessian` - Hessian H [dim, dim] (NOT the inverse!)
     /// * `is_logit` - True for logistic regression, false for Gaussian
+    ///
+    /// # Numerical Stability
+    /// Accepts the Hessian directly and computes L = (chol(H))^{-T} via
+    /// triangular solves, which is more stable than explicitly inverting H.
     pub fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,
         penalty_matrix: ArrayView2<f64>,
         mode: ArrayView1<f64>,
-        inv_hessian: ArrayView2<f64>,
+        hessian: ArrayView2<f64>,
         is_logit: bool,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let dim = x.ncols();
 
-        // Compute Cholesky factor L where L L^T = H^{-1}
-        let chol = cholesky_lower(inv_hessian);
-        let chol_t = chol.t().to_owned();
+        // Use faer for numerically stable Cholesky decomposition of H
+        // H = U U^T where U is lower triangular
+        let hessian_owned = hessian.to_owned();
+        let chol_factor = hessian_owned
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("Hessian Cholesky decomposition failed: {:?}", e))?;
 
-        Self {
-            x: x.to_owned(),
-            y: y.to_owned(),
-            weights: weights.to_owned(),
-            penalty: penalty_matrix.to_owned(),
-            mode: mode.to_owned(),
-            chol,
-            chol_t,
-            is_logit,
+        // We need L where L L^T = H^{-1}
+        // Since H = U U^T, we have H^{-1} = U^{-T} U^{-1}
+        // So L = U^{-T} (the inverse transpose of the Cholesky factor)
+        // We compute this by solving U^T L = I
+        let identity = Array2::<f64>::eye(dim);
+        let l_inv_t = chol_factor.solve_mat(&identity);
+        let chol_t = l_inv_t.t().to_owned();
+
+        let data = SharedData {
+            x: Arc::new(x.to_owned()),
+            y: Arc::new(y.to_owned()),
+            weights: Arc::new(weights.to_owned()),
+            penalty: Arc::new(penalty_matrix.to_owned()),
+            mode: Arc::new(mode.to_owned()),
             n_samples,
             dim,
-        }
+        };
+
+        Ok(Self {
+            data,
+            chol: l_inv_t,
+            chol_t,
+            is_logit,
+        })
     }
 
     /// Compute log-posterior and gradient analytically using ndarray.
@@ -106,10 +143,10 @@ impl NutsPosterior {
     fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         // === Step 1: Transform z (whitened) -> β (original) ===
         // β = μ + L @ z
-        let beta = &self.mode + &self.chol.dot(z);
+        let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
         // === Step 2: Compute η = X @ β ===
-        let eta = self.x.dot(&beta);
+        let eta = self.data.x.dot(&beta);
 
         // === Step 3: Compute log-likelihood and gradient ===
         let (ll, grad_ll_beta) = if self.is_logit {
@@ -120,7 +157,7 @@ impl NutsPosterior {
 
         // === Step 4: Compute penalty and its gradient ===
         // penalty = 0.5 * β^T @ S @ β
-        let s_beta = self.penalty.dot(&beta);
+        let s_beta = self.data.penalty.dot(&beta);
         let penalty = 0.5 * beta.dot(&s_beta);
 
         // ∇_β penalty = S @ β
@@ -140,7 +177,7 @@ impl NutsPosterior {
 
     /// Logistic regression log-likelihood and gradient.
     fn logit_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.n_samples;
+        let n = self.data.n_samples;
         let mut ll = 0.0;
         let mut residual = Array1::<f64>::zeros(n);
 
@@ -150,8 +187,8 @@ impl NutsPosterior {
             let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
 
             // Log-likelihood: y*log(μ) + (1-y)*log(1-μ)
-            let y_i = self.y[i];
-            let w_i = self.weights[i];
+            let y_i = self.data.y[i];
+            let w_i = self.data.weights[i];
             ll += w_i * (y_i * mu_clamped.ln() + (1.0 - y_i) * (1.0 - mu_clamped).ln());
 
             // Residual for gradient: y - μ (canonical link, score function)
@@ -159,28 +196,43 @@ impl NutsPosterior {
         }
 
         // Gradient of log-likelihood: X^T @ (w * (y - μ))
-        let grad_ll = self.x.t().dot(&residual);
+        let grad_ll = self.data.x.t().dot(&residual);
 
         (ll, grad_ll)
     }
 
     /// Gaussian log-likelihood and gradient.
     fn gaussian_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        let n = self.n_samples;
+        let n = self.data.n_samples;
         let mut ll = 0.0;
         let mut weighted_residual = Array1::<f64>::zeros(n);
 
         for i in 0..n {
-            let residual = self.y[i] - eta[i];
-            let w_i = self.weights[i];
+            let residual = self.data.y[i] - eta[i];
+            let w_i = self.data.weights[i];
             ll -= 0.5 * w_i * residual * residual;
             weighted_residual[i] = w_i * residual;
         }
 
         // Gradient of log-likelihood: X^T @ (w * (y - η))
-        let grad_ll = self.x.t().dot(&weighted_residual);
+        let grad_ll = self.data.x.t().dot(&weighted_residual);
 
         (ll, grad_ll)
+    }
+
+    /// Get the Cholesky factor L for un-whitening samples
+    pub fn chol(&self) -> &Array2<f64> {
+        &self.chol
+    }
+
+    /// Get the mode
+    pub fn mode(&self) -> &Array1<f64> {
+        &self.data.mode
+    }
+
+    /// Get dimension
+    pub fn dim(&self) -> usize {
+        self.data.dim
     }
 }
 
@@ -218,7 +270,7 @@ impl GradientTarget<f64, NutsBackend> for NutsPosterior {
 
         let grad_data: Vec<f64> = grad_z.to_vec();
         let grad_tensor = Tensor::<NutsBackend, 1>::from_data(
-            TensorData::new(grad_data, [self.dim]),
+            TensorData::new(grad_data, [self.data.dim]),
             &device,
         );
 
@@ -301,24 +353,34 @@ impl NutsResult {
 }
 
 /// Runs NUTS sampling using mini-mcmc with whitened parameter space.
+///
+/// # Arguments
+/// * `x` - Design matrix [n_samples, dim]
+/// * `y` - Response vector [n_samples]
+/// * `weights` - Prior weights [n_samples]
+/// * `penalty_matrix` - Combined penalty S [dim, dim]
+/// * `mode` - MAP estimate μ [dim]
+/// * `hessian` - Penalized Hessian H [dim, dim] (NOT the inverse!)
+/// * `is_logit` - True for logistic regression, false for Gaussian
+/// * `config` - NUTS configuration
 pub fn run_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     penalty_matrix: ArrayView2<f64>,
     mode: ArrayView1<f64>,
-    inv_hessian: ArrayView2<f64>,
+    hessian: ArrayView2<f64>,
     is_logit: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     let dim = mode.len();
 
     // Create posterior target with analytical gradients
-    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, inv_hessian, is_logit);
+    let target = NutsPosterior::new(x, y, weights, penalty_matrix, mode, hessian, is_logit)?;
 
     // Get Cholesky factor for un-whitening samples later
-    let chol = cholesky_lower(inv_hessian);
-    let mode_arr: Array1<f64> = mode.to_owned();
+    let chol = target.chol().clone();
+    let mode_arr = target.mode().clone();
 
     // Initialize chains at z=0 with small jitter
     let mut rng = rand::thread_rng();
@@ -339,7 +401,7 @@ pub fn run_nuts_sampling(
     let mut sampler = NUTS::<f64, NutsBackend, NutsPosterior>::new(
         target,
         initial_positions,
-        config.target_accept, // f64 throughout
+        config.target_accept,
     );
 
     // Run sampling with progress bar
@@ -390,28 +452,6 @@ pub fn run_nuts_sampling(
     })
 }
 
-/// Cholesky decomposition (lower triangular).
-fn cholesky_lower(a: ArrayView2<f64>) -> Array2<f64> {
-    let n = a.nrows();
-    let mut l = Array2::<f64>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                l[[i, j]] = (sum.max(1e-10)).sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]].max(1e-10);
-            }
-        }
-    }
-
-    l
-}
-
 // Legacy type alias for backwards compatibility
 pub type WhitenedBurnPosterior = NutsPosterior;
 
@@ -426,7 +466,8 @@ mod tests {
         let weights = ndarray::array![1.0];
         let penalty = ndarray::array![[0.0]];
         let mode = ndarray::array![0.0];
-        let inv_h = ndarray::array![[1.0]];
+        // Pass Hessian (not inverse) - identity matrix
+        let hessian = ndarray::array![[1.0]];
 
         let target = NutsPosterior::new(
             x.view(),
@@ -434,12 +475,12 @@ mod tests {
             weights.view(),
             penalty.view(),
             mode.view(),
-            inv_h.view(),
+            hessian.view(),
             true,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(target.dim, 1);
-        assert_eq!(target.n_samples, 1);
+        assert_eq!(target.dim(), 1);
     }
 
     #[test]
@@ -449,7 +490,7 @@ mod tests {
         let weights = ndarray::array![1.0];
         let penalty = ndarray::array![[0.0]];
         let mode = ndarray::array![0.0];
-        let inv_h = ndarray::array![[1.0]];
+        let hessian = ndarray::array![[1.0]];
 
         let target = NutsPosterior::new(
             x.view(),
@@ -457,9 +498,10 @@ mod tests {
             weights.view(),
             penalty.view(),
             mode.view(),
-            inv_h.view(),
+            hessian.view(),
             false, // Gaussian
-        );
+        )
+        .unwrap();
 
         let z = ndarray::array![0.0];
         let (logp, grad) = target.compute_logp_and_grad_nd(&z);
@@ -488,7 +530,7 @@ mod tests {
         let weights = ndarray::array![1.0];
         let penalty = ndarray::array![[0.0]];
         let mode = ndarray::array![0.0];
-        let inv_h = ndarray::array![[1.0]];
+        let hessian = ndarray::array![[1.0]];
 
         let target = NutsPosterior::new(
             x.view(),
@@ -496,9 +538,10 @@ mod tests {
             weights.view(),
             penalty.view(),
             mode.view(),
-            inv_h.view(),
+            hessian.view(),
             true, // Logit
-        );
+        )
+        .unwrap();
 
         let z = ndarray::array![0.0];
         let (logp, grad) = target.compute_logp_and_grad_nd(&z);
@@ -526,7 +569,7 @@ mod tests {
         let weights = ndarray::array![1.0, 1.0, 1.0];
         let penalty = ndarray::array![[0.1, 0.0], [0.0, 0.1]];
         let mode = ndarray::array![0.0, 0.0];
-        let inv_h = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+        let hessian = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
 
         let target = NutsPosterior::new(
             x.view(),
@@ -534,9 +577,10 @@ mod tests {
             weights.view(),
             penalty.view(),
             mode.view(),
-            inv_h.view(),
+            hessian.view(),
             true, // Logit
-        );
+        )
+        .unwrap();
 
         let z = ndarray::array![0.5, -0.3];
         let (_, grad) = target.compute_logp_and_grad_nd(&z);
@@ -564,5 +608,33 @@ mod tests {
                 rel_error
             );
         }
+    }
+
+    #[test]
+    fn test_arc_prevents_cloning_data() {
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0]];
+        let y = ndarray::array![1.0, 0.0];
+        let weights = ndarray::array![1.0, 1.0];
+        let penalty = ndarray::array![[0.1, 0.0], [0.0, 0.1]];
+        let mode = ndarray::array![0.0, 0.0];
+        let hessian = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+
+        let target1 = NutsPosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            hessian.view(),
+            true,
+        )
+        .unwrap();
+
+        // Clone should share data via Arc, not duplicate
+        let target2 = target1.clone();
+
+        // Verify Arc::ptr_eq - same underlying allocation
+        assert!(Arc::ptr_eq(&target1.data.x, &target2.data.x));
+        assert!(Arc::ptr_eq(&target1.data.y, &target2.data.y));
     }
 }
