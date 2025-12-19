@@ -476,13 +476,8 @@ lemma optimal_coeffs_raw_additive_standalone
     (h_orth_1 : a + b * 0 = 0 + β_env * 0) -- derived from E[resid] = 0
     (h_orth_P : a * 0 + b * 1 = 1 + β_env * 0) -- derived from E[resid*P] = 0
     : a = 0 ∧ b = 1 := by
-  constructor
-  · -- a = 0
-    simp at h_orth_1
-    exact h_orth_1
-  · -- b = 1
-    simp at h_orth_P
-    exact h_orth_P
+  simp at h_orth_1 h_orth_P
+  exact ⟨h_orth_1, h_orth_P⟩
 
 /-- First normal equation: optimality implies a = E[Y] (when E[P] = 0).
     This is the orthogonality condition ⟪residual, 1⟫ = 0. -/
