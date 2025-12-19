@@ -955,8 +955,40 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   unfold Matrix.mulVec designMatrix packParams
   simp only [Matrix.of_apply]
 
-  -- The rest requires careful sum manipulation
-  sorry
+  intro i
+  -- By `hm`, we can substitute the model's bases with the provided ones.
+  rcases hm with ⟨h_pgs, h_spline, _, _⟩
+  subst h_pgs
+  subst h_spline
+
+  -- We will show both sides are equal by expanding them into a sum of four canonical terms.
+  -- First, expand the RHS: (X * β)[i]
+  unfold Matrix.mulVec designMatrix packParams
+  simp_rw [Matrix.of_apply] -- Simplifies `X[i, j]`
+
+  -- The RHS is a sum over the structured index `ParamIx`. We split this sum into its four parts.
+  -- This is equivalent to `(Xβ)_intercept + (Xβ)_pgs + (Xβ)_spline + (Xβ)_interaction`.
+  rw [Finset.sum_equiv (ParamIx.equivSum p k sp).symm]
+  simp_rw [ParamIx.equivSum, Finset.sum_sum_elim, Fintype.card_unit, Finset.sum_singleton]
+  simp_rw [Finset.sum_sum_elim]
+
+  -- The sum over `Fin k × Fin sp` for the spline term is split into a nested sum.
+  -- And similarly for the `Fin p × Fin k × Fin sp` interaction term.
+  have h_sum_prod_3 : ∀ (f : Fin p × Fin k × Fin sp → ℝ),
+      (∑ x, f x) = ∑ m, ∑ l, ∑ j, f (m, l, j) := by
+    intro f; simp_rw [Finset.sum_product]
+  rw [Finset.sum_product, h_sum_prod_3]
+
+  -- Now, expand the LHS: linearPredictor
+  unfold linearPredictor evalSmooth
+  -- Distribute multiplication over addition to expand the `pgs_related_effects` term.
+  simp_rw [add_mul, Finset.sum_add_distrib]
+
+  -- At this point, both LHS and RHS are sums of the same four groups of terms.
+  -- We use `ac_rfl` to prove they are equal by associativity and commutativity of addition.
+  -- We may need to use `mul_comm` to align terms for `ac_rfl`.
+  simp_rw [@mul_comm ℝ]
+  ac_rfl
 
 /-- Full column rank implies `X.mulVec` is injective.
 
