@@ -1352,7 +1352,7 @@ lemma optimal_coefficients_via_risk
 
     **Key insight**: The raw model is an L² projection onto the {1, P} subspace.
     Under the given moment assumptions, the optimal affine predictor has a=0, b=1. -/
-theorem raw_score_bias_in_scenario4_simplified [Fact (p = 1)]
+theorem raw_score_bias_in_scenario4_simplified
     (model_raw : PhenotypeInformedGAM 1 1 1) (h_raw_struct : IsRawScoreModel model_raw)
     (h_pgs_basis_linear : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1)
     (dgp4 : DataGeneratingProcess 1) (h_s4 : dgp4.trueExpectation = fun p c => p - (0.8 * c ⟨0, by norm_num⟩))
