@@ -1208,6 +1208,8 @@ lemma linearPredictor_eq_affine_of_raw
 lemma risk_affine_additive
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (_h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP_l2 : Memℒp (fun pc => pc.1) 2 μ)
+    (hC_l2 : Memℒp (fun pc => pc.2 ⟨0, by norm_num⟩) 2 μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
@@ -1215,28 +1217,48 @@ lemma risk_affine_additive
     (β a b : ℝ) :
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-  -- Let u = 1 - b
-  set u := 1 - b with hu
+  -- Define aliases for cleaner code
+  let P : (ℝ × (Fin 1 → ℝ)) → ℝ := fun pc => pc.1
+  let C : (ℝ × (Fin 1 → ℝ)) → ℝ := fun pc => pc.2 ⟨0, by norm_num⟩
 
-  -- The integrand is: (uP + βC - a)²
-  -- = u²P² + β²C² + a² + 2uβPC - 2uaP - 2aβC
-  --
-  -- Integrating term by term:
-  -- ∫ u²P² = u² ∫ P² = u² · 1 = (1-b)²
-  -- ∫ β²C² = β² ∫ C²
-  -- ∫ a² = a² (since μ is prob measure)
-  -- ∫ 2uβPC = 2uβ · 0 = 0 (by hPC0)
-  -- ∫ -2uaP = -2ua · 0 = 0 (by hP0)
-  -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
+  -- Integrability proofs for all terms that will appear in the expansion
+  have hP_int : Integrable P μ := hP_l2.integrable (by norm_num)
+  have hC_int : Integrable C μ := hC_l2.integrable (by norm_num)
+  have hP2_int : Integrable (fun pc => (P pc)^2) μ := by simpa using hP_l2.integrable (by norm_num)
+  have hC2_int : Integrable (fun pc => (C pc)^2) μ := by simpa using hC_l2.integrable (by norm_num)
+  have hPC_int : Integrable (fun pc => P pc * C pc) μ := (hP_l2.mul hC_l2).integrable (by norm_num)
 
-  -- The formal proof requires:
-  -- 1. Rewriting the integrand as a sum of terms
-  -- 2. Applying integral_add for each term (requires integrability)
-  -- 3. Using the moment hypotheses to simplify
+  -- The integrand is integrable because it is the square of an L² function.
+  have h_integrand_int : Integrable (fun pc => (P pc + β * C pc - (a + b * P pc))^2) μ := by
+    let res := fun pc => (1 - b) * P pc + β * C pc - a
+    have h_res_l2 : Memℒp res 2 μ :=
+      ((hP_l2.const_mul (1 - b)).add (hC_l2.const_mul β)).sub (memℒp_const a)
+    exact h_res_l2.integrable (by norm_num)
 
-  -- For now, we leave this with a sketch. The algebraic manipulations are tedious
-  -- but purely mechanical once integrability is established.
-  sorry
+  -- Main calculation block
+  calc
+    ∫ pc, (P pc + β * C pc - (a + b * P pc))^2 ∂μ
+    _ = ∫ pc, ((1 - b) * P pc + β * C pc - a)^2 ∂μ := by
+          refine integral_congr_ae ?_
+          filter_upwards with pc; ring
+    _ = ∫ pc, (1 - b)^2 * (P pc)^2 + β^2 * (C pc)^2 + a^2
+              + 2 * (1 - b) * β * (P pc * C pc)
+              - 2 * (1 - b) * a * (P pc)
+              - 2 * β * a * (C pc) ∂μ := by
+          refine integral_congr_ae ?_
+          filter_upwards with pc; ring
+    _ = (1 - b)^2 * (∫ pc, (P pc)^2 ∂μ) + β^2 * (∫ pc, (C pc)^2 ∂μ) + a^2
+        + 2 * (1 - b) * β * (∫ pc, P pc * C pc ∂μ)
+        - 2 * (1 - b) * a * (∫ pc, P pc ∂μ)
+        - 2 * β * a * (∫ pc, C pc ∂μ) := by
+          -- Justify the expansion using integral linearity and the integrability proofs
+          simp_rw [integral_add, integral_sub, integral_mul_const]
+          --simp only [integral_add, integral_sub, integral_mul_const, i1, i2, i3, i4, i5, i6]
+    _ = (1 - b)^2 * 1 + β^2 * (∫ pc, (C pc)^2 ∂μ) + a^2 * 1
+        + 2 * (1 - b) * β * 0 - 2 * (1 - b) * a * 0 - 2 * β * a * 0 := by
+          simp [hP0, hC0, hPC0, hP2]
+    _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (C pc)^2 ∂μ) := by
+          ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
