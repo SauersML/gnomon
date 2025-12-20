@@ -23,19 +23,14 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when mini-mcmc clones the target.
 
-use burn::backend::{Autodiff, NdArray};
-use burn::prelude::*;
-use burn::tensor::TensorData;
 use crate::calibrate::faer_ndarray::FaerCholesky;
 use faer::Side;
-use mini_mcmc::distributions::GradientTarget;
-use mini_mcmc::nuts::NUTS;
+use mini_mcmc::generic_hmc::HamiltonianTarget;
+use mini_mcmc::generic_nuts::GenericNUTS;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Backend type for NUTS - uses f64 for numerical precision
-pub type NutsBackend = Autodiff<NdArray<f64>>;
 
 /// Solve L^T * X = I where L is lower triangular.
 ///
@@ -275,45 +270,12 @@ impl NutsPosterior {
     }
 }
 
-/// Implement GradientTarget for NUTS with analytical gradients.
-impl GradientTarget<f64, NutsBackend> for NutsPosterior {
-    fn unnorm_logp(&self, z: Tensor<NutsBackend, 1>) -> Tensor<NutsBackend, 1> {
-        // Convert tensor to ndarray
-        let z_data: Vec<f64> = z.clone().into_data().to_vec().unwrap();
-        let z_arr = Array1::from_vec(z_data);
-
-        // Compute log-posterior (discard gradient)
-        let (logp, _) = self.compute_logp_and_grad_nd(&z_arr);
-
-        // Wrap scalar in tensor
-        let device = z.device();
-        Tensor::<NutsBackend, 1>::from_data(TensorData::new(vec![logp], [1]), &device)
-    }
-
-    fn unnorm_logp_and_grad(
-        &self,
-        z: Tensor<NutsBackend, 1>,
-    ) -> (Tensor<NutsBackend, 1>, Tensor<NutsBackend, 1>) {
-        let device = z.device();
-
-        // Convert tensor to ndarray
-        let z_data: Vec<f64> = z.into_data().to_vec().unwrap();
-        let z_arr = Array1::from_vec(z_data);
-
-        // Compute log-posterior AND gradient analytically
-        let (logp, grad_z) = self.compute_logp_and_grad_nd(&z_arr);
-
-        // Convert back to tensors
-        let logp_tensor =
-            Tensor::<NutsBackend, 1>::from_data(TensorData::new(vec![logp], [1]), &device);
-
-        let grad_data: Vec<f64> = grad_z.to_vec();
-        let grad_tensor = Tensor::<NutsBackend, 1>::from_data(
-            TensorData::new(grad_data, [self.data.dim]),
-            &device,
-        );
-
-        (logp_tensor, grad_tensor)
+/// Implement HamiltonianTarget for NUTS with analytical gradients.
+impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let (logp, grad_z) = self.compute_logp_and_grad_nd(position);
+        grad.assign(&grad_z);
+        logp
     }
 }
 
@@ -423,53 +385,45 @@ pub fn run_nuts_sampling(
 
     // Initialize chains at z=0 with small jitter
     let mut rng = rand::thread_rng();
-    let initial_positions: Vec<Vec<f64>> = (0..config.n_chains)
+    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
-            (0..dim)
-                .map(|_| {
-                    let u1: f64 = rand::Rng::r#gen(&mut rng);
-                    let u2: f64 = rand::Rng::r#gen(&mut rng);
-                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    z * 0.1
-                })
-                .collect()
+            Array1::from_iter((0..dim).map(|_| {
+                let u1: f64 = rand::Rng::r#gen(&mut rng);
+                let u2: f64 = rand::Rng::r#gen(&mut rng);
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                z * 0.1
+            }))
         })
         .collect();
 
-    // Create NUTS sampler - it auto-tunes step size!
-    let mut sampler = NUTS::<f64, NutsBackend, NutsPosterior>::new(
-        target,
-        initial_positions,
-        config.target_accept,
-    );
+    // Create GenericNUTS sampler - it auto-tunes step size!
+    let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
 
     // Run sampling with progress bar
-    let (samples_tensor, run_stats) = sampler
+    let (samples_array, run_stats) = sampler
         .run_progress(config.n_samples, config.n_warmup)
         .map_err(|e| format!("NUTS sampling failed: {}", e))?;
 
     log::info!("NUTS sampling complete: {}", run_stats);
 
     // Convert samples from whitened space back to original space
-    let shape = samples_tensor.dims();
+    // samples_array has shape [n_chains, n_samples, dim]
+    let shape = samples_array.shape();
     let n_chains = shape[0];
     let n_samples_out = shape[1];
     let total_samples = n_chains * n_samples_out;
 
-    let data: Vec<f64> = samples_tensor.into_data().to_vec().unwrap();
-
     let mut samples = Array2::<f64>::zeros((total_samples, dim));
     for chain in 0..n_chains {
-        for sample in 0..n_samples_out {
-            // Get z (whitened coordinates)
-            let z: Array1<f64> = (0..dim)
-                .map(|d| data[chain * n_samples_out * dim + sample * dim + d])
-                .collect();
+        for sample_i in 0..n_samples_out {
+            // Get z (whitened coordinates) directly from Array3
+            let z = samples_array.slice(ndarray::s![chain, sample_i, ..]);
 
             // Transform to β: β = μ + L @ z
-            let beta = &mode_arr + &chol.dot(&z);
+            let z_owned: Array1<f64> = z.to_owned();
+            let beta = &mode_arr + &chol.dot(&z_owned);
 
-            let sample_idx = chain * n_samples_out + sample;
+            let sample_idx = chain * n_samples_out + sample_i;
             samples.row_mut(sample_idx).assign(&beta);
         }
     }

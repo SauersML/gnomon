@@ -86,7 +86,8 @@ no-inline-profiling = []
 survival-data = []
 
 [dependencies.mini-mcmc]
-version = "0.8.0"
+git = "https://github.com/SauersML/mini-mcmc"
+branch = "main"
 
 [dependencies.burn]
 version = "0.18"
