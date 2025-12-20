@@ -397,8 +397,8 @@ pub fn run_nuts_sampling(
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
             Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rng.gen();
-                let u2: f64 = rng.gen();
+                let u1: f64 = rng.r#gen();
+                let u2: f64 = rng.r#gen();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 z * 0.1
             })
@@ -634,8 +634,8 @@ mod survival_hmc {
         let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
             .map(|_| {
                 Array1::from_shape_fn(dim, |_| {
-                    let u1: f64 = rng.gen();
-                    let u2: f64 = rng.gen();
+                    let u1: f64 = rng.r#gen();
+                    let u2: f64 = rng.r#gen();
                     let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     z * 0.1
                 })
