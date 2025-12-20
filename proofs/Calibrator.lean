@@ -348,10 +348,10 @@ def IsBayesOptimalInClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
 /-- Bayes-optimal among raw score models only (L² projection onto {1, P} subspace).
     This is the correct predicate for Scenario 4, where the raw class cannot represent
     the true PC main effect. -/
-def IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
-    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
-  IsRawScoreModel model ∧
-  ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
+structure IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop where
+  is_raw : IsRawScoreModel model
+  is_optimal : ∀ (m : PhenotypeInformedGAM p k sp), IsRawScoreModel m →
     expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
@@ -598,7 +598,6 @@ lemma optimal_slope_eq_covariance_of_normalized_p
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
     (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1) :
     let a := model.γ₀₀
     let b := model.γₘ₀ ⟨0, by norm_num⟩
@@ -647,7 +646,7 @@ lemma rawOptimal_implies_orthogonality
   -- Therefore E[residual · P] = 0.
 
   -- The formal proof requires constructing the competitor models and using
-  -- h_opt.2 to get the inequality, then taking the limit as ε → 0.
+  -- h_opt.is_optimal to get the inequality, then taking the limit as ε → 0.
   -- This involves Calculus (derivatives of integrals) or the algebraic
   -- manipulation shown above.
 
@@ -693,7 +692,6 @@ lemma optimal_coefficients_for_additive_dgp
     (dgp : DataGeneratingProcess 1)
     (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
     (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_raw : IsRawScoreModel model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
     (hP0 : ∫ pc, pc.1 ∂dgp.jointMeasure = 0)
@@ -701,7 +699,7 @@ lemma optimal_coefficients_for_additive_dgp
     (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
   -- Step 1: Get the orthogonality conditions from optimality
-  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_raw h_linear
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear
   set a := model.γ₀₀ with ha_def
   set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
   obtain ⟨h_orth1, h_orthP⟩ := h_orth
@@ -1415,7 +1413,7 @@ theorem raw_score_bias_in_scenario4_simplified
 
   -- Step 3: Apply the optimal coefficients lemma
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add
-                     h_opt_raw h_raw_struct h_pgs_basis_linear h_indep
+                     h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
   obtain ⟨ha, hb⟩ := h_coeffs
 
@@ -1466,7 +1464,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
 
   -- Step 2: Apply the optimal coefficients lemma to get γ₀₀ = 0, γₘ₀[0] = 1
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw β_env dgp h_dgp
-                     h_opt_raw h_raw_struct h_pgs_basis_linear h_indep
+                     h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
   obtain ⟨ha, hb⟩ := h_coeffs
 
