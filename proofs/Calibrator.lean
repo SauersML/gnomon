@@ -1137,6 +1137,20 @@ def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (
 The following lemmas support the main theorem `raw_score_bias_in_scenario4_simplified`.
 They formalize the L²-projection structure: raw model = projection onto {1, P} subspace. -/
 
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
+lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
+lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
 /-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
     the linear predictor simplifies to an affine function: a + b*p.
     This is the key structural simplification.
@@ -1157,22 +1171,12 @@ lemma linearPredictor_eq_affine_of_raw
   -- Step 2: Show base reduces to γ₀₀ for raw model
   have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
     unfold predictorBase
-    -- All f₀ₗ terms are zero for raw model
-    have h_f0l_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.f₀ₗ l) (c_val l) = 0 := by
-      intro l
-      unfold evalSmooth
-      simp only [h_raw.1 l, zero_mul, Finset.sum_const_zero]
-    simp only [h_f0l_zero, Finset.sum_const_zero, add_zero]
+    simp [evalSmooth_eq_zero_of_raw h_raw]
 
   -- Step 3: Show slope reduces to γₘ₀[0] for raw model
   have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
     unfold predictorSlope
-    -- All fₘₗ terms are zero for raw model
-    have h_fml_zero : ∀ l, evalSmooth model_raw.pcSplineBasis (model_raw.fₘₗ 0 l) (c_val l) = 0 := by
-      intro l
-      unfold evalSmooth
-      simp only [h_raw.2 0 l, zero_mul, Finset.sum_const_zero]
-    simp [h_fml_zero]
+    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
 
   rw [h_base, h_slope]
 
