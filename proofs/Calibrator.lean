@@ -681,20 +681,32 @@ lemma rawOptimal_implies_orthogonality
 
   constructor
   · -- Orthogonality with 1: E[residual] = 0
-    -- The variational argument shows: for optimality at ε=0, the derivative of
-    -- L(ε) = E[(residual - ε)²] must be zero, giving E[residual] = 0.
-    -- We use the first-order optimality condition from calculus of variations.
-    -- The full proof would construct competitor models and use h_opt.is_optimal.
+    -- **Quadratic Perturbation Proof** (no calculus of variations needed):
+    -- L(ε) = E[(residual - ε)²] = E[residual²] - 2ε·E[residual] + ε²
+    --      = L(0) + ε² - 2ε·E[residual]
+    -- Optimality: L(0) ≤ L(ε) for all ε
+    -- This means: 0 ≤ ε² - 2ε·E[residual] = ε(ε - 2·E[residual])
+    -- Testing ε > 0 small: 0 ≤ ε - 2·E[residual], so E[residual] ≤ ε/2 → E[residual] ≤ 0
+    -- Testing ε < 0 small: 0 ≤ ε - 2·E[residual] becomes 2·E[residual] ≤ ε → E[residual] ≥ 0
+    -- Therefore E[residual] = 0
     have h1 : ∫ pc, residual pc ∂μ = 0 := by
-      -- By first-order condition: d/dε L(ε)|_{ε=0} = -2·E[residual] = 0
-      sorry -- Variational calculus proof
+      -- The formal proof constructs competitor models and uses h_opt.is_optimal
+      -- to derive ε² - 2ε·E[residual] ≥ 0 for all ε, which forces E[residual] = 0.
+      -- This is a standard "first-order necessary condition" from optimization theory.
+      sorry -- Quadratic perturbation: ε² - 2ε·E[resid] ≥ 0 ∀ε ⟹ E[resid] = 0
     simpa [hres_def] using h1
 
   · -- Orthogonality with P: E[residual · P] = 0
-    -- Same variational argument for slope perturbation.
+    -- **Quadratic Perturbation Proof**:
+    -- L(ε) = E[(residual - εP)²] = E[residual²] - 2ε·E[residual·P] + ε²·E[P²]
+    -- Optimality: 0 ≤ -2ε·E[residual·P] + ε²·E[P²] = ε(-2·E[residual·P] + ε·E[P²])
+    -- For small |ε|, the sign is determined by -2·E[residual·P]
+    -- Testing ε > 0: -2·E[residual·P] ≥ 0 → E[residual·P] ≤ 0
+    -- Testing ε < 0: -2·E[residual·P] ≤ 0 → E[residual·P] ≥ 0
+    -- Therefore E[residual·P] = 0
     have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
-      -- By first-order condition: d/dε L(ε)|_{ε=0} = -2·E[residual·P] = 0
-      sorry -- Variational calculus proof
+      -- Same construction with slope perturbation b → b + ε
+      sorry -- Quadratic perturbation: ε(-2E[resid·P] + εE[P²]) ≥ 0 ∀ε ⟹ E[resid·P] = 0
     simpa [hres_def] using h2
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
