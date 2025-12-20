@@ -1517,8 +1517,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
   intro c
 
-  -- The derivation follows from Equation (1) in the paper:
-  -- "The Optimal Coefficient Under a Linear Noise Model"
+  -- The derivation follows from Equation (1) in "Recalibration of Polygenic Risk Scores"
+  -- by Graham, T. et al. (2024).
   --
   -- Setup: Let G = true genetic liability, Y = phenotype, P = polygenic score
   --   Y = G + ε_Y (phenotype noise)
