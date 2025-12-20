@@ -780,10 +780,8 @@ lemma optimal_coefficients_for_additive_dgp
     have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure
                   = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
       -- Need integrability hypotheses
-      have hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure := by
-        sorry -- Integrability of Y
-      have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
-        sorry -- Integrability of P
+      have hY_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure := hY_int
+      have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
       -- ∫ (Y - (a + bP)) = ∫ Y - ∫ (a + bP) = ∫ Y - a - b*∫ P
       have hConst_int : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) dgp.jointMeasure := by
         simp
@@ -814,12 +812,9 @@ lemma optimal_coefficients_for_additive_dgp
                     - a * (∫ pc, pc.1 ∂dgp.jointMeasure)
                     - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
       -- Need integrability hypotheses
-      have hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure := by
-        sorry -- Integrability of Y*P
-      have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
-        sorry -- Integrability of P
-      have hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1^2) dgp.jointMeasure := by
-        sorry -- Integrability of P²
+      have hYP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure := hYP_int
+      have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
+      have hP2_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1^2) dgp.jointMeasure := hP2_int
       have hLinP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (a + b * pc.1) * pc.1) dgp.jointMeasure := by
         -- (a + bP)*P = aP + bP²
         have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) dgp.jointMeasure := hP_int.const_mul a
