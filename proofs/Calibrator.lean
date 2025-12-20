@@ -776,7 +776,27 @@ lemma optimal_coefficients_for_additive_dgp
     -- a = 0
     have h_expand : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure
                   = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
-      sorry -- Integral linearity
+      -- Need integrability hypotheses
+      have hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure := by
+        sorry -- Integrability of Y
+      have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
+        sorry -- Integrability of P
+      -- ∫ (Y - (a + bP)) = ∫ Y - ∫ (a + bP) = ∫ Y - a - b*∫ P
+      have hConst_int : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => a) dgp.jointMeasure := by
+        simp
+      have hLin_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a + b * pc.1) dgp.jointMeasure := by
+        exact hConst_int.add (hP_int.const_mul b)
+      calc ∫ pc, dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1) ∂dgp.jointMeasure
+          = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - (∫ pc, a + b * pc.1 ∂dgp.jointMeasure) := by
+            rw [integral_sub hY_int hLin_int]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - (a + b * (∫ pc, pc.1 ∂dgp.jointMeasure)) := by
+            congr 1
+            calc ∫ pc, a + b * pc.1 ∂dgp.jointMeasure
+                = (∫ pc, (a : ℝ) ∂dgp.jointMeasure) + (∫ pc, b * pc.1 ∂dgp.jointMeasure) := by
+                  exact integral_add hConst_int (hP_int.const_mul b)
+                _ = a + b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by
+                  simp [integral_const, MeasureTheory.integral_const_mul]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure) - a - b * (∫ pc, pc.1 ∂dgp.jointMeasure) := by ring
     rw [h_expand, hY_mean, hP0] at h_orth1
     linarith
 
@@ -790,7 +810,41 @@ lemma optimal_coefficients_for_additive_dgp
                   = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
                     - a * (∫ pc, pc.1 ∂dgp.jointMeasure)
                     - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
-      sorry -- Integral linearity
+      -- Need integrability hypotheses
+      have hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure := by
+        sorry -- Integrability of Y*P
+      have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
+        sorry -- Integrability of P
+      have hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1^2) dgp.jointMeasure := by
+        sorry -- Integrability of P²
+      have hLinP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => (a + b * pc.1) * pc.1) dgp.jointMeasure := by
+        -- (a + bP)*P = aP + bP²
+        have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) dgp.jointMeasure := hP_int.const_mul a
+        have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1^2) dgp.jointMeasure := hP2_int.const_mul b
+        have heq_ae : ∀ᵐ pc ∂dgp.jointMeasure, a * pc.1 + b * pc.1^2 = (a + b * pc.1) * pc.1 := by
+          filter_upwards with pc
+          ring
+        exact (h1.add h2).congr heq_ae
+      calc ∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure
+          = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 - (a + b * pc.1) * pc.1 ∂dgp.jointMeasure := by
+            congr 1; ext pc; ring
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure) - (∫ pc, (a + b * pc.1) * pc.1 ∂dgp.jointMeasure) := by
+            rw [integral_sub hYP_int hLinP_int]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+              - (a * (∫ pc, pc.1 ∂dgp.jointMeasure) + b * (∫ pc, pc.1^2 ∂dgp.jointMeasure)) := by
+            congr 1
+            -- Expand ∫ (a + bP)*P = ∫ aP + bP² = a*∫ P + b*∫ P²
+            have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) dgp.jointMeasure := hP_int.const_mul a
+            have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1^2) dgp.jointMeasure := hP2_int.const_mul b
+            calc ∫ pc, (a + b * pc.1) * pc.1 ∂dgp.jointMeasure
+                = ∫ pc, a * pc.1 + b * pc.1^2 ∂dgp.jointMeasure := by
+                  congr 1; ext pc; ring
+                _ = (∫ pc, a * pc.1 ∂dgp.jointMeasure) + (∫ pc, b * pc.1^2 ∂dgp.jointMeasure) := by
+                  exact integral_add h1 h2
+                _ = a * (∫ pc, pc.1 ∂dgp.jointMeasure) + b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by
+                  simp [MeasureTheory.integral_const_mul]
+          _ = (∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure)
+              - a * (∫ pc, pc.1 ∂dgp.jointMeasure) - b * (∫ pc, pc.1^2 ∂dgp.jointMeasure) := by ring
     rw [h_expand, hYP, hP0, hP2, ha] at h_orthP
     linarith
 
