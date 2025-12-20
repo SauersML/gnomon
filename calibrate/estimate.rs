@@ -2572,6 +2572,54 @@ pub fn train_survival_model(
         final_artifacts.coefficients.to_vec(),
     );
 
+    // Generate MCMC posterior samples if requested
+    let mcmc_samples = if config.mcmc_enabled {
+        eprintln!("\n[STAGE 3/3] Running HMC/NUTS posterior sampling for survival model...");
+        
+        if let Some(ref hessian) = primary_hessian {
+            // Allow overriding NUTS config via env vars for testing
+            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+
+            let nuts_config = hmc::NutsConfig {
+                n_samples: num_samples,
+                n_warmup: num_warmup,
+                ..hmc::NutsConfig::default()
+            };
+
+            match hmc::run_survival_nuts_sampling(
+                layout.clone(),
+                &bundle.data,
+                monotonicity.clone(),
+                survival_spec,
+                final_artifacts.coefficients.view(),
+                hessian.view(),
+                &nuts_config,
+            ) {
+                Ok(result) => {
+                    eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
+                    Some(result.samples)
+                }
+                Err(e) => {
+                    log::warn!("Survival MCMC sampling failed: {}", e);
+                    eprintln!("            WARNING: Survival MCMC sampling failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            eprintln!("            WARNING: No Hessian available for MCMC; skipping.");
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(TrainedModel {
         config,
         coefficients: mapped_coefficients,
@@ -2582,6 +2630,7 @@ pub fn train_survival_model(
         calibrator: None, // Survival uses artifacts.calibrator
         survival: Some(final_artifacts),
         survival_companions: companions, // The map of mortality artifacts
+        mcmc_samples,
     })
 }
 

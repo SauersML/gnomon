@@ -446,6 +446,246 @@ pub fn run_nuts_sampling(
     })
 }
 
+// ============================================================================
+// Survival Model HMC Support
+// ============================================================================
+
+#[cfg(feature = "survival-data")]
+mod survival_hmc {
+    use super::*;
+    use crate::calibrate::survival::{
+        MonotonicityPenalty, SurvivalLayout, SurvivalSpec, SurvivalTrainingData,
+        WorkingModelSurvival,
+    };
+
+    /// Shared data for survival NUTS posterior (wrapped in Arc to prevent cloning).
+    #[derive(Clone)]
+    struct SharedSurvivalData {
+        /// Survival layout with design matrices and penalties
+        layout: Arc<SurvivalLayout>,
+        /// Sample weights
+        sample_weight: Arc<Array1<f64>>,
+        /// Event indicators (1 = event, 0 = censored)
+        event_target: Arc<Array1<u8>>,
+        /// Entry ages
+        age_entry: Arc<Array1<f64>>,
+        /// Exit ages
+        age_exit: Arc<Array1<f64>>,
+        /// Monotonicity constraint
+        monotonicity: Arc<MonotonicityPenalty>,
+        /// Survival spec
+        spec: SurvivalSpec,
+        /// MAP estimate (mode) μ [dim]
+        mode: Arc<Array1<f64>>,
+    }
+
+    /// Whitened log-posterior target for survival models with analytical gradients.
+    #[derive(Clone)]
+    pub struct SurvivalPosterior {
+        /// Shared read-only data (Arc prevents duplication)
+        data: SharedSurvivalData,
+        /// Transform: L where L L^T = H^{-1}
+        chol: Array2<f64>,
+        /// L^T for gradient chain rule: ∇_z = L^T @ ∇_β
+        chol_t: Array2<f64>,
+    }
+
+    impl SurvivalPosterior {
+        /// Creates a new survival posterior target.
+        pub fn new(
+            layout: SurvivalLayout,
+            training_data: &SurvivalTrainingData,
+            monotonicity: MonotonicityPenalty,
+            spec: SurvivalSpec,
+            mode: ArrayView1<f64>,
+            hessian: ArrayView2<f64>,
+        ) -> Result<Self, String> {
+            let dim = mode.len();
+
+            // Compute whitening transform via Cholesky of Hessian
+            let hessian_owned = hessian.to_owned();
+            let chol_factor = hessian_owned
+                .cholesky(Side::Lower)
+                .map_err(|e| format!("Hessian Cholesky decomposition failed: {:?}", e))?;
+            let l_h = chol_factor.lower_triangular();
+            let chol = solve_upper_triangular_transpose(&l_h, dim);
+            let chol_t = chol.t().to_owned();
+
+            let data = SharedSurvivalData {
+                layout: Arc::new(layout),
+                sample_weight: Arc::new(training_data.sample_weight.clone()),
+                event_target: Arc::new(training_data.event_target.clone()),
+                age_entry: Arc::new(training_data.age_entry.clone()),
+                age_exit: Arc::new(training_data.age_exit.clone()),
+                monotonicity: Arc::new(monotonicity),
+                spec,
+                mode: Arc::new(mode.to_owned()),
+            };
+
+            Ok(Self {
+                data,
+                chol,
+                chol_t,
+            })
+        }
+
+        /// Compute log-posterior and gradient analytically.
+        fn compute_logp_and_grad(&self, z: &Array1<f64>) -> Result<(f64, Array1<f64>), String> {
+            // Transform z (whitened) -> β (original): β = μ + L @ z
+            let beta = self.data.mode.as_ref() + &self.chol.dot(z);
+
+            // Create a temporary working model to compute likelihood
+            // We need owned copies for the working model
+            let layout_clone = (*self.data.layout).clone();
+            let mut model = WorkingModelSurvival {
+                layout: layout_clone,
+                sample_weight: (*self.data.sample_weight).clone(),
+                event_target: (*self.data.event_target).clone(),
+                age_entry: (*self.data.age_entry).clone(),
+                age_exit: (*self.data.age_exit).clone(),
+                monotonicity: (*self.data.monotonicity).clone(),
+                spec: self.data.spec,
+            };
+
+            // Compute state (deviance and gradient in beta space)
+            let state = model
+                .update_state(&beta)
+                .map_err(|e| format!("Survival state update failed: {:?}", e))?;
+
+            // Convert deviance to log-posterior: logp = -0.5 * deviance
+            // (deviance = -2 * log_likelihood + penalty, so -0.5 * deviance = log_likelihood - 0.5*penalty)
+            let logp = -0.5 * state.deviance;
+
+            // The gradient from update_state is ∂deviance/∂β = -2 * ∂log_posterior/∂β
+            // So ∂log_posterior/∂β = -0.5 * gradient
+            let grad_beta = state.gradient.mapv(|g| -0.5 * g);
+
+            // Chain rule to get gradient in z space: ∇_z = L^T @ ∇_β
+            let grad_z = self.chol_t.dot(&grad_beta);
+
+            Ok((logp, grad_z))
+        }
+
+        /// Get the Cholesky factor L for un-whitening samples
+        pub fn chol(&self) -> &Array2<f64> {
+            &self.chol
+        }
+
+        /// Get the mode
+        pub fn mode(&self) -> &Array1<f64> {
+            &self.data.mode
+        }
+    }
+
+    impl HamiltonianTarget<Array1<f64>> for SurvivalPosterior {
+        fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+            match self.compute_logp_and_grad(position) {
+                Ok((logp, grad_z)) => {
+                    grad.assign(&grad_z);
+                    logp
+                }
+                Err(e) => {
+                    // On error (e.g., monotonicity violation), return -infinity log-prob
+                    // This causes NUTS to reject the proposal
+                    log::warn!("Survival posterior evaluation failed: {}", e);
+                    grad.fill(0.0);
+                    f64::NEG_INFINITY
+                }
+            }
+        }
+    }
+
+    /// Runs NUTS sampling for survival models with whitened parameter space.
+    pub fn run_survival_nuts_sampling(
+        layout: SurvivalLayout,
+        training_data: &SurvivalTrainingData,
+        monotonicity: MonotonicityPenalty,
+        spec: SurvivalSpec,
+        mode: ArrayView1<f64>,
+        hessian: ArrayView2<f64>,
+        config: &NutsConfig,
+    ) -> Result<NutsResult, String> {
+        let dim = mode.len();
+
+        // Create posterior target
+        let target = SurvivalPosterior::new(
+            layout,
+            training_data,
+            monotonicity,
+            spec,
+            mode,
+            hessian,
+        )?;
+
+        // Get Cholesky factor for un-whitening samples later
+        let chol = target.chol().clone();
+        let mode_arr = target.mode().clone();
+
+        // Initialize chains at z=0 with small jitter
+        let mut rng = rand::thread_rng();
+        let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
+            .map(|_| {
+                Array1::from_shape_fn(dim, |_| {
+                    let u1: f64 = rand::Rng::r#gen(&mut rng);
+                    let u2: f64 = rand::Rng::r#gen(&mut rng);
+                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                    z * 0.1
+                })
+            })
+            .collect();
+
+        // Create GenericNUTS sampler
+        let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
+
+        // Run sampling with progress bar
+        let (samples_array, run_stats) = sampler
+            .run_progress(config.n_samples, config.n_warmup)
+            .map_err(|e| format!("NUTS sampling failed: {}", e))?;
+
+        log::info!("Survival NUTS sampling complete: {}", run_stats);
+
+        // Convert samples from whitened space back to original space
+        let shape = samples_array.shape();
+        let n_chains = shape[0];
+        let n_samples_out = shape[1];
+        let total_samples = n_chains * n_samples_out;
+
+        let mut samples = Array2::<f64>::zeros((total_samples, dim));
+        let mut z_buffer = Array1::<f64>::zeros(dim);
+        for chain in 0..n_chains {
+            for sample_i in 0..n_samples_out {
+                let z_view = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+                z_buffer.assign(&z_view);
+
+                // Transform to β: β = μ + L @ z
+                let beta = &mode_arr + &chol.dot(&z_buffer);
+
+                let sample_idx = chain * n_samples_out + sample_i;
+                samples.row_mut(sample_idx).assign(&beta);
+            }
+        }
+
+        // Compute statistics
+        let posterior_mean = samples.mean_axis(Axis(0)).unwrap();
+        let posterior_std = samples.std_axis(Axis(0), 0.0);
+        let rhat = f64::from(run_stats.rhat.mean);
+        let ess = f64::from(run_stats.ess.mean);
+        let converged = rhat < 1.1;
+
+        Ok(NutsResult {
+            samples,
+            posterior_mean,
+            posterior_std,
+            rhat,
+            ess,
+            converged,
+        })
+    }
+}
+
+#[cfg(feature = "survival-data")]
+pub use survival_hmc::run_survival_nuts_sampling;
+
 // Legacy type alias for backwards compatibility
 pub type WhitenedBurnPosterior = NutsPosterior;
 
