@@ -696,7 +696,14 @@ lemma optimal_coefficients_for_additive_dgp
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
     (hP0 : ∫ pc, pc.1 ∂dgp.jointMeasure = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
-    (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
+    (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
+    -- Integrability hypotheses
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
+    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
   -- Step 1: Get the orthogonality conditions from optimality
   have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear
@@ -716,10 +723,8 @@ lemma optimal_coefficients_for_additive_dgp
     -- Goal: ∫ pc, pc.1 + β_env * pc.2 ⟨0, _⟩ ∂μ = 0
     -- We need integrability hypotheses. Since we assume a probability measure
     -- with finite moments (implicit in hP0, hC0, hP2), we admit integrability.
-    have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
-      sorry -- Integrability of P (implied by hP0, hP2)
-    have hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure := by
-      sorry -- Integrability of C (implied by hC0)
+    have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
+    have hC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure := hC_int
     calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
         = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
           rw [integral_add hP_int (hC_int.const_mul β_env)]
@@ -734,10 +739,8 @@ lemma optimal_coefficients_for_additive_dgp
     simp only [h_dgp]
     -- Goal: ∫ pc, (pc.1 + β_env * pc.2 ⟨0, _⟩) * pc.1 ∂μ = 1
     -- Expand: ∫ (P² + β*C*P) = ∫ P² + β * ∫ C*P = 1 + β*0 = 1
-    have hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure := by
-      sorry -- Integrability of P² (implied by hP2)
-    have hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure := by
-      sorry -- Integrability of C*P (follows from independence and finite moments)
+    have hP2_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure := hP2_int
+    have hPC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure := hPC_int
     -- Rewrite (P + β*C)*P as P² + β*(C*P)
     have heq : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1
                                       = pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
@@ -1505,7 +1508,14 @@ theorem raw_score_bias_in_scenario4_simplified
     (h_opt_raw : IsBayesOptimalInRawClass dgp4 model_raw)
     (h_indep : dgp4.jointMeasure = (dgp4.jointMeasure.map Prod.fst).prod (dgp4.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp4.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp4.jointMeasure = 0)
-    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1) :
+    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp4.jointMeasure = 1)
+    -- Integrability hypotheses
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp4.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp4.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp4.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp4.jointMeasure)
+    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2) dgp4.jointMeasure)
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2 * pc.1) dgp4.jointMeasure) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val ⟨0, by norm_num⟩ := by
   intros p_val c_val
@@ -1528,6 +1538,7 @@ theorem raw_score_bias_in_scenario4_simplified
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add
                      h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
+                     hP_int hC_int hP2_int hPC_int hY_int hYP_int
   obtain ⟨ha, hb⟩ := h_coeffs
 
   -- Step 4: Substitute a=0, b=1 into the predictor
@@ -1561,7 +1572,14 @@ theorem raw_score_bias_general [Fact (p = 1)]
     (h_opt_raw : IsBayesOptimalInRawClass dgp model_raw)
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
     (h_means_zero : ∫ pc, pc.1 ∂dgp.jointMeasure = 0 ∧ ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
-    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1) :
+    (h_var_p_one : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
+    -- Integrability hypotheses
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
+    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp (fun p _ => linearPredictor model_raw p c_val) p_val c_val
     = β_env * c_val ⟨0, by norm_num⟩ := by
@@ -1579,6 +1597,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw β_env dgp h_dgp
                      h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
+                     hP_int hC_int hP2_int hPC_int hY_int hYP_int
   obtain ⟨ha, hb⟩ := h_coeffs
 
   -- Step 3: Substitute a=0, b=1 into the predictor
