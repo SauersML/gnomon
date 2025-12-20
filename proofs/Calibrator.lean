@@ -1083,8 +1083,10 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   unfold Matrix.mulVec designMatrix packParams
   simp only [Matrix.of_apply]
 
-  -- The rest requires careful sum manipulation
-  sorry
+  -- The rest requires matching the ParamIx sum structure with linearPredictor's definition.
+  -- This involves showing that the vectorized parameters reconstruct the original prediction.
+  -- See: Wood (2017), "Generalized Additive Models", Section 4.2 on basis representation.
+  sorry -- Sum manipulation with ParamIx (basis reconstruction proof)
 
 /-- Full column rank implies `X.mulVec` is injective.
 
