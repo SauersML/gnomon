@@ -28,6 +28,7 @@ use faer::Side;
 use mini_mcmc::generic_hmc::HamiltonianTarget;
 use mini_mcmc::generic_nuts::GenericNUTS;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -290,6 +291,13 @@ pub struct NutsConfig {
     pub n_chains: usize,
     /// Target acceptance probability (0.6-0.9 recommended)
     pub target_accept: f64,
+    /// Seed for deterministic chain initialization
+    #[serde(default = "default_nuts_seed")]
+    pub seed: u64,
+}
+
+fn default_nuts_seed() -> u64 {
+    42
 }
 
 impl Default for NutsConfig {
@@ -299,6 +307,7 @@ impl Default for NutsConfig {
             n_warmup: 500,
             n_chains: 4,
             target_accept: 0.8,
+            seed: 42,
         }
     }
 }
@@ -384,12 +393,12 @@ pub fn run_nuts_sampling(
     let mode_arr = target.mode().clone();
 
     // Initialize chains at z=0 with small jitter
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(config.seed);
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
             Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rand::Rng::r#gen(&mut rng);
-                let u2: f64 = rand::Rng::r#gen(&mut rng);
+                let u1: f64 = rng.gen();
+                let u2: f64 = rng.gen();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 z * 0.1
             })
@@ -536,14 +545,13 @@ mod survival_hmc {
 
             // Create a temporary working model to compute likelihood
             // We need owned copies for the working model
-            let layout_clone = (*self.data.layout).clone();
             let mut model = WorkingModelSurvival {
-                layout: layout_clone,
-                sample_weight: (*self.data.sample_weight).clone(),
-                event_target: (*self.data.event_target).clone(),
-                age_entry: (*self.data.age_entry).clone(),
-                age_exit: (*self.data.age_exit).clone(),
-                monotonicity: (*self.data.monotonicity).clone(),
+                layout: Arc::clone(&self.data.layout),
+                sample_weight: Arc::clone(&self.data.sample_weight),
+                event_target: Arc::clone(&self.data.event_target),
+                age_entry: Arc::clone(&self.data.age_entry),
+                age_exit: Arc::clone(&self.data.age_exit),
+                monotonicity: Arc::clone(&self.data.monotonicity),
                 spec: self.data.spec,
             };
 
@@ -622,12 +630,12 @@ mod survival_hmc {
         let mode_arr = target.mode().clone();
 
         // Initialize chains at z=0 with small jitter
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(config.seed);
         let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
             .map(|_| {
                 Array1::from_shape_fn(dim, |_| {
-                    let u1: f64 = rand::Rng::r#gen(&mut rng);
-                    let u2: f64 = rand::Rng::r#gen(&mut rng);
+                    let u1: f64 = rng.gen();
+                    let u2: f64 = rng.gen();
                     let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     z * 0.1
                 })
