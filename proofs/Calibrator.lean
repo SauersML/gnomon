@@ -1686,6 +1686,24 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
   -- For a Bayes-optimal model with linear PGS basis, the coefficient of p must equal α(c)
   -- This means: γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) = σ_G² / (σ_G² + σ_η²(c))
+
+  -- From h_bayes with p=1 and p=0, we can extract the coefficients:
+  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes 0
+  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes 1
+
+  -- From h_true_form: trueExpectation 0 c = 0, trueExpectation 1 c = α(c)
+  simp only [h_true_form] at h_at_0 h_at_1
+  simp only [mul_zero] at h_at_0
+  simp only [mul_one] at h_at_1
+
+  -- The linearPredictor has structure: linearPredictor p c = base(c) + slope(c) * p
+  -- From h_at_0: base(c) = 0
+  -- From h_at_1: slope(c) = α(c)
+  -- The goal is exactly slope(c), so we need to show:
+  --   γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) = α(c)
+
+  -- This requires showing linearPredictor decomposes as base + slope * p for p=1 models,
+  -- which is proven in linearPredictor_decomp (but requires linear PGS basis hypothesis)
   sorry
 
 /-- Predictions are invariant under affine transformations of ancestry coordinates.
