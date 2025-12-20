@@ -12,7 +12,7 @@ use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 
 const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
@@ -1262,12 +1262,12 @@ fn build_monotonicity_penalty(
 
 /// Royston–Parmar working model implementation.
 pub struct WorkingModelSurvival {
-    pub layout: SurvivalLayout,
-    pub sample_weight: Array1<f64>,
-    pub event_target: Array1<u8>,
-    pub age_entry: Array1<f64>,
-    pub age_exit: Array1<f64>,
-    pub monotonicity: MonotonicityPenalty,
+    pub layout: Arc<SurvivalLayout>,
+    pub sample_weight: Arc<Array1<f64>>,
+    pub event_target: Arc<Array1<u8>>,
+    pub age_entry: Arc<Array1<f64>>,
+    pub age_exit: Arc<Array1<f64>>,
+    pub monotonicity: Arc<MonotonicityPenalty>,
     pub spec: SurvivalSpec,
 }
 
@@ -1280,12 +1280,12 @@ impl WorkingModelSurvival {
     ) -> Result<Self, SurvivalError> {
         data.validate()?;
         Ok(Self {
-            layout,
-            sample_weight: data.sample_weight.clone(),
-            event_target: data.event_target.clone(),
-            age_entry: data.age_entry.clone(),
-            age_exit: data.age_exit.clone(),
-            monotonicity,
+            layout: Arc::new(layout),
+            sample_weight: Arc::new(data.sample_weight.clone()),
+            event_target: Arc::new(data.event_target.clone()),
+            age_entry: Arc::new(data.age_entry.clone()),
+            age_exit: Arc::new(data.age_exit.clone()),
+            monotonicity: Arc::new(monotonicity),
             spec,
         })
     }
@@ -1425,7 +1425,7 @@ impl WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
-    pub fn update_state(&mut self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
+    pub fn update_state(&self, beta: &Array1<f64>) -> Result<WorkingState, SurvivalError> {
         let expected_dim = self.layout.combined_exit.ncols();
         if beta.len() != expected_dim {
             return Err(SurvivalError::DesignDimensionMismatch);

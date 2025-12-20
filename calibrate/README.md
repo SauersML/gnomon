@@ -51,7 +51,10 @@ the penalized IRLS solver that returns coefficients for any proposed set of
 likelihood of those smoothing parameters. Gaussian models maximize the exact
 restricted likelihood (REML), while non-Gaussian models maximize the Laplace
 approximate marginal likelihood (LAML); both objectives include stabilization
-priors and null-space accounting to prevent degeneracy.
+priors and null-space accounting to prevent degeneracy. This approach is
+**empirical Bayes**: the smoothing parameters (hyperparameters) are estimated
+from the data via marginal likelihood, then coefficients are inferred
+conditional on those point estimates.
 
 ## Optimization strategy
 
@@ -62,6 +65,45 @@ corrections, and effective degrees of freedom are cached so the outer REML/LAML
 optimizer can evaluate gradients efficiently. The final Hessian, effective
 penalty factors, and fitted scale (when applicable) are preserved inside the
 [`TrainedModel`](model.rs) artifact for downstream uncertainty estimates.
+
+## Uncertainty estimation
+
+The stored penalized Hessian enables standard error estimation at prediction time
+via the delta method: `Var(η) = x' H⁻¹ x`. However, these intervals have important
+limitations:
+
+**Smoothing bias**: Penalized splines systematically flatten peaks, fill valleys,
+and round corners. The Hessian-based SE captures _parameter uncertainty_ but not
+_smoothing-induced bias_. At extremes of the predictor space (high/low PGS, rare
+ancestries), the confidence interval may be centered incorrectly and under-cover.
+
+**Conditional vs. unconditional**: The current implementation computes the
+_conditional_ variance treating spline coefficients as fixed parameters. The
+_unconditional_ approach (averaging over the prior on coefficients) would give
+wider intervals but is "too large where bias is small and too small where bias
+is large" (Nychka 1988). Neither approach is perfect.
+
+**Calibrator uncertainty**: The post-hoc calibrator receives the base model's SE
+as a feature but does not propagate its own coefficient uncertainty. The final
+calibrated prediction inherits only the base model's uncertainty estimate.
+
+**Practical guidance**: Treat SEs as approximate. They are most reliable in smooth
+regions of the predictor space with dense training data. For clinical use, the
+hull distance (indicating proximity to training support) may be more informative
+than the SE magnitude.
+
+**Point estimate choice (mode vs. mean)**: The current implementation returns the
+posterior mode (MAP estimate from PIRLS). For risk predictions ("you have 13%
+chance of X"), the posterior mean is theoretically preferable because it minimizes
+Brier score / squared prediction error. If MCMC sampling were added post-BFGS,
+the posterior mean of the risk (averaging f(patient, β) over β samples) would
+give more accurate calibrated probabilities than the mode. The mode answers "what's
+the single most probable β?" while the mean answers "what risk should I report to
+minimize prediction error on average?" For patient-facing risk estimates, the mean
+is the Bayes-optimal choice.
+
+See Ruppert, Wand, Carroll "Semiparametric Regression" Ch. 6.6-6.9 for theoretical
+background on confidence intervals for penalized splines.
 
 ## Optional calibrator layer
 

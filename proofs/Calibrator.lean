@@ -197,8 +197,8 @@ structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
   f₀ₗ_zero : ∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0
   fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
-def IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop :=
-  ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
+structure IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
+  fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
 noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
   sorry
@@ -356,7 +356,7 @@ def IsBayesOptimalInRawClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] 
     expectedSquaredError dgp (fun p c => linearPredictor m p c)
 
 /-- Bayes-optimal among normalized score models only (L² projection onto additive subspace). -/
-def isBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+def IsBayesOptimalInNormalizedClass {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp) : Prop :=
   IsNormalizedScoreModel model ∧
   ∀ (m : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m →
@@ -656,11 +656,24 @@ lemma rawOptimal_implies_orthogonality
     -- We need: ∫ pc, residual pc ∂μ = 0
     -- By the variational argument above, this follows from the fact that
     -- perturbing the intercept a → a + ε increases the loss unless E[residual] = 0.
+    -- To formalize this, one would need to:
+    -- 1. Define a competitor model `m_eps` with intercept `a + ε`.
+    -- 2. Use `h_opt.2` to show `E[(Y - pred m)²] ≤ E[(Y - pred m_eps)²]`.
+    -- 3. Expand the RHS: `E[(resid - ε)²] = E[resid²] - 2ε E[resid] + ε²`.
+    -- 4. This gives `0 ≤ -2ε E[resid] + ε²`.
+    -- 5. For this to hold for all ε (positive and negative), `E[resid]` must be 0.
+    -- This requires showing all integrands are `Integrable`.
     sorry
   · -- Orthogonality with P
     -- We need: ∫ pc, residual pc * pc.1 ∂μ = 0
     -- By the variational argument above, this follows from the fact that
     -- perturbing the slope b → b + ε increases the loss unless E[residual·P] = 0.
+    -- The argument is analogous to the intercept case:
+    -- 1. Define `m_eps` with slope `b + ε`.
+    -- 2. Loss inequality becomes `E[resid²] ≤ E[(resid - ε*P)²]`.
+    -- 3. Expansion: `E[resid²] ≤ E[resid²] - 2ε E[resid·P] + ε² E[P²]`.
+    -- 4. `0 ≤ -2ε E[resid·P] + ε² E[P²]`, which implies `E[resid·P] = 0`.
+    -- This also requires proving integrability for `Y*P`, `P²`, etc.
     sorry
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
@@ -770,7 +783,7 @@ theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [
   -- are orthogonal. Since Y ∈ W_add, its projection onto W has no W_int component.
   -- This means all `fₘₗ` coefficients in the optimal model must be zero,
   -- which is the definition of `IsNormalizedScoreModel`.
-  admit
+  sorry
 
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
@@ -1493,7 +1506,7 @@ noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProc
 theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
     (hk_pos : k > 0)
-    (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInClass dgp1 model_norm)
+    (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInNormalizedClass dgp1 model_norm)
     (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle) :
   let predict_norm := fun p c => linearPredictor model_norm p c
   let predict_oracle := fun p c => linearPredictor model_oracle p c
@@ -1533,8 +1546,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
   intro c
 
-  -- The derivation follows from Equation (1) in the paper:
-  -- "The Optimal Coefficient Under a Linear Noise Model"
+  -- The derivation follows from Equation (1) in "Recalibration of Polygenic Risk Scores"
+  -- by Graham, T. et al. (2024).
   --
   -- Setup: Let G = true genetic liability, Y = phenotype, P = polygenic score
   --   Y = G + ε_Y (phenotype noise)

@@ -1,6 +1,12 @@
 # gnomon
 <img width="282" height="154" alt="Gnomon Logo" src="https://github.com/user-attachments/assets/73185e7e-09eb-4bc9-a82c-62d7102f4341" />
 
+[![Lean Proofs](https://github.com/SauersML/gnomon/actions/workflows/prover.yml/badge.svg)](https://github.com/SauersML/gnomon/actions/workflows/prover.yml)
+
+</div>
+
+---
+
 Wiktionary gives this etymology:
 >Borrowed from French gnomon, or directly from its etymon Latin gnōmōn, or directly from its etymon Ancient Greek γνώμων (gnṓmōn, “discerner, interpreter; carpenter’s square; gnomon of a sundial; (geometry) gnomon”), from γιγνώσκω (gignṓskō, “to be aware of; to perceive; to know”), ultimately from Proto-Indo-European *ǵneh₃- (“to know”); the word is thus related to know.
 
