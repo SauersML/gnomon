@@ -1,6 +1,7 @@
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use ahash::{AHashMap, AHasher};
 use faer::Side;
+use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{Array, Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -79,6 +80,9 @@ pub enum BasisError {
         "The provided knot vector is invalid: {0}. It must be non-decreasing and contain only finite values."
     )]
     InvalidKnotVector(String),
+
+    #[error("Failed to build sparse basis matrix: {0}")]
+    SparseCreation(String),
 }
 
 /// Runtime statistics for the optional B-spline basis cache.
@@ -409,6 +413,135 @@ pub fn create_bspline_basis_with_knots(
     Ok((basis_arc, knot_vec))
 }
 
+/// Returns true if the B-spline basis should be built in sparse form based on density.
+pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize) -> bool {
+    if num_basis_cols == 0 {
+        return false;
+    }
+
+    let support_per_row = (degree + 1).saturating_pow(dim as u32) as f64;
+    let density = support_per_row / num_basis_cols as f64;
+
+    density < 0.10 && num_basis_cols > 64
+}
+
+/// Creates a sparse B-spline basis matrix using a pre-computed knot vector.
+pub fn create_bspline_basis_sparse_with_knots(
+    data: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<(SparseColMat<usize, f64>, Array1<f64>), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    if knot_vector.iter().any(|&k| !k.is_finite()) {
+        return Err(BasisError::InvalidKnotVector(
+            "knot vector contains non-finite (NaN or Infinity) values".to_string(),
+        ));
+    }
+
+    if knot_vector.len() >= 2 {
+        for i in 0..(knot_vector.len() - 1) {
+            if knot_vector[i] > knot_vector[i + 1] {
+                return Err(BasisError::InvalidKnotVector(
+                    "knot vector is not non-decreasing".to_string(),
+                ));
+            }
+        }
+    }
+
+    let knot_vec = knot_vector.to_owned();
+    let knot_view = knot_vec.view();
+
+    let num_basis_functions = knot_view.len() - degree - 1;
+    let support = degree + 1;
+    let nrows = data.len();
+
+    const PAR_THRESHOLD: usize = 256;
+
+    let triplets: Vec<Triplet<usize, usize, f64>> = if let (true, Some(data_slice)) =
+        (nrows >= PAR_THRESHOLD, data.as_slice())
+    {
+        let triplet_chunks: Vec<Vec<Triplet<usize, usize, f64>>> = bspline_thread_pool().install(
+            || {
+                data_slice
+                    .par_iter()
+                    .enumerate()
+                    .map_init(
+                        || (internal::BsplineScratch::new(degree), vec![0.0; support]),
+                        |(scratch, values), (row_i, &x)| {
+                            let start_col = internal::evaluate_splines_sparse_into(
+                                x,
+                                degree,
+                                knot_view,
+                                values,
+                                scratch,
+                            );
+                            let mut local = Vec::with_capacity(support);
+                            for (offset, &v) in values.iter().enumerate() {
+                                if v == 0.0 {
+                                    continue;
+                                }
+                                let col_j = start_col + offset;
+                                if col_j < num_basis_functions {
+                                    local.push(Triplet::new(row_i, col_j, v));
+                                }
+                            }
+                            local
+                        },
+                    )
+                    .collect()
+            },
+        );
+
+        let mut flattened = Vec::with_capacity(nrows.saturating_mul(support));
+        for mut chunk in triplet_chunks {
+            flattened.append(&mut chunk);
+        }
+        flattened
+    } else {
+        let mut scratch = internal::BsplineScratch::new(degree);
+        let mut values = vec![0.0; support];
+        let mut triplets = Vec::with_capacity(nrows.saturating_mul(support));
+
+        for (row_i, &x) in data.iter().enumerate() {
+            let start_col = internal::evaluate_splines_sparse_into(
+                x,
+                degree,
+                knot_view,
+                &mut values,
+                &mut scratch,
+            );
+            for (offset, &v) in values.iter().enumerate() {
+                if v == 0.0 {
+                    continue;
+                }
+                let col_j = start_col + offset;
+                if col_j < num_basis_functions {
+                    triplets.push(Triplet::new(row_i, col_j, v));
+                }
+            }
+        }
+
+        triplets
+    };
+
+    let sparse = SparseColMat::try_new_from_triplets(nrows, num_basis_functions, &triplets)
+        .map_err(|err| BasisError::SparseCreation(format!("{err:?}")))?;
+
+    Ok((sparse, knot_vec))
+}
+
 /// Creates a B-spline basis expansion matrix with uniformly spaced knots.
 ///
 /// This function creates B-splines optimized for P-splines with D^T D penalties.
@@ -517,6 +650,33 @@ pub fn create_bspline_basis(
     global_basis_cache().insert(cache_key, Arc::clone(&basis_arc));
 
     Ok((basis_arc, knot_vector))
+}
+
+/// Creates a sparse B-spline basis expansion matrix with uniformly spaced knots.
+pub fn create_bspline_basis_sparse(
+    data: ArrayView1<f64>,
+    data_range: (f64, f64),
+    num_internal_knots: usize,
+    degree: usize,
+) -> Result<(SparseColMat<usize, f64>, Array1<f64>), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    if data_range.0 > data_range.1 {
+        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
+    }
+
+    if data_range.0 == data_range.1 && num_internal_knots > 0 {
+        return Err(BasisError::DegenerateRange(num_internal_knots));
+    }
+
+    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
+    let knot_view = knot_vector.view();
+
+    let (sparse, knot_vec) =
+        create_bspline_basis_sparse_with_knots(data.view(), knot_view, degree)?;
+
+    Ok((sparse, knot_vec))
 }
 
 /// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
@@ -896,6 +1056,70 @@ mod internal {
                 basis_values[global_idx] = n[i];
             }
         }
+    }
+
+    /// Evaluates only the non-zero B-spline basis values at a single point `x`.
+    /// Returns the start column for the contiguous support.
+    #[inline]
+    pub(super) fn evaluate_splines_sparse_into(
+        x: f64,
+        degree: usize,
+        knots: ArrayView1<f64>,
+        values: &mut [f64],
+        scratch: &mut BsplineScratch,
+    ) -> usize {
+        let num_knots = knots.len();
+        let num_basis = num_knots - degree - 1;
+        debug_assert_eq!(values.len(), degree + 1);
+
+        scratch.ensure_degree(degree);
+        scratch.n.fill(0.0);
+        scratch.left.fill(0.0);
+        scratch.right.fill(0.0);
+
+        let x_eval = x;
+
+        let mu = {
+            if x_eval >= knots[num_basis] {
+                num_basis - 1
+            } else if x_eval < knots[degree] {
+                degree
+            } else {
+                let mut span = degree;
+                while span < num_basis && x_eval >= knots[span + 1] {
+                    span += 1;
+                }
+                span
+            }
+        };
+
+        let left = &mut scratch.left;
+        let right = &mut scratch.right;
+        let n = &mut scratch.n;
+
+        n[0] = 1.0;
+
+        for d in 1..=degree {
+            left[d] = x_eval - knots[mu + 1 - d];
+            right[d] = knots[mu + d] - x_eval;
+
+            let mut saved = 0.0;
+
+            for r in 0..d {
+                let den = right[r + 1] + left[d - r];
+                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+
+                n[r] = saved + right[r + 1] * temp;
+                saved = left[d - r] * temp;
+            }
+            n[d] = saved;
+        }
+
+        for i in 0..=degree {
+            values[i] = n[i];
+        }
+
+        mu.saturating_sub(degree)
     }
 
     #[cfg(test)]

@@ -4,12 +4,14 @@ use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
     array2_to_mat_mut, hash_array2, ldlt_rook,
 };
+use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 use faer::{Accum, Side, get_global_parallelism};
+use faer::sparse::SparseRowMat;
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::{
@@ -258,7 +260,7 @@ pub struct WorkingModelPirlsResult {
 }
 
 struct GamWorkingModel<'a> {
-    x_transformed: Array2<f64>,
+    x_transformed: DesignMatrix,
     x_original: ArrayView2<'a, f64>,
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
@@ -273,10 +275,11 @@ struct GamWorkingModel<'a> {
     last_weights: Array1<f64>,
     last_z: Array1<f64>,
     last_penalty_term: f64,
+    x_csr: Option<SparseRowMat<usize, f64>>,
 }
 
 struct GamModelFinalState {
-    x_transformed: Array2<f64>,
+    x_transformed: DesignMatrix,
     e_transformed: Array2<f64>,
     final_mu: Array1<f64>,
     final_weights: Array1<f64>,
@@ -287,7 +290,7 @@ struct GamModelFinalState {
 
 impl<'a> GamWorkingModel<'a> {
     fn new(
-        x_transformed: Array2<f64>,
+        x_transformed: DesignMatrix,
         x_original: ArrayView2<'a, f64>,
         offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
@@ -299,6 +302,7 @@ impl<'a> GamWorkingModel<'a> {
         firth_bias_reduction: bool,
     ) -> Self {
         let n = x_transformed.nrows();
+        let x_csr = x_transformed.to_csr_cache();
         GamWorkingModel {
             x_transformed,
             x_original,
@@ -315,6 +319,7 @@ impl<'a> GamWorkingModel<'a> {
             last_weights: Array1::zeros(n),
             last_z: Array1::zeros(n),
             last_penalty_term: 0.0,
+            x_csr,
         }
     }
 
@@ -334,18 +339,31 @@ impl<'a> GamWorkingModel<'a> {
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
         let mut eta = self.offset.clone();
-        eta += &self.x_transformed.dot(beta);
+        eta += &self.x_transformed.matrix_vector_multiply(beta);
 
         let (mu, weights, mut z) = update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
 
         if self.firth_bias_reduction {
-            let (hat_diag, half_log_det) = compute_firth_hat_and_half_logdet(
-                self.x_transformed.view(),
-                self.x_original,
-                weights.view(),
-                &self.s_transformed,
-                &mut self.workspace,
-            )?;
+            let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
+                (DesignMatrix::Dense(matrix), _) => compute_firth_hat_and_half_logdet(
+                    matrix.view(),
+                    self.x_original,
+                    weights.view(),
+                    &self.s_transformed,
+                    &mut self.workspace,
+                )?,
+                (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
+                    csr,
+                    self.x_original,
+                    weights.view(),
+                    &self.s_transformed,
+                )?,
+                (DesignMatrix::Sparse(_), None) => {
+                    return Err(EstimationError::InvalidInput(
+                        "missing CSR cache for Firth computation".to_string(),
+                    ));
+                }
+            };
             self.firth_log_det = Some(half_log_det);
             for i in 0..z.len() {
                 let wi = weights[i];
@@ -357,15 +375,27 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.firth_log_det = None;
         }
 
-        self.workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
-        let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
-        if self.workspace.wx.dim() != self.x_transformed.dim() {
-            self.workspace.wx = Array2::zeros(self.x_transformed.dim());
-        }
-        self.workspace.wx.assign(&self.x_transformed);
-        self.workspace.wx *= &sqrt_w_col;
-        let xtwx = self.workspace.wx.t().dot(&self.workspace.wx);
-        let mut penalized_hessian = xtwx + &self.s_transformed;
+        let mut penalized_hessian = match &self.x_transformed {
+            DesignMatrix::Dense(matrix) => {
+                self.workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+                let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
+                if self.workspace.wx.dim() != matrix.dim() {
+                    self.workspace.wx = Array2::zeros(matrix.dim());
+                }
+                self.workspace.wx.assign(matrix);
+                self.workspace.wx *= &sqrt_w_col;
+                let xtwx = self.workspace.wx.t().dot(&self.workspace.wx);
+                xtwx + &self.s_transformed
+            }
+            DesignMatrix::Sparse(_) => {
+                let csr = self
+                    .x_csr
+                    .as_ref()
+                    .ok_or_else(|| EstimationError::InvalidInput("missing CSR cache".to_string()))?;
+                let xtwx = compute_hessian_sparse(csr, &weights)?;
+                xtwx + &self.s_transformed
+            }
+        };
         for i in 0..penalized_hessian.nrows() {
             for j in 0..i {
                 let val = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -380,8 +410,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.workspace.weighted_residual *= &weights;
         let mut gradient = self
             .x_transformed
-            .t()
-            .dot(&self.workspace.weighted_residual);
+            .transpose_vector_multiply(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta);
         gradient += &s_beta;
 
@@ -402,6 +431,138 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             penalty_term,
         })
     }
+}
+
+fn compute_hessian_sparse(
+    x: &SparseRowMat<usize, f64>,
+    weights: &Array1<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let ncols = x.ncols();
+    let nrows = x.nrows();
+    if weights.len() != nrows {
+        return Err(EstimationError::InvalidInput(format!(
+            "weights length {} does not match design rows {}",
+            weights.len(),
+            nrows
+        )));
+    }
+
+    let mut hessian = Array2::<f64>::zeros((ncols, ncols));
+
+    for row in 0..nrows {
+        let w = weights[row];
+        if w == 0.0 {
+            continue;
+        }
+        let x_row = x.as_ref();
+        let vals = x_row.val_of_row(row);
+        let cols: Vec<usize> = x_row.col_idx_of_row(row).map(|c| c).collect();
+        if cols.len() != vals.len() {
+            return Err(EstimationError::InvalidInput(
+                "sparse row value/index length mismatch".to_string(),
+            ));
+        }
+        for (idx_a, &col_a) in cols.iter().enumerate() {
+            let val_a = vals[idx_a];
+            let scaled = w * val_a;
+            for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
+                let val_b = vals[idx_b];
+                let delta = scaled * val_b;
+                hessian[[col_a, col_b]] += delta;
+                if col_a != col_b {
+                    hessian[[col_b, col_a]] += delta;
+                }
+            }
+        }
+    }
+
+    Ok(hessian)
+}
+
+fn compute_firth_hat_and_half_logdet_sparse(
+    x_transformed: &SparseRowMat<usize, f64>,
+    x_original: ArrayView2<f64>,
+    weights: ArrayView1<f64>,
+    s_transformed: &Array2<f64>,
+) -> Result<(Array1<f64>, f64), EstimationError> {
+    let n = x_transformed.nrows();
+    let p = x_transformed.ncols();
+
+    let xtwx_transformed = compute_hessian_sparse(x_transformed, &weights.to_owned())?;
+    let mut penalized_hessian = xtwx_transformed + s_transformed;
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+            penalized_hessian[[i, j]] = v;
+            penalized_hessian[[j, i]] = v;
+        }
+    }
+
+    let mut stabilized = penalized_hessian.clone();
+    ensure_positive_definite(&mut stabilized)?;
+
+    let mut fisher = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        if wi == 0.0 {
+            continue;
+        }
+        let xi = x_original.row(i);
+        for j in 0..p {
+            let xij = xi[j];
+            for k in 0..p {
+                fisher[[j, k]] += wi * xij * xi[k];
+            }
+        }
+    }
+    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
+    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+        EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: f64::NEG_INFINITY,
+        }
+    })?;
+    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+
+    let h_view = FaerArrayView::new(&stabilized);
+    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let mut identity = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        identity[[i, i]] = 1.0;
+    }
+    let identity_view = FaerArrayView::new(&identity);
+    let h_inv = chol_faer.solve(identity_view.as_ref());
+    let h_inv_arr = Array2::from_shape_fn((p, p), |(i, j)| h_inv[(i, j)]);
+
+    let mut hat_diag = Array1::<f64>::zeros(n);
+    let x_view = x_transformed.as_ref();
+    for i in 0..n {
+        let w = weights[i];
+        if w <= 0.0 {
+            continue;
+        }
+        let vals = x_view.val_of_row(i);
+        let cols: Vec<usize> = x_view.col_idx_of_row(i).map(|c| c).collect();
+        if cols.len() != vals.len() {
+            return Err(EstimationError::InvalidInput(
+                "sparse row value/index length mismatch".to_string(),
+            ));
+        }
+        let mut quad = 0.0;
+        for (idx_a, &col_a) in cols.iter().enumerate() {
+            let val_a = vals[idx_a];
+            for (idx_b, &col_b) in cols.iter().enumerate() {
+                let val_b = vals[idx_b];
+                quad += val_a * h_inv_arr[[col_a, col_b]] * val_b;
+            }
+        }
+        hat_diag[i] = w * quad;
+    }
+
+    Ok((hat_diag, half_log_det))
 }
 
 fn solve_newton_direction_dense(
@@ -872,7 +1033,7 @@ pub struct PirlsResult {
     // Pass through the entire reparameterization result for use in the gradient
     pub reparam_result: ReparamResult,
     // Cached X·Qs for this PIRLS result (transformed design matrix)
-    pub x_transformed: Array2<f64>,
+    pub x_transformed: DesignMatrix,
 }
 
 fn detect_logit_instability(
@@ -1002,20 +1163,21 @@ pub fn fit_model_for_fixed_rho<'a>(
     let eb: &Array2<f64> = eb_cow.as_ref();
 
     let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
-    let x_transformed = x.dot(&reparam_result.qs);
+    let x_transformed_dense = x.dot(&reparam_result.qs);
+    let x_transformed = DesignMatrix::Dense(x_transformed_dense.clone());
 
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
     let mut workspace = PirlsWorkspace::new(
-        x_transformed.nrows(),
-        x_transformed.ncols(),
+        x_transformed_dense.nrows(),
+        x_transformed_dense.ncols(),
         eb_rows,
         e_rows,
     );
 
     if matches!(link_function, LinkFunction::Identity) {
         let (pls_result, _) = solve_penalized_least_squares(
-            x_transformed.view(),
+            x_transformed_dense.view(),
             y,
             prior_weights,
             offset.view(),
@@ -1033,14 +1195,14 @@ pub fn fit_model_for_fixed_rho<'a>(
 
         let prior_weights_owned = prior_weights.to_owned();
         let mut eta = offset.to_owned();
-        eta += &x_transformed.dot(&beta_transformed);
+        eta += &x_transformed_dense.dot(&beta_transformed);
         let final_mu = eta.clone();
         let final_z = y.to_owned();
 
         let mut weighted_residual = final_mu.clone();
         weighted_residual -= &final_z;
         weighted_residual *= &prior_weights_owned;
-        let gradient_data = x_transformed.t().dot(&weighted_residual);
+        let gradient_data = x_transformed_dense.t().dot(&weighted_residual);
         let s_beta = reparam_result.s_transformed.dot(&beta_transformed);
         let mut gradient = gradient_data;
         gradient += &s_beta;
