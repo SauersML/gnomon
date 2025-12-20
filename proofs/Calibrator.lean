@@ -1761,7 +1761,16 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
       have := congr_fun (congr_fun h_eq_fn 0) c
       simp at this; exact this
     exact h_diff_env this
-  sorry
+  -- h_neq: dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation
+  -- h_opt1: model1 is Bayes-optimal for dgp1
+  -- h_opt2: model1 is Bayes-optimal for dgp2
+  -- But a Bayes-optimal predictor matches the true expectation (up to modification on null sets)
+  -- If model1 is optimal for both, then dgp1.trueExpectation = dgp2.trueExpectation, contradiction
+
+  -- The formal argument: if model1 minimizes E[(Y - pred)²] for both dgp1 and dgp2,
+  -- then pred = E[Y|P,C] for each. But E[Y|P,C] differs between the two DGPs,
+  -- so model1 cannot be optimal for both.
+  sorry -- Requires showing IsBayesOptimalInClass implies pred = trueExpectation a.e.
 
 end AllClaims
 
