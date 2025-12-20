@@ -1776,7 +1776,10 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
   -- This requires showing linearPredictor decomposes as base + slope * p for p=1 models,
   -- which is proven in linearPredictor_decomp (but requires linear PGS basis hypothesis)
-  sorry
+  -- The algebraic form: α(c) = σ_G² / (σ_G² + σ_η²(c)) is exactly the shrinkage factor
+  -- from measurement error attenuation bias theory.
+  -- See: Fuller (1987), "Measurement Error Models", Chapter 2.
+  sorry -- Shrinkage coefficient extraction from linearPredictor structure
 
 /-- Predictions are invariant under affine transformations of ancestry coordinates.
 
