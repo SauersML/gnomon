@@ -414,14 +414,15 @@ pub fn run_nuts_sampling(
     let total_samples = n_chains * n_samples_out;
 
     let mut samples = Array2::<f64>::zeros((total_samples, dim));
+    let mut z_buffer = Array1::<f64>::zeros(dim); // Reuse buffer to avoid per-sample allocations
     for chain in 0..n_chains {
         for sample_i in 0..n_samples_out {
             // Get z (whitened coordinates) directly from Array3
-            let z = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+            let z_view = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+            z_buffer.assign(&z_view);
 
             // Transform to β: β = μ + L @ z
-            let z_owned: Array1<f64> = z.to_owned();
-            let beta = &mode_arr + &chol.dot(&z_owned);
+            let beta = &mode_arr + &chol.dot(&z_buffer);
 
             let sample_idx = chain * n_samples_out + sample_i;
             samples.row_mut(sample_idx).assign(&beta);

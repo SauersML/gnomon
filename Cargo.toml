@@ -88,11 +88,7 @@ survival-data = []
 [dependencies.mini-mcmc]
 git = "https://github.com/SauersML/mini-mcmc"
 branch = "main"
-
-[dependencies.burn]
-version = "0.18"
 default-features = false
-features = ["ndarray", "autodiff"]
 
 [lints.rust]
 unused_variables = "deny"
