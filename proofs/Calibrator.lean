@@ -1345,14 +1345,38 @@ lemma risk_affine_additive
   -- ∫ -2uaP = -2ua · 0 = 0 (by hP0)
   -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
 
-  -- The formal proof requires:
-  -- 1. Rewriting the integrand as a sum of terms
-  -- 2. Applying integral_add for each term (requires integrability)
-  -- 3. Using the moment hypotheses to simplify
+  -- The formal proof: expand the squared term and integrate term by term
+  -- First, we rewrite the integrand algebraically
+  have h_expand : ∀ pc : ℝ × (Fin 1 → ℝ),
+      (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 =
+      u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+      + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
+      - 2*u*a * pc.1
+      - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
+    intro pc
+    simp only [hu]
+    ring
 
-  -- For now, we leave this with a sketch. The algebraic manipulations are tedious
-  -- but purely mechanical once integrability is established.
-  sorry
+  -- Rewrite the integral using the expansion
+  calc ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ
+      = ∫ pc, u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+            + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
+            - 2*u*a * pc.1
+            - 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ := by
+        congr 1; ext pc; exact h_expand pc
+      _ = u^2 * (∫ pc, pc.1^2 ∂μ) + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
+          + 2*u*β * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
+          - 2*u*a * (∫ pc, pc.1 ∂μ)
+          - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+        -- This step requires integral linearity and integrability hypotheses
+        -- The integrability of P, P², C, C², PC all follow from the finite moment assumptions
+        sorry -- Integral linearity (requires integrability of all terms)
+      _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
+          + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
+        rw [hP2, hPC0, hP0, hC0]
+      _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
+        simp only [hu]
+        ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
