@@ -377,7 +377,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
         let mut penalized_hessian = match &self.x_transformed {
             DesignMatrix::Dense(matrix) => {
-                self.workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+                self.workspace
+                    .sqrt_w
+                    .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
                 let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
                 if self.workspace.wx.dim() != matrix.dim() {
                     self.workspace.wx = Array2::zeros(matrix.dim());
@@ -450,7 +452,7 @@ fn compute_hessian_sparse(
     let mut hessian = Array2::<f64>::zeros((ncols, ncols));
 
     for row in 0..nrows {
-        let w = weights[row];
+        let w = weights[row].max(0.0);
         if w == 0.0 {
             continue;
         }
@@ -1831,7 +1833,7 @@ pub fn solve_penalized_least_squares(
         println!("[PLS Solver] Using fast path for unpenalized WLS");
 
         // Weighted design and RHS
-        let sqrt_w = weights.mapv(f64::sqrt);
+        let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
         let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
         let z_eff = &z - &offset;
         let wz = &sqrt_w * &z_eff;
@@ -1929,7 +1931,9 @@ pub fn solve_penalized_least_squares(
     // FAST PATH (penalized case): Use symmetric solve on H = Xᵀ W X + S_λ
     if e_transformed.nrows() > 0 {
         // Weighted design and RHS via broadcasting
-        workspace.sqrt_w.assign(&weights.mapv(f64::sqrt));
+        workspace
+            .sqrt_w
+            .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
         let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
         if workspace.wx.dim() != x_transformed.dim() {
             workspace.wx = Array2::zeros(x_transformed.dim());
@@ -2157,15 +2161,17 @@ pub fn solve_penalized_least_squares(
     // If full Newton-Raphson is implemented in the future, a full SVD-based correction,
     // as seen in the mgcv C function `pls_fit1`, would be required here for statistical correctness.
 
-    // Note: Current implementation uses Fisher scoring where weights are always non-negative
-    // Full Newton-Raphson would require handling negative weights via SVD correction
+    // Note: Current implementation uses Fisher scoring where weights should be non-negative;
+    // we still clamp tiny negatives to zero before forming sqrt(W) to avoid NaNs.
 
     // EXACTLY following mgcv's pls_fit1 multi-stage approach:
 
     // Stage: Initial QR decomposition of the weighted design matrix
 
     // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
-    workspace.sqrt_w.assign(&weights.mapv(f64::sqrt)); // Weights are guaranteed non-negative
+    workspace
+        .sqrt_w
+        .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
     // wx <- X .* sqrt_w (broadcast)
     if workspace.wx.dim() != x_transformed.dim() {
@@ -2732,7 +2738,7 @@ pub fn compute_final_penalized_hessian(
     let p = x.ncols();
 
     // Stage: Perform the QR decomposition of sqrt(W)X to get R_bar
-    let sqrt_w = weights.mapv(|w| w.sqrt()); // Weights are guaranteed non-negative with current link functions
+    let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
     let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
     let (_, r_bar) = wx.qr().map_err(EstimationError::LinearSystemSolveFailed)?;
     let r_rows = r_bar.nrows().min(p);
