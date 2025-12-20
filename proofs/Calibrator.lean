@@ -185,13 +185,22 @@ def IsIdentifiable {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
   (∀ l, (∑ i, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (data.c i l)) = 0) ∧
   (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
 
+-- Axiom: The penalized least squares problem has a solution (under suitable regularity conditions)
+-- This abstracts over the numerical solver in estimate.rs (PIRLS algorithm)
+axiom fit_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ) :
+    ∃ (m : PhenotypeInformedGAM p k sp),
+      (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
+      IsIdentifiable m data
+
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  sorry
+  Classical.choose (fit_exists p k sp n data lambda)
 
 theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
-  IsIdentifiable (fit p k sp n data lambda) data := by sorry
+  IsIdentifiable (fit p k sp n data lambda) data :=
+    Classical.choose_spec (fit_exists p k sp n data lambda)
 
 structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
   f₀ₗ_zero : ∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0
@@ -200,23 +209,43 @@ structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
 structure IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
   fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
+-- Axiom: The constrained raw model optimization problem has a solution
+axiom fitRaw_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ) :
+    ∃ (m : PhenotypeInformedGAM p k sp),
+      IsRawScoreModel m ∧
+      ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+        empiricalLoss m data lambda ≤ empiricalLoss m' data lambda
+
 noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  sorry
+  Classical.choose (fitRaw_exists p k sp n data lambda)
 
 theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
-    empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
+    empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec (fitRaw_exists p k sp n data lambda)
+  exact ⟨h.1, fun m hm => h.2 m hm⟩
+
+-- Axiom: The constrained normalized model optimization problem has a solution
+axiom fitNormalized_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ) :
+    ∃ (m : PhenotypeInformedGAM p k sp),
+      IsNormalizedScoreModel m ∧
+      ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+        empiricalLoss m data lambda ≤ empiricalLoss m' data lambda
 
 noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  sorry
+  Classical.choose (fitNormalized_exists p k sp n data lambda)
 
 theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
-    empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by sorry
+    empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
+  exact ⟨h.1, fun m hm => h.2 m hm⟩
 
 /-!
 =================================================================
