@@ -299,12 +299,13 @@ pub fn compute_alo_features(
     hull_opt: Option<&PeeledHull>,
     link: LinkFunction,
 ) -> Result<CalibratorFeatures, EstimationError> {
-    let n = base.x_transformed.nrows();
+    let x_dense = base.x_transformed.to_dense();
+    let n = x_dense.nrows();
 
     // Prepare U = sqrt(W) X and z
     let w = &base.final_weights;
     let sqrt_w = w.mapv(f64::sqrt);
-    let mut u = base.x_transformed.clone();
+    let mut u = x_dense.clone();
     let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
     u *= &sqrt_w_col;
 
@@ -373,7 +374,7 @@ pub fn compute_alo_features(
     let xtwx_view = FaerArrayView::new(&xtwx);
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_tilde = Array1::<f64>::zeros(n);
-    let eta_hat = base.x_transformed.dot(&base.beta_transformed);
+    let eta_hat = x_dense.dot(&base.beta_transformed);
     let z = &base.solve_working_response;
 
     let mut diag_counter = 0;
@@ -3041,6 +3042,7 @@ mod tests {
 
         // Fit a simple model
         let fit_res = real_unpenalized_fit(&x, &y, &w, link);
+        let x_dense = fit_res.x_transformed.to_dense();
 
         // Run ALO with our fixed code
         let alo_features = compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
@@ -3049,7 +3051,7 @@ mod tests {
         let n_test = 10; // Just test a few points for comparison
         // Use FINAL Fisher weights for comparison (this is what ALO uses)
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
-        let mut u = fit_res.x_transformed.clone();
+        let mut u = x_dense.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
@@ -3122,6 +3124,7 @@ mod tests {
 
         // Fit a simple model to get baseline predictions
         let fit_res = real_unpenalized_fit(&x, &y, &w, link);
+        let x_dense = fit_res.x_transformed.to_dense();
 
         // Compute ALO features
         compute_alo_features(&fit_res, y.view(), x.view(), None, link).unwrap();
@@ -3136,7 +3139,7 @@ mod tests {
         // Prepare U = sqrt(W)X
         let w = &fit_res.final_weights;
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
-        let mut u = fit_res.x_transformed.clone();
+        let mut u = x_dense.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
@@ -3144,7 +3147,7 @@ mod tests {
         let mut k = Array2::<f64>::zeros((p, p));
         for i in 0..n {
             let wi = w[i];
-            let xi = fit_res.x_transformed.row(i);
+            let xi = x_dense.row(i);
             for a in 0..p {
                 for b in 0..p {
                     k[[a, b]] += wi * xi[a] * xi[b];
@@ -3227,10 +3230,11 @@ mod tests {
         w_zero[test_idx] = 0.0;
 
         let fit_with_zero = real_unpenalized_fit(&x, &y, &w_zero, link);
+        let x_zero_dense = fit_with_zero.x_transformed.to_dense();
         compute_alo_features(&fit_with_zero, y.view(), x.view(), None, link).unwrap();
 
         // Check directly with small custom calculation
-        let mut u_zero = fit_with_zero.x_transformed.clone();
+        let mut u_zero = x_zero_dense.clone();
         let sqrt_w_zero = w_zero.mapv(f64::sqrt);
         let sqrt_w_zero_col = sqrt_w_zero.view().insert_axis(Axis(1));
         u_zero *= &sqrt_w_zero_col;
@@ -3279,6 +3283,7 @@ mod tests {
 
         // Fit full model
         let full_fit = real_unpenalized_fit(&x, &y, &w, link);
+        let x_full_dense = full_fit.x_transformed.to_dense();
 
         // Compute ALO features
         let alo_features = compute_alo_features(&full_fit, y.view(), x.view(), None, link).unwrap();
@@ -3286,7 +3291,7 @@ mod tests {
         // Build the exact Sherman–Morrison LOO baseline using the full-fit Fisher geometry
         let w_full = full_fit.final_weights.clone();
         let sqrt_w = w_full.mapv(f64::sqrt);
-        let mut u = full_fit.x_transformed.clone();
+        let mut u = x_full_dense.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
@@ -3328,7 +3333,7 @@ mod tests {
         let s_all = factor.solve(rhs_view.as_ref());
         let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
-        let eta_hat = full_fit.x_transformed.dot(&full_fit.beta_transformed);
+        let eta_hat = x_full_dense.dot(&full_fit.beta_transformed);
         let z = &full_fit.solve_working_response;
         let phi = 1.0_f64;
 
@@ -7668,6 +7673,7 @@ mod tests {
 
         // Fit a simple model to get the ALO features
         let fit_res = real_unpenalized_fit(&x, &y, &w, LinkFunction::Logit);
+        let x_dense = fit_res.x_transformed.to_dense();
 
         // Compute ALO features
         let alo_features =
@@ -7675,7 +7681,7 @@ mod tests {
 
         // Get inputs for manual SE calculation using the final PIRLS weights
         let sqrt_w = fit_res.final_weights.mapv(f64::sqrt);
-        let mut u = fit_res.x_transformed.clone();
+        let mut u = x_dense.clone();
         let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
         u *= &sqrt_w_col;
 
