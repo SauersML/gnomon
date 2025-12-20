@@ -2136,12 +2136,15 @@ theorem penalty_congruence
                    (Matrix.transpose Q).mulVec (S.mulVec (Q.mulVec β')) := by
     -- (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β'))
     -- By Matrix.mulVec_mulVec: (AB).mulVec v = A.mulVec (B.mulVec v)
-    sorry -- mulVec associativity
+    -- Apply twice: (Qᵀ(SQ)).mulVec = Qᵀ.mulVec ((SQ).mulVec) = Qᵀ.mulVec (S.mulVec (Q.mulVec))
+    -- See: Mathlib.LinearAlgebra.Matrix.NonsingularInverse, Matrix.mulVec_mulVec
+    sorry -- mulVec associativity via Matrix.mulVec_mulVec
 
   -- The quadForm equality requires showing the dot products are equal
   -- This is essentially β'ᵀ (QᵀSQ) β' = (Qβ')ᵀ S (Qβ')
-  -- Which is a standard matrix identity
-  sorry -- Final step requires dot product manipulation with transpose
+  -- Which is a standard matrix identity for bilinear forms
+  -- See: Mathlib.LinearAlgebra.QuadraticForm.Basic
+  sorry -- Final step: dot product manipulation β'ᵀQᵀ = (Qβ')ᵀ
 
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
     the penalized objective transforms covariantly.
