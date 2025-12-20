@@ -656,11 +656,24 @@ lemma rawOptimal_implies_orthogonality
     -- We need: ∫ pc, residual pc ∂μ = 0
     -- By the variational argument above, this follows from the fact that
     -- perturbing the intercept a → a + ε increases the loss unless E[residual] = 0.
+    -- To formalize this, one would need to:
+    -- 1. Define a competitor model `m_eps` with intercept `a + ε`.
+    -- 2. Use `h_opt.2` to show `E[(Y - pred m)²] ≤ E[(Y - pred m_eps)²]`.
+    -- 3. Expand the RHS: `E[(resid - ε)²] = E[resid²] - 2ε E[resid] + ε²`.
+    -- 4. This gives `0 ≤ -2ε E[resid] + ε²`.
+    -- 5. For this to hold for all ε (positive and negative), `E[resid]` must be 0.
+    -- This requires showing all integrands are `Integrable`.
     sorry
   · -- Orthogonality with P
     -- We need: ∫ pc, residual pc * pc.1 ∂μ = 0
     -- By the variational argument above, this follows from the fact that
     -- perturbing the slope b → b + ε increases the loss unless E[residual·P] = 0.
+    -- The argument is analogous to the intercept case:
+    -- 1. Define `m_eps` with slope `b + ε`.
+    -- 2. Loss inequality becomes `E[resid²] ≤ E[(resid - ε*P)²]`.
+    -- 3. Expansion: `E[resid²] ≤ E[resid²] - 2ε E[resid·P] + ε² E[P²]`.
+    -- 4. `0 ≤ -2ε E[resid·P] + ε² E[P²]`, which implies `E[resid·P] = 0`.
+    -- This also requires proving integrability for `Y*P`, `P²`, etc.
     sorry
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
