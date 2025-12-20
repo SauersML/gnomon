@@ -1146,8 +1146,10 @@ lemma transpose_mul_self_posDef {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintyp
     intro h_eq
     apply hv
     exact h_inj (h_eq.trans (X.mulVec_zero).symm)
-  -- Now show dotProduct' (XᵀX).mulVec v v = ‖Xv‖² > 0
-  sorry
+  -- Show: dotProduct' (XᵀX).mulVec v v = ‖Xv‖² > 0
+  -- The key is: (XᵀX).mulVec v = Xᵀ(Xv), so vᵀ(XᵀX)v = (Xv)ᵀ(Xv) = ‖Xv‖²
+  -- Since Xv ≠ 0, we have ‖Xv‖² > 0
+  sorry -- dotProduct' vᵀ(XᵀX)v = ‖Xv‖² > 0 by Hilbert space norm property
 
 /-- The penalized Gaussian loss as a quadratic function of parameters. -/
 noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
