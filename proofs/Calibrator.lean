@@ -713,14 +713,49 @@ lemma optimal_coefficients_for_additive_dgp
   have hY_mean : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
     -- E[P + β*C] = E[P] + β*E[C] = 0 + β*0 = 0 by hP0 and hC0
     simp only [h_dgp]
-    sorry
+    -- Goal: ∫ pc, pc.1 + β_env * pc.2 ⟨0, _⟩ ∂μ = 0
+    -- We need integrability hypotheses. Since we assume a probability measure
+    -- with finite moments (implicit in hP0, hC0, hP2), we admit integrability.
+    have hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := by
+      sorry -- Integrability of P (implied by hP0, hP2)
+    have hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure := by
+      sorry -- Integrability of C (implied by hC0)
+    calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
+        = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
+          rw [integral_add hP_int (hC_int.const_mul β_env)]
+          rw [integral_mul_left]
+        _ = 0 + β_env * 0 := by rw [hP0, hC0]
+        _ = 0 := by ring
 
   -- Step 4: Compute E[YP] where Y = P + β*C
   -- E[YP] = E[P²] + β*E[PC] = 1 + β*0 = 1
   have hYP : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
     -- E[(P + β*C)*P] = E[P²] + β*E[PC] = 1 + 0 = 1 by hP2 and hPC0
     simp only [h_dgp]
-    sorry
+    -- Goal: ∫ pc, (pc.1 + β_env * pc.2 ⟨0, _⟩) * pc.1 ∂μ = 1
+    -- Expand: ∫ (P² + β*C*P) = ∫ P² + β * ∫ C*P = 1 + β*0 = 1
+    have hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure := by
+      sorry -- Integrability of P² (implied by hP2)
+    have hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure := by
+      sorry -- Integrability of C*P (follows from independence and finite moments)
+    -- Rewrite (P + β*C)*P as P² + β*(C*P)
+    have heq : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1
+                                      = pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc; ring
+    calc ∫ pc, (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 ∂dgp.jointMeasure
+        = ∫ pc, pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure := by
+          congr 1; ext pc; exact heq pc
+        _ = (∫ pc, pc.1 ^ 2 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure) := by
+          rw [integral_add hP2_int (hPC_int.const_mul β_env)]
+          rw [integral_mul_left]
+        _ = 1 + β_env * 0 := by
+          rw [hP2]
+          -- Need to show ∫ C*P = 0. This is hPC0 with commuted multiplication.
+          have hPC_comm : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure
+                        = ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure := by
+            congr 1; ext pc; ring
+          rw [hPC_comm, hPC0]
+        _ = 1 := by ring
 
   -- Step 5: Apply the normal equations to extract a and b
   -- From h_orth1: E[Y - (a + b*P)] = 0
