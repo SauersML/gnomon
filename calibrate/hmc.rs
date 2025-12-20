@@ -387,12 +387,12 @@ pub fn run_nuts_sampling(
     let mut rng = rand::thread_rng();
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
-            Array1::from_iter((0..dim).map(|_| {
+            Array1::from_shape_fn(dim, |_| {
                 let u1: f64 = rand::Rng::r#gen(&mut rng);
                 let u2: f64 = rand::Rng::r#gen(&mut rng);
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 z * 0.1
-            }))
+            })
         })
         .collect();
 
