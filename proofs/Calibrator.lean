@@ -2068,8 +2068,24 @@ theorem penalty_congruence
     quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
   -- quadForm S (Qβ') = Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = (Qβ')ᵀ S (Qβ')
   -- = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β' = quadForm (QᵀSQ) β'
-  -- The key is showing S(Qβ') vs (QᵀSQ)β' relation via matrix associativity
-  sorry -- Requires careful unfolding of quadForm and Matrix.mulVec
+  unfold quadForm
+  -- LHS: Σᵢ (Q.mulVec β') i * (S.mulVec (Q.mulVec β')) i
+  -- RHS: Σᵢ β' i * ((QᵀSQ).mulVec β') i
+
+  -- The key is: (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β'))
+  -- This follows from Matrix.mulVec_mulVec: (AB).mulVec v = A.mulVec (B.mulVec v)
+
+  -- First, simplify the RHS penalty matrix action
+  have h_rhs_eq : (Matrix.transpose Q * S * Q).mulVec β' =
+                   (Matrix.transpose Q).mulVec (S.mulVec (Q.mulVec β')) := by
+    -- (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β'))
+    -- By Matrix.mulVec_mulVec: (AB).mulVec v = A.mulVec (B.mulVec v)
+    sorry -- mulVec associativity
+
+  -- The quadForm equality requires showing the dot products are equal
+  -- This is essentially β'ᵀ (QᵀSQ) β' = (Qβ')ᵀ S (Qβ')
+  -- Which is a standard matrix identity
+  sorry -- Final step requires dot product manipulation with transpose
 
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
     the penalized objective transforms covariantly.
