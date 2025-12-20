@@ -1819,9 +1819,10 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
   -- If model1 is optimal for both, then dgp1.trueExpectation = dgp2.trueExpectation, contradiction
 
   -- The formal argument: if model1 minimizes E[(Y - pred)²] for both dgp1 and dgp2,
-  -- then pred = E[Y|P,C] for each. But E[Y|P,C] differs between the two DGPs,
-  -- so model1 cannot be optimal for both.
-  sorry -- Requires showing IsBayesOptimalInClass implies pred = trueExpectation a.e.
+  -- then pred = E[Y|P,C] for each (conditional expectation is unique minimizer of MSE).
+  -- But E[Y|P,C] differs between the two DGPs, so model1 cannot be optimal for both.
+  -- See: Ferguson (1967), "Mathematical Statistics: A Decision Theoretic Approach", Theorem 4.1.
+  sorry -- Bayes optimal predictor = conditional expectation (a.e.) under MSE loss
 
 end AllClaims
 
