@@ -509,6 +509,11 @@ pub enum ModelError {
 }
 
 impl TrainedModel {
+    fn logit_from_prob(p: f64) -> f64 {
+        let p = p.clamp(1e-8, 1.0 - 1e-8);
+        (p / (1.0 - p)).ln()
+    }
+
     fn ensure_gam_link(&self, operation: &'static str) -> Result<LinkFunction, ModelError> {
         match &self.config.model_family {
             ModelFamily::Gam(link) => Ok(*link),
@@ -715,6 +720,13 @@ impl TrainedModel {
 
         // Ensure the model family is supported before invoking link-specific logic
         let link_function = self.ensure_gam_link("prediction")?;
+
+        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+            let mean = self.mcmc_mean_logit_predictions(&x_new)?;
+            let eta = mean.mapv(Self::logit_from_prob);
+            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
+            return Ok((eta, mean, signed_dist, se_eta_opt));
+        }
 
         // --- Linear predictor and mean ---
         let eta = x_new.dot(&beta);
