@@ -2420,10 +2420,8 @@ pub fn train_survival_model(
 
                                 let exp_neg_entry = (-h_entry).exp();
                                 let exp_neg_exit = (-h_exit).exp();
-                                let f_entry = 1.0 - exp_neg_entry;
-                                let f_exit = 1.0 - exp_neg_exit;
-                                let delta_raw = f_exit - f_entry;
-                                let denom_raw = 1.0 - f_entry;
+                                let delta_raw = exp_neg_entry - exp_neg_exit;
+                                let denom_raw = exp_neg_entry;
                                 let delta = delta_raw.max(0.0);
                                 let denom =
                                     denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
