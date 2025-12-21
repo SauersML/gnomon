@@ -1014,6 +1014,7 @@ impl TrainedModel {
         let design_width = coeffs.len();
 
         if let Some(samples) = self.mcmc_samples.as_ref() {
+            const MCMC_CHUNK_SIZE: usize = 32;
             if samples.nrows() == 0 {
                 return Err(ModelError::DimensionMismatch(
                     "MCMC samples are empty.".to_string(),
@@ -1029,8 +1030,10 @@ impl TrainedModel {
 
             let mut design_entry = Array2::<f64>::zeros((n, design_width));
             let mut design_exit = Array2::<f64>::zeros((n, design_width));
+            let mut cov_rows = Vec::with_capacity(n);
             for i in 0..n {
                 let cov_row = covariates.row(i).to_owned();
+                cov_rows.push(cov_row.clone());
                 let entry_age = age_entry[i];
                 let exit_age = age_exit[i];
                 let entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
@@ -1051,82 +1054,89 @@ impl TrainedModel {
             let mut conditional_risk = Array1::<f64>::zeros(n);
             let mut gradient = Array2::<f64>::zeros((n, design_width));
 
-            for sample in samples.outer_iter() {
-                let eta_entry = design_entry.dot(&sample);
-                let eta_exit = design_exit.dot(&sample);
+            let n_samples = samples.nrows();
+            let mut start = 0;
+            while start < n_samples {
+                let end = (start + MCMC_CHUNK_SIZE).min(n_samples);
+                let chunk = samples.slice(s![start..end, ..]);
+                let eta_entry = design_entry.dot(&chunk.t());
+                let eta_exit = design_exit.dot(&chunk.t());
 
-                for i in 0..n {
-                    let h_entry = eta_entry[i].exp();
-                    let h_exit = eta_exit[i].exp();
-                    hazard_entry[i] += h_entry;
-                    hazard_exit[i] += h_exit;
+                for j in 0..(end - start) {
+                    for i in 0..n {
+                        let h_entry = eta_entry[[i, j]].exp();
+                        let h_exit = eta_exit[[i, j]].exp();
+                        hazard_entry[i] += h_entry;
+                        hazard_exit[i] += h_exit;
 
-                    let cif_entry_val = 1.0 - (-h_entry).exp();
-                    let cif_exit_val = 1.0 - (-h_exit).exp();
-                    cif_entry[i] += cif_entry_val;
-                    cif_exit[i] += cif_exit_val;
+                        let cif_entry_val = 1.0 - (-h_entry).exp();
+                        let cif_exit_val = 1.0 - (-h_exit).exp();
+                        cif_entry[i] += cif_entry_val;
+                        cif_exit[i] += cif_exit_val;
 
-                    let (risk_val, mut grad_row) = match risk_type {
-                        SurvivalRiskType::Net => {
-                            let delta_h = (h_exit - h_entry).max(0.0);
-                            let risk = 1.0 - (-delta_h).exp();
+                        let (risk_val, mut grad_row) = match risk_type {
+                            SurvivalRiskType::Net => {
+                                let delta_h = (h_exit - h_entry).max(0.0);
+                                let risk = 1.0 - (-delta_h).exp();
 
-                            let exp_neg_entry = (-h_entry).exp();
-                            let exp_neg_exit = (-h_exit).exp();
-                            let f_entry = 1.0 - exp_neg_entry;
-                            let f_exit = 1.0 - exp_neg_exit;
-                            let delta_raw = f_exit - f_entry;
-                            let denom_raw = 1.0 - f_entry;
-                            let delta = delta_raw.max(0.0);
-                            let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
+                                let exp_neg_entry = (-h_entry).exp();
+                                let exp_neg_exit = (-h_exit).exp();
+                                let f_entry = 1.0 - exp_neg_entry;
+                                let f_exit = 1.0 - exp_neg_exit;
+                                let delta_raw = f_exit - f_entry;
+                                let denom_raw = 1.0 - f_entry;
+                                let delta = delta_raw.max(0.0);
+                                let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
 
-                            let d_f_entry = h_entry * exp_neg_entry;
-                            let d_f_exit = h_exit * exp_neg_exit;
-                            let dr_deta_exit = if delta_raw > 0.0 {
-                                d_f_exit / denom
-                            } else {
-                                0.0
-                            };
-                            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
-                            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
-                            let dden = -d_f_entry;
-                            let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
-                                (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
-                            } else {
-                                0.0
-                            };
+                                let d_f_entry = h_entry * exp_neg_entry;
+                                let d_f_exit = h_exit * exp_neg_exit;
+                                let dr_deta_exit = if delta_raw > 0.0 {
+                                    d_f_exit / denom
+                                } else {
+                                    0.0
+                                };
+                                let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                                let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                                let dden = -d_f_entry;
+                                let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+                                    (dnum * denom_raw - numerator * dden)
+                                        / (denom_raw * denom_raw)
+                                } else {
+                                    0.0
+                                };
 
-                            let grad_exit = design_exit.row(i).mapv(|v| v * dr_deta_exit);
-                            let grad_entry = design_entry.row(i).mapv(|v| v * dr_deta_entry);
-                            let grad = grad_exit + grad_entry;
-                            (risk, grad)
+                                let grad_exit = design_exit.row(i).mapv(|v| v * dr_deta_exit);
+                                let grad_entry = design_entry.row(i).mapv(|v| v * dr_deta_entry);
+                                let grad = grad_exit + grad_entry;
+                                (risk, grad)
+                            }
+                            SurvivalRiskType::Crude => {
+                                let mortality = mortality_model.expect("checked above");
+                                survival::calculate_crude_risk_quadrature(
+                                    age_entry[i],
+                                    age_exit[i],
+                                    &cov_rows[i],
+                                    artifacts,
+                                    mortality,
+                                    Some(chunk.row(j)),
+                                    None,
+                                )?
+                            }
+                        };
+
+                        conditional_risk[i] += risk_val;
+                        let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                        let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+                        grad_row.mapv_inplace(|v| v * logistic_scale);
+                        {
+                            let mut grad_acc = gradient.row_mut(i);
+                            Zip::from(&mut grad_acc)
+                                .and(&grad_row)
+                                .for_each(|a, &b| *a += b);
                         }
-                        SurvivalRiskType::Crude => {
-                            let mortality = mortality_model.expect("checked above");
-                            let cov_row = covariates.row(i).to_owned();
-                            survival::calculate_crude_risk_quadrature(
-                                age_entry[i],
-                                age_exit[i],
-                                &cov_row,
-                                artifacts,
-                                mortality,
-                                Some(sample.view()),
-                                None,
-                            )?
-                        }
-                    };
-
-                    conditional_risk[i] += risk_val;
-                    let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
-                    let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                    grad_row.mapv_inplace(|v| v * logistic_scale);
-                    {
-                        let mut grad_acc = gradient.row_mut(i);
-                        Zip::from(&mut grad_acc)
-                            .and(&grad_row)
-                            .for_each(|a, &b| *a += b);
                     }
                 }
+                start = end;
             }
 
             let scale = 1.0 / (samples.nrows() as f64);
