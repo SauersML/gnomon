@@ -224,9 +224,8 @@ theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
-    empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
-  have h := Classical.choose_spec (fitRaw_exists p k sp n data lambda)
-  exact ⟨h.1, fun m hm => h.2 m hm⟩
+    empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda :=
+  Classical.choose_spec (fitRaw_exists p k sp n data lambda)
 
 -- Axiom: The constrained normalized model optimization problem has a solution
 axiom fitNormalized_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
@@ -243,9 +242,8 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
-    empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
-  have h := Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
-  exact ⟨h.1, fun m hm => h.2 m hm⟩
+    empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda :=
+  Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
 
 /-!
 =================================================================
