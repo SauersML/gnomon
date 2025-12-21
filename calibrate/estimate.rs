@@ -75,6 +75,7 @@ fn mean_logit_from_samples(
     x: ArrayView2<f64>,
     samples: &Array2<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
+    const MCMC_CHUNK_SIZE: usize = 64;
     if samples.nrows() == 0 {
         return Err(EstimationError::InvalidInput(
             "MCMC samples are empty.".to_string(),
@@ -89,11 +90,21 @@ fn mean_logit_from_samples(
     }
 
     let mut sum = Array1::<f64>::zeros(x.nrows());
-    for sample in samples.outer_iter() {
-        let eta = x.dot(&sample);
-        let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-        let probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
-        sum += &probs;
+    let n_samples = samples.nrows();
+    let mut start = 0;
+    while start < n_samples {
+        let end = (start + MCMC_CHUNK_SIZE).min(n_samples);
+        let chunk = samples.slice(s![start..end, ..]);
+        let eta = x.dot(&chunk.t());
+        for i in 0..eta.nrows() {
+            let mut acc = 0.0;
+            for j in 0..eta.ncols() {
+                let e = eta[[i, j]].clamp(-700.0, 700.0);
+                acc += 1.0 / (1.0 + f64::exp(-e));
+            }
+            sum[i] += acc;
+        }
+        start = end;
     }
     let scale = 1.0 / (samples.nrows() as f64);
     Ok(sum.mapv(|v| logit_from_prob(v * scale)))

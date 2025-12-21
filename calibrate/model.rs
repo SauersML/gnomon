@@ -642,6 +642,7 @@ impl TrainedModel {
         &self,
         x_new: &Array2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
+        const MCMC_CHUNK_SIZE: usize = 64;
         let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
             ModelError::DimensionMismatch("MCMC samples missing for logit prediction.".to_string())
         })?;
@@ -659,11 +660,21 @@ impl TrainedModel {
         }
 
         let mut sum = Array1::<f64>::zeros(x_new.nrows());
-        for sample in samples.outer_iter() {
-            let eta = x_new.dot(&sample);
-            let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-            let probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
-            sum += &probs;
+        let n_samples = samples.nrows();
+        let mut start = 0;
+        while start < n_samples {
+            let end = (start + MCMC_CHUNK_SIZE).min(n_samples);
+            let chunk = samples.slice(s![start..end, ..]);
+            let eta = x_new.dot(&chunk.t());
+            for i in 0..eta.nrows() {
+                let mut acc = 0.0;
+                for j in 0..eta.ncols() {
+                    let e = eta[[i, j]].clamp(-700.0, 700.0);
+                    acc += 1.0 / (1.0 + f64::exp(-e));
+                }
+                sum[i] += acc;
+            }
+            start = end;
         }
 
         let scale = 1.0 / (samples.nrows() as f64);
