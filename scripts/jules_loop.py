@@ -265,8 +265,8 @@ def main():
         prompt = (
             "The Lean Proof build passed successfully. "
             "Please find one thing to do, improve, fix, or strengthen in the Lean proof files "
-            "(specifically files in proofs/). "
-            "You can optimize code, add comments, strengthen proofs, replace 'sorry' with actual proofs, or refactor. "
+            "(specifically files in proofs/). You must successfully compile the code yourself. If the build times out or fails, do not submit it and keep working."
+            "You can optimize code, strengthen proofs, replace 'sorry' with actual proofs, or refactor. "
             "IMPORTANT: Ensure your changes compile and that all proofs are valid. "
             "Do not break existing functionality."
             + version_restriction
