@@ -672,10 +672,10 @@ impl TrainedModel {
             let end = (start + ROW_CHUNK_SIZE).min(x_new.nrows());
             let x_chunk = x_new.slice(s![start..end, ..]);
             let eta = x_chunk.dot(&samples_t);
-            for i in 0..eta.nrows() {
+            for (i, row) in eta.outer_iter().enumerate() {
                 let mut acc = 0.0;
-                for j in 0..eta.ncols() {
-                    let e = eta[[i, j]].clamp(-700.0, 700.0);
+                for &e_raw in row.iter() {
+                    let e = e_raw.clamp(-700.0, 700.0);
                     acc += 1.0 / (1.0 + f64::exp(-e));
                 }
                 sum[start + i] = acc;
@@ -1153,16 +1153,18 @@ impl TrainedModel {
                             conditional_risk[idx] += risk_val;
                             let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
                             let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                            match risk_type {
-                                SurvivalRiskType::Net => {
-                                    let mut grad_acc = gradient.row_mut(idx);
-                                    for k in 0..design_width {
-                                        grad_acc[k] +=
-                                            (design_exit_chunk[[i, k]] * dr_deta_exit
-                                                + design_entry_chunk[[i, k]] * dr_deta_entry)
-                                                * logistic_scale;
+                                match risk_type {
+                                    SurvivalRiskType::Net => {
+                                        let entry_row = design_entry_chunk.row(i);
+                                        let exit_row = design_exit_chunk.row(i);
+                                        let mut grad_acc = gradient.row_mut(idx);
+                                        for k in 0..design_width {
+                                            grad_acc[k] +=
+                                                (exit_row[k] * dr_deta_exit
+                                                    + entry_row[k] * dr_deta_entry)
+                                                    * logistic_scale;
+                                        }
                                     }
-                                }
                                 SurvivalRiskType::Crude => {
                                     if let Some(mut grad_row) = grad_row_opt {
                                         grad_row.mapv_inplace(|v| v * logistic_scale);

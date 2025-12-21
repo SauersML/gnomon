@@ -97,10 +97,10 @@ fn mean_logit_from_samples(
         let end = (start + ROW_CHUNK_SIZE).min(x.nrows());
         let x_chunk = x.slice(s![start..end, ..]);
         let eta = x_chunk.dot(&samples_t);
-        for i in 0..eta.nrows() {
+        for (i, row) in eta.outer_iter().enumerate() {
             let mut acc = 0.0;
-            for j in 0..eta.ncols() {
-                let e = eta[[i, j]].clamp(-700.0, 700.0);
+            for &e_raw in row.iter() {
+                let e = e_raw.clamp(-700.0, 700.0);
                 acc += 1.0 / (1.0 + f64::exp(-e));
             }
             sum[start + i] = acc;
