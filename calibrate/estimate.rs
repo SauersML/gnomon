@@ -2374,83 +2374,95 @@ pub fn train_survival_model(
                 primary_mcmc_samples.as_ref()
             {
                 const MCMC_CHUNK_SIZE: usize = 32;
+                const ROW_CHUNK_SIZE: usize = 2048;
                 let mut risks = Array1::<f64>::zeros(n);
                 let mut logit_design = Array2::<f64>::zeros((n, p_dim));
 
                 let n_samples = samples.nrows();
-                let mut start = 0;
-                while start < n_samples {
-                    let end = (start + MCMC_CHUNK_SIZE).min(n_samples);
-                    let chunk = samples.slice(s![start..end, ..]);
-                    let eta_entry = layout.combined_entry.dot(&chunk.t());
-                    let eta_exit = layout.combined_exit.dot(&chunk.t());
+                let mut row_start = 0;
+                while row_start < n {
+                    let row_end = (row_start + ROW_CHUNK_SIZE).min(n);
+                    let design_entry_chunk =
+                        layout.combined_entry.slice(s![row_start..row_end, ..]);
+                    let design_exit_chunk =
+                        layout.combined_exit.slice(s![row_start..row_end, ..]);
 
-                    for j in 0..(end - start) {
-                        for i in 0..n {
-                            let design_entry = layout.combined_entry.row(i);
-                            let design_exit = layout.combined_exit.row(i);
+                    let mut sample_start = 0;
+                    while sample_start < n_samples {
+                        let sample_end = (sample_start + MCMC_CHUNK_SIZE).min(n_samples);
+                        let chunk = samples.slice(s![sample_start..sample_end, ..]);
+                        let eta_entry = design_entry_chunk.dot(&chunk.t());
+                        let eta_exit = design_exit_chunk.dot(&chunk.t());
 
-                            let eta_entry_i = eta_entry[[i, j]];
-                            let eta_exit_i = eta_exit[[i, j]];
-                            if !eta_entry_i.is_finite() || !eta_exit_i.is_finite() {
-                                return Err(EstimationError::CalibratorTrainingFailed(
-                                    "non-finite linear predictor during calibrator feature extraction"
-                                        .to_string(),
-                                ));
-                            }
+                        for j in 0..(sample_end - sample_start) {
+                            for i in 0..(row_end - row_start) {
+                                let idx = row_start + i;
+                                let design_entry = design_entry_chunk.row(i);
+                                let design_exit = design_exit_chunk.row(i);
 
-                            let h_entry = eta_entry_i.exp();
-                            let h_exit = eta_exit_i.exp();
-                            if !h_entry.is_finite() || !h_exit.is_finite() {
-                                return Err(EstimationError::CalibratorTrainingFailed(
-                                    "non-finite hazard during calibrator feature extraction"
-                                        .to_string(),
-                                ));
-                            }
+                                let eta_entry_i = eta_entry[[i, j]];
+                                let eta_exit_i = eta_exit[[i, j]];
+                                if !eta_entry_i.is_finite() || !eta_exit_i.is_finite() {
+                                    return Err(EstimationError::CalibratorTrainingFailed(
+                                        "non-finite linear predictor during calibrator feature extraction"
+                                            .to_string(),
+                                    ));
+                                }
 
-                            let exp_neg_entry = (-h_entry).exp();
-                            let exp_neg_exit = (-h_exit).exp();
-                            let f_entry = 1.0 - exp_neg_entry;
-                            let f_exit = 1.0 - exp_neg_exit;
-                            let delta_raw = f_exit - f_entry;
-                            let denom_raw = 1.0 - f_entry;
-                            let delta = delta_raw.max(0.0);
-                            let denom =
-                                denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
-                            let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
-                            let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
-                            risks[i] += risk_clamped;
+                                let h_entry = eta_entry_i.exp();
+                                let h_exit = eta_exit_i.exp();
+                                if !h_entry.is_finite() || !h_exit.is_finite() {
+                                    return Err(EstimationError::CalibratorTrainingFailed(
+                                        "non-finite hazard during calibrator feature extraction"
+                                            .to_string(),
+                                    ));
+                                }
 
-                            let d_f_entry = h_entry * exp_neg_entry;
-                            let d_f_exit = h_exit * exp_neg_exit;
-                            let dr_deta_exit = if delta_raw > 0.0 {
-                                d_f_exit / denom
-                            } else {
-                                0.0
-                            };
-                            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
-                            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
-                            let dden = -d_f_entry;
-                            let dr_deta_entry =
-                                if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
-                                    (dnum * denom_raw - numerator * dden)
-                                        / (denom_raw * denom_raw)
+                                let exp_neg_entry = (-h_entry).exp();
+                                let exp_neg_exit = (-h_exit).exp();
+                                let f_entry = 1.0 - exp_neg_entry;
+                                let f_exit = 1.0 - exp_neg_exit;
+                                let delta_raw = f_exit - f_entry;
+                                let denom_raw = 1.0 - f_entry;
+                                let delta = delta_raw.max(0.0);
+                                let denom =
+                                    denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
+                                let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
+                                let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                                risks[idx] += risk_clamped;
+
+                                let d_f_entry = h_entry * exp_neg_entry;
+                                let d_f_exit = h_exit * exp_neg_exit;
+                                let dr_deta_exit = if delta_raw > 0.0 {
+                                    d_f_exit / denom
                                 } else {
                                     0.0
                                 };
+                                let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                                let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                                let dden = -d_f_entry;
+                                let dr_deta_entry =
+                                    if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
+                                        (dnum * denom_raw - numerator * dden)
+                                            / (denom_raw * denom_raw)
+                                    } else {
+                                        0.0
+                                    };
 
-                            let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                            {
-                                let mut grad_acc = logit_design.row_mut(i);
-                                for k in 0..p_dim {
-                                    grad_acc[k] += (design_exit[k] * dr_deta_exit
-                                        + design_entry[k] * dr_deta_entry)
-                                        * logistic_scale;
+                                let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+                                {
+                                    let mut grad_acc = logit_design.row_mut(idx);
+                                    for k in 0..p_dim {
+                                        grad_acc[k] += (design_exit[k] * dr_deta_exit
+                                            + design_entry[k] * dr_deta_entry)
+                                            * logistic_scale;
+                                    }
                                 }
                             }
                         }
+                        sample_start = sample_end;
                     }
-                    start = end;
+                    row_start = row_end;
                 }
 
                 let scale = 1.0 / (samples.nrows() as f64);
