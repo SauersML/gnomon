@@ -1044,10 +1044,8 @@ impl TrainedModel {
 
             let mut design_entry = Array2::<f64>::zeros((n, design_width));
             let mut design_exit = Array2::<f64>::zeros((n, design_width));
-            let mut cov_rows = Vec::with_capacity(n);
             for i in 0..n {
                 let cov_row = covariates.row(i).to_owned();
-                cov_rows.push(cov_row.clone());
                 let entry_age = age_entry[i];
                 let exit_age = age_exit[i];
                 let entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
@@ -1079,7 +1077,6 @@ impl TrainedModel {
                 let row_end = (row_start + ROW_CHUNK_SIZE).min(n);
                 let design_entry_chunk = design_entry.slice(s![row_start..row_end, ..]);
                 let design_exit_chunk = design_exit.slice(s![row_start..row_end, ..]);
-                let cov_rows_chunk = &cov_rows[row_start..row_end];
                 let age_entry_chunk = age_entry.slice(s![row_start..row_end]);
                 let age_exit_chunk = age_exit.slice(s![row_start..row_end]);
 
@@ -1144,7 +1141,7 @@ impl TrainedModel {
                                         survival::calculate_crude_risk_quadrature(
                                             age_entry_chunk[i],
                                             age_exit_chunk[i],
-                                            &cov_rows_chunk[i],
+                                            covariates.row(idx),
                                             artifacts,
                                             mortality,
                                             Some(chunk.row(j)),
@@ -1294,7 +1291,7 @@ impl TrainedModel {
                 SurvivalRiskType::Crude => {
                     let mortality = mortality_model.expect("checked above");
                     survival::calculate_crude_risk_quadrature(
-                        entry_age, exit_age, &cov_row, artifacts, mortality,
+                        entry_age, exit_age, cov_row.view(), artifacts, mortality,
                         None,
                         None,
                     )?

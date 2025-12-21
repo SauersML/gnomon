@@ -2041,11 +2041,11 @@ pub fn cumulative_hazard(
 
 pub fn cumulative_hazard_with_coeffs(
     age: f64,
-    covariates: &Array1<f64>,
+    covariates: ArrayView1<'_, f64>,
     artifacts: &SurvivalModelArtifacts,
     coeffs: ArrayView1<'_, f64>,
 ) -> Result<f64, SurvivalError> {
-    let design = design_row_at_age(age, covariates.view(), artifacts)?;
+    let design = design_row_at_age(age, covariates, artifacts)?;
     let eta = design.dot(&coeffs);
     Ok(eta.exp())
 }
@@ -2134,7 +2134,7 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 pub fn calculate_crude_risk_quadrature<'a>(
     t0: f64,
     t1: f64,
-    covariates: &Array1<f64>,
+    covariates: ArrayView1<'a, f64>,
     disease_model: &'a SurvivalModelArtifacts,
     mortality_model: &'a SurvivalModelArtifacts,
     disease_coeffs: Option<ArrayView1<'a, f64>>,
@@ -2227,7 +2227,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
     // Design row at entry age for gradient term involving H_D(t0) X(t0)
     design_and_derivative_at_age_scratch(
         t0,
-        covariates.view(),
+        covariates,
         disease_model,
         &mut design_d,
         &mut deriv_d,
@@ -2247,7 +2247,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
             // Eval Disease: h(u), H(u)
             design_and_derivative_at_age_scratch(
                 u,
-                covariates.view(),
+                covariates,
                 disease_model,
                 &mut design_d,
                 &mut deriv_d,
@@ -2262,7 +2262,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
             // Eval Mortality: H(u) (hazard not needed for integrand)
             design_and_derivative_at_age_scratch(
                 u,
-                covariates.view(),
+                covariates,
                 mortality_model,
                 &mut design_m,
                 &mut deriv_m,
