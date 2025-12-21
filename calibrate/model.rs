@@ -1067,6 +1067,11 @@ impl TrainedModel {
             let mut cif_exit = Array1::<f64>::zeros(n);
             let mut conditional_risk = Array1::<f64>::zeros(n);
             let mut gradient = Array2::<f64>::zeros((n, design_width));
+            let mortality_ref = if matches!(risk_type, SurvivalRiskType::Crude) {
+                Some(mortality_model.expect("checked above"))
+            } else {
+                None
+            };
 
             let n_samples = samples.nrows();
             let mut row_start = 0;
@@ -1134,7 +1139,7 @@ impl TrainedModel {
                                     risk
                                 }
                                 SurvivalRiskType::Crude => {
-                                    let mortality = mortality_model.expect("checked above");
+                                    let mortality = mortality_ref.expect("checked above");
                                     let (risk, grad_row) =
                                         survival::calculate_crude_risk_quadrature(
                                             age_entry_chunk[i],
