@@ -2037,6 +2037,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use ndarray::{Array1, Array2, array};
 
+    fn sigmoid(x: f64) -> f64 {
+        let x = x.clamp(-700.0, 700.0);
+        1.0 / (1.0 + f64::exp(-x))
+    }
+
     /// Test a trivially simple case with degree 1 B-spline (piecewise linear interpolation).
     /// This test uses a simple ground truth we can calculate by hand to verify the prediction.
     #[test]
@@ -2147,6 +2152,208 @@ mod tests {
 
         // Verify the results match our correctly calculated ground truth
         assert_eq!(predictions.len(), 2);
+        assert_abs_diff_eq!(
+            predictions.as_slice().unwrap(),
+            expected_values.as_slice().unwrap(),
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn predict_detailed_uses_mcmc_mean_for_logit() {
+        let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
+        let degree = 1;
+        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+            array![0.25, 0.75].view(),
+            knot_vector.view(),
+            degree,
+        )
+        .unwrap();
+        let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
+        let (_, z_transform) =
+            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view(), None).unwrap();
+
+        let mut model = TrainedModel {
+            config: ModelConfig {
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
+                penalty_order: 2,
+                convergence_tolerance: 1e-6,
+                max_iterations: 100,
+                reml_convergence_tolerance: 1e-6,
+                reml_max_iterations: 50,
+                firth_bias_reduction: false,
+                reml_parallel_threshold: default_reml_parallel_threshold(),
+                pgs_basis_config: BasisConfig {
+                    num_knots: 1,
+                    degree,
+                },
+                pc_configs: vec![],
+                pgs_range: (0.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: {
+                    let mut constraints = HashMap::new();
+                    constraints.insert("pgs_main".to_string(), z_transform.clone());
+                    constraints
+                },
+                knot_vectors: {
+                    let mut knots = HashMap::new();
+                    knots.insert("pgs".to_string(), knot_vector.clone());
+                    knots
+                },
+                range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
+                interaction_orth_alpha: HashMap::new(),
+                mcmc_enabled: true,
+                survival: None,
+            },
+            coefficients: MappedCoefficients {
+                intercept: 0.5,
+                main_effects: MainEffects {
+                    sex: 0.5,
+                    pgs: vec![2.0],
+                    pcs: HashMap::new(),
+                },
+                interaction_effects: HashMap::new(),
+            },
+            lambdas: vec![],
+            hull: None,
+            penalized_hessian: None,
+            scale: None,
+            calibrator: None,
+            survival: None,
+            survival_companions: HashMap::new(),
+            mcmc_samples: None,
+        };
+
+        let test_points = array![0.25, 0.75];
+        let sex_points = array![0.0, 1.0];
+        let empty_pcs = Array2::<f64>::zeros((2, 0));
+        let x_new = internal_construct_design_matrix(
+            test_points.view(),
+            sex_points.view(),
+            empty_pcs.view(),
+            &model.config,
+            &model.coefficients,
+        )
+        .unwrap();
+        let p = x_new.ncols();
+        let mut samples = Array2::<f64>::zeros((2, p));
+        samples.row_mut(1).fill(1.0);
+        model.mcmc_samples = Some(samples);
+
+        let (eta, mean, _, _) = model
+            .predict_detailed(test_points.view(), sex_points.view(), empty_pcs.view())
+            .unwrap();
+        let pred = model
+            .predict(test_points.view(), sex_points.view(), empty_pcs.view())
+            .unwrap();
+
+        let eta_ones = x_new.dot(&Array1::ones(p));
+        let expected_mean = eta_ones.mapv(|e| 0.5 * (0.5 + sigmoid(e)));
+        let expected_eta = expected_mean.mapv(|p| (p / (1.0 - p)).ln());
+
+        assert_abs_diff_eq!(
+            mean.as_slice().unwrap(),
+            expected_mean.as_slice().unwrap(),
+            epsilon = 1e-10
+        );
+        assert_abs_diff_eq!(
+            pred.as_slice().unwrap(),
+            expected_mean.as_slice().unwrap(),
+            epsilon = 1e-10
+        );
+        assert_abs_diff_eq!(
+            eta.as_slice().unwrap(),
+            expected_eta.as_slice().unwrap(),
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn identity_prediction_ignores_mcmc_samples() {
+        let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
+        let degree = 1;
+        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+            array![0.25, 0.75].view(),
+            knot_vector.view(),
+            degree,
+        )
+        .unwrap();
+        let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
+        let (_, z_transform) =
+            basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view(), None).unwrap();
+
+        let mut model = TrainedModel {
+            config: ModelConfig {
+                model_family: ModelFamily::Gam(LinkFunction::Identity),
+                penalty_order: 2,
+                convergence_tolerance: 1e-6,
+                max_iterations: 100,
+                reml_convergence_tolerance: 1e-6,
+                reml_max_iterations: 50,
+                firth_bias_reduction: false,
+                reml_parallel_threshold: default_reml_parallel_threshold(),
+                pgs_basis_config: BasisConfig {
+                    num_knots: 1,
+                    degree,
+                },
+                pc_configs: vec![],
+                pgs_range: (0.0, 1.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: {
+                    let mut constraints = HashMap::new();
+                    constraints.insert("pgs_main".to_string(), z_transform.clone());
+                    constraints
+                },
+                knot_vectors: {
+                    let mut knots = HashMap::new();
+                    knots.insert("pgs".to_string(), knot_vector.clone());
+                    knots
+                },
+                range_transforms: HashMap::new(),
+                pc_null_transforms: HashMap::new(),
+                interaction_centering_means: HashMap::new(),
+                interaction_orth_alpha: HashMap::new(),
+                mcmc_enabled: true,
+                survival: None,
+            },
+            coefficients: MappedCoefficients {
+                intercept: 0.5,
+                main_effects: MainEffects {
+                    sex: 0.5,
+                    pgs: vec![2.0],
+                    pcs: HashMap::new(),
+                },
+                interaction_effects: HashMap::new(),
+            },
+            lambdas: vec![],
+            hull: None,
+            penalized_hessian: None,
+            scale: None,
+            calibrator: None,
+            survival: None,
+            survival_companions: HashMap::new(),
+            mcmc_samples: Some(Array2::<f64>::ones((2, 3))),
+        };
+
+        let test_points = array![0.25, 0.75];
+        let sex_points = array![0.0, 1.0];
+        let empty_pcs = Array2::<f64>::zeros((2, 0));
+        let predictions = model
+            .predict(test_points.view(), sex_points.view(), empty_pcs.view())
+            .unwrap();
+
+        let (full_basis_unc, _) =
+            basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
+                .unwrap();
+        let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
+        let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);
+        let coeffs = Array1::from(model.coefficients.main_effects.pgs.clone());
+        let mut expected_values = pgs_main_basis_con.dot(&coeffs);
+        expected_values += &sex_points.mapv(|v| v * model.coefficients.main_effects.sex);
+        expected_values += model.coefficients.intercept;
+
         assert_abs_diff_eq!(
             predictions.as_slice().unwrap(),
             expected_values.as_slice().unwrap(),
