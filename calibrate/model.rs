@@ -1074,6 +1074,9 @@ impl TrainedModel {
                 let row_end = (row_start + ROW_CHUNK_SIZE).min(n);
                 let design_entry_chunk = design_entry.slice(s![row_start..row_end, ..]);
                 let design_exit_chunk = design_exit.slice(s![row_start..row_end, ..]);
+                let cov_rows_chunk = &cov_rows[row_start..row_end];
+                let age_entry_chunk = age_entry.slice(s![row_start..row_end]);
+                let age_exit_chunk = age_exit.slice(s![row_start..row_end]);
 
                 let mut sample_start = 0;
                 while sample_start < n_samples {
@@ -1134,9 +1137,9 @@ impl TrainedModel {
                                     let mortality = mortality_model.expect("checked above");
                                     let (risk, grad_row) =
                                         survival::calculate_crude_risk_quadrature(
-                                            age_entry[idx],
-                                            age_exit[idx],
-                                            &cov_rows[idx],
+                                            age_entry_chunk[i],
+                                            age_exit_chunk[i],
+                                            &cov_rows_chunk[i],
                                             artifacts,
                                             mortality,
                                             Some(chunk.row(j)),
