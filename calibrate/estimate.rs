@@ -2439,18 +2439,13 @@ pub fn train_survival_model(
                                 };
 
                             let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                            let grad_exit = design_exit
-                                .to_owned()
-                                .mapv(|v| v * dr_deta_exit * logistic_scale);
-                            let grad_entry = design_entry
-                                .to_owned()
-                                .mapv(|v| v * dr_deta_entry * logistic_scale);
-                            let grad_row = grad_exit + grad_entry;
                             {
                                 let mut grad_acc = logit_design.row_mut(i);
-                                ndarray::Zip::from(&mut grad_acc)
-                                    .and(&grad_row)
-                                    .for_each(|a, &b| *a += b);
+                                for k in 0..p_dim {
+                                    grad_acc[k] += (design_exit[k] * dr_deta_exit
+                                        + design_entry[k] * dr_deta_entry)
+                                        * logistic_scale;
+                                }
                             }
                         }
                     }

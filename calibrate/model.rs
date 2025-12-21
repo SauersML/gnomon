@@ -1077,16 +1077,19 @@ impl TrainedModel {
                 for j in 0..(end - start) {
                     for i in 0..n {
                         let h_entry = eta_entry[[i, j]].exp();
-                        let h_exit = eta_exit[[i, j]].exp();
-                        hazard_entry[i] += h_entry;
-                        hazard_exit[i] += h_exit;
+                    let h_exit = eta_exit[[i, j]].exp();
+                    hazard_entry[i] += h_entry;
+                    hazard_exit[i] += h_exit;
 
                         let cif_entry_val = 1.0 - (-h_entry).exp();
                         let cif_exit_val = 1.0 - (-h_exit).exp();
                         cif_entry[i] += cif_entry_val;
                         cif_exit[i] += cif_exit_val;
 
-                        let (risk_val, mut grad_row) = match risk_type {
+                        let mut grad_row_opt = None;
+                        let mut dr_deta_entry = 0.0;
+                        let mut dr_deta_exit = 0.0;
+                        let risk_val = match risk_type {
                             SurvivalRiskType::Net => {
                                 let delta_h = (h_exit - h_entry).max(0.0);
                                 let risk = 1.0 - (-delta_h).exp();
@@ -1102,7 +1105,7 @@ impl TrainedModel {
 
                                 let d_f_entry = h_entry * exp_neg_entry;
                                 let d_f_exit = h_exit * exp_neg_exit;
-                                let dr_deta_exit = if delta_raw > 0.0 {
+                                dr_deta_exit = if delta_raw > 0.0 {
                                     d_f_exit / denom
                                 } else {
                                     0.0
@@ -1110,21 +1113,17 @@ impl TrainedModel {
                                 let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
                                 let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
                                 let dden = -d_f_entry;
-                                let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+                                dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
                                     (dnum * denom_raw - numerator * dden)
                                         / (denom_raw * denom_raw)
                                 } else {
                                     0.0
                                 };
-
-                                let grad_exit = design_exit.row(i).mapv(|v| v * dr_deta_exit);
-                                let grad_entry = design_entry.row(i).mapv(|v| v * dr_deta_entry);
-                                let grad = grad_exit + grad_entry;
-                                (risk, grad)
+                                risk
                             }
                             SurvivalRiskType::Crude => {
                                 let mortality = mortality_model.expect("checked above");
-                                survival::calculate_crude_risk_quadrature(
+                                let (risk, grad_row) = survival::calculate_crude_risk_quadrature(
                                     age_entry[i],
                                     age_exit[i],
                                     &cov_rows[i],
@@ -1132,19 +1131,33 @@ impl TrainedModel {
                                     mortality,
                                     Some(chunk.row(j)),
                                     None,
-                                )?
+                                )?;
+                                grad_row_opt = Some(grad_row);
+                                risk
                             }
                         };
 
                         conditional_risk[i] += risk_val;
                         let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
                         let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                        grad_row.mapv_inplace(|v| v * logistic_scale);
-                        {
-                            let mut grad_acc = gradient.row_mut(i);
-                            Zip::from(&mut grad_acc)
-                                .and(&grad_row)
-                                .for_each(|a, &b| *a += b);
+                        match risk_type {
+                            SurvivalRiskType::Net => {
+                                let mut grad_acc = gradient.row_mut(i);
+                                for k in 0..design_width {
+                                    grad_acc[k] += (design_exit[[i, k]] * dr_deta_exit
+                                        + design_entry[[i, k]] * dr_deta_entry)
+                                        * logistic_scale;
+                                }
+                            }
+                            SurvivalRiskType::Crude => {
+                                if let Some(mut grad_row) = grad_row_opt {
+                                    grad_row.mapv_inplace(|v| v * logistic_scale);
+                                    let mut grad_acc = gradient.row_mut(i);
+                                    Zip::from(&mut grad_acc)
+                                        .and(&grad_row)
+                                        .for_each(|a, &b| *a += b);
+                                }
+                            }
                         }
                     }
                 }
