@@ -860,38 +860,21 @@ impl TrainedModel {
 
         if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
             let (x_new, signed_dist) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
+            let mean_probs = self.mcmc_mean_logit_predictions(&x_new)?;
+            let pred_in = mean_probs.mapv(|p| {
+                let p = p.clamp(1e-8, 1.0 - 1e-8);
+                (p / (1.0 - p)).ln()
+            });
             let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
             let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(x_new.nrows()));
             let cal = self.calibrator.as_ref().unwrap();
-            let samples = self.mcmc_samples.as_ref().unwrap();
-            if samples.nrows() == 0 {
-                return Err(ModelError::DimensionMismatch(
-                    "MCMC samples are empty.".to_string(),
-                ));
-            }
-            if samples.ncols() != x_new.ncols() {
-                return Err(ModelError::DimensionMismatch(format!(
-                    "MCMC sample width {} does not match design columns {}",
-                    samples.ncols(),
-                    x_new.ncols()
-                )));
-            }
-
-            let mut sum = Array1::<f64>::zeros(x_new.nrows());
-            for sample in samples.outer_iter() {
-                let eta = x_new.dot(&sample);
-                let preds = crate::calibrate::calibrator::predict_calibrator(
-                    cal,
-                    eta.view(),
-                    se_in.view(),
-                    signed_dist.view(),
-                )?;
-                sum += &preds;
-            }
-            let scale = 1.0 / (samples.nrows() as f64);
-            let mut mean = sum.mapv(|v| v * scale);
-            mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
-            return Ok(mean);
+            let preds = crate::calibrate::calibrator::predict_calibrator(
+                cal,
+                pred_in.view(),
+                se_in.view(),
+                signed_dist.view(),
+            )?;
+            return Ok(preds);
         }
 
         let baseline = self.predict(p_new, sex_new, pcs_new)?;

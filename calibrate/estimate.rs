@@ -51,6 +51,54 @@ use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
 
+fn logit_from_prob(p: f64) -> f64 {
+    let p = p.clamp(1e-8, 1.0 - 1e-8);
+    (p / (1.0 - p)).ln()
+}
+
+#[cfg(test)]
+mod mcmc_mean_tests {
+    use super::*;
+
+    #[test]
+    fn test_mean_logit_from_samples_matches_expected() {
+        let x = Array2::from_shape_vec((1, 1), vec![1.0]).unwrap();
+        let samples = Array2::from_shape_vec((2, 1), vec![0.0, (3.0_f64).ln()]).unwrap();
+        let mean_logit = mean_logit_from_samples(x.view(), &samples).unwrap();
+        let expected_prob = 0.5_f64 * (0.5 + 0.75);
+        let expected_logit = (expected_prob / (1.0 - expected_prob)).ln();
+        assert!((mean_logit[0] - expected_logit).abs() < 1e-10);
+    }
+}
+
+fn mean_logit_from_samples(
+    x: ArrayView2<f64>,
+    samples: &Array2<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    if samples.nrows() == 0 {
+        return Err(EstimationError::InvalidInput(
+            "MCMC samples are empty.".to_string(),
+        ));
+    }
+    if samples.ncols() != x.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "MCMC sample width {} does not match design columns {}",
+            samples.ncols(),
+            x.ncols()
+        )));
+    }
+
+    let mut sum = Array1::<f64>::zeros(x.nrows());
+    for sample in samples.outer_iter() {
+        let eta = x.dot(&sample);
+        let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+        let probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
+        sum += &probs;
+    }
+    let scale = 1.0 / (samples.nrows() as f64);
+    Ok(sum.mapv(|v| logit_from_prob(v * scale)))
+}
+
 fn log_basis_cache_stats(context: &str) {
     let stats = basis::basis_cache_stats();
     let total = stats.hits.saturating_add(stats.misses);
@@ -1247,7 +1295,7 @@ pub fn train_model(
         &final_lambda.to_vec()
     );
 
-    eprintln!("\n[STAGE 3/3] Fitting final model with optimal parameters...");
+    eprintln!("\n[STAGE 3/4] Fitting final model with optimal parameters...");
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
@@ -1347,6 +1395,59 @@ pub fn train_model(
         eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
         None
     };
+    // Generate MCMC posterior samples if requested
+    let mcmc_samples = if config.mcmc_enabled {
+        eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling...");
+        let dim = final_beta_original.len();
+
+        // Reconstruct the penalty matrix sum(lambda_i * S_i)
+        let mut s_accum = Array2::<f64>::zeros((dim, dim));
+        for (i, &lambda) in final_lambda.iter().enumerate() {
+            if i < s_list.len() {
+                s_accum = s_accum + s_list[i].mapv(|v| v * lambda.exp());
+            }
+        }
+
+        // Allow overriding NUTS config via env vars for testing
+        let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+        let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        let nuts_config = hmc::NutsConfig {
+            n_samples: num_samples,
+            n_warmup: num_warmup,
+            ..hmc::NutsConfig::default()
+        };
+
+        match hmc::run_nuts_sampling(
+            x_matrix.view(),
+            data.y.view(),
+            data.weights.view(),
+            s_accum.view(),
+            final_beta_original.view(),
+            penalized_hessian_orig.view(),
+            matches!(config.link_function(), LinkFunction::Logit),
+            &nuts_config,
+        ) {
+            Ok(result) => {
+                eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
+                Some(result.samples)
+            }
+            Err(e) => {
+                log::warn!("MCMC sampling failed: {}", e);
+                eprintln!("            WARNING: MCMC sampling failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ===== Calibrator training (post-fit layer; loud behavior) =====
     let calibrator_opt = if !crate::calibrate::model::calibrator_enabled() {
         eprintln!("[CAL] Calibrator disabled by flag; skipping post-process calibration.");
@@ -1365,7 +1466,7 @@ pub fn train_model(
         }
 
         // Compute ALO features from the base fit (fail loud if any error)
-        let features = cal::compute_alo_features(
+        let mut features = cal::compute_alo_features(
             &final_fit,
             reml_state.y(),
             x_raw.view(),
@@ -1375,6 +1476,13 @@ pub fn train_model(
         .map_err(|e| {
             EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
         })?;
+        if matches!(config.link_function(), LinkFunction::Logit) {
+            if let Some(ref samples) = mcmc_samples {
+                let mean_logit = mean_logit_from_samples(x_matrix.view(), samples)?;
+                features.pred = mean_logit.clone();
+                features.pred_identity = mean_logit;
+            }
+        }
 
         // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
         // This ensures the calibrator lives in the same function class as the base smooth
@@ -1549,75 +1657,6 @@ pub fn train_model(
             Some(model)
         }
     };
-
-        // Generate MCMC posterior samples if requested
-        let mcmc_samples = if config.mcmc_enabled {
-            eprintln!("\n[STAGE 3/3] Running HMC/NUTS posterior sampling...");
-            // We need to flatten the penalty matrix list into a single matrix S
-            // The combined penalty is already computed implicitly during PIRLS in the Hessian (X'WX + S)
-            // But we can reconstruct S directly:
-            let dim = final_beta_original.len();
-
-            // Reconstruct the penalty matrix sum(lambda_i * S_i)
-            // We need to map the lambdas back to penalty blocks.
-            // Since we don't have the easy lambda-to-block mapping here,
-            // we can use the fact that `penalized_hessian_orig` = X'WX + S.
-            //
-            // However, computing S via subtraction (H - X'WX) can be numerically unstable if X'WX dominates.
-            // A safer bet is to sum the S matrices weighted by the final lambdas.
-            //
-            // We have `s_list` (original unscaled S matrices) and `final_lambda`.
-            // But `s_list` ordering corresponds to `layout.penalty_map`.
-            let mut s_accum = Array2::<f64>::zeros((dim, dim));
-            for (i, &lambda) in final_lambda.iter().enumerate() {
-                // Find which blocks this penalty parameter affects
-                // In generic generalized additive models, there's usually 1 lambda per S matrix in s_list
-                // provided we respected the 1-to-1 mapping in build_design...
-                if i < s_list.len() {
-                     // We found s_list[i], use it
-                     s_accum = s_accum + s_list[i].mapv(|v| v * lambda.exp());
-                }
-            }
-
-            // Allow overriding NUTS config via env vars for testing
-            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000);
-            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000);
-
-            let nuts_config = hmc::NutsConfig {
-                n_samples: num_samples,
-                n_warmup: num_warmup,
-                ..hmc::NutsConfig::default()
-            };
-
-            match hmc::run_nuts_sampling(
-                x_matrix.view(),
-                data.y.view(),
-                data.weights.view(),
-                s_accum.view(),
-                final_beta_original.view(),
-                penalized_hessian_orig.view(),
-                matches!(config.link_function(), LinkFunction::Logit),
-                &nuts_config,
-            ) {
-                Ok(result) => {
-                    eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
-                    Some(result.samples)
-                }
-                Err(e) => {
-                    log::warn!("MCMC sampling failed: {}", e);
-                    eprintln!("            WARNING: MCMC sampling failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
     let trained_model = TrainedModel {
         config: config_with_constraints,
@@ -2116,6 +2155,7 @@ pub fn train_survival_model(
     let mut primary_artifacts = None;
     let mut primary_lambdas = Vec::new();
     let mut primary_hessian = None;
+    let mut primary_mcmc_samples: Option<Array2<f64>> = None;
     let mut companions = HashMap::new();
 
     for (kind, data_ref) in targets {
@@ -2206,7 +2246,7 @@ pub fn train_survival_model(
         }
 
         // STAGE 3: Final Fit
-        eprintln!("{} [STAGE 3/3] Fitting final model...", label_prefix);
+        eprintln!("{} [STAGE 3/4] Fitting final model...", label_prefix);
         let mut model = WorkingModelSurvival::new(
             layout.clone(),
             &data_ref,
@@ -2259,6 +2299,53 @@ pub fn train_survival_model(
         let hessian_factor =
             factor_hessian(&final_state.hessian, model.spec.use_expected_information)?;
 
+        if kind == "primary" && config.mcmc_enabled {
+            eprintln!(
+                "{} [STAGE 4/4] Running HMC/NUTS posterior sampling for survival model...",
+                label_prefix
+            );
+            if final_state.hessian.is_empty() {
+                eprintln!("            WARNING: No Hessian available for MCMC; skipping.");
+            } else {
+                let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+
+                let nuts_config = hmc::NutsConfig {
+                    n_samples: num_samples,
+                    n_warmup: num_warmup,
+                    ..hmc::NutsConfig::default()
+                };
+
+                match hmc::run_survival_nuts_sampling(
+                    layout.clone(),
+                    &bundle.data,
+                    monotonicity.clone(),
+                    survival_spec,
+                    beta.view(),
+                    final_state.hessian.view(),
+                    &nuts_config,
+                ) {
+                    Ok(result) => {
+                        eprintln!(
+                            "            Generated {} MCMC samples.",
+                            result.samples.nrows()
+                        );
+                        primary_mcmc_samples = Some(result.samples);
+                    }
+                    Err(e) => {
+                        log::warn!("Survival MCMC sampling failed: {}", e);
+                        eprintln!("            WARNING: Survival MCMC sampling failed: {}", e);
+                    }
+                }
+            }
+        }
+
         // Restore FULL Calibrator Logic for the primary model
         let calibrator_opt_local = if kind == "primary"
             && crate::calibrate::model::calibrator_enabled()
@@ -2271,70 +2358,156 @@ pub fn train_survival_model(
 
             let n = data_ref.age_entry.len();
             let p_dim = beta.len();
-            let mut risks = Array1::<f64>::zeros(n);
-            let mut logit_design = Array2::<f64>::zeros((n, p_dim));
+            let (mut risks, mut logit_design) = if let Some(samples) =
+                primary_mcmc_samples.as_ref()
+            {
+                let mut risks = Array1::<f64>::zeros(n);
+                let mut logit_design = Array2::<f64>::zeros((n, p_dim));
 
-            for i in 0..n {
-                let design_entry = layout.combined_entry.row(i);
-                let design_exit = layout.combined_exit.row(i);
+                for sample in samples.outer_iter() {
+                    let eta_entry = layout.combined_entry.dot(&sample);
+                    let eta_exit = layout.combined_exit.dot(&sample);
 
-                let eta_entry = design_entry.dot(&beta);
-                let eta_exit = design_exit.dot(&beta);
+                    for i in 0..n {
+                        let design_entry = layout.combined_entry.row(i);
+                        let design_exit = layout.combined_exit.row(i);
 
-                if !eta_entry.is_finite() || !eta_exit.is_finite() {
-                    return Err(EstimationError::CalibratorTrainingFailed(
-                        "non-finite linear predictor during calibrator feature extraction"
-                            .to_string(),
-                    ));
+                        let eta_entry_i = eta_entry[i];
+                        let eta_exit_i = eta_exit[i];
+                        if !eta_entry_i.is_finite() || !eta_exit_i.is_finite() {
+                            return Err(EstimationError::CalibratorTrainingFailed(
+                                "non-finite linear predictor during calibrator feature extraction"
+                                    .to_string(),
+                            ));
+                        }
+
+                        let h_entry = eta_entry_i.exp();
+                        let h_exit = eta_exit_i.exp();
+                        if !h_entry.is_finite() || !h_exit.is_finite() {
+                            return Err(EstimationError::CalibratorTrainingFailed(
+                                "non-finite hazard during calibrator feature extraction"
+                                    .to_string(),
+                            ));
+                        }
+
+                        let exp_neg_entry = (-h_entry).exp();
+                        let exp_neg_exit = (-h_exit).exp();
+                        let f_entry = 1.0 - exp_neg_entry;
+                        let f_exit = 1.0 - exp_neg_exit;
+                        let delta_raw = f_exit - f_entry;
+                        let denom_raw = 1.0 - f_entry;
+                        let delta = delta_raw.max(0.0);
+                        let denom = denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
+                        let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
+                        let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                        risks[i] += risk_clamped;
+
+                        let d_f_entry = h_entry * exp_neg_entry;
+                        let d_f_exit = h_exit * exp_neg_exit;
+                        let dr_deta_exit = if delta_raw > 0.0 {
+                            d_f_exit / denom
+                        } else {
+                            0.0
+                        };
+                        let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                        let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                        let dden = -d_f_entry;
+                        let dr_deta_entry =
+                            if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
+                                (dnum * denom_raw - numerator * dden)
+                                    / (denom_raw * denom_raw)
+                            } else {
+                                0.0
+                            };
+
+                        let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+                        let grad_exit = design_exit
+                            .to_owned()
+                            .mapv(|v| v * dr_deta_exit * logistic_scale);
+                        let grad_entry = design_entry
+                            .to_owned()
+                            .mapv(|v| v * dr_deta_entry * logistic_scale);
+                        let grad_row = grad_exit + grad_entry;
+                        {
+                            let mut grad_acc = logit_design.row_mut(i);
+                            ndarray::Zip::from(&mut grad_acc)
+                                .and(&grad_row)
+                                .for_each(|a, &b| *a += b);
+                        }
+                    }
                 }
 
-                let h_entry = eta_entry.exp();
-                let h_exit = eta_exit.exp();
-                if !h_entry.is_finite() || !h_exit.is_finite() {
-                    return Err(EstimationError::CalibratorTrainingFailed(
-                        "non-finite hazard during calibrator feature extraction".to_string(),
-                    ));
+                let scale = 1.0 / (samples.nrows() as f64);
+                risks.mapv_inplace(|v| v * scale);
+                logit_design.mapv_inplace(|v| v * scale);
+                (risks, logit_design)
+            } else {
+                let mut risks = Array1::<f64>::zeros(n);
+                let mut logit_design = Array2::<f64>::zeros((n, p_dim));
+
+                for i in 0..n {
+                    let design_entry = layout.combined_entry.row(i);
+                    let design_exit = layout.combined_exit.row(i);
+
+                    let eta_entry = design_entry.dot(&beta);
+                    let eta_exit = design_exit.dot(&beta);
+
+                    if !eta_entry.is_finite() || !eta_exit.is_finite() {
+                        return Err(EstimationError::CalibratorTrainingFailed(
+                            "non-finite linear predictor during calibrator feature extraction"
+                                .to_string(),
+                        ));
+                    }
+
+                    let h_entry = eta_entry.exp();
+                    let h_exit = eta_exit.exp();
+                    if !h_entry.is_finite() || !h_exit.is_finite() {
+                        return Err(EstimationError::CalibratorTrainingFailed(
+                            "non-finite hazard during calibrator feature extraction".to_string(),
+                        ));
+                    }
+
+                    let exp_neg_entry = (-h_entry).exp();
+                    let exp_neg_exit = (-h_exit).exp();
+                    let f_entry = 1.0 - exp_neg_entry;
+                    let f_exit = 1.0 - exp_neg_exit;
+                    let delta_raw = f_exit - f_entry;
+                    let denom_raw = 1.0 - f_entry;
+                    let delta = delta_raw.max(0.0);
+                    let denom = denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
+                    let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
+                    let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                    risks[i] = risk_clamped;
+
+                    let d_f_entry = h_entry * exp_neg_entry;
+                    let d_f_exit = h_exit * exp_neg_exit;
+                    let dr_deta_exit = if delta_raw > 0.0 {
+                        d_f_exit / denom
+                    } else {
+                        0.0
+                    };
+                    let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                    let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                    let dden = -d_f_entry;
+                    let dr_deta_entry =
+                        if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
+                            (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+                        } else {
+                            0.0
+                        };
+
+                    let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+                    let grad_exit = design_exit
+                        .to_owned()
+                        .mapv(|v| v * dr_deta_exit * logistic_scale);
+                    let grad_entry = design_entry
+                        .to_owned()
+                        .mapv(|v| v * dr_deta_entry * logistic_scale);
+                    let grad_row = grad_exit + grad_entry;
+                    logit_design.row_mut(i).assign(&grad_row);
                 }
-
-                let exp_neg_entry = (-h_entry).exp();
-                let exp_neg_exit = (-h_exit).exp();
-                let f_entry = 1.0 - exp_neg_entry;
-                let f_exit = 1.0 - exp_neg_exit;
-                let delta_raw = f_exit - f_entry;
-                let denom_raw = 1.0 - f_entry;
-                let delta = delta_raw.max(0.0);
-                let denom = denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
-                let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
-                let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
-                risks[i] = risk_clamped;
-
-                let d_f_entry = h_entry * exp_neg_entry;
-                let d_f_exit = h_exit * exp_neg_exit;
-                let dr_deta_exit = if delta_raw > 0.0 {
-                    d_f_exit / denom
-                } else {
-                    0.0
-                };
-                let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
-                let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
-                let dden = -d_f_entry;
-                let dr_deta_entry = if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON
-                {
-                    (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
-                } else {
-                    0.0
-                };
-
-                let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
-                let grad_exit = design_exit
-                    .to_owned()
-                    .mapv(|v| v * dr_deta_exit * logistic_scale);
-                let grad_entry = design_entry
-                    .to_owned()
-                    .mapv(|v| v * dr_deta_entry * logistic_scale);
-                let grad_row = grad_exit + grad_entry;
-                logit_design.row_mut(i).assign(&grad_row);
-            }
+                (risks, logit_design)
+            };
 
             let features_matrix = crate::calibrate::survival::survival_calibrator_features(
                 &risks,
@@ -2574,10 +2747,11 @@ pub fn train_survival_model(
 
     // Generate MCMC posterior samples if requested
     let mcmc_samples = if config.mcmc_enabled {
-        eprintln!("\n[STAGE 3/3] Running HMC/NUTS posterior sampling for survival model...");
-        
-        if let Some(ref hessian) = primary_hessian {
-            // Allow overriding NUTS config via env vars for testing
+        if primary_mcmc_samples.is_some() {
+            primary_mcmc_samples
+        } else if let Some(ref hessian) = primary_hessian {
+            eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling for survival model...");
+
             let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
                 .ok()
                 .and_then(|s| s.parse().ok())
