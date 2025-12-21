@@ -223,7 +223,7 @@ noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [F
 theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsRawScoreModel m),
     empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
   have h := Classical.choose_spec (fitRaw_exists p k sp n data lambda)
   exact ⟨h.1, fun m hm => h.2 m hm⟩
@@ -242,7 +242,7 @@ noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin
 theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsNormalizedScoreModel m),
     empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
   have h := Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
   exact ⟨h.1, fun m hm => h.2 m hm⟩
