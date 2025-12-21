@@ -627,7 +627,11 @@ lemma optimal_slope_eq_covariance_of_normalized_p
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
     (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1) :
+    (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
     let a := model.γ₀₀
     let b := model.γₘ₀ ⟨0, by norm_num⟩
     -- Orthogonality with 1:
@@ -740,7 +744,7 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
   -- Step 1: Get the orthogonality conditions from optimality
-  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int
   set a := model.γ₀₀ with ha_def
   set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
   obtain ⟨h_orth1, h_orthP⟩ := h_orth
