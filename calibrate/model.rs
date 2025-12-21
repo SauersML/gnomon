@@ -647,7 +647,7 @@ impl TrainedModel {
         &self,
         x_new: &Array2<f64>,
     ) -> Result<Array1<f64>, ModelError> {
-        const MCMC_CHUNK_SIZE: usize = 64;
+        const ROW_CHUNK_SIZE: usize = 2048;
         let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
             ModelError::DimensionMismatch("MCMC samples missing for logit prediction.".to_string())
         })?;
@@ -665,24 +665,25 @@ impl TrainedModel {
         }
 
         let mut sum = Array1::<f64>::zeros(x_new.nrows());
-        let n_samples = samples.nrows();
+        let samples_t = samples.t();
+        let n_samples = samples.nrows() as f64;
         let mut start = 0;
-        while start < n_samples {
-            let end = (start + MCMC_CHUNK_SIZE).min(n_samples);
-            let chunk = samples.slice(s![start..end, ..]);
-            let eta = x_new.dot(&chunk.t());
+        while start < x_new.nrows() {
+            let end = (start + ROW_CHUNK_SIZE).min(x_new.nrows());
+            let x_chunk = x_new.slice(s![start..end, ..]);
+            let eta = x_chunk.dot(&samples_t);
             for i in 0..eta.nrows() {
                 let mut acc = 0.0;
                 for j in 0..eta.ncols() {
                     let e = eta[[i, j]].clamp(-700.0, 700.0);
                     acc += 1.0 / (1.0 + f64::exp(-e));
                 }
-                sum[i] += acc;
+                sum[start + i] = acc;
             }
             start = end;
         }
 
-        let scale = 1.0 / (samples.nrows() as f64);
+        let scale = 1.0 / n_samples;
         let mut mean = sum.mapv(|v| v * scale);
         mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
         Ok(mean)
