@@ -73,6 +73,8 @@ pub enum SurvivalError {
         value: f64,
         maximum: f64,
     },
+    #[error("coefficient length mismatch (expected {expected}, got {actual})")]
+    CoefficientDimensionMismatch { expected: usize, actual: usize },
     #[error("covariate values must be finite")]
     NonFiniteCovariate,
     #[error("linear predictor became non-finite during evaluation")]
@@ -2037,6 +2039,17 @@ pub fn cumulative_hazard(
     Ok(eta.exp())
 }
 
+pub fn cumulative_hazard_with_coeffs(
+    age: f64,
+    covariates: &Array1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+    coeffs: ArrayView1<'_, f64>,
+) -> Result<f64, SurvivalError> {
+    let design = design_row_at_age(age, covariates.view(), artifacts)?;
+    let eta = design.dot(&coeffs);
+    Ok(eta.exp())
+}
+
 pub fn cumulative_incidence(
     age: f64,
     covariates: &Array1<f64>,
@@ -2118,12 +2131,14 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 /// Compute Crude Risk (Real-world risk) via numerical integration.
 /// P(Event in (t0, t1] | Survival to t0, Accounting for Competing Mortality)
 /// Formula: Integral_{t0}^{t1} h_dis(u) * S_total(u|t0) du
-pub fn calculate_crude_risk_quadrature(
+pub fn calculate_crude_risk_quadrature<'a>(
     t0: f64,
     t1: f64,
     covariates: &Array1<f64>,
-    disease_model: &SurvivalModelArtifacts,
-    mortality_model: &SurvivalModelArtifacts,
+    disease_model: &'a SurvivalModelArtifacts,
+    mortality_model: &'a SurvivalModelArtifacts,
+    disease_coeffs: Option<ArrayView1<'a, f64>>,
+    mortality_coeffs: Option<ArrayView1<'a, f64>>,
 ) -> Result<(f64, Array1<f64>), SurvivalError> {
     if t1 <= t0 {
         return Ok((0.0, Array1::zeros(disease_model.coefficients.len())));
@@ -2155,8 +2170,35 @@ pub fn calculate_crude_risk_quadrature(
 
     // 2. Pre-calculate baselines at t0 to normalize conditional survival
     // H(u|t0) = H(u) - H(t0)
-    let h_dis_t0 = cumulative_hazard(t0, covariates, disease_model)?;
-    let h_mor_t0 = cumulative_hazard(t0, covariates, mortality_model)?;
+    let coeff_len_d = disease_model.coefficients.len();
+    let coeff_len_m = mortality_model.coefficients.len();
+    let coeff_d = match disease_coeffs {
+        Some(c) => {
+            if c.len() != coeff_len_d {
+                return Err(SurvivalError::CoefficientDimensionMismatch {
+                    expected: coeff_len_d,
+                    actual: c.len(),
+                });
+            }
+            c
+        }
+        None => disease_model.coefficients.view(),
+    };
+    let coeff_m = match mortality_coeffs {
+        Some(c) => {
+            if c.len() != coeff_len_m {
+                return Err(SurvivalError::CoefficientDimensionMismatch {
+                    expected: coeff_len_m,
+                    actual: c.len(),
+                });
+            }
+            c
+        }
+        None => mortality_model.coefficients.view(),
+    };
+
+    let h_dis_t0 = cumulative_hazard_with_coeffs(t0, covariates, disease_model, coeff_d)?;
+    let h_mor_t0 = cumulative_hazard_with_coeffs(t0, covariates, mortality_model, coeff_m)?;
 
     // Pre-allocate scratch for hot loop
     // Determine max sizes
@@ -2170,9 +2212,6 @@ pub fn calculate_crude_risk_quadrature(
     let mut scratch_d = SurvivalScratch::new(disease_model.age_basis.degree, max_basis, max_pgs);
 
     let mut scratch_m = SurvivalScratch::new(mortality_model.age_basis.degree, max_basis, max_pgs);
-
-    let coeff_len_d = disease_model.coefficients.len();
-    let coeff_len_m = mortality_model.coefficients.len();
 
     let mut design_d = Array1::zeros(coeff_len_d);
     let mut deriv_d = Array1::zeros(coeff_len_d);
@@ -2215,8 +2254,8 @@ pub fn calculate_crude_risk_quadrature(
                 &mut scratch_d,
             )?;
 
-            let eta_d = design_d.dot(&disease_model.coefficients);
-            let slope_d = deriv_d.dot(&disease_model.coefficients);
+            let eta_d = design_d.dot(&coeff_d);
+            let slope_d = deriv_d.dot(&coeff_d);
             let hazard_d = eta_d.exp();
             let inst_hazard_d = (hazard_d * slope_d).max(0.0);
 
@@ -2229,7 +2268,7 @@ pub fn calculate_crude_risk_quadrature(
                 &mut deriv_m,
                 &mut scratch_m,
             )?;
-            let eta_m = design_m.dot(&mortality_model.coefficients);
+            let eta_m = design_m.dot(&coeff_m);
             let hazard_m = eta_m.exp();
 
             // Conditional Cumulative Hazards

@@ -5,7 +5,7 @@ use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::survival::{
     self, DEFAULT_RISK_EPSILON, SurvivalError, SurvivalModelArtifacts, SurvivalSpec,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -573,6 +573,105 @@ impl TrainedModel {
         Ok(matrix)
     }
 
+    fn build_prediction_design(
+        &self,
+        p_new: ArrayView1<f64>,
+        sex_new: ArrayView1<f64>,
+        pcs_new: ArrayView2<f64>,
+    ) -> Result<(Array2<f64>, Array1<f64>), ModelError> {
+        if pcs_new.ncols() != self.config.pc_configs.len() {
+            return Err(ModelError::MismatchedPcCount {
+                found: pcs_new.ncols(),
+                expected: self.config.pc_configs.len(),
+            });
+        }
+
+        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+        let (signed_dist, x_corr) = if let Some(hull) = &self.hull {
+            hull.signed_distance_and_project_many(raw.view())
+        } else {
+            (Array1::zeros(raw.nrows()), raw.clone())
+        };
+        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
+
+        let x_new = internal::construct_design_matrix(
+            p_corr.view(),
+            sex_new,
+            pcs_corr.view(),
+            &self.config,
+            &self.coefficients,
+        )?;
+
+        Ok((x_new, signed_dist))
+    }
+
+    fn compute_se_eta_from_hessian(
+        &self,
+        x_new: &Array2<f64>,
+        link_function: LinkFunction,
+    ) -> Option<Array1<f64>> {
+        let h = self.penalized_hessian.as_ref()?;
+        if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
+            return None;
+        }
+        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+        let chol = match h.clone().cholesky(Side::Lower) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        let mut vars = Array1::zeros(x_new.nrows());
+        for i in 0..x_new.nrows() {
+            let x_row = x_new.row(i).to_owned();
+            let v = chol.solve_vec(&x_row);
+            let var_i = x_row.dot(&v);
+            vars[i] = if link_function == LinkFunction::Identity {
+                if let Some(scale) = self.scale {
+                    var_i * scale
+                } else {
+                    var_i
+                }
+            } else {
+                var_i
+            };
+        }
+        Some(vars.mapv(|v| v.max(0.0).sqrt()))
+    }
+
+    fn mcmc_mean_logit_predictions(
+        &self,
+        x_new: &Array2<f64>,
+    ) -> Result<Array1<f64>, ModelError> {
+        let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
+            ModelError::DimensionMismatch("MCMC samples missing for logit prediction.".to_string())
+        })?;
+        if samples.nrows() == 0 {
+            return Err(ModelError::DimensionMismatch(
+                "MCMC samples are empty.".to_string(),
+            ));
+        }
+        if samples.ncols() != x_new.ncols() {
+            return Err(ModelError::DimensionMismatch(format!(
+                "MCMC sample width {} does not match design columns {}",
+                samples.ncols(),
+                x_new.ncols()
+            )));
+        }
+
+        let mut sum = Array1::<f64>::zeros(x_new.nrows());
+        for sample in samples.outer_iter() {
+            let eta = x_new.dot(&sample);
+            let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
+            let probs = eta_clamped.mapv(|e| 1.0 / (1.0 + f64::exp(-e)));
+            sum += &probs;
+        }
+
+        let scale = 1.0 / (samples.nrows() as f64);
+        let mut mean = sum.mapv(|v| v * scale);
+        mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+        Ok(mean)
+    }
+
     /// Detailed predictions including linear predictor, mean response, signed distance
     /// to the peeled hull boundary (negative inside), and optional SEs for eta.
     pub fn predict_detailed(
@@ -592,31 +691,8 @@ impl TrainedModel {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival("predict_detailed"));
         }
-        // --- Validate inputs ---
-        if pcs_new.ncols() != self.config.pc_configs.len() {
-            return Err(ModelError::MismatchedPcCount {
-                found: pcs_new.ncols(),
-                expected: self.config.pc_configs.len(),
-            });
-        }
-
-        // --- Geometry: compute signed distance and projection in one pass ---
-        let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
-        let (signed_dist, x_corr) = if let Some(hull) = &self.hull {
-            hull.signed_distance_and_project_many(raw.view())
-        } else {
-            (Array1::zeros(raw.nrows()), raw.clone())
-        };
-        let (p_corr, pcs_corr) = internal::split_p_and_pcs_from_raw(x_corr.view());
-
         // --- Build design and coefficients ---
-        let x_new = internal::construct_design_matrix(
-            p_corr.view(),
-            sex_new,
-            pcs_corr.view(),
-            &self.config,
-            &self.coefficients,
-        )?;
+        let (x_new, signed_dist) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
         let beta = internal::flatten_coefficients(&self.coefficients, &self.config)?;
         if x_new.ncols() != beta.len() {
             return Err(ModelError::DimensionMismatch(format!(
@@ -675,38 +751,7 @@ impl TrainedModel {
         // computed here to be a LOWER BOUND on true uncertainty. In sparse regions
         // of covariate space, the reported SE may be overconfident.
         //
-        let se_eta_opt = if let Some(h) = &self.penalized_hessian {
-            if h.nrows() != h.ncols() || h.ncols() != x_new.ncols() {
-                None
-            } else {
-                use crate::calibrate::faer_ndarray::FaerCholesky;
-                use faer::Side;
-                let chol = match h.clone().cholesky(Side::Lower) {
-                    Ok(c) => c,
-                    Err(_) => return Ok((eta, mean, signed_dist, None)),
-                };
-                let mut vars = Array1::zeros(x_new.nrows());
-                for i in 0..x_new.nrows() {
-                    let x_row = x_new.row(i).to_owned();
-                    // Solve H v = x^T for v (1D)
-                    let v = chol.solve_vec(&x_row);
-                    let var_i = x_row.dot(&v);
-                    vars[i] = if link_function == LinkFunction::Identity {
-                        // For Gaussian identity, scale variance if scale present
-                        if let Some(scale) = self.scale {
-                            var_i * scale
-                        } else {
-                            var_i
-                        }
-                    } else {
-                        var_i
-                    };
-                }
-                Some(vars.mapv(|v| v.max(0.0).sqrt()))
-            }
-        } else {
-            None
-        };
+        let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
 
         Ok((eta, mean, signed_dist, se_eta_opt))
     }
@@ -734,7 +779,12 @@ impl TrainedModel {
         if matches!(self.config.model_family, ModelFamily::Survival(_)) {
             return Err(ModelError::UnsupportedForSurvival("predict"));
         }
-        // Restore original behavior via detailed path: PHC -> design rebuild -> inverse link
+        let link_function = self.ensure_gam_link("prediction")?;
+        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+            let (x_new, _) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
+            return self.mcmc_mean_logit_predictions(&x_new);
+        }
+
         let (_, mean, _, _) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         Ok(mean)
     }
@@ -763,8 +813,13 @@ impl TrainedModel {
             return Err(ModelError::UnsupportedForSurvival("predict_mean"));
         }
 
-        let (eta, mode_mean, _, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         let link_function = self.ensure_gam_link("predict_mean")?;
+        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+            let (x_new, _) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
+            return self.mcmc_mean_logit_predictions(&x_new);
+        }
+
+        let (eta, mode_mean, _, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
 
         match link_function {
             LinkFunction::Identity => {
@@ -799,25 +854,53 @@ impl TrainedModel {
         }
         // Stage: Compute baseline predictions
         let link_function = self.ensure_gam_link("calibrated prediction")?;
-
-        let baseline = self.predict(p_new, sex_new, pcs_new)?;
-        // Stage: If no calibrator is present, error loudly (no silent fallback)
         if self.calibrator.is_none() {
             return Err(ModelError::CalibratorMissing);
         }
 
-        // Stage: Retrieve eta, signed distance, and se(eta) via the detailed path
+        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+            let (x_new, signed_dist) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
+            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
+            let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(x_new.nrows()));
+            let cal = self.calibrator.as_ref().unwrap();
+            let samples = self.mcmc_samples.as_ref().unwrap();
+            if samples.nrows() == 0 {
+                return Err(ModelError::DimensionMismatch(
+                    "MCMC samples are empty.".to_string(),
+                ));
+            }
+            if samples.ncols() != x_new.ncols() {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "MCMC sample width {} does not match design columns {}",
+                    samples.ncols(),
+                    x_new.ncols()
+                )));
+            }
+
+            let mut sum = Array1::<f64>::zeros(x_new.nrows());
+            for sample in samples.outer_iter() {
+                let eta = x_new.dot(&sample);
+                let preds = crate::calibrate::calibrator::predict_calibrator(
+                    cal,
+                    eta.view(),
+                    se_in.view(),
+                    signed_dist.view(),
+                )?;
+                sum += &preds;
+            }
+            let scale = 1.0 / (samples.nrows() as f64);
+            let mut mean = sum.mapv(|v| v * scale);
+            mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+            return Ok(mean);
+        }
+
+        let baseline = self.predict(p_new, sex_new, pcs_new)?;
         let (eta, _, signed_dist, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
         let cal = self.calibrator.as_ref().unwrap();
         let pred_in = match link_function {
             LinkFunction::Logit => eta.clone(),
             LinkFunction::Identity => baseline.clone(),
         };
-        // NOTE: se_in is the conditional SE from the base model's Hessian.
-        // It does NOT account for smoothing bias (see comment in predict_detailed).
-        // The calibrator uses this as a feature but doesn't propagate its own
-        // coefficient uncertainty - the final prediction inherits only the base
-        // model's approximate uncertainty.
         let se_in = se_eta_opt.unwrap_or_else(|| Array1::zeros(pred_in.len()));
 
         let preds = crate::calibrate::calibrator::predict_calibrator(
@@ -935,6 +1018,155 @@ impl TrainedModel {
 
         let coeffs = &artifacts.coefficients;
         let design_width = coeffs.len();
+
+        if let Some(samples) = self.mcmc_samples.as_ref() {
+            if samples.nrows() == 0 {
+                return Err(ModelError::DimensionMismatch(
+                    "MCMC samples are empty.".to_string(),
+                ));
+            }
+            if samples.ncols() != design_width {
+                return Err(ModelError::DimensionMismatch(format!(
+                    "MCMC sample width {} does not match survival design width {}",
+                    samples.ncols(),
+                    design_width
+                )));
+            }
+
+            let mut design_entry = Array2::<f64>::zeros((n, design_width));
+            let mut design_exit = Array2::<f64>::zeros((n, design_width));
+            for i in 0..n {
+                let cov_row = covariates.row(i).to_owned();
+                let entry_age = age_entry[i];
+                let exit_age = age_exit[i];
+                let entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
+                let exit = survival::design_row_at_age(exit_age, cov_row.view(), artifacts)?;
+                if entry.len() != design_width || exit.len() != design_width {
+                    return Err(ModelError::DimensionMismatch(
+                        "Survival design reconstruction mismatch".to_string(),
+                    ));
+                }
+                design_entry.row_mut(i).assign(&entry);
+                design_exit.row_mut(i).assign(&exit);
+            }
+
+            let mut hazard_entry = Array1::<f64>::zeros(n);
+            let mut hazard_exit = Array1::<f64>::zeros(n);
+            let mut cif_entry = Array1::<f64>::zeros(n);
+            let mut cif_exit = Array1::<f64>::zeros(n);
+            let mut conditional_risk = Array1::<f64>::zeros(n);
+            let mut gradient = Array2::<f64>::zeros((n, design_width));
+
+            for sample in samples.outer_iter() {
+                let eta_entry = design_entry.dot(&sample);
+                let eta_exit = design_exit.dot(&sample);
+
+                for i in 0..n {
+                    let h_entry = eta_entry[i].exp();
+                    let h_exit = eta_exit[i].exp();
+                    hazard_entry[i] += h_entry;
+                    hazard_exit[i] += h_exit;
+
+                    let cif_entry_val = 1.0 - (-h_entry).exp();
+                    let cif_exit_val = 1.0 - (-h_exit).exp();
+                    cif_entry[i] += cif_entry_val;
+                    cif_exit[i] += cif_exit_val;
+
+                    let (risk_val, mut grad_row) = match risk_type {
+                        SurvivalRiskType::Net => {
+                            let delta_h = (h_exit - h_entry).max(0.0);
+                            let risk = 1.0 - (-delta_h).exp();
+
+                            let exp_neg_entry = (-h_entry).exp();
+                            let exp_neg_exit = (-h_exit).exp();
+                            let f_entry = 1.0 - exp_neg_entry;
+                            let f_exit = 1.0 - exp_neg_exit;
+                            let delta_raw = f_exit - f_entry;
+                            let denom_raw = 1.0 - f_entry;
+                            let delta = delta_raw.max(0.0);
+                            let denom = denom_raw.max(DEFAULT_RISK_EPSILON);
+
+                            let d_f_entry = h_entry * exp_neg_entry;
+                            let d_f_exit = h_exit * exp_neg_exit;
+                            let dr_deta_exit = if delta_raw > 0.0 {
+                                d_f_exit / denom
+                            } else {
+                                0.0
+                            };
+                            let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
+                            let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
+                            let dden = -d_f_entry;
+                            let dr_deta_entry = if denom_raw > DEFAULT_RISK_EPSILON {
+                                (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+                            } else {
+                                0.0
+                            };
+
+                            let grad_exit = design_exit.row(i).mapv(|v| v * dr_deta_exit);
+                            let grad_entry = design_entry.row(i).mapv(|v| v * dr_deta_entry);
+                            let grad = grad_exit + grad_entry;
+                            (risk, grad)
+                        }
+                        SurvivalRiskType::Crude => {
+                            let mortality = mortality_model.expect("checked above");
+                            let cov_row = covariates.row(i).to_owned();
+                            survival::calculate_crude_risk_quadrature(
+                                age_entry[i],
+                                age_exit[i],
+                                &cov_row,
+                                artifacts,
+                                mortality,
+                                Some(sample.view()),
+                                None,
+                            )?
+                        }
+                    };
+
+                    conditional_risk[i] += risk_val;
+                    let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                    let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
+                    grad_row.mapv_inplace(|v| v * logistic_scale);
+                    {
+                        let mut grad_acc = gradient.row_mut(i);
+                        Zip::from(&mut grad_acc)
+                            .and(&grad_row)
+                            .for_each(|a, &b| *a += b);
+                    }
+                }
+            }
+
+            let scale = 1.0 / (samples.nrows() as f64);
+            hazard_entry.mapv_inplace(|v| v * scale);
+            hazard_exit.mapv_inplace(|v| v * scale);
+            cif_entry.mapv_inplace(|v| v * scale);
+            cif_exit.mapv_inplace(|v| v * scale);
+            conditional_risk.mapv_inplace(|v| v * scale);
+            gradient.mapv_inplace(|v| v * scale);
+
+            let mut logit_risk = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let p = conditional_risk[i].max(1e-12).min(1.0 - 1e-12);
+                logit_risk[i] = (p / (1.0 - p)).ln();
+            }
+
+            let logit_risk_se = if let Some(factor) = artifacts.hessian_factor.as_ref() {
+                Some(survival::delta_method_standard_errors(factor, &gradient)?)
+            } else {
+                None
+            };
+
+            return Ok(SurvivalPrediction {
+                cumulative_hazard_entry: hazard_entry,
+                cumulative_hazard_exit: hazard_exit,
+                cumulative_incidence_entry: cif_entry,
+                cumulative_incidence_exit: cif_exit,
+                conditional_risk,
+                logit_risk,
+                logit_risk_se,
+                logit_risk_design: gradient,
+            });
+        }
+
         let mut hazard_entry = Array1::<f64>::zeros(n);
         let mut hazard_exit = Array1::<f64>::zeros(n);
         let mut cif_entry = Array1::<f64>::zeros(n);
@@ -1011,6 +1243,8 @@ impl TrainedModel {
                     let mortality = mortality_model.expect("checked above");
                     survival::calculate_crude_risk_quadrature(
                         entry_age, exit_age, &cov_row, artifacts, mortality,
+                        None,
+                        None,
                     )?
                 }
             };
