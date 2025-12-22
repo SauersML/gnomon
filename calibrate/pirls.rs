@@ -2,7 +2,7 @@ use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condi
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, hash_array2, ldlt_rook,
+    array2_to_mat_mut, fast_ata, hash_array2, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
@@ -386,7 +386,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 }
                 self.workspace.wx.assign(matrix);
                 self.workspace.wx *= &sqrt_w_col;
-                let xtwx = self.workspace.wx.t().dot(&self.workspace.wx);
+                let xtwx = fast_ata(&self.workspace.wx);
                 xtwx + &self.s_transformed
             }
             DesignMatrix::Sparse(_) => {

@@ -54,9 +54,53 @@ pub fn hash_array2(matrix: &Array2<f64>) -> u64 {
     hasher.finish()
 }
 
+/// Compute A^T * A using faer's SIMD-optimized GEMM.
+/// This is MUCH faster than ndarray's .t().dot() for matrices where n > ~100.
+///
+/// For a matrix A of shape (n, p), this computes the (p, p) result.
+/// Uses zero-copy view when possible, falls back to copy for non-contiguous arrays.
+#[inline]
+pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Mat, Par};
+
+    let (n, p) = a.dim();
+    
+    // For very small matrices, ndarray might be faster due to less overhead
+    // Threshold chosen empirically - faer wins above ~64 elements in inner dim
+    if n < 64 {
+        return a.t().dot(a);
+    }
+
+    // Create output matrix
+    let mut result = Mat::<f64>::zeros(p, p);
+
+    // Try to use zero-copy view if array is contiguous
+    if let Some(slice) = a.as_slice() {
+        // Standard layout (row-major contiguous)
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        let a_t = a_ref.transpose();
+        
+        // dst = A^T * A
+        matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, Par::Seq);
+    } else {
+        // Non-contiguous: need to copy to contiguous buffer
+        let a_owned: Array2<f64> = a.to_owned();
+        let slice = a_owned.as_slice().expect("owned array should be contiguous");
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        let a_t = a_ref.transpose();
+        
+        matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, Par::Seq);
+    }
+
+    // Convert back to ndarray
+    Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
+}
+
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
     Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
 }
+
 
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
     let mat = diag.column_vector().as_mat();
