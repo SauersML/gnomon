@@ -1,8 +1,0 @@
-# Clippy configuration for gnomon project
-# These values are set appropriately for numerical/scientific computing code
-
-# Allow more arguments for complex mathematical functions
-too-many-arguments-threshold = 15
-
-# Allow larger enum variants for error types
-enum-variant-size-threshold = 512
