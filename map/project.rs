@@ -17,16 +17,13 @@ pub struct HwePcaProjector<'model> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ZeroAlignmentAction {
+    #[default]
     Zero,
     NaN,
 }
 
-impl Default for ZeroAlignmentAction {
-    fn default() -> Self {
-        Self::Zero
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProjectionOptions {
@@ -75,7 +72,7 @@ impl HwePcaModel {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
-        let progress = NoopProjectionProgress::default();
+        let progress = NoopProjectionProgress;
         self.projector()
             .project_with_options_and_progress(source, opts, &progress)
     }
@@ -100,7 +97,7 @@ impl<'model> HwePcaProjector<'model> {
         S: VariantBlockSource,
         S::Error: Error + Send + Sync + 'static,
     {
-        let progress = NoopProjectionProgress::default();
+        let progress = NoopProjectionProgress;
         self.project_with_options_and_progress(source, opts, &progress)
     }
 
@@ -144,7 +141,7 @@ impl<'model> HwePcaProjector<'model> {
         S::Error: Error + Send + Sync + 'static,
     {
         let options = ProjectionOptions::default();
-        let progress = NoopProjectionProgress::default();
+        let progress = NoopProjectionProgress;
         self.project_into_with_options_and_progress(source, scores, &options, None, &progress)
     }
 
@@ -197,13 +194,12 @@ impl<'model> HwePcaProjector<'model> {
                 "Projection output column count must equal number of components",
             ));
         }
-        if let Some(ref alignment) = alignment_out {
-            if alignment.nrows() != n_samples || alignment.ncols() != components {
+        if let Some(ref alignment) = alignment_out
+            && (alignment.nrows() != n_samples || alignment.ncols() != components) {
                 return Err(HwePcaError::InvalidInput(
                     "Alignment output shape must match projection output",
                 ));
             }
-        }
 
         scores.fill(0.0);
 
@@ -261,13 +257,12 @@ impl<'model> HwePcaProjector<'model> {
             if filled == 0 {
                 break;
             }
-            if processed + filled > expected_variants {
-                if variant_hint != 0 || processed + filled > model_variants {
+            if processed + filled > expected_variants
+                && (variant_hint != 0 || processed + filled > model_variants) {
                     return Err(HwePcaError::InvalidInput(
                         "VariantBlockSource returned more variants than reported",
                     ));
                 }
-            }
 
             let mut block = MatMut::from_column_major_slice_mut(
                 &mut block_storage[..n_samples * filled],
@@ -534,7 +529,7 @@ fn projection_block_capacity(
         return 1;
     }
     let default = DEFAULT_BLOCK_WIDTH.max(1);
-    let safe_reference = fitted_samples.checked_mul(default).unwrap_or(usize::MAX);
+    let safe_reference = fitted_samples.saturating_mul(default);
     let mut capacity = if projected_samples == 0 {
         default
     } else {

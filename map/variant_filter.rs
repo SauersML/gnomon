@@ -65,7 +65,7 @@ impl From<io::Error> for VariantListError {
 
 impl From<PipelineError> for VariantListError {
     fn from(err: PipelineError) -> Self {
-        Self::Io(io::Error::new(io::ErrorKind::Other, err.to_string()))
+        Self::Io(io::Error::other(err.to_string()))
     }
 }
 

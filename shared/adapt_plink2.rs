@@ -815,7 +815,7 @@ impl TextSource for VirtualBim {
         Some(self.lines.len() as u64)
     }
 
-    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+    fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
         if self.next_idx >= self.lines.len() {
             return Ok(None);
         }
@@ -851,7 +851,7 @@ impl TextSource for VirtualFam {
         Some(self.rows.len() as u64)
     }
 
-    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+    fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
         if self.next_idx >= self.rows.len() {
             return Ok(None);
         }
@@ -893,7 +893,7 @@ impl VirtualBed {
                 "SEX column count mismatch with sample count".into(),
             ));
         }
-        let block_bytes = (n_samples + 3) / 4;
+        let block_bytes = n_samples.div_ceil(4);
         Ok(Self {
             inner: Arc::new(Mutex::new(decoder)),
             plan,
@@ -916,7 +916,7 @@ impl VirtualBed {
     ///   11 hom-A2 (A1 dosage 0)
     ///   01 missing
     fn pack_to_block(dst: &mut [u8], hardcalls: &[u8]) {
-        debug_assert_eq!(dst.len(), (hardcalls.len() + 3) / 4);
+        debug_assert_eq!(dst.len(), hardcalls.len().div_ceil(4));
         for chunk_i in 0..dst.len() {
             let base = chunk_i * 4;
             let mut byte = 0u8;
@@ -1102,11 +1102,10 @@ impl ByteRangeSource for VirtualBed {
                 let mut hard = vec![255u8; self.n_samples]; // 255 = missing
                 decoder.decode_variant_hardcalls(in_idx, alt_ord, &mut hard, sample_ploidy)?;
 
-                if let Some(kind) = haploidy_kind {
-                    if !matches!(kind, HaploidyKind::Diploid) {
+                if let Some(kind) = haploidy_kind
+                    && !matches!(kind, HaploidyKind::Diploid) {
                         enforce_haploidy(&mut hard, &self.sex_by_sample, kind);
                     }
-                }
 
                 // Pack to bytes and store in cache.
                 let mut block = vec![0u8; self.block_bytes];
@@ -1198,7 +1197,7 @@ impl ByteRangeSource for LocalFileByteRangeSource {
         if dst.is_empty() {
             return Ok(());
         }
-        if offset.checked_add(dst.len() as u64).unwrap_or(u64::MAX) > self.len {
+        if offset.saturating_add(dst.len() as u64) > self.len {
             return Err(ioerr("Attempted to read past end of local .pgen"));
         }
         let mut f = self.file.lock().unwrap();
@@ -1374,7 +1373,7 @@ impl PgenHeader {
 
             // types per block
             if type_bits == 4 {
-                let nbytes = (cnt + 1) / 2;
+                let nbytes = cnt.div_ceil(2);
                 let mut buf = vec![0u8; nbytes];
                 src.read_at(off, &mut buf)?;
                 off += nbytes as u64;
@@ -1423,7 +1422,7 @@ impl PgenHeader {
                 off += nbytes as u64;
             }
             if ref_flag_mode == 3 {
-                let nbytes = (cnt + 7) / 8;
+                let nbytes = cnt.div_ceil(8);
                 off += nbytes as u64;
             }
 
@@ -1517,7 +1516,7 @@ fn read_bitarray_indices(
     cursor: &mut usize,
     nbits: usize,
 ) -> Result<Vec<usize>, PipelineError> {
-    let nbytes = (nbits + 7) / 8;
+    let nbytes = nbits.div_ceil(8);
     if *cursor + nbytes > buf.len() {
         return Err(ioerr("EOF in bitarray"));
     }
@@ -1548,7 +1547,7 @@ fn read_packed_fixed_width(
         return Ok(vec![0; count]);
     }
     let total_bits = width_bits * count;
-    let nbytes = (total_bits + 7) / 8;
+    let nbytes = total_bits.div_ceil(8);
     if *cursor + nbytes > buf.len() {
         return Err(ioerr("EOF in packed values"));
     }
@@ -1592,7 +1591,7 @@ fn difflist_ids(
     if l == 0 {
         return Ok(vec![]);
     }
-    let g = (l + 63) / 64;
+    let g = l.div_ceil(64);
     let sid_bytes = sample_id_bytes(n_samples);
 
     let mut first_ids = Vec::with_capacity(g);
@@ -1688,7 +1687,7 @@ fn difflist_pairs(
     if l == 0 {
         return Ok(vec![]);
     }
-    let g = (l + 63) / 64;
+    let g = l.div_ceil(64);
     let sid_bytes = sample_id_bytes(n_samples);
 
     let mut first_ids = Vec::with_capacity(g);
@@ -1739,7 +1738,7 @@ fn difflist_pairs(
         *cursor += g - 1;
     }
 
-    let vals_packed = (l + 3) / 4;
+    let vals_packed = l.div_ceil(4);
     if *cursor + vals_packed > buf.len() {
         return Err(ioerr("EOF in difflist values"));
     }
@@ -1797,7 +1796,7 @@ fn difflist_pairs(
     }
     Ok(ids
         .into_iter()
-        .zip(vals.into_iter().map(|v| v as u8))
+        .zip(vals.into_iter())
         .collect())
 }
 
@@ -1853,12 +1852,12 @@ impl PgenDecoder {
     fn record_offset_len(&self, idx: usize) -> Result<(u64, usize, u8), PipelineError> {
         match self.hdr.mode {
             PgenMode::FixHard => {
-                let rec_len = (self.n + 3) / 4;
+                let rec_len = self.n.div_ceil(4);
                 let ref_flag_mode = (self.hdr.fmt_byte >> 6) & 0x03;
                 let mut base = 12u64 + 1; // header + format byte
                 if ref_flag_mode == 3 {
                     base = base
-                        .checked_add(((self.hdr.m_variants as u64) + 7) / 8)
+                        .checked_add((self.hdr.m_variants as u64).div_ceil(8))
                         .ok_or_else(|| ioerr("Header overflow"))?;
                 }
                 Ok((base + (idx as u64) * (rec_len as u64), rec_len, 0))
@@ -1907,11 +1906,10 @@ impl PgenDecoder {
         if dst.len() != self.n {
             return Err(ioerr("Hardcall buffer length must equal sample count"));
         }
-        if let Some(ploidy) = sample_ploidy {
-            if ploidy.len() != self.n {
+        if let Some(ploidy) = sample_ploidy
+            && ploidy.len() != self.n {
                 return Err(ioerr("Sample ploidy length mismatch"));
             }
-        }
         let idx = in_idx as usize;
         if idx >= self.hdr.m_variants as usize {
             return Err(ioerr("Variant index out of bounds"));
@@ -1929,7 +1927,7 @@ impl PgenDecoder {
         let main_kind = rec_ty & 0x07;
         match main_kind {
             0 => {
-                let need = (self.n + 3) / 4;
+                let need = self.n.div_ceil(4);
                 if need > len {
                     return Err(ioerr("Truncated type-0 main track"));
                 }
@@ -2079,7 +2077,7 @@ impl PgenDecoder {
                 }
                 bit_cursor += 1;
             }
-            let bytes_needed = (bit_cursor + 7) / 8;
+            let bytes_needed = bit_cursor.div_ceil(8);
             if start + bytes_needed > len {
                 return Err(PipelineError::Io(format!(
                     "EOF in phase track (variant #{idx})"
@@ -2196,7 +2194,7 @@ impl PgenDecoder {
                 cursor += need;
             } else {
                 let d = dosage_entries;
-                let nbytes = (d + 7) / 8;
+                let nbytes = d.div_ceil(8);
                 if cursor + nbytes > len {
                     return Err(PipelineError::Io(format!(
                         "EOF in phased dosage presence (variant #{idx})"
@@ -2298,7 +2296,7 @@ fn apply_multiallelic_and_project(
     }
     let fmt_byte = record[*cursor];
     *cursor += 1;
-    let cat1_fmt = (fmt_byte & 0x0f) as u8;
+    let cat1_fmt = fmt_byte & 0x0f;
     let cat2_fmt = (fmt_byte >> 4) & 0x0f;
 
     let cat1_ids = collect_cat_ids(cats, 1);

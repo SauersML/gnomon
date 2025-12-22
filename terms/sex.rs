@@ -233,7 +233,7 @@ fn finalize_records(
 ) -> Result<Vec<SexInferenceRecord>, SexInferenceError> {
     accumulators
         .into_iter()
-        .zip(sample_ids.into_iter())
+        .zip(sample_ids)
         .map(|(acc, individual_id)| {
             let inference = acc.finish()?;
             Ok(SexInferenceRecord {
@@ -249,11 +249,10 @@ fn write_results(
     records: &[SexInferenceRecord],
     build: GenomeBuild,
 ) -> Result<(), SexInferenceError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
-    }
 
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);

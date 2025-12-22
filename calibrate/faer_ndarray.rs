@@ -284,7 +284,7 @@ pub fn ldlt_rook(
         par,
         params_spec,
     ));
-    let mut stack = MemStack::new(&mut mem);
+    let stack = MemStack::new(&mut mem);
 
     factor::cholesky_in_place(
         faer_mat.as_mut(),
@@ -292,7 +292,7 @@ pub fn ldlt_rook(
         &mut perm_fwd,
         &mut perm_inv,
         par,
-        &mut stack,
+        stack,
         params_spec,
     );
 
@@ -381,14 +381,14 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
                 par,
                 Default::default(),
             ));
-            let mut stack = MemStack::new(&mut mem);
+            let stack = MemStack::new(&mut mem);
             svd::svd(
                 faer_mat,
                 singular.as_mut(),
                 None,
                 None,
                 par,
-                &mut stack,
+                stack,
                 Default::default(),
             )
             .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
@@ -421,7 +421,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
             par,
             Default::default(),
         ));
-        let mut stack = MemStack::new(&mut mem);
+        let stack = MemStack::new(&mut mem);
 
         svd::svd(
             faer_mat.as_ref(),
@@ -429,7 +429,7 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
             u_storage.as_mut().map(|mat| mat.as_mut()),
             v_storage.as_mut().map(|mat| mat.as_mut()),
             par,
-            &mut stack,
+            stack,
             Default::default(),
         )
         .map_err(|_| FaerLinalgError::SvdNoConvergence)?;

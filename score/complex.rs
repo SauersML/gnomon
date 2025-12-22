@@ -729,7 +729,7 @@ pub fn resolve_complex_variants(
                 .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
                 .enumerate()
                 .try_fold(
-                    || PerThreadCollector::new(),
+                    PerThreadCollector::new,
                     |mut local_collector, (person_output_idx, (person_scores_slice, person_counts_slice))| {
                         let guard = ScopeGuard::new(|| {
                             progress_counter.fetch_add(1, Ordering::Relaxed);
@@ -865,7 +865,7 @@ pub fn resolve_complex_variants(
                 )
                 .map(|collector_opt| collector_opt.unwrap_or_default())
                 .reduce(
-                    || PerThreadCollector::new(),
+                    PerThreadCollector::new,
                     |mut main_collector, thread_collector| {
                         for (heuristic, (count, samples)) in thread_collector {
                             let (main_count, main_samples) = main_collector.entry(heuristic).or_insert((0, Vec::new()));

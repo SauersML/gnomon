@@ -644,7 +644,7 @@ fn build_banded_difference_penalty(
     }
 
     let coeffs: Array1<f64> = Array1::from_iter((0..=order).map(|j| {
-        let sign = if (order - j) % 2 == 0 { 1.0 } else { -1.0 };
+        let sign = if (order - j).is_multiple_of(2) { 1.0 } else { -1.0 };
         sign * binomial(order, j) as f64
     }));
     let num_rows = num_basis_functions - order;
@@ -735,12 +735,9 @@ impl DifferencePenaltyCache {
         ncols: usize,
         order: usize,
     ) -> Result<Arc<DifferencePenalty>, EstimationError> {
-        if !self.cache.contains_key(&(ncols, order)) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.cache.entry((ncols, order)) {
             let representation = build_banded_difference_penalty(ncols, order)?;
-            self.cache.insert(
-                (ncols, order),
-                Arc::new(DifferencePenalty::new(representation)),
-            );
+            e.insert(Arc::new(DifferencePenalty::new(representation)));
         }
         Ok(self
             .cache
@@ -1492,8 +1489,8 @@ pub fn build_design_and_penalty_matrices(
         let pc_name = &pc_config.name;
         // Fill null-space columns
         let null_cols = &layout.pc_null_cols[pc_idx];
-        if null_cols.len() > 0 {
-            if let Some(null_basis) = &pc_null_bases[pc_idx] {
+        if !null_cols.is_empty()
+            && let Some(null_basis) = &pc_null_bases[pc_idx] {
                 if null_basis.nrows() != n_samples {
                     return Err(EstimationError::LayoutError(format!(
                         "PC null basis {} has {} rows but expected {} samples",
@@ -1514,7 +1511,6 @@ pub fn build_design_and_penalty_matrices(
                     .slice_mut(s![.., null_cols.clone()])
                     .assign(null_basis);
             }
-        }
         // Fill penalized range-space columns
         for block in &layout.penalty_map {
             if block.term_name == format!("f({pc_name})") {
@@ -1703,7 +1699,7 @@ pub fn build_design_and_penalty_matrices(
             // Extract this PC's main effect columns: null then range
             let pc_block = &layout.penalty_map[layout.pc_main_block_idx[pc_idx]];
             let pc_null_cols = &layout.pc_null_cols[pc_idx];
-            let pc_null = if pc_null_cols.len() > 0 {
+            let pc_null = if !pc_null_cols.is_empty() {
                 Some(x_matrix.slice(s![.., pc_null_cols.clone()]).to_owned())
             } else {
                 None
@@ -2082,7 +2078,7 @@ pub fn stable_reparameterization(
     let rs_faer: Vec<Mat<f64>> = rs_list.iter().map(array_to_faer).collect();
     let s_original_list: Vec<Mat<f64>> = rs_faer
         .iter()
-        .map(|rs_k| penalty_from_root_faer(rs_k))
+        .map(penalty_from_root_faer)
         .collect();
 
     let mut s_balanced = Mat::<f64>::zeros(p, p);
@@ -2106,8 +2102,8 @@ pub fn stable_reparameterization(
             log_det: 0.0,
             det1: Array1::zeros(m),
             qs: Array2::eye(p),
-            rs_transformed: rs_list.iter().cloned().collect(),
-            rs_transposed: rs_list.iter().map(|rs| transpose_owned(rs)).collect(),
+            rs_transformed: rs_list.to_vec(),
+            rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
         });
     }
@@ -2327,7 +2323,7 @@ pub fn stable_reparameterization(
         log_det,
         det1: Array1::from(det1_vec),
         qs: mat_to_array(&qs),
-        rs_transformed: rs_transformed.iter().map(|mat| mat_to_array(mat)).collect(),
+        rs_transformed: rs_transformed.iter().map(mat_to_array).collect(),
         rs_transposed: rs_transformed
             .iter()
             .map(|mat| Array2::from_shape_fn((mat.ncols(), mat.nrows()), |(i, j)| mat[(j, i)]))

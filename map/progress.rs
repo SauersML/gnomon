@@ -518,25 +518,23 @@ impl CiStageState {
             return true;
         }
 
-        if let Some(total) = self.total {
-            if total > 0 {
+        if let Some(total) = self.total
+            && total > 0 {
                 let current_percent = (self.processed as f64 / total as f64) * 100.0;
                 if current_percent - self.last_log_percent >= CI_LOG_PERCENT_THRESHOLD {
                     return true;
                 }
             }
-        }
 
         false
     }
 
     fn mark_logged(&mut self) {
         self.last_log_time = Instant::now();
-        if let Some(total) = self.total {
-            if total > 0 {
+        if let Some(total) = self.total
+            && total > 0 {
                 self.last_log_percent = (self.processed as f64 / total as f64) * 100.0;
             }
-        }
     }
 
     fn format_progress(&self, stage: FitProgressStage) -> String {
@@ -627,11 +625,10 @@ impl FitProgressObserver for CiFitProgress {
 
     fn on_stage_estimate(&self, stage: FitProgressStage, estimated_total: usize) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(state) = inner.get_mut(&stage) {
-            if state.total.is_none() && estimated_total > 0 {
+        if let Some(state) = inner.get_mut(&stage)
+            && state.total.is_none() && estimated_total > 0 {
                 state.total = Some(estimated_total);
             }
-        }
     }
 
     fn on_stage_total(&self, stage: FitProgressStage, total_variants: usize) {
@@ -661,9 +658,9 @@ impl FitProgressObserver for CiFitProgress {
         // For CI mode, we don't track byte-level progress separately
         // Just update based on bytes if we have a total
         let mut inner = self.inner.lock().unwrap();
-        if let Some(state) = inner.get_mut(&stage) {
-            if let Some(total) = total_bytes {
-                if total > 0 {
+        if let Some(state) = inner.get_mut(&stage)
+            && let Some(total) = total_bytes
+                && total > 0 {
                     // Approximate variant progress from bytes
                     let approx_variants = if let Some(variant_total) = state.total {
                         ((processed_bytes as f64 / total as f64) * variant_total as f64) as usize
@@ -682,8 +679,6 @@ impl FitProgressObserver for CiFitProgress {
                         state.mark_logged();
                     }
                 }
-            }
-        }
     }
 
     fn on_stage_finish(&self, stage: FitProgressStage) {

@@ -1074,11 +1074,9 @@ pub fn train_model(
                 best_symmetric_seed = Some((seed.clone(), cost, i));
                 eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
             }
-        } else {
-            if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-                best_asymmetric_seed = Some((seed.clone(), cost, i));
-                eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
-            }
+        } else if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+            best_asymmetric_seed = Some((seed.clone(), cost, i));
+            eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
         }
     }
 
@@ -1489,13 +1487,12 @@ pub fn train_model(
         .map_err(|e| {
             EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
         })?;
-        if matches!(config.link_function(), LinkFunction::Logit) {
-            if let Some(ref samples) = mcmc_samples {
+        if matches!(config.link_function(), LinkFunction::Logit)
+            && let Some(ref samples) = mcmc_samples {
                 let mean_logit = mean_logit_from_samples(x_matrix.view(), samples)?;
                 features.pred = mean_logit.clone();
                 features.pred_identity = mean_logit;
             }
-        }
 
         // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
         // This ensures the calibrator lives in the same function class as the base smooth
@@ -2882,7 +2879,7 @@ pub fn optimize_external_design(
     let p = x.ncols();
     let k = s_list.len();
     let layout = ModelLayout::external(p, k);
-    let firth_active = opts.firth.as_ref().map_or(false, |spec| {
+    let firth_active = opts.firth.as_ref().is_some_and(|spec| {
         spec.enabled && matches!(opts.link, LinkFunction::Logit)
     });
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
@@ -3291,7 +3288,7 @@ pub fn evaluate_external_gradients(
     use crate::calibrate::model::ModelConfig;
 
     let layout = ModelLayout::external(p, s_list.len());
-    let firth_active = opts.firth.as_ref().map_or(false, |spec| {
+    let firth_active = opts.firth.as_ref().is_some_and(|spec| {
         spec.enabled && matches!(opts.link, LinkFunction::Logit)
     });
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
@@ -3563,9 +3560,9 @@ pub mod internal {
         /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
         /// If not, a small ridge is added to ensure positive definiteness, and that
         /// ridged matrix is returned along with the ridge value used.
-        fn effective_hessian<'p>(
+        fn effective_hessian(
             &self,
-            pr: &'p PirlsResult,
+            pr: &PirlsResult,
         ) -> Result<(Array2<f64>, f64), EstimationError> {
             let base = pr.stabilized_hessian_transformed.clone();
 
@@ -3586,17 +3583,15 @@ pub mod internal {
 
             let min_target = LAML_RIDGE.max(1e-9);
             let mut ridge = min_target;
-            if let Ok((eigs, _)) = base.eigh(Side::Lower) {
-                if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
-                    if min_eig.is_finite() {
+            if let Ok((eigs, _)) = base.eigh(Side::Lower)
+                && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
+                    && min_eig.is_finite() {
                         if min_eig < min_target {
                             ridge = (min_target - min_eig).max(min_target);
                         } else if min_eig < 0.0 {
                             ridge = (-min_eig) + min_target;
                         }
                     }
-                }
-            }
 
             if !ridge.is_finite() || ridge <= 0.0 {
                 ridge = min_target;
@@ -3778,11 +3773,10 @@ pub mod internal {
 
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
             let key = self.rho_key_sanitized(rho);
-            if let Some(existing) = self.current_eval_bundle.borrow().as_ref() {
-                if existing.matches(&key) {
+            if let Some(existing) = self.current_eval_bundle.borrow().as_ref()
+                && existing.matches(&key) {
                     return Ok(existing.clone());
                 }
-            }
             let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
             *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
             Ok(bundle)
@@ -3948,11 +3942,10 @@ pub mod internal {
             // split the cache.  Until then we prefer the cheaper key because it maximizes cache
             // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
-            if let Some(key) = &key_opt {
-                if let Some(f) = self.faer_factor_cache.borrow().get(key) {
+            if let Some(key) = &key_opt
+                && let Some(f) = self.faer_factor_cache.borrow().get(key) {
                     return Arc::clone(f);
                 }
-            }
             let fact = Arc::new(self.factorize_faer(h));
 
             if let Some(key) = key_opt {
@@ -4171,8 +4164,8 @@ pub mod internal {
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
             let key_opt = self.rho_key_sanitized(rho);
-            if let Some(key) = &key_opt {
-                if let Some(cached) = {
+            if let Some(key) = &key_opt
+                && let Some(cached) = {
                     let cache_ref = self.cache.borrow();
                     cache_ref.get(key).cloned()
                 } {
@@ -4181,7 +4174,6 @@ pub mod internal {
                     }
                     return Ok(cached);
                 }
-            }
 
             // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
             let lambdas_for_logging = rho.mapv(f64::exp);
@@ -4367,10 +4359,9 @@ pub mod internal {
             // Don't barrier on non-PD; we'll stabilize and continue like mgcv
             // Only check eigenvalues if we needed to add a ridge
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
-            if ridge_used > 0.0 {
-                if let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
-                {
-                    if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
+            if ridge_used > 0.0
+                && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
+                    && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
                         eprintln!("[Diag] H min_eig={:.3e}", min_eig);
 
                         if min_eig <= 0.0 {
@@ -4393,8 +4384,6 @@ pub mod internal {
                             );
                         }
                     }
-                }
-            }
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
@@ -4700,7 +4689,7 @@ pub mod internal {
                         "\n[BFGS Step #{eval_num}] -> Cost is infinite, computing retreat gradient"
                     );
                     // Diagnostics: report which rho are at bounds
-                    if rho.len() > 0 {
+                    if !rho.is_empty() {
                         let at_lower: Vec<usize> = rho
                             .iter()
                             .enumerate()
@@ -4894,7 +4883,7 @@ pub mod internal {
             bundle: &EvalShared,
         ) -> Result<Array1<f64>, EstimationError> {
             // If there are no penalties (zero-length rho), the gradient in rho-space is empty.
-            if p.len() == 0 {
+            if p.is_empty() {
                 return Ok(Array1::zeros(0));
             }
 

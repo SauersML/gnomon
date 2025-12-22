@@ -458,7 +458,7 @@ fn compute_hessian_sparse(
         }
         let x_row = x.as_ref();
         let vals = x_row.val_of_row(row);
-        let cols: Vec<usize> = x_row.col_idx_of_row(row).map(|c| c).collect();
+        let cols: Vec<usize> = x_row.col_idx_of_row(row).collect();
         if cols.len() != vals.len() {
             return Err(EstimationError::InvalidInput(
                 "sparse row value/index length mismatch".to_string(),
@@ -547,7 +547,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
             continue;
         }
         let vals = x_view.val_of_row(i);
-        let cols: Vec<usize> = x_view.col_idx_of_row(i).map(|c| c).collect();
+        let cols: Vec<usize> = x_view.col_idx_of_row(i).collect();
         if cols.len() != vals.len() {
             return Err(EstimationError::InvalidInput(
                 "sparse row value/index length mismatch".to_string(),
@@ -833,7 +833,7 @@ where
         final_state = Some(candidate_state);
     }
 
-    let state = final_state.ok_or_else(|| EstimationError::PirlsDidNotConverge {
+    let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
         last_change: last_gradient_norm,
     })?;
@@ -1480,8 +1480,8 @@ fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
     }
 
     // The condition number is the product of the two norms
-    let kappa = r_inf * y_inf;
-    kappa
+    
+    r_inf * y_inf
 }
 
 /// Pivots the columns of a matrix according to a pivot vector.
@@ -2090,8 +2090,8 @@ pub fn solve_penalized_least_squares(
         };
 
         let mut skip_new_factor = false;
-        if let Some(entry) = workspace.chol_cache.as_ref() {
-            if entry.hash == matrix_hash && entry.dim == p_dim {
+        if let Some(entry) = workspace.chol_cache.as_ref()
+            && entry.hash == matrix_hash && entry.dim == p_dim {
                 ridge_used = entry.ridge;
                 cond_est = entry.cond_estimate;
                 if ridge_used > 0.0 {
@@ -2108,7 +2108,6 @@ pub fn solve_penalized_least_squares(
                     skip_new_factor = true;
                 }
             }
-        }
 
         if !skip_new_factor {
             let (chol_opt, ridge, cond) = attempt_spd_cholesky(&mut penalized_hessian);
@@ -2186,7 +2185,7 @@ pub fn solve_penalized_least_squares(
     let wz = &workspace.wz;
 
     // Perform initial pivoted QR on the weighted design matrix
-    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(&wx)?;
+    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(wx)?;
 
     // Keep only the leading p rows of r1 (r_rows = min(n, p))
     let r_rows = r1_full.nrows().min(p_dim);
@@ -2411,7 +2410,7 @@ pub fn solve_penalized_least_squares(
         let residual = {
             let mut eta = offset.to_owned();
             eta += &x_transformed.dot(&beta_transformed);
-            eta - &z
+            eta - z
         };
         let weighted_residual = &weights * &residual;
         let grad_dev_part = fast_atv(&x_transformed, &weighted_residual);

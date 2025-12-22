@@ -517,7 +517,7 @@ fn prepare_for_computation_with_retry(
             }
         }
     }
-    while let Some(result) = bim_iter.next() {
+    for result in bim_iter.by_ref() {
         match result {
             Ok(record) => {
                 diagnostics.add_bim_key(record.key);
@@ -543,15 +543,14 @@ fn prepare_for_computation_with_retry(
     if let (Some(filters), Some(hit_flags)) = (region_filters.as_ref(), region_filter_hits.as_ref())
     {
         for (idx, region_opt) in filters.iter().enumerate() {
-            if let Some(region) = region_opt {
-                if !hit_flags.get(idx).copied().unwrap_or(false) {
+            if let Some(region) = region_opt
+                && !hit_flags.get(idx).copied().unwrap_or(false) {
                     let score_name = &score_names[idx];
                     eprintln!(
                         "Warning: Score '{score_name}' has no variants within the requested region {region}."
                     );
                     diagnostics.record_region_without_hits(score_name);
                 }
-            }
         }
     }
 
@@ -908,7 +907,7 @@ fn apply_extension(path: &Path, extension: &str) -> Result<PathBuf, PrepError> {
             let mut new_path = path_str.to_string();
             if let Some(dot_pos) = new_path.rfind('.') {
                 let slash_pos = new_path.rfind('/');
-                if slash_pos.map_or(true, |idx| idx < dot_pos) {
+                if slash_pos.is_none_or(|idx| idx < dot_pos) {
                     new_path.truncate(dot_pos);
                     new_path.push('.');
                     new_path.push_str(extension);
@@ -970,8 +969,8 @@ fn conduct_post_mortem(
                 let current_key = record.key;
                 bim_chromosomes.insert(current_key.0);
 
-                if let Some(prev_key) = previous_bim_key {
-                    if current_key < prev_key {
+                if let Some(prev_key) = previous_bim_key
+                    && current_key < prev_key {
                         let unsorted_error = PrepError::UnsortedInput {
                             source: "BIM",
                             path: bim_iter.current_path.clone(),
@@ -992,7 +991,6 @@ fn conduct_post_mortem(
 
                         return Ok(PostMortemAction::Fatal(unsorted_error));
                     }
-                }
 
                 previous_bim_key = Some(current_key);
             }
@@ -1047,8 +1045,8 @@ fn conduct_post_mortem(
 
             score_chromosomes.insert(key.0);
 
-            if let Some(prev_key) = previous_key {
-                if key < prev_key {
+            if let Some(prev_key) = previous_key
+                && key < prev_key {
                     return Ok(PostMortemAction::Fatal(PrepError::UnsortedInput {
                         source: "score",
                         path: path.clone(),
@@ -1057,7 +1055,6 @@ fn conduct_post_mortem(
                         current_key: key,
                     }));
                 }
-            }
 
             previous_key = Some(key);
         }
@@ -1132,10 +1129,7 @@ impl<'a, 'arena> Iterator for BimIterator<'a, 'arena> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let reader = match self.current_reader.as_mut() {
-                Some(reader) => reader,
-                None => return None,
-            };
+            let reader = self.current_reader.as_mut()?;
 
             match reader.next_line() {
                 Ok(Some(line_bytes)) => {
@@ -1305,7 +1299,7 @@ impl<'arena> KWayMergeIterator<'arena> {
                     return Ok(());
                 }
 
-                let region_hits_slice = region_hits.as_mut().map(|vec| vec.as_mut_slice());
+                let region_hits_slice = region_hits.as_deref_mut();
 
                 Self::read_line_into_buffer(
                     stream,
@@ -1387,11 +1381,10 @@ impl<'arena> KWayMergeIterator<'arena> {
                     && let Some(&score_column_index) = column_map.get(i)
                 {
                     if let Some(filters) = region_filters {
-                        if let Some(Some(region)) = filters.get(score_column_index.0) {
-                            if !region.contains(key) {
+                        if let Some(Some(region)) = filters.get(score_column_index.0)
+                            && !region.contains(key) {
                                 continue;
                             }
-                        }
                         if let Some(hit_flags) = region_hits.as_deref_mut() {
                             hit_flags[score_column_index.0] = true;
                         }

@@ -374,7 +374,6 @@ pub fn create_bspline_basis_with_knots(
     let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
         for (mut row, &x) in basis_matrix
             .axis_iter_mut(Axis(0))
-            .into_iter()
             .zip(data.iter())
         {
             let row_slice = row
@@ -613,7 +612,6 @@ pub fn create_bspline_basis(
     let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
         for (mut row, &x) in basis_matrix
             .axis_iter_mut(Axis(0))
-            .into_iter()
             .zip(data.iter())
         {
             let row_slice = row

@@ -98,10 +98,10 @@ pub fn gcs_billing_project_from_env() -> Option<String> {
         "GOOGLE_CLOUD_PROJECT",
         "CLOUDSDK_CORE_PROJECT",
     ] {
-        if let Ok(v) = env::var(key) {
-            if !v.trim().is_empty() {
-                return Some(v);
-            }
+        if let Ok(v) = env::var(key)
+            && !v.trim().is_empty()
+        {
+            return Some(v);
         }
     }
     None
@@ -136,7 +136,11 @@ pub trait TextSource: Send {
         None
     }
 
-    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError>;
+    fn is_empty(&self) -> bool {
+        self.len().is_none_or(|l| l == 0)
+    }
+
+    fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError>;
 }
 
 fn augment_pipeline_error(err: PipelineError, context: &str) -> PipelineError {
@@ -151,6 +155,11 @@ fn augment_pipeline_error(err: PipelineError, context: &str) -> PipelineError {
 /// underlying storage mechanism.
 pub trait ByteRangeSource: Send + Sync {
     fn len(&self) -> u64;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError>;
 }
 
@@ -177,6 +186,10 @@ impl BedSource {
 
     pub fn len(&self) -> u64 {
         self.byte_source.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn read_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), PipelineError> {
@@ -356,6 +369,10 @@ impl VariantSource {
     /// when known.
     pub fn len(&self) -> Option<u64> {
         self.total_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_len.is_none_or(|l| l == 0)
     }
 
     pub fn metrics(&self) -> Arc<ReadMetrics> {
@@ -991,7 +1008,7 @@ impl TextSource for LocalTextSource {
         Some(self.len)
     }
 
-    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+    fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
         if self.line_active {
             self.line.clear();
             self.line_active = false;
@@ -1072,15 +1089,15 @@ impl TextSource for StreamingTextSource {
         Some(self.len)
     }
 
-    fn next_line<'a>(&'a mut self) -> Result<Option<&'a [u8]>, PipelineError> {
+    fn next_line(&mut self) -> Result<Option<&[u8]>, PipelineError> {
         if self.carry_active {
             self.carry.clear();
             self.carry_active = false;
         }
 
         loop {
-            if self.cursor >= self.valid {
-                if !self.fill_buffer()? {
+            if self.cursor >= self.valid
+                && !self.fill_buffer()? {
                     if self.carry.is_empty() {
                         return Ok(None);
                     }
@@ -1090,7 +1107,6 @@ impl TextSource for StreamingTextSource {
                     self.carry_active = true;
                     return Ok(Some(&self.carry));
                 }
-            }
 
             if let Some(rel_pos) = self.buffer[self.cursor..self.valid]
                 .iter()
@@ -1432,19 +1448,17 @@ impl HttpByteRangeSource {
                 PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}"))
             })?;
 
-        if response.status() == StatusCode::PARTIAL_CONTENT {
-            if let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE)) {
+        if response.status() == StatusCode::PARTIAL_CONTENT
+            && let Some(total) = Self::parse_content_range(response.headers().get(CONTENT_RANGE)) {
                 let _ = response.bytes();
                 return Ok(total);
             }
-        }
 
-        if response.status().is_success() {
-            if let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
+        if response.status().is_success()
+            && let Some(len) = Self::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
                 let _ = response.bytes();
                 return Ok(len);
             }
-        }
 
         let status = response.status();
         Err(PipelineError::Io(format!(
@@ -1509,14 +1523,13 @@ impl HttpByteRangeSource {
                 ))
             })?;
         let status = response.status();
-        if status != StatusCode::PARTIAL_CONTENT {
-            if !(status.is_success() && start == 0) {
+        if status != StatusCode::PARTIAL_CONTENT
+            && !(status.is_success() && start == 0) {
                 return Err(PipelineError::Io(format!(
                     "HTTP range request for {} returned unexpected status {status}",
                     self.url
                 )));
             }
-        }
 
         let bytes = response.bytes().map_err(|e| {
             PipelineError::Io(format!("Failed to read HTTP body from {}: {e}", self.url))
@@ -1676,7 +1689,7 @@ impl Read for StreamingReader {
             if self.cursor >= self.valid {
                 if !self
                     .ensure_buffer()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                    .map_err(|e| io::Error::other(e.to_string()))?
                 {
                     break;
                 }
@@ -1749,16 +1762,15 @@ impl RemoteCache {
     }
 
     fn insert(&mut self, key: u64, value: Arc<Vec<u8>>) {
-        if self.blocks.contains_key(&key) {
-            self.blocks.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.blocks.entry(key) {
+            e.insert(value);
             self.touch(key);
             return;
         }
-        if self.order.len() == self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
+        if self.order.len() == self.capacity
+            && let Some(oldest) = self.order.pop_front() {
                 self.blocks.remove(&oldest);
             }
-        }
         self.order.push_back(key);
         self.blocks.insert(key, value);
     }

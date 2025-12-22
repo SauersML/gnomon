@@ -542,7 +542,7 @@ fn nullspace_transform(constraint_row: &Array1<f64>) -> Result<Array2<f64>, Surv
     let (u_opt, ..) = row_mat
         .svd(true, false)
         .map_err(|err| SurvivalError::Basis(BasisError::from(err)))?;
-    let u = u_opt.ok_or_else(|| SurvivalError::Basis(BasisError::ConstraintNullspaceNotFound))?;
+    let u = u_opt.ok_or(SurvivalError::Basis(BasisError::ConstraintNullspaceNotFound))?;
     Ok(u.slice(s![.., 1..]).to_owned())
 }
 
@@ -907,8 +907,8 @@ pub fn build_survival_layout(
                 if let (Ok((age_null, _)), Ok((pgs_null, _))) = (
                     null_range_whiten(&age_penalty_1d),
                     null_range_whiten(&pgs_penalty_1d),
-                ) {
-                    if age_null.ncols() > 0 && pgs_null.ncols() > 0 {
+                )
+                    && age_null.ncols() > 0 && pgs_null.ncols() > 0 {
                         let age_projector = age_null.dot(&age_null.t());
                         let pgs_projector = pgs_null.dot(&pgs_null.t());
                         let kron_null = kronecker_product(&age_projector, &pgs_projector);
@@ -926,7 +926,6 @@ pub fn build_survival_layout(
                             column_range: ColumnRange::new(time_range.start, time_range.end),
                         });
                     }
-                }
 
                 time_varying_entry = Some(time_entry);
                 time_varying_exit = Some(time_exit);
@@ -1405,15 +1404,11 @@ impl WorkingModelSurvival {
                     shifted[(idx, idx)] += shift;
                 }
             }
-            match ldlt_rook(&shifted) {
-                Ok((_, _, _, _, _, inertia)) => {
-                    if inertia.1 == 0 && inertia.2 == 0 {
-                        expected = -shifted;
-                        break;
-                    }
+            if let Ok((_, _, _, _, _, inertia)) = ldlt_rook(&shifted)
+                && inertia.1 == 0 && inertia.2 == 0 {
+                    expected = -shifted;
+                    break;
                 }
-                Err(_) => {}
-            }
             attempts += 1;
             if attempts >= max_attempts {
                 expected = -shifted;
@@ -1561,13 +1556,12 @@ impl WorkingModelSurvival {
         let penalty_term = self.layout.penalties.deviance(beta);
         deviance += penalty_term;
 
-        if self.spec.use_expected_information {
-            if let Some(expected_hessian) =
+        if self.spec.use_expected_information
+            && let Some(expected_hessian) =
                 self.build_expected_information_hessian(beta, &penalty_hessian)?
             {
                 hessian = expected_hessian;
             }
-        }
 
         Ok(WorkingState {
             eta: eta_exit,
@@ -1690,14 +1684,14 @@ pub fn resolve_companion_model<'a, 'b>(
 }
 
 /// Determine the competing-risk CIF at a given horizon.
-pub fn competing_cif_value<'a, 'b>(
+pub fn competing_cif_value(
     horizon: f64,
     covariates: &Array1<f64>,
     explicit: Option<f64>,
-    companion: Option<(&'a CompanionModelHandle, &'b SurvivalModelArtifacts)>,
+    companion: Option<(&CompanionModelHandle, &SurvivalModelArtifacts)>,
 ) -> Result<f64, SurvivalError> {
     if let Some(value) = explicit {
-        if !value.is_finite() || value < 0.0 || value > 1.0 {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err(SurvivalError::InvalidCompetingCif { value });
         }
         return Ok(value);
@@ -2078,7 +2072,7 @@ pub fn conditional_absolute_risk(
 /// Compute Gauss-Legendre quadrature nodes and weights for N points on interval [-1, 1].
 fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
     let mut nodes_weights = Vec::with_capacity(n);
-    let m = (n + 1) / 2;
+    let m = n.div_ceil(2);
     let pi = std::f64::consts::PI;
 
     for i in 0..m {
@@ -2109,7 +2103,7 @@ fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
         let x = z;
         let w = 2.0 / ((1.0 - z * z) * pp * pp);
 
-        if n % 2 != 0 && i == m - 1 {
+        if !n.is_multiple_of(2) && i == m - 1 {
             nodes_weights.push((0.0, w));
         } else {
             nodes_weights.push((-x, w));

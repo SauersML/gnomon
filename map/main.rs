@@ -382,15 +382,14 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
                 selection_plan = SelectionPlan::ByKeys(Arc::new(filter));
             }
         }
-    } else if let Some(known) = dataset.variant_count_hint() {
-        if known > 0 && known != model.n_variants() {
+    } else if let Some(known) = dataset.variant_count_hint()
+        && known > 0 && known != model.n_variants() {
             return Err(MapDriverError::InvalidState(format!(
                 "Model expects {} variants but dataset provides {}",
                 model.n_variants(),
                 known
             )));
         }
-    }
 
     let mut source = dataset.block_source_with_plan(selection_plan)?;
     let options = ProjectionOptions::default();

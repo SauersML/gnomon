@@ -228,7 +228,7 @@ impl ModelConfig {
     pub fn survival_spec(&self) -> Option<SurvivalSpec> {
         match &self.model_family {
             ModelFamily::Gam(_) => None,
-            ModelFamily::Survival(spec) => Some(spec.clone()),
+            ModelFamily::Survival(spec) => Some(*spec),
         }
     }
 }
@@ -1618,7 +1618,7 @@ mod internal {
         let saved_knots = config
             .knot_vectors
             .get("pgs")
-            .ok_or_else(|| ModelError::InternalStackingError)?;
+            .ok_or(ModelError::InternalStackingError)?;
 
         let (pgs_basis_unc, _) = basis::create_bspline_basis_with_knots(
             p_new,
@@ -1681,7 +1681,7 @@ mod internal {
             let saved_knots = config
                 .knot_vectors
                 .get(pc_name)
-                .ok_or_else(|| ModelError::InternalStackingError)?;
+                .ok_or(ModelError::InternalStackingError)?;
 
             let (pc_basis_unc, _) = basis::create_bspline_basis_with_knots(
                 pc_col,
@@ -1855,7 +1855,7 @@ mod internal {
                             let z_range_pc_pred = config
                                 .range_transforms
                                 .get(pc_name)
-                                .ok_or_else(|| ModelError::InternalStackingError)?;
+                                .ok_or(ModelError::InternalStackingError)?;
 
                             if pc_unconstrained_bases_main[pc_idx].ncols()
                                 != z_range_pc_pred.nrows()
@@ -3083,7 +3083,7 @@ pub fn map_coefficients(
         let range_block = &layout.penalty_map[range_block_idx];
         let mut full = Vec::new();
         let null_range = &layout.pc_null_cols[i];
-        if null_range.len() > 0 {
+        if !null_range.is_empty() {
             full.extend_from_slice(&beta.slice(s![null_range.clone()]).to_vec());
         }
         full.extend_from_slice(&beta.slice(s![range_block.col_range.clone()]).to_vec());

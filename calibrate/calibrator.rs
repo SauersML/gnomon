@@ -281,7 +281,7 @@ pub(crate) fn active_penalty_nullspace_dims(
     let tol = 1e-12_f64;
     penalties
         .iter()
-        .zip(dims.into_iter())
+        .zip(dims)
         .filter_map(|(penalty, dim)| {
             let max_abs = penalty
                 .iter()
@@ -457,7 +457,7 @@ pub fn compute_alo_features(
                 max_aii = max_aii.max(ai);
             }
 
-            if ai < 0.0 || ai > 1.0 || !ai.is_finite() {
+            if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
                 invalid_count += 1;
                 eprintln!(
                     "[CAL] WARNING: Invalid leverage at i={}, a_ii={:.6e}",
@@ -768,15 +768,14 @@ pub fn build_calibrator_design(
         constraints
     }
 
-    if let Some(w) = spec.prior_weights.as_ref() {
-        if w.len() != n {
+    if let Some(w) = spec.prior_weights.as_ref()
+        && w.len() != n {
             return Err(EstimationError::InvalidSpecification(format!(
                 "Calibrator prior weights length {} does not match number of observations {}",
                 w.len(),
                 n
             )));
         }
-    }
     if features.fisher_weights.len() != n {
         return Err(EstimationError::InvalidSpecification(format!(
             "Calibrator fisher weights length {} does not match number of observations {}",
@@ -1036,7 +1035,7 @@ pub fn build_calibrator_design(
     let use_wiggle_only_dist = !distance_enabled ||
         // Basic criteria:
         dist_std_raw < 1e-6_f64 ||                  // Low variance
-        dist_raw.len() == 0 ||                 // Empty data
+        dist_raw.is_empty() ||                 // Empty data
         n_valid == 0 ||                        // No valid data
 
         // Hinge-specific criteria:
@@ -1474,13 +1473,12 @@ pub fn build_calibrator_design(
 
     let (mut b_se_c, mut stz_se) = if se_wiggle_only_drop {
         eprintln!(
-            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights={}",
+            "[CAL][WARN] block=se reason=channel_constant_after_standardization action=drop_block_wiggle_only std_before={:.3e} raw_cols={} degree={} knots={} penalty_order={} weights=true",
             se_std_raw,
             se_raw_cols,
             spec.se_basis.degree,
             knots_se.len(),
-            spec.penalty_order_se,
-            true
+            spec.penalty_order_se
         );
         (
             Array2::<f64>::zeros((n, 0)),
@@ -2095,7 +2093,7 @@ pub fn predict_calibrator(
             let probs = eta_c.mapv(|e| 1.0 / (1.0 + (-e).exp()));
 
             // Verify all probabilities are valid
-            if probs.iter().any(|&p| p < 0.0 || p > 1.0 || !p.is_finite()) {
+            if probs.iter().any(|&p| !(0.0..=1.0).contains(&p) || !p.is_finite()) {
                 eprintln!("[CAL] ERROR: Invalid probability values in prediction");
                 return Err(EstimationError::PredictionError);
             }

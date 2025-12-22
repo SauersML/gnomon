@@ -820,8 +820,8 @@ impl VariantStatsCache {
 
         let additional = required - self.frequencies.len();
         self.frequencies
-            .extend(std::iter::repeat(0.0).take(additional));
-        self.scales.extend(std::iter::repeat(0.0).take(additional));
+            .extend(std::iter::repeat_n(0.0, additional));
+        self.scales.extend(std::iter::repeat_n(0.0, additional));
     }
 }
 
@@ -866,10 +866,10 @@ fn detected_simd_lane_selection() -> SimdLaneSelection {
         any(target_arch = "aarch64", target_arch = "wasm32")
     ))]
     {
-        return record_simd_lane_diagnostic(
+        record_simd_lane_diagnostic(
             "default lanes4 architecture",
             SimdLaneSelection::Lanes4,
-        );
+        )
     }
 
     #[cfg(not(any(
@@ -1177,7 +1177,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 log::debug!(
                     "Using generic four-lane sum_and_count_finite implementation for non-x86 architecture"
                 );
-                return sum_and_count_finite_impl::<4>(values);
+                sum_and_count_finite_impl::<4>(values)
             }
 
             #[cfg(not(any(
@@ -1193,7 +1193,7 @@ fn sum_and_count_finite(values: &[f64]) -> (f64, usize) {
                 return sum_and_count_finite_impl::<2>(values);
             }
         }
-        _ => return sum_and_count_finite_impl::<2>(values),
+        _ => sum_and_count_finite_impl::<2>(values),
     }
 }
 
@@ -1259,7 +1259,7 @@ impl HwePcaModel {
         S: VariantBlockSource + Send,
         S::Error: Error + Send + Sync + 'static,
     {
-        let progress = Arc::new(NoopFitProgress::default());
+        let progress = Arc::new(NoopFitProgress);
         Self::fit_k_with_options_and_progress(source, components, &FitOptions::default(), &progress)
     }
 
@@ -1825,7 +1825,7 @@ where
                     let mut guard = source_mutex
                         .lock()
                         .expect("covariance source mutex poisoned");
-                    let source: &mut S = &mut **guard;
+                    let source: &mut S = &mut guard;
                     source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
                 } {
                     let _ = filled_sender.send(PrefetchMessage::Error(err));
@@ -1847,7 +1847,7 @@ where
                         let mut guard = source_mutex
                             .lock()
                             .expect("covariance source mutex poisoned");
-                        let source: &mut S = &mut **guard;
+                        let source: &mut S = &mut guard;
                         source.next_block_into(block_capacity, buffer_slice)
                     };
 
@@ -2129,7 +2129,7 @@ where
         let scratch = partial_eigen_scratch(&op, params.max_dim, par, params);
         let mut mem = MemBuffer::new(scratch);
         let info = {
-            let mut stack = MemStack::new(&mut mem);
+            let stack = MemStack::new(&mut mem);
             partial_self_adjoint_eigen(
                 eigvecs.as_mut(),
                 &mut eigvals,
@@ -2137,7 +2137,7 @@ where
                 v0.as_ref(),
                 f64::EPSILON * 128.0,
                 par,
-                &mut stack,
+                stack,
                 params,
             )
         };
@@ -2267,7 +2267,7 @@ where
                 let mut guard = source_mutex
                     .lock()
                     .expect("covariance source mutex poisoned");
-                let source: &mut S = &mut **guard;
+                let source: &mut S = &mut guard;
                 source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
             } {
                 let _ = filled_sender.send(PrefetchMessage::Error(err));
@@ -2289,7 +2289,7 @@ where
                     let mut guard = source_mutex
                         .lock()
                         .expect("covariance source mutex poisoned");
-                    let source: &mut S = &mut **guard;
+                    let source: &mut S = &mut guard;
                     let filled = source.next_block_into(block_capacity, buffer_slice);
                     let bytes = source.progress_bytes();
                     let variants = source.progress_variants();
@@ -2476,7 +2476,7 @@ where
     let mut mem = MemBuffer::new(scratch);
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let mut stack = MemStack::new(&mut mem);
+        let stack = MemStack::new(&mut mem);
         partial_self_adjoint_eigen(
             eigvecs.as_mut(),
             &mut eigvals,
@@ -2484,7 +2484,7 @@ where
             v0.as_ref(),
             f64::EPSILON * 128.0,
             par,
-            &mut stack,
+            stack,
             params,
         )
     }));
@@ -2841,7 +2841,8 @@ impl LdRingBuffer {
         if capacity == 0 {
             return 0;
         }
-        let slot = if self.len < capacity {
+        
+        if self.len < capacity {
             let slot = (self.start + self.len) % capacity;
             self.len += 1;
             slot
@@ -2849,8 +2850,7 @@ impl LdRingBuffer {
             let slot = self.start;
             self.start = (self.start + 1) % capacity;
             slot
-        };
-        slot
+        }
     }
 
     fn position_of(&self, index: usize) -> Option<usize> {
@@ -3617,7 +3617,9 @@ where
     let block_len = block_len;
     let expected_variants = expected_variants;
 
-    let result = thread::scope(|scope| {
+    
+
+    thread::scope(|scope| {
         let buffer_ptrs_prefetch = buffer_ptrs;
         let filled_sender = filled_tx;
         let free_receiver = free_rx;
@@ -3757,9 +3759,7 @@ where
         progress.on_stage_finish(FitProgressStage::Loadings);
 
         Ok(loadings)
-    });
-
-    result
+    })
 }
 
 #[derive(Serialize, Deserialize)]

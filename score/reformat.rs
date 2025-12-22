@@ -338,11 +338,9 @@ pub fn reformat_pgs_file(input_path: &Path, output_path: &Path) -> Result<String
                         .parent()
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
-                    {
-                        if parent_name != "." && parent_name != "/" {
+                        && parent_name != "." && parent_name != "/" {
                             return format!("{}_{}", parent_name, s);
                         }
-                    }
                     s.to_string()
                 })
                 .unwrap_or_else(|| {
