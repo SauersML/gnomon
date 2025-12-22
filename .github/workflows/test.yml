@@ -139,16 +139,22 @@ jobs:
         continue-on-error: true
 
       - name: Run score-specific tests
+        id: score_test_step
         if: steps.rust_changes.outputs.score == 'true'
         run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(score::)"'
+        continue-on-error: true
 
       - name: Run calibrate-specific tests
+        id: calibrate_test_step
         if: steps.rust_changes.outputs.calibrate == 'true'
         run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(calib)"'
+        continue-on-error: true
 
       - name: Run map-specific tests
+        id: map_test_step
         if: steps.rust_changes.outputs.map == 'true'
         run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(map::)"'
+        continue-on-error: true
 
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
@@ -187,7 +193,12 @@ jobs:
           cat report.md
 
       - name: Build Gnomon binaries (Release and Profiling)
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success'
+        if: |
+          steps.rust_changes.outputs.rust == 'true' &&
+          steps.test_step.outcome != 'failure' &&
+          steps.score_test_step.outcome != 'failure' &&
+          steps.calibrate_test_step.outcome != 'failure' &&
+          steps.map_test_step.outcome != 'failure'
         run: |
           cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
@@ -307,9 +318,19 @@ jobs:
           rm -rf export
           du -sh build-output || true
 
-      - name: Fail job if unit tests failed
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
-        run: exit 1
+      - name: Fail job if any tests failed
+        if: |
+          steps.test_step.outcome == 'failure' ||
+          steps.score_test_step.outcome == 'failure' ||
+          steps.calibrate_test_step.outcome == 'failure' ||
+          steps.map_test_step.outcome == 'failure'
+        run: |
+          echo "::error::One or more test suites failed"
+          echo "Unit tests: ${{ steps.test_step.outcome }}"
+          echo "Score tests: ${{ steps.score_test_step.outcome }}"
+          echo "Calibrate tests: ${{ steps.calibrate_test_step.outcome }}"
+          echo "Map tests: ${{ steps.map_test_step.outcome }}"
+          exit 1
 
       - name: Upload build artifacts for all downstream jobs
         uses: actions/upload-artifact@v4
