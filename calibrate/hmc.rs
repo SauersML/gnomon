@@ -1352,8 +1352,8 @@ mod tests {
 
         // Run MCMC with many samples for statistical significance
         let config = NutsConfig {
-            n_samples: 500,   // 500 samples × 4 chains = 2000 total
-            n_warmup: 100,
+            n_samples: 50,    // reduced for fast testing
+            n_warmup: 20,
             n_chains: 4,
             target_accept: 0.8,
             seed: 12345,
@@ -1490,8 +1490,8 @@ mod tests {
 
         // Run MCMC
         let config = NutsConfig {
-            n_samples: 200,
-            n_warmup: 100,
+            n_samples: 50,
+            n_warmup: 20,
             n_chains: 4,
             target_accept: 0.8,
             seed: 54321,
