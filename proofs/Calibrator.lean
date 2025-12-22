@@ -766,7 +766,7 @@ lemma optimal_coefficients_for_additive_dgp
     calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
         = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
           rw [integral_add hP_int (hC_int.const_mul β_env)]
-          rw [integral_mul_left]
+          rw [MeasureTheory.integral_const_mul]
         _ = 0 + β_env * 0 := by rw [hP0, hC0]
         _ = 0 := by ring
 
@@ -788,7 +788,7 @@ lemma optimal_coefficients_for_additive_dgp
           congr 1; ext pc; exact heq pc
         _ = (∫ pc, pc.1 ^ 2 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure) := by
           rw [integral_add hP2_int (hPC_int.const_mul β_env)]
-          rw [integral_mul_left]
+          rw [MeasureTheory.integral_const_mul]
         _ = 1 + β_env * 0 := by
           rw [hP2]
           -- Need to show ∫ C*P = 0. This is hPC0 with commuted multiplication.
