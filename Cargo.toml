@@ -118,3 +118,6 @@ harness = false
 name = "calibrate"
 path = "calibrate/tests/mod.rs"
 
+# Optimize test profile for MUCH faster numerical tests
+[profile.test]
+opt-level = 2            # Huge speedup for matrix ops with minimal compile overhead
