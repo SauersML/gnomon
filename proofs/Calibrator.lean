@@ -765,8 +765,7 @@ lemma optimal_coefficients_for_additive_dgp
     have hC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure := hC_int
     calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
         = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
-          rw [integral_add hP_int (hC_int.const_mul β_env)]
-          rw [integral_mul_left]
+          rw [integral_add hP_int (hC_int.const_mul β_env), integral_mul_left]
         _ = 0 + β_env * 0 := by rw [hP0, hC0]
         _ = 0 := by ring
 
