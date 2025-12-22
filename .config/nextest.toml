@@ -1,0 +1,13 @@
+# cargo-nextest configuration
+# See: https://nexte.st/book/configuration.html
+
+[profile.default]
+# Fail any test that takes longer than 3 hours
+slow-timeout = { period = "3h", terminate-after = 1 }
+
+# Also set a reasonable "slow test" warning threshold
+slow-timeout.warn = "60s"
+
+[profile.ci]
+# For CI, use stricter timeout
+slow-timeout = { period = "1h", terminate-after = 1 }
