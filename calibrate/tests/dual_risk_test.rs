@@ -100,6 +100,7 @@ fn create_mock_trained_model(
             pc_configs: vec![], pgs_range: (0.0, 1.0), interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
             pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None
         },
         coefficients: MappedCoefficients::default(),
@@ -110,6 +111,7 @@ fn create_mock_trained_model(
         calibrator: None,
         survival: Some(disease_model),
         survival_companions: companions,
+        mcmc_samples: None,
     }
 }
 
@@ -217,11 +219,13 @@ fn test_missing_companion_error() {
             pc_configs: vec![], pgs_range: (0.0, 1.0), interaction_penalty: InteractionPenaltyKind::Anisotropic,
             sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
             pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
+            mcmc_enabled: false,
             survival: None
         },
         coefficients: MappedCoefficients::default(), lambdas: vec![], hull: None, penalized_hessian: None, scale: None, calibrator: None,
         survival: Some(disease_model),
         survival_companions: HashMap::new(),
+        mcmc_samples: None,
     };
 
     let res = model.predict_survival(
