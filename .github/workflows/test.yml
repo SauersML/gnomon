@@ -122,30 +122,33 @@ jobs:
           cargo +nightly build
           cargo +nightly test --no-run
 
+      - name: Install cargo-nextest
+        if: steps.rust_changes.outputs.rust == 'true'
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Run Rust unit tests
         id: test_step
         if: steps.rust_changes.outputs.core == 'true'
         run: |
           set -euo pipefail
           rm -f cargo-test.log
-          cargo +nightly test --release -- \
-            --show-output \
-            --skip calibrate:: \
-            --skip map:: \
+          cargo +nightly nextest run --profile ci --release \
+            --filter-expr 'not test(calibrate::) and not test(map::)' \
             2>&1 | tee cargo-test.log
         continue-on-error: true
 
       - name: Run score-specific tests
         if: steps.rust_changes.outputs.score == 'true'
-        run: 'cargo +nightly test --release score:: -- --nocapture'
+        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(score::)"'
 
       - name: Run calibrate-specific tests
         if: steps.rust_changes.outputs.calibrate == 'true'
-        run: 'cargo +nightly test --release calib -- --nocapture'
+        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(calib)"'
 
       - name: Run map-specific tests
         if: steps.rust_changes.outputs.map == 'true'
-        run: 'cargo +nightly test --release map:: -- --nocapture'
+        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(map::)"'
 
       - name: Inspect Assembly for Performance Analysis
         if: steps.rust_changes.outputs.rust == 'false'
