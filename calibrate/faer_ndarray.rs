@@ -97,6 +97,100 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
 }
 
+/// Compute A^T * B using faer's SIMD-optimized GEMM.
+/// For A of shape (n, p) and B of shape (n, q), this computes the (p, q) result.
+/// Uses zero-copy views when possible.
+#[inline]
+pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+) -> Array2<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Mat, Par};
+
+    let (n_a, p) = a.dim();
+    let (n_b, q) = b.dim();
+    debug_assert_eq!(n_a, n_b, "A and B must have same number of rows");
+
+    // For very small matrices, ndarray might be faster due to less overhead
+    if n_a < 64 {
+        return a.t().dot(b);
+    }
+
+    let mut result = Mat::<f64>::zeros(p, q);
+
+    // Get views, copying if non-contiguous
+    let a_owned: Option<Array2<f64>>;
+    let a_slice: &[f64] = if let Some(s) = a.as_slice() {
+        s
+    } else {
+        a_owned = Some(a.to_owned());
+        a_owned.as_ref().unwrap().as_slice().unwrap()
+    };
+    
+    let b_owned: Option<Array2<f64>>;
+    let b_slice: &[f64] = if let Some(s) = b.as_slice() {
+        s
+    } else {
+        b_owned = Some(b.to_owned());
+        b_owned.as_ref().unwrap().as_slice().unwrap()
+    };
+
+    let a_ref = MatRef::from_row_major_slice(a_slice, n_a, p);
+    let b_ref = MatRef::from_row_major_slice(b_slice, n_b, q);
+    
+    // dst = A^T * B
+    matmul(result.as_mut(), Accum::Replace, a_ref.transpose(), b_ref, 1.0, Par::Seq);
+
+    Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
+}
+
+/// Compute A^T * v using faer's SIMD-optimized GEMV.
+/// For A of shape (n, p) and v of shape (n,), this computes the (p,) result.
+#[inline]
+pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+) -> Array1<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Mat, Par};
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(n, v.len(), "A rows must match v length");
+
+    // For very small arrays, ndarray might be faster
+    if n < 64 {
+        return a.t().dot(v);
+    }
+
+    let mut result = Mat::<f64>::zeros(p, 1);
+
+    // Get views, copying if non-contiguous
+    let a_owned: Option<Array2<f64>>;
+    let a_slice: &[f64] = if let Some(s) = a.as_slice() {
+        s
+    } else {
+        a_owned = Some(a.to_owned());
+        a_owned.as_ref().unwrap().as_slice().unwrap()
+    };
+    
+    let v_owned: Option<Array1<f64>>;
+    let v_slice: &[f64] = if let Some(s) = v.as_slice() {
+        s
+    } else {
+        v_owned = Some(v.to_owned());
+        v_owned.as_ref().unwrap().as_slice().unwrap()
+    };
+
+    let a_ref = MatRef::from_row_major_slice(a_slice, n, p);
+    let v_ref = MatRef::from_row_major_slice(v_slice, n, 1);
+    
+    // dst = A^T * v (treating v as n×1 matrix)
+    matmul(result.as_mut(), Accum::Replace, a_ref.transpose(), v_ref, 1.0, Par::Seq);
+
+    Array1::from_shape_fn(p, |i| result[(i, 0)])
+}
+
 fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
     Array2::from_shape_fn((mat.nrows(), mat.ncols()), |(i, j)| mat[(i, j)])
 }

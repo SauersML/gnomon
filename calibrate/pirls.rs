@@ -2,7 +2,7 @@ use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condi
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ata, hash_array2, ldlt_rook,
+    array2_to_mat_mut, fast_ata, fast_atv, hash_array2, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
@@ -123,7 +123,7 @@ impl<'a> GamLogitWorkingModel<'a> {
 
         let working_residual = &eta_clamped - &self.working_response;
         let weighted_residual = &self.weights * &working_residual;
-        let grad_data = self.design.t().dot(&weighted_residual);
+        let grad_data = fast_atv(&self.design, &weighted_residual);
         let grad_penalty = self.penalty.dot(beta);
         let gradient = &grad_data + &grad_penalty;
 
@@ -141,7 +141,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         }
 
         // Compute X^T W X = (sqrt(W) * X)^T * (sqrt(W) * X)
-        let mut hessian = weighted_design.t().dot(&weighted_design);
+        let mut hessian = fast_ata(&weighted_design);
 
         for j in 0..p.min(self.penalty.nrows()) {
             for k in 0..p.min(self.penalty.ncols()) {
@@ -1204,7 +1204,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let mut weighted_residual = final_mu.clone();
         weighted_residual -= &final_z;
         weighted_residual *= &prior_weights_owned;
-        let gradient_data = x_transformed_dense.t().dot(&weighted_residual);
+        let gradient_data = fast_atv(&x_transformed_dense, &weighted_residual);
         let s_beta = reparam_result.s_transformed.dot(&beta_transformed);
         let mut gradient = gradient_data;
         gradient += &s_beta;
@@ -2196,7 +2196,7 @@ pub fn solve_penalized_least_squares(
     // The columns of R1 are currently permuted according to `initial_pivot`.
     // This permutation is crucial for numerical stability in rank detection.
     // Transform RHS using Q1' (first transformation of the RHS)
-    let q1_t_wz = q1.t().dot(wz);
+    let q1_t_wz = fast_atv(&q1, wz);
 
     // Stage: Rank determination using the scaled augmented system
 
@@ -2414,7 +2414,7 @@ pub fn solve_penalized_least_squares(
             eta - &z
         };
         let weighted_residual = &weights * &residual;
-        let grad_dev_part = x_transformed.t().dot(&weighted_residual);
+        let grad_dev_part = fast_atv(&x_transformed, &weighted_residual);
         let grad_pen_part = s_transformed.dot(&beta_transformed);
         let grad = &grad_dev_part + &grad_pen_part;
         let grad_norm_inf = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));

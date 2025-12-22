@@ -4,7 +4,7 @@ use crate::calibrate::basis::{
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::FaerArrayView;
 #[cfg(test)]
-use crate::calibrate::faer_ndarray::FaerColView;
+use crate::calibrate::faer_ndarray::{FaerColView, fast_ata};
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
@@ -3062,7 +3062,7 @@ mod tests {
         let factor = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
 
         // Precompute XtWX = Uᵀ U (U = sqrt(W) X)
-        let xtwx = u.t().dot(&u);
+        let xtwx = fast_ata(&u);
 
         // Gaussian dispersion φ (always 1.0 for logistic regression)
         let phi = 1.0;
@@ -7723,7 +7723,7 @@ mod tests {
             "|---|--------|---------|------|--------|----------|---------|--------|------------------|"
         );
 
-        let xtwx = u.t().dot(&u);
+        let xtwx = fast_ata(&u);
         let mut hat_diagonals = Vec::with_capacity(n);
         let mut se_fulls = Vec::with_capacity(n);
         let mut se_loos = Vec::with_capacity(n);

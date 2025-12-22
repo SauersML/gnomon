@@ -23,7 +23,7 @@
 //! Large data (design matrix, response, etc.) is wrapped in `Arc` to allow
 //! sharing across chains without duplication when mini-mcmc clones the target.
 
-use crate::calibrate::faer_ndarray::FaerCholesky;
+use crate::calibrate::faer_ndarray::{FaerCholesky, fast_atv};
 use faer::Side;
 use mini_mcmc::generic_hmc::HamiltonianTarget;
 use mini_mcmc::generic_nuts::GenericNUTS;
@@ -243,7 +243,7 @@ impl NutsPosterior {
         }
 
         // Gradient of log-likelihood: X^T @ (w * (y - μ))
-        let grad_ll = self.data.x.t().dot(&residual);
+        let grad_ll = fast_atv(&self.data.x, &residual);
 
         (ll, grad_ll)
     }
@@ -262,7 +262,7 @@ impl NutsPosterior {
         }
 
         // Gradient of log-likelihood: X^T @ (w * (y - η))
-        let grad_ll = self.data.x.t().dot(&weighted_residual);
+        let grad_ll = fast_atv(&self.data.x, &weighted_residual);
 
         (ll, grad_ll)
     }
