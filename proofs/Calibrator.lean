@@ -223,7 +223,7 @@ noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [F
 theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsRawScoreModel (fitRaw p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsRawScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsRawScoreModel m),
     empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
   have h := Classical.choose_spec (fitRaw_exists p k sp n data lambda)
   exact ⟨h.1, fun m hm => h.2 m hm⟩
@@ -242,7 +242,7 @@ noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin
 theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
     (data : RealizedData n k) (lambda : ℝ) :
   IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
-  ∀ (m : PhenotypeInformedGAM p k sp) (h_m : IsNormalizedScoreModel m),
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsNormalizedScoreModel m),
     empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
   have h := Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
   exact ⟨h.1, fun m hm => h.2 m hm⟩
@@ -766,7 +766,7 @@ lemma optimal_coefficients_for_additive_dgp
     calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
         = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
           rw [integral_add hP_int (hC_int.const_mul β_env)]
-          rw [integral_mul_left]
+          rw [integral_const_mul]
         _ = 0 + β_env * 0 := by rw [hP0, hC0]
         _ = 0 := by ring
 
@@ -788,7 +788,7 @@ lemma optimal_coefficients_for_additive_dgp
           congr 1; ext pc; exact heq pc
         _ = (∫ pc, pc.1 ^ 2 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure) := by
           rw [integral_add hP2_int (hPC_int.const_mul β_env)]
-          rw [integral_mul_left]
+          rw [integral_const_mul]
         _ = 1 + β_env * 0 := by
           rw [hP2]
           -- Need to show ∫ C*P = 0. This is hPC0 with commuted multiplication.
