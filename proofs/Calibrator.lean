@@ -624,11 +624,60 @@ lemma optimal_slope_eq_covariance_of_normalized_p
       for different measures μ (population vs empirical 1/n Σδᵢ)
     - Abstract the parameter space to any [InnerProductSpace ℝ P], not just ParamIx
     - Use LinearMap instead of Matrix for cleaner kernel/image reasoning -/
+/-! ### Helper Lemmas for Scenario 4 (Raw Score Bias)
+
+The following lemmas support the main theorem `raw_score_bias_in_scenario4_simplified`.
+They formalize the L²-projection structure: raw model = projection onto {1, P} subspace. -/
+
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
+lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
+lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
+/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p.
+    This is the key structural simplification.
+
+    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
+lemma linearPredictor_eq_affine_of_raw
+    (model_raw : PhenotypeInformedGAM 1 1 1)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
+  intros p_val c_val
+
+  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
+  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
+  rw [h_decomp]
+
+  -- Step 2: Show base reduces to γ₀₀ for raw model
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    simp [evalSmooth_eq_zero_of_raw h_raw]
+
+  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
+
+  rw [h_base, h_slope]
+
 lemma rawOptimal_implies_orthogonality
     (model : PhenotypeInformedGAM 1 1 1) (dgp : DataGeneratingProcess 1)
     (h_opt : IsBayesOptimalInRawClass dgp model)
     (h_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
     (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hY2_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2) ^ 2) dgp.jointMeasure)
     (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
     (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
     (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
@@ -694,10 +743,82 @@ lemma rawOptimal_implies_orthogonality
     -- Testing ε < 0 small: 0 ≤ ε - 2·E[residual] becomes 2·E[residual] ≤ ε → E[residual] ≥ 0
     -- Therefore E[residual] = 0
     have h1 : ∫ pc, residual pc ∂μ = 0 := by
-      -- The formal proof constructs competitor models and uses h_opt.is_optimal
-      -- to derive ε² - 2ε·E[residual] ≥ 0 for all ε, which forces E[residual] = 0.
-      -- This is a standard "first-order necessary condition" from optimization theory.
-      sorry -- Quadratic perturbation: ε² - 2ε·E[resid] ≥ 0 ∀ε ⟹ E[resid] = 0
+      have h_opt' := h_opt.is_optimal
+      let competitor_model (ε : ℝ) : PhenotypeInformedGAM 1 1 1 := {
+        pgsBasis := model.pgsBasis,
+        pcSplineBasis := model.pcSplineBasis,
+        γ₀₀ := a + ε,
+        γₘ₀ := model.γₘ₀,
+        f₀ₗ := fun _ _ => 0,
+        fₘₗ := fun _ _ _ => 0,
+        link := LinkFunction.identity,
+        dist := DistributionFamily.Gaussian
+      }
+      have h_comp_is_raw : ∀ ε, IsRawScoreModel (competitor_model ε) := by
+        intro ε; constructor <;> (intros; rfl)
+      have h_ineq : ∀ ε, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+                        expectedSquaredError dgp (fun p c => linearPredictor (competitor_model ε) p c) := by
+        intro ε; apply h_opt.is_optimal; apply h_comp_is_raw
+      have h_integrable_resid : Integrable residual μ := by
+        unfold residual; simp [hY_def, ha_def, hb_def]
+        exact hY_int.sub (hP_int.const_mul b |>.add_const a)
+      let I := ∫ pc, residual pc ∂μ
+      specialize h_ineq I
+      unfold expectedSquaredError at h_ineq
+      simp_rw [linearPredictor_eq_affine_of_raw model h_opt.is_raw ⟨h_linear.1, h_linear.2⟩] at h_ineq
+      have h_comp_pred : ∀ ε p c, linearPredictor (competitor_model ε) p c = a + ε + b * p := by
+        intros; apply linearPredictor_eq_affine_of_raw; exact h_comp_is_raw _; exact ⟨h_linear.1, h_linear.2⟩
+      simp_rw [h_comp_pred] at h_ineq
+      simp [hY_def] at h_ineq
+      unfold residual at h_ineq
+      simp at h_ineq
+      -- We have: E[(Y - (a+bP))^2] <= E[(Y - (a+I+bP))^2]
+      -- Which is: E[residual^2] <= E[(residual - I)^2]
+      have h_ineq_resid : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - I) ^ 2 ∂μ := by
+        have h_loss_model : (fun pc => (Y pc.1 pc.2 - (a + b * pc.1)) ^ 2) = fun pc => (residual pc)^2 := by
+          funext pc; unfold residual; simp [hY_def, ha_def, hb_def]
+        have h_loss_competitor : (fun pc => (Y pc.1 pc.2 - (a + I + b * pc.1)) ^ 2) = fun pc => (residual pc - I)^2 := by
+          funext pc; unfold residual; simp [hY_def, ha_def, hb_def]; ring
+        rw [h_loss_model, h_loss_competitor] at h_ineq
+        exact h_ineq
+
+      -- Now expand E[(residual - I)^2] = E[residual^2] - I^2
+      have h_integrable_resid_sq : Integrable (fun pc => residual pc ^ 2) μ := by
+        have h_Y2 : Integrable (fun pc => (Y pc.1 pc.2) ^ 2) μ := hY2_int
+        have h_2aY : Integrable (fun pc => 2 * a * Y pc.1 pc.2) μ := hY_int.const_mul (2 * a)
+        have h_2bYP : Integrable (fun pc => 2 * b * (Y pc.1 pc.2 * pc.1)) μ := hYP_int.const_mul (2 * b)
+        have h_a2 : Integrable (fun _ => a ^ 2) μ := integrable_const (a ^ 2)
+        have h_2abP : Integrable (fun pc => 2 * a * b * pc.1) μ := hP_int.const_mul (2 * a * b)
+        have h_b2P2 : Integrable (fun pc => b ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (b ^ 2)
+        have h_expand_eq_ae : (fun pc => residual pc ^ 2) =ᵐ[μ] fun pc =>
+            (Y pc.1 pc.2) ^ 2 - (2 * a * Y pc.1 pc.2 + 2 * b * (Y pc.1 pc.2 * pc.1)) +
+            (a ^ 2 + 2 * a * b * pc.1 + b ^ 2 * pc.1 ^ 2) := by
+          filter_upwards with pc; unfold residual; simp [hY_def, ha_def, hb_def]; ring
+        refine Integrable.congr ?_ h_expand_eq_ae.symm
+        let term1 := h_Y2
+        let term2 := h_2aY.add h_2bYP
+        let term3 := h_a2.add (h_2abP.add h_b2P2)
+        exact (term1.sub term2).add term3
+      have h_expand : ∫ (pc : ℝ × Fin 1 → ℝ), (residual pc - I) ^ 2 ∂μ =
+                      ∫ (pc : ℝ × Fin 1 → ℝ), residual pc ^ 2 ∂μ - I^2 := by
+        have h_int_I2 : Integrable (fun _ => I^2) μ := integrable_const (I^2)
+        have h_int_resid_I : Integrable (fun pc => 2 * I * residual pc) μ :=
+          h_integrable_resid.const_mul (2 * I)
+        calc ∫ pc, (residual pc - I) ^ 2 ∂μ
+            = ∫ pc, residual pc ^ 2 - 2 * I * residual pc + I ^ 2 ∂μ := by
+              refine integral_congr_ae ?_
+              filter_upwards with pc; ring
+            _ = (∫ pc, residual pc ^ 2 - 2 * I * residual pc ∂μ) + ∫ pc, I ^ 2 ∂μ :=
+              integral_add (h_integrable_resid_sq.sub h_int_resid_I) h_int_I2
+            _ = (∫ pc, residual pc ^ 2 ∂μ) - ∫ pc, 2 * I * residual pc ∂μ + ∫ pc, I ^ 2 ∂μ := by
+              rw [integral_sub h_integrable_resid_sq h_int_resid_I]
+            _ = (∫ pc, residual pc ^ 2 ∂μ) - 2 * I * (∫ pc, residual pc ∂μ) + I ^ 2 := by
+              simp [integral_const_mul, integral_const]
+            _ = (∫ pc, residual pc ^ 2 ∂μ) - I ^ 2 := by simp [show (∫ pc, residual pc ∂μ) = I from rfl]; ring
+      rw [h_expand] at h_ineq_resid
+      have h_I2_le_zero : I ^ 2 ≤ 0 := by linarith [h_ineq_resid]
+      have h_I2_eq_zero : I ^ 2 = 0 := by nlinarith [sq_nonneg I]
+      exact sq_eq_zero_iff.mp h_I2_eq_zero
     simpa [hres_def] using h1
 
   · -- Orthogonality with P: E[residual · P] = 0
@@ -709,8 +830,101 @@ lemma rawOptimal_implies_orthogonality
     -- Testing ε < 0: -2·E[residual·P] ≤ 0 → E[residual·P] ≥ 0
     -- Therefore E[residual·P] = 0
     have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
-      -- Same construction with slope perturbation b → b + ε
-      sorry -- Quadratic perturbation: ε(-2E[resid·P] + εE[P²]) ≥ 0 ∀ε ⟹ E[resid·P] = 0
+      let competitor_model (ε : ℝ) : PhenotypeInformedGAM 1 1 1 := {
+        pgsBasis := model.pgsBasis,
+        pcSplineBasis := model.pcSplineBasis,
+        γ₀₀ := a,
+        γₘ₀ := fun _ => b + ε,
+        f₀ₗ := fun _ _ => 0,
+        fₘₗ := fun _ _ _ => 0,
+        link := LinkFunction.identity,
+        dist := DistributionFamily.Gaussian
+      }
+      have h_comp_is_raw : ∀ ε, IsRawScoreModel (competitor_model ε) := by
+        intro ε; constructor <;> (intros; rfl)
+      have h_ineq : ∀ ε, expectedSquaredError dgp (fun p c => linearPredictor model p c) ≤
+                        expectedSquaredError dgp (fun p c => linearPredictor (competitor_model ε) p c) := by
+        intro ε; apply h_opt.is_optimal; apply h_comp_is_raw
+
+      let I_P := ∫ pc, residual pc * pc.1 ∂μ
+      let E_P2 := ∫ pc, pc.1 ^ 2 ∂μ
+
+      have h_integrable_resid_P : Integrable (fun pc => residual pc * pc.1) μ := by
+        have h_integrable_Y_P := hYP_int
+        have h_integrable_a_P := hP_int.const_mul a
+        have h_integrable_b_P2 := hP2_int.const_mul b
+        have h_expand_ae : (fun pc => residual pc * pc.1) =ᵐ[μ] fun pc =>
+            Y pc.1 pc.2 * pc.1 - a * pc.1 - b * pc.1 ^ 2 := by
+          filter_upwards with pc; unfold residual; simp [hY_def, ha_def, hb_def]; ring
+        refine Integrable.congr ?_ h_expand_ae.symm
+        exact (h_integrable_Y_P.sub h_integrable_a_P).sub h_integrable_b_P2
+
+      have h_integrable_resid_sq : Integrable (fun pc => residual pc ^ 2) μ := by
+        have h_Y2 : Integrable (fun pc => (Y pc.1 pc.2) ^ 2) μ := hY2_int
+        have h_2aY : Integrable (fun pc => 2 * a * Y pc.1 pc.2) μ := hY_int.const_mul (2 * a)
+        have h_2bYP : Integrable (fun pc => 2 * b * (Y pc.1 pc.2 * pc.1)) μ := hYP_int.const_mul (2 * b)
+        have h_a2 : Integrable (fun _ => a ^ 2) μ := integrable_const (a ^ 2)
+        have h_2abP : Integrable (fun pc => 2 * a * b * pc.1) μ := hP_int.const_mul (2 * a * b)
+        have h_b2P2 : Integrable (fun pc => b ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (b ^ 2)
+        have h_expand_eq_ae : (fun pc => residual pc ^ 2) =ᵐ[μ] fun pc =>
+            (Y pc.1 pc.2) ^ 2 - (2 * a * Y pc.1 pc.2 + 2 * b * (Y pc.1 pc.2 * pc.1)) +
+            (a ^ 2 + 2 * a * b * pc.1 + b ^ 2 * pc.1 ^ 2) := by
+          filter_upwards with pc; unfold residual; simp [hY_def, ha_def, hb_def]; ring
+        refine Integrable.congr ?_ h_expand_eq_ae.symm
+        let term1 := h_Y2; let term2 := h_2aY.add h_2bYP; let term3 := h_a2.add (h_2abP.add h_b2P2)
+        exact (term1.sub term2).add term3
+
+      have h_loss_ineq : ∀ ε, 0 ≤ -2 * ε * I_P + ε ^ 2 * E_P2 := by
+        intro ε
+        specialize h_ineq ε
+        unfold expectedSquaredError at h_ineq
+        have h_pred_competitor : ∀ p c, linearPredictor (competitor_model ε) p c = a + (b + ε) * p := by
+          intros; apply linearPredictor_eq_affine_of_raw; exact h_comp_is_raw _; exact ⟨h_linear.1, h_linear.2⟩
+        simp_rw [linearPredictor_eq_affine_of_raw model h_opt.is_raw ⟨h_linear.1, h_linear.2⟩, h_pred_competitor] at h_ineq
+        simp [hY_def] at h_ineq
+        have h_ineq_resid : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+          have h_loss_model : (fun pc => (Y pc.1 pc.2 - (a + b * pc.1)) ^ 2) = fun pc => (residual pc)^2 := by
+            funext pc; unfold residual; simp [hY_def, ha_def, hb_def]
+          have h_loss_competitor : (fun pc => (Y pc.1 pc.2 - (a + (b + ε) * pc.1)) ^ 2) = fun pc => (residual pc - ε * pc.1)^2 := by
+            funext pc; unfold residual; simp [hY_def, ha_def, hb_def]; ring
+          rwa [h_loss_model, h_loss_competitor] at h_ineq
+        have h_expand_rhs : ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * I_P + ε ^ 2 * E_P2 := by
+          have h_integrable_term2 := h_integrable_resid_P.const_mul (2 * ε)
+          have h_integrable_term3 := hP2_int.const_mul (ε^2)
+          calc ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                refine integral_congr_ae ?_; filter_upwards with pc; ring
+              _ = (∫ pc, residual pc ^ 2 ∂μ) - (∫ pc, 2 * ε * residual pc * pc.1 ∂μ) + (∫ pc, ε ^ 2 * pc.1 ^ 2 ∂μ) := by
+                have h_int_A_sub_B := h_integrable_resid_sq.sub h_integrable_term2
+                rw [integral_add h_int_A_sub_B h_integrable_term3]
+                rw [integral_sub h_integrable_resid_sq h_integrable_term2]
+              _ = (∫ pc, residual pc ^ 2 ∂μ) - 2 * ε * I_P + ε ^ 2 * E_P2 := by
+                simp [integral_const_mul]
+        rw [h_expand_rhs] at h_ineq_resid
+        have h_finite_integral_val := h_integrable_resid_sq.hasFiniteIntegral
+        linarith
+
+      by_cases h_E_P2_zero : E_P2 = 0
+      · have hP_ae_zero : (fun pc => pc.1) =ᵐ[μ] 0 := by
+          refine (integral_eq_zero_iff_of_nonneg_ae ?_).1 h_E_P2_zero
+          filter_upwards with pc using sq_nonneg (pc.1)
+        have h_integrand_ae_zero : (fun pc => residual pc * pc.1) =ᵐ[μ] 0 := by
+          filter_upwards [hP_ae_zero] with pc hpc_zero
+          simp [hpc_zero]
+        exact integral_congr_ae h_integrand_ae_zero
+      · have h_E_P2_pos : 0 < E_P2 := by
+          have h_nonneg := integral_nonneg (by intro pc; exact sq_nonneg _)
+          exact lt_of_le_of_ne h_nonneg (Ne.symm h_E_P2_zero)
+
+        let ε₀ := I_P / E_P2
+        specialize h_loss_ineq ε₀
+        rw [mul_assoc, div_mul_cancel _ h_E_P2_zero] at h_loss_ineq
+        have h_le : I_P ^ 2 ≤ 0 := by
+          have : 0 ≤ -I_P ^ 2 / E_P2 := by linarith
+          have := mul_le_mul_of_nonpos_right this (le_of_lt h_E_P2_pos)
+          rwa [div_mul_cancel, neg_le_neg_iff] at this
+        have : I_P ^ 2 = 0 := by nlinarith [sq_nonneg I_P]
+        exact sq_eq_zero_iff.mp this
     simpa [hres_def] using h2
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
@@ -1297,53 +1511,6 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
   dgp.trueExpectation p_val c_val - f p_val c_val
 
-/-! ### Helper Lemmas for Scenario 4 (Raw Score Bias)
-
-The following lemmas support the main theorem `raw_score_bias_in_scenario4_simplified`.
-They formalize the L²-projection structure: raw model = projection onto {1, P} subspace. -/
-
-/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
-lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.f₀ₗ_zero l]
-
-/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
-lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.fₘₗ_zero m l]
-
-/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
-    the linear predictor simplifies to an affine function: a + b*p.
-    This is the key structural simplification.
-
-    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
-lemma linearPredictor_eq_affine_of_raw
-    (model_raw : PhenotypeInformedGAM 1 1 1)
-    (h_raw : IsRawScoreModel model_raw)
-    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
-    ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
-  intros p_val c_val
-
-  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
-  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
-  rw [h_decomp]
-
-  -- Step 2: Show base reduces to γ₀₀ for raw model
-  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
-    unfold predictorBase
-    simp [evalSmooth_eq_zero_of_raw h_raw]
-
-  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
-  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
-    unfold predictorSlope
-    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
-
-  rw [h_base, h_slope]
 
 
 
