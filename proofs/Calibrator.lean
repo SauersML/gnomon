@@ -2135,7 +2135,12 @@ def IsOrthogonal (Q : Matrix (Fin p) (Fin p) ℝ) : Prop :=
 /-- The penalty transforms as a congruence under reparameterization.
 
     **Proof**: (Qβ')ᵀ S (Qβ') = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β'
-    This is just associativity of matrix-vector multiplication. -/
+    This is just associativity of matrix-vector multiplication.
+
+    This is a key step in Wood's (2011) stable reparameterization for GAMs,
+    as it shows how the penalty matrix S transforms under an orthogonal change
+    of basis Q. By choosing Q to be the eigenvectors of S, the transformed
+    penalty matrix QᵀSQ becomes diagonal, simplifying the optimization problem. -/
 theorem penalty_congruence
     (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
     (β' : Fin p → ℝ) (_h_orth : IsOrthogonal Q) :
