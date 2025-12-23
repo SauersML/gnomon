@@ -191,7 +191,7 @@ mod tests {
         for _ in 0..n_samples {
             // Box-Muller for normal samples
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let u1 = (rng_state as f64) / (u64::MAX as f64);
+            let u1 = ((rng_state as f64) / (u64::MAX as f64)).max(1e-10); // Prevent ln(0)
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let u2 = (rng_state as f64) / (u64::MAX as f64);
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();

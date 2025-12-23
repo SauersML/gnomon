@@ -417,7 +417,7 @@ pub fn run_nuts_sampling(
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
             Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rng.r#gen();
+                let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
                 let u2: f64 = rng.r#gen();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 z * 0.1
@@ -648,7 +648,7 @@ mod survival_hmc {
         let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
             .map(|_| {
                 Array1::from_shape_fn(dim, |_| {
-                    let u1: f64 = rng.r#gen();
+                    let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
                     let u2: f64 = rng.r#gen();
                     let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                     z * 0.1
@@ -1339,7 +1339,7 @@ mod tests {
         // Generate response: y = X * β + ε, where ε ~ N(0, 1)
         let eta = x.dot(&true_beta);
         let noise: Array1<f64> = Array1::from_shape_fn(n, |_| {
-            let u1: f64 = rng.r#gen();
+            let u1: f64 = rng.r#gen::<f64>().max(1e-10); // Prevent ln(0) = -inf
             let u2: f64 = rng.r#gen();
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         });
