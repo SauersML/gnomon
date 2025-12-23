@@ -137,7 +137,6 @@ impl<'a> GamLogitWorkingModel<'a> {
         gradient += &grad_penalty;
 
         let p = beta.len();
-        let n = self.weights.len();
 
         // Compute X^T W X efficiently using weighted design matrix
         // First create sqrt(W) * X
