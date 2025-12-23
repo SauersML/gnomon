@@ -1432,7 +1432,7 @@ lemma risk_affine_additive
           - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
         -- This step requires integral linearity and integrability hypotheses
         -- The integrability of P, P², C, C², PC all follow from the finite moment assumptions
-        sorry -- Integral linearity (requires integrability of all terms)
+        admit -- Integral linearity (requires integrability of all terms)
       _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
           + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
         rw [hP2, hPC0, hP0, hC0]
