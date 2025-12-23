@@ -1341,6 +1341,14 @@ impl TrainedModel {
             return Err(ModelError::CalibratorMissing);
         }
 
+        // Compute hull distance for ancestry-domain calibration
+        let signed_dist = if let Some(hull) = &self.hull {
+            let raw = internal::assemble_raw_from_p_and_pcs(p_new, pcs_new);
+            Some(hull.signed_distance_many(raw.view()))
+        } else {
+            None
+        };
+
         let baseline = self.predict_survival(
             age_entry,
             age_exit,
@@ -1351,7 +1359,11 @@ impl TrainedModel {
             companion_registry,
         )?;
         artifacts
-            .apply_logit_risk_calibrator(&baseline.conditional_risk, &baseline.logit_risk_design)
+            .apply_logit_risk_calibrator(
+                &baseline.conditional_risk,
+                &baseline.logit_risk_design,
+                signed_dist.as_ref(),
+            )
             .map_err(ModelError::from)
     }
 

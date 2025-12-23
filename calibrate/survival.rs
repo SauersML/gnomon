@@ -2431,10 +2431,18 @@ pub fn delta_method_standard_errors(
 }
 
 impl SurvivalModelArtifacts {
+    /// Apply the logit-risk calibrator to convert conditional risk to calibrated probabilities.
+    ///
+    /// # Arguments
+    /// * `conditional_risk` - Raw risk predictions
+    /// * `logit_risk_design` - Design matrix for delta-method SE computation
+    /// * `dist` - Optional signed distance to ancestry hull (negative = inside hull).
+    ///            If None, zeros are used (no distance adjustment).
     pub fn apply_logit_risk_calibrator(
         &self,
         conditional_risk: &Array1<f64>,
         logit_risk_design: &Array2<f64>,
+        dist: Option<&Array1<f64>>,
     ) -> Result<Array1<f64>, SurvivalError> {
         let cal = self
             .calibrator
@@ -2455,15 +2463,22 @@ impl SurvivalModelArtifacts {
             Array1::zeros(n)
         };
 
-        // Distance (0 for now)
-        let dist = Array1::zeros(n);
+        // Use provided distance or fall back to zeros
+        let dist_owned;
+        let dist_view = match dist {
+            Some(d) => d.view(),
+            None => {
+                dist_owned = Array1::zeros(n);
+                dist_owned.view()
+            }
+        };
 
         // Predict
         let preds = crate::calibrate::calibrator::predict_calibrator(
             cal,
             logit_risk.view(),
             se.view(),
-            dist.view(),
+            dist_view,
         )
         .map_err(|e| SurvivalError::Calibrator(e.to_string()))?;
 
@@ -2648,7 +2663,7 @@ mod tests {
         // We assume enabled by default or we enable it
         set_calibrator_enabled(true);
         let calibrated = artifacts
-            .apply_logit_risk_calibrator(&risks, &design)
+            .apply_logit_risk_calibrator(&risks, &design, None)
             .unwrap();
         assert_eq!(calibrated.len(), risks.len());
         // Since coeffs are zero, output should be transformed but likely different if standardization or basis shifts.
@@ -2656,7 +2671,7 @@ mod tests {
 
         set_calibrator_enabled(false);
         let bypass = artifacts
-            .apply_logit_risk_calibrator(&risks, &design)
+            .apply_logit_risk_calibrator(&risks, &design, None)
             .unwrap();
         for (cal, base) in bypass.iter().zip(risks.iter()) {
             assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);

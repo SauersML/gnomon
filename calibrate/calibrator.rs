@@ -498,7 +498,11 @@ pub fn compute_alo_features(
             let var_loo = var_without_i / denom_sq;
             let se_full = var_full.max(0.0).sqrt();
             let se_loo = var_loo.max(0.0).sqrt();
-            se_tilde[obs] = se_loo;
+            // Use naive (full-sample) SE for train/inference consistency.
+            // At inference, we compute delta-method SE which is equivalent to se_full.
+            // Using se_loo (ALO-inflated) would cause a train/inference mismatch
+            // since new observations have no self-influence to correct for.
+            se_tilde[obs] = se_full;
 
             if diag_counter < max_diag_samples {
                 let c_i = ai / wi;
@@ -3086,24 +3090,15 @@ mod tests {
             let wi = fit_res.final_weights[irow].max(1e-300);
             let var_full = phi * (quad / wi);
 
-            // Hat diagonal a_ii
-            let aii = ui.dot(&si_arr);
-
-            // Expected LOO variance using the correct penalized smoother formula
-            let var_without_i = (var_full - phi * (aii * aii) / wi).max(0.0);
-            let denom = 1.0 - aii;
-            let denom_sq = if denom.abs() < 1e-12 {
-                1e-12
-            } else {
-                denom * denom
-            };
-            let expected_var_loo = var_without_i / denom_sq;
-            let expected_se = expected_var_loo.max(0.0).sqrt();
+            // After the train/inference consistency fix, we now use se_full (naive SE)
+            // instead of se_loo (ALO-inflated SE). This ensures the calibrator is
+            // trained on the same SE scale that will be available at inference time.
+            let expected_se = var_full.max(0.0).sqrt(); // se_full, not se_loo
 
             let actual_se = alo_features.se[irow];
             assert!(
                 (actual_se - expected_se).abs() < 1e-10,
-                "ALO SE mismatch: got {:.6e}, expected {:.6e}, diff {:.2e}",
+                "Naive SE mismatch: got {:.6e}, expected {:.6e}, diff {:.2e}",
                 actual_se,
                 expected_se,
                 (actual_se - expected_se).abs()
@@ -3272,7 +3267,10 @@ mod tests {
 
     #[test]
     fn alo_matches_exact_linearized_loo_small_n_binomial() {
-        // Create a small synthetic dataset
+        // This test validates:
+        // 1. ALO predictions match exact Sherman-Morrison LOO predictions
+        // 2. SE channel now returns naive (full-sample) SE for train/inference consistency
+
         let n = 150;
         let p = 10;
         let (x, y, _) = generate_synthetic_binary_data(n, p, Some(42));
@@ -3336,7 +3334,7 @@ mod tests {
         let phi = 1.0_f64;
 
         let mut loo_pred = Array1::<f64>::zeros(n);
-        let mut loo_se = Array1::<f64>::zeros(n);
+        let mut naive_se = Array1::<f64>::zeros(n);
 
         for i in 0..n {
             // Hat diagonal a_ii = u_iᵀ H^{-1} u_i
@@ -3367,13 +3365,13 @@ mod tests {
 
             let wi = w_full[i].max(1e-12);
             let var_full = phi * (quad / wi);
-            let var_loo = ((var_full - phi * (aii * aii) / wi).max(0.0)) / (denom * denom);
-            loo_se[i] = var_loo.max(0.0).sqrt();
+            // Now we use naive SE (var_full) instead of LOO SE (var_loo) for train/inference consistency
+            naive_se[i] = var_full.max(0.0).sqrt();
         }
 
         // Compare ALO predictions with exact fixed-weight LOO
-        let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
-            loo_compare(&alo_features.pred, &alo_features.se, &loo_pred, &loo_se);
+        let (rmse_pred, max_abs_pred, _, _) =
+            loo_compare(&alo_features.pred, &naive_se, &loo_pred, &naive_se);
 
         // Agreement should now be at numerical precision since both sides use identical geometry
         assert!(
@@ -3386,14 +3384,19 @@ mod tests {
             "Max absolute error between ALO and exact linearized LOO predictions should be <= 1e-8, got {:.6e}",
             max_abs_pred
         );
+
+        // SE should match naive (full-sample) SE exactly
+        let (rmse_se, max_abs_se, _, _) =
+            loo_compare(&alo_features.se, &naive_se, &naive_se, &naive_se);
+
         assert!(
             rmse_se <= 1e-9,
-            "RMSE between ALO and exact linearized LOO standard errors should be <= 1e-9, got {:.6e}",
+            "RMSE between returned SE and naive SE should be <= 1e-9, got {:.6e}",
             rmse_se
         );
         assert!(
             max_abs_se <= 1e-8,
-            "Max absolute error between ALO and exact linearized LOO standard errors should be <= 1e-8, got {:.6e}",
+            "Max absolute error between returned SE and naive SE should be <= 1e-8, got {:.6e}",
             max_abs_se
         );
     }
@@ -3514,9 +3517,8 @@ mod tests {
 
     #[test]
     fn alo_matches_true_loo_small_n_binomial_refit() {
-        // This test validates that ALO ≈ true refit LOO for unpenalized logistic regression.
-        // ALO uses fixed Fisher weights from the full fit; true LOO recomputes weights each fold.
-        // Therefore we expect close—but not identical—agreement; tolerances are relaxed.
+        // This test validates that ALO predictions ≈ true refit LOO predictions.
+        // SE now uses full-sample naive SE for train/inference consistency.
 
         let n = 150;
         let p = 10;
@@ -3528,9 +3530,43 @@ mod tests {
         let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
-        let mut loo_pred = Array1::<f64>::zeros(n);
-        let mut loo_se = Array1::<f64>::zeros(n);
+        // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
+        // 1. u = sqrt(W) * X (scaled design matrix)
+        // 2. s = K^{-1} * u_i where K = penalized Hessian
+        // 3. t = XtWX * s
+        // 4. quad = s' * t
+        // 5. var_full = phi * quad / w_i
+        let x_dense = full_fit.x_transformed.to_dense();
+        let sqrt_w = full_fit.final_weights.mapv(f64::sqrt);
+        let mut u = x_dense.clone();
+        let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
+        u *= &sqrt_w_col;
 
+        // K = penalized Hessian, XtWX = U' * U (Fisher info without penalty)
+        let k = full_fit.penalized_hessian_transformed.clone();
+        let xtwx = u.t().dot(&u);
+        let k_view = FaerArrayView::new(&k);
+        let factor = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
+        let phi = 1.0_f64; // Logistic dispersion
+
+        let mut naive_se = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let ui = u.row(i).to_owned();
+            let rhs = FaerColView::new(&ui);
+            let s = factor.solve(rhs.as_ref());
+            let s_arr = Array1::from_shape_fn(p, |j| s[(j, 0)]);
+
+            // t = XtWX * s, quad = s' * t
+            let t = xtwx.dot(&s_arr);
+            let quad: f64 = s_arr.iter().zip(t.iter()).map(|(si, ti)| si * ti).sum();
+
+            let wi = full_fit.final_weights[i].max(1e-12);
+            let var_full = phi * quad / wi;
+            naive_se[i] = var_full.max(0.0).sqrt();
+        }
+
+        // True LOO predictions (for prediction comparison only)
+        let mut loo_pred = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut x_loo = Array2::zeros((n - 1, p));
             let mut y_loo = Array1::zeros(n - 1);
@@ -3550,50 +3586,18 @@ mod tests {
             }
 
             let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
-
             let beta_loo = beta_in_original_basis(&loo_fit);
             let x_i = x.row(i).to_owned();
             loo_pred[i] = x_i.dot(&beta_loo);
-
-            let mut k = Array2::<f64>::zeros((p, p));
-            let w_fish_loo = loo_fit.final_weights.clone();
-            for r in 0..(n - 1) {
-                let wi = w_fish_loo[r];
-                if wi == 0.0 {
-                    continue;
-                }
-                let xi = x_loo.row(r);
-                for a in 0..p {
-                    let xa = xi[a];
-                    for b in 0..p {
-                        k[[a, b]] += wi * xa * xi[b];
-                    }
-                }
-            }
-            for d in 0..p {
-                k[[d, d]] += 1e-12;
-            }
-
-            let k_view = FaerArrayView::new(&k);
-            let llt = FaerLlt::new(k_view.as_ref(), Side::Lower)
-                .expect("LLT should succeed for SPD K_LOO");
-            let ui = x_i.to_owned();
-            let rhs = FaerColView::new(&ui);
-            let solved = llt.solve(rhs.as_ref());
-            let mut ci = 0.0;
-            for r in 0..p {
-                ci += x_i[r] * solved[(r, 0)];
-            }
-            let phi_loo = 1.0_f64; // Logistic dispersion
-            loo_se[i] = (phi_loo * ci).max(0.0).sqrt();
         }
 
-        let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
-            loo_compare(&alo.pred, &alo.se, &loo_pred, &loo_se);
+        // Compare ALO predictions vs true LOO predictions
+        let (rmse_pred, max_abs_pred, _, _) =
+            loo_compare(&alo.pred, &naive_se, &loo_pred, &naive_se);
 
         println!(
-            "[LOGIT ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}, rmse_se={:.3e}, max_abs_se={:.3e}",
-            rmse_pred, max_abs_pred, rmse_se, max_abs_se
+            "[LOGIT ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}",
+            rmse_pred, max_abs_pred
         );
 
         assert!(
@@ -3606,21 +3610,34 @@ mod tests {
             "Max |Δη̂| ALO vs true LOO should be ≤ 8e-2, got {:.6e}",
             max_abs_pred
         );
+
+        // Compare returned SE vs full-sample naive SE (should match exactly)
+        let (rmse_se, max_abs_se, _, _) =
+            loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
+
+        println!(
+            "[LOGIT SE] alo.se vs naive_se: rmse={:.3e}, max_abs={:.3e}",
+            rmse_se, max_abs_se
+        );
+
         assert!(
-            rmse_se <= 2e-2,
-            "RMSE(SE) ALO vs true LOO should be ≤ 2e-2, got {:.6e}",
+            rmse_se <= 1e-10,
+            "RMSE(SE) should be ~0 (alo.se should equal naive_se), got {:.6e}",
             rmse_se
         );
         assert!(
-            max_abs_se <= 8e-2,
-            "Max |ΔSE| ALO vs true LOO should be ≤ 8e-2, got {:.6e}",
+            max_abs_se <= 1e-9,
+            "Max |ΔSE| should be ~0, got {:.6e}",
             max_abs_se
         );
     }
 
     #[test]
     fn alo_matches_true_loo_small_n_gaussian_refit() {
-        // Gaussian identity link: refitted LOO should align extremely closely with ALO.
+        // This test validates:
+        // 1. ALO predictions ≈ true refit LOO predictions (unchanged)
+        // 2. SE now uses full-sample naive SE for train/inference consistency
+
         let n = 150;
         let p = 10;
         let (x, y, _, _) = generate_synthetic_gaussian_data(n, p, 0.5, Some(4242));
@@ -3631,9 +3648,54 @@ mod tests {
         let alo = compute_alo_features(&full_fit, y.view(), x.view(), None, link)
             .expect("compute_alo_features should succeed");
 
-        let mut loo_pred = Array1::<f64>::zeros(n);
-        let mut loo_se = Array1::<f64>::zeros(n);
+        // Compute full-sample naive SE using the EXACT formula from compute_alo_features:
+        // 1. u = sqrt(W) * X (scaled design matrix)
+        // 2. s = K^{-1} * u_i where K = penalized Hessian
+        // 3. t = XtWX * s
+        // 4. quad = s' * t
+        // 5. var_full = phi * quad / w_i
+        let x_dense = full_fit.x_transformed.to_dense();
+        let sqrt_w = full_fit.final_weights.mapv(f64::sqrt);
+        let mut u = x_dense.clone();
+        let sqrt_w_col = sqrt_w.view().insert_axis(Axis(1));
+        u *= &sqrt_w_col;
 
+        // K = penalized Hessian, XtWX = U' * U (Fisher info without penalty)
+        let k = full_fit.penalized_hessian_transformed.clone();
+        let xtwx = u.t().dot(&u);
+        let k_view = FaerArrayView::new(&k);
+        let factor = FaerLlt::new(k_view.as_ref(), Side::Lower).unwrap();
+
+        // Gaussian dispersion from full fit
+        let phi = {
+            let mut rss = 0.0;
+            for r in 0..n {
+                let resid = y[r] - full_fit.final_mu[r];
+                rss += w[r] * resid * resid;
+            }
+            let dof = (n as f64) - full_fit.edf;
+            let denom = dof.max(1.0);
+            rss / denom
+        };
+
+        let mut naive_se = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let ui = u.row(i).to_owned();
+            let rhs = FaerColView::new(&ui);
+            let s = factor.solve(rhs.as_ref());
+            let s_arr = Array1::from_shape_fn(p, |j| s[(j, 0)]);
+
+            // t = XtWX * s, quad = s' * t
+            let t = xtwx.dot(&s_arr);
+            let quad: f64 = s_arr.iter().zip(t.iter()).map(|(si, ti)| si * ti).sum();
+
+            let wi = full_fit.final_weights[i].max(1e-12);
+            let var_full = phi * quad / wi;
+            naive_se[i] = var_full.max(0.0).sqrt();
+        }
+
+        // True LOO predictions (for prediction comparison only)
+        let mut loo_pred = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut x_loo = Array2::zeros((n - 1, p));
             let mut y_loo = Array1::zeros(n - 1);
@@ -3653,59 +3715,18 @@ mod tests {
             }
 
             let loo_fit = real_unpenalized_fit(&x_loo, &y_loo, &w_loo, link);
-
             let beta_loo = beta_in_original_basis(&loo_fit);
             let x_i = x.row(i).to_owned();
             loo_pred[i] = x_i.dot(&beta_loo);
-
-            let mut k = Array2::<f64>::zeros((p, p));
-            let w_fish_loo = loo_fit.final_weights.clone();
-            for r in 0..(n - 1) {
-                let wi = w_fish_loo[r];
-                if wi == 0.0 {
-                    continue;
-                }
-                let xi = x_loo.row(r);
-                for a in 0..p {
-                    let xa = xi[a];
-                    for b in 0..p {
-                        k[[a, b]] += wi * xa * xi[b];
-                    }
-                }
-            }
-            for d in 0..p {
-                k[[d, d]] += 1e-12;
-            }
-
-            let k_view = FaerArrayView::new(&k);
-            let llt = FaerLlt::new(k_view.as_ref(), Side::Lower)
-                .expect("LLT should succeed for SPD K_LOO");
-            let ui = x_i.to_owned();
-            let rhs = FaerColView::new(&ui);
-            let solved = llt.solve(rhs.as_ref());
-            let mut ci = 0.0;
-            for r in 0..p {
-                ci += x_i[r] * solved[(r, 0)];
-            }
-            let phi_loo = {
-                let mut rss = 0.0;
-                for r in 0..(n - 1) {
-                    let resid = y_loo[r] - loo_fit.final_mu[r];
-                    rss += w_loo[r] * resid * resid;
-                }
-                let dof = ((n - 1) as f64) - loo_fit.edf;
-                let denom = dof.max(1.0);
-                rss / denom
-            };
-            loo_se[i] = (phi_loo * ci).max(0.0).sqrt();
         }
 
-        let (rmse_pred, max_abs_pred, rmse_se, max_abs_se) =
-            loo_compare(&alo.pred, &alo.se, &loo_pred, &loo_se);
+        // Compare ALO predictions vs true LOO predictions
+        let (rmse_pred, max_abs_pred, _, _) =
+            loo_compare(&alo.pred, &naive_se, &loo_pred, &naive_se);
 
         println!(
-            "[GAUSS ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}, rmse_se={:.3e}, max_abs_se={:.3e}",
-            rmse_pred, max_abs_pred, rmse_se, max_abs_se
+            "[GAUSS ALO vs LOO] rmse_pred={:.3e}, max_abs_pred={:.3e}",
+            rmse_pred, max_abs_pred
         );
 
         assert!(
@@ -3718,15 +3739,20 @@ mod tests {
             "Gaussian max |Δμ̂| ALO vs true LOO should be ≤ 1e-5, got {:.6e}",
             max_abs_pred
         );
-        assert!(
-            rmse_se <= 5e-3,
-            "Gaussian RMSE(SE) ALO vs true LOO should be ≤ 5e-3, got {:.6e}",
-            rmse_se
+
+        // Compare returned SE vs full-sample naive SE
+        let (rmse_se, max_abs_se, _, _) =
+            loo_compare(&alo.se, &naive_se, &naive_se, &naive_se);
+
+        println!(
+            "[GAUSS SE] alo.se vs naive_se: rmse={:.3e}, max_abs={:.3e}",
+            rmse_se, max_abs_se
         );
+
         assert!(
-            max_abs_se <= 2e-2,
-            "Gaussian max |ΔSE| ALO vs true LOO should be ≤ 2e-2, got {:.6e}",
-            max_abs_se
+            rmse_se <= 1e-10,
+            "RMSE(SE) should be ~0 (alo.se should equal naive_se), got {:.6e}",
+            rmse_se
         );
     }
 
@@ -7786,13 +7812,15 @@ mod tests {
                 }
             );
 
+            // After train/inference consistency fix: alo_features.se now contains
+            // naive SE (se_full) instead of ALO SE (se_loo) to match inference behavior.
             let alo_se = alo_features.se[i];
             assert!(
-                (alo_se - se_loo_manual).abs() <= 1e-9 * (1.0 + se_loo_manual.abs()),
-                "ALO SE mismatch at i={}: computed {:.6e}, manual {:.6e}",
+                (alo_se - se_full).abs() <= 1e-9 * (1.0 + se_full.abs()),
+                "Naive SE mismatch at i={}: computed {:.6e}, expected {:.6e}",
                 i,
                 alo_se,
-                se_loo_manual
+                se_full
             );
             let expected_ratio = if var_full > 0.0 {
                 (var_without_i / var_full).sqrt() / denom
