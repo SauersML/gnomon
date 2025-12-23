@@ -1502,6 +1502,30 @@ impl WorkingModelSurvival {
             }
         }
 
+        // Vectorized Hessian accumulation using weighted design matrices
+        // H_exit = -X_exit^T * diag(w * h_e) * X_exit
+        // H_entry = X_entry^T * diag(w * h_s) * X_entry
+        // This replaces O(N) scalar outer products with O(1) BLAS-3 operations
+        
+        // Compute weight vectors for vectorized accumulation
+        let mut w_exit = Array1::<f64>::zeros(n);
+        let mut w_entry = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let weight = self.sample_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let h_e = h_exit[i];
+            let h_s = h_entry[i];
+            if !h_e.is_finite() || !h_s.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            // sqrt of absolute weight for sqrt(W)*X formulation
+            w_exit[i] = (weight * h_e).sqrt();
+            w_entry[i] = (weight * h_s).sqrt();
+        }
+
+        // Compute log-likelihood and gradient (still per-sample for now due to conditionals)
         for i in 0..n {
             let weight = self.sample_weight[i];
             if weight == 0.0 {
@@ -1511,7 +1535,7 @@ impl WorkingModelSurvival {
             let eta_e = eta_exit[i];
             let h_e = h_exit[i];
             let h_s = h_entry[i];
-            if !eta_e.is_finite() || !h_e.is_finite() || !h_s.is_finite() {
+            if !eta_e.is_finite() {
                 return Err(SurvivalError::NonFiniteLinearPredictor);
             }
             let scale = derivative_scale[i];
@@ -1534,9 +1558,7 @@ impl WorkingModelSurvival {
                 accumulate_weighted_vector(&mut gradient, weight * d, &x_tilde);
             }
 
-            accumulate_symmetric_outer(&mut hessian, -weight * h_e, &x_exit);
-            accumulate_symmetric_outer(&mut hessian, weight * h_s, &x_entry);
-
+            // Event-specific Hessian term (cannot be batched due to conditional)
             let event_scale = weight * d;
             if event_scale != 0.0 && scale != 0.0 {
                 accumulate_symmetric_outer(
@@ -1545,6 +1567,40 @@ impl WorkingModelSurvival {
                     &self.layout.combined_derivative_exit.row(i),
                 );
             }
+        }
+
+        // Vectorized Hessian: H += -sqrt(w*h_e)*X_exit)^T * (sqrt(w*h_e)*X_exit)
+        // Using BLAS GEMM (via ndarray general_mat_mul) for efficiency
+        {
+            use ndarray::linalg::general_mat_mul;
+            
+            // Create weighted design matrices: sqrt(w) * X
+            let n_rows = self.layout.combined_exit.nrows();
+            let n_cols = self.layout.combined_exit.ncols();
+            
+            // Exit term: H -= (sqrt(w*h_e)*X)^T * (sqrt(w*h_e)*X)
+            let mut wx_exit = Array2::<f64>::zeros((n_rows, n_cols));
+            for i in 0..n_rows {
+                let sqrt_w = w_exit[i];
+                for j in 0..n_cols {
+                    wx_exit[[i, j]] = sqrt_w * self.layout.combined_exit[[i, j]];
+                }
+            }
+            // H -= wx_exit^T * wx_exit via BLAS GEMM
+            let mut h_exit_contrib = Array2::<f64>::zeros((p, p));
+            general_mat_mul(1.0, &wx_exit.t(), &wx_exit, 0.0, &mut h_exit_contrib);
+            hessian -= &h_exit_contrib;
+
+            // Entry term: H += (sqrt(w*h_s)*X)^T * (sqrt(w*h_s)*X)
+            let mut wx_entry = Array2::<f64>::zeros((n_rows, n_cols));
+            for i in 0..n_rows {
+                let sqrt_w = w_entry[i];
+                for j in 0..n_cols {
+                    wx_entry[[i, j]] = sqrt_w * self.layout.combined_entry[[i, j]];
+                }
+            }
+            // H += wx_entry^T * wx_entry via BLAS GEMM
+            general_mat_mul(1.0, &wx_entry.t(), &wx_entry, 1.0, &mut hessian);
         }
 
         gradient.mapv_inplace(|value| value * -2.0);
