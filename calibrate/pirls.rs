@@ -14,6 +14,7 @@ use faer::{Accum, Side, get_global_parallelism};
 use faer::sparse::SparseRowMat;
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use rayon::prelude::*;
 use std::{
     borrow::Cow,
     time::{Duration, Instant},
@@ -456,37 +457,92 @@ fn compute_hessian_sparse(
             nrows
         )));
     }
+    const PAR_ROW_THRESHOLD: usize = 512;
 
-    let mut hessian = Array2::<f64>::zeros((ncols, ncols));
-
-    for row in 0..nrows {
-        let w = weights[row].max(0.0);
-        if w == 0.0 {
-            continue;
-        }
-        let x_row = x.as_ref();
-        let vals = x_row.val_of_row(row);
-        let cols: Vec<usize> = x_row.col_idx_of_row(row).collect();
-        if cols.len() != vals.len() {
-            return Err(EstimationError::InvalidInput(
-                "sparse row value/index length mismatch".to_string(),
-            ));
-        }
-        for (idx_a, &col_a) in cols.iter().enumerate() {
-            let val_a = vals[idx_a];
-            let scaled = w * val_a;
-            for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
-                let val_b = vals[idx_b];
-                let delta = scaled * val_b;
-                hessian[[col_a, col_b]] += delta;
-                if col_a != col_b {
-                    hessian[[col_b, col_a]] += delta;
+    let x_view = x.as_ref();
+    let mismatch = std::sync::atomic::AtomicBool::new(false);
+    let hessian_vec = if nrows >= PAR_ROW_THRESHOLD {
+        (0..nrows)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; ncols * ncols],
+                |mut local, row| {
+                    let w = weights[row].max(0.0);
+                    if w == 0.0 {
+                        return local;
+                    }
+                    let vals = x_view.val_of_row(row);
+                    let cols: Vec<usize> = x_view.col_idx_of_row(row).collect();
+                    if cols.len() != vals.len() {
+                        mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return local;
+                    }
+                    for (idx_a, &col_a) in cols.iter().enumerate() {
+                        let val_a = vals[idx_a];
+                        let scaled = w * val_a;
+                        let row_offset_a = col_a * ncols;
+                        for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
+                            let val_b = vals[idx_b];
+                            let delta = scaled * val_b;
+                            local[row_offset_a + col_b] += delta;
+                            if col_a != col_b {
+                                local[col_b * ncols + col_a] += delta;
+                            }
+                        }
+                    }
+                    local
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; ncols * ncols],
+                |mut acc, local| {
+                    for (dst, src) in acc.iter_mut().zip(local.into_iter()) {
+                        *dst += src;
+                    }
+                    acc
+                },
+            )
+    } else {
+        let mut local = vec![0.0_f64; ncols * ncols];
+        for row in 0..nrows {
+            let w = weights[row].max(0.0);
+            if w == 0.0 {
+                continue;
+            }
+            let vals = x_view.val_of_row(row);
+            let cols: Vec<usize> = x_view.col_idx_of_row(row).collect();
+            if cols.len() != vals.len() {
+                mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(EstimationError::InvalidInput(
+                    "sparse row value/index length mismatch".to_string(),
+                ));
+            }
+            for (idx_a, &col_a) in cols.iter().enumerate() {
+                let val_a = vals[idx_a];
+                let scaled = w * val_a;
+                let row_offset_a = col_a * ncols;
+                for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
+                    let val_b = vals[idx_b];
+                    let delta = scaled * val_b;
+                    local[row_offset_a + col_b] += delta;
+                    if col_a != col_b {
+                        local[col_b * ncols + col_a] += delta;
+                    }
                 }
             }
         }
+        local
+    };
+
+    if mismatch.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(EstimationError::InvalidInput(
+            "sparse row value/index length mismatch".to_string(),
+        ));
     }
 
-    Ok(hessian)
+    Array2::from_shape_vec((ncols, ncols), hessian_vec).map_err(|_| {
+        EstimationError::InvalidInput("failed to build sparse Hessian".to_string())
+    })
 }
 
 fn compute_firth_hat_and_half_logdet_sparse(

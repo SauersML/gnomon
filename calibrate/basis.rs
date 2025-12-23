@@ -93,6 +93,8 @@ pub struct BasisCacheStats {
 }
 
 const DEFAULT_BASIS_CACHE_CAPACITY: usize = 1_000;
+const BASIS_CACHE_MAX_POINTS: usize = 20_000;
+const BASIS_CACHE_MIN_DEGREE: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BasisCacheKey {
@@ -289,6 +291,10 @@ fn make_cache_key(
     }
 }
 
+fn should_use_basis_cache(data_len: usize, degree: usize) -> bool {
+    degree >= BASIS_CACHE_MIN_DEGREE && data_len <= BASIS_CACHE_MAX_POINTS
+}
+
 pub fn clear_basis_cache() {
     global_basis_cache().clear();
 }
@@ -360,9 +366,15 @@ pub fn create_bspline_basis_with_knots(
     let knot_vec = knot_vector.to_owned();
     let knot_view = knot_vec.view();
 
-    let cache_key = make_cache_key(knot_view, degree, data, 0);
+    let cache_key = if should_use_basis_cache(data.len(), degree) {
+        Some(make_cache_key(knot_view, degree, data, 0))
+    } else {
+        None
+    };
 
-    if let Some(cached) = global_basis_cache().get(&cache_key) {
+    if let Some(key) = cache_key.as_ref()
+        && let Some(cached) = global_basis_cache().get(key)
+    {
         return Ok((cached, knot_vec));
     }
 
@@ -407,7 +419,9 @@ pub fn create_bspline_basis_with_knots(
     }
 
     let basis_arc = Arc::new(basis_matrix);
-    global_basis_cache().insert(cache_key, Arc::clone(&basis_arc));
+    if let Some(key) = cache_key {
+        global_basis_cache().insert(key, Arc::clone(&basis_arc));
+    }
 
     Ok((basis_arc, knot_vec))
 }
@@ -593,9 +607,15 @@ pub fn create_bspline_basis(
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
     let knot_view = knot_vector.view();
 
-    let cache_key = make_cache_key(knot_view, degree, data, 0);
+    let cache_key = if should_use_basis_cache(data.len(), degree) {
+        Some(make_cache_key(knot_view, degree, data, 0))
+    } else {
+        None
+    };
 
-    if let Some(cached) = global_basis_cache().get(&cache_key) {
+    if let Some(key) = cache_key.as_ref()
+        && let Some(cached) = global_basis_cache().get(key)
+    {
         return Ok((cached, knot_vector));
     }
 
@@ -645,7 +665,9 @@ pub fn create_bspline_basis(
     }
 
     let basis_arc = Arc::new(basis_matrix);
-    global_basis_cache().insert(cache_key, Arc::clone(&basis_arc));
+    if let Some(key) = cache_key {
+        global_basis_cache().insert(key, Arc::clone(&basis_arc));
+    }
 
     Ok((basis_arc, knot_vector))
 }

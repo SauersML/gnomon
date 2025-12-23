@@ -47,7 +47,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
-use faer::Side;
+use faer::{Par, Side, get_global_parallelism, set_global_parallelism};
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
@@ -3370,6 +3370,28 @@ pub mod internal {
         }
     }
 
+    struct FaerParallelismGuard {
+        previous: Par,
+    }
+
+    impl FaerParallelismGuard {
+        fn new(desired: Par) -> Self {
+            let previous = get_global_parallelism();
+            set_global_parallelism(desired);
+            Self { previous }
+        }
+
+        fn current_parallelism(&self) -> Par {
+            get_global_parallelism()
+        }
+    }
+
+    impl Drop for FaerParallelismGuard {
+        fn drop(&mut self) {
+            set_global_parallelism(self.previous);
+        }
+    }
+
     /// Holds the state for the outer REML optimization and supplies cost and
     /// gradient evaluations to the `wolfe_bfgs` optimizer.
     ///
@@ -4057,6 +4079,9 @@ pub mod internal {
                 }
             };
 
+            let faer_guard = FaerParallelismGuard::new(Par::Seq);
+            let faer_parallelism = faer_guard.current_parallelism();
+            std::hint::black_box(faer_parallelism);
             let grad_values = (0..len)
                 .into_par_iter()
                 .map(|k| -> Result<f64, EstimationError> {
