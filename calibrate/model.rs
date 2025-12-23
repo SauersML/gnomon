@@ -1090,6 +1090,8 @@ impl TrainedModel {
             let mut cif_exit = Array1::<f64>::zeros(n);
             let mut conditional_risk = Array1::<f64>::zeros(n);
             let mut gradient = Array2::<f64>::zeros((n, design_width));
+            let mut logit_risk_sum = Array1::<f64>::zeros(n);
+            let mut logit_risk_sq_sum = Array1::<f64>::zeros(n);
             let mortality_ref = if matches!(risk_type, SurvivalRiskType::Crude) {
                 Some(mortality_model.expect("checked above"))
             } else {
@@ -1177,6 +1179,9 @@ impl TrainedModel {
 
                             conditional_risk[idx] += risk_val;
                             let risk_clamped = risk_val.max(1e-12).min(1.0 - 1e-12);
+                            let logit_r = (risk_clamped / (1.0 - risk_clamped)).ln();
+                            logit_risk_sum[idx] += logit_r;
+                            logit_risk_sq_sum[idx] += logit_r * logit_r;
                             let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
                                 match risk_type {
                                     SurvivalRiskType::Net => {
@@ -1221,8 +1226,16 @@ impl TrainedModel {
                 logit_risk[i] = (p / (1.0 - p)).ln();
             }
 
-            let logit_risk_se = if let Some(factor) = artifacts.hessian_factor.as_ref() {
-                Some(survival::delta_method_standard_errors(factor, &gradient)?)
+            let logit_risk_se = if n_samples > 1 {
+                let mut se = Array1::<f64>::zeros(n);
+                let n_f = n_samples as f64;
+                for i in 0..n {
+                    let mean = logit_risk_sum[i] / n_f;
+                    let mean_sq = logit_risk_sq_sum[i] / n_f;
+                    let var = (n_f / (n_f - 1.0)) * (mean_sq - mean * mean);
+                    se[i] = if var > 0.0 { var.sqrt() } else { 0.0 };
+                }
+                Some(se)
             } else {
                 None
             };
@@ -1402,6 +1415,7 @@ impl TrainedModel {
         artifacts
             .apply_logit_risk_calibrator(
                 &baseline.conditional_risk,
+                baseline.logit_risk_se.as_ref(),
                 design,
                 signed_dist.as_ref(),
             )

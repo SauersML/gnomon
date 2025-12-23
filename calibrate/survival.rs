@@ -2730,6 +2730,7 @@ impl SurvivalModelArtifacts {
     pub fn apply_logit_risk_calibrator(
         &self,
         conditional_risk: &Array1<f64>,
+        logit_risk_se: Option<&Array1<f64>>,
         logit_risk_design: &Array2<f64>,
         dist: Option<&Array1<f64>>,
     ) -> Result<Array1<f64>, SurvivalError> {
@@ -2746,7 +2747,9 @@ impl SurvivalModelArtifacts {
         }
 
         // Compute SE
-        let se = if let Some(factor) = &self.hessian_factor {
+        let se = if let Some(se) = logit_risk_se {
+            se.to_owned()
+        } else if let Some(factor) = &self.hessian_factor {
             delta_method_standard_errors(factor, logit_risk_design)?
         } else {
             Array1::zeros(n)
@@ -2954,7 +2957,7 @@ mod tests {
         // We assume enabled by default or we enable it
         set_calibrator_enabled(true);
         let calibrated = artifacts
-            .apply_logit_risk_calibrator(&risks, &design, None)
+            .apply_logit_risk_calibrator(&risks, None, &design, None)
             .unwrap();
         assert_eq!(calibrated.len(), risks.len());
         // Since coeffs are zero, output should be transformed but likely different if standardization or basis shifts.
@@ -2962,7 +2965,7 @@ mod tests {
 
         set_calibrator_enabled(false);
         let bypass = artifacts
-            .apply_logit_risk_calibrator(&risks, &design, None)
+            .apply_logit_risk_calibrator(&risks, None, &design, None)
             .unwrap();
         for (cal, base) in bypass.iter().zip(risks.iter()) {
             assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
