@@ -148,6 +148,7 @@ fn logit_risk_calibration_improves_log_loss() {
         standardize_se: schema.standardize_se,
         standardize_dist: schema.standardize_dist,
         interaction_center_pred: Some(schema.interaction_center_pred),
+        se_log_space: schema.se_log_space,
         se_wiggle_only_drop: schema.se_wiggle_only_drop,
         dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
         lambda_pred: lambdas[0],

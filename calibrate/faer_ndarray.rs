@@ -1,4 +1,3 @@
-use ahash::AHasher;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagMut, DiagRef};
 use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
@@ -6,7 +5,6 @@ use faer::linalg::solvers::{self, Solve};
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::{Auto, Mat, MatMut, MatRef, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
-use std::hash::Hasher;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -41,17 +39,6 @@ pub fn array1_to_col_mat_mut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
         .as_slice_memory_order_mut()
         .expect("vector must expose a contiguous slice");
     MatMut::from_row_major_slice_mut(slice, len, 1)
-}
-
-#[inline]
-pub fn hash_array2(matrix: &Array2<f64>) -> u64 {
-    let mut hasher = AHasher::default();
-    hasher.write_usize(matrix.nrows());
-    hasher.write_usize(matrix.ncols());
-    for value in matrix.iter() {
-        hasher.write(&value.to_ne_bytes());
-    }
-    hasher.finish()
 }
 
 /// Compute A^T * A using faer's SIMD-optimized GEMM.

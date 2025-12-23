@@ -74,6 +74,7 @@ fn make_constant_hazard_artifacts(hazard_rate: f64) -> SurvivalModelArtifacts {
         companion_models: vec![],
         hessian_factor: None,
         calibrator: None,
+        mcmc_samples: None,
     }
 }
 

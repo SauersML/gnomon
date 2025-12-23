@@ -2354,7 +2354,7 @@ mod tests {
         let (_, z_transform) =
             basis::apply_sum_to_zero_constraint(unconstrained_main_basis.view(), None).unwrap();
 
-        let mut model = TrainedModel {
+        let model = TrainedModel {
             config: ModelConfig {
                 model_family: ModelFamily::Gam(LinkFunction::Identity),
                 penalty_order: 2,

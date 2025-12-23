@@ -2,7 +2,7 @@ use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condi
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ata, fast_atv, hash_array2, ldlt_rook,
+    array2_to_mat_mut, fast_ata, fast_atv, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
@@ -202,7 +202,6 @@ pub struct PirlsWorkspace {
     pub xtwx_buf: Array2<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
-    pub(crate) chol_cache: Option<CholeskyCacheEntry>,
 }
 
 impl PirlsWorkspace {
@@ -223,7 +222,6 @@ impl PirlsWorkspace {
             delta_eta: Array1::zeros(n),
             xtwx_buf: Array2::zeros((p, p)),
             vec_buf_p: Array1::zeros(p),
-            chol_cache: None,
         }
     }
 }
@@ -341,7 +339,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut eta = self.offset.clone();
         eta += &self.x_transformed.matrix_vector_multiply(beta);
 
-        let (mu, weights, mut z) = update_glm_vectors(self.y, &eta, self.link, self.prior_weights);
+        // Use zero-allocation update into pre-allocated buffers
+        update_glm_vectors(
+            self.y,
+            &eta,
+            self.link,
+            self.prior_weights,
+            &mut self.last_mu,
+            &mut self.last_weights,
+            &mut self.last_z,
+        );
+        // Create references for use in this function
+        let mu = &self.last_mu;
+        let weights = &self.last_weights;
 
         if self.firth_bias_reduction {
             let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
@@ -365,10 +375,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 }
             };
             self.firth_log_det = Some(half_log_det);
-            for i in 0..z.len() {
+            for i in 0..self.last_z.len() {
                 let wi = weights[i];
                 if wi > 0.0 {
-                    z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
+                    self.last_z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
                 }
             }
         } else {
@@ -406,10 +416,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             }
         }
 
+        let z = &self.last_z;
         let mut eta_minus_z = eta.clone();
-        eta_minus_z -= &z;
+        eta_minus_z -= z;
         self.workspace.weighted_residual.assign(&eta_minus_z);
-        self.workspace.weighted_residual *= &weights;
+        self.workspace.weighted_residual *= weights;
         let mut gradient = self
             .x_transformed
             .transpose_vector_multiply(&self.workspace.weighted_residual);
@@ -420,9 +431,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
         let penalty_term = beta.dot(&s_beta);
 
-        self.last_mu = mu;
-        self.last_weights = weights;
-        self.last_z = z;
         self.last_penalty_term = penalty_term;
 
         Ok(WorkingState {
@@ -885,14 +893,6 @@ fn record_penalized_deviance(value: f64) {
     });
 }
 
-pub(crate) struct CholeskyCacheEntry {
-    hash: u64,
-    ridge: f64,
-    cond_estimate: Option<f64>,
-    factor: FaerLlt<f64>,
-    dim: usize,
-}
-
 const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 
@@ -1133,6 +1133,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     prior_weights: ArrayView1<'a, f64>,
     rs_original: &[Array2<f64>],
     balanced_penalty_root: Option<&Array2<f64>>,
+    reparam_invariant: Option<&crate::calibrate::construction::ReparamInvariant>,
     layout: &ModelLayout,
     config: &ModelConfig,
     warm_start_beta: Option<&Array1<f64>>,
@@ -1148,7 +1149,10 @@ pub fn fit_model_for_fixed_rho<'a>(
         }
     };
 
-    use crate::calibrate::construction::{create_balanced_penalty_root, stable_reparameterization};
+    use crate::calibrate::construction::{
+        create_balanced_penalty_root, stable_reparameterization,
+        stable_reparameterization_with_invariant,
+    };
 
     let eb_cow: Cow<'_, Array2<f64>> = if let Some(precomputed) = balanced_penalty_root {
         Cow::Borrowed(precomputed)
@@ -1164,7 +1168,16 @@ pub fn fit_model_for_fixed_rho<'a>(
     };
     let eb: &Array2<f64> = eb_cow.as_ref();
 
-    let reparam_result = stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?;
+    let reparam_result = if let Some(invariant) = reparam_invariant {
+        stable_reparameterization_with_invariant(
+            rs_original,
+            &lambdas.to_vec(),
+            layout,
+            invariant,
+        )?
+    } else {
+        stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?
+    };
     let x_transformed_dense = x.dot(&reparam_result.qs);
     let x_transformed = DesignMatrix::Dense(x_transformed_dense.clone());
 
@@ -1634,45 +1647,49 @@ pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64
     }
 }
 
-pub fn update_glm_vectors<'a>(
-    y: ArrayView1<'a, f64>,
+/// Zero-allocation update of GLM working vectors using pre-allocated buffers.
+#[inline]
+pub fn update_glm_vectors(
+    y: ArrayView1<f64>,
     eta: &Array1<f64>,
     link: LinkFunction,
-    prior_weights: ArrayView1<'a, f64>,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    // Smaller floor for Fisher weights to preserve geometry; slightly larger floor for z denom
+    prior_weights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+) {
     const MIN_WEIGHT: f64 = 1e-12;
     const MIN_D_FOR_Z: f64 = 1e-6;
-    const PROB_EPS: f64 = 1e-8; // Epsilon for clamping probabilities
+    const PROB_EPS: f64 = 1e-8;
 
     match link {
         LinkFunction::Logit => {
-            // Clamp eta to prevent overflow in exp
-            let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
-            // Create mu and then clamp to prevent values exactly at 0 or 1
-            let mut mu = eta_clamped.mapv(|e| 1.0 / (1.0 + (-e).exp()));
-            mu.mapv_inplace(|v| v.clamp(PROB_EPS, 1.0 - PROB_EPS));
-
-            // Stage: Calculate dμ/dη, which is μ(1-μ) for the logit link.
-            // This term must NOT include prior weights.
-            let dmu_deta = &mu * &(1.0 - &mu);
-
-            // Stage: Form the true Fisher weights with a tiny floor to avoid literal zeros
-            let fisher_w = dmu_deta.mapv(|v| v.max(MIN_WEIGHT));
-            let weights = &prior_weights * &fisher_w;
-
-            // Stage: Build the working-response denominator with a slightly larger floor for stability
-            let denom_z = dmu_deta.mapv(|v| v.max(MIN_D_FOR_Z));
-            let z = &eta_clamped + &((&y.view().to_owned() - &mu) / &denom_z);
-
-            (mu, weights, z)
+            let n = eta.len();
+            for i in 0..n {
+                // Clamp eta and compute mu
+                let e = eta[i].clamp(-700.0, 700.0);
+                let mu_i = (1.0 / (1.0 + (-e).exp())).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                mu[i] = mu_i;
+                
+                // dmu/deta = mu(1-mu)
+                let dmu = mu_i * (1.0 - mu_i);
+                
+                // Fisher weight with floor
+                let fisher_w = dmu.max(MIN_WEIGHT);
+                weights[i] = prior_weights[i] * fisher_w;
+                
+                // Working response
+                let denom = dmu.max(MIN_D_FOR_Z);
+                z[i] = e + (y[i] - mu_i) / denom;
+            }
         }
         LinkFunction::Identity => {
-            let model = GamIdentityWorkingModel::new(y, prior_weights);
-            let mu = eta.clone();
-            let weights = model.weights().to_owned();
-            let z = model.working_response().to_owned();
-            (mu, weights, z)
+            let n = eta.len();
+            for i in 0..n {
+                mu[i] = eta[i];
+                weights[i] = prior_weights[i];
+                z[i] = y[i];
+            }
         }
     }
 }
@@ -1987,9 +2004,6 @@ pub fn solve_penalized_least_squares(
                 penalized_hessian[[j, i]] = v;
             }
         }
-        let matrix_hash = hash_array2(&penalized_hessian);
-        let mut ridge_used;
-        let mut cond_est;
 
         let mut solve_spd = |penalized: &Array2<f64>,
                              chol: &FaerLlt<f64>,
@@ -2089,50 +2103,17 @@ pub fn solve_penalized_least_squares(
             )))
         };
 
-        let mut skip_new_factor = false;
-        if let Some(entry) = workspace.chol_cache.as_ref()
-            && entry.hash == matrix_hash && entry.dim == p_dim {
-                ridge_used = entry.ridge;
-                cond_est = entry.cond_estimate;
-                if ridge_used > 0.0 {
-                    for i in 0..p_dim {
-                        penalized_hessian[[i, i]] += ridge_used;
-                    }
-                }
-
+        let (chol_opt, ridge_used, cond_est) = attempt_spd_cholesky(&mut penalized_hessian);
+        match chol_opt {
+            Some(chol) => {
                 if let Some(result) =
-                    solve_spd(&penalized_hessian, &entry.factor, ridge_used, cond_est)?
+                    solve_spd(&penalized_hessian, &chol, ridge_used, cond_est)?
                 {
                     return Ok(result);
-                } else {
-                    skip_new_factor = true;
                 }
             }
-
-        if !skip_new_factor {
-            let (chol_opt, ridge, cond) = attempt_spd_cholesky(&mut penalized_hessian);
-            ridge_used = ridge;
-            cond_est = cond;
-            match chol_opt {
-                Some(chol) => {
-                    workspace.chol_cache = Some(CholeskyCacheEntry {
-                        hash: matrix_hash,
-                        ridge: ridge_used,
-                        cond_estimate: cond_est,
-                        factor: chol,
-                        dim: p_dim,
-                    });
-                    let entry = workspace.chol_cache.as_ref().unwrap();
-                    if let Some(result) =
-                        solve_spd(&penalized_hessian, &entry.factor, ridge_used, cond_est)?
-                    {
-                        return Ok(result);
-                    }
-                }
-                None => {
-                    workspace.chol_cache = None;
-                    diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed);
-                }
+            None => {
+                diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed);
             }
         }
         // If LLᵀ fails, continue into the robust QR path below.
@@ -2958,6 +2939,7 @@ mod tests {
             data.weights.view(),
             &rs_original,
             None,
+            None,
             &layout,
             &config,
             None,
@@ -3194,11 +3176,17 @@ mod tests {
     impl WorkingModel for IdentityGamWorkingModel {
         fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
             let eta = self.design.dot(beta);
-            let (mu, weights, z) = update_glm_vectors(
+            let mut mu = Array1::zeros(self.response.len());
+            let mut weights = Array1::zeros(self.response.len());
+            let mut z = Array1::zeros(self.response.len());
+            update_glm_vectors(
                 self.response.view(),
                 &eta,
                 self.link,
                 self.prior_weights.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
             );
 
             let eta_minus_z = &eta - &z;
@@ -3250,7 +3238,18 @@ mod tests {
         weights: &Array1<f64>,
     ) -> (Array1<f64>, Array2<f64>, f64) {
         let eta = x.dot(beta);
-        let (mu, fisher_weights, z) = update_glm_vectors(y.view(), &eta, link, weights.view());
+        let mut mu = Array1::zeros(y.len());
+        let mut fisher_weights = Array1::zeros(y.len());
+        let mut z = Array1::zeros(y.len());
+        update_glm_vectors(
+            y.view(),
+            &eta,
+            link,
+            weights.view(),
+            &mut mu,
+            &mut fisher_weights,
+            &mut z,
+        );
         let working_gradient = x.t().dot(&(&fisher_weights * (&eta - &z)));
 
         let mut w_matrix = Array2::<f64>::zeros((x.nrows(), x.nrows()));
@@ -3586,6 +3585,7 @@ mod tests {
             weights.view(),
             &rs_original,
             None,
+            None,
             &layout,
             &config,
             None,
@@ -3600,6 +3600,7 @@ mod tests {
             y.view(),
             weights.view(),
             &rs_original,
+            None,
             None,
             &layout,
             &config,
@@ -3716,6 +3717,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             None,
             &layout,
             &config,
@@ -3850,6 +3852,7 @@ mod tests {
             data.y.view(),
             data.weights.view(),
             &rs_original,
+            None,
             None,
             &layout,
             &config,
@@ -4215,14 +4218,20 @@ mod tests {
 
         // Build IRLS vectors at beta=0
         // Use a tuple with let binding to explicitly declare variable usage
-        let (_, w_old, z_old) = {
-            let vectors = super::update_glm_vectors(
+        let (w_old, z_old) = {
+            let mut mu = Array1::zeros(n);
+            let mut weights = Array1::zeros(n);
+            let mut z = Array1::zeros(n);
+            super::update_glm_vectors(
                 y.view(),
                 &eta0,
                 super::LinkFunction::Logit,
                 w_prior.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
             );
-            ((), vectors.1, vectors.2)
+            (weights, z)
         };
         assert!(w_old.iter().all(|w| *w >= 0.0));
 
@@ -4260,14 +4269,20 @@ mod tests {
         // Now recompute eta, mu, and updated weights at the accepted beta
         let eta1 = x.dot(&res.beta);
         // Use same approach for the second update_glm_vectors call
-        let (_, w_new, z_new) = {
-            let vectors = super::update_glm_vectors(
+        let (w_new, z_new) = {
+            let mut mu = Array1::zeros(n);
+            let mut weights = Array1::zeros(n);
+            let mut z = Array1::zeros(n);
+            super::update_glm_vectors(
                 y.view(),
                 &eta1,
                 super::LinkFunction::Logit,
                 w_prior.view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
             );
-            ((), vectors.1, vectors.2)
+            (weights, z)
         };
 
         let sqrt_w_new = w_new.mapv(f64::sqrt);

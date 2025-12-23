@@ -32,8 +32,9 @@ use self::internal::RemlState;
 use crate::calibrate::basis;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
-    ModelLayout, build_design_and_penalty_matrices, calculate_condition_number,
-    compute_penalty_square_roots, create_balanced_penalty_root,
+    ModelLayout, ReparamInvariant, build_design_and_penalty_matrices,
+    calculate_condition_number, compute_penalty_square_roots,
+    create_balanced_penalty_root, precompute_reparam_invariant,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
@@ -846,6 +847,7 @@ pub fn train_model(
             reml_state.weights(),
             reml_state.rs_list_ref(),
             Some(reml_state.balanced_penalty_root()),
+            None,
             &layout,
             config,
             None,
@@ -1319,6 +1321,7 @@ pub fn train_model(
         reml_state.weights(),     // Pass weights
         reml_state.rs_list_ref(), // Pass original penalty matrices
         Some(reml_state.balanced_penalty_root()),
+        None,
         &layout,
         config,
         warm_start_ref,
@@ -2944,6 +2947,7 @@ pub fn optimize_external_design(
         w_o.view(),
         &rs_list,
         Some(reml_state.balanced_penalty_root()),
+        None,
         &layout,
         &cfg,
         None,
@@ -3511,6 +3515,7 @@ pub mod internal {
         s_full_list: Vec<Array2<f64>>,
         pub(super) rs_list: Vec<Array2<f64>>, // Pre-computed penalty square roots
         balanced_penalty_root: Array2<f64>,
+        reparam_invariant: ReparamInvariant,
         layout: &'a ModelLayout,
         config: &'a ModelConfig,
         nullspace_dims: Vec<usize>,
@@ -3713,6 +3718,7 @@ pub mod internal {
             let workspace = RemlWorkspace::new(penalty_count, layout.total_coeffs, total_rank);
 
             let balanced_penalty_root = create_balanced_penalty_root(&s_list, layout.total_coeffs)?;
+            let reparam_invariant = precompute_reparam_invariant(&rs_list, layout)?;
 
             Ok(Self {
                 y,
@@ -3722,6 +3728,7 @@ pub mod internal {
                 s_full_list: s_list,
                 rs_list,
                 balanced_penalty_root,
+                reparam_invariant,
                 layout,
                 config,
                 nullspace_dims,
@@ -4011,6 +4018,7 @@ pub mod internal {
                     weights,
                     rs_list,
                     Some(balanced_root),
+                    None,
                     layout,
                     config,
                     warm_start_initial.as_ref(),
@@ -4197,6 +4205,7 @@ pub mod internal {
                 self.weights,
                 &self.rs_list,
                 Some(&self.balanced_penalty_root),
+                Some(&self.reparam_invariant),
                 self.layout,
                 self.config,
                 warm_start_ref,
@@ -6631,6 +6640,7 @@ pub mod internal {
                 data.weights.view(),
                 reml_state.rs_list_ref(),
                 Some(reml_state.balanced_penalty_root()),
+                None,
                 &layout,
                 &config,
                 None,
@@ -6747,6 +6757,7 @@ pub mod internal {
                 data.weights.view(),
                 reml_state.rs_list_ref(),
                 Some(reml_state.balanced_penalty_root()),
+                None,
                 &layout,
                 &config,
                 None,
@@ -7028,6 +7039,7 @@ pub mod internal {
                         data_train.weights.view(),
                         &rs_list,
                         Some(&balanced_root),
+                        None,
                         &layout,
                         &trained.config,
                         None,
@@ -8366,6 +8378,7 @@ pub mod internal {
                 data.y.view(),
                 data.weights.view(),
                 &rs_original,
+                None,
                 None,
                 &layout,
                 &config,

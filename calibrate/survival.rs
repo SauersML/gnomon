@@ -2771,7 +2771,7 @@ mod tests {
             degree: 2,
         };
         let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
-        let mut model = WorkingModelSurvival::new(
+        let model = WorkingModelSurvival::new(
             layout_bundle.layout.clone(),
             &data,
             layout_bundle.monotonicity.clone(),
@@ -3029,7 +3029,7 @@ mod tests {
         } = build_survival_layout(&data, &basis, 0.1, 2, 10, None).unwrap();
         let spec = SurvivalSpec::default();
         let beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
-        let mut model =
+        let model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity, spec).unwrap();
 
         let state = model.update_state(&beta).unwrap();
@@ -3093,7 +3093,7 @@ mod tests {
         let slopes = monotonicity.derivative_design.dot(&beta);
         assert!(slopes.iter().any(|value| *value < MONOTONICITY_TOLERANCE));
 
-        let mut model =
+        let model =
             WorkingModelSurvival::new(layout, &data, monotonicity, SurvivalSpec::default())
                 .unwrap();
         let err = model.update_state(&beta).unwrap_err();
@@ -3332,7 +3332,7 @@ mod tests {
         let monotonicity = bundle.monotonicity.clone();
         let mut spec = SurvivalSpec::default();
         spec.derivative_guard = 1e-12;
-        let mut model =
+        let model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
 
         let mut beta = Array1::<f64>::zeros(layout.combined_exit.ncols());
@@ -3388,7 +3388,7 @@ mod tests {
         let time_varying_basis = bundle.time_varying_basis.clone();
         let mut spec = SurvivalSpec::default();
         spec.derivative_guard = 1e-12;
-        let mut model =
+        let model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
 
         let p = layout.combined_exit.ncols();
@@ -3467,7 +3467,7 @@ mod tests {
 
         let mut spec = SurvivalSpec::default();
         spec.derivative_guard = 1e-12;
-        let mut model =
+        let model =
             WorkingModelSurvival::new(layout.clone(), &data, monotonicity.clone(), spec).unwrap();
 
         let p = layout.combined_exit.ncols();
@@ -3685,14 +3685,14 @@ mod tests {
         let mut spec = SurvivalSpec::default();
         spec.derivative_guard = 1e-12;
 
-        let mut weighted_model = WorkingModelSurvival::new(
+        let weighted_model = WorkingModelSurvival::new(
             layout_weighted.clone(),
             &weighted_data,
             monotonic_weighted.clone(),
             spec,
         )
         .unwrap();
-        let mut expanded_model = WorkingModelSurvival::new(
+        let expanded_model = WorkingModelSurvival::new(
             layout_expanded.clone(),
             &expanded_data,
             monotonic_weighted,
@@ -3846,7 +3846,7 @@ mod tests {
             .expect_err("pgs below range should error");
         assert!(matches!(err_low, SurvivalError::CovariateBelowRange { .. }));
 
-        let mut model = WorkingModelSurvival::new(
+        let model = WorkingModelSurvival::new(
             layout.clone(),
             &data,
             monotonicity.clone(),

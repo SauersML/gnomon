@@ -2028,50 +2028,31 @@ pub fn construct_s_lambda(
     s_lambda
 }
 
-/// Implements a fast, numerically stable reparameterization of the coefficient
-/// space that preserves the conditioning benefits of Wood (2011) Appendix B
-/// without the iterative similarity-transform loop.
-///
-/// The new strategy builds a lambda-independent “balanced” penalty matrix by
-/// scaling each penalty to unit Frobenius norm, performs a single eigenvalue
-/// decomposition to separate penalized and null-space directions, and then
-/// whitens the penalized block using the current smoothing parameters. This
-/// yields the same well-conditioned basis as the recursive algorithm while
-/// avoiding its repeated \(O(q^3)\) eigendecompositions.
-///
-/// Each entry in `rs_list` is a `p × rank_k` penalty square root for penalty
-/// `k`. The vector `lambdas` provides the smoothing parameters, and `layout`
-/// defines the model’s coefficient structure. The function returns the
-/// transformed penalties, the orthogonal basis, and log-determinant
-/// information required by PIRLS.
-pub fn stable_reparameterization(
-    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
-    lambdas: &[f64],
+/// Lambda-independent reparameterization invariants derived from penalty structure.
+#[derive(Clone)]
+pub struct ReparamInvariant {
+    qs_base: Array2<f64>,
+    rs_transformed_base: Vec<Array2<f64>>,
+    penalized_rank: usize,
+    has_nonzero: bool,
+}
+
+/// Precompute the lambda-invariant reparameterization structure from penalty roots.
+pub fn precompute_reparam_invariant(
+    rs_list: &[Array2<f64>],
     layout: &ModelLayout,
-) -> Result<ReparamResult, EstimationError> {
+) -> Result<ReparamInvariant, EstimationError> {
     use std::cmp::Ordering;
 
     let p = layout.total_coeffs;
     let m = rs_list.len();
 
-    if lambdas.len() != m {
-        return Err(EstimationError::ParameterConstraintViolation(format!(
-            "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
-            m,
-            m,
-            lambdas.len()
-        )));
-    }
-
     if m == 0 {
-        return Ok(ReparamResult {
-            s_transformed: Array2::zeros((p, p)),
-            log_det: 0.0,
-            det1: Array1::zeros(0),
-            qs: Array2::eye(p),
-            rs_transformed: vec![],
-            rs_transposed: vec![],
-            e_transformed: Array2::zeros((0, p)),
+        return Ok(ReparamInvariant {
+            qs_base: Array2::eye(p),
+            rs_transformed_base: Vec::new(),
+            penalized_rank: 0,
+            has_nonzero: false,
         });
     }
 
@@ -2097,14 +2078,11 @@ pub fn stable_reparameterization(
     }
 
     if !has_nonzero {
-        return Ok(ReparamResult {
-            s_transformed: Array2::zeros((p, p)),
-            log_det: 0.0,
-            det1: Array1::zeros(m),
-            qs: Array2::eye(p),
-            rs_transformed: rs_list.to_vec(),
-            rs_transposed: rs_list.iter().map(transpose_owned).collect(),
-            e_transformed: Array2::zeros((0, p)),
+        return Ok(ReparamInvariant {
+            qs_base: Array2::eye(p),
+            rs_transformed_base: rs_list.to_vec(),
+            penalized_rank: 0,
+            has_nonzero: false,
         });
     }
 
@@ -2143,7 +2121,7 @@ pub fn stable_reparameterization(
         .take_while(|&&val| val > rank_tol)
         .count();
 
-    let mut rs_transformed: Vec<Mat<f64>> = Vec::with_capacity(m);
+    let mut rs_transformed_base: Vec<Mat<f64>> = Vec::with_capacity(m);
     for rs in &rs_faer {
         let mut product = Mat::<f64>::zeros(rs.nrows(), qs.ncols());
         matmul(
@@ -2154,8 +2132,103 @@ pub fn stable_reparameterization(
             1.0,
             Par::Seq,
         );
-        rs_transformed.push(product);
+        rs_transformed_base.push(product);
     }
+
+    Ok(ReparamInvariant {
+        qs_base: mat_to_array(&qs),
+        rs_transformed_base: rs_transformed_base.iter().map(mat_to_array).collect(),
+        penalized_rank,
+        has_nonzero,
+    })
+}
+
+/// Implements a fast, numerically stable reparameterization of the coefficient
+/// space that preserves the conditioning benefits of Wood (2011) Appendix B
+/// without the iterative similarity-transform loop.
+///
+/// The new strategy builds a lambda-independent “balanced” penalty matrix by
+/// scaling each penalty to unit Frobenius norm, performs a single eigenvalue
+/// decomposition to separate penalized and null-space directions, and then
+/// whitens the penalized block using the current smoothing parameters. This
+/// yields the same well-conditioned basis as the recursive algorithm while
+/// avoiding its repeated \(O(q^3)\) eigendecompositions.
+///
+/// Each entry in `rs_list` is a `p × rank_k` penalty square root for penalty
+/// `k`. The vector `lambdas` provides the smoothing parameters, and `layout`
+/// defines the model’s coefficient structure. The function returns the
+/// transformed penalties, the orthogonal basis, and log-determinant
+/// information required by PIRLS.
+pub fn stable_reparameterization(
+    rs_list: &[Array2<f64>], // penalty square roots (each is rank_i x p) STANDARDIZED
+    lambdas: &[f64],
+    layout: &ModelLayout,
+) -> Result<ReparamResult, EstimationError> {
+    let invariant = precompute_reparam_invariant(rs_list, layout)?;
+    stable_reparameterization_with_invariant(rs_list, lambdas, layout, &invariant)
+}
+
+/// Apply stable reparameterization using precomputed lambda-invariant structures.
+pub fn stable_reparameterization_with_invariant(
+    rs_list: &[Array2<f64>],
+    lambdas: &[f64],
+    layout: &ModelLayout,
+    invariant: &ReparamInvariant,
+) -> Result<ReparamResult, EstimationError> {
+    use std::cmp::Ordering;
+
+    let p = layout.total_coeffs;
+    let m = rs_list.len();
+
+    if lambdas.len() != m {
+        return Err(EstimationError::ParameterConstraintViolation(format!(
+            "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
+            m,
+            m,
+            lambdas.len()
+        )));
+    }
+
+    if invariant.rs_transformed_base.len() != m {
+        return Err(EstimationError::LayoutError(format!(
+            "Reparameterization invariant mismatch: expected {} penalties, got {}",
+            m,
+            invariant.rs_transformed_base.len()
+        )));
+    }
+
+    if m == 0 {
+        return Ok(ReparamResult {
+            s_transformed: Array2::zeros((p, p)),
+            log_det: 0.0,
+            det1: Array1::zeros(0),
+            qs: Array2::eye(p),
+            rs_transformed: vec![],
+            rs_transposed: vec![],
+            e_transformed: Array2::zeros((0, p)),
+        });
+    }
+
+    if !invariant.has_nonzero {
+        return Ok(ReparamResult {
+            s_transformed: Array2::zeros((p, p)),
+            log_det: 0.0,
+            det1: Array1::zeros(m),
+            qs: invariant.qs_base.clone(),
+            rs_transformed: rs_list.to_vec(),
+            rs_transposed: rs_list.iter().map(transpose_owned).collect(),
+            e_transformed: Array2::zeros((0, p)),
+        });
+    }
+
+    let mut qs = array_to_faer(&invariant.qs_base);
+    let mut rs_transformed: Vec<Mat<f64>> = invariant
+        .rs_transformed_base
+        .iter()
+        .map(array_to_faer)
+        .collect();
+
+    let penalized_rank = invariant.penalized_rank;
 
     let mut s_lambda = Mat::<f64>::zeros(p, p);
     for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
