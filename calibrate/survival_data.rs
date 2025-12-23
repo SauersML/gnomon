@@ -81,6 +81,37 @@ impl SurvivalPredictionData {
     }
 }
 
+/// Minimal prediction-only covariates without outcome columns.
+/// Use this for inference when you don't have outcome data (age_exit, events).
+#[derive(Debug)]
+pub struct SurvivalPredictionCovariates {
+    pub age_entry: Array1<f64>,
+    pub pgs: Array1<f64>,
+    pub sex: Array1<f64>,
+    pub pcs: Array2<f64>,
+    pub extra_static_covariates: Array2<f64>,
+    pub extra_static_names: Vec<String>,
+}
+
+impl SurvivalPredictionCovariates {
+    /// Get covariates as a flat array for a single individual at index `i`.
+    /// Layout: [pgs, sex, pcs..., extra_static...]
+    pub fn covariates_for(&self, i: usize) -> Array1<f64> {
+        let n_pcs = self.pcs.ncols();
+        let n_extra = self.extra_static_covariates.ncols();
+        let mut cov = Array1::<f64>::zeros(2 + n_pcs + n_extra);
+        cov[0] = self.pgs[i];
+        cov[1] = self.sex[i];
+        for (j, val) in self.pcs.row(i).iter().enumerate() {
+            cov[2 + j] = *val;
+        }
+        for (j, val) in self.extra_static_covariates.row(i).iter().enumerate() {
+            cov[2 + n_pcs + j] = *val;
+        }
+        cov
+    }
+}
+
 /// Load survival training data from a TSV or Parquet file, validating and caching the age transform.
 pub fn load_survival_training_data(
     path: &str,
@@ -122,6 +153,10 @@ pub fn load_survival_training_data(
 
 /// Load survival prediction data from a TSV or Parquet file, validating the arrays and
 /// preparing owned covariate storage.
+///
+/// **Note:** This function requires outcome columns (age_exit, event_target, event_competing)
+/// which are typically not available at prediction time. For inference without outcomes,
+/// use [`load_survival_prediction_covariates`] instead.
 pub fn load_survival_prediction_data(
     path: &str,
     num_pcs: usize,
@@ -151,6 +186,134 @@ pub fn load_survival_prediction_data(
         pcs: arrays.pcs,
         extra_static_covariates: arrays.extra_static_covariates,
         extra_static_names: arrays.extra_static_names,
+    })
+}
+
+/// Load prediction covariates from a TSV or Parquet file without requiring outcome columns.
+///
+/// This is the recommended function for inference when you don't have outcome data
+/// (age_exit, event_target, event_competing) available.
+pub fn load_survival_prediction_covariates(
+    path: &str,
+    num_pcs: usize,
+) -> Result<SurvivalPredictionCovariates, SurvivalDataError> {
+    let df = read_tabular(path)?;
+    let name_map = build_case_insensitive_map(
+        df.get_column_names()
+            .into_iter()
+            .map(|name| name.as_str().to_string()),
+    );
+    let mut used_columns = HashSet::new();
+
+    let age_entry = extract_f64_column(&df, &name_map, "age_entry")?;
+    if let Some(actual) = name_map.get("age_entry") {
+        used_columns.insert(actual.clone());
+    }
+    let n = age_entry.len();
+
+    let pgs = extract_f64_column(&df, &name_map, "pgs")?;
+    if let Some(actual) = name_map.get("pgs") {
+        used_columns.insert(actual.clone());
+    }
+    let sex = extract_f64_column(&df, &name_map, "sex")?;
+    if let Some(actual) = name_map.get("sex") {
+        used_columns.insert(actual.clone());
+    }
+
+    // Validate lengths
+    if pgs.len() != n {
+        return Err(SurvivalDataError::LengthMismatch {
+            column_name: "pgs".to_string(),
+            expected: n,
+            found: pgs.len(),
+        });
+    }
+    if sex.len() != n {
+        return Err(SurvivalDataError::LengthMismatch {
+            column_name: "sex".to_string(),
+            expected: n,
+            found: sex.len(),
+        });
+    }
+
+    // Load PC columns
+    let mut pc_columns = Vec::with_capacity(num_pcs);
+    for idx in 0..num_pcs {
+        let key = format!("pc{}", idx + 1);
+        let values = extract_f64_column(&df, &name_map, &key)?;
+        if values.len() != n {
+            let actual = name_map
+                .get(&key.to_lowercase())
+                .cloned()
+                .unwrap_or(key.clone());
+            return Err(SurvivalDataError::LengthMismatch {
+                column_name: actual,
+                expected: n,
+                found: values.len(),
+            });
+        }
+        if let Some(actual) = name_map.get(&key.to_ascii_lowercase()) {
+            used_columns.insert(actual.clone());
+        }
+        pc_columns.push(values);
+    }
+
+    let mut pcs = Array2::<f64>::zeros((n, num_pcs));
+    for (j, column) in pc_columns.into_iter().enumerate() {
+        pcs.column_mut(j).assign(&column);
+    }
+
+    // Skip known outcome columns if present
+    for skip in &["age_exit", "event_target", "event_competing", "sample_weight"] {
+        if let Some(actual) = name_map.get(&skip.to_ascii_lowercase()) {
+            used_columns.insert(actual.clone());
+        }
+    }
+
+    // Collect extra static covariates
+    let mut extra_names = Vec::new();
+    let mut extra_columns = Vec::new();
+    for original in df.get_column_names() {
+        let original_str = original.as_ref();
+        if used_columns.contains(original_str) {
+            continue;
+        }
+        let series = df
+            .column(original_str)
+            .map_err(|_| SurvivalDataError::ColumnNotFound(original_str.to_string()))?;
+        let casted = match series.cast(&DataType::Float64) {
+            Ok(values) => values,
+            Err(_) => continue,
+        };
+        let values = casted.f64().expect("casted to f64");
+        if values.null_count() > 0 {
+            return Err(SurvivalDataError::MissingValues(original_str.to_string()));
+        }
+        if values.len() != n {
+            return Err(SurvivalDataError::LengthMismatch {
+                column_name: original_str.to_string(),
+                expected: n,
+                found: values.len(),
+            });
+        }
+        let column = Array1::from_iter(values.into_no_null_iter());
+        extra_names.push(original_str.to_string());
+        extra_columns.push(column);
+    }
+
+    let extra_width = extra_columns.len();
+    let mut extra_static = Array2::<f64>::zeros((n, extra_width));
+    for (idx, column) in extra_columns.into_iter().enumerate() {
+        extra_static.column_mut(idx).assign(&column);
+    }
+
+    Ok(SurvivalPredictionCovariates {
+        age_entry,
+        pgs,
+        sex,
+        pcs,
+        extra_static_covariates: extra_static,
+        extra_static_names: extra_names,
     })
 }
 

@@ -2732,6 +2732,7 @@ pub fn train_survival_model(
             companion_models: Vec::new(), // Will be populated for primary later
             hessian_factor,
             calibrator: calibrator_opt_local,
+            mcmc_samples: None, // TODO: populate from survival MCMC sampling
         };
 
         log_basis_cache_stats(&format!("train_survival_{}", kind));

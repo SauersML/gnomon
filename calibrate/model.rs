@@ -461,7 +461,9 @@ pub struct SurvivalPrediction {
     pub conditional_risk: Array1<f64>,
     pub logit_risk: Array1<f64>,
     pub logit_risk_se: Option<Array1<f64>>,
-    logit_risk_design: Array2<f64>,
+    /// Jacobian matrix for logit risk (N × P). Optional to avoid memory waste
+    /// for large cohorts when only risk scores are needed without SE computation.
+    pub logit_risk_design: Option<Array2<f64>>,
 }
 
 /// Custom error type for model loading, saving, and prediction.
@@ -1210,7 +1212,7 @@ impl TrainedModel {
                 conditional_risk,
                 logit_risk,
                 logit_risk_se,
-                logit_risk_design: gradient,
+                logit_risk_design: Some(gradient),
             });
         }
 
@@ -1318,7 +1320,7 @@ impl TrainedModel {
             conditional_risk,
             logit_risk,
             logit_risk_se,
-            logit_risk_design: gradient,
+            logit_risk_design: Some(gradient),
         })
     }
 
@@ -1358,10 +1360,14 @@ impl TrainedModel {
             SurvivalRiskType::Net,
             companion_registry,
         )?;
+        // logit_risk_design is required for calibration SE computation
+        let design = baseline.logit_risk_design.as_ref().ok_or_else(|| {
+            ModelError::DimensionMismatch("logit_risk_design is required for calibration".into())
+        })?;
         artifacts
             .apply_logit_risk_calibrator(
                 &baseline.conditional_risk,
-                &baseline.logit_risk_design,
+                design,
                 signed_dist.as_ref(),
             )
             .map_err(ModelError::from)
@@ -2450,6 +2456,7 @@ mod tests {
                 },
             }),
             calibrator: None,
+            mcmc_samples: None,
         };
 
         let config = ModelConfig {
@@ -2522,7 +2529,8 @@ mod tests {
         let se = result.logit_risk_se.expect("delta-method se available");
         assert_eq!(se.len(), 2);
         for i in 0..se.len() {
-            let grad = result.logit_risk_design.row(i);
+            let design = result.logit_risk_design.as_ref().expect("design available");
+            let grad = design.row(i);
             let expected = grad.iter().map(|v| v * v).sum::<f64>().sqrt();
             assert!((se[i] - expected).abs() < 1e-9);
         }
