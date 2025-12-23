@@ -2270,6 +2270,13 @@ pub fn solve_penalized_least_squares(
 
     // Apply the rank-determining pivot to the working matrices, then keep the first `rank` columns
     // This ensures we drop by position in the rank-ordered system (Option A fix)
+    //
+    // NOTE ON TRIANGULARITY: Permuting columns of the upper-triangular r1_pivoted
+    // intentionally destroys its triangular structure. This is NOT a bug.
+    // The resulting dense r1_ranked is used only to SELECT which columns to keep.
+    // A fresh QR decomposition (Stage 4 below) will restore proper triangular
+    // structure for the final back-substitution solve. This multi-stage approach
+    // is standard for rank-revealing decompositions on partially-reduced systems.
     let r1_ranked = pivot_columns(r1_pivoted.view(), &rank_pivot_scaled);
     let e_transformed_ranked = pivot_columns(e_transformed_pivoted.view(), &rank_pivot_scaled);
 
