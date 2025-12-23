@@ -2621,6 +2621,9 @@ mod tests {
 
     /// Expected Calibration Error (ECE) - Measures calibration quality
     pub fn ece(y: &Array1<f64>, p: &Array1<f64>, n_bins: usize) -> f64 {
+        if y.is_empty() {
+            return 0.0;
+        }
         let (bin_counts, mean_pred, mean_emp) = reliability_bins(y, p, n_bins);
 
         let n = y.len() as f64;
@@ -2652,6 +2655,9 @@ mod tests {
     pub fn brier(y: &Array1<f64>, p: &Array1<f64>) -> f64 {
         assert_eq!(y.len(), p.len());
         let n = y.len();
+        if n == 0 {
+            return 0.0;
+        }
         let mut sum = 0.0;
         for i in 0..n {
             let diff = p[i] - y[i];
