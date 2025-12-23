@@ -38,6 +38,7 @@ use crate::calibrate::construction::{
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
+use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
 
@@ -3963,8 +3964,7 @@ pub mod internal {
             // sound because every caller obeys a single rule:
             //   • Identity/Gaussian REML cost & gradient only ever request factors of the
             //     stabilized Hessian.
-            //   • Non-Gaussian (logit/LAML) cost requests factors of the effective/ridged Hessian,
-            //     and the gradient path never touches this cache.
+            //   • Non-Gaussian (logit/LAML) cost and gradient request factors of the effective/ridged Hessian.
             // Consequently each ρ corresponds to exactly one matrix within the lifetime of a
             // `RemlState`, so returning the cached factorization is correct.
             // This design is still brittle: adding a new code path that calls `get_faer_factor`
@@ -4877,17 +4877,15 @@ pub mod internal {
         //
         //     2.2  Non-Gaussian case, LAML.
         //          The Laplace objective contains −½ log |H_p| with H_p = Xᵀ W(β̂) X + S_λ.  Because W
-        //          depends on β̂, the partial derivative ∂V/∂β̂ is not zero.  The indirect part is present
-        //          and must be evaluated.  Differentiating the optimality condition for β̂ gives
-        //          ∂β̂/∂λₖ = −λₖ H_p⁻¹ Sₖ β̂.  Meanwhile ∂V/∂β̂ equals −½ tr(H_p⁻¹ ∂H_p/∂β̂).
-        //          Multiplying these two factors produces +½ λₖ β̂ᵀ Sₖ β̂ plus an additional trace that
-        //          involves the derivative of W.  The direct part still contributes −½ λₖ β̂ᵀ Sₖ β̂.
-        //          The two quadratic terms are equal in magnitude and opposite in sign, so they cancel
-        //          exactly.  After cancellation the gradient reduces to
-        //            0.5 λₖ [ tr(S_λ⁺ Sₖ) − tr(H_p⁻¹ Sₖ) ]  -  0.5 tr(H_p⁻¹ Xᵀ ∂W/∂λₖ X).
-        //          No β̂ᵀ Sₖ β̂ term remains.  The non-Gaussian branch therefore leaves the beta_term code
-        //          commented out and assembles
-        //          gradient[k] = 0.5 * λₖ * (s_inv_trace_term − trace_term) - 0.5 * weight_deriv_term.
+        //          depends on β̂, the total derivative includes dW/dλₖ via β̂.  Differentiating the
+        //          optimality condition for β̂ gives
+        //          ∂β̂/∂λₖ = −λₖ H_p⁻¹ Sₖ β̂.  The penalized log-likelihood L(β̂, λ) still obeys the
+        //          envelope theorem, so dL/dλₖ = −½ β̂ᵀ Sₖ β̂ (no implicit term).
+        //          The resulting cost gradient combines four pieces:
+        //            +½ λₖ β̂ᵀ Sₖ β̂
+        //            +½ λₖ tr(H_p⁻¹ Sₖ)
+        //            +½ tr(H_p⁻¹ Xᵀ ∂W/∂λₖ X)
+        //            −½ λₖ tr(S_λ⁺ Sₖ)
         //
         // Stage: Remember that the sign of ∂β̂/∂λₖ matters; from the implicit-function theorem the linear solve reads
         //     −H_p (∂β̂/∂λₖ) = λₖ Sₖ β̂, giving the minus sign used above.  With that sign the indirect and
@@ -5171,87 +5169,236 @@ pub mod internal {
                 }
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
-                    println!("Pre-computing for gradient calculation (LAML)...");
-
-                    // Include the missing derivative of the penalized log-likelihood part via FD.
-                    // This ensures exact consistency with the COST used in compute_cost.
-                    let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
-
-                    // Full numerical derivative of 0.5·log|H_eff(ρ)| for exact consistency with cost
-                    let g_half_logh = self.numeric_half_logh_grad_with_workspace(p, workspace)?;
-
-                    // No explicit deviance-by-beta channel here; we rely on numeric components for consistency.
-
-                    // Use stabilized derivatives of log|Sλ|_+ directly from the reparameterization:
-                    // det1[k] = λ_k tr(S_λ^+ S_k) in the stabilized basis.
-                    let det1_full = pirls_result.reparam_result.det1.clone();
-                    eprintln!("[Sλ] Using stabilized det1 from reparam: {:?}", det1_full);
-
-                    // Report current ½·log|H_eff| using the same stabilized path as cost
-                    let h_eff_m = h_eff.clone();
-                    let half_logh_val = match h_eff_m.cholesky(Side::Lower) {
-                        Ok(l) => l.diag().mapv(f64::ln).sum(),
-                        Err(_) => match h_eff_m.eigh(Side::Lower) {
-                            Ok((eigs, _)) => eigs
-                                .iter()
-                                .map(|&ev| (ev + LAML_RIDGE).max(LAML_RIDGE))
-                                .map(|ev| 0.5 * ev.ln())
-                                .sum(),
-                            Err(_) => f64::NAN,
-                        },
-                    };
-                    // Try to get min eigen for quick conditioning diagnostics
-                    let min_eig_opt = h_eff_m
-                        .eigh(Side::Lower)
-                        .ok()
-                        .and_then(|(e, _)| e.iter().cloned().reduce(f64::min));
-                    if let Some(min_eig) = min_eig_opt {
-                        eprintln!(
-                            "[H_eff] ½·log|H|={:.6e}  min_eig={:.3e}",
-                            half_logh_val, min_eig
-                        );
+                    // Replace FD with implicit differentiation for logit models.
+                    if !matches!(self.config.link_function(), LinkFunction::Logit) {
+                        let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
+                        let g_half_logh =
+                            self.numeric_half_logh_grad_with_workspace(p, workspace)?;
+                        let det1_full = pirls_result.reparam_result.det1.clone();
+                        let mut laml_grad = Vec::with_capacity(lambdas.len());
+                        for k in 0..lambdas.len() {
+                            let gradient_value =
+                                g_pll[k] + g_half_logh[k] - 0.5 * det1_full[k];
+                            laml_grad.push(gradient_value);
+                        }
+                        workspace
+                            .cost_gradient_view(len)
+                            .assign(&Array1::from_vec(laml_grad));
+                        // Continue to prior-gradient adjustment below.
                     } else {
-                        eprintln!("[H_eff] ½·log|H|={:.6e}", half_logh_val);
+                        let factor_g = self.get_faer_factor(p, h_eff);
+
+                        // --- trace(H^-1 S_k) terms via shared solves with R_k^T ---
+                        workspace.reset_block_ranges();
+                        let mut total_rank = 0;
+                        for rt in rs_transposed {
+                            let cols = rt.ncols();
+                            workspace.block_ranges.push((total_rank, total_rank + cols));
+                            total_rank += cols;
+                        }
+                        workspace.solved_rows = h_eff.nrows();
+                        if total_rank > 0 {
+                            workspace.concat.fill(0.0);
+                            let rows = h_eff.nrows();
+                            for ((start, end), rt) in
+                                workspace.block_ranges.iter().zip(rs_transposed.iter())
+                            {
+                                if *end > *start {
+                                    workspace
+                                        .concat
+                                        .slice_mut(s![..rows, *start..*end])
+                                        .assign(rt);
+                                }
+                            }
+                            let rows = h_eff.nrows();
+                            let cols = total_rank;
+                            {
+                                let mut solved_slice =
+                                    workspace.solved.slice_mut(s![..rows, ..cols]);
+                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
+                                if let Some(slice) = solved_slice.as_slice_mut() {
+                                    let mut solved_view =
+                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
+                                    factor_g.solve_in_place(solved_view.as_mut());
+                                } else {
+                                    let mut temp = faer::Mat::from_fn(
+                                        rows,
+                                        cols,
+                                        |i, j| solved_slice[(i, j)],
+                                    );
+                                    factor_g.solve_in_place(temp.as_mut());
+                                    for j in 0..cols {
+                                        for i in 0..rows {
+                                            solved_slice[(i, j)] = temp[(i, j)];
+                                        }
+                                    }
+                                }
+                            }
+                            workspace.solved_rows = rows;
+                        } else {
+                            workspace.solved_rows = 0;
+                        }
+
+                        // --- H^-1 for leverage-like diagonal ---
+                        let p_dim = h_eff.nrows();
+                        let mut identity = Array2::<f64>::zeros((p_dim, p_dim));
+                        for i in 0..p_dim {
+                            identity[[i, i]] = 1.0;
+                        }
+                        let identity_view = FaerArrayView::new(&identity);
+                        let h_inv = factor_g.solve(identity_view.as_ref());
+                        let h_inv_arr =
+                            Array2::from_shape_fn((p_dim, p_dim), |(i, j)| h_inv[(i, j)]);
+
+                        let x_transformed = &pirls_result.x_transformed;
+                        let mut hdiag = Array1::<f64>::zeros(x_transformed.nrows());
+                        match x_transformed {
+                            DesignMatrix::Dense(x_dense) => {
+                                for i in 0..x_dense.nrows() {
+                                    let row = x_dense.row(i);
+                                    let mut quad = 0.0;
+                                    for a in 0..p_dim {
+                                        let xa = row[a];
+                                        if xa == 0.0 {
+                                            continue;
+                                        }
+                                        let mut acc = 0.0;
+                                        for b in 0..p_dim {
+                                            acc += h_inv_arr[[a, b]] * row[b];
+                                        }
+                                        quad += xa * acc;
+                                    }
+                                    hdiag[i] = quad;
+                                }
+                            }
+                            DesignMatrix::Sparse(_) => {
+                                if let Some(x_csr) = x_transformed.to_csr_cache() {
+                                    let x_view = x_csr.as_ref();
+                                    for i in 0..x_csr.nrows() {
+                                        let vals = x_view.val_of_row(i);
+                                        let cols: Vec<usize> =
+                                            x_view.col_idx_of_row(i).collect();
+                                        if cols.len() != vals.len() {
+                                            return Err(EstimationError::InvalidInput(
+                                                "sparse row value/index length mismatch".to_string(),
+                                            ));
+                                        }
+                                        let mut quad = 0.0;
+                                        for (idx_a, &col_a) in cols.iter().enumerate() {
+                                            let val_a = vals[idx_a];
+                                            for (idx_b, &col_b) in cols.iter().enumerate() {
+                                                let val_b = vals[idx_b];
+                                                quad += val_a * h_inv_arr[[col_a, col_b]] * val_b;
+                                            }
+                                        }
+                                        hdiag[i] = quad;
+                                    }
+                                } else {
+                                    let x_dense = x_transformed.to_dense();
+                                    for i in 0..x_dense.nrows() {
+                                        let row = x_dense.row(i);
+                                        let mut quad = 0.0;
+                                        for a in 0..p_dim {
+                                            let xa = row[a];
+                                            if xa == 0.0 {
+                                                continue;
+                                            }
+                                            let mut acc = 0.0;
+                                            for b in 0..p_dim {
+                                                acc += h_inv_arr[[a, b]] * row[b];
+                                            }
+                                            quad += xa * acc;
+                                        }
+                                        hdiag[i] = quad;
+                                    }
+                                }
+                            }
+                        }
+
+                        // --- dW/deta (logit) ---
+                        const MIN_WEIGHT: f64 = 1e-12;
+                        const PROB_EPS: f64 = 1e-8;
+                        let mu = &pirls_result.final_mu;
+                        let prior_weights = self.weights;
+                        let mut dw_deta = Array1::<f64>::zeros(mu.len());
+                        for i in 0..mu.len() {
+                            let mu_i = mu[i];
+                            let at_bound = mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS;
+                            let dmu = mu_i * (1.0 - mu_i);
+                            if at_bound || dmu <= MIN_WEIGHT {
+                                dw_deta[i] = 0.0;
+                            } else {
+                                dw_deta[i] = prior_weights[i] * dmu * (1.0 - 2.0 * mu_i);
+                            }
+                        }
+
+                        // --- ∂β̂/∂ρ_k via implicit differentiation ---
+                        let k_count = lambdas.len();
+                        let beta_ref = beta_transformed;
+                        let mut rhs = Array2::<f64>::zeros((p_dim, k_count));
+                        let mut beta_terms = Array1::<f64>::zeros(k_count);
+                        for k in 0..k_count {
+                            let r_k = &rs_transformed[k];
+                            let r_beta = r_k.dot(beta_ref);
+                            let s_k_beta = r_k.t().dot(&r_beta);
+                            beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                            for i in 0..p_dim {
+                                rhs[[i, k]] = -lambdas[k] * s_k_beta[i];
+                            }
+                        }
+                        let rhs_view = FaerArrayView::new(&rhs);
+                        let d_beta_mat = factor_g.solve(rhs_view.as_ref());
+                        let d_beta =
+                            Array2::from_shape_fn((p_dim, k_count), |(i, j)| d_beta_mat[(i, j)]);
+
+                        // --- Assemble gradient ---
+                        let det1_values = &pirls_result.reparam_result.det1;
+                        let solved_rows = workspace.solved_rows;
+                        let block_ranges_ref = &workspace.block_ranges;
+                        let solved_ref = &workspace.solved;
+                        let concat_ref = &workspace.concat;
+
+                        let mut laml_grad = Vec::with_capacity(k_count);
+                        for k in 0..k_count {
+                            let trace_h_inv_s_k = if solved_rows > 0 {
+                                let (start, end) = block_ranges_ref[k];
+                                if end > start {
+                                    let solved_block =
+                                        solved_ref.slice(s![..solved_rows, start..end]);
+                                    let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
+                                    kahan_sum(
+                                        solved_block
+                                            .iter()
+                                            .zip(rt_block.iter())
+                                            .map(|(&x, &y)| x * y),
+                                    )
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
+
+                            let trace_term = lambdas[k] * trace_h_inv_s_k;
+                            let log_det_s_grad_term = 0.5 * det1_values[k];
+
+                            let d_beta_col = d_beta.column(k).to_owned();
+                            let d_eta = x_transformed.matrix_vector_multiply(&d_beta_col);
+                            let mut weight_term = 0.0;
+                            for i in 0..d_eta.len() {
+                                weight_term += hdiag[i] * dw_deta[i] * d_eta[i];
+                            }
+
+                            let gradient_value = 0.5 * beta_terms[k]
+                                + 0.5 * trace_term
+                                + 0.5 * weight_term
+                                - log_det_s_grad_term;
+                            laml_grad.push(gradient_value);
+                        }
+                        workspace
+                            .cost_gradient_view(len)
+                            .assign(&Array1::from_vec(laml_grad));
                     }
-
-                    // Summaries of numeric components (helpful in release logs)
-                    let sum_pll = g_pll.sum();
-                    let sum_half_logh = g_half_logh.sum();
-                    let sum_neg_half_logs: f64 = det1_full.iter().map(|&val| -0.5 * val).sum();
-                    eprintln!(
-                        "[LAML sum] Σ d(-ℓ_p)={:+.6e}  Σ ½ dlog|H|={:+.6e}  Σ (-½ dlog|S|)={:+.6e}",
-                        sum_pll, sum_half_logh, sum_neg_half_logs
-                    );
-
-                    // --- Loop through penalties to assemble gradient components ---
-                    let det1_full_ref = &det1_full;
-                    let g_pll_ref = &g_pll;
-                    let g_half_logh_ref = &g_half_logh;
-                    let assemble_laml_grad = |k: usize| -> f64 {
-                        let log_det_h_grad_term = g_half_logh_ref[k];
-                        let log_det_s_grad_term = 0.5 * det1_full_ref[k];
-                        let pll_grad_term = g_pll_ref[k];
-                        let gradient_value =
-                            pll_grad_term + log_det_h_grad_term - log_det_s_grad_term;
-                        eprintln!(
-                            "[LAML g] k={k} d(-ℓ_p)={:+.6e}  +½ dlog|H|(full)={:+.6e}  -½ dlog|S|={:+.6e}  => g={:+.6e}",
-                            pll_grad_term,
-                            log_det_h_grad_term,
-                            -0.5 * det1_full_ref[k],
-                            gradient_value
-                        );
-                        gradient_value
-                    };
-
-                    let mut laml_grad = Vec::with_capacity(lambdas.len());
-                    for k in 0..lambdas.len() {
-                        laml_grad.push(assemble_laml_grad(k));
-                    }
-                    workspace
-                        .cost_gradient_view(len)
-                        .assign(&Array1::from_vec(laml_grad));
-                    // mgcv-style assembly
-                    println!("LAML gradient computation finished.");
                 }
             }
 
