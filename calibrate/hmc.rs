@@ -688,7 +688,7 @@ mod survival_hmc {
         }
 
         // Compute statistics
-        let posterior_mean = samples.mean_axis(Axis(0)).unwrap();
+        let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
         let posterior_std = samples.std_axis(Axis(0), 0.0);
         let rhat = f64::from(run_stats.rhat.mean);
         let ess = f64::from(run_stats.ess.mean);
