@@ -68,6 +68,7 @@ pub struct GamLogitWorkingModel<'a> {
     mu: Array1<f64>,
     weights: Array1<f64>,
     working_response: Array1<f64>,
+    weighted_design: Array2<f64>,
 }
 
 impl<'a> GamLogitWorkingModel<'a> {
@@ -79,6 +80,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         penalty: &Array2<f64>,
     ) -> Self {
         let n = design.nrows();
+        let p = design.ncols();
         Self {
             design,
             offset: offset.to_owned(),
@@ -88,6 +90,7 @@ impl<'a> GamLogitWorkingModel<'a> {
             mu: Array1::zeros(n),
             weights: Array1::zeros(n),
             working_response: Array1::zeros(n),
+            weighted_design: Array2::zeros((n, p)),
         }
     }
 
@@ -133,16 +136,15 @@ impl<'a> GamLogitWorkingModel<'a> {
 
         // Compute X^T W X efficiently using weighted design matrix
         // First create sqrt(W) * X
-        let mut weighted_design = Array2::<f64>::zeros((n, p));
         for (i, &w) in self.weights.iter().enumerate() {
             let sqrt_w = w.sqrt();
             for j in 0..p {
-                weighted_design[[i, j]] = sqrt_w * self.design[[i, j]];
+                self.weighted_design[[i, j]] = sqrt_w * self.design[[i, j]];
             }
         }
 
         // Compute X^T W X = (sqrt(W) * X)^T * (sqrt(W) * X)
-        let mut hessian = fast_ata(&weighted_design);
+        let mut hessian = fast_ata(&self.weighted_design);
 
         for j in 0..p.min(self.penalty.nrows()) {
             for k in 0..p.min(self.penalty.ncols()) {
