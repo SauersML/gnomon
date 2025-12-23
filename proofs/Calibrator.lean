@@ -682,6 +682,19 @@ lemma rawOptimal_implies_orthogonality
   -- h_opt.is_optimal to get the inequality, then taking the limit as ε → 0.
   -- This involves Calculus (derivatives of integrals) or the algebraic
   -- manipulation shown above.
+  --
+  -- **Formal Proof Outline**:
+  -- 1. Construct a "competitor" raw score model `m'` with a slightly perturbed
+  --    intercept `a' = a + ε`. This is a valid raw model.
+  -- 2. By `h_opt.is_optimal`, the risk of `model` is less than or equal to the
+  --    risk of `m'`: `R(a,b) ≤ R(a+ε, b)`.
+  -- 3. The risk function is a quadratic in its parameters. Expanding the inequality
+  --    `E[(Y - (a+b·P))²] ≤ E[(Y - (a+ε+b·P))²]` simplifies to
+  --    `0 ≤ ε² - 2ε·E[Y - (a+b·P)]`.
+  -- 4. This must hold for all `ε`. If `E[...] > 0`, a small positive `ε` violates it.
+  --    If `E[...] < 0`, a small negative `ε` violates it. Thus `E[...] = 0`.
+  -- 5. A similar argument with a perturbed slope `b' = b + ε` shows that
+  --    `E[(Y - (a+b·P))·P] = 0`.
 
   constructor
   · -- Orthogonality with 1: E[residual] = 0
