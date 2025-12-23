@@ -94,6 +94,12 @@ pub struct CalibratorModel {
     #[serde(default)]
     pub interaction_center_pred: Option<f64>,
 
+    // SE is log-transformed before standardization for better variance modeling.
+    // Log-space is natural for variance (multiplicative effects, like GAMLSS).
+    // Default true for new models; false for backwards compatibility with old serialized models.
+    #[serde(default = "default_true")]
+    pub se_log_space: bool,
+
     // Flag for SE wiggle-only drop when SE range is negligible
     #[serde(alias = "se_linear_fallback")]
     pub se_wiggle_only_drop: bool,
@@ -258,6 +264,7 @@ pub struct InternalSchema {
     pub standardize_dist: (f64, f64),
     pub interaction_center_pred: f64,
     pub se_wiggle_only_drop: bool,
+    pub se_log_space: bool,
     pub dist_wiggle_only_drop: bool,
     pub penalty_nullspace_dims: (usize, usize, usize, usize),
     pub column_spans: (
@@ -482,7 +489,18 @@ pub fn compute_alo_features(
 
             let wi = base.final_weights[obs].max(1e-12);
 
+            // NOTE: If the original weight w_i is zero (e.g., near-separation in logistic
+            // regression), then u_i = sqrt(w_i) * x_i = 0, so quad = 0 and var_full = 0.
+            // This results in SE = 0, which incorrectly implies infinite confidence.
+            // In practice, zero weights only occur at complete separation (μ=0 or μ=1),
+            // which indicates a degenerate fit. We warn if this happens.
             let var_full = phi * (quad / wi);
+            if var_full == 0.0 && base.final_weights[obs] < 1e-10 {
+                eprintln!(
+                    "[CAL] WARNING: obs {} has near-zero weight ({:.2e}) resulting in SE=0",
+                    obs, base.final_weights[obs]
+                );
+            }
             let se_full = var_full.max(0.0).sqrt();
 
             // Use naive (full-sample) SE for train/inference consistency.
@@ -900,10 +918,16 @@ pub fn build_calibrator_design(
     // backbone features for both the free identity column and the penalized
     // spline so train and serve stay aligned.
     let (pred_mean, pred_std_raw) = mean_and_std_raw(&features.pred_identity, weight_opt);
-    let (se_mean, se_std_raw) = mean_and_std_raw(&features.se, weight_opt);
+
+    // SE is log-transformed for better variance modeling:
+    // - SEs span orders of magnitude; log-space gives uniform resolution
+    // - Variance acts multiplicatively (2× inflation means the same at any base level)
+    // - This matches GAMLSS convention where log(σ) ~ Xβ
+    let se_log = features.se.mapv(|s| (s.max(1e-12)).ln());
+    let (se_mean, se_std_raw) = mean_and_std_raw(&se_log, weight_opt);
 
     // --- Check SE variability BEFORE standardization ---
-    // Detect near-constant SE values that would lead to numerical issues
+    // Detect near-constant log(SE) values that would lead to numerical issues
     let se_wiggle_only_drop = se_std_raw < 1e-8_f64;
     if se_wiggle_only_drop {
         eprintln!(
@@ -1032,7 +1056,7 @@ pub fn build_calibrator_design(
     // Center the predictor on the Fisher-weighted mean so interaction terms shrink toward c
     // in the geometry used for REML.
     let pred_centered = features.pred_identity.mapv(|x| x - pred_mean_fisher);
-    let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &features.se);
+    let (se_std, se_ms) = standardize_with(se_mean, se_std_raw, &se_log);
     let (dist_std, dist_ms) = if use_wiggle_only_dist {
         // Center only for wiggle-only drop to avoid extreme scaling
         (dist_raw.mapv(|x| x - dist_mean), (dist_mean, 1.0))
@@ -1875,6 +1899,7 @@ pub fn build_calibrator_design(
         standardize_dist: dist_ms,
         interaction_center_pred: pred_mean_fisher,
         se_wiggle_only_drop,
+        se_log_space: true, // Always use log-space SE in new models
         dist_wiggle_only_drop: use_wiggle_only_dist,
         penalty_nullspace_dims: (
             pred_null_dim,
@@ -1922,7 +1947,15 @@ pub fn predict_calibrator(
     let (md, sd) = model.standardize_dist;
     let pred_std = pred.mapv(|x| (x - mp) / sp.max(1e-8_f64));
     let pred_centered = pred.mapv(|x| x - pred_center);
-    let se_std = se.mapv(|x| (x - ms) / ss.max(1e-8_f64));
+
+    // Apply log-transform to SE if model was trained with log-space SE
+    // This matches the transform in build_calibrator_design for train/inference consistency
+    let se_for_std = if model.se_log_space {
+        se.mapv(|s| (s.max(1e-12)).ln())
+    } else {
+        se.to_owned()
+    };
+    let se_std = se_for_std.mapv(|x| (x - ms) / ss.max(1e-8_f64));
 
     // Important: Apply hinge in raw space before standardization,
     // matching exactly the same operation order as in build_calibrator_design
@@ -4856,6 +4889,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5026,6 +5060,7 @@ mod tests {
                 standardize_se: schema.standardize_se,
                 standardize_dist: schema.standardize_dist,
                 interaction_center_pred: Some(schema.interaction_center_pred),
+                se_log_space: schema.se_log_space,
                 se_wiggle_only_drop: schema.se_wiggle_only_drop,
                 dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
                 lambda_pred: lambdas[0],
@@ -5193,6 +5228,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5355,6 +5391,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -5729,6 +5766,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -6024,6 +6062,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -6136,6 +6175,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],
@@ -7447,6 +7487,7 @@ mod tests {
             standardize_se: schema.standardize_se,
             standardize_dist: schema.standardize_dist,
             interaction_center_pred: Some(schema.interaction_center_pred),
+            se_log_space: schema.se_log_space,
             se_wiggle_only_drop: schema.se_wiggle_only_drop,
             dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
             lambda_pred: lambdas[0],

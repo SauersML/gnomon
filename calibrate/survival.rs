@@ -2619,6 +2619,7 @@ mod tests {
             standardize_se: (0.0, 1.0),
             standardize_dist: (0.0, 1.0),
             interaction_center_pred: None,
+            se_log_space: true,
             se_wiggle_only_drop: false,
             dist_wiggle_only_drop: false,
             lambda_pred: 1.0,
