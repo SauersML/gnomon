@@ -1557,7 +1557,12 @@ lemma risk_affine_additive
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (β a b : ℝ) :
+    (β a b : ℝ)
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ) :
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
   -- Let u = 1 - b
@@ -1597,9 +1602,40 @@ lemma risk_affine_additive
           + 2*u*β * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
           - 2*u*a * (∫ pc, pc.1 ∂μ)
           - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
-        -- This step requires integral linearity and integrability hypotheses
-        -- The integrability of P, P², C, C², PC all follow from the finite moment assumptions
-        sorry -- Integral linearity (requires integrability of all terms)
+        -- This step requires integral linearity, which is now proven.
+        -- First, show each term in the expansion is integrable.
+        have i_p2  := hP2_int.const_mul (u ^ 2)
+        have i_c2  := hC2_int.const_mul (β ^ 2)
+        have i_a2  : Integrable (fun _ => a ^ 2) μ := integrable_const (a ^ 2)
+        have i_pc  := hPC_int.const_mul (2 * u * β)
+        have i_p   := hP_int.const_mul (-2 * u * a)
+        have i_c   := hC_int.const_mul (-2 * a * β)
+
+        -- Rewrite the integrand as a sum of integrable functions to apply linearity.
+        have h_integrand_rw :
+          (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+            + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩ - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩) =
+          (fun pc => u^2 * pc.1^2)
+          + ((fun pc => β^2 * (pc.2 ⟨0, by norm_num⟩)^2)
+          + ((fun _ => a^2)
+          + ((fun pc => 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩)
+          + ((fun pc => -2*u*a * pc.1)
+          + (fun pc => -2*a*β * pc.2 ⟨0, by norm_num⟩))))) := by funext pc; ring
+        rw [h_integrand_rw]
+
+        -- Apply linearity of the integral step-by-step.
+        rw [integral_add i_p2 (i_c2.add(i_a2.add(i_pc.add(i_p.add i_c))))]
+        rw [integral_add i_c2 (i_a2.add(i_pc.add(i_p.add i_c)))]
+        rw [integral_add i_a2 (i_pc.add(i_p.add i_c))]
+        rw [integral_add i_pc (i_p.add i_c)]
+        rw [integral_add i_p i_c]
+
+        -- Pull out all constant factors.
+        rw [integral_const_mul, integral_const_mul, integral_const, integral_const_mul, integral_const_mul, integral_const_mul]
+        -- Simplify integral of 1 over a probability measure.
+        simp [measure_univ]
+        -- The goal is now an algebraic identity.
+        ring
       _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
           + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
         rw [hP2, hPC0, hP0, hC0]
@@ -1615,7 +1651,12 @@ lemma risk_affine_scenario4
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (a b : ℝ) :
+    (a b : ℝ)
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ) :
     ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
   -- p - 0.8*c = p + (-0.8)*c, so this is risk_affine_additive with β = -0.8
@@ -1632,6 +1673,7 @@ lemma risk_affine_scenario4
 
   -- Apply the general lemma
   have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 (-0.8) a b
+    hP_int hC_int hP2_int hC2_int hPC_int
 
   -- Simplify (-0.8)² = 0.64
   simp only [neg_mul] at h_gen ⊢
@@ -1678,6 +1720,11 @@ lemma optimal_coefficients_via_risk
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
     (hC2_pos : 0 ≤ ∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
     (β a b : ℝ)
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ)
     -- Optimality: (a,b) achieves minimal risk among all affine predictors
     (h_opt : ∀ a' b' : ℝ,
       ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ ≤
@@ -1693,7 +1740,9 @@ lemma optimal_coefficients_via_risk
 
   -- Step 1: Apply risk_affine_additive to get closed-form risks
   have h_risk := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 β a b
+    hP_int hC_int hP2_int hC2_int hPC_int
   have h_risk_ref := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 β 0 1
+    hP_int hC_int hP2_int hC2_int hPC_int
 
   -- Step 2: Risk at (0,1) is the global minimum β²·C²
   have h_ref_val : (0 : ℝ)^2 + (1 - 1)^2 + β^2 * C2 = β^2 * C2 := by ring
