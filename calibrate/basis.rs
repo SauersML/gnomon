@@ -988,9 +988,10 @@ mod internal {
     ///
     /// IMPORTANT: Do not clamp `x` to the knot domain here. Upstream Peeled Hull
     /// Clamping (PHC) provides geometric projection. This function must honor the
-    /// provided `x` value. For out-of-domain `x`, we select the boundary span so the
-    /// basis evaluates consistently (yielding zeros except at boundaries), without
-    /// altering `x` itself.
+    /// provided `x` value. For out-of-domain `x`, we select the boundary span and
+    /// evaluate the polynomial there. This results in polynomial extrapolation
+    /// (not zeros), which may produce large values far from the boundary. Callers
+    /// should use PHC or other projection to keep `x` within reasonable bounds.
     #[inline]
     pub(super) fn evaluate_splines_at_point_into(
         x: f64,

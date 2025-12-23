@@ -373,7 +373,7 @@ pub fn compute_alo_features(
     // Solve K S = Uᵀ once and reuse it to compute leverage and variances efficiently.
     let xtwx_view = FaerArrayView::new(&xtwx);
     let mut aii = Array1::<f64>::zeros(n);
-    let mut se_tilde = Array1::<f64>::zeros(n);
+    let mut se_naive = Array1::<f64>::zeros(n);
     let eta_hat = x_dense.dot(&base.beta_transformed);
     let z = &base.solve_working_response;
 
@@ -502,7 +502,7 @@ pub fn compute_alo_features(
             // At inference, we compute delta-method SE which is equivalent to se_full.
             // Using se_loo (ALO-inflated) would cause a train/inference mismatch
             // since new observations have no self-influence to correct for.
-            se_tilde[obs] = se_full;
+            se_naive[obs] = se_full;
 
             if diag_counter < max_diag_samples {
                 let c_i = ai / wi;
@@ -663,7 +663,7 @@ pub fn compute_alo_features(
 
     // Perform final sanity checks on ALO features before returning
     let has_nan_pred = pred.iter().any(|&x| x.is_nan());
-    let has_nan_se = se_tilde.iter().any(|&x| x.is_nan());
+    let has_nan_se = se_naive.iter().any(|&x| x.is_nan());
     let has_nan_dist = dist.iter().any(|&x| x.is_nan());
 
     if has_nan_pred || has_nan_se || has_nan_dist {
@@ -674,7 +674,7 @@ pub fn compute_alo_features(
         );
         eprintln!(
             "      - se: {} NaN values",
-            se_tilde.iter().filter(|&&x| x.is_nan()).count()
+            se_naive.iter().filter(|&&x| x.is_nan()).count()
         );
         eprintln!(
             "      - dist: {} NaN values",
@@ -687,7 +687,7 @@ pub fn compute_alo_features(
 
     Ok(CalibratorFeatures {
         pred,
-        se: se_tilde,
+        se: se_naive,
         dist,
         pred_identity: eta_hat,
         fisher_weights: base.final_weights.clone(),
