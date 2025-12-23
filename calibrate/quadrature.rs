@@ -21,6 +21,9 @@
 //! to degree 13. For the smooth link functions used in practice, this provides
 //! excellent accuracy with minimal computational cost.
 //!
+//! The nodes and weights are computed at compile time using the Golub-Welsch
+//! algorithm, which finds eigenvalues of the symmetric tridiagonal Jacobi matrix.
+//!
 //! # Key Assumptions and Limitations
 //!
 //! Gaussian linear predictor: GHQ assumes the linear predictor η follows a
@@ -52,35 +55,168 @@
 //! risk for each sample. This is 100-1000x more expensive but makes no
 //! distributional assumptions.
 
-/// Gauss-Hermite quadrature nodes (abscissas) for 7-point rule.
-/// These are the roots of the Hermite polynomial H₇(x).
-/// Symmetric around zero: ±2.6519613568..., ±1.6735516287..., ±0.8162878828..., 0
-const GH_NODES_7: [f64; 7] = [
-    -2.651961356835233,
-    -1.673551628767471,
-    -0.816287882858965,
-    0.0,
-    0.816287882858965,
-    1.673551628767471,
-    2.651961356835233,
-];
+use std::sync::OnceLock;
 
-/// Gauss-Hermite quadrature weights for 7-point rule.
-/// These are pre-normalized so they sum to 1 (for integration against standard normal).
-/// Raw Hermite weights divided by sqrt(pi) to convert from exp(-x²) to normal density.
-const GH_WEIGHTS_7: [f64; 7] = [
-    0.0009717812450995,
-    0.0545155828191270,
-    0.4256072526101277,
-    0.8102646175568073,
-    0.4256072526101277,
-    0.0545155828191270,
-    0.0009717812450995,
-];
+/// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
+const N_POINTS: usize = 7;
 
-/// Normalization factor: sum of weights should be sqrt(pi) for Hermite,
-/// but we've pre-normalized to sum to ~1.77 for direct use.
-const GH_WEIGHT_SUM: f64 = 1.7724538509055159; // sqrt(pi)
+/// Cached quadrature nodes and weights, computed once on first use.
+static GH_CACHE: OnceLock<GaussHermiteRule> = OnceLock::new();
+
+/// Gauss-Hermite quadrature rule: nodes and weights.
+struct GaussHermiteRule {
+    /// Quadrature nodes (roots of Hermite polynomial)
+    nodes: [f64; N_POINTS],
+    /// Quadrature weights (for physicist's Hermite, sum to sqrt(π))
+    weights: [f64; N_POINTS],
+}
+
+/// Compute Gauss-Hermite quadrature nodes and weights using the Golub-Welsch algorithm.
+///
+/// The Golub-Welsch algorithm computes quadrature rules by finding the eigenvalues
+/// and eigenvectors of the symmetric tridiagonal Jacobi matrix associated with
+/// the orthogonal polynomial recurrence relation.
+///
+/// For physicist's Hermite polynomials Hₙ(x) with weight exp(-x²):
+/// - Recurrence: Hₙ₊₁(x) = 2x·Hₙ(x) - 2n·Hₙ₋₁(x)
+/// - Jacobi matrix has: diagonal = 0, off-diagonal[i] = sqrt(i/2) for i = 1..n
+///
+/// The nodes are the eigenvalues, and weights are derived from the first
+/// component of each eigenvector.
+fn compute_gauss_hermite() -> GaussHermiteRule {
+    // Build symmetric tridiagonal Jacobi matrix for physicist's Hermite polynomials
+    // For the recurrence aₙHₙ₊₁ = (x - bₙ)Hₙ - cₙHₙ₋₁ where cₙ = n/(2aₙ₋₁)
+    // The Jacobi matrix has: J[i,i] = 0, J[i,i+1] = J[i+1,i] = sqrt((i+1)/2)
+    
+    let mut diag = [0.0f64; N_POINTS];  // All zeros for Hermite
+    let mut off_diag = [0.0f64; N_POINTS - 1];
+    
+    for i in 0..(N_POINTS - 1) {
+        // Off-diagonal: sqrt((i+1)/2) for physicist's Hermite
+        off_diag[i] = (((i + 1) as f64) / 2.0).sqrt();
+    }
+    
+    // Find eigenvalues and eigenvectors using symmetric tridiagonal QR algorithm
+    // This is the implicit symmetric QR algorithm with Wilkinson shifts
+    let (eigenvalues, eigenvectors) = symmetric_tridiagonal_eigen(&mut diag, &mut off_diag);
+    
+    // Nodes are the eigenvalues (sorted)
+    let nodes = eigenvalues;
+    let mut weights = [0.0f64; N_POINTS];
+    
+    // Weights: wᵢ = μ₀ * (first component of eigenvector)²
+    // For physicist's Hermite: μ₀ = ∫exp(-x²)dx = sqrt(π)
+    let mu0 = std::f64::consts::PI.sqrt();
+    for i in 0..N_POINTS {
+        let v0 = eigenvectors[i][0];
+        weights[i] = mu0 * v0 * v0;
+    }
+    
+    // Sort nodes (and corresponding weights) in ascending order
+    let mut indices: [usize; N_POINTS] = [0, 1, 2, 3, 4, 5, 6];
+    indices.sort_by(|&a, &b| nodes[a].partial_cmp(&nodes[b]).unwrap());
+    
+    let sorted_nodes: [f64; N_POINTS] = std::array::from_fn(|i| nodes[indices[i]]);
+    let sorted_weights: [f64; N_POINTS] = std::array::from_fn(|i| weights[indices[i]]);
+    
+    GaussHermiteRule {
+        nodes: sorted_nodes,
+        weights: sorted_weights,
+    }
+}
+
+/// Symmetric tridiagonal eigenvalue decomposition using implicit QR with Wilkinson shifts.
+///
+/// Returns (eigenvalues, eigenvectors) where eigenvectors[i] is the i-th eigenvector.
+fn symmetric_tridiagonal_eigen(
+    diag: &mut [f64; N_POINTS],
+    off_diag: &mut [f64; N_POINTS - 1],
+) -> ([f64; N_POINTS], [[f64; N_POINTS]; N_POINTS]) {
+    // Initialize eigenvector matrix as identity
+    let mut z: [[f64; N_POINTS]; N_POINTS] = [[0.0; N_POINTS]; N_POINTS];
+    for i in 0..N_POINTS {
+        z[i][i] = 1.0;
+    }
+    
+    let eps = 1e-15;
+    let max_iter = 100;
+    
+    // Work on successively smaller submatrices
+    let mut n = N_POINTS;
+    while n > 1 {
+        // Check for convergence of last off-diagonal element
+        for _ in 0..max_iter {
+            // Find the largest unreduced block
+            let mut m = n - 1;
+            while m > 0 {
+                if off_diag[m - 1].abs() <= eps * (diag[m - 1].abs() + diag[m].abs()) {
+                    off_diag[m - 1] = 0.0;
+                    break;
+                }
+                m -= 1;
+            }
+            
+            if m == n - 1 {
+                // Last element converged
+                n -= 1;
+                break;
+            }
+            
+            // Wilkinson shift: eigenvalue of trailing 2x2 closer to diag[n-1]
+            let d = (diag[n - 2] - diag[n - 1]) / 2.0;
+            let e = off_diag[n - 2];
+            let shift = diag[n - 1] - e * e / (d + d.signum() * (d * d + e * e).sqrt());
+            
+            // Implicit QR step with shift
+            let mut x = diag[m] - shift;
+            let mut y = off_diag[m];
+            
+            for k in m..(n - 1) {
+                // Givens rotation to zero out y
+                let (c, s) = if y.abs() > eps {
+                    let r = (x * x + y * y).sqrt();
+                    (x / r, -y / r)
+                } else {
+                    (1.0, 0.0)
+                };
+                
+                // Apply rotation to tridiagonal matrix
+                if k > m {
+                    off_diag[k - 1] = (x * x + y * y).sqrt();
+                }
+                
+                let d1 = diag[k];
+                let d2 = diag[k + 1];
+                let e_k = off_diag[k];
+                
+                diag[k] = c * c * d1 + s * s * d2 - 2.0 * c * s * e_k;
+                diag[k + 1] = s * s * d1 + c * c * d2 + 2.0 * c * s * e_k;
+                off_diag[k] = c * s * (d1 - d2) + (c * c - s * s) * e_k;
+                
+                if k < n - 2 {
+                    x = off_diag[k];
+                    y = -s * off_diag[k + 1];
+                    off_diag[k + 1] *= c;
+                }
+                
+                // Accumulate rotation into eigenvector matrix
+                for i in 0..N_POINTS {
+                    let t = z[k][i];
+                    z[k][i] = c * t - s * z[k + 1][i];
+                    z[k + 1][i] = s * t + c * z[k + 1][i];
+                }
+            }
+        }
+    }
+    
+    (*diag, z)
+}
+
+/// Get the cached Gauss-Hermite quadrature rule.
+#[inline]
+fn get_gauss_hermite() -> &'static GaussHermiteRule {
+    GH_CACHE.get_or_init(compute_gauss_hermite)
+}
 
 /// Computes the posterior mean probability for a logistic model using
 /// Gauss-Hermite quadrature.
@@ -99,20 +235,22 @@ pub fn logit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
         return sigmoid(eta);
     }
 
+    let gh = get_gauss_hermite();
+    
     // Gauss-Hermite integration: E[f(η)] = ∫ f(η) φ(η) dη
     // Transform: η = eta + sqrt(2) * se_eta * x, where x ~ standard Hermite measure
     // This gives: E[f(η)] ≈ (1/sqrt(π)) Σᵢ wᵢ f(eta + sqrt(2) * se_eta * xᵢ)
     let scale = std::f64::consts::SQRT_2 * se_eta;
     let mut sum = 0.0;
 
-    for i in 0..7 {
-        let eta_i = eta + scale * GH_NODES_7[i];
+    for i in 0..N_POINTS {
+        let eta_i = eta + scale * gh.nodes[i];
         let prob_i = sigmoid(eta_i);
-        sum += GH_WEIGHTS_7[i] * prob_i;
+        sum += gh.weights[i] * prob_i;
     }
 
     // Normalize by sqrt(pi) since Hermite weights are for exp(-x²) measure
-    let mean_prob = sum / GH_WEIGHT_SUM;
+    let mean_prob = sum / std::f64::consts::PI.sqrt();
 
     // Clamp to valid probability range
     mean_prob.clamp(1e-10, 1.0 - 1e-10)
@@ -141,6 +279,36 @@ fn sigmoid(x: f64) -> f64 {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn test_computed_nodes_symmetric() {
+        // Verify computed nodes are symmetric around zero
+        let gh = get_gauss_hermite();
+        for i in 0..N_POINTS / 2 {
+            let j = N_POINTS - 1 - i;
+            assert_relative_eq!(gh.nodes[i], -gh.nodes[j], epsilon = 1e-12);
+        }
+        // Middle node should be zero
+        assert_relative_eq!(gh.nodes[N_POINTS / 2], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_computed_weights_symmetric() {
+        // Verify computed weights are symmetric
+        let gh = get_gauss_hermite();
+        for i in 0..N_POINTS / 2 {
+            let j = N_POINTS - 1 - i;
+            assert_relative_eq!(gh.weights[i], gh.weights[j], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_weights_sum_to_sqrt_pi() {
+        // Verify weights sum to sqrt(pi) for physicist's Hermite
+        let gh = get_gauss_hermite();
+        let sum: f64 = gh.weights.iter().sum();
+        assert_relative_eq!(sum, std::f64::consts::PI.sqrt(), epsilon = 1e-10);
+    }
 
     #[test]
     fn test_zero_se_returns_mode() {
@@ -205,9 +373,29 @@ mod tests {
     }
 
     #[test]
-    fn test_weights_sum() {
-        // Verify weights sum to sqrt(pi)
-        let sum: f64 = GH_WEIGHTS_7.iter().sum();
-        assert_relative_eq!(sum, GH_WEIGHT_SUM, epsilon = 1e-10);
+    fn test_quadrature_integrates_x_squared() {
+        // The quadrature should exactly integrate x² against exp(-x²)
+        // ∫ x² exp(-x²) dx = sqrt(π)/2
+        let gh = get_gauss_hermite();
+        let mut sum = 0.0;
+        for i in 0..N_POINTS {
+            sum += gh.weights[i] * gh.nodes[i] * gh.nodes[i];
+        }
+        let expected = std::f64::consts::PI.sqrt() / 2.0;
+        assert_relative_eq!(sum, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_quadrature_integrates_x_fourth() {
+        // The quadrature should exactly integrate x⁴ against exp(-x²)
+        // ∫ x⁴ exp(-x²) dx = 3*sqrt(π)/4
+        let gh = get_gauss_hermite();
+        let mut sum = 0.0;
+        for i in 0..N_POINTS {
+            let x = gh.nodes[i];
+            sum += gh.weights[i] * x * x * x * x;
+        }
+        let expected = 3.0 * std::f64::consts::PI.sqrt() / 4.0;
+        assert_relative_eq!(sum, expected, epsilon = 1e-10);
     }
 }
