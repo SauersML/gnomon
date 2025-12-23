@@ -483,58 +483,19 @@ pub fn compute_alo_features(
             let wi = base.final_weights[obs].max(1e-12);
 
             let var_full = phi * (quad / wi);
-
-            let denom_raw = 1.0 - ai;
-            if denom_raw <= 0.0 {
-                eprintln!(
-                    "[CAL] WARNING: 1 - a_ii is non-positive (i={}, a_ii={:.6e}); using epsilon for SE",
-                    obs, ai
-                );
-            }
-            let denom = denom_raw.max(1e-12);
-
-            let var_without_i = (var_full - phi * (ai * ai) / wi).max(0.0);
-            let denom_sq = denom * denom;
-            let var_loo = var_without_i / denom_sq;
             let se_full = var_full.max(0.0).sqrt();
-            let se_loo = var_loo.max(0.0).sqrt();
+
             // Use naive (full-sample) SE for train/inference consistency.
             // At inference, we compute delta-method SE which is equivalent to se_full.
-            // Using se_loo (ALO-inflated) would cause a train/inference mismatch
-            // since new observations have no self-influence to correct for.
+            // ALO-inflated SE would cause a mismatch since new observations have no self-influence.
             se_naive[obs] = se_full;
 
             if diag_counter < max_diag_samples {
-                let c_i = ai / wi;
-                let se_unw = c_i.max(0.0).sqrt();
-                println!("[GNOMON DIAG] ALO SE formula (obs {}):", obs);
+                println!("[GNOMON DIAG] SE formula (obs {}):", obs);
                 println!("  - w_i: {:.6e}", wi);
                 println!("  - a_ii: {:.6e}", ai);
-                println!("  - 1 - a_ii: {:.6e}", denom_raw);
-                println!("  - var_full (full sample): {:.6e}", var_full);
-                println!("  - var_without_i (remove obs i): {:.6e}", var_without_i);
-                println!("  - var_loo (inflated): {:.6e}", var_loo);
-                println!("  - SE_full (full sample): {:.6e}", se_full);
-                println!("  - SE_tilde (LOO): {:.6e}", se_loo);
-                println!("  - c_i = a_ii/w_i: {:.6e}", c_i);
-                println!("  - SE_unw (sqrt(c_i)): {:.6e}", se_unw);
-                let expected_ratio = {
-                    let infl = var_without_i / var_full.max(1e-24);
-                    if infl >= 0.0 {
-                        (infl.sqrt() / denom.max(1e-12)).abs()
-                    } else {
-                        f64::NAN
-                    }
-                };
-                println!(
-                    "  - Inflation SE_tilde/SE_full: {:.6e} (expected ≈ {:.6e})",
-                    if se_full > 0.0 {
-                        se_loo / se_full
-                    } else {
-                        f64::NAN
-                    },
-                    expected_ratio
-                );
+                println!("  - var_full: {:.6e}", var_full);
+                println!("  - SE_naive: {:.6e}", se_full);
                 diag_counter += 1;
             }
         }
