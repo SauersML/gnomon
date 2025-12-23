@@ -49,7 +49,7 @@ pub fn array1_to_col_mat_mut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
 #[inline]
 pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat, Par};
+    use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
     
@@ -69,7 +69,14 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
         let a_t = a_ref.transpose();
         
         // dst = A^T * A
-        matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, Par::Seq);
+        matmul(
+            result.as_mut(),
+            Accum::Replace,
+            a_t,
+            a_ref,
+            1.0,
+            get_global_parallelism(),
+        );
     } else {
         // Non-contiguous: need to copy to contiguous buffer
         let a_owned: Array2<f64> = a.to_owned();
@@ -77,7 +84,14 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
         let a_ref = MatRef::from_row_major_slice(slice, n, p);
         let a_t = a_ref.transpose();
         
-        matmul(result.as_mut(), Accum::Replace, a_t, a_ref, 1.0, Par::Seq);
+        matmul(
+            result.as_mut(),
+            Accum::Replace,
+            a_t,
+            a_ref,
+            1.0,
+            get_global_parallelism(),
+        );
     }
 
     // Convert back to ndarray
@@ -93,7 +107,7 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
     use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat, Par};
+    use faer::{Accum, Mat};
 
     let (n_a, p) = a.dim();
     let (n_b, q) = b.dim();
@@ -127,7 +141,14 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let b_ref = MatRef::from_row_major_slice(b_slice, n_b, q);
     
     // dst = A^T * B
-    matmul(result.as_mut(), Accum::Replace, a_ref.transpose(), b_ref, 1.0, Par::Seq);
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_ref.transpose(),
+        b_ref,
+        1.0,
+        get_global_parallelism(),
+    );
 
     Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
 }
@@ -140,7 +161,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
-    use faer::{Accum, Mat, Par};
+    use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
     debug_assert_eq!(n, v.len(), "A rows must match v length");
@@ -173,7 +194,14 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = MatRef::from_row_major_slice(v_slice, n, 1);
     
     // dst = A^T * v (treating v as n×1 matrix)
-    matmul(result.as_mut(), Accum::Replace, a_ref.transpose(), v_ref, 1.0, Par::Seq);
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_ref.transpose(),
+        v_ref,
+        1.0,
+        get_global_parallelism(),
+    );
 
     Array1::from_shape_fn(p, |i| result[(i, 0)])
 }

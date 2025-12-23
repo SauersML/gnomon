@@ -5241,37 +5241,40 @@ pub mod internal {
 
                         // --- H^-1 for leverage-like diagonal ---
                         let p_dim = h_eff.nrows();
-                        let mut identity = Array2::<f64>::zeros((p_dim, p_dim));
-                        for i in 0..p_dim {
-                            identity[[i, i]] = 1.0;
-                        }
-                        let identity_view = FaerArrayView::new(&identity);
-                        let h_inv = factor_g.solve(identity_view.as_ref());
-                        let h_inv_arr =
-                            Array2::from_shape_fn((p_dim, p_dim), |(i, j)| h_inv[(i, j)]);
-
                         let x_transformed = &pirls_result.x_transformed;
                         let mut hdiag = Array1::<f64>::zeros(x_transformed.nrows());
                         match x_transformed {
                             DesignMatrix::Dense(x_dense) => {
+                                let x_owned;
+                                let x_slice: &[f64] = if let Some(s) = x_dense.as_slice() {
+                                    s
+                                } else {
+                                    x_owned = x_dense.to_owned();
+                                    x_owned.as_slice().expect("dense copy is contiguous")
+                                };
+                                let x_ref = faer::MatRef::from_row_major_slice(
+                                    x_slice,
+                                    x_dense.nrows(),
+                                    x_dense.ncols(),
+                                );
+                                let z_t = factor_g.solve(x_ref.transpose());
                                 for i in 0..x_dense.nrows() {
-                                    let row = x_dense.row(i);
                                     let mut quad = 0.0;
-                                    for a in 0..p_dim {
-                                        let xa = row[a];
-                                        if xa == 0.0 {
-                                            continue;
-                                        }
-                                        let mut acc = 0.0;
-                                        for b in 0..p_dim {
-                                            acc += h_inv_arr[[a, b]] * row[b];
-                                        }
-                                        quad += xa * acc;
+                                    for j in 0..p_dim {
+                                        quad += x_dense[(i, j)] * z_t[(j, i)];
                                     }
                                     hdiag[i] = quad;
                                 }
                             }
                             DesignMatrix::Sparse(_) => {
+                                let mut identity = Array2::<f64>::zeros((p_dim, p_dim));
+                                for i in 0..p_dim {
+                                    identity[[i, i]] = 1.0;
+                                }
+                                let identity_view = FaerArrayView::new(&identity);
+                                let h_inv = factor_g.solve(identity_view.as_ref());
+                                let h_inv_arr =
+                                    Array2::from_shape_fn((p_dim, p_dim), |(i, j)| h_inv[(i, j)]);
                                 if let Some(x_csr) = x_transformed.to_csr_cache() {
                                     let x_view = x_csr.as_ref();
                                     for i in 0..x_csr.nrows() {
@@ -5350,6 +5353,42 @@ pub mod internal {
                         let d_beta_mat = factor_g.solve(rhs_view.as_ref());
                         let d_beta =
                             Array2::from_shape_fn((p_dim, k_count), |(i, j)| d_beta_mat[(i, j)]);
+                        let d_eta_all = match x_transformed {
+                            DesignMatrix::Dense(x_dense) => {
+                                let x_owned;
+                                let x_slice: &[f64] = if let Some(s) = x_dense.as_slice() {
+                                    s
+                                } else {
+                                    x_owned = x_dense.to_owned();
+                                    x_owned.as_slice().expect("dense copy is contiguous")
+                                };
+                                let x_ref = faer::MatRef::from_row_major_slice(
+                                    x_slice,
+                                    x_dense.nrows(),
+                                    x_dense.ncols(),
+                                );
+                                let d_beta_slice = d_beta
+                                    .as_slice()
+                                    .expect("d_beta should be contiguous");
+                                let d_beta_ref = faer::MatRef::from_row_major_slice(
+                                    d_beta_slice,
+                                    p_dim,
+                                    k_count,
+                                );
+                                let mut result =
+                                    faer::Mat::<f64>::zeros(x_dense.nrows(), k_count);
+                                faer::linalg::matmul::matmul(
+                                    result.as_mut(),
+                                    faer::Accum::Replace,
+                                    x_ref,
+                                    d_beta_ref,
+                                    1.0,
+                                    get_global_parallelism(),
+                                );
+                                Some(result)
+                            }
+                            _ => None,
+                        };
 
                         // --- Assemble gradient ---
                         let det1_values = &pirls_result.reparam_result.det1;
@@ -5382,11 +5421,17 @@ pub mod internal {
                             let trace_term = lambdas[k] * trace_h_inv_s_k;
                             let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                            let d_beta_col = d_beta.column(k).to_owned();
-                            let d_eta = x_transformed.matrix_vector_multiply(&d_beta_col);
                             let mut weight_term = 0.0;
-                            for i in 0..d_eta.len() {
-                                weight_term += hdiag[i] * dw_deta[i] * d_eta[i];
+                            if let Some(ref d_eta_all) = d_eta_all {
+                                for i in 0..hdiag.len() {
+                                    weight_term += hdiag[i] * dw_deta[i] * d_eta_all[(i, k)];
+                                }
+                            } else {
+                                let d_beta_col = d_beta.column(k).to_owned();
+                                let d_eta = x_transformed.matrix_vector_multiply(&d_beta_col);
+                                for i in 0..d_eta.len() {
+                                    weight_term += hdiag[i] * dw_deta[i] * d_eta[i];
+                                }
                             }
 
                             let gradient_value = 0.5 * beta_terms[k]
