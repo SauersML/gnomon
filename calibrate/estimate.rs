@@ -806,7 +806,7 @@ pub fn train_model(
         layout.total_coeffs, layout.num_penalties
     );
 
-    if matches!(config.link_function(), LinkFunction::Identity) {
+    if matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Identity) {
         let design_condition = calculate_condition_number(&x_matrix)
             .map_err(EstimationError::EigendecompositionFailed)?;
         if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
@@ -885,7 +885,7 @@ pub fn train_model(
             .dot(&final_fit.penalized_hessian_transformed)
             .dot(&qs.t());
         // Compute scale for Identity; 1.0 for Logit
-        let scale_val = match config.link_function() {
+        let scale_val = match config.link_function().expect("link_function called on survival model") {
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
                 // Weighted RSS over residuals divided by (n - edf)
@@ -1341,7 +1341,7 @@ pub fn train_model(
         .dot(&final_fit.penalized_hessian_transformed)
         .dot(&qs.t());
     // Compute scale for Identity; 1.0 for Logit
-    let scale_val = match config.link_function() {
+    let scale_val = match config.link_function().expect("link_function called on survival model") {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
             let mut fitted = reml_state.offset().to_owned();
@@ -1358,7 +1358,7 @@ pub fn train_model(
         }
     };
 
-    if let LinkFunction::Identity = config.link_function() {
+    if let LinkFunction::Identity = config.link_function().expect("link_function called on survival model") {
         let dp = final_fit.deviance + final_fit.stable_penalty_term;
         let (dp_c, _) = smooth_floor_dp(dp);
         let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
@@ -1446,7 +1446,7 @@ pub fn train_model(
             s_accum.view(),
             final_beta_original.view(),
             penalized_hessian_orig.view(),
-            matches!(config.link_function(), LinkFunction::Logit),
+            matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit),
             &nuts_config,
         ) {
             Ok(result) => {
@@ -1486,12 +1486,12 @@ pub fn train_model(
             reml_state.y(),
             x_raw.view(),
             hull_opt.as_ref(),
-            config.link_function(),
+            config.link_function().expect("link_function called on survival model"),
         )
         .map_err(|e| {
             EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
         })?;
-        if matches!(config.link_function(), LinkFunction::Logit)
+        if matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
             && let Some(ref samples) = mcmc_samples {
                 let mean_logit = mean_logit_from_samples(x_matrix.view(), samples)?;
                 features.pred = mean_logit.clone();
@@ -1510,7 +1510,7 @@ pub fn train_model(
         );
 
         let spec = cal::CalibratorSpec {
-            link: config.link_function(),
+            link: config.link_function().expect("link_function called on survival model"),
             // Use identical parameters for all three calibrator smooths
             pred_basis: crate::calibrate::model::BasisConfig {
                 num_knots: base_num_knots,
@@ -1530,7 +1530,7 @@ pub fn train_model(
             distance_enabled: has_pc_axes,
             distance_hinge: true,
             prior_weights: Some(reml_state.weights().to_owned()),
-            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function()),
+            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function().expect("link_function called on survival model")),
         };
 
         // Build design and penalties for calibrator
@@ -1555,7 +1555,7 @@ pub fn train_model(
                 offset.view(),
                 &penalties_cal,
                 &penalty_nullspace_dims,
-                config.link_function(),
+                config.link_function().expect("link_function called on survival model"),
                 &spec,
             )
             .map_err(|e| {
@@ -1572,7 +1572,7 @@ pub fn train_model(
                 edf_pair.1,
                 edf_pair.2,
                 edf_pair.3,
-                if config.link_function() == LinkFunction::Identity {
+                if config.link_function().expect("link_function called on survival model") == LinkFunction::Identity {
                     format!("; scale={:.3e}", scale_cal)
                 } else {
                     String::new()
@@ -1605,7 +1605,7 @@ pub fn train_model(
                 coefficients: beta_cal,
                 column_spans: schema.column_spans,
                 pred_param_range: schema.pred_param_range.clone(),
-                scale: if config.link_function() == LinkFunction::Identity {
+                scale: if config.link_function().expect("link_function called on survival model") == LinkFunction::Identity {
                     Some(scale_cal)
                 } else {
                     None
@@ -4018,7 +4018,7 @@ pub mod internal {
             let layout = self.layout;
             let config = self.config;
             let firth_bias = config.firth_bias_reduction;
-            let link_is_logit = matches!(config.link_function(), LinkFunction::Logit);
+            let link_is_logit = matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit);
             let balanced_root = &self.balanced_penalty_root;
 
             // Capture the current best beta to warm-start the gradient probes.
@@ -4423,7 +4423,7 @@ pub mod internal {
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
-            match self.config.link_function() {
+            match self.config.link_function().expect("link_function called on survival model") {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
                     // From Wood (2017), Chapter 6, Eq. 6.24:
@@ -4530,7 +4530,7 @@ pub mod internal {
                     let penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                     if self.config.firth_bias_reduction
-                        && matches!(self.config.link_function(), LinkFunction::Logit)
+                        && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
                     {
                         // Ignore the Firth log-determinant contribution when assembling
                         // the outer objective; it only stabilizes the coefficient solve.
@@ -4992,7 +4992,7 @@ pub mod internal {
             // Implement Wood (2011) exact REML/LAML gradient formulas
             // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
-            match self.config.link_function() {
+            match self.config.link_function().expect("link_function called on survival model") {
                 LinkFunction::Identity => {
                     // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
@@ -5170,7 +5170,7 @@ pub mod internal {
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // Replace FD with implicit differentiation for logit models.
-                    if !matches!(self.config.link_function(), LinkFunction::Logit) {
+                    if !matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit) {
                         let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                         let g_half_logh =
                             self.numeric_half_logh_grad_with_workspace(p, workspace)?;

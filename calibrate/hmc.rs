@@ -343,11 +343,15 @@ pub struct NutsResult {
 
 impl NutsResult {
     /// Computes the posterior mean of a function applied to coefficients.
+    /// Returns 0.0 if samples is empty to avoid divide-by-zero.
     pub fn posterior_mean_of<F>(&self, f: F) -> f64
     where
         F: Fn(ArrayView1<f64>) -> f64,
     {
         let n = self.samples.nrows();
+        if n == 0 {
+            return 0.0;
+        }
         let mut sum = 0.0;
         for i in 0..n {
             sum += f(self.samples.row(i));
@@ -356,11 +360,15 @@ impl NutsResult {
     }
 
     /// Computes percentiles of a function applied to coefficients.
+    /// Returns (0.0, 0.0) if samples is empty to avoid index-out-of-bounds.
     pub fn posterior_interval_of<F>(&self, f: F, lower_pct: f64, upper_pct: f64) -> (f64, f64)
     where
         F: Fn(ArrayView1<f64>) -> f64,
     {
         let n = self.samples.nrows();
+        if n == 0 {
+            return (0.0, 0.0);
+        }
         let mut values: Vec<f64> = (0..n).map(|i| f(self.samples.row(i))).collect();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -368,8 +376,8 @@ impl NutsResult {
         let upper_idx = ((upper_pct / 100.0) * n as f64).ceil() as usize;
 
         (
-            values[lower_idx.min(n - 1)],
-            values[upper_idx.min(n - 1)],
+            values[lower_idx.min(n.saturating_sub(1))],
+            values[upper_idx.min(n.saturating_sub(1))],
         )
     }
 }
@@ -442,12 +450,14 @@ pub fn run_nuts_sampling(
         }
     }
 
-    // Compute statistics (without run_progress diagnostics, use conservative estimates)
-    let posterior_mean = samples.mean_axis(Axis(0)).unwrap();
+    // Compute statistics
+    // TODO: Implement proper split-chain R-hat and ESS calculations for accurate diagnostics
+    // Currently using conservative placeholder values since run_progress() has blocking issues
+    let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
-    let rhat = 1.0; // Conservative - proper R-hat requires split-chain calculation
-    let ess = (total_samples as f64) * 0.5; // Conservative ESS estimate
-    let converged = true;
+    let rhat = 1.0; // PLACEHOLDER: proper R-hat requires split-chain calculation
+    let ess = (total_samples as f64) * 0.5; // PLACEHOLDER: conservative ESS estimate
+    let converged = total_samples > 0; // Only mark converged if we have samples
 
     Ok(NutsResult {
         samples,

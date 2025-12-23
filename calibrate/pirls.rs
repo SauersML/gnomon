@@ -4623,7 +4623,6 @@ fn compute_firth_hat_and_half_logdet(
             }
         }
     }
-    let mut fisher = fisher;
     ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
     let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {

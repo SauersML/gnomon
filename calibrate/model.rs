@@ -216,11 +216,11 @@ impl ModelConfig {
         }
     }
 
-    pub fn link_function(&self) -> LinkFunction {
+    pub fn link_function(&self) -> Result<LinkFunction, &'static str> {
         match &self.model_family {
-            ModelFamily::Gam(link) => *link,
+            ModelFamily::Gam(link) => Ok(*link),
             ModelFamily::Survival(_) => {
-                panic!("link_function requested for survival model family")
+                Err("link_function is not applicable for survival model family")
             }
         }
     }
@@ -2963,8 +2963,8 @@ mod tests {
 
         // Stage: Check model configuration
         assert_eq!(
-            loaded_model.config.link_function(),
-            original_model.config.link_function()
+            loaded_model.config.link_function().expect("link_function called on survival model"),
+            original_model.config.link_function().expect("link_function called on survival model")
         );
         assert_eq!(
             loaded_model.config.penalty_order,
