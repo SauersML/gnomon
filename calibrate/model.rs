@@ -1044,21 +1044,44 @@ impl TrainedModel {
                 )));
             }
 
+            // Pre-allocate scratch buffer for zero-allocation loop
+            let max_basis = artifacts.age_basis.knot_vector.len().max(100);
+            let max_pgs = 10;
+            let mut scratch = survival::SurvivalScratch::new(
+                artifacts.age_basis.degree,
+                max_basis,
+                max_pgs,
+            );
+            let mut entry_buf = Array1::<f64>::zeros(design_width);
+            let mut exit_buf = Array1::<f64>::zeros(design_width);
+
             let mut design_entry = Array2::<f64>::zeros((n, design_width));
             let mut design_exit = Array2::<f64>::zeros((n, design_width));
             for i in 0..n {
-                let cov_row = covariates.row(i).to_owned();
+                let cov_row = covariates.row(i);
                 let entry_age = age_entry[i];
                 let exit_age = age_exit[i];
-                let entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
-                let exit = survival::design_row_at_age(exit_age, cov_row.view(), artifacts)?;
-                if entry.len() != design_width || exit.len() != design_width {
+                survival::design_row_at_age_scratch(
+                    entry_age,
+                    cov_row,
+                    artifacts,
+                    &mut entry_buf,
+                    &mut scratch,
+                )?;
+                survival::design_row_at_age_scratch(
+                    exit_age,
+                    cov_row,
+                    artifacts,
+                    &mut exit_buf,
+                    &mut scratch,
+                )?;
+                if entry_buf.len() != design_width || exit_buf.len() != design_width {
                     return Err(ModelError::DimensionMismatch(
                         "Survival design reconstruction mismatch".to_string(),
                     ));
                 }
-                design_entry.row_mut(i).assign(&entry);
-                design_exit.row_mut(i).assign(&exit);
+                design_entry.row_mut(i).assign(&entry_buf);
+                design_exit.row_mut(i).assign(&exit_buf);
             }
 
             let mut hazard_entry = Array1::<f64>::zeros(n);
@@ -1224,23 +1247,35 @@ impl TrainedModel {
         let mut logit_risk = Array1::<f64>::zeros(n);
         let mut gradient = Array2::<f64>::zeros((n, design_width));
 
+        // Pre-allocate scratch buffer for zero-allocation loop
+        let max_basis = artifacts.age_basis.knot_vector.len().max(100);
+        let max_pgs = 10;
+        let mut scratch = survival::SurvivalScratch::new(
+            artifacts.age_basis.degree,
+            max_basis,
+            max_pgs,
+        );
+        let mut design_entry = Array1::<f64>::zeros(design_width);
+        let mut design_exit = Array1::<f64>::zeros(design_width);
+
         for i in 0..n {
-            let cov_row = covariates.row(i).to_owned();
+            let cov_row = covariates.row(i);
+            let cov_row_owned = cov_row.to_owned(); // For functions requiring Array1
             let entry_age = age_entry[i];
             let exit_age = age_exit[i];
 
-            let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row, artifacts)?;
-            let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row, artifacts)?;
+            let hazard_entry_val = survival::cumulative_hazard(entry_age, &cov_row_owned, artifacts)?;
+            let hazard_exit_val = survival::cumulative_hazard(exit_age, &cov_row_owned, artifacts)?;
             hazard_entry[i] = hazard_entry_val;
             hazard_exit[i] = hazard_exit_val;
 
-            let cif_entry_val = survival::cumulative_incidence(entry_age, &cov_row, artifacts)?;
-            let cif_exit_val = survival::cumulative_incidence(exit_age, &cov_row, artifacts)?;
+            let cif_entry_val = survival::cumulative_incidence(entry_age, &cov_row_owned, artifacts)?;
+            let cif_exit_val = survival::cumulative_incidence(exit_age, &cov_row_owned, artifacts)?;
             cif_entry[i] = cif_entry_val;
             cif_exit[i] = cif_exit_val;
 
-            let design_entry = survival::design_row_at_age(entry_age, cov_row.view(), artifacts)?;
-            let design_exit = survival::design_row_at_age(exit_age, cov_row.view(), artifacts)?;
+            survival::design_row_at_age_scratch(entry_age, cov_row, artifacts, &mut design_entry, &mut scratch)?;
+            survival::design_row_at_age_scratch(exit_age, cov_row, artifacts, &mut design_exit, &mut scratch)?;
             if design_entry.len() != design_width || design_exit.len() != design_width {
                 return Err(ModelError::DimensionMismatch(
                     "Survival design reconstruction mismatch".to_string(),
@@ -1250,7 +1285,7 @@ impl TrainedModel {
             let (risk_val, mut grad_row) = match risk_type {
                 SurvivalRiskType::Net => {
                     let risk = survival::conditional_absolute_risk(
-                        entry_age, exit_age, &cov_row, artifacts,
+                        entry_age, exit_age, &cov_row_owned, artifacts,
                     )?;
 
                     let eta_entry = design_entry.dot(coeffs);

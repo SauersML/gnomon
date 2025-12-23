@@ -1795,6 +1795,8 @@ fn enforce_covariate_ranges(
 }
 
 /// Reconstruct the design row at a given age for prediction.
+/// NOTE: This allocates a new SurvivalScratch per call. For batch prediction,
+/// use `design_row_at_age_scratch` with a pre-allocated scratch buffer.
 pub fn design_row_at_age(
     age: f64,
     covariates: ArrayView1<f64>,
@@ -1804,19 +1806,29 @@ pub fn design_row_at_age(
     Ok(design)
 }
 
+/// Non-allocating version of design_row_at_age for batch prediction.
+/// Reuses the provided scratch buffer and writes into the output array.
+pub fn design_row_at_age_scratch(
+    age: f64,
+    covariates: ArrayView1<f64>,
+    artifacts: &SurvivalModelArtifacts,
+    out: &mut Array1<f64>,
+    scratch: &mut SurvivalScratch,
+) -> Result<(), SurvivalError> {
+    let mut deriv_dummy = Array1::zeros(out.len());
+    design_and_derivative_at_age_scratch(age, covariates, artifacts, out, &mut deriv_dummy, scratch)
+}
+
 /// Compute both design row and its time derivative at a given age.
 fn design_and_derivative_at_age(
     age: f64,
     covariates: ArrayView1<f64>,
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<(Array1<f64>, Array1<f64>), SurvivalError> {
-    // This function now allocates! We should use design_and_derivative_at_age_scratch for performance.
-    // We keep this for compatibility and existing tests that don't care about allocs.
-
+    // This function allocates! Use design_and_derivative_at_age_scratch for performance.
     let total_cols = artifacts.coefficients.len();
 
-    // Just allocate buffers and delegate
-    let max_basis = artifacts.age_basis.knot_vector.len().max(100); // safe guess
+    let max_basis = artifacts.age_basis.knot_vector.len().max(100);
     let max_pgs = 10;
     let mut scratch = SurvivalScratch::new(artifacts.age_basis.degree, max_basis, max_pgs);
 
