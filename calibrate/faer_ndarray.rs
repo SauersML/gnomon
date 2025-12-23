@@ -98,6 +98,51 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
 }
 
+/// Compute A^T * A into a pre-allocated output buffer.
+/// `out` must be shaped (p, p) where A is (n, p).
+#[inline]
+pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array2<f64>) {
+    use faer::linalg::matmul::matmul;
+    use faer::Accum;
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(out.nrows(), p, "output rows must match p");
+    debug_assert_eq!(out.ncols(), p, "output cols must match p");
+
+    if n < 64 {
+        out.assign(&a.t().dot(a));
+        return;
+    }
+
+    let mut out_view = array2_to_mat_mut(out);
+
+    if let Some(slice) = a.as_slice() {
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        let a_t = a_ref.transpose();
+        matmul(
+            out_view.as_mut(),
+            Accum::Replace,
+            a_t,
+            a_ref,
+            1.0,
+            get_global_parallelism(),
+        );
+    } else {
+        let a_owned: Array2<f64> = a.to_owned();
+        let slice = a_owned.as_slice().expect("owned array should be contiguous");
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        let a_t = a_ref.transpose();
+        matmul(
+            out_view.as_mut(),
+            Accum::Replace,
+            a_t,
+            a_ref,
+            1.0,
+            get_global_parallelism(),
+        );
+    }
+}
+
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
 /// For A of shape (n, p) and B of shape (n, q), this computes the (p, q) result.
 /// Uses zero-copy views when possible.
@@ -151,6 +196,58 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     );
 
     Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
+}
+
+/// Compute A^T * v into a pre-allocated output buffer.
+/// `out` must be length p where A is (n, p) and v is length n.
+#[inline]
+pub fn fast_atv_into<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    v: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
+    use faer::linalg::matmul::matmul;
+    use faer::Accum;
+
+    let (n, p) = a.dim();
+    debug_assert_eq!(v.len(), n, "vector length must match A rows");
+    debug_assert_eq!(out.len(), p, "output length must match A cols");
+
+    if n < 64 {
+        out.assign(&a.t().dot(v));
+        return;
+    }
+
+    let mut out_view = array1_to_col_mat_mut(out);
+
+    let v_slice = v
+        .as_slice()
+        .expect("vector must expose a contiguous slice");
+    let v_ref = MatRef::from_row_major_slice(v_slice, n, 1);
+
+    if let Some(slice) = a.as_slice() {
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        matmul(
+            out_view.as_mut(),
+            Accum::Replace,
+            a_ref.transpose(),
+            v_ref,
+            1.0,
+            get_global_parallelism(),
+        );
+    } else {
+        let a_owned: Array2<f64> = a.to_owned();
+        let slice = a_owned.as_slice().expect("owned array should be contiguous");
+        let a_ref = MatRef::from_row_major_slice(slice, n, p);
+        matmul(
+            out_view.as_mut(),
+            Accum::Replace,
+            a_ref.transpose(),
+            v_ref,
+            1.0,
+            get_global_parallelism(),
+        );
+    }
 }
 
 /// Compute A^T * v using faer's SIMD-optimized GEMV.

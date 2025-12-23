@@ -2103,6 +2103,211 @@ fn design_and_derivative_at_age_scratch(
     Ok(())
 }
 
+struct SurvivalDesignCache {
+    baseline_cols: usize,
+    time_cols: usize,
+    static_covs: Vec<f64>,
+    pgs_reduced: Vec<f64>,
+}
+
+impl SurvivalDesignCache {
+    fn new(
+        covariates: ArrayView1<'_, f64>,
+        artifacts: &SurvivalModelArtifacts,
+        scratch: &mut SurvivalScratch,
+    ) -> Result<Self, SurvivalError> {
+        let expected_covs = artifacts.static_covariate_layout.column_names.len();
+        if covariates.len() != expected_covs {
+            return Err(SurvivalError::CovariateDimensionMismatch);
+        }
+        enforce_covariate_ranges(covariates, &artifacts.static_covariate_layout)?;
+
+        let baseline_cols = artifacts.reference_constraint.transform.ncols();
+        let total_cols = artifacts.coefficients.len();
+        if baseline_cols + expected_covs > total_cols {
+            return Err(SurvivalError::InvalidTimeVaryingLayout);
+        }
+        let time_cols = total_cols - baseline_cols - expected_covs;
+
+        let mut pgs_reduced = Vec::new();
+        if time_cols > 0 {
+            let time_basis = artifacts
+                .time_varying_basis
+                .as_ref()
+                .ok_or(SurvivalError::MissingTimeVaryingBasis)?;
+
+            let descriptor = artifacts
+                .interaction_metadata
+                .iter()
+                .find(|meta| {
+                    meta.column_range.start == baseline_cols
+                        && meta.column_range.end == baseline_cols + time_cols
+                })
+                .ok_or(SurvivalError::MissingInteractionMetadata)?;
+
+            let pgs_idx = artifacts
+                .static_covariate_layout
+                .column_names
+                .iter()
+                .position(|name| name == "pgs")
+                .ok_or(SurvivalError::MissingPgsCovariate)?;
+            let pgs_value = covariates[pgs_idx];
+
+            if let Some(range) = descriptor.value_ranges.first() {
+                if range.min.is_finite() && pgs_value < range.min {
+                    return Err(SurvivalError::CovariateBelowRange {
+                        column: "pgs".into(),
+                        index: pgs_idx,
+                        value: pgs_value,
+                        minimum: range.min,
+                    });
+                }
+                if range.max.is_finite() && pgs_value > range.max {
+                    return Err(SurvivalError::CovariateAboveRange {
+                        column: "pgs".into(),
+                        index: pgs_idx,
+                        value: pgs_value,
+                        maximum: range.max,
+                    });
+                }
+            }
+
+            let pgs_basis_dim = time_basis.knot_vector.len() - time_basis.degree - 1;
+            if scratch.pgs_basis_buff.len() < pgs_basis_dim {
+                return Err(SurvivalError::InvalidTimeVaryingLayout);
+            }
+            let pgs_buff = &mut scratch.pgs_basis_buff[..pgs_basis_dim];
+            evaluate_bspline_basis_scalar(
+                pgs_value,
+                time_basis.knot_vector.view(),
+                time_basis.degree,
+                pgs_buff,
+                &mut scratch.spline_scratch,
+            )
+            .map_err(|_| SurvivalError::InvalidTimeVaryingLayout)?;
+
+            if pgs_basis_dim <= 1 {
+                return Err(SurvivalError::InvalidTimeVaryingLayout);
+            }
+            pgs_reduced.extend_from_slice(&pgs_buff[1..]);
+
+            if let Some(centering) = &descriptor.centering {
+                if centering.offsets.len() != pgs_reduced.len() {
+                    return Err(SurvivalError::InvalidTimeVaryingLayout);
+                }
+                for (dst, &offset) in pgs_reduced.iter_mut().zip(centering.offsets.iter()) {
+                    *dst -= offset;
+                }
+            }
+
+            let tensor_len = baseline_cols * pgs_reduced.len();
+            if tensor_len != time_cols {
+                return Err(SurvivalError::InvalidTimeVaryingLayout);
+            }
+        }
+
+        Ok(SurvivalDesignCache {
+            baseline_cols,
+            time_cols,
+            static_covs: covariates.to_vec(),
+            pgs_reduced,
+        })
+    }
+}
+
+fn design_and_derivative_at_age_cached(
+    age: f64,
+    artifacts: &SurvivalModelArtifacts,
+    cache: &SurvivalDesignCache,
+    out_design: &mut Array1<f64>,
+    out_deriv: &mut Array1<f64>,
+    scratch: &mut SurvivalScratch,
+) -> Result<(), SurvivalError> {
+    let expected_covs = artifacts.static_covariate_layout.column_names.len();
+    if cache.static_covs.len() != expected_covs {
+        return Err(SurvivalError::CovariateDimensionMismatch);
+    }
+
+    let log_age = artifacts.age_transform.transform(age)?;
+    let age_deriv_factor = artifacts.age_transform.derivative_factor(age)?;
+
+    let k = artifacts.reference_constraint.transform.nrows();
+    let k_minus_1 = artifacts.reference_constraint.transform.ncols();
+    if scratch.basis_raw.len() < k {
+        return Err(SurvivalError::Basis(
+            BasisError::ConstraintMatrixRowMismatch {
+                basis_rows: k,
+                constraint_rows: scratch.basis_raw.len(),
+            },
+        ));
+    }
+
+    let basis_raw_buff = &mut scratch.basis_raw[..k];
+    let deriv_raw_buff = &mut scratch.derivative_raw[..k];
+    let plus_buff = &mut scratch.basis_plus[..k];
+    let minus_buff = &mut scratch.basis_minus[..k];
+
+    evaluate_basis_and_derivative_scalar_into(
+        log_age,
+        &artifacts.age_basis,
+        basis_raw_buff,
+        deriv_raw_buff,
+        &mut scratch.spline_scratch,
+        plus_buff,
+        minus_buff,
+    )?;
+
+    let constrained_basis_buff = &mut scratch.constrained_basis[..k_minus_1];
+    vec_mat_mul_into(
+        basis_raw_buff,
+        &artifacts.reference_constraint.transform,
+        constrained_basis_buff,
+    );
+
+    let constrained_deriv_buff = &mut scratch.constrained_derivative[..k_minus_1];
+    vec_mat_mul_into(
+        deriv_raw_buff,
+        &artifacts.reference_constraint.transform,
+        constrained_deriv_buff,
+    );
+
+    let baseline_cols = cache.baseline_cols;
+    let static_cols = expected_covs;
+    let total_cols = artifacts.coefficients.len();
+    if baseline_cols + static_cols > total_cols {
+        return Err(SurvivalError::InvalidTimeVaryingLayout);
+    }
+    let time_cols = cache.time_cols;
+
+    let design_base = out_design.as_slice_mut().expect("contiguous array");
+    let deriv_base = out_deriv.as_slice_mut().expect("contiguous array");
+    design_base.fill(0.0);
+    deriv_base.fill(0.0);
+
+    design_base[..baseline_cols].copy_from_slice(constrained_basis_buff);
+    for i in 0..baseline_cols {
+        deriv_base[i] = constrained_deriv_buff[i] * age_deriv_factor;
+    }
+
+    if time_cols > 0 {
+        let dest_design = &mut design_base[baseline_cols..baseline_cols + time_cols];
+        tensor_product_into(constrained_basis_buff, &cache.pgs_reduced, dest_design);
+
+        let dest_deriv = &mut deriv_base[baseline_cols..baseline_cols + time_cols];
+        tensor_product_into(constrained_deriv_buff, &cache.pgs_reduced, dest_deriv);
+        for x in dest_deriv.iter_mut() {
+            *x *= age_deriv_factor;
+        }
+    }
+
+    let dest_static = &mut design_base[baseline_cols + time_cols..];
+    for (dst, &val) in dest_static.iter_mut().zip(cache.static_covs.iter()) {
+        *dst = val;
+    }
+
+    Ok(())
+}
+
 /// Evaluate the cumulative hazard at a given age.
 pub fn cumulative_hazard(
     age: f64,
@@ -2294,16 +2499,19 @@ pub fn calculate_crude_risk_quadrature<'a>(
     let mut design_m = Array1::zeros(coeff_len_m);
     let mut deriv_m = Array1::zeros(coeff_len_m); // unused but needed for sig
 
+    let disease_cache = SurvivalDesignCache::new(covariates, disease_model, &mut scratch_d)?;
+    let mortality_cache = SurvivalDesignCache::new(covariates, mortality_model, &mut scratch_m)?;
+
     // 3. Integrate segment by segment
     let mut total_risk = 0.0;
     let mut total_gradient = Array1::zeros(coeff_len_d);
     let nodes_weights = gauss_legendre_quadrature();
 
     // Design row at entry age for gradient term involving H_D(t0) X(t0)
-    design_and_derivative_at_age_scratch(
+    design_and_derivative_at_age_cached(
         t0,
-        covariates,
         disease_model,
+        &disease_cache,
         &mut design_d,
         &mut deriv_d,
         &mut scratch_d,
@@ -2320,10 +2528,10 @@ pub fn calculate_crude_risk_quadrature<'a>(
             let u = center + half_width * x;
 
             // Eval Disease: h(u), H(u)
-            design_and_derivative_at_age_scratch(
+            design_and_derivative_at_age_cached(
                 u,
-                covariates,
                 disease_model,
+                &disease_cache,
                 &mut design_d,
                 &mut deriv_d,
                 &mut scratch_d,
@@ -2335,10 +2543,10 @@ pub fn calculate_crude_risk_quadrature<'a>(
             let inst_hazard_d = (hazard_d * slope_d).max(0.0);
 
             // Eval Mortality: H(u) (hazard not needed for integrand)
-            design_and_derivative_at_age_scratch(
+            design_and_derivative_at_age_cached(
                 u,
-                covariates,
                 mortality_model,
+                &mortality_cache,
                 &mut design_m,
                 &mut deriv_m,
                 &mut scratch_m,

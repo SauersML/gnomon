@@ -2,7 +2,7 @@ use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condi
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ata, fast_atv, ldlt_rook,
+    array2_to_mat_mut, fast_ata, fast_ata_into, fast_atv, fast_atv_into, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
@@ -69,6 +69,8 @@ pub struct GamLogitWorkingModel<'a> {
     weights: Array1<f64>,
     working_response: Array1<f64>,
     weighted_design: Array2<f64>,
+    grad_data_buf: Array1<f64>,
+    hessian_buf: Array2<f64>,
 }
 
 impl<'a> GamLogitWorkingModel<'a> {
@@ -91,6 +93,8 @@ impl<'a> GamLogitWorkingModel<'a> {
             weights: Array1::zeros(n),
             working_response: Array1::zeros(n),
             weighted_design: Array2::zeros((n, p)),
+            grad_data_buf: Array1::zeros(p),
+            hessian_buf: Array2::zeros((p, p)),
         }
     }
 
@@ -127,9 +131,10 @@ impl<'a> GamLogitWorkingModel<'a> {
 
         let working_residual = &eta_clamped - &self.working_response;
         let weighted_residual = &self.weights * &working_residual;
-        let grad_data = fast_atv(&self.design, &weighted_residual);
+        fast_atv_into(&self.design, &weighted_residual, &mut self.grad_data_buf);
         let grad_penalty = self.penalty.dot(beta);
-        let gradient = &grad_data + &grad_penalty;
+        let mut gradient = self.grad_data_buf.clone();
+        gradient += &grad_penalty;
 
         let p = beta.len();
         let n = self.weights.len();
@@ -144,7 +149,8 @@ impl<'a> GamLogitWorkingModel<'a> {
         }
 
         // Compute X^T W X = (sqrt(W) * X)^T * (sqrt(W) * X)
-        let mut hessian = fast_ata(&self.weighted_design);
+        fast_ata_into(&self.weighted_design, &mut self.hessian_buf);
+        let mut hessian = self.hessian_buf.clone();
 
         for j in 0..p.min(self.penalty.nrows()) {
             for k in 0..p.min(self.penalty.ncols()) {
