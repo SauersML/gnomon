@@ -264,10 +264,10 @@ def main():
     if conclusion == "success":
         prompt = (
             "The Lean Proof build passed successfully. "
-            "Please find one thing to do, improve, fix, or strengthen in the Lean proof files "
+            "Please find one thing to do or strengthen in the Lean proof files "
             "(specifically files in proofs/). You must successfully compile the code yourself. If the build times out or fails, do not submit it and keep working."
             "If the build executes and terminates the shell, count that as a failure. Always tail build logs. You can optimize code, strengthen proofs, replace 'sorry' with actual proofs, or refactor. Feel free to try big or multiple tasks."
-            "IMPORTANT: Ensure your changes compile and that all proofs are valid. "
+            "IMPORTANT: Ensure your changes compile and that all proofs are valid. Do not attempt low-importance small changes like style improvements, comments, etc."
             "Do not break existing functionality."
             + version_restriction
         )
