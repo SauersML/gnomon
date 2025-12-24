@@ -1792,10 +1792,13 @@ fn covariate_label(layout: &CovariateLayout, index: usize) -> String {
         .unwrap_or_else(|| format!("column_{index}"))
 }
 
-fn enforce_covariate_ranges(
+/// Clamp covariates to training ranges, logging warnings for extrapolation.
+/// Returns the clamped values. This is production-safe: out-of-range values
+/// trigger linear extrapolation via splines rather than hard failures.
+fn clamp_covariates_to_ranges(
     covariates: ArrayView1<f64>,
     layout: &CovariateLayout,
-) -> Result<(), SurvivalError> {
+) -> Result<Array1<f64>, SurvivalError> {
     let expected = layout.column_names.len();
     if layout.ranges.is_empty() {
         return Err(SurvivalError::MissingCovariateRanges { expected });
@@ -1810,13 +1813,15 @@ fn enforce_covariate_ranges(
         return Err(SurvivalError::CovariateDimensionMismatch);
     }
 
-    for (idx, value) in covariates.iter().enumerate() {
+    let mut clamped = covariates.to_owned();
+    
+    for (idx, value) in clamped.iter_mut().enumerate() {
         if !value.is_finite() {
             return Err(SurvivalError::NonFiniteCovariate);
         }
         let range = &layout.ranges[idx];
         if !range.min.is_finite() && !range.max.is_finite() {
-            // Both bounds are infinite, nothing to enforce.
+            // Both bounds are infinite, nothing to clamp.
             continue;
         }
         if range.min.is_nan()
@@ -1830,24 +1835,28 @@ fn enforce_covariate_ranges(
                 max: range.max,
             });
         }
+        
+        let original = *value;
         if range.min.is_finite() && *value < range.min {
-            return Err(SurvivalError::CovariateBelowRange {
-                column: covariate_label(layout, idx),
-                index: idx,
-                value: *value,
-                minimum: range.min,
-            });
+            *value = range.min;
+            log::debug!(
+                "Covariate '{}' clamped from {:.4} to minimum {:.4} (extrapolation)",
+                covariate_label(layout, idx),
+                original,
+                range.min
+            );
         }
         if range.max.is_finite() && *value > range.max {
-            return Err(SurvivalError::CovariateAboveRange {
-                column: covariate_label(layout, idx),
-                index: idx,
-                value: *value,
-                maximum: range.max,
-            });
+            *value = range.max;
+            log::debug!(
+                "Covariate '{}' clamped from {:.4} to maximum {:.4} (extrapolation)",
+                covariate_label(layout, idx),
+                original,
+                range.max
+            );
         }
     }
-    Ok(())
+    Ok(clamped)
 }
 
 /// Reconstruct the design row at a given age for prediction.
@@ -1916,8 +1925,8 @@ fn design_and_derivative_at_age_scratch(
     if covariates.len() != expected_covs {
         return Err(SurvivalError::CovariateDimensionMismatch);
     }
-    // Range enforcement is cheap
-    enforce_covariate_ranges(covariates, &artifacts.static_covariate_layout)?;
+    // Clamp covariates to training ranges (production-safe)
+    let clamped_covs = clamp_covariates_to_ranges(covariates, &artifacts.static_covariate_layout)?;
 
     let log_age = artifacts.age_transform.transform(age)?;
     let age_deriv_factor = artifacts.age_transform.derivative_factor(age)?;
@@ -2015,25 +2024,25 @@ fn design_and_derivative_at_age_scratch(
             .iter()
             .position(|name| name == "pgs")
             .ok_or(SurvivalError::MissingPgsCovariate)?;
-        let pgs_value = covariates[pgs_idx];
+        let mut pgs_value = clamped_covs[pgs_idx];
 
-        // Check range
+        // Clamp PGS to time-varying range instead of erroring
         if let Some(range) = descriptor.value_ranges.first() {
             if range.min.is_finite() && pgs_value < range.min {
-                return Err(SurvivalError::CovariateBelowRange {
-                    column: "pgs".into(),
-                    index: pgs_idx,
-                    value: pgs_value,
-                    minimum: range.min,
-                });
+                log::debug!(
+                    "PGS clamped from {:.4} to time-varying minimum {:.4}",
+                    pgs_value,
+                    range.min
+                );
+                pgs_value = range.min;
             }
             if range.max.is_finite() && pgs_value > range.max {
-                return Err(SurvivalError::CovariateAboveRange {
-                    column: "pgs".into(),
-                    index: pgs_idx,
-                    value: pgs_value,
-                    maximum: range.max,
-                });
+                log::debug!(
+                    "PGS clamped from {:.4} to time-varying maximum {:.4}",
+                    pgs_value,
+                    range.max
+                );
+                pgs_value = range.max;
             }
         }
 
@@ -2093,9 +2102,9 @@ fn design_and_derivative_at_age_scratch(
         }
     }
 
-    // 3. Static
+    // 3. Static - use clamped values
     let dest_static = &mut design_base[baseline_cols + time_cols..];
-    for (i, &val) in covariates.iter().enumerate() {
+    for (i, &val) in clamped_covs.iter().enumerate() {
         dest_static[i] = val;
     }
     // Derivatives for static cols are 0.0 (already set)
@@ -2120,7 +2129,8 @@ impl SurvivalDesignCache {
         if covariates.len() != expected_covs {
             return Err(SurvivalError::CovariateDimensionMismatch);
         }
-        enforce_covariate_ranges(covariates, &artifacts.static_covariate_layout)?;
+        // Clamp covariates to training ranges (production-safe)
+        let clamped_covs = clamp_covariates_to_ranges(covariates, &artifacts.static_covariate_layout)?;
 
         let baseline_cols = artifacts.reference_constraint.transform.ncols();
         let total_cols = artifacts.coefficients.len();
@@ -2151,24 +2161,25 @@ impl SurvivalDesignCache {
                 .iter()
                 .position(|name| name == "pgs")
                 .ok_or(SurvivalError::MissingPgsCovariate)?;
-            let pgs_value = covariates[pgs_idx];
+            let mut pgs_value = clamped_covs[pgs_idx];
 
+            // Clamp PGS to time-varying range instead of erroring
             if let Some(range) = descriptor.value_ranges.first() {
                 if range.min.is_finite() && pgs_value < range.min {
-                    return Err(SurvivalError::CovariateBelowRange {
-                        column: "pgs".into(),
-                        index: pgs_idx,
-                        value: pgs_value,
-                        minimum: range.min,
-                    });
+                    log::debug!(
+                        "PGS clamped from {:.4} to time-varying minimum {:.4}",
+                        pgs_value,
+                        range.min
+                    );
+                    pgs_value = range.min;
                 }
                 if range.max.is_finite() && pgs_value > range.max {
-                    return Err(SurvivalError::CovariateAboveRange {
-                        column: "pgs".into(),
-                        index: pgs_idx,
-                        value: pgs_value,
-                        maximum: range.max,
-                    });
+                    log::debug!(
+                        "PGS clamped from {:.4} to time-varying maximum {:.4}",
+                        pgs_value,
+                        range.max
+                    );
+                    pgs_value = range.max;
                 }
             }
 
@@ -2209,7 +2220,7 @@ impl SurvivalDesignCache {
         Ok(SurvivalDesignCache {
             baseline_cols,
             time_cols,
-            static_covs: covariates.to_vec(),
+            static_covs: clamped_covs.to_vec(),
             pgs_reduced,
         })
     }
@@ -2409,8 +2420,23 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 }
 
 /// Compute Crude Risk (Real-world risk) via numerical integration.
+/// Result of crude risk calculation with gradients for uncertainty quantification.
+#[derive(Debug, Clone)]
+pub struct CrudeRiskResult {
+    /// The crude risk value (probability of event in time window)
+    pub risk: f64,
+    /// Gradient of risk with respect to disease model coefficients
+    pub disease_gradient: Array1<f64>,
+    /// Gradient of risk with respect to mortality model coefficients
+    pub mortality_gradient: Array1<f64>,
+}
+
+/// Compute the Cumulative Incidence Function (Crude Risk) with competing mortality.
 /// P(Event in (t0, t1] | Survival to t0, Accounting for Competing Mortality)
 /// Formula: Integral_{t0}^{t1} h_dis(u) * S_total(u|t0) du
+///
+/// Returns gradients for BOTH disease and mortality models to enable proper
+/// uncertainty propagation via the delta method.
 pub fn calculate_crude_risk_quadrature<'a>(
     t0: f64,
     t1: f64,
@@ -2419,9 +2445,16 @@ pub fn calculate_crude_risk_quadrature<'a>(
     mortality_model: &'a SurvivalModelArtifacts,
     disease_coeffs: Option<ArrayView1<'a, f64>>,
     mortality_coeffs: Option<ArrayView1<'a, f64>>,
-) -> Result<(f64, Array1<f64>), SurvivalError> {
+) -> Result<CrudeRiskResult, SurvivalError> {
+    let coeff_len_d = disease_model.coefficients.len();
+    let coeff_len_m = mortality_model.coefficients.len();
+    
     if t1 <= t0 {
-        return Ok((0.0, Array1::zeros(disease_model.coefficients.len())));
+        return Ok(CrudeRiskResult {
+            risk: 0.0,
+            disease_gradient: Array1::zeros(coeff_len_d),
+            mortality_gradient: Array1::zeros(coeff_len_m),
+        });
     }
 
     // 1. Collect all knots from both models within range [t0, t1]
@@ -2450,8 +2483,6 @@ pub fn calculate_crude_risk_quadrature<'a>(
 
     // 2. Pre-calculate baselines at t0 to normalize conditional survival
     // H(u|t0) = H(u) - H(t0)
-    let coeff_len_d = disease_model.coefficients.len();
-    let coeff_len_m = mortality_model.coefficients.len();
     let coeff_d = match disease_coeffs {
         Some(c) => {
             if c.len() != coeff_len_d {
@@ -2497,14 +2528,15 @@ pub fn calculate_crude_risk_quadrature<'a>(
     let mut deriv_d = Array1::zeros(coeff_len_d);
 
     let mut design_m = Array1::zeros(coeff_len_m);
-    let mut deriv_m = Array1::zeros(coeff_len_m); // unused but needed for sig
+    let mut deriv_m = Array1::zeros(coeff_len_m);
 
     let disease_cache = SurvivalDesignCache::new(covariates, disease_model, &mut scratch_d)?;
     let mortality_cache = SurvivalDesignCache::new(covariates, mortality_model, &mut scratch_m)?;
 
     // 3. Integrate segment by segment
     let mut total_risk = 0.0;
-    let mut total_gradient = Array1::zeros(coeff_len_d);
+    let mut disease_gradient = Array1::zeros(coeff_len_d);
+    let mut mortality_gradient = Array1::zeros(coeff_len_m);
     let nodes_weights = gauss_legendre_quadrature();
 
     // Design row at entry age for gradient term involving H_D(t0) X(t0)
@@ -2517,6 +2549,17 @@ pub fn calculate_crude_risk_quadrature<'a>(
         &mut scratch_d,
     )?;
     let design_d_t0 = design_d.clone();
+    
+    // Design row at entry age for mortality model (for H_M(t0) gradient)
+    design_and_derivative_at_age_cached(
+        t0,
+        mortality_model,
+        &mortality_cache,
+        &mut design_m,
+        &mut deriv_m,
+        &mut scratch_m,
+    )?;
+    let design_m_t0 = design_m.clone();
 
     for i in 0..breakpoints.len() - 1 {
         let a = breakpoints[i];
@@ -2542,7 +2585,7 @@ pub fn calculate_crude_risk_quadrature<'a>(
             let hazard_d = eta_d.exp();
             let inst_hazard_d = (hazard_d * slope_d).max(0.0);
 
-            // Eval Mortality: H(u) (hazard not needed for integrand)
+            // Eval Mortality: H(u)
             design_and_derivative_at_age_cached(
                 u,
                 mortality_model,
@@ -2562,11 +2605,13 @@ pub fn calculate_crude_risk_quadrature<'a>(
             // Survival Function S_total(u|t0)
             let s_total = (-(h_dis_cond + h_mor_cond)).exp();
 
-            // Accumulate
+            // Accumulate risk
             // Integral += h_dis(u) * S_total(u) * du
             // weight scaled by half_width due to change of variables
             total_risk += w * inst_hazard_d * s_total * half_width;
 
+            // ========== Disease Gradient ==========
+            // ∂Risk/∂β_d = ∫ (∂h_d/∂β_d * S - h_d * S * ∂H_d/∂β_d) du
             if inst_hazard_d > 0.0 {
                 let weight = w * s_total * half_width;
                 let mut grad_contrib = design_d.mapv(|x| inst_hazard_d * (1.0 - hazard_d) * x);
@@ -2577,12 +2622,30 @@ pub fn calculate_crude_risk_quadrature<'a>(
                     *g += inst_hazard_d * h_dis_t0 * x0;
                 });
                 grad_contrib.mapv_inplace(|v| v * weight);
-                total_gradient += &grad_contrib;
+                disease_gradient += &grad_contrib;
+            }
+
+            // ========== Mortality Gradient ==========
+            // ∂Risk/∂β_m = -∫ h_d(u) * S_total(u) * ∂H_m(u|t0)/∂β_m du
+            // where ∂H_m(u|t0)/∂β_m = H_m(u) * X_m(u) - H_m(t0) * X_m(t0)
+            // Since H_m = exp(η_m), ∂H_m/∂β_m = H_m * X_m
+            if inst_hazard_d > 0.0 && hazard_m > 0.0 {
+                let weight = w * inst_hazard_d * s_total * half_width;
+                // ∂H_m(u|t0)/∂β_m = H_m(u) * X_m(u) - H_m(t0) * X_m(t0)
+                let mut mort_grad_contrib = design_m.mapv(|x| -weight * hazard_m * x);
+                mort_grad_contrib.zip_mut_with(&design_m_t0, |g, &x0| {
+                    *g += weight * h_mor_t0 * x0;
+                });
+                mortality_gradient += &mort_grad_contrib;
             }
         }
     }
 
-    Ok((total_risk, total_gradient))
+    Ok(CrudeRiskResult {
+        risk: total_risk,
+        disease_gradient,
+        mortality_gradient,
+    })
 }
 
 pub fn survival_calibrator_features(

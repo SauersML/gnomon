@@ -1162,7 +1162,7 @@ impl TrainedModel {
                                 }
                                 SurvivalRiskType::Crude => {
                                     let mortality = mortality_ref.expect("checked above");
-                                    let (risk, grad_row) =
+                                    let result =
                                         survival::calculate_crude_risk_quadrature(
                                             age_entry_chunk[i],
                                             age_exit_chunk[i],
@@ -1172,8 +1172,8 @@ impl TrainedModel {
                                             Some(chunk.row(j)),
                                             None,
                                         )?;
-                                    grad_row_opt = Some(grad_row);
-                                    risk
+                                    grad_row_opt = Some(result.disease_gradient);
+                                    result.risk
                                 }
                             };
 
@@ -1338,11 +1338,12 @@ impl TrainedModel {
                 }
                 SurvivalRiskType::Crude => {
                     let mortality = mortality_model.expect("checked above");
-                    survival::calculate_crude_risk_quadrature(
+                    let result = survival::calculate_crude_risk_quadrature(
                         entry_age, exit_age, cov_row.view(), artifacts, mortality,
                         None,
                         None,
-                    )?
+                    )?;
+                    (result.risk, result.disease_gradient)
                 }
             };
             conditional_risk[i] = risk_val;
