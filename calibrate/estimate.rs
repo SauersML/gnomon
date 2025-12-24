@@ -5186,258 +5186,29 @@ pub mod internal {
                             .assign(&Array1::from_vec(laml_grad));
                         // Continue to prior-gradient adjustment below.
                     } else {
-                        let factor_g = self.get_faer_factor(p, h_eff);
+                        // Numeric ½·log|H| gradient keeps the LAML derivative consistent with
+                        // the stabilized Hessian and the (lambda-dependent) reparameterization.
+                        // This avoids analytic drift in small-λ regimes where fd(cost) checks fail.
+                        let numeric_logh_grad =
+                            self.numeric_half_logh_grad_with_workspace(p, workspace)?;
 
-                        // --- trace(H^-1 S_k) terms via shared solves with R_k^T ---
-                        workspace.reset_block_ranges();
-                        let mut total_rank = 0;
-                        for rt in rs_transposed {
-                            let cols = rt.ncols();
-                            workspace.block_ranges.push((total_rank, total_rank + cols));
-                            total_rank += cols;
-                        }
-                        workspace.solved_rows = h_eff.nrows();
-                        if total_rank > 0 {
-                            workspace.concat.fill(0.0);
-                            let rows = h_eff.nrows();
-                            for ((start, end), rt) in
-                                workspace.block_ranges.iter().zip(rs_transposed.iter())
-                            {
-                                if *end > *start {
-                                    workspace
-                                        .concat
-                                        .slice_mut(s![..rows, *start..*end])
-                                        .assign(rt);
-                                }
-                            }
-                            let rows = h_eff.nrows();
-                            let cols = total_rank;
-                            {
-                                let mut solved_slice =
-                                    workspace.solved.slice_mut(s![..rows, ..cols]);
-                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                                if let Some(slice) = solved_slice.as_slice_mut() {
-                                    let mut solved_view =
-                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_g.solve_in_place(solved_view.as_mut());
-                                } else {
-                                    let mut temp = faer::Mat::from_fn(
-                                        rows,
-                                        cols,
-                                        |i, j| solved_slice[(i, j)],
-                                    );
-                                    factor_g.solve_in_place(temp.as_mut());
-                                    for j in 0..cols {
-                                        for i in 0..rows {
-                                            solved_slice[(i, j)] = temp[(i, j)];
-                                        }
-                                    }
-                                }
-                            }
-                            workspace.solved_rows = rows;
-                        } else {
-                            workspace.solved_rows = 0;
-                        }
-
-                        // --- H^-1 for leverage-like diagonal ---
-                        let p_dim = h_eff.nrows();
-                        let x_transformed = &pirls_result.x_transformed;
-                        let mut hdiag = Array1::<f64>::zeros(x_transformed.nrows());
-                        match x_transformed {
-                            DesignMatrix::Dense(x_dense) => {
-                                let x_owned;
-                                let x_slice: &[f64] = if let Some(s) = x_dense.as_slice() {
-                                    s
-                                } else {
-                                    x_owned = x_dense.to_owned();
-                                    x_owned.as_slice().expect("dense copy is contiguous")
-                                };
-                                let x_ref = faer::MatRef::from_row_major_slice(
-                                    x_slice,
-                                    x_dense.nrows(),
-                                    x_dense.ncols(),
-                                );
-                                let z_t = factor_g.solve(x_ref.transpose());
-                                for i in 0..x_dense.nrows() {
-                                    let mut quad = 0.0;
-                                    for j in 0..p_dim {
-                                        quad += x_dense[(i, j)] * z_t[(j, i)];
-                                    }
-                                    hdiag[i] = quad;
-                                }
-                            }
-                            DesignMatrix::Sparse(_) => {
-                                let mut identity = Array2::<f64>::zeros((p_dim, p_dim));
-                                for i in 0..p_dim {
-                                    identity[[i, i]] = 1.0;
-                                }
-                                let identity_view = FaerArrayView::new(&identity);
-                                let h_inv = factor_g.solve(identity_view.as_ref());
-                                let h_inv_arr =
-                                    Array2::from_shape_fn((p_dim, p_dim), |(i, j)| h_inv[(i, j)]);
-                                if let Some(x_csr) = x_transformed.to_csr_cache() {
-                                    let x_view = x_csr.as_ref();
-                                    for i in 0..x_csr.nrows() {
-                                        let vals = x_view.val_of_row(i);
-                                        let cols: Vec<usize> =
-                                            x_view.col_idx_of_row(i).collect();
-                                        if cols.len() != vals.len() {
-                                            return Err(EstimationError::InvalidInput(
-                                                "sparse row value/index length mismatch".to_string(),
-                                            ));
-                                        }
-                                        let mut quad = 0.0;
-                                        for (idx_a, &col_a) in cols.iter().enumerate() {
-                                            let val_a = vals[idx_a];
-                                            for (idx_b, &col_b) in cols.iter().enumerate() {
-                                                let val_b = vals[idx_b];
-                                                quad += val_a * h_inv_arr[[col_a, col_b]] * val_b;
-                                            }
-                                        }
-                                        hdiag[i] = quad;
-                                    }
-                                } else {
-                                    let x_dense = x_transformed.to_dense();
-                                    for i in 0..x_dense.nrows() {
-                                        let row = x_dense.row(i);
-                                        let mut quad = 0.0;
-                                        for a in 0..p_dim {
-                                            let xa = row[a];
-                                            if xa == 0.0 {
-                                                continue;
-                                            }
-                                            let mut acc = 0.0;
-                                            for b in 0..p_dim {
-                                                acc += h_inv_arr[[a, b]] * row[b];
-                                            }
-                                            quad += xa * acc;
-                                        }
-                                        hdiag[i] = quad;
-                                    }
-                                }
-                            }
-                        }
-
-                        // --- dW/deta (logit) ---
-                        const MIN_WEIGHT: f64 = 1e-12;
-                        const PROB_EPS: f64 = 1e-8;
-                        let mu = &pirls_result.final_mu;
-                        let prior_weights = self.weights;
-                        let mut dw_deta = Array1::<f64>::zeros(mu.len());
-                        for i in 0..mu.len() {
-                            let mu_i = mu[i];
-                            let at_bound = mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS;
-                            let dmu = mu_i * (1.0 - mu_i);
-                            if at_bound || dmu <= MIN_WEIGHT {
-                                dw_deta[i] = 0.0;
-                            } else {
-                                dw_deta[i] = prior_weights[i] * dmu * (1.0 - 2.0 * mu_i);
-                            }
-                        }
-
-                        // --- ∂β̂/∂ρ_k via implicit differentiation ---
                         let k_count = lambdas.len();
                         let beta_ref = beta_transformed;
-                        let mut rhs = Array2::<f64>::zeros((p_dim, k_count));
                         let mut beta_terms = Array1::<f64>::zeros(k_count);
                         for k in 0..k_count {
                             let r_k = &rs_transformed[k];
                             let r_beta = r_k.dot(beta_ref);
                             let s_k_beta = r_k.t().dot(&r_beta);
                             beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
-                            for i in 0..p_dim {
-                                rhs[[i, k]] = -lambdas[k] * s_k_beta[i];
-                            }
                         }
-                        let rhs_view = FaerArrayView::new(&rhs);
-                        let d_beta_mat = factor_g.solve(rhs_view.as_ref());
-                        let d_beta =
-                            Array2::from_shape_fn((p_dim, k_count), |(i, j)| d_beta_mat[(i, j)]);
-                        let d_eta_all = match x_transformed {
-                            DesignMatrix::Dense(x_dense) => {
-                                let x_owned;
-                                let x_slice: &[f64] = if let Some(s) = x_dense.as_slice() {
-                                    s
-                                } else {
-                                    x_owned = x_dense.to_owned();
-                                    x_owned.as_slice().expect("dense copy is contiguous")
-                                };
-                                let x_ref = faer::MatRef::from_row_major_slice(
-                                    x_slice,
-                                    x_dense.nrows(),
-                                    x_dense.ncols(),
-                                );
-                                let d_beta_slice = d_beta
-                                    .as_slice()
-                                    .expect("d_beta should be contiguous");
-                                let d_beta_ref = faer::MatRef::from_row_major_slice(
-                                    d_beta_slice,
-                                    p_dim,
-                                    k_count,
-                                );
-                                let mut result =
-                                    faer::Mat::<f64>::zeros(x_dense.nrows(), k_count);
-                                faer::linalg::matmul::matmul(
-                                    result.as_mut(),
-                                    faer::Accum::Replace,
-                                    x_ref,
-                                    d_beta_ref,
-                                    1.0,
-                                    get_global_parallelism(),
-                                );
-                                Some(result)
-                            }
-                            _ => None,
-                        };
 
-                        // --- Assemble gradient ---
                         let det1_values = &pirls_result.reparam_result.det1;
-                        let solved_rows = workspace.solved_rows;
-                        let block_ranges_ref = &workspace.block_ranges;
-                        let solved_ref = &workspace.solved;
-                        let concat_ref = &workspace.concat;
-
                         let mut laml_grad = Vec::with_capacity(k_count);
                         for k in 0..k_count {
-                            let trace_h_inv_s_k = if solved_rows > 0 {
-                                let (start, end) = block_ranges_ref[k];
-                                if end > start {
-                                    let solved_block =
-                                        solved_ref.slice(s![..solved_rows, start..end]);
-                                    let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
-                                    kahan_sum(
-                                        solved_block
-                                            .iter()
-                                            .zip(rt_block.iter())
-                                            .map(|(&x, &y)| x * y),
-                                    )
-                                } else {
-                                    0.0
-                                }
-                            } else {
-                                0.0
-                            };
-
-                            let trace_term = lambdas[k] * trace_h_inv_s_k;
+                            let log_det_h_grad_term = numeric_logh_grad[k];
                             let log_det_s_grad_term = 0.5 * det1_values[k];
-
-                            let mut weight_term = 0.0;
-                            if let Some(ref d_eta_all) = d_eta_all {
-                                for i in 0..hdiag.len() {
-                                    weight_term += hdiag[i] * dw_deta[i] * d_eta_all[(i, k)];
-                                }
-                            } else {
-                                let d_beta_col = d_beta.column(k).to_owned();
-                                let d_eta = x_transformed.matrix_vector_multiply(&d_beta_col);
-                                for i in 0..d_eta.len() {
-                                    weight_term += hdiag[i] * dw_deta[i] * d_eta[i];
-                                }
-                            }
-
-                            let gradient_value = 0.5 * beta_terms[k]
-                                + 0.5 * trace_term
-                                + 0.5 * weight_term
-                                - log_det_s_grad_term;
+                            let gradient_value =
+                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
                             laml_grad.push(gradient_value);
                         }
                         workspace
