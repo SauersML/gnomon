@@ -256,6 +256,65 @@ pub fn logit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     mean_prob.clamp(1e-10, 1.0 - 1e-10)
 }
 
+/// Computes the integrated probability AND its derivative with respect to eta.
+///
+/// For IRLS, we need both:
+/// - μ = ∫ σ(η) × N(η; m, SE²) dη
+/// - dμ/dm = ∫ σ'(η) × N(η; m, SE²) dη = ∫ σ(η)(1-σ(η)) × N(η; m, SE²) dη
+///
+/// Returns: (μ, dμ/dm)
+#[inline]
+pub fn logit_posterior_mean_with_deriv(eta: f64, se_eta: f64) -> (f64, f64) {
+    const MIN_DERIV: f64 = 1e-6;
+    
+    // If SE is negligible, return standard sigmoid and its derivative
+    if se_eta < 1e-10 {
+        let mu = sigmoid(eta);
+        let dmu = (mu * (1.0 - mu)).max(MIN_DERIV);
+        return (mu, dmu);
+    }
+
+    let gh = get_gauss_hermite();
+    let scale = std::f64::consts::SQRT_2 * se_eta;
+    let norm = 1.0 / std::f64::consts::PI.sqrt();
+    
+    let mut sum_mu = 0.0;
+    let mut sum_dmu = 0.0;
+
+    for i in 0..N_POINTS {
+        let eta_i = eta + scale * gh.nodes[i];
+        let prob_i = sigmoid(eta_i);
+        let deriv_i = prob_i * (1.0 - prob_i);  // σ'(η) = σ(η)(1-σ(η))
+        
+        sum_mu += gh.weights[i] * prob_i;
+        sum_dmu += gh.weights[i] * deriv_i;
+    }
+
+    let mu = (sum_mu * norm).clamp(1e-10, 1.0 - 1e-10);
+    let dmu = (sum_dmu * norm).max(MIN_DERIV);
+    
+    (mu, dmu)
+}
+
+/// Batch version of logit_posterior_mean_with_deriv.
+/// Returns (mu_array, dmu_array)
+pub fn logit_posterior_mean_with_deriv_batch(
+    eta: &ndarray::Array1<f64>,
+    se_eta: &ndarray::Array1<f64>,
+) -> (ndarray::Array1<f64>, ndarray::Array1<f64>) {
+    let n = eta.len();
+    let mut mu = ndarray::Array1::<f64>::zeros(n);
+    let mut dmu = ndarray::Array1::<f64>::zeros(n);
+    
+    for i in 0..n {
+        let (m, d) = logit_posterior_mean_with_deriv(eta[i], se_eta[i]);
+        mu[i] = m;
+        dmu[i] = d;
+    }
+    
+    (mu, dmu)
+}
+
 /// Computes posterior mean probabilities for a batch of predictions.
 ///
 /// This is the vectorized version of `logit_posterior_mean`.

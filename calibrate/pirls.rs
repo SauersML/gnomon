@@ -282,7 +282,11 @@ struct GamWorkingModel<'a> {
     last_z: Array1<f64>,
     last_penalty_term: f64,
     x_csr: Option<SparseRowMat<usize, f64>>,
+    /// Optional per-observation SE for integrated (GHQ) likelihood.
+    /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
+    covariate_se: Option<Array1<f64>>,
 }
+
 
 struct GamModelFinalState {
     x_transformed: DesignMatrix,
@@ -326,7 +330,15 @@ impl<'a> GamWorkingModel<'a> {
             last_z: Array1::zeros(n),
             last_penalty_term: 0.0,
             x_csr,
+            covariate_se: None,
         }
+    }
+    
+    /// Set per-observation SE for integrated (GHQ) likelihood.
+    /// When set, the working model uses uncertainty-aware IRLS updates.
+    fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
+        self.covariate_se = Some(se);
+        self
     }
 
     fn into_final_state(self) -> GamModelFinalState {
@@ -347,19 +359,34 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut eta = self.offset.clone();
         eta += &self.x_transformed.matrix_vector_multiply(beta);
 
-        // Use zero-allocation update into pre-allocated buffers
-        update_glm_vectors(
-            self.y,
-            &eta,
-            self.link,
-            self.prior_weights,
-            &mut self.last_mu,
-            &mut self.last_weights,
-            &mut self.last_z,
-        );
+        // Use integrated (GHQ) likelihood if per-observation SE is available.
+        // This coherently accounts for uncertainty in the base prediction.
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            update_glm_vectors_integrated(
+                self.y,
+                &eta,
+                se.view(),
+                self.prior_weights,
+                &mut self.last_mu,
+                &mut self.last_weights,
+                &mut self.last_z,
+            );
+        } else {
+            // Standard GLM update (canonical logit or identity)
+            update_glm_vectors(
+                self.y,
+                &eta,
+                self.link,
+                self.prior_weights,
+                &mut self.last_mu,
+                &mut self.last_weights,
+                &mut self.last_z,
+            );
+        }
         // Create references for use in this function
         let mu = &self.last_mu;
         let weights = &self.last_weights;
+
 
         if self.firth_bias_reduction {
             let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
@@ -1200,6 +1227,8 @@ pub fn fit_model_for_fixed_rho<'a>(
     layout: &ModelLayout,
     config: &ModelConfig,
     warm_start_beta: Option<&Array1<f64>>,
+    // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
+    covariate_se: Option<&Array1<f64>>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
 
@@ -1348,6 +1377,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
     );
+    
+    // Apply integrated (GHQ) likelihood if per-observation SE is provided.
+    // This is used by the calibrator to coherently account for base prediction uncertainty.
+    if let Some(se) = covariate_se {
+        working_model = working_model.with_covariate_se(se.to_owned());
+    }
 
     let beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == layout.total_coeffs)
@@ -1754,6 +1789,58 @@ pub fn update_glm_vectors(
                 z[i] = y[i];
             }
         }
+    }
+}
+
+/// Updates GLM working vectors using integrated (uncertainty-aware) likelihood.
+///
+/// For the calibrator, we model:
+///   μᵢ = E[σ(ηᵢ + ε)] where ε ~ N(0, SEᵢ²)
+///
+/// This integrates out uncertainty in the base prediction, giving a coherent
+/// probabilistic treatment of measurement error. The effect is that steep
+/// calibration adjustments are automatically attenuated when SE is high.
+///
+/// Uses the general IRLS formula (not canonical shortcut):
+///   weight = prior × (dμ/dη)² / (μ(1-μ))  
+///   z = η + (y - μ) / (dμ/dη)
+pub fn update_glm_vectors_integrated(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    se: ArrayView1<f64>,
+    prior_weights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+) {
+    use crate::calibrate::quadrature::logit_posterior_mean_with_deriv;
+    
+    const MIN_WEIGHT: f64 = 1e-12;
+    const MIN_D_FOR_Z: f64 = 1e-6;
+    const PROB_EPS: f64 = 1e-8;
+
+    let n = eta.len();
+    for i in 0..n {
+        let e = eta[i].clamp(-700.0, 700.0);
+        let se_i = se[i].max(0.0);
+        
+        // Integrated probability and derivative via GHQ
+        let (mu_i, dmu_deta) = logit_posterior_mean_with_deriv(e, se_i);
+        let mu_clamped = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
+        mu[i] = mu_clamped;
+        
+        // General IRLS weight formula (not canonical shortcut):
+        // W = prior × (dμ/dη)² / Var(Y|μ)
+        // For Bernoulli: Var(Y|μ) = μ(1-μ)
+        let variance = (mu_clamped * (1.0 - mu_clamped)).max(PROB_EPS);
+        let dmu_sq = dmu_deta * dmu_deta;
+        let fisher_w = (dmu_sq / variance).max(MIN_WEIGHT);
+        weights[i] = prior_weights[i] * fisher_w;
+        
+        // Working response using general formula:
+        // z = η + (y - μ) / (dμ/dη)
+        let denom = dmu_deta.max(MIN_D_FOR_Z);
+        z[i] = e + (y[i] - mu_clamped) / denom;
     }
 }
 
@@ -3006,6 +3093,7 @@ mod tests {
             &layout,
             &config,
             None,
+            None, // No SE for test
         )?;
 
         // --- Return all necessary components for assertion ---
@@ -3652,6 +3740,7 @@ mod tests {
             &layout,
             &config,
             None,
+            None, // No SE for test
         )
         .expect("First fit should converge for this stable test case");
 
@@ -3668,6 +3757,7 @@ mod tests {
             &layout,
             &config,
             None,
+            None, // No SE for test
         )
         .expect("Second fit should converge for this stable test case");
 
@@ -3785,6 +3875,7 @@ mod tests {
             &layout,
             &config,
             None,
+            None, // No SE for test
         )
         .expect("P-IRLS MUST NOT FAIL on a perfectly stable, zero-signal dataset.");
 
@@ -3920,6 +4011,7 @@ mod tests {
             &layout,
             &config,
             None,
+            None, // No SE for test
         )
         .expect("P-IRLS should converge on realistic data with clear signal");
 

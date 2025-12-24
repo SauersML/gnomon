@@ -2490,6 +2490,7 @@ mod tests {
             &layout,
             &cfg,
             None,
+            None, // No SE for log-det computation
         )
         .expect("pirls");
 
@@ -2554,6 +2555,7 @@ mod tests {
             &layout,
             &cfg,
             None,
+            None, // No SE for Identity link
         )
         .expect("pirls");
 
@@ -3019,6 +3021,7 @@ mod tests {
             &layout,
             &cfg,
             None,
+            None, // No SE for test helper
         )
         .expect("real PIRLS fit failed");
         pirls_result
@@ -4258,6 +4261,7 @@ mod tests {
             &layout,
             &cfg,
             None,
+            None, // No SE for test
         )
         .expect("fixed-rho PIRLS (low)");
         let (fit_high, _) = pirls::fit_model_for_fixed_rho(
@@ -4272,6 +4276,7 @@ mod tests {
             &layout,
             &cfg,
             None,
+            None, // No SE for test
         )
         .expect("fixed-rho PIRLS (high)");
 
