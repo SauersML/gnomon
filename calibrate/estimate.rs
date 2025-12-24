@@ -129,7 +129,43 @@ fn log_basis_cache_stats(context: &str) {
     );
 }
 
-// Helper: Frobenius inner product for faer matrices using compensated summation
+/// Deflate calibrator weights by SE² to prevent regularization reversal.
+///
+/// This implements the "errors-in-variables" correction. The base model's predictions
+/// (η̂) are not fixed values - they have estimation uncertainty (SE). Points with high
+/// SE should have less influence on calibrator fitting to prevent the calibrator from
+/// "undoing" intentional shrinkage at uncertain predictions.
+///
+/// Formula: W_cal = W_base / (1 + W_base × SE²)
+///
+/// - Where SE is low: W_cal ≈ W_base (full weight, allow calibration)
+/// - Where SE is high: W_cal → 0 (low weight, preserve base model's shrinkage)
+fn deflate_weights_by_se(weights: &Array1<f64>, se: &Array1<f64>) -> Array1<f64> {
+    assert_eq!(weights.len(), se.len(), "weights and se must have same length");
+    
+    let mut deflated = Array1::<f64>::zeros(weights.len());
+    for i in 0..weights.len() {
+        let w = weights[i].max(1e-12);
+        let se_sq = se[i] * se[i];
+        // W_cal = W / (1 + W × SE²)
+        deflated[i] = w / (1.0 + w * se_sq);
+    }
+    
+    // Log diagnostic about weight deflation
+    let total_orig: f64 = weights.iter().sum();
+    let total_defl: f64 = deflated.iter().sum();
+    let reduction = if total_orig > 0.0 {
+        100.0 * (1.0 - total_defl / total_orig)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[CAL] Weight deflation: sum(W_base)={:.2}, sum(W_cal)={:.2}, reduction={:.1}%",
+        total_orig, total_defl, reduction
+    );
+    
+    deflated
+}
 fn faer_frob_inner(a: faer::MatRef<'_, f64>, b: faer::MatRef<'_, f64>) -> f64 {
     let (m, n) = (a.nrows(), a.ncols());
     let mut sum = KahanSum::default();
@@ -1547,9 +1583,17 @@ pub fn train_model(
         } else {
             eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
             let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties_cal);
+            
+            // Deflate weights by SE² to prevent regularization reversal
+            // (errors-in-variables correction for calibrator fitting)
+            let deflated_weights = deflate_weights_by_se(
+                &features.fisher_weights,
+                &features.se,
+            );
+            
             let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
                 reml_state.y(),
-                reml_state.weights(),
+                deflated_weights.view(),
                 x_cal.view(),
                 offset.view(),
                 &penalties_cal,
@@ -2606,9 +2650,17 @@ pub fn train_survival_model(
                 let penalty_nullspace_dims =
                     cal::active_penalty_nullspace_dims(&schema, &penalties_cal);
                 let outcomes = data_ref.event_target.mapv(|value| f64::from(value));
+                
+                // Deflate weights by SE² to prevent regularization reversal
+                // (errors-in-variables correction for calibrator fitting)
+                let deflated_weights = deflate_weights_by_se(
+                    &features.fisher_weights,
+                    &features.se,
+                );
+                
                 let (beta_cal, lambdas_cal, _, edf_pair, fit_meta) = cal::fit_calibrator(
                     outcomes.view(),
-                    features.fisher_weights.view(),
+                    deflated_weights.view(),
                     x_cal.view(),
                     offset.view(),
                     &penalties_cal,
