@@ -4099,26 +4099,24 @@ mod tests {
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
         assert_abs_diff_eq!(hazard, eta_exit[0].exp(), epsilon = 1e-10);
 
+        // Test that out-of-range PGS values are clamped (not errored) for robustness
         let pgs_idx = artifacts
             .static_covariate_layout
             .column_names
             .iter()
             .position(|name| name == "pgs")
             .expect("pgs column present");
+        
+        // Values outside range should now be clamped silently, not error
         let mut covariates_high = covariates.clone();
         covariates_high[pgs_idx] = metadata.value_ranges[0].max + 0.5;
-        let err_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts)
-            .expect_err("pgs above range should error");
-        assert!(matches!(
-            err_high,
-            SurvivalError::CovariateAboveRange { .. }
-        ));
+        let result_high = design_row_at_age(data.age_exit[0], covariates_high.view(), &artifacts);
+        assert!(result_high.is_ok(), "out-of-range PGS should be clamped, not error");
 
         let mut covariates_low = covariates;
         covariates_low[pgs_idx] = metadata.value_ranges[0].min - 0.5;
-        let err_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts)
-            .expect_err("pgs below range should error");
-        assert!(matches!(err_low, SurvivalError::CovariateBelowRange { .. }));
+        let result_low = design_row_at_age(data.age_exit[0], covariates_low.view(), &artifacts);
+        assert!(result_low.is_ok(), "out-of-range PGS should be clamped, not error");
 
         let model = WorkingModelSurvival::new(
             layout.clone(),
