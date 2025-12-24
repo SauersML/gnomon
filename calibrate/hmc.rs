@@ -1530,18 +1530,23 @@ mod tests {
         let eta_map = x_test.dot(&mode);
         let pred_map = 1.0 / (1.0 + (-eta_map).exp());
         
-        // MCMC prediction: E[σ(x_test^T * β)]
+        // MCMC prediction: E[σ(x_test^T * β)] and η moments for Jensen checks.
         let mut sum_prob = 0.0;
         let mut sum_eta = 0.0;
+        let mut sum_eta_sq = 0.0;
         for i in 0..samples.nrows() {
             let beta_i = samples.row(i);
             let eta_i = x_test.dot(&beta_i);
             let p_i = 1.0 / (1.0 + (-eta_i.clamp(-700.0, 700.0)).exp());
             sum_prob += p_i;
             sum_eta += eta_i;
+            sum_eta_sq += eta_i * eta_i;
         }
-        let pred_mcmc = sum_prob / samples.nrows() as f64;
-        let mean_eta = sum_eta / samples.nrows() as f64;
+        let n_f = samples.nrows() as f64;
+        let pred_mcmc = sum_prob / n_f;
+        let mean_eta = sum_eta / n_f;
+        let mean_eta_sq = sum_eta_sq / n_f;
+        let var_eta = (mean_eta_sq - mean_eta * mean_eta).max(0.0);
         let pred_mean_eta = 1.0 / (1.0 + (-mean_eta.clamp(-700.0, 700.0)).exp());
 
         println!("[Jensen Gap] η_MAP = {:.4}, P_MAP = {:.4}", eta_map, pred_map);
@@ -1551,10 +1556,21 @@ mod tests {
 
         // MCMC should shrink overconfident predictions
         if mean_eta > 0.0 {
+            // Guard against mode-collapse: eta variance should be non-trivial.
+            assert!(
+                var_eta > 1e-4,
+                "Sampler appears collapsed: var(eta)={:.3e}",
+                var_eta
+            );
             assert!(
                 pred_mcmc <= pred_mean_eta + 1e-3,
                 "Jensen gap: P_MCMC ({:.4}) should be <= sigma(E[eta]) ({:.4})",
                 pred_mcmc, pred_mean_eta
+            );
+            assert!(
+                pred_mcmc < pred_map,
+                "Jensen gap: P_MCMC ({:.4}) should be < P_MAP ({:.4})",
+                pred_mcmc, pred_map
             );
             println!("[Jensen Gap] PASSED: Overconfidence shrinkage observed");
         } else {
