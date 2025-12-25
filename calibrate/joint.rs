@@ -1543,6 +1543,15 @@ fn compute_link_derivative_from_state(
     deriv
 }
 
+/// Public version for use in HMC Hessian computation
+pub fn compute_link_derivative_from_result_public(
+    result: &JointModelResult,
+    eta_base: &Array1<f64>,
+    b_wiggle: &Array2<f64>,
+) -> Array1<f64> {
+    compute_link_derivative_from_result(result, eta_base, b_wiggle)
+}
+
 fn compute_link_derivative_from_result(
     result: &JointModelResult,
     eta_base: &Array1<f64>,

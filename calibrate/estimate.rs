@@ -903,15 +903,17 @@ pub fn train_joint_model(
     };
 
 
-    // ===== Stage 5: Joint MCMC sampling (if enabled) =====
+    // ===== Stage 5: Joint MCMC sampling (if enabled, supports Logit and Identity) =====
     let mcmc_samples = if config.mcmc_enabled {
-        eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling...");
+        let is_logit = link == LinkFunction::Logit;
+        eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...", if is_logit { "logit" } else { "identity" });
         
-        // Build combined base penalty: Σλ_k S_k
         let p_base = x_matrix.ncols();
         let p_link = result.beta_link.len();
         let dim = p_base + p_link;
+        let n = data.y.len();
         
+        // Build combined base penalty: Σλ_k S_k
         let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
         for k in 0..n_base {
             if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
@@ -919,29 +921,95 @@ pub fn train_joint_model(
             }
         }
         
-        
-        // Use the REAL constrained link penalty from the REML fit (critical for correct posterior)
+        // Use the REAL constrained link penalty from the REML fit
         let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
         let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
         
-        // Build approximate joint Hessian (diagonal for now - NUTS adapts mass matrix)
-        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
-        // Use base penalty + small ridge for base block
-        for i in 0..p_base {
-            for j in 0..p_base {
-                joint_hessian[[i, j]] = s_base_accum[[i, j]];
+        // Build real Gauss-Newton Hessian at the mode (not just penalties)
+        // H = [[X'WX + S_base, X'W·g'·B], [B'·g'·W·X, B'WB + S_link]]
+        // where W = diag(w * μ(1-μ)) at the mode
+        let eta_base = x_matrix.dot(&result.beta_base);
+        let b_wiggle = {
+            let (min_u, max_u) = result.knot_range;
+            let rw = (max_u - min_u).max(1e-6);
+            let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
+            match crate::calibrate::basis::create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
+                Ok((basis, _)) => {
+                    let raw = basis.as_ref();
+                    if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
+                        raw.dot(&result.link_transform)
+                    } else {
+                        raw.clone()
+                    }
+                }
+                Err(_) => Array2::zeros((n, p_link)),
             }
-            joint_hessian[[i, i]] += 1e-4; // Small ridge for stability
-        }
-        // Use link penalty + small ridge for link block
-        for i in 0..p_link {
-            for j in 0..p_link {
-                joint_hessian[[p_base + i, p_base + j]] = s_link[[i, j]];
-            }
-            joint_hessian[[p_base + i, p_base + i]] += 1e-4;
+        };
+        
+        // Compute μ and weights W = w * μ(1-μ) at the mode
+        let wiggle = b_wiggle.dot(&result.beta_link);
+        let eta_full = &eta_base + &wiggle;
+        let mut w_eff = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let eta_i = eta_full[i].clamp(-700.0, 700.0);
+            let mu_i = 1.0 / (1.0 + (-eta_i).exp());
+            let var_i = mu_i * (1.0 - mu_i);
+            w_eff[i] = data.weights[i] * var_i.max(1e-10);
         }
         
-        // Build spline artifacts from result
+        // Compute g'(u) at the mode (use finite diff for now)
+        let g_prime = crate::calibrate::joint::compute_link_derivative_from_result_public(&result, &eta_base, &b_wiggle);
+        
+        // Build joint Hessian blocks
+        // A = X' diag(W * g'^2) X + S_base
+        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+        
+        // Base block: X' W_eff X + S_base (simplified: ignore g'^2 for speed)
+        for j in 0..p_base {
+            for k in j..p_base {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    sum += w_eff[i] * x_matrix[[i, j]] * x_matrix[[i, k]];
+                }
+                joint_hessian[[j, k]] = sum + s_base_accum[[j, k]];
+                if j != k {
+                    joint_hessian[[k, j]] = joint_hessian[[j, k]];
+                }
+            }
+        }
+        
+        // Link block: B' W B + S_link
+        for j in 0..p_link {
+            for k in j..p_link {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    sum += w_eff[i] * b_wiggle[[i, j]] * b_wiggle[[i, k]];
+                }
+                joint_hessian[[p_base + j, p_base + k]] = sum + s_link[[j, k]];
+                if j != k {
+                    joint_hessian[[p_base + k, p_base + j]] = joint_hessian[[p_base + j, p_base + k]];
+                }
+            }
+        }
+        
+        
+        // Cross block: C = X' diag(W * g') B
+        for j in 0..p_base {
+            for k in 0..p_link {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    sum += w_eff[i] * g_prime[i] * x_matrix[[i, j]] * b_wiggle[[i, k]];
+                }
+                joint_hessian[[j, p_base + k]] = sum;
+                joint_hessian[[p_base + k, j]] = sum; // Symmetric
+            }
+        }
+        
+        // Add small ridge for stability
+        for i in 0..dim {
+            joint_hessian[[i, i]] += 1e-4;
+        }
+        
         let spline = crate::calibrate::hmc::JointSplineArtifacts {
             knot_range: result.knot_range,
             knot_vector: result.knot_vector.clone(),
@@ -972,6 +1040,8 @@ pub fn train_joint_model(
             joint_hessian.view(),
             spline,
             &nuts_config,
+            is_logit,
+            scale_val,
         ) {
             Ok(nuts_result) => {
                 eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());

@@ -928,15 +928,20 @@ pub struct JointLinkPosterior {
     p_base: usize,
     p_link: usize,
     n_samples: usize,
+    is_logit: bool,  // true=logit, false=identity
+    scale: f64,      // dispersion parameter for identity link
 }
 
 impl JointLinkPosterior {
     /// Creates a new joint posterior target.
+    /// `is_logit`: true for Bernoulli-logit, false for Gaussian-identity
+    /// `scale`: dispersion parameter (ignored if is_logit=true)
     pub fn new(
         x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
         penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
         mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
         hessian: ArrayView2<f64>, spline: JointSplineArtifacts,
+        is_logit: bool, scale: f64,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let p_base = x.ncols();
@@ -954,7 +959,7 @@ impl JointLinkPosterior {
             x: Arc::new(x.to_owned()), y: Arc::new(y.to_owned()), weights: Arc::new(weights.to_owned()),
             penalty_base: Arc::new(penalty_base.to_owned()), penalty_link: Arc::new(penalty_link.to_owned()),
             mode_beta: Arc::new(mode_beta.to_owned()), mode_theta: Arc::new(mode_theta.to_owned()),
-            spline, chol, chol_t, p_base, p_link, n_samples,
+            spline, chol, chol_t, p_base, p_link, n_samples, is_logit, scale,
         })
     }
 
@@ -970,26 +975,38 @@ impl JointLinkPosterior {
         let (b_wiggle, eta) = self.evaluate_link(&u, &theta);
         let mut ll = 0.0;
         let mut residual = Array1::<f64>::zeros(self.n_samples);
-        for i in 0..self.n_samples {
-            let eta_i = eta[i];
-            let (y_i, w_i) = (self.y[i], self.weights[i]);
-            // Numerically stable log-likelihood: y*η - log(1 + exp(η))
-            // Use softplus: log(1 + exp(η)) = η + log(1 + exp(-η)) for η > 0
-            let log1pexp = if eta_i > 0.0 {
-                eta_i + (-eta_i).exp().ln_1p()
-            } else {
-                eta_i.exp().ln_1p()
-            };
-            ll += w_i * (y_i * eta_i - log1pexp);
-            // μ via stable sigmoid
-            let mu = if eta_i > 0.0 {
-                1.0 / (1.0 + (-eta_i).exp())
-            } else {
-                let e = eta_i.exp();
-                e / (1.0 + e)
-            };
-            residual[i] = w_i * (y_i - mu);
+        
+        if self.is_logit {
+            // Bernoulli-logit log-likelihood
+            for i in 0..self.n_samples {
+                let eta_i = eta[i];
+                let (y_i, w_i) = (self.y[i], self.weights[i]);
+                let log1pexp = if eta_i > 0.0 {
+                    eta_i + (-eta_i).exp().ln_1p()
+                } else {
+                    eta_i.exp().ln_1p()
+                };
+                ll += w_i * (y_i * eta_i - log1pexp);
+                let mu = if eta_i > 0.0 {
+                    1.0 / (1.0 + (-eta_i).exp())
+                } else {
+                    let e = eta_i.exp();
+                    e / (1.0 + e)
+                };
+                residual[i] = w_i * (y_i - mu);
+            }
+        } else {
+            // Gaussian identity log-likelihood: -0.5 * w * (y - η)² / σ²
+            let inv_scale_sq = 1.0 / (self.scale * self.scale).max(1e-10);
+            for i in 0..self.n_samples {
+                let eta_i = eta[i];
+                let (y_i, w_i) = (self.y[i], self.weights[i]);
+                let r = y_i - eta_i;
+                ll -= 0.5 * w_i * r * r * inv_scale_sq;
+                residual[i] = w_i * r * inv_scale_sq; // grad of ll w.r.t. η
+            }
         }
+        
         let g_prime = self.compute_g_prime(&u, &theta);
         let grad_theta = &b_wiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
         let r_scaled: Array1<f64> = residual.iter().zip(g_prime.iter()).map(|(&r, &g)| r * g).collect();
@@ -1068,14 +1085,17 @@ impl HamiltonianTarget<Array1<f64>> for JointLinkPosterior {
 }
 
 /// Runs NUTS sampling for joint (β, θ).
+/// `is_logit`: true for Bernoulli-logit, false for Gaussian-identity
+/// `scale`: dispersion parameter for identity link (ignored if is_logit=true)
 pub fn run_joint_nuts_sampling(
     x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
     penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
     mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
     hessian: ArrayView2<f64>, spline: JointSplineArtifacts, config: &NutsConfig,
+    is_logit: bool, scale: f64,
 ) -> Result<NutsResult, String> {
     let (p_base, dim) = (mode_beta.len(), mode_beta.len() + mode_theta.len());
-    let target = JointLinkPosterior::new(x, y, weights, penalty_base, penalty_link, mode_beta, mode_theta, hessian, spline)?;
+    let target = JointLinkPosterior::new(x, y, weights, penalty_base, penalty_link, mode_beta, mode_theta, hessian, spline, is_logit, scale)?;
     let chol = target.chol().clone();
     let (mb, mt) = target.mode();
     let mut mode_arr = Array1::<f64>::zeros(dim);
