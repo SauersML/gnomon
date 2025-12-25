@@ -777,6 +777,81 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
+/// Train a joint single-index model with flexible link calibration
+/// 
+/// This uses the joint model architecture where the base predictor and
+/// flexible link are fitted together in one optimization with REML.
+/// 
+/// The model is: η = g(Xβ) where g is a learned flexible link function.
+pub fn train_joint_model(
+    data: &TrainingData,
+    config: &ModelConfig,
+) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
+    use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
+    
+    basis::clear_basis_cache();
+    
+    log::info!(
+        "Starting joint model training with REML. {} total samples.",
+        data.y.len()
+    );
+    
+    eprintln!("\n[JOINT] Constructing model structure...");
+    let (
+        x_matrix,
+        s_list,
+        layout,
+        sum_to_zero_constraints,
+        knot_vectors,
+        range_transforms,
+        pc_null_transforms,
+        interaction_centering_means,
+        interaction_orth_alpha,
+        penalty_structs,
+    ) = build_design_and_penalty_matrices(data, config)?;
+    
+    // Drop unused construction outputs (needed for prediction, not fitting)
+    drop(sum_to_zero_constraints);
+    drop(knot_vectors);
+    drop(range_transforms);
+    drop(pc_null_transforms);
+    drop(interaction_centering_means);
+    drop(interaction_orth_alpha);
+    drop(penalty_structs);
+    
+    eprintln!(
+        "[JOINT] Model structure built. Total Coeffs: {}, Penalties: {}",
+        layout.total_coeffs, layout.num_penalties
+    );
+    
+    // Configure joint model
+    let joint_config = JointModelConfig {
+        max_backfit_iter: 100,
+        backfit_tol: 1e-6,
+        max_reml_iter: 50,
+        reml_tol: 1e-4,
+        n_link_knots: 10, // 10 internal knots for flexible link
+    };
+    
+    eprintln!("[JOINT] Starting joint optimization with REML...");
+    let result = fit_joint_model_with_reml(
+        data.y.view(),
+        data.weights.view(),
+        x_matrix.view(),
+        s_list,
+        layout,
+        config.link_function().expect("link required"),
+        &joint_config,
+    )?;
+    
+    eprintln!(
+        "[JOINT] Optimization complete. Converged: {}, Iterations: {}, Deviance: {:.4}",
+        result.converged, result.backfit_iterations, result.deviance
+    );
+    
+    Ok(result)
+}
+
 /// The main entry point for model training. Orchestrates the REML/BFGS optimization.
 pub fn train_model(
     data: &TrainingData,
