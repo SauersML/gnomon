@@ -936,7 +936,7 @@ fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
 }
 
 /// Internal module for implementation details not exposed in the public API.
-pub mod internal {
+pub(crate) mod internal {
     use super::*;
 
     /// Thread-local scratch buffers for spline evaluation. These are reused across
@@ -1939,14 +1939,11 @@ pub fn evaluate_bspline_basis_scalar(
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
-        // For performance in this hot path, we could panic or return error.
-        // Since BasisError doesn't have a DimensionMismatch for this specific case, reusing a generic one or just Linalg.
-        // Let's panic for now as this is a logic error in the caller.
-        panic!(
+        return Err(BasisError::InvalidKnotVector(format!(
             "Output buffer length {} does not match number of basis functions {}",
             out.len(),
             num_basis
-        );
+        )));
     }
 
     internal::evaluate_splines_at_point_into(x, degree, knot_vector, out, &mut scratch.inner);
@@ -2005,20 +2002,20 @@ pub fn evaluate_bspline_derivative_scalar_into(
 
     let num_basis = knot_vector.len() - degree - 1;
     if out.len() != num_basis {
-        panic!(
+        return Err(BasisError::InvalidKnotVector(format!(
             "Output buffer length {} does not match number of basis functions {}",
             out.len(),
             num_basis
-        );
+        )));
     }
 
     let num_basis_lower = knot_vector.len() - degree;
     if lower_basis.len() < num_basis_lower {
-        panic!(
+        return Err(BasisError::InvalidKnotVector(format!(
             "lower_basis buffer too small: {} < {}",
             lower_basis.len(),
             num_basis_lower
-        );
+        )));
     }
     
     // Fill lower basis with zeros

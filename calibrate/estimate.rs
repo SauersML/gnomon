@@ -1042,45 +1042,49 @@ pub fn train_joint_model(
         // D = B' diag(W) B + S_link
         let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
         
-        // Base block: X' diag(W * g'^2) X + S_base (includes g'² for correct GN curvature)
+        // Compute weighted matrices once: sqrt(w*g'^2)*X and sqrt(w)*B
+        let mut x_weighted = x_matrix.to_owned();
+        let mut b_weighted = b_wiggle.clone();
+        for i in 0..n {
+            let sqrt_wg2 = (w_eff[i] * g_prime[i] * g_prime[i]).sqrt();
+            let sqrt_w = w_eff[i].sqrt();
+            for j in 0..p_base {
+                x_weighted[[i, j]] *= sqrt_wg2;
+            }
+            for j in 0..p_link {
+                b_weighted[[i, j]] *= sqrt_w;
+            }
+        }
+        
+        // Base block: X'WX + S_base using efficient matrix multiply
+        let xtx = x_weighted.t().dot(&x_weighted);
         for j in 0..p_base {
-            for k in j..p_base {
-                let mut sum = 0.0;
-                for i in 0..n {
-                    let wi = w_eff[i] * g_prime[i] * g_prime[i];
-                    sum += wi * x_matrix[[i, j]] * x_matrix[[i, k]];
-                }
-                joint_hessian[[j, k]] = sum + s_base_accum[[j, k]];
-                if j != k {
-                    joint_hessian[[k, j]] = joint_hessian[[j, k]];
-                }
+            for k in 0..p_base {
+                joint_hessian[[j, k]] = xtx[[j, k]] + s_base_accum[[j, k]];
             }
         }
         
-        // Link block: B' W B + S_link
+        // Link block: B'WB + S_link
+        let btb = b_weighted.t().dot(&b_weighted);
         for j in 0..p_link {
-            for k in j..p_link {
-                let mut sum = 0.0;
-                for i in 0..n {
-                    sum += w_eff[i] * b_wiggle[[i, j]] * b_wiggle[[i, k]];
-                }
-                joint_hessian[[p_base + j, p_base + k]] = sum + s_link[[j, k]];
-                if j != k {
-                    joint_hessian[[p_base + k, p_base + j]] = joint_hessian[[p_base + j, p_base + k]];
-                }
+            for k in 0..p_link {
+                joint_hessian[[p_base + j, p_base + k]] = btb[[j, k]] + s_link[[j, k]];
             }
         }
         
-        
-        // Cross block: C = X' diag(W * g') B
+        // Cross block: C = X' diag(W * g') B - need different weighting
+        let mut x_gw = x_matrix.to_owned();
+        for i in 0..n {
+            let wg = w_eff[i] * g_prime[i];
+            for j in 0..p_base {
+                x_gw[[i, j]] *= wg;
+            }
+        }
+        let cross = x_gw.t().dot(&b_wiggle);
         for j in 0..p_base {
             for k in 0..p_link {
-                let mut sum = 0.0;
-                for i in 0..n {
-                    sum += w_eff[i] * g_prime[i] * x_matrix[[i, j]] * b_wiggle[[i, k]];
-                }
-                joint_hessian[[j, p_base + k]] = sum;
-                joint_hessian[[p_base + k, j]] = sum; // Symmetric
+                joint_hessian[[j, p_base + k]] = cross[[j, k]];
+                joint_hessian[[p_base + k, j]] = cross[[j, k]]; // Symmetric
             }
         }
         
