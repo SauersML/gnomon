@@ -1953,3 +1953,79 @@ pub fn evaluate_bspline_basis_scalar(
 
     Ok(())
 }
+
+/// Evaluates B-spline basis derivatives at a single scalar point `x` into a provided buffer.
+///
+/// Uses the analytic de Boor derivative formula:
+/// B'_{i,k}(x) = k * (B_{i,k-1}(x)/(t_{i+k}-t_i) - B_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+///
+/// # Arguments
+/// * `x` - The point at which to evaluate
+/// * `knot_vector` - The knot vector
+/// * `degree` - B-spline degree (must be >= 1)
+/// * `out` - Output buffer for derivative values (length = num_basis)
+/// * `scratch` - Scratch space for temporary computation
+pub fn evaluate_bspline_derivative_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        panic!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        );
+    }
+
+    // Evaluate lower-degree (k-1) basis functions for derivative formula
+    let num_basis_lower = knot_vector.len() - degree; // = (n_knots) - (degree-1) - 1 + 1
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    
+    // Create a fresh scratch for lower degree evaluation
+    let mut lower_scratch = internal::BsplineScratch::new(degree - 1);
+    internal::evaluate_splines_at_point_into(
+        x, 
+        degree - 1, 
+        knot_vector, 
+        &mut lower_basis,
+        &mut lower_scratch
+    );
+    
+    // Apply derivative formula: B'_{i,k}(x) = k * (B_{i,k-1}/(t_{i+k}-t_i) - B_{i+1,k-1}/(t_{i+k+1}-t_{i+1}))
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom_left = knot_vector[i + degree] - knot_vector[i];
+        let denom_right = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        
+        let left_term = if denom_left.abs() > 1e-12 && i < lower_basis.len() {
+            lower_basis[i] / denom_left
+        } else {
+            0.0
+        };
+        
+        let right_term = if denom_right.abs() > 1e-12 && (i + 1) < lower_basis.len() {
+            lower_basis[i + 1] / denom_right
+        } else {
+            0.0
+        };
+        
+        out[i] = k * (left_term - right_term);
+    }
+
+    Ok(())
+}

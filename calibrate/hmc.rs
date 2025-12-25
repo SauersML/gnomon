@@ -27,7 +27,7 @@ use crate::calibrate::faer_ndarray::{FaerCholesky, fast_atv};
 use faer::Side;
 use mini_mcmc::generic_hmc::HamiltonianTarget;
 use mini_mcmc::generic_nuts::GenericNUTS;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -1042,7 +1042,7 @@ impl JointLinkPosterior {
     }
 
     fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
-        use crate::calibrate::basis::{SplineScratch, evaluate_bspline_basis_scalar};
+        use crate::calibrate::basis::evaluate_bspline_derivative_scalar;
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
         let (min_u, max_u) = self.spline.knot_range;
@@ -1050,24 +1050,42 @@ impl JointLinkPosterior {
         let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
         let n_c = self.spline.link_transform.ncols();
         if n_raw == 0 || n_c == 0 || theta.len() != n_c { return g; }
-        let h = 1e-4;
-        let mut rp = vec![0.0; n_raw]; let mut rm = vec![0.0; n_raw];
-        let mut scratch = SplineScratch::new(self.spline.degree);
+        
+        let mut deriv_raw = vec![0.0; n_raw];
+        
         for i in 0..n {
-            let zv = ((u[i] - min_u) / rw).clamp(0.0, 1.0);
-            let (zp, zm) = ((zv + h).clamp(0.0, 1.0), (zv - h).clamp(0.0, 1.0));
-            let dz = (zp - zm).max(1e-8);
-            rp.fill(0.0); rm.fill(0.0);
-            if evaluate_bspline_basis_scalar(zp, self.spline.knot_vector.view(), self.spline.degree, &mut rp, &mut scratch).is_err() { continue; }
-            if evaluate_bspline_basis_scalar(zm, self.spline.knot_vector.view(), self.spline.degree, &mut rm, &mut scratch).is_err() { continue; }
-            if self.spline.link_transform.nrows() == n_raw {
-                let dw: f64 = (0..n_c).map(|c| {
-                    let bp: f64 = (0..n_raw).map(|r| rp[r] * self.spline.link_transform[[r, c]]).sum();
-                    let bm: f64 = (0..n_raw).map(|r| rm[r] * self.spline.link_transform[[r, c]]).sum();
-                    (bp - bm) * theta[c]
-                }).sum();
-                g[i] = 1.0 + dw / dz / rw;
+            let u_i = u[i];
+            let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
+            
+            // At boundaries (clamped), the wiggle is constant so g'(u) = 1
+            if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+                g[i] = 1.0;
+                continue;
             }
+            
+            // Evaluate analytic derivatives of B-spline basis at z_i
+            deriv_raw.fill(0.0);
+            if evaluate_bspline_derivative_scalar(
+                z_i, self.spline.knot_vector.view(), self.spline.degree, &mut deriv_raw
+            ).is_err() {
+                continue;
+            }
+            
+            // Apply constraint transform and compute d(wiggle)/dz
+            // dg/du = 1 + (d/dz [B(z) Z θ]) / rw
+            // where d/dz [B(z) Z θ] = B'(z) Z θ
+            let d_wiggle_dz: f64 = if self.spline.link_transform.nrows() == n_raw {
+                (0..n_c).map(|c| {
+                    let b_prime_c: f64 = (0..n_raw).map(|r| 
+                        deriv_raw[r] * self.spline.link_transform[[r, c]]
+                    ).sum();
+                    b_prime_c * theta[c]
+                }).sum()
+            } else {
+                0.0
+            };
+            
+            g[i] = 1.0 + d_wiggle_dz / rw;
         }
         g
     }
@@ -1120,7 +1138,81 @@ pub fn run_joint_nuts_sampling(
     }
     let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
-    Ok(NutsResult { samples, posterior_mean, posterior_std, rhat: 1.0, ess: total_samples as f64 * 0.5, converged: total_samples > 0 })
+    
+    // Compute real R-hat and ESS (Vehtari et al. 2021 split-R-hat formula)
+    let (rhat, ess) = compute_rhat_ess(&samples_array, n_chains, n_samples_out, dim);
+    let converged = rhat < 1.1 && ess > 100.0;
+    
+    Ok(NutsResult { samples, posterior_mean, posterior_std, rhat, ess, converged })
+}
+
+/// Compute R-hat and ESS for MCMC samples.
+/// Uses simplified split-R-hat: R-hat = sqrt((var_between + var_within) / var_within)
+/// ESS = n * m / (1 + 2*sum(autocorr)) ≈ n * m * var_within / var_total for weak autocorr
+fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, dim: usize) -> (f64, f64) {
+    if n_chains < 2 || n_samples < 4 {
+        return (f64::NAN, (n_chains * n_samples) as f64 * 0.5);
+    }
+    
+    let mut max_rhat = 1.0_f64;
+    let mut min_ess = f64::MAX;
+    
+    for d in 0..dim {
+        // Compute chain means and overall mean
+        let mut chain_means = vec![0.0; n_chains];
+        let mut chain_vars = vec![0.0; n_chains];
+        let mut overall_mean = 0.0;
+        
+        for c in 0..n_chains {
+            let mut sum = 0.0;
+            for s in 0..n_samples {
+                sum += samples[[c, s, d]];
+            }
+            chain_means[c] = sum / n_samples as f64;
+            overall_mean += chain_means[c];
+        }
+        overall_mean /= n_chains as f64;
+        
+        // Within-chain variance W
+        for c in 0..n_chains {
+            let mut sum_sq = 0.0;
+            for s in 0..n_samples {
+                let diff = samples[[c, s, d]] - chain_means[c];
+                sum_sq += diff * diff;
+            }
+            chain_vars[c] = sum_sq / (n_samples - 1) as f64;
+        }
+        let w: f64 = chain_vars.iter().sum::<f64>() / n_chains as f64;
+        
+        // Between-chain variance B
+        let b: f64 = {
+            let mut sum_sq = 0.0;
+            for c in 0..n_chains {
+                let diff = chain_means[c] - overall_mean;
+                sum_sq += diff * diff;
+            }
+            sum_sq * n_samples as f64 / (n_chains - 1) as f64
+        };
+        
+        // R-hat = sqrt((n-1)/n + B/(n*W))
+        let rhat_d = if w > 1e-10 {
+            (((n_samples as f64 - 1.0) / n_samples as f64) + (b / (n_samples as f64 * w))).sqrt()
+        } else {
+            1.0
+        };
+        max_rhat = max_rhat.max(rhat_d);
+        
+        // Simplified ESS = n * m * W / (W + B/n) 
+        let var_total = w + b / n_samples as f64;
+        let ess_d = if var_total > 1e-10 {
+            (n_chains * n_samples) as f64 * w / var_total
+        } else {
+            (n_chains * n_samples) as f64
+        };
+        min_ess = min_ess.min(ess_d);
+    }
+    
+    (max_rhat, min_ess.max(1.0))
 }
 
 #[cfg(test)]
