@@ -1674,8 +1674,10 @@ pub fn predict_joint_from_base_model(
         .base_model
         .as_ref()
         .ok_or(crate::calibrate::model::ModelError::CalibratorMissing)?;
-    let (eta_base, mean, dist, se_eta_opt) = base.predict_detailed(p_new, sex_new, pcs_new)?;
-    drop(dist);
+    let pred = base.predict_detailed(p_new, sex_new, pcs_new)?;
+    let eta_base = pred.0;
+    let mean = pred.1;
+    let se_eta_opt = pred.3;
     if base.joint_link.is_some() {
         return Ok(JointModelPrediction {
             eta: eta_base,
