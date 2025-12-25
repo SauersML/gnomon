@@ -777,6 +777,65 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
+/// Compute g'(u) using analytic B-spline derivatives (same as HMC).
+/// g(u) = u + B(z(u)) @ θ, so g'(u) = 1 + dB/dz @ θ / range_width
+fn compute_analytic_gprime(
+    eta_base: &Array1<f64>,
+    result: &crate::calibrate::joint::JointModelResult,
+) -> Array1<f64> {
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar;
+    
+    let n = eta_base.len();
+    let mut g_prime = Array1::<f64>::ones(n);
+    
+    let (min_u, max_u) = result.knot_range;
+    let rw = (max_u - min_u).max(1e-6);
+    let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
+    let n_c = result.link_transform.ncols();
+    let theta = &result.beta_link;
+    
+    if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+        return g_prime;
+    }
+    
+    // Preallocate outside the loop for performance
+    let mut deriv_raw = vec![0.0; n_raw];
+    
+    for i in 0..n {
+        let u_i = eta_base[i];
+        let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
+        
+        // At boundaries, g'(u) = 1 (wiggle is constant)
+        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+            g_prime[i] = 1.0;
+            continue;
+        }
+        
+        deriv_raw.fill(0.0);
+        if evaluate_bspline_derivative_scalar(
+            z_i, result.knot_vector.view(), result.degree, &mut deriv_raw
+        ).is_err() {
+            continue;
+        }
+        
+        // d(wiggle)/dz = B'(z) @ Z @ θ
+        let d_wiggle_dz: f64 = if result.link_transform.nrows() == n_raw {
+            (0..n_c).map(|c| {
+                let b_prime_c: f64 = (0..n_raw).map(|r| 
+                    deriv_raw[r] * result.link_transform[[r, c]]
+                ).sum();
+                b_prime_c * theta[c]
+            }).sum()
+        } else {
+            0.0
+        };
+        
+        g_prime[i] = 1.0 + d_wiggle_dz / rw;
+    }
+    
+    g_prime
+}
+
 /// Train a joint single-index model with flexible link calibration
 /// 
 /// This uses the joint model architecture where the base predictor and
@@ -946,30 +1005,43 @@ pub fn train_joint_model(
             }
         };
         
-        // Compute μ and weights W = w * μ(1-μ) at the mode
+        // Compute weights W at the mode (depends on link type)
         let wiggle = b_wiggle.dot(&result.beta_link);
         let eta_full = &eta_base + &wiggle;
         let mut w_eff = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let eta_i = eta_full[i].clamp(-700.0, 700.0);
-            let mu_i = 1.0 / (1.0 + (-eta_i).exp());
-            let var_i = mu_i * (1.0 - mu_i);
-            w_eff[i] = data.weights[i] * var_i.max(1e-10);
+        
+        if is_logit {
+            // Logit: W = w * μ(1-μ)
+            for i in 0..n {
+                let eta_i = eta_full[i].clamp(-700.0, 700.0);
+                let mu_i = 1.0 / (1.0 + (-eta_i).exp());
+                let var_i = (mu_i * (1.0 - mu_i)).max(1e-10);
+                w_eff[i] = data.weights[i] * var_i;
+            }
+        } else {
+            // Identity/Gaussian: W = w / σ² (scale_val is σ², so use directly)
+            let inv_scale = 1.0 / scale_val.max(1e-10);
+            for i in 0..n {
+                w_eff[i] = data.weights[i] * inv_scale;
+            }
         }
         
-        // Compute g'(u) at the mode (use finite diff for now)
-        let g_prime = crate::calibrate::joint::compute_link_derivative_from_result_public(&result, &eta_base, &b_wiggle);
+        // Compute g'(u) at the mode using analytic derivatives (same as HMC)
+        let g_prime = compute_analytic_gprime(&eta_base, &result);
         
-        // Build joint Hessian blocks
+        // Build joint Hessian blocks with CORRECT curvature
         // A = X' diag(W * g'^2) X + S_base
+        // C = X' diag(W * g') B
+        // D = B' diag(W) B + S_link
         let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
         
-        // Base block: X' W_eff X + S_base (simplified: ignore g'^2 for speed)
+        // Base block: X' diag(W * g'^2) X + S_base (includes g'² for correct GN curvature)
         for j in 0..p_base {
             for k in j..p_base {
                 let mut sum = 0.0;
                 for i in 0..n {
-                    sum += w_eff[i] * x_matrix[[i, j]] * x_matrix[[i, k]];
+                    let wi = w_eff[i] * g_prime[i] * g_prime[i];
+                    sum += wi * x_matrix[[i, j]] * x_matrix[[i, k]];
                 }
                 joint_hessian[[j, k]] = sum + s_base_accum[[j, k]];
                 if j != k {
@@ -1041,7 +1113,7 @@ pub fn train_joint_model(
             spline,
             &nuts_config,
             is_logit,
-            scale_val,
+            scale_val.sqrt(),  // scale_val is σ², HMC expects σ
         ) {
             Ok(nuts_result) => {
                 eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());

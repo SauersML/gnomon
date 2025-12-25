@@ -1042,7 +1042,7 @@ impl JointLinkPosterior {
     }
 
     fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
-        use crate::calibrate::basis::evaluate_bspline_derivative_scalar;
+        use crate::calibrate::basis::{evaluate_bspline_derivative_scalar_into, internal::BsplineScratch};
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
         let (min_u, max_u) = self.spline.knot_range;
@@ -1051,29 +1051,32 @@ impl JointLinkPosterior {
         let n_c = self.spline.link_transform.ncols();
         if n_raw == 0 || n_c == 0 || theta.len() != n_c { return g; }
         
+        // Pre-allocate all buffers ONCE outside the loop
         let mut deriv_raw = vec![0.0; n_raw];
+        let num_basis_lower = self.spline.knot_vector.len().saturating_sub(self.spline.degree);
+        let mut lower_basis = vec![0.0; num_basis_lower];
+        let mut lower_scratch = BsplineScratch::new(self.spline.degree.saturating_sub(1));
         
         for i in 0..n {
             let u_i = u[i];
             let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
             
-            // At boundaries (clamped), the wiggle is constant so g'(u) = 1
+            // At boundaries, g'(u) = 1 (wiggle is constant)
             if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
                 g[i] = 1.0;
                 continue;
             }
             
-            // Evaluate analytic derivatives of B-spline basis at z_i
+            // Zero-allocation eval using pre-allocated buffers
             deriv_raw.fill(0.0);
-            if evaluate_bspline_derivative_scalar(
-                z_i, self.spline.knot_vector.view(), self.spline.degree, &mut deriv_raw
+            if evaluate_bspline_derivative_scalar_into(
+                z_i, self.spline.knot_vector.view(), self.spline.degree, 
+                &mut deriv_raw, &mut lower_basis, &mut lower_scratch
             ).is_err() {
                 continue;
             }
             
-            // Apply constraint transform and compute d(wiggle)/dz
-            // dg/du = 1 + (d/dz [B(z) Z θ]) / rw
-            // where d/dz [B(z) Z θ] = B'(z) Z θ
+            // d(wiggle)/dz = B'(z) @ Z @ θ
             let d_wiggle_dz: f64 = if self.spline.link_transform.nrows() == n_raw {
                 (0..n_c).map(|c| {
                     let b_prime_c: f64 = (0..n_raw).map(|r| 
@@ -1139,16 +1142,16 @@ pub fn run_joint_nuts_sampling(
     let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
     let posterior_std = samples.std_axis(Axis(0), 0.0);
     
-    // Compute real R-hat and ESS (Vehtari et al. 2021 split-R-hat formula)
+    // Compute R-hat and ESS heuristics (simplified between/within-chain variance method)
     let (rhat, ess) = compute_rhat_ess(&samples_array, n_chains, n_samples_out, dim);
     let converged = rhat < 1.1 && ess > 100.0;
     
     Ok(NutsResult { samples, posterior_mean, posterior_std, rhat, ess, converged })
 }
 
-/// Compute R-hat and ESS for MCMC samples.
-/// Uses simplified split-R-hat: R-hat = sqrt((var_between + var_within) / var_within)
-/// ESS = n * m / (1 + 2*sum(autocorr)) ≈ n * m * var_within / var_total for weak autocorr
+/// Compute R-hat and ESS heuristics for MCMC samples.
+/// NOTE: This is a simplified diagnostic, NOT the full Vehtari et al. split-R-hat/ESS.
+/// Uses basic between/within chain variance ratio as a convergence heuristic.
 fn compute_rhat_ess(samples: &Array3<f64>, n_chains: usize, n_samples: usize, dim: usize) -> (f64, f64) {
     if n_chains < 2 || n_samples < 4 {
         return (f64::NAN, (n_chains * n_samples) as f64 * 0.5);
