@@ -938,7 +938,7 @@ impl<'a> JointRemlState<'a> {
         *self.cached_laml.borrow_mut() = Some(laml);
         *self.cached_rho.borrow_mut() = rho.clone();
         
-        Ok(laml)
+        Ok(-laml)
     }
     
     /// Compute LAML at the converged solution

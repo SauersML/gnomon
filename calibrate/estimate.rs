@@ -828,13 +828,21 @@ pub fn train_joint_model(
     };
     
     eprintln!("[JOINT] Starting joint optimization with REML...");
+    let link = match config.link_function() {
+        Some(link) => link,
+        None => {
+            return Err(EstimationError::InvalidSpecification(
+                "Joint model requires a non-survival link function".to_string(),
+            ));
+        }
+    };
     let mut result = fit_joint_model_with_reml(
         data.y.view(),
         data.weights.view(),
         x_matrix.view(),
         s_list,
         layout,
-        config.link_function().expect("link required"),
+        link,
         &joint_config,
     )?;
 
