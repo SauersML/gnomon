@@ -1026,7 +1026,8 @@ impl JointLinkPosterior {
         let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
         let n_c = self.spline.link_transform.ncols();
         if n_raw == 0 || n_c == 0 || theta.len() != n_c {
-            return (Array2::zeros((n, theta.len().max(1))), u.clone());
+            // Return (n, 0) matrix when no link basis - avoids dimension mismatch downstream
+            return (Array2::zeros((n, 0)), u.clone());
         }
         let z: Array1<f64> = u.mapv(|v| ((v - min_u) / rw).clamp(0.0, 1.0));
         let mut b = Array2::<f64>::zeros((n, n_c));
@@ -1035,7 +1036,9 @@ impl JointLinkPosterior {
         for i in 0..n {
             raw.fill(0.0);
             if evaluate_bspline_basis_scalar(z[i], self.spline.knot_vector.view(), self.spline.degree, &mut raw, &mut scratch).is_ok() && self.spline.link_transform.nrows() == n_raw {
-                for c in 0..n_c { b[[i, c]] = raw.iter().zip(self.spline.link_transform.column(c)).map(|(r, t)| r * t).sum(); }
+                for c in 0..n_c { 
+                    b[[i, c]] = raw.iter().zip(self.spline.link_transform.column(c).iter()).map(|(&r, &t)| r * t).sum(); 
+                }
             }
         }
         (b.clone(), u + &b.dot(theta))

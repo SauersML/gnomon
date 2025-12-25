@@ -927,7 +927,9 @@ pub fn train_joint_model(
                 .map(|(&w, &r)| w * r * r)
                 .sum();
             let effective_n = data.y.len() as f64;
-            weighted_rss / (effective_n - layout.total_coeffs as f64).max(1.0)
+            // DOF = n - (base coeffs + link coeffs), or use edf if available
+            let total_df = (layout.total_coeffs + result.beta_link.len()) as f64;
+            weighted_rss / (effective_n - total_df).max(1.0)
         }
     };
 
