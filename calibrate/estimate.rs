@@ -788,6 +788,7 @@ pub fn train_joint_model(
     config: &ModelConfig,
 ) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
     use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
+    use crate::calibrate::model::{map_coefficients, TrainedModel};
     
     basis::clear_basis_cache();
     
@@ -810,13 +811,6 @@ pub fn train_joint_model(
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
     
-    // Drop unused construction outputs (needed for prediction, not fitting)
-    drop(sum_to_zero_constraints);
-    drop(knot_vectors);
-    drop(range_transforms);
-    drop(pc_null_transforms);
-    drop(interaction_centering_means);
-    drop(interaction_orth_alpha);
     drop(penalty_structs);
     
     eprintln!(
@@ -834,7 +828,7 @@ pub fn train_joint_model(
     };
     
     eprintln!("[JOINT] Starting joint optimization with REML...");
-    let result = fit_joint_model_with_reml(
+    let mut result = fit_joint_model_with_reml(
         data.y.view(),
         data.weights.view(),
         x_matrix.view(),
@@ -843,6 +837,68 @@ pub fn train_joint_model(
         config.link_function().expect("link required"),
         &joint_config,
     )?;
+
+    // Build a base TrainedModel so predictions can be reproduced.
+    let mapped_coefficients = map_coefficients(&result.beta_base, &layout)?;
+    let mut config_with_constraints = config.clone();
+    config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
+    config_with_constraints.knot_vectors = knot_vectors;
+    config_with_constraints.range_transforms = range_transforms;
+    config_with_constraints.interaction_centering_means = interaction_centering_means;
+    config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+    config_with_constraints.pc_null_transforms = pc_null_transforms;
+
+    let scale_val = match config.link_function().expect("link_function called on survival model") {
+        LinkFunction::Logit => 1.0,
+        LinkFunction::Identity => {
+            let fitted = x_matrix.dot(&result.beta_base);
+            let residuals = data.y.to_owned() - &fitted;
+            let weighted_rss: f64 = data
+                .weights
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            let effective_n = data.y.len() as f64;
+            weighted_rss / (effective_n - layout.total_coeffs as f64).max(1.0)
+        }
+    };
+
+    let hull_opt = if config.pc_configs.is_empty() {
+        None
+    } else {
+        let n = data.p.len();
+        let d = 1 + config.pc_configs.len();
+        let mut x_raw = ndarray::Array2::zeros((n, d));
+        x_raw.column_mut(0).assign(&data.p);
+        if d > 1 {
+            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+        }
+        match build_peeled_hull(&x_raw, 3) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                println!("PHC hull construction skipped: {}", e);
+                None
+            }
+        }
+    };
+
+    let n_base = result.lambdas.len().saturating_sub(1);
+    let base_lambdas = result.lambdas[..n_base].to_vec();
+    let base_model = TrainedModel {
+        config: config_with_constraints,
+        coefficients: mapped_coefficients,
+        lambdas: base_lambdas,
+        hull: hull_opt,
+        penalized_hessian: None,
+        scale: Some(scale_val),
+        calibrator: None,
+        survival: None,
+        survival_companions: HashMap::new(),
+        mcmc_samples: None,
+    };
+    result.base_model = Some(base_model);
     
     eprintln!(
         "[JOINT] Optimization complete. Converged: {}, Iterations: {}, Deviance: {:.4}",

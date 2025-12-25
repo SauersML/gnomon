@@ -117,6 +117,8 @@ pub struct JointModelResult {
     pub degree: usize,
     /// Link function used during training
     pub link: LinkFunction,
+    /// Base trained model artifacts needed for prediction
+    pub base_model: Option<crate::calibrate::model::TrainedModel>,
 }
 
 impl<'a> JointModelState<'a> {
@@ -221,15 +223,24 @@ impl<'a> JointModelState<'a> {
         let k = self.n_link_knots;
         let degree = self.degree;
         
-        // Use fixed knot range if available, otherwise compute it (lock only when non-degenerate).
-        let (min_u, max_u, lock_range) = match self.knot_range {
-            Some(range) => (range.0, range.1, false),
+        // Use fixed knot range if available, otherwise compute and store a padded range.
+        let (min_u, max_u) = match self.knot_range {
+            Some(range) => range,
             None => {
                 let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let range_width = max_val - min_val;
-                let lock = range_width > 1e-6;
-                (min_val, max_val, lock)
+                if range_width > 1e-6 {
+                    let range = (min_val, max_val);
+                    self.knot_range = Some(range);
+                    range
+                } else {
+                    let center = 0.5 * (min_val + max_val);
+                    let pad = 1.0_f64.max(center.abs() * 1e-3);
+                    let range = (center - pad, center + pad);
+                    self.knot_range = Some(range);
+                    range
+                }
             }
         };
         
@@ -249,12 +260,29 @@ impl<'a> JointModelState<'a> {
         match basis_result {
             Ok((bspline_basis, knots)) => {
                 // Store knot vector if not already stored
-                if self.knot_vector.is_none() && lock_range {
+                if self.knot_vector.is_none() {
                     self.knot_vector = Some(knots);
-                    self.knot_range = Some((min_u, max_u));
                 }
                 
                 let n_raw = bspline_basis.ncols();
+                
+                // If we already have a fixed transform, reuse it to keep basis coordinates stable.
+                if self.knot_vector.is_some()
+                    && self.link_transform.nrows() == n_raw
+                    && self.link_transform.ncols() > 0
+                {
+                    let n_constrained = self.link_transform.ncols();
+                    if self.beta_link.len() != n_constrained {
+                        let mut new_beta = Array1::zeros(n_constrained);
+                        let copy_len = self.beta_link.len().min(n_constrained);
+                        for i in 0..copy_len {
+                            new_beta[i] = self.beta_link[i];
+                        }
+                        self.beta_link = new_beta;
+                        self.n_constrained_basis = n_constrained;
+                    }
+                    return bspline_basis.dot(&self.link_transform);
+                }
                 
                 // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
                 let mut constraint = Array2::<f64>::zeros((n, 2));
@@ -757,6 +785,7 @@ pub fn fit_joint_model<'a>(
         link_transform: state.link_transform.clone(),
         degree: state.degree,
         link: state.link.clone(),
+        base_model: None,
     })
 }
 
@@ -1065,9 +1094,24 @@ impl<'a> JointRemlState<'a> {
         // Null space dimension
         let mp = (p_base as f64 - base_rank) + (p_link as f64 - link_rank);
         
-        // LAML = -2*log_lik + log|H_pen| - log|Sλ| + mp*log(2π)
-        // Or equivalently: deviance + log|H_pen| - log|Sλ| + mp*log(2π)
-        let laml = deviance + 0.5 * log_det_a - 0.5 * log_det_s 
+        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'Sλ beta
+        let mut penalty_term = 0.0;
+        for (idx, s_k) in state.s_base.iter().enumerate() {
+            let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
+            if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
+                let sb = s_k.dot(&state.beta_base);
+                penalty_term += lambda_k * state.beta_base.dot(&sb);
+            }
+        }
+        if p_link > 0 && link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
+            if state.beta_link.len() == p_link {
+                let sb = link_penalty.dot(&state.beta_link);
+                penalty_term += lambda_link * state.beta_link.dot(&sb);
+            }
+        }
+        
+        let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
+        let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                  + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
         
         laml
@@ -1145,6 +1189,7 @@ impl<'a> JointRemlState<'a> {
             link_transform: state.link_transform,
             degree: state.degree,
             link: state.link.clone(),
+            base_model: None,
         }
     }
 }
@@ -1172,56 +1217,26 @@ pub fn fit_joint_model_with_reml<'a>(
     let initial_rho = Array1::from_elem(n_base + 1, 0.0);
     
     // Run BFGS optimization
-    let mut best_rho = initial_rho.clone();
-    let mut best_cost = reml_state.compute_cost(&initial_rho)?;
+    use wolfe_bfgs::Bfgs;
+    let solver = Bfgs::new(initial_rho.clone(), |rho| reml_state.cost_and_grad(rho))
+        .with_tolerance(config.reml_tol)
+        .with_max_iterations(config.max_reml_iter)
+        .with_fp_tolerances(1e2, 1e2)
+        .with_no_improve_stop(1e-8, 5)
+        .with_rng_seed(0xC0FFEE_u64);
     
-    if initial_rho.len() >= 2 {
-        eprintln!("[REML] Initial: ρ[0]={:.2}, ρ[1]={:.2}, LAML={:.4}", 
-                 initial_rho[0], initial_rho[1], best_cost);
-    } else {
-        eprintln!("[REML] Initial: LAML={:.4}", best_cost);
-    }
-    
-    // Simple gradient descent with line search (BFGS lite)
-    for outer_iter in 0..config.max_reml_iter {
-        let grad = reml_state.compute_gradient(&best_rho)?;
-        let grad_norm = grad.mapv(|g| g * g).sum().sqrt();
-        
-        if grad_norm < config.reml_tol {
-            eprintln!("[REML] Converged at iter {}: grad_norm={:.2e}", outer_iter, grad_norm);
-            break;
+    let solution = match solver.run() {
+        Ok(solution) => solution,
+        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+        Err(e) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "BFGS failed for joint model: {e:?}"
+            )));
         }
-        
-        // Line search along -gradient
-        let mut step_size = 1.0;
-        let direction = grad.mapv(|g| -g);
-        
-        for _ in 0..10 {
-            let candidate_rho = &best_rho + &(&direction * step_size);
-            // Bound ρ to [-8, 8] (λ ∈ [e^-8, e^8])
-            let bounded_rho = candidate_rho.mapv(|r| r.max(-8.0).min(8.0));
-            
-            match reml_state.compute_cost(&bounded_rho) {
-                Ok(cost) if cost < best_cost => {
-                    best_cost = cost;
-                    best_rho = bounded_rho;
-                    if best_rho.len() >= 2 {
-                        eprintln!("[REML] Iter {}: ρ[0]={:.2}, ρ[1]={:.2}, LAML={:.4}, step={:.2e}", 
-                                 outer_iter, best_rho[0], best_rho[1], best_cost, step_size);
-                    } else {
-                        eprintln!("[REML] Iter {}: LAML={:.4}, step={:.2e}", 
-                                 outer_iter, best_cost, step_size);
-                    }
-                    break;
-                }
-                _ => {
-                    step_size *= 0.5;
-                }
-            }
-        }
-    }
+    };
     
-    // Final fit at optimal rho
+    let best_rho = solution.final_point.clone();
     let _ = reml_state.compute_cost(&best_rho)?;
     Ok(reml_state.into_result())
 }
@@ -1482,6 +1497,7 @@ mod tests {
             link_transform: Array2::eye(num_basis),
             degree,
             link: LinkFunction::Logit,
+            base_model: None,
         };
         
         // Test with base eta values
@@ -1531,6 +1547,7 @@ mod tests {
             link_transform: Array2::eye(num_basis),
             degree,
             link: LinkFunction::Logit,
+            base_model: None,
         };
         
         let eta_base = Array1::from_vec(vec![0.0, 1.0, 2.0]);
