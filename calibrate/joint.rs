@@ -248,12 +248,13 @@ impl<'a> JointModelState<'a> {
         let data_range = (0.0, 1.0);
         let basis_result = if let Some(knots) = self.knot_vector.as_ref() {
             create_bspline_basis_with_knots(z.view(), knots.view(), degree)
-                .map(|(basis, _)| (basis.as_ref().clone(), knots.clone()))
+                .map(|(basis, _)| (basis, knots.clone()))
         } else {
             create_bspline_basis(z.view(), data_range, k, degree)
         };
         match basis_result {
             Ok((bspline_basis, knots)) => {
+                let bspline_basis = bspline_basis.as_ref();
                 // Store knot vector if not already stored
                 if self.knot_vector.is_none() {
                     self.knot_vector = Some(knots);
@@ -310,7 +311,7 @@ impl<'a> JointModelState<'a> {
                         
                         use crate::calibrate::faer_ndarray::FaerEigh;
                         use faer::Side;
-                        let (eigs, evecs) = cross_prod
+                        let (eigs, evecs): (Array1<f64>, Array2<f64>) = cross_prod
                             .eigh(Side::Lower)
                             .unwrap_or_else(|_| (Array1::zeros(n_raw), Array2::eye(n_raw)));
                         let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
@@ -1159,13 +1160,13 @@ impl<'a> JointRemlState<'a> {
         (laml, edf)
     }
 
-fn compute_joint_edf(
-    state: &JointModelState,
-    b_wiggle: &Array2<f64>,
-    g_prime: &Array1<f64>,
-    weights: &Array1<f64>,
-    lambda_base: &Array1<f64>,
-    lambda_link: f64,
+    fn compute_joint_edf(
+        state: &JointModelState,
+        b_wiggle: &Array2<f64>,
+        g_prime: &Array1<f64>,
+        weights: &Array1<f64>,
+        lambda_base: &Array1<f64>,
+        lambda_link: f64,
 ) -> Option<f64> {
     use crate::calibrate::faer_ndarray::FaerCholesky;
     use faer::Side;
@@ -1272,7 +1273,7 @@ fn compute_joint_edf(
     }
     
     Some(p_total as f64 - trace)
-}
+    }
     
     /// Compute numerical gradient of LAML w.r.t. ρ using central differences
     pub fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {

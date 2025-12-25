@@ -839,7 +839,7 @@ pub fn train_joint_model(
         data.weights.view(),
         x_matrix.view(),
         s_list,
-        layout,
+        layout.clone(),
         link,
         &joint_config,
     )?;
