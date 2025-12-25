@@ -834,6 +834,7 @@ pub fn train_joint_model(
             return Err(EstimationError::InvalidSpecification(err.to_string()));
         }
     };
+    let s_list_for_mcmc = s_list.clone(); // Clone for MCMC use after fit
     let mut result = fit_joint_model_with_reml(
         data.y.view(),
         data.weights.view(),
@@ -900,6 +901,106 @@ pub fn train_joint_model(
         beta_link: result.beta_link.clone(),
         degree: result.degree,
     };
+
+
+    // ===== Stage 5: Joint MCMC sampling (if enabled) =====
+    let mcmc_samples = if config.mcmc_enabled {
+        eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling...");
+        
+        // Build combined base penalty: Σλ_k S_k
+        let p_base = x_matrix.ncols();
+        let p_link = result.beta_link.len();
+        let dim = p_base + p_link;
+        
+        let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
+        for k in 0..n_base {
+            if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
+                s_base_accum = s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
+            }
+        }
+        
+        // Build link penalty (already scaled by lambda)
+        let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
+        // Need to get it from JointModelResult - for now use stored s_link_constrained if available
+        // Using identity approximation - will be replaced when we add proper storage
+        let s_link = {
+            let d = result.link_transform.ncols();
+            let mut s = Array2::<f64>::eye(d);
+            // Apply difference penalty structure (second order)
+            for i in 0..(d.saturating_sub(1)) {
+                s[[i, i]] += 2.0 * link_lambda;
+                s[[i, i + 1]] -= link_lambda;
+                s[[i + 1, i]] -= link_lambda;
+            }
+            if d > 0 {
+                s[[d - 1, d - 1]] += link_lambda;
+            }
+            s
+        };
+        
+        // Build approximate joint Hessian (diagonal for now - NUTS adapts mass matrix)
+        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+        // Use base penalty + small ridge for base block
+        for i in 0..p_base {
+            for j in 0..p_base {
+                joint_hessian[[i, j]] = s_base_accum[[i, j]];
+            }
+            joint_hessian[[i, i]] += 1e-4; // Small ridge for stability
+        }
+        // Use link penalty + small ridge for link block
+        for i in 0..p_link {
+            for j in 0..p_link {
+                joint_hessian[[p_base + i, p_base + j]] = s_link[[i, j]];
+            }
+            joint_hessian[[p_base + i, p_base + i]] += 1e-4;
+        }
+        
+        // Build spline artifacts from result
+        let spline = crate::calibrate::hmc::JointSplineArtifacts {
+            knot_range: result.knot_range,
+            knot_vector: result.knot_vector.clone(),
+            link_transform: result.link_transform.clone(),
+            degree: result.degree,
+        };
+        
+        let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        
+        let nuts_config = crate::calibrate::hmc::NutsConfig {
+            n_samples: num_samples,
+            n_warmup: num_warmup,
+            n_chains: 2,
+            ..crate::calibrate::hmc::NutsConfig::default()
+        };
+        
+        match crate::calibrate::hmc::run_joint_nuts_sampling(
+            x_matrix.view(),
+            data.y.view(),
+            data.weights.view(),
+            s_base_accum.view(),
+            s_link.view(),
+            result.beta_base.view(),
+            result.beta_link.view(),
+            joint_hessian.view(),
+            spline,
+            &nuts_config,
+        ) {
+            Ok(nuts_result) => {
+                eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());
+                Some(nuts_result.samples)
+            }
+            Err(e) => {
+                eprintln!("[JOINT-MCMC] WARNING: sampling failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    
+    // Update base_model with MCMC samples
     let base_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
@@ -911,7 +1012,7 @@ pub fn train_joint_model(
         joint_link: Some(joint_link),
         survival: None,
         survival_companions: HashMap::new(),
-        mcmc_samples: None,
+        mcmc_samples,
     };
     result.base_model = Some(base_model);
     

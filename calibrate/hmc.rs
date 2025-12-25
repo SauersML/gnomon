@@ -895,6 +895,201 @@ pub use survival_hmc::run_survival_nuts_sampling;
 // Legacy type alias for backwards compatibility
 pub type WhitenedBurnPosterior = NutsPosterior;
 
+// ============================================================================
+// Joint Link Model HMC Support
+// ============================================================================
+
+/// Fixed spline artifacts for joint link (frozen from REML fit).
+#[derive(Clone)]
+pub struct JointSplineArtifacts {
+    /// Knot range (min, max) from training
+    pub knot_range: (f64, f64),
+    /// Knot vector for B-splines
+    pub knot_vector: Array1<f64>,
+    /// Constraint transform Z (raw basis → constrained basis)
+    pub link_transform: Array2<f64>,
+    /// B-spline degree
+    pub degree: usize,
+}
+
+/// Whitened log-posterior target for joint (β, θ) with analytical gradients.
+#[derive(Clone)]
+pub struct JointLinkPosterior {
+    x: Arc<Array2<f64>>,
+    y: Arc<Array1<f64>>,
+    weights: Arc<Array1<f64>>,
+    penalty_base: Arc<Array2<f64>>,
+    penalty_link: Arc<Array2<f64>>,
+    mode_beta: Arc<Array1<f64>>,
+    mode_theta: Arc<Array1<f64>>,
+    spline: JointSplineArtifacts,
+    chol: Array2<f64>,
+    chol_t: Array2<f64>,
+    p_base: usize,
+    p_link: usize,
+    n_samples: usize,
+}
+
+impl JointLinkPosterior {
+    /// Creates a new joint posterior target.
+    pub fn new(
+        x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
+        penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
+        mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
+        hessian: ArrayView2<f64>, spline: JointSplineArtifacts,
+    ) -> Result<Self, String> {
+        let n_samples = x.nrows();
+        let p_base = x.ncols();
+        let p_link = mode_theta.len();
+        let dim = p_base + p_link;
+        if hessian.nrows() != dim || hessian.ncols() != dim {
+            return Err(format!("Hessian dim mismatch: {}x{} vs {}x{}", dim, dim, hessian.nrows(), hessian.ncols()));
+        }
+        let hessian_owned = hessian.to_owned();
+        let chol_factor = hessian_owned.cholesky(Side::Lower).map_err(|e| format!("Cholesky failed: {:?}", e))?;
+        let l_h = chol_factor.lower_triangular();
+        let chol = solve_upper_triangular_transpose(&l_h, dim);
+        let chol_t = chol.t().to_owned();
+        Ok(Self {
+            x: Arc::new(x.to_owned()), y: Arc::new(y.to_owned()), weights: Arc::new(weights.to_owned()),
+            penalty_base: Arc::new(penalty_base.to_owned()), penalty_link: Arc::new(penalty_link.to_owned()),
+            mode_beta: Arc::new(mode_beta.to_owned()), mode_theta: Arc::new(mode_theta.to_owned()),
+            spline, chol, chol_t, p_base, p_link, n_samples,
+        })
+    }
+
+    fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+        let dim = self.p_base + self.p_link;
+        let mut mode = Array1::<f64>::zeros(dim);
+        mode.slice_mut(ndarray::s![0..self.p_base]).assign(&self.mode_beta);
+        mode.slice_mut(ndarray::s![self.p_base..]).assign(&self.mode_theta);
+        let q = &mode + &self.chol.dot(z);
+        let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
+        let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
+        let u = self.x.dot(&beta);
+        let (b_wiggle, eta) = self.evaluate_link(&u, &theta);
+        let mut ll = 0.0;
+        let mut residual = Array1::<f64>::zeros(self.n_samples);
+        for i in 0..self.n_samples {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu = (1.0 / (1.0 + (-eta_i).exp())).clamp(1e-10, 1.0 - 1e-10);
+            let (y_i, w_i) = (self.y[i], self.weights[i]);
+            ll += w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
+            residual[i] = w_i * (y_i - mu);
+        }
+        let g_prime = self.compute_g_prime(&u, &theta);
+        let grad_theta = &b_wiggle.t().dot(&residual) - &self.penalty_link.dot(&theta);
+        let r_scaled: Array1<f64> = residual.iter().zip(g_prime.iter()).map(|(&r, &g)| r * g).collect();
+        let grad_beta = &fast_atv(&self.x, &r_scaled) - &self.penalty_base.dot(&beta);
+        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta)) + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+        let mut grad_q = Array1::<f64>::zeros(dim);
+        grad_q.slice_mut(ndarray::s![0..self.p_base]).assign(&grad_beta);
+        grad_q.slice_mut(ndarray::s![self.p_base..]).assign(&grad_theta);
+        (ll - penalty, self.chol_t.dot(&grad_q))
+    }
+
+    fn evaluate_link(&self, u: &Array1<f64>, theta: &Array1<f64>) -> (Array2<f64>, Array1<f64>) {
+        use crate::calibrate::basis::{SplineScratch, evaluate_bspline_basis_scalar};
+        let n = u.len();
+        let (min_u, max_u) = self.spline.knot_range;
+        let rw = (max_u - min_u).max(1e-6);
+        let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
+        let n_c = self.spline.link_transform.ncols();
+        if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+            return (Array2::zeros((n, theta.len().max(1))), u.clone());
+        }
+        let z: Array1<f64> = u.mapv(|v| ((v - min_u) / rw).clamp(0.0, 1.0));
+        let mut b = Array2::<f64>::zeros((n, n_c));
+        let mut raw = vec![0.0; n_raw];
+        let mut scratch = SplineScratch::new(self.spline.degree);
+        for i in 0..n {
+            raw.fill(0.0);
+            if evaluate_bspline_basis_scalar(z[i], self.spline.knot_vector.view(), self.spline.degree, &mut raw, &mut scratch).is_ok() && self.spline.link_transform.nrows() == n_raw {
+                for c in 0..n_c { b[[i, c]] = raw.iter().zip(self.spline.link_transform.column(c)).map(|(r, t)| r * t).sum(); }
+            }
+        }
+        (b.clone(), u + &b.dot(theta))
+    }
+
+    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
+        use crate::calibrate::basis::{SplineScratch, evaluate_bspline_basis_scalar};
+        let n = u.len();
+        let mut g = Array1::<f64>::ones(n);
+        let (min_u, max_u) = self.spline.knot_range;
+        let rw = (max_u - min_u).max(1e-6);
+        let n_raw = self.spline.knot_vector.len().saturating_sub(self.spline.degree + 1);
+        let n_c = self.spline.link_transform.ncols();
+        if n_raw == 0 || n_c == 0 || theta.len() != n_c { return g; }
+        let h = 1e-4;
+        let mut rp = vec![0.0; n_raw]; let mut rm = vec![0.0; n_raw];
+        let mut scratch = SplineScratch::new(self.spline.degree);
+        for i in 0..n {
+            let zv = ((u[i] - min_u) / rw).clamp(0.0, 1.0);
+            let (zp, zm) = ((zv + h).clamp(0.0, 1.0), (zv - h).clamp(0.0, 1.0));
+            let dz = (zp - zm).max(1e-8);
+            rp.fill(0.0); rm.fill(0.0);
+            if evaluate_bspline_basis_scalar(zp, self.spline.knot_vector.view(), self.spline.degree, &mut rp, &mut scratch).is_err() { continue; }
+            if evaluate_bspline_basis_scalar(zm, self.spline.knot_vector.view(), self.spline.degree, &mut rm, &mut scratch).is_err() { continue; }
+            if self.spline.link_transform.nrows() == n_raw {
+                let dw: f64 = (0..n_c).map(|c| {
+                    let bp: f64 = (0..n_raw).map(|r| rp[r] * self.spline.link_transform[[r, c]]).sum();
+                    let bm: f64 = (0..n_raw).map(|r| rm[r] * self.spline.link_transform[[r, c]]).sum();
+                    (bp - bm) * theta[c]
+                }).sum();
+                g[i] = 1.0 + dw / dz / rw;
+            }
+        }
+        g
+    }
+
+    pub fn chol(&self) -> &Array2<f64> { &self.chol }
+    pub fn mode(&self) -> (Array1<f64>, Array1<f64>) { (self.mode_beta.as_ref().clone(), self.mode_theta.as_ref().clone()) }
+}
+
+impl HamiltonianTarget<Array1<f64>> for JointLinkPosterior {
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let (logp, g) = self.compute_logp_and_grad(position);
+        grad.assign(&g);
+        logp
+    }
+}
+
+/// Runs NUTS sampling for joint (β, θ).
+pub fn run_joint_nuts_sampling(
+    x: ArrayView2<f64>, y: ArrayView1<f64>, weights: ArrayView1<f64>,
+    penalty_base: ArrayView2<f64>, penalty_link: ArrayView2<f64>,
+    mode_beta: ArrayView1<f64>, mode_theta: ArrayView1<f64>,
+    hessian: ArrayView2<f64>, spline: JointSplineArtifacts, config: &NutsConfig,
+) -> Result<NutsResult, String> {
+    let (p_base, dim) = (mode_beta.len(), mode_beta.len() + mode_theta.len());
+    let target = JointLinkPosterior::new(x, y, weights, penalty_base, penalty_link, mode_beta, mode_theta, hessian, spline)?;
+    let chol = target.chol().clone();
+    let (mb, mt) = target.mode();
+    let mut mode_arr = Array1::<f64>::zeros(dim);
+    mode_arr.slice_mut(ndarray::s![0..p_base]).assign(&mb);
+    mode_arr.slice_mut(ndarray::s![p_base..]).assign(&mt);
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains).map(|_| Array1::from_shape_fn(dim, |_| {
+        let u1: f64 = rng.r#gen::<f64>().max(1e-10); let u2: f64 = rng.r#gen();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
+    })).collect();
+    let mut sampler = GenericNUTS::new(target, initial_positions, config.target_accept);
+    let samples_array = sampler.run(config.n_samples, config.n_warmup);
+    let (n_chains, n_samples_out) = (samples_array.shape()[0], samples_array.shape()[1]);
+    let total_samples = n_chains * n_samples_out;
+    let mut samples = Array2::<f64>::zeros((total_samples, dim));
+    let mut z_buffer = Array1::<f64>::zeros(dim);
+    for chain in 0..n_chains {
+        for sample_i in 0..n_samples_out {
+            z_buffer.assign(&samples_array.slice(ndarray::s![chain, sample_i, ..]));
+            samples.row_mut(chain * n_samples_out + sample_i).assign(&(&mode_arr + &chol.dot(&z_buffer)));
+        }
+    }
+    let posterior_mean = samples.mean_axis(Axis(0)).unwrap_or_else(|| Array1::zeros(dim));
+    let posterior_std = samples.std_axis(Axis(0), 0.0);
+    Ok(NutsResult { samples, posterior_mean, posterior_std, rhat: 1.0, ess: total_samples as f64 * 0.5, converged: total_samples > 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

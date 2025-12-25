@@ -704,6 +704,96 @@ impl TrainedModel {
         Ok(mean)
     }
 
+    /// Posterior mean probability using joint MCMC samples over (β, θ).
+    /// For each sample [β_s | θ_s], computes η_s = Xβ_s + B(Xβ_s)θ_s
+    /// and returns mean(sigmoid(η_s)).
+    fn joint_mcmc_mean_predictions(
+        &self,
+        x_new: &Array2<f64>,
+        joint: &JointLinkModel,
+    ) -> Result<Array1<f64>, ModelError> {
+        let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
+            ModelError::DimensionMismatch("MCMC samples missing for joint prediction.".to_string())
+        })?;
+        let n_samples = samples.nrows();
+        let n_points = x_new.nrows();
+        if n_samples == 0 {
+            return Err(ModelError::DimensionMismatch("MCMC samples are empty.".to_string()));
+        }
+        
+        let p_base = x_new.ncols();
+        let p_link = joint.beta_link.len();
+        let expected_cols = p_base + p_link;
+        if samples.ncols() != expected_cols {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Joint MCMC samples have {} cols, expected {} (p_base={}, p_link={})",
+                samples.ncols(), expected_cols, p_base, p_link
+            )));
+        }
+        
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
+        let n_constrained = joint.link_transform.ncols();
+        
+        let mut prob_sum = Array1::<f64>::zeros(n_points);
+        let mut raw = vec![0.0; n_raw];
+        let mut constrained = vec![0.0; n_constrained];
+        let mut scratch = basis::SplineScratch::new(joint.degree);
+        
+        // For each sample s
+        for s in 0..n_samples {
+            let beta_s = samples.slice(s![s, 0..p_base]);
+            let theta_s = samples.slice(s![s, p_base..]);
+            
+            // Compute u = X @ β_s
+            let u = x_new.dot(&beta_s.to_owned());
+            
+            // For each prediction point
+            for i in 0..n_points {
+                let u_i = u[i];
+                let z_i = ((u_i - min_u) / range_width).clamp(0.0, 1.0);
+                
+                // Evaluate basis at z_i
+                raw.fill(0.0);
+                if basis::evaluate_bspline_basis_scalar(
+                    z_i, joint.knot_vector.view(), joint.degree, &mut raw, &mut scratch
+                ).is_err() {
+                    // Fallback: no wiggle
+                    let eta_i = u_i.clamp(-700.0, 700.0);
+                    prob_sum[i] += 1.0 / (1.0 + f64::exp(-eta_i));
+                    continue;
+                }
+                
+                // Transform to constrained basis
+                constrained.fill(0.0);
+                if joint.link_transform.nrows() == n_raw && n_constrained > 0 {
+                    for r in 0..n_raw {
+                        let v = raw[r];
+                        for c in 0..n_constrained {
+                            constrained[c] += v * joint.link_transform[[r, c]];
+                        }
+                    }
+                }
+                
+                // Compute wiggle = B(u_i) @ θ_s
+                let mut wiggle = 0.0;
+                for c in 0..n_constrained.min(theta_s.len()) {
+                    wiggle += constrained[c] * theta_s[c];
+                }
+                
+                // η_i = u_i + wiggle
+                let eta_i = (u_i + wiggle).clamp(-700.0, 700.0);
+                prob_sum[i] += 1.0 / (1.0 + f64::exp(-eta_i));
+            }
+        }
+        
+        // Average over samples
+        let mut mean = prob_sum.mapv(|p| p / n_samples as f64);
+        mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
+        Ok(mean)
+    }
+
     /// Detailed predictions including linear predictor, mean response, signed distance
     /// to the peeled hull boundary (negative inside), and optional SEs for eta.
     pub fn predict_detailed(
@@ -736,6 +826,18 @@ impl TrainedModel {
 
         // Ensure the model family is supported before invoking link-specific logic
         let link_function = self.ensure_gam_link("prediction")?;
+
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_some()
+        {
+            // Joint posterior predictive: average sigmoid over (β,θ) samples
+            let joint = self.joint_link.as_ref().unwrap();
+            let mean = self.joint_mcmc_mean_predictions(&x_new, joint)?;
+            let eta = mean.mapv(Self::logit_from_prob);
+            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
+            return Ok((eta, mean, signed_dist, se_eta_opt));
+        }
 
         if link_function == LinkFunction::Logit
             && self.mcmc_samples.is_some()
