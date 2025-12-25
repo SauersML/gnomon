@@ -374,7 +374,7 @@ impl<'a> JointModelState<'a> {
             .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         
         let b_raw = match create_bspline_basis_with_knots(z.view(), knot_vector.view(), self.degree) {
-            Ok((basis, _)) => (*basis).clone(),
+            Ok((basis, _)) => basis.clone(),
             Err(_) => Array2::zeros((n, 0)),
         };
         
@@ -1129,9 +1129,23 @@ impl<'a> JointRemlState<'a> {
             }
         }
         
-        let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
-        let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
-                 + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
+        let laml = match state.link {
+            LinkFunction::Logit => {
+                let penalised_ll = -0.5 * deviance - 0.5 * penalty_term;
+                let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
+                    + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
+                laml
+            }
+            LinkFunction::Identity => {
+                let dp = (deviance + penalty_term).max(1e-12);
+                let denom = (n as f64 - mp).max(1.0);
+                let phi = dp / denom;
+                let reml_cost = dp / (2.0 * phi)
+                    + 0.5 * (log_det_a - log_det_s)
+                    + ((n as f64 - mp) / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                -reml_cost
+            }
+        };
         
         let edf = compute_joint_edf(
             state,
@@ -1604,7 +1618,7 @@ pub fn predict_joint(
             if result.link_transform.ncols() > 0 && result.link_transform.nrows() == basis.ncols() {
                 basis.dot(&result.link_transform)
             } else {
-                (*basis).clone()
+                basis.clone()
             }
         }
         Err(_) => Array2::zeros((n, result.beta_link.len())),
@@ -1629,7 +1643,7 @@ pub fn predict_joint(
         let probs = match result.link {
             LinkFunction::Logit => (0..n)
                 .map(|i| crate::calibrate::quadrature::logit_posterior_mean(eta_cal[i], eff_se[i]))
-                .collect(),
+                .collect::<Array1<f64>>(),
             LinkFunction::Identity => eta_cal.clone(),
         };
         
@@ -1660,7 +1674,14 @@ pub fn predict_joint_from_base_model(
         .base_model
         .as_ref()
         .ok_or(crate::calibrate::model::ModelError::CalibratorMissing)?;
-    let (eta_base, _mean, _dist, se_eta_opt) = base.predict_detailed(p_new, sex_new, pcs_new)?;
+    let (eta_base, mean, _dist, se_eta_opt) = base.predict_detailed(p_new, sex_new, pcs_new)?;
+    if base.joint_link.is_some() {
+        return Ok(JointModelPrediction {
+            eta: eta_base,
+            probabilities: mean,
+            effective_se: se_eta_opt,
+        });
+    }
     Ok(predict_joint(result, &eta_base, se_eta_opt.as_ref()))
 }
 
@@ -1784,7 +1805,7 @@ mod tests {
         let eff_se = pred.effective_se.unwrap();
         assert_eq!(eff_se.len(), 3);
         
-        // With identity link, effective SE should equal base SE (derivative = 1)
+        // With zero wiggle, g'(u)=1 so effective SE equals base SE.
         for i in 0..3 {
             assert!((eff_se[i] - se_base[i]).abs() < 0.1);
         }

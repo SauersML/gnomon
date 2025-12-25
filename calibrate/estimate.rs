@@ -788,7 +788,7 @@ pub fn train_joint_model(
     config: &ModelConfig,
 ) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
     use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
-    use crate::calibrate::model::{map_coefficients, TrainedModel};
+    use crate::calibrate::model::{map_coefficients, JointLinkModel, TrainedModel};
     
     basis::clear_basis_cache();
     
@@ -859,8 +859,9 @@ pub fn train_joint_model(
     let scale_val = match config.link_function().expect("link_function called on survival model") {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
-            let fitted = x_matrix.dot(&result.beta_base);
-            let residuals = data.y.to_owned() - &fitted;
+            let eta_base = x_matrix.dot(&result.beta_base);
+            let eta_cal = crate::calibrate::joint::predict_joint(&result, &eta_base, None).eta;
+            let residuals = data.y.to_owned() - &eta_cal;
             let weighted_rss: f64 = data
                 .weights
                 .iter()
@@ -894,6 +895,13 @@ pub fn train_joint_model(
 
     let n_base = result.lambdas.len().saturating_sub(1);
     let base_lambdas = result.lambdas[..n_base].to_vec();
+    let joint_link = JointLinkModel {
+        knot_range: result.knot_range,
+        knot_vector: result.knot_vector.clone(),
+        link_transform: result.link_transform.clone(),
+        beta_link: result.beta_link.clone(),
+        degree: result.degree,
+    };
     let base_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
@@ -902,6 +910,7 @@ pub fn train_joint_model(
         penalized_hessian: None,
         scale: Some(scale_val),
         calibrator: None,
+        joint_link: Some(joint_link),
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples: None,
@@ -1086,6 +1095,7 @@ pub fn train_model(
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -1830,6 +1840,7 @@ pub fn train_model(
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
         calibrator: calibrator_opt,
+        joint_link: None,
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
@@ -2986,6 +2997,7 @@ pub fn train_survival_model(
         penalized_hessian: primary_hessian,
         scale: None,
         calibrator: None, // Survival uses artifacts.calibrator
+        joint_link: None,
         survival: Some(final_artifacts),
         survival_companions: companions, // The map of mortality artifacts
         mcmc_samples,
