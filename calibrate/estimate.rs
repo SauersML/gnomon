@@ -854,7 +854,7 @@ pub fn train_joint_model(
     config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
     config_with_constraints.pc_null_transforms = pc_null_transforms;
 
-    let scale_val = match config.link_function().expect("link_function called on survival model") {
+    let scale_val = match link {
         LinkFunction::Logit => 1.0,
         LinkFunction::Identity => {
             let eta_base = x_matrix.dot(&result.beta_base);

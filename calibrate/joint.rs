@@ -223,21 +223,23 @@ impl<'a> JointModelState<'a> {
         let k = self.n_link_knots;
         let degree = self.degree;
         
-        // Update knot range each build to track current u spread (with padding).
-        let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let range_width = max_val - min_val;
-        let (min_u, max_u) = if range_width > 1e-6 {
-            (min_val, max_val)
+        // Freeze knot range after first initialization to keep the objective stable.
+        let (min_u, max_u) = if let Some(range) = self.knot_range {
+            range
         } else {
-            let center = 0.5 * (min_val + max_val);
-            let pad = 1.0_f64.max(center.abs() * 1e-3);
-            (center - pad, center + pad)
+            let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let range_width = max_val - min_val;
+            let range = if range_width > 1e-6 {
+                (min_val, max_val)
+            } else {
+                let center = 0.5 * (min_val + max_val);
+                let pad = 1.0_f64.max(center.abs() * 1e-3);
+                (center - pad, center + pad)
+            };
+            self.knot_range = Some(range);
+            range
         };
-        if self.knot_range != Some((min_u, max_u)) {
-            self.knot_range = Some((min_u, max_u));
-            self.knot_vector = None;
-        }
         
         // Standardize: z = (u - min) / (max - min) to [0, 1]
         let range_width = (max_u - min_u).max(1e-6);
@@ -261,6 +263,16 @@ impl<'a> JointModelState<'a> {
                 }
                 
                 let n_raw = bspline_basis.ncols();
+
+                // Reuse existing transform if it matches the current raw basis.
+                if self.link_transform.ncols() > 0 && self.link_transform.nrows() == n_raw {
+                    let n_constrained = self.link_transform.ncols();
+                    if self.beta_link.len() != n_constrained {
+                        self.beta_link = Array1::zeros(n_constrained);
+                        self.n_constrained_basis = n_constrained;
+                    }
+                    return bspline_basis.dot(&self.link_transform);
+                }
                 
                 // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
                 let mut constraint = Array2::<f64>::zeros((n, 2));
@@ -291,9 +303,9 @@ impl<'a> JointModelState<'a> {
                         self.link_transform = transform;
                         self.s_link_constrained = projected_penalty;
                         self.n_constrained_basis = n_constrained;
-                        
-                        // Reset beta_link to avoid mismatched coordinates after transform update
-                        self.beta_link = Array1::zeros(n_constrained);
+                        if self.beta_link.len() != n_constrained {
+                            self.beta_link = Array1::zeros(n_constrained);
+                        }
                         
                         constrained_basis
                     }
@@ -345,8 +357,9 @@ impl<'a> JointModelState<'a> {
                         self.link_transform = transform;
                         self.s_link_constrained = projected_penalty;
                         self.n_constrained_basis = n_constrained;
-                        // Reset beta_link to avoid mismatched coordinates after transform update
-                        self.beta_link = Array1::zeros(n_constrained);
+                        if self.beta_link.len() != n_constrained {
+                            self.beta_link = Array1::zeros(n_constrained);
+                        }
                         constrained_basis
                     }
                 }
@@ -576,9 +589,14 @@ impl<'a> JointModelState<'a> {
         let mut w_eff = Array1::<f64>::zeros(n);
         let mut z_eff = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let g = g_prime[i].max(1e-8);
-            w_eff[i] = weights[i] * g * g;
-            z_eff[i] = z_beta[i] / g;
+            let g = g_prime[i];
+            let g_safe = if g.abs() < 1e-8 {
+                if g >= 0.0 { 1e-8 } else { -1e-8 }
+            } else {
+                g
+            };
+            w_eff[i] = weights[i] * g_safe * g_safe;
+            z_eff[i] = z_beta[i] / g_safe;
         }
         
         // Build penalty for base block: S_base = Σ λ_k S_k
