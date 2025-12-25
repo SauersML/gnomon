@@ -1004,7 +1004,8 @@ pub fn train_joint_model(
                     if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
                         raw.dot(&result.link_transform)
                     } else {
-                        raw.clone()
+                        // Fallback: return zeros with correct dimensions to avoid panic
+                        Array2::zeros((n, p_link))
                     }
                 }
                 Err(_) => Array2::zeros((n, p_link)),

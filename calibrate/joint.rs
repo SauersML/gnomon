@@ -266,14 +266,33 @@ impl<'a> JointModelState<'a> {
                 
                 let n_raw = bspline_basis.ncols();
 
-                // Reuse existing transform if it matches the current raw basis.
-                if self.link_transform.ncols() > 0 && self.link_transform.nrows() == n_raw {
+                // Check if z has sufficient variance for a well-conditioned constraint
+                // If z is nearly constant, the constraint matrix [1,z] is rank-deficient
+                let z_mean: f64 = z.iter().sum::<f64>() / n as f64;
+                let z_var: f64 = z.iter().map(|&v| (v - z_mean).powi(2)).sum::<f64>() / n as f64;
+                let z_has_spread = z_var > 1e-6;
+
+                // Reuse existing transform if it matches AND z has sufficient spread
+                // (if z had no spread when transform was built, it's degenerate)
+                if self.link_transform.ncols() > 0 && self.link_transform.nrows() == n_raw && z_has_spread {
                     let n_constrained = self.link_transform.ncols();
                     if self.beta_link.len() != n_constrained {
                         self.beta_link = Array1::zeros(n_constrained);
                         self.n_constrained_basis = n_constrained;
                     }
                     return bspline_basis.dot(&self.link_transform);
+                }
+                
+                // Skip constraint building if z has no spread (degenerate case)
+                if !z_has_spread {
+                    // Return raw basis with identity transform (will be recomputed later)
+                    let n_constrained = n_raw.saturating_sub(2).max(1);
+                    if self.beta_link.len() != n_constrained {
+                        self.beta_link = Array1::zeros(n_constrained);
+                        self.n_constrained_basis = n_constrained;
+                    }
+                    // Don't freeze a degenerate transform - return unconstrained for now
+                    return bspline_basis.slice(ndarray::s![.., ..n_constrained]).to_owned();
                 }
                 
                 // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
