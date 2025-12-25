@@ -642,12 +642,6 @@ pub fn fit_joint_model<'a>(
         
         // Step B: Given g, update β using g'(u)*X design
         // Get knot range for derivative computation
-        let knot_range = state.knot_range.unwrap_or_else(|| {
-            let min_val = u.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max_val = u.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            (min_val, max_val)
-        });
-        
         // Compute g'(u) for chain rule
         let g_prime = compute_link_derivative_from_state(&state, &u, &b_wiggle);
         
@@ -776,6 +770,7 @@ impl<'a> JointRemlState<'a> {
         config: &JointModelConfig,
     ) -> Self {
         let state = JointModelState::new(y, weights, x_base, s_base, layout_base, link, config);
+        let n_base = state.s_base.len();
         let cached_beta_base = state.beta_base.clone();
         let cached_beta_link = state.beta_link.clone();
         let base_rs_list = compute_penalty_square_roots(&state.s_base)
@@ -788,7 +783,7 @@ impl<'a> JointRemlState<'a> {
             cached_beta_base: RefCell::new(cached_beta_base),
             cached_beta_link: RefCell::new(cached_beta_link),
             cached_laml: RefCell::new(None),
-            cached_rho: RefCell::new(Array1::zeros(state.s_base.len() + 1)),
+            cached_rho: RefCell::new(Array1::zeros(n_base + 1)),
             base_reparam_invariant,
             base_rs_list,
         }
