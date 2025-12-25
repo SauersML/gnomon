@@ -223,26 +223,21 @@ impl<'a> JointModelState<'a> {
         let k = self.n_link_knots;
         let degree = self.degree;
         
-        // Use fixed knot range if available, otherwise compute and store a padded range.
-        let (min_u, max_u) = match self.knot_range {
-            Some(range) => range,
-            None => {
-                let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let range_width = max_val - min_val;
-                if range_width > 1e-6 {
-                    let range = (min_val, max_val);
-                    self.knot_range = Some(range);
-                    range
-                } else {
-                    let center = 0.5 * (min_val + max_val);
-                    let pad = 1.0_f64.max(center.abs() * 1e-3);
-                    let range = (center - pad, center + pad);
-                    self.knot_range = Some(range);
-                    range
-                }
-            }
+        // Update knot range each build to track current u spread (with padding).
+        let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let range_width = max_val - min_val;
+        let (min_u, max_u) = if range_width > 1e-6 {
+            (min_val, max_val)
+        } else {
+            let center = 0.5 * (min_val + max_val);
+            let pad = 1.0_f64.max(center.abs() * 1e-3);
+            (center - pad, center + pad)
         };
+        if self.knot_range != Some((min_u, max_u)) {
+            self.knot_range = Some((min_u, max_u));
+            self.knot_vector = None;
+        }
         
         // Standardize: z = (u - min) / (max - min) to [0, 1]
         let range_width = (max_u - min_u).max(1e-6);
@@ -265,24 +260,6 @@ impl<'a> JointModelState<'a> {
                 }
                 
                 let n_raw = bspline_basis.ncols();
-                
-                // If we already have a fixed transform, reuse it to keep basis coordinates stable.
-                if self.knot_vector.is_some()
-                    && self.link_transform.nrows() == n_raw
-                    && self.link_transform.ncols() > 0
-                {
-                    let n_constrained = self.link_transform.ncols();
-                    if self.beta_link.len() != n_constrained {
-                        let mut new_beta = Array1::zeros(n_constrained);
-                        let copy_len = self.beta_link.len().min(n_constrained);
-                        for i in 0..copy_len {
-                            new_beta[i] = self.beta_link[i];
-                        }
-                        self.beta_link = new_beta;
-                        self.n_constrained_basis = n_constrained;
-                    }
-                    return bspline_basis.dot(&self.link_transform);
-                }
                 
                 // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
                 let mut constraint = Array2::<f64>::zeros((n, 2));
@@ -314,15 +291,8 @@ impl<'a> JointModelState<'a> {
                         self.s_link_constrained = projected_penalty;
                         self.n_constrained_basis = n_constrained;
                         
-                        // Resize beta_link if needed
-                        if self.beta_link.len() != n_constrained {
-                            let mut new_beta = Array1::zeros(n_constrained);
-                            let copy_len = self.beta_link.len().min(n_constrained);
-                            for i in 0..copy_len {
-                                new_beta[i] = self.beta_link[i];
-                            }
-                            self.beta_link = new_beta;
-                        }
+                        // Reset beta_link to avoid mismatched coordinates after transform update
+                        self.beta_link = Array1::zeros(n_constrained);
                         
                         constrained_basis
                     }
@@ -374,14 +344,8 @@ impl<'a> JointModelState<'a> {
                         self.link_transform = transform;
                         self.s_link_constrained = projected_penalty;
                         self.n_constrained_basis = n_constrained;
-                        if self.beta_link.len() != n_constrained {
-                            let mut new_beta = Array1::zeros(n_constrained);
-                            let copy_len = self.beta_link.len().min(n_constrained);
-                            for i in 0..copy_len {
-                                new_beta[i] = self.beta_link[i];
-                            }
-                            self.beta_link = new_beta;
-                        }
+                        // Reset beta_link to avoid mismatched coordinates after transform update
+                        self.beta_link = Array1::zeros(n_constrained);
                         constrained_basis
                     }
                 }
@@ -707,7 +671,6 @@ pub fn fit_joint_model<'a>(
     let mut prev_deviance = f64::INFINITY;
     let mut converged = false;
     let mut iter = 0;
-    let mut total_design_cols = 0;
     
     // Get lambdas from rho (log-lambdas)
     let n_base = state.s_base.len();
@@ -731,7 +694,6 @@ pub fn fit_joint_model<'a>(
         // Step A: Given β, build wiggle basis and update link coefficients
         let u = state.base_linear_predictor();
         let b_wiggle = state.build_link_basis(&u);  // Updates internal state (transform, penalty)
-        total_design_cols = b_wiggle.ncols();
         
         // Update link coefficients (θ) via IRLS with u as OFFSET
         let deviance_after_g = state.irls_link_step(&b_wiggle, &u, lambda_link);
@@ -769,8 +731,32 @@ pub fn fit_joint_model<'a>(
     let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
     let knot_vector = state.knot_vector.clone().unwrap_or_else(|| Array1::zeros(0));
     
-    // Estimate EDF from design dimensions (placeholder - proper EDF requires trace(hat matrix))
-    let edf = total_design_cols as f64 + state.x_base.ncols() as f64;
+    let u_final = state.base_linear_predictor();
+    let b_final = state.build_link_basis(&u_final);
+    let eta_final = state.compute_eta_full(&u_final, &b_final);
+    let mut mu_final = Array1::<f64>::zeros(state.n_obs());
+    let mut weights_final = Array1::<f64>::zeros(state.n_obs());
+    let mut z_final = Array1::<f64>::zeros(state.n_obs());
+    crate::calibrate::pirls::update_glm_vectors(
+        state.y,
+        &eta_final,
+        state.link.clone(),
+        state.weights,
+        &mut mu_final,
+        &mut weights_final,
+        &mut z_final,
+    );
+    drop(z_final);
+    let g_prime_final = compute_link_derivative_from_state(&state, &u_final, &b_final);
+    let edf = compute_joint_edf(
+        &state,
+        &b_final,
+        &g_prime_final,
+        &weights_final,
+        &lambda_base,
+        lambda_link,
+    )
+    .unwrap_or(f64::NAN);
     
     Ok(JointModelResult {
         beta_base: state.beta_base.clone(),
@@ -802,6 +788,9 @@ pub struct JointRemlState<'a> {
     /// Cached LAML value for gradient computation
     cached_laml: RefCell<Option<f64>>,
     cached_rho: RefCell<Array1<f64>>,
+    cached_edf: RefCell<Option<f64>>,
+    last_backfit_iterations: RefCell<usize>,
+    last_converged: RefCell<bool>,
     base_reparam_invariant: Option<ReparamInvariant>,
     base_rs_list: Vec<Array2<f64>>,
 }
@@ -819,6 +808,9 @@ struct JointRemlSnapshot {
     cached_beta_link: Array1<f64>,
     cached_rho: Array1<f64>,
     cached_laml: Option<f64>,
+    cached_edf: Option<f64>,
+    last_backfit_iterations: usize,
+    last_converged: bool,
 }
 
 impl JointRemlSnapshot {
@@ -837,6 +829,9 @@ impl JointRemlSnapshot {
             cached_beta_link: reml.cached_beta_link.borrow().clone(),
             cached_rho: reml.cached_rho.borrow().clone(),
             cached_laml: *reml.cached_laml.borrow(),
+            cached_edf: *reml.cached_edf.borrow(),
+            last_backfit_iterations: *reml.last_backfit_iterations.borrow(),
+            last_converged: *reml.last_converged.borrow(),
         }
     }
     
@@ -854,6 +849,9 @@ impl JointRemlSnapshot {
         *reml.cached_beta_link.borrow_mut() = self.cached_beta_link.clone();
         *reml.cached_rho.borrow_mut() = self.cached_rho.clone();
         *reml.cached_laml.borrow_mut() = self.cached_laml;
+        *reml.cached_edf.borrow_mut() = self.cached_edf;
+        *reml.last_backfit_iterations.borrow_mut() = self.last_backfit_iterations;
+        *reml.last_converged.borrow_mut() = self.last_converged;
     }
 }
 
@@ -885,6 +883,9 @@ impl<'a> JointRemlState<'a> {
             cached_beta_link: RefCell::new(cached_beta_link),
             cached_laml: RefCell::new(None),
             cached_rho: RefCell::new(Array1::zeros(n_base + 1)),
+            cached_edf: RefCell::new(None),
+            last_backfit_iterations: RefCell::new(0),
+            last_converged: RefCell::new(false),
             base_reparam_invariant,
             base_rs_list,
         }
@@ -909,6 +910,8 @@ impl<'a> JointRemlState<'a> {
         let lambda_link = rho.get(n_base).map(|r| r.exp()).unwrap_or(1.0);
         
         let mut prev_deviance = f64::INFINITY;
+        let mut iter_count = 0;
+        let mut converged = false;
         for i in 0..self.config.max_backfit_iter {
             let progress = (i as f64) / (self.config.max_backfit_iter as f64);
             let damping = 0.5 + progress * 0.5;
@@ -921,7 +924,9 @@ impl<'a> JointRemlState<'a> {
             let deviance = state.irls_base_step(&b_wiggle, &g_prime, &lambda_base, damping);
             
             let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
+            iter_count = i + 1;
             if delta < self.config.backfit_tol {
+                converged = true;
                 break;
             }
             prev_deviance = deviance;
@@ -932,17 +937,20 @@ impl<'a> JointRemlState<'a> {
         *self.cached_beta_link.borrow_mut() = state.beta_link.clone();
         
         // Compute LAML = deviance + log|H_pen| - log|S_λ|
-        let laml = self.compute_laml_at_convergence(&state, &lambda_base, lambda_link);
+        let (laml, edf) = self.compute_laml_at_convergence(&state, &lambda_base, lambda_link);
         
         // Cache for gradient
         *self.cached_laml.borrow_mut() = Some(laml);
         *self.cached_rho.borrow_mut() = rho.clone();
+        *self.cached_edf.borrow_mut() = edf;
+        *self.last_backfit_iterations.borrow_mut() = iter_count;
+        *self.last_converged.borrow_mut() = converged;
         
         Ok(-laml)
     }
     
     /// Compute LAML at the converged solution
-    fn compute_laml_at_convergence(&self, state: &JointModelState, lambda_base: &Array1<f64>, lambda_link: f64) -> f64 {
+    fn compute_laml_at_convergence(&self, state: &JointModelState, lambda_base: &Array1<f64>, lambda_link: f64) -> (f64, Option<f64>) {
         let n = state.n_obs();
         let u = state.base_linear_predictor();
         let b_wiggle = state.build_link_basis_from_state(&u);
@@ -1039,7 +1047,16 @@ impl<'a> JointRemlState<'a> {
                 let schur = &d_mat - &a_inv_c.t().dot(&c_mat);
                 let log_det_schur = match schur.cholesky(Side::Lower) {
                     Ok(schol) => 2.0 * schol.diag().mapv(|d| d.max(1e-10).ln()).sum(),
-                    Err(_) => 0.0,
+                    Err(_) => {
+                        use crate::calibrate::faer_ndarray::FaerEigh;
+                        let (eigs, _) = schur
+                            .clone()
+                            .eigh(Side::Lower)
+                            .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
+                        let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+                        let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+                        eigs.iter().map(|&ev| ev.max(tol).ln()).sum()
+                    }
                 };
                 log_det + log_det_schur
             }
@@ -1116,8 +1133,132 @@ impl<'a> JointRemlState<'a> {
         let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_a
                  + (mp / 2.0) * (2.0 * std::f64::consts::PI).ln();
         
-        laml
+        let edf = compute_joint_edf(
+            state,
+            &b_wiggle,
+            &g_prime,
+            &weights,
+            lambda_base,
+            lambda_link,
+        );
+        
+        (laml, edf)
     }
+
+fn compute_joint_edf(
+    state: &JointModelState,
+    b_wiggle: &Array2<f64>,
+    g_prime: &Array1<f64>,
+    weights: &Array1<f64>,
+    lambda_base: &Array1<f64>,
+    lambda_link: f64,
+) -> Option<f64> {
+    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+    
+    let n = state.n_obs();
+    let p_base = state.x_base.ncols();
+    let p_link = b_wiggle.ncols();
+    let p_total = p_base + p_link;
+    if p_total == 0 {
+        return Some(0.0);
+    }
+    
+    let mut w_eff = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        w_eff[i] = weights[i] * g_prime[i] * g_prime[i];
+    }
+    let mut x_weighted = state.x_base.to_owned();
+    for i in 0..n {
+        let scale = w_eff[i].sqrt();
+        for j in 0..p_base {
+            x_weighted[[i, j]] *= scale;
+        }
+    }
+    let mut a_mat = crate::calibrate::faer_ndarray::fast_ata(&x_weighted);
+    for (idx, s_k) in state.s_base.iter().enumerate() {
+        let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
+        if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
+            a_mat.scaled_add(lambda_k, s_k);
+        }
+    }
+    
+    let mut wb = b_wiggle.clone();
+    for i in 0..n {
+        let scale = weights[i] * g_prime[i];
+        for j in 0..p_link {
+            wb[[i, j]] *= scale;
+        }
+    }
+    let c_mat = crate::calibrate::faer_ndarray::fast_atb(&state.x_base, &wb);
+    
+    let mut b_weighted = b_wiggle.clone();
+    for i in 0..n {
+        let scale = weights[i].sqrt();
+        for j in 0..p_link {
+            b_weighted[[i, j]] *= scale;
+        }
+    }
+    let mut d_mat = crate::calibrate::faer_ndarray::fast_ata(&b_weighted);
+    let link_penalty = state.build_link_penalty();
+    if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
+        d_mat.scaled_add(lambda_link, &link_penalty);
+    }
+    
+    for i in 0..p_base {
+        a_mat[[i, i]] += 1e-8;
+    }
+    for i in 0..p_link {
+        d_mat[[i, i]] += 1e-8;
+    }
+    
+    let mut h_mat = Array2::<f64>::zeros((p_total, p_total));
+    for i in 0..p_base {
+        for j in 0..p_base {
+            h_mat[[i, j]] = a_mat[[i, j]];
+        }
+    }
+    for i in 0..p_base {
+        for j in 0..p_link {
+            h_mat[[i, p_base + j]] = c_mat[[i, j]];
+            h_mat[[p_base + j, i]] = c_mat[[i, j]];
+        }
+    }
+    for i in 0..p_link {
+        for j in 0..p_link {
+            h_mat[[p_base + i, p_base + j]] = d_mat[[i, j]];
+        }
+    }
+    
+    let mut s_lambda = Array2::<f64>::zeros((p_total, p_total));
+    for (idx, s_k) in state.s_base.iter().enumerate() {
+        let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
+        if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
+            for i in 0..p_base {
+                for j in 0..p_base {
+                    s_lambda[[i, j]] += lambda_k * s_k[[i, j]];
+                }
+            }
+        }
+    }
+    if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
+        for i in 0..p_link {
+            for j in 0..p_link {
+                s_lambda[[p_base + i, p_base + j]] += lambda_link * link_penalty[[i, j]];
+            }
+        }
+    }
+    
+    let chol = h_mat.cholesky(Side::Lower).ok()?;
+    let mut trace = 0.0;
+    for j in 0..p_total {
+        let col = s_lambda.column(j).to_owned();
+        let solved = chol.solve_vec(&col);
+        trace += solved[j];
+    }
+    
+    Some(p_total as f64 - trace)
+}
     
     /// Compute numerical gradient of LAML w.r.t. ρ using central differences
     pub fn compute_gradient(&self, rho: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -1157,6 +1298,9 @@ impl<'a> JointRemlState<'a> {
     
     /// Extract final result after optimization
     pub fn into_result(self) -> JointModelResult {
+        let cached_edf = *self.cached_edf.borrow();
+        let cached_iters = *self.last_backfit_iterations.borrow();
+        let cached_converged = *self.last_converged.borrow();
         let state = self.state.into_inner();
         let rho = state.rho.clone();
         let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
@@ -1183,9 +1327,9 @@ impl<'a> JointRemlState<'a> {
             beta_link: state.beta_link,
             lambdas: rho.mapv(f64::exp).to_vec(),
             deviance,
-            edf: state.n_constrained_basis as f64 + state.x_base.ncols() as f64,
-            backfit_iterations: self.config.max_backfit_iter,
-            converged: true,
+            edf: cached_edf.unwrap_or(f64::NAN),
+            backfit_iterations: cached_iters,
+            converged: cached_converged,
             knot_range,
             knot_vector,
             link_transform: state.link_transform,
@@ -1275,42 +1419,74 @@ fn compute_link_derivative_from_state(
     let h = 1e-4;
     let z_plus: Array1<f64> = z.mapv(|v| (v + h).clamp(0.0, 1.0));
     let z_minus: Array1<f64> = z.mapv(|v| (v - h).clamp(0.0, 1.0));
+    let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
+    let n_constrained = state.link_transform.ncols();
+    if n_raw == 0 || n_constrained == 0 {
+        return deriv;
+    }
+    if state.beta_link.len() != n_constrained {
+        return deriv;
+    }
     
-    let b_plus_raw = match create_bspline_basis_with_knots(z_plus.view(), knot_vector.view(), state.degree) {
-        Ok((basis, _)) => (*basis).clone(),
-        Err(_) => return deriv,
-    };
-    let b_minus_raw = match create_bspline_basis_with_knots(z_minus.view(), knot_vector.view(), state.degree) {
-        Ok((basis, _)) => (*basis).clone(),
-        Err(_) => return deriv,
-    };
-    
-    let b_plus = if state.link_transform.ncols() > 0 && state.link_transform.nrows() == b_plus_raw.ncols() {
-        b_plus_raw.dot(&state.link_transform)
-    } else {
-        b_plus_raw
-    };
-    let b_minus = if state.link_transform.ncols() > 0 && state.link_transform.nrows() == b_minus_raw.ncols() {
-        b_minus_raw.dot(&state.link_transform)
-    } else {
-        b_minus_raw
-    };
+    let mut raw_plus = vec![0.0; n_raw];
+    let mut raw_minus = vec![0.0; n_raw];
+    let mut plus = vec![0.0; n_constrained];
+    let mut minus = vec![0.0; n_constrained];
+    let mut scratch = crate::calibrate::basis::SplineScratch::new(state.degree);
     
     for i in 0..n {
         let dz = (z_plus[i] - z_minus[i]).max(1e-8);
-        if b_plus.ncols() != state.beta_link.len() || b_minus.ncols() != state.beta_link.len() {
-            deriv[i] = 1.0;
+        raw_plus.fill(0.0);
+        raw_minus.fill(0.0);
+        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+            z_plus[i],
+            knot_vector.view(),
+            state.degree,
+            &mut raw_plus,
+            &mut scratch,
+        )
+        .is_err()
+        {
             continue;
         }
+        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+            z_minus[i],
+            knot_vector.view(),
+            state.degree,
+            &mut raw_minus,
+            &mut scratch,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        
+        plus.fill(0.0);
+        minus.fill(0.0);
+        if state.link_transform.nrows() == n_raw && state.link_transform.ncols() == n_constrained {
+            for r in 0..n_raw {
+                let vrp = raw_plus[r];
+                let vrm = raw_minus[r];
+                for c in 0..n_constrained {
+                    plus[c] += vrp * state.link_transform[[r, c]];
+                    minus[c] += vrm * state.link_transform[[r, c]];
+                }
+            }
+        } else if n_constrained == n_raw {
+            plus.copy_from_slice(&raw_plus);
+            minus.copy_from_slice(&raw_minus);
+        } else {
+            continue;
+        }
+        
         let mut d_wiggle_dz = 0.0;
-        for j in 0..state.beta_link.len() {
-            d_wiggle_dz += (b_plus[[i, j]] - b_minus[[i, j]]) * state.beta_link[j];
+        for j in 0..n_constrained {
+            d_wiggle_dz += (plus[j] - minus[j]) * state.beta_link[j];
         }
         d_wiggle_dz /= dz;
         deriv[i] = 1.0 + d_wiggle_dz / range_width;
     }
     
-    deriv.mapv_inplace(|d| d.max(0.1).min(10.0));
     deriv
 }
 
@@ -1332,42 +1508,74 @@ fn compute_link_derivative_from_result(
     let h = 1e-4;
     let z_plus: Array1<f64> = z.mapv(|v| (v + h).clamp(0.0, 1.0));
     let z_minus: Array1<f64> = z.mapv(|v| (v - h).clamp(0.0, 1.0));
+    let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
+    let n_constrained = result.link_transform.ncols();
+    if n_raw == 0 || n_constrained == 0 {
+        return deriv;
+    }
+    if result.beta_link.len() != n_constrained {
+        return deriv;
+    }
     
-    let b_plus_raw = match create_bspline_basis_with_knots(z_plus.view(), result.knot_vector.view(), result.degree) {
-        Ok((basis, _)) => (*basis).clone(),
-        Err(_) => return deriv,
-    };
-    let b_minus_raw = match create_bspline_basis_with_knots(z_minus.view(), result.knot_vector.view(), result.degree) {
-        Ok((basis, _)) => (*basis).clone(),
-        Err(_) => return deriv,
-    };
-    
-    let b_plus = if result.link_transform.ncols() > 0 && result.link_transform.nrows() == b_plus_raw.ncols() {
-        b_plus_raw.dot(&result.link_transform)
-    } else {
-        b_plus_raw
-    };
-    let b_minus = if result.link_transform.ncols() > 0 && result.link_transform.nrows() == b_minus_raw.ncols() {
-        b_minus_raw.dot(&result.link_transform)
-    } else {
-        b_minus_raw
-    };
+    let mut raw_plus = vec![0.0; n_raw];
+    let mut raw_minus = vec![0.0; n_raw];
+    let mut plus = vec![0.0; n_constrained];
+    let mut minus = vec![0.0; n_constrained];
+    let mut scratch = crate::calibrate::basis::SplineScratch::new(result.degree);
     
     for i in 0..n {
         let dz = (z_plus[i] - z_minus[i]).max(1e-8);
-        if b_plus.ncols() != result.beta_link.len() || b_minus.ncols() != result.beta_link.len() {
-            deriv[i] = 1.0;
+        raw_plus.fill(0.0);
+        raw_minus.fill(0.0);
+        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+            z_plus[i],
+            result.knot_vector.view(),
+            result.degree,
+            &mut raw_plus,
+            &mut scratch,
+        )
+        .is_err()
+        {
             continue;
         }
+        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+            z_minus[i],
+            result.knot_vector.view(),
+            result.degree,
+            &mut raw_minus,
+            &mut scratch,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        
+        plus.fill(0.0);
+        minus.fill(0.0);
+        if result.link_transform.nrows() == n_raw && result.link_transform.ncols() == n_constrained {
+            for r in 0..n_raw {
+                let vrp = raw_plus[r];
+                let vrm = raw_minus[r];
+                for c in 0..n_constrained {
+                    plus[c] += vrp * result.link_transform[[r, c]];
+                    minus[c] += vrm * result.link_transform[[r, c]];
+                }
+            }
+        } else if n_constrained == n_raw {
+            plus.copy_from_slice(&raw_plus);
+            minus.copy_from_slice(&raw_minus);
+        } else {
+            continue;
+        }
+        
         let mut d_wiggle_dz = 0.0;
-        for j in 0..result.beta_link.len() {
-            d_wiggle_dz += (b_plus[[i, j]] - b_minus[[i, j]]) * result.beta_link[j];
+        for j in 0..n_constrained {
+            d_wiggle_dz += (plus[j] - minus[j]) * result.beta_link[j];
         }
         d_wiggle_dz /= dz;
         deriv[i] = 1.0 + d_wiggle_dz / range_width;
     }
     
-    deriv.mapv_inplace(|d| d.max(0.1).min(10.0));
     deriv
 }
 
@@ -1439,6 +1647,21 @@ pub fn predict_joint(
         probabilities,
         effective_se,
     }
+}
+
+/// Predict using the stored base_model plus the joint link calibration.
+pub fn predict_joint_from_base_model(
+    result: &JointModelResult,
+    p_new: ArrayView1<f64>,
+    sex_new: ArrayView1<f64>,
+    pcs_new: ArrayView2<f64>,
+) -> Result<JointModelPrediction, crate::calibrate::model::ModelError> {
+    let base = result
+        .base_model
+        .as_ref()
+        .ok_or(crate::calibrate::model::ModelError::CalibratorMissing)?;
+    let (eta_base, _mean, _dist, se_eta_opt) = base.predict_detailed(p_new, sex_new, pcs_new)?;
+    Ok(predict_joint(result, &eta_base, se_eta_opt.as_ref()))
 }
 
 #[cfg(test)]
