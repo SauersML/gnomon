@@ -706,12 +706,12 @@ impl TrainedModel {
 
     /// Posterior mean probability using joint MCMC samples over (β, θ).
     /// For each sample [β_s | θ_s], computes η_s = Xβ_s + B(Xβ_s)θ_s
-    /// and returns mean(sigmoid(η_s)).
+    /// and returns (mean_prob, mean_eta, se_eta) for proper uncertainty quantification.
     fn joint_mcmc_mean_predictions(
         &self,
         x_new: &Array2<f64>,
         joint: &JointLinkModel,
-    ) -> Result<Array1<f64>, ModelError> {
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), ModelError> {
         let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
             ModelError::DimensionMismatch("MCMC samples missing for joint prediction.".to_string())
         })?;
@@ -737,61 +737,52 @@ impl TrainedModel {
         let n_constrained = joint.link_transform.ncols();
         
         let mut prob_sum = Array1::<f64>::zeros(n_points);
+        let mut eta_sum = Array1::<f64>::zeros(n_points);
+        let mut eta_sq_sum = Array1::<f64>::zeros(n_points);
         let mut raw = vec![0.0; n_raw];
         let mut constrained = vec![0.0; n_constrained];
         let mut scratch = basis::SplineScratch::new(joint.degree);
         
-        // For each sample s
         for s in 0..n_samples {
             let beta_s = samples.slice(s![s, 0..p_base]);
             let theta_s = samples.slice(s![s, p_base..]);
-            
-            // Compute u = X @ β_s
             let u = x_new.dot(&beta_s.to_owned());
             
-            // For each prediction point
             for i in 0..n_points {
                 let u_i = u[i];
                 let z_i = ((u_i - min_u) / range_width).clamp(0.0, 1.0);
                 
-                // Evaluate basis at z_i
                 raw.fill(0.0);
-                if basis::evaluate_bspline_basis_scalar(
+                let eta_i = if basis::evaluate_bspline_basis_scalar(
                     z_i, joint.knot_vector.view(), joint.degree, &mut raw, &mut scratch
-                ).is_err() {
-                    // Fallback: no wiggle
-                    let eta_i = u_i.clamp(-700.0, 700.0);
-                    prob_sum[i] += 1.0 / (1.0 + f64::exp(-eta_i));
-                    continue;
-                }
-                
-                // Transform to constrained basis
-                constrained.fill(0.0);
-                if joint.link_transform.nrows() == n_raw && n_constrained > 0 {
+                ).is_ok() && joint.link_transform.nrows() == n_raw && n_constrained > 0 {
+                    constrained.fill(0.0);
                     for r in 0..n_raw {
                         let v = raw[r];
-                        for c in 0..n_constrained {
-                            constrained[c] += v * joint.link_transform[[r, c]];
-                        }
+                        for c in 0..n_constrained { constrained[c] += v * joint.link_transform[[r, c]]; }
                     }
-                }
+                    let mut wiggle = 0.0;
+                    for c in 0..n_constrained.min(theta_s.len()) { wiggle += constrained[c] * theta_s[c]; }
+                    u_i + wiggle
+                } else {
+                    u_i
+                };
                 
-                // Compute wiggle = B(u_i) @ θ_s
-                let mut wiggle = 0.0;
-                for c in 0..n_constrained.min(theta_s.len()) {
-                    wiggle += constrained[c] * theta_s[c];
-                }
-                
-                // η_i = u_i + wiggle
-                let eta_i = (u_i + wiggle).clamp(-700.0, 700.0);
-                prob_sum[i] += 1.0 / (1.0 + f64::exp(-eta_i));
+                let eta_clamped = eta_i.clamp(-700.0, 700.0);
+                let p_i = 1.0 / (1.0 + f64::exp(-eta_clamped));
+                prob_sum[i] += p_i;
+                eta_sum[i] += eta_i;
+                eta_sq_sum[i] += eta_i * eta_i;
             }
         }
         
-        // Average over samples
-        let mut mean = prob_sum.mapv(|p| p / n_samples as f64);
-        mean.mapv_inplace(|p| p.clamp(1e-8, 1.0 - 1e-8));
-        Ok(mean)
+        let ns = n_samples as f64;
+        let mean_prob = prob_sum.mapv(|p| (p / ns).clamp(1e-8, 1.0 - 1e-8));
+        let mean_eta = eta_sum.mapv(|e| e / ns);
+        let var_eta = (&eta_sq_sum / ns) - (&mean_eta * &mean_eta);
+        let se_eta = var_eta.mapv(|v| v.max(0.0).sqrt());
+        
+        Ok((mean_prob, mean_eta, se_eta))
     }
 
     /// Detailed predictions including linear predictor, mean response, signed distance
@@ -831,12 +822,10 @@ impl TrainedModel {
             && self.mcmc_samples.is_some()
             && self.joint_link.is_some()
         {
-            // Joint posterior predictive: average sigmoid over (β,θ) samples
+            // Joint posterior predictive: get mean prob, mean eta, and SE from samples
             let joint = self.joint_link.as_ref().unwrap();
-            let mean = self.joint_mcmc_mean_predictions(&x_new, joint)?;
-            let eta = mean.mapv(Self::logit_from_prob);
-            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
-            return Ok((eta, mean, signed_dist, se_eta_opt));
+            let (mean, eta, se_eta) = self.joint_mcmc_mean_predictions(&x_new, joint)?;
+            return Ok((eta, mean, signed_dist, Some(se_eta)));
         }
 
         if link_function == LinkFunction::Logit

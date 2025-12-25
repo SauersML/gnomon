@@ -117,6 +117,8 @@ pub struct JointModelResult {
     pub degree: usize,
     /// Link function used during training
     pub link: LinkFunction,
+    /// Constrained link penalty matrix (Z'SZ) used in REML fit
+    pub s_link_constrained: Array2<f64>,
     /// Base trained model artifacts needed for prediction
     pub base_model: Option<crate::calibrate::model::TrainedModel>,
 }
@@ -790,6 +792,7 @@ pub fn fit_joint_model<'a>(
         link_transform: state.link_transform.clone(),
         degree: state.degree,
         link: state.link.clone(),
+        s_link_constrained: state.s_link_constrained.clone(),
         base_model: None,
     })
 }
@@ -1384,6 +1387,7 @@ impl<'a> JointRemlState<'a> {
             link_transform: state.link_transform,
             degree: state.degree,
             link: state.link.clone(),
+            s_link_constrained: state.s_link_constrained,
             base_model: None,
         }
     }

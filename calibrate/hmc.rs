@@ -971,10 +971,23 @@ impl JointLinkPosterior {
         let mut ll = 0.0;
         let mut residual = Array1::<f64>::zeros(self.n_samples);
         for i in 0..self.n_samples {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
-            let mu = (1.0 / (1.0 + (-eta_i).exp())).clamp(1e-10, 1.0 - 1e-10);
+            let eta_i = eta[i];
             let (y_i, w_i) = (self.y[i], self.weights[i]);
-            ll += w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
+            // Numerically stable log-likelihood: y*η - log(1 + exp(η))
+            // Use softplus: log(1 + exp(η)) = η + log(1 + exp(-η)) for η > 0
+            let log1pexp = if eta_i > 0.0 {
+                eta_i + (-eta_i).exp().ln_1p()
+            } else {
+                eta_i.exp().ln_1p()
+            };
+            ll += w_i * (y_i * eta_i - log1pexp);
+            // μ via stable sigmoid
+            let mu = if eta_i > 0.0 {
+                1.0 / (1.0 + (-eta_i).exp())
+            } else {
+                let e = eta_i.exp();
+                e / (1.0 + e)
+            };
             residual[i] = w_i * (y_i - mu);
         }
         let g_prime = self.compute_g_prime(&u, &theta);

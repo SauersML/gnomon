@@ -919,24 +919,10 @@ pub fn train_joint_model(
             }
         }
         
-        // Build link penalty (already scaled by lambda)
+        
+        // Use the REAL constrained link penalty from the REML fit (critical for correct posterior)
         let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
-        // Need to get it from JointModelResult - for now use stored s_link_constrained if available
-        // Using identity approximation - will be replaced when we add proper storage
-        let s_link = {
-            let d = result.link_transform.ncols();
-            let mut s = Array2::<f64>::eye(d);
-            // Apply difference penalty structure (second order)
-            for i in 0..(d.saturating_sub(1)) {
-                s[[i, i]] += 2.0 * link_lambda;
-                s[[i, i + 1]] -= link_lambda;
-                s[[i + 1, i]] -= link_lambda;
-            }
-            if d > 0 {
-                s[[d - 1, d - 1]] += link_lambda;
-            }
-            s
-        };
+        let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
         
         // Build approximate joint Hessian (diagonal for now - NUTS adapts mass matrix)
         let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
