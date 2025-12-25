@@ -1458,6 +1458,9 @@ fn compute_link_derivative_from_state(
     u: &Array1<f64>,
     b_wiggle: &Array2<f64>,
 ) -> Array1<f64> {
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
+    use crate::calibrate::basis::internal::BsplineScratch;
+    
     let n = u.len();
     let mut deriv = Array1::<f64>::ones(n);
     
@@ -1469,74 +1472,47 @@ fn compute_link_derivative_from_state(
     };
     
     let (z, range_width) = state.standardized_z(u);
-    let h = 1e-4;
-    let z_plus: Array1<f64> = z.mapv(|v| (v + h).clamp(0.0, 1.0));
-    let z_minus: Array1<f64> = z.mapv(|v| (v - h).clamp(0.0, 1.0));
     let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
     let n_constrained = state.link_transform.ncols();
-    if n_raw == 0 || n_constrained == 0 {
-        return deriv;
-    }
-    if state.beta_link.len() != n_constrained {
+    if n_raw == 0 || n_constrained == 0 || state.beta_link.len() != n_constrained {
         return deriv;
     }
     
-    let mut raw_plus = vec![0.0; n_raw];
-    let mut raw_minus = vec![0.0; n_raw];
-    let mut plus = vec![0.0; n_constrained];
-    let mut minus = vec![0.0; n_constrained];
-    let mut scratch = crate::calibrate::basis::SplineScratch::new(state.degree);
+    // Pre-allocate all buffers outside loop (zero-allocation, same as HMC)
+    let mut deriv_raw = vec![0.0; n_raw];
+    let num_basis_lower = knot_vector.len().saturating_sub(state.degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = BsplineScratch::new(state.degree.saturating_sub(1));
     
     for i in 0..n {
-        let dz = (z_plus[i] - z_minus[i]).max(1e-8);
-        raw_plus.fill(0.0);
-        raw_minus.fill(0.0);
-        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-            z_plus[i],
-            knot_vector.view(),
-            state.degree,
-            &mut raw_plus,
-            &mut scratch,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-            z_minus[i],
-            knot_vector.view(),
-            state.degree,
-            &mut raw_minus,
-            &mut scratch,
-        )
-        .is_err()
-        {
+        let z_i = z[i];
+        
+        // At boundaries (clamped), g'(u) = 1 (wiggle is constant w.r.t. u)
+        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+            deriv[i] = 1.0;
             continue;
         }
         
-        plus.fill(0.0);
-        minus.fill(0.0);
-        if state.link_transform.nrows() == n_raw && state.link_transform.ncols() == n_constrained {
-            for r in 0..n_raw {
-                let vrp = raw_plus[r];
-                let vrm = raw_minus[r];
-                for c in 0..n_constrained {
-                    plus[c] += vrp * state.link_transform[[r, c]];
-                    minus[c] += vrm * state.link_transform[[r, c]];
-                }
-            }
-        } else if n_constrained == n_raw {
-            plus.copy_from_slice(&raw_plus);
-            minus.copy_from_slice(&raw_minus);
+        deriv_raw.fill(0.0);
+        if evaluate_bspline_derivative_scalar_into(
+            z_i, knot_vector.view(), state.degree,
+            &mut deriv_raw, &mut lower_basis, &mut lower_scratch
+        ).is_err() {
+            continue;
+        }
+        
+        // d(wiggle)/dz = B'(z) @ Z @ θ
+        let d_wiggle_dz: f64 = if state.link_transform.nrows() == n_raw {
+            (0..n_constrained).map(|c| {
+                let b_prime_c: f64 = (0..n_raw).map(|r|
+                    deriv_raw[r] * state.link_transform[[r, c]]
+                ).sum();
+                b_prime_c * state.beta_link[c]
+            }).sum()
         } else {
-            continue;
-        }
+            0.0
+        };
         
-        let mut d_wiggle_dz = 0.0;
-        for j in 0..n_constrained {
-            d_wiggle_dz += (plus[j] - minus[j]) * state.beta_link[j];
-        }
-        d_wiggle_dz /= dz;
         deriv[i] = 1.0 + d_wiggle_dz / range_width;
     }
     
@@ -1557,6 +1533,9 @@ fn compute_link_derivative_from_result(
     eta_base: &Array1<f64>,
     b_wiggle: &Array2<f64>,
 ) -> Array1<f64> {
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
+    use crate::calibrate::basis::internal::BsplineScratch;
+    
     let n = eta_base.len();
     let mut deriv = Array1::<f64>::ones(n);
     if b_wiggle.ncols() == 0 || result.beta_link.is_empty() {
@@ -1565,76 +1544,48 @@ fn compute_link_derivative_from_result(
     
     let (min_u, max_u) = result.knot_range;
     let range_width = (max_u - min_u).max(1e-6);
-    let z: Array1<f64> = eta_base
-        .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
-    let h = 1e-4;
-    let z_plus: Array1<f64> = z.mapv(|v| (v + h).clamp(0.0, 1.0));
-    let z_minus: Array1<f64> = z.mapv(|v| (v - h).clamp(0.0, 1.0));
+    let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
     let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
     let n_constrained = result.link_transform.ncols();
-    if n_raw == 0 || n_constrained == 0 {
-        return deriv;
-    }
-    if result.beta_link.len() != n_constrained {
+    if n_raw == 0 || n_constrained == 0 || result.beta_link.len() != n_constrained {
         return deriv;
     }
     
-    let mut raw_plus = vec![0.0; n_raw];
-    let mut raw_minus = vec![0.0; n_raw];
-    let mut plus = vec![0.0; n_constrained];
-    let mut minus = vec![0.0; n_constrained];
-    let mut scratch = crate::calibrate::basis::SplineScratch::new(result.degree);
+    // Pre-allocate all buffers outside loop (zero-allocation, same as HMC)
+    let mut deriv_raw = vec![0.0; n_raw];
+    let num_basis_lower = result.knot_vector.len().saturating_sub(result.degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = BsplineScratch::new(result.degree.saturating_sub(1));
     
     for i in 0..n {
-        let dz = (z_plus[i] - z_minus[i]).max(1e-8);
-        raw_plus.fill(0.0);
-        raw_minus.fill(0.0);
-        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-            z_plus[i],
-            result.knot_vector.view(),
-            result.degree,
-            &mut raw_plus,
-            &mut scratch,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-            z_minus[i],
-            result.knot_vector.view(),
-            result.degree,
-            &mut raw_minus,
-            &mut scratch,
-        )
-        .is_err()
-        {
+        let z_i = z[i];
+        
+        // At boundaries (clamped), g'(u) = 1 (wiggle is constant w.r.t. u)
+        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+            deriv[i] = 1.0;
             continue;
         }
         
-        plus.fill(0.0);
-        minus.fill(0.0);
-        if result.link_transform.nrows() == n_raw && result.link_transform.ncols() == n_constrained {
-            for r in 0..n_raw {
-                let vrp = raw_plus[r];
-                let vrm = raw_minus[r];
-                for c in 0..n_constrained {
-                    plus[c] += vrp * result.link_transform[[r, c]];
-                    minus[c] += vrm * result.link_transform[[r, c]];
-                }
-            }
-        } else if n_constrained == n_raw {
-            plus.copy_from_slice(&raw_plus);
-            minus.copy_from_slice(&raw_minus);
+        deriv_raw.fill(0.0);
+        if evaluate_bspline_derivative_scalar_into(
+            z_i, result.knot_vector.view(), result.degree,
+            &mut deriv_raw, &mut lower_basis, &mut lower_scratch
+        ).is_err() {
+            continue;
+        }
+        
+        // d(wiggle)/dz = B'(z) @ Z @ θ
+        let d_wiggle_dz: f64 = if result.link_transform.nrows() == n_raw {
+            (0..n_constrained).map(|c| {
+                let b_prime_c: f64 = (0..n_raw).map(|r|
+                    deriv_raw[r] * result.link_transform[[r, c]]
+                ).sum();
+                b_prime_c * result.beta_link[c]
+            }).sum()
         } else {
-            continue;
-        }
+            0.0
+        };
         
-        let mut d_wiggle_dz = 0.0;
-        for j in 0..n_constrained {
-            d_wiggle_dz += (plus[j] - minus[j]) * result.beta_link[j];
-        }
-        d_wiggle_dz /= dz;
         deriv[i] = 1.0 + d_wiggle_dz / range_width;
     }
     

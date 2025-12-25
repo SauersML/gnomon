@@ -783,7 +783,7 @@ fn compute_analytic_gprime(
     eta_base: &Array1<f64>,
     result: &crate::calibrate::joint::JointModelResult,
 ) -> Array1<f64> {
-    use crate::calibrate::basis::evaluate_bspline_derivative_scalar;
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
     
     let n = eta_base.len();
     let mut g_prime = Array1::<f64>::ones(n);
@@ -798,8 +798,11 @@ fn compute_analytic_gprime(
         return g_prime;
     }
     
-    // Preallocate outside the loop for performance
+    // Preallocate ALL buffers outside the loop (zero-allocation, same as HMC)
     let mut deriv_raw = vec![0.0; n_raw];
+    let num_basis_lower = result.knot_vector.len().saturating_sub(result.degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(1));
     
     for i in 0..n {
         let u_i = eta_base[i];
@@ -812,8 +815,9 @@ fn compute_analytic_gprime(
         }
         
         deriv_raw.fill(0.0);
-        if evaluate_bspline_derivative_scalar(
-            z_i, result.knot_vector.view(), result.degree, &mut deriv_raw
+        if evaluate_bspline_derivative_scalar_into(
+            z_i, result.knot_vector.view(), result.degree, 
+            &mut deriv_raw, &mut lower_basis, &mut lower_scratch
         ).is_err() {
             continue;
         }
