@@ -868,7 +868,9 @@ impl<'a> JointRemlState<'a> {
         link: LinkFunction,
         config: &JointModelConfig,
     ) -> Self {
-        let state = JointModelState::new(y, weights, x_base, s_base, layout_base, link, config);
+        let mut state = JointModelState::new(y, weights, x_base, s_base, layout_base, link, config);
+        let u0 = state.base_linear_predictor();
+        let _ = state.build_link_basis(&u0);
         let n_base = state.s_base.len();
         let cached_beta_base = state.beta_base.clone();
         let cached_beta_link = state.beta_link.clone();
