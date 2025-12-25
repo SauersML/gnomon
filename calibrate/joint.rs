@@ -248,7 +248,7 @@ impl<'a> JointModelState<'a> {
         let data_range = (0.0, 1.0);
         let basis_result = if let Some(knots) = self.knot_vector.as_ref() {
             create_bspline_basis_with_knots(z.view(), knots.view(), degree)
-                .map(|(basis, _)| (basis, knots.clone()))
+                .map(|(basis, _)| (basis.as_ref().clone(), knots.clone()))
         } else {
             create_bspline_basis(z.view(), data_range, k, degree)
         };
@@ -374,7 +374,7 @@ impl<'a> JointModelState<'a> {
             .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         
         let b_raw = match create_bspline_basis_with_knots(z.view(), knot_vector.view(), self.degree) {
-            Ok((basis, _)) => basis.clone(),
+            Ok((basis, _)) => basis.as_ref().clone(),
             Err(_) => Array2::zeros((n, 0)),
         };
         
@@ -748,7 +748,7 @@ pub fn fit_joint_model<'a>(
     );
     drop(z_final);
     let g_prime_final = compute_link_derivative_from_state(&state, &u_final, &b_final);
-    let edf = compute_joint_edf(
+    let edf = JointRemlState::compute_joint_edf(
         &state,
         &b_final,
         &g_prime_final,
@@ -1147,7 +1147,7 @@ impl<'a> JointRemlState<'a> {
             }
         };
         
-        let edf = compute_joint_edf(
+        let edf = Self::compute_joint_edf(
             state,
             &b_wiggle,
             &g_prime,
@@ -1304,10 +1304,26 @@ fn compute_joint_edf(
     }
     
     /// Combined cost and gradient for BFGS
-    pub fn cost_and_grad(&self, rho: &Array1<f64>) -> Result<(f64, Array1<f64>), EstimationError> {
-        let cost = self.compute_cost(rho)?;
-        let grad = self.compute_gradient(rho)?;
-        Ok((cost, grad))
+    pub fn cost_and_grad(&self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+        let cost = match self.compute_cost(rho) {
+            Ok(val) if val.is_finite() => val,
+            Ok(_) => {
+                eprintln!("[JOINT][REML] Non-finite cost; returning large penalty.");
+                return (f64::INFINITY, Array1::zeros(rho.len()));
+            }
+            Err(err) => {
+                eprintln!("[JOINT][REML] Cost evaluation failed: {err}");
+                return (f64::INFINITY, Array1::zeros(rho.len()));
+            }
+        };
+        let grad = match self.compute_gradient(rho) {
+            Ok(grad) => grad,
+            Err(err) => {
+                eprintln!("[JOINT][REML] Gradient evaluation failed: {err}");
+                Array1::zeros(rho.len())
+            }
+        };
+        (cost, grad)
     }
     
     /// Extract final result after optimization
@@ -1615,10 +1631,11 @@ pub fn predict_joint(
     // Build B-spline basis at prediction points using stored parameters
     let b_wiggle = match create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
         Ok((basis, _)) => {
-            if result.link_transform.ncols() > 0 && result.link_transform.nrows() == basis.ncols() {
-                basis.dot(&result.link_transform)
+            let raw = basis.as_ref();
+            if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
+                raw.dot(&result.link_transform)
             } else {
-                basis.clone()
+                raw.clone()
             }
         }
         Err(_) => Array2::zeros((n, result.beta_link.len())),
