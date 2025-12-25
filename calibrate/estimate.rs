@@ -777,6 +777,388 @@ impl core::fmt::Debug for EstimationError {
     }
 }
 
+/// Compute g'(u) using analytic B-spline derivatives (same as HMC).
+/// g(u) = u + B(z(u)) @ θ, so g'(u) = 1 + dB/dz @ θ / range_width
+fn compute_analytic_gprime(
+    eta_base: &Array1<f64>,
+    result: &crate::calibrate::joint::JointModelResult,
+) -> Array1<f64> {
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
+    
+    let n = eta_base.len();
+    let mut g_prime = Array1::<f64>::ones(n);
+    
+    let (min_u, max_u) = result.knot_range;
+    let rw = (max_u - min_u).max(1e-6);
+    let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
+    let n_c = result.link_transform.ncols();
+    let theta = &result.beta_link;
+    
+    if n_raw == 0 || n_c == 0 || theta.len() != n_c {
+        return g_prime;
+    }
+    
+    // Preallocate ALL buffers outside the loop (zero-allocation, same as HMC)
+    let mut deriv_raw = vec![0.0; n_raw];
+    let num_basis_lower = result.knot_vector.len().saturating_sub(result.degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(1));
+    
+    for i in 0..n {
+        let u_i = eta_base[i];
+        let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
+        
+        // At boundaries, g'(u) = 1 (wiggle is constant)
+        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+            g_prime[i] = 1.0;
+            continue;
+        }
+        
+        deriv_raw.fill(0.0);
+        if evaluate_bspline_derivative_scalar_into(
+            z_i, result.knot_vector.view(), result.degree, 
+            &mut deriv_raw, &mut lower_basis, &mut lower_scratch
+        ).is_err() {
+            continue;
+        }
+        
+        // d(wiggle)/dz = B'(z) @ Z @ θ
+        let d_wiggle_dz: f64 = if result.link_transform.nrows() == n_raw {
+            (0..n_c).map(|c| {
+                let b_prime_c: f64 = (0..n_raw).map(|r| 
+                    deriv_raw[r] * result.link_transform[[r, c]]
+                ).sum();
+                b_prime_c * theta[c]
+            }).sum()
+        } else {
+            0.0
+        };
+        
+        g_prime[i] = 1.0 + d_wiggle_dz / rw;
+    }
+    
+    g_prime
+}
+
+/// Train a joint single-index model with flexible link calibration
+/// 
+/// This uses the joint model architecture where the base predictor and
+/// flexible link are fitted together in one optimization with REML.
+/// 
+/// The model is: η = g(Xβ) where g is a learned flexible link function.
+pub fn train_joint_model(
+    data: &TrainingData,
+    config: &ModelConfig,
+) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
+    use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
+    use crate::calibrate::model::{map_coefficients, JointLinkModel, TrainedModel};
+    
+    basis::clear_basis_cache();
+    
+    log::info!(
+        "Starting joint model training with REML. {} total samples.",
+        data.y.len()
+    );
+    
+    eprintln!("\n[JOINT] Constructing model structure...");
+    let (
+        x_matrix,
+        s_list,
+        layout,
+        sum_to_zero_constraints,
+        knot_vectors,
+        range_transforms,
+        pc_null_transforms,
+        interaction_centering_means,
+        interaction_orth_alpha,
+        penalty_structs,
+    ) = build_design_and_penalty_matrices(data, config)?;
+    
+    drop(penalty_structs);
+    
+    eprintln!(
+        "[JOINT] Model structure built. Total Coeffs: {}, Penalties: {}",
+        layout.total_coeffs, layout.num_penalties
+    );
+    
+    // Configure joint model
+    let joint_config = JointModelConfig {
+        max_backfit_iter: 100,
+        backfit_tol: 1e-6,
+        max_reml_iter: 50,
+        reml_tol: 1e-4,
+        n_link_knots: 10, // 10 internal knots for flexible link
+    };
+    
+    eprintln!("[JOINT] Starting joint optimization with REML...");
+    let link = match config.link_function() {
+        Ok(link) => link,
+        Err(err) => {
+            return Err(EstimationError::InvalidSpecification(err.to_string()));
+        }
+    };
+    let s_list_for_mcmc = s_list.clone(); // Clone for MCMC use after fit
+    let mut result = fit_joint_model_with_reml(
+        data.y.view(),
+        data.weights.view(),
+        x_matrix.view(),
+        s_list,
+        layout.clone(),
+        link,
+        &joint_config,
+    )?;
+
+    // Build a base TrainedModel so predictions can be reproduced.
+    let mapped_coefficients = map_coefficients(&result.beta_base, &layout)?;
+    let mut config_with_constraints = config.clone();
+    config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
+    config_with_constraints.knot_vectors = knot_vectors;
+    config_with_constraints.range_transforms = range_transforms;
+    config_with_constraints.interaction_centering_means = interaction_centering_means;
+    config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+    config_with_constraints.pc_null_transforms = pc_null_transforms;
+
+    let scale_val = match link {
+        LinkFunction::Logit => 1.0,
+        LinkFunction::Identity => {
+            let eta_base = x_matrix.dot(&result.beta_base);
+            let eta_cal = crate::calibrate::joint::predict_joint(&result, &eta_base, None).eta;
+            let residuals = data.y.to_owned() - &eta_cal;
+            let weighted_rss: f64 = data
+                .weights
+                .iter()
+                .zip(residuals.iter())
+                .map(|(&w, &r)| w * r * r)
+                .sum();
+            let effective_n = data.y.len() as f64;
+            // DOF = n - (base coeffs + link coeffs), or use edf if available
+            let total_df = (layout.total_coeffs + result.beta_link.len()) as f64;
+            weighted_rss / (effective_n - total_df).max(1.0)
+        }
+    };
+
+    let hull_opt = if config.pc_configs.is_empty() {
+        None
+    } else {
+        let n = data.p.len();
+        let d = 1 + config.pc_configs.len();
+        let mut x_raw = ndarray::Array2::zeros((n, d));
+        x_raw.column_mut(0).assign(&data.p);
+        if d > 1 {
+            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+        }
+        match build_peeled_hull(&x_raw, 3) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                println!("PHC hull construction skipped: {}", e);
+                None
+            }
+        }
+    };
+
+    let n_base = result.lambdas.len().saturating_sub(1);
+    let base_lambdas = result.lambdas[..n_base].to_vec();
+    let joint_link = JointLinkModel {
+        knot_range: result.knot_range,
+        knot_vector: result.knot_vector.clone(),
+        link_transform: result.link_transform.clone(),
+        beta_link: result.beta_link.clone(),
+        degree: result.degree,
+    };
+
+
+    // ===== Stage 5: Joint MCMC sampling (if enabled, supports Logit and Identity) =====
+    let mcmc_samples = if config.mcmc_enabled {
+        let is_logit = link == LinkFunction::Logit;
+        eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...", if is_logit { "logit" } else { "identity" });
+        
+        let p_base = x_matrix.ncols();
+        let p_link = result.beta_link.len();
+        let dim = p_base + p_link;
+        let n = data.y.len();
+        
+        // Build combined base penalty: Σλ_k S_k
+        let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
+        for k in 0..n_base {
+            if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
+                s_base_accum = s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
+            }
+        }
+        
+        // Use the REAL constrained link penalty from the REML fit
+        let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
+        let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
+        
+        // Build real Gauss-Newton Hessian at the mode (not just penalties)
+        // H = [[X'WX + S_base, X'W·g'·B], [B'·g'·W·X, B'WB + S_link]]
+        // where W = diag(w * μ(1-μ)) at the mode
+        let eta_base = x_matrix.dot(&result.beta_base);
+        let b_wiggle = {
+            let (min_u, max_u) = result.knot_range;
+            let rw = (max_u - min_u).max(1e-6);
+            let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
+            match crate::calibrate::basis::create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
+                Ok((basis, _)) => {
+                    let raw = basis.as_ref();
+                    if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
+                        raw.dot(&result.link_transform)
+                    } else {
+                        // Fallback: return zeros with correct dimensions to avoid panic
+                        Array2::zeros((n, p_link))
+                    }
+                }
+                Err(_) => Array2::zeros((n, p_link)),
+            }
+        };
+        
+        // Compute weights W at the mode (depends on link type)
+        let wiggle = b_wiggle.dot(&result.beta_link);
+        let eta_full = &eta_base + &wiggle;
+        let mut w_eff = Array1::<f64>::zeros(n);
+        
+        if is_logit {
+            // Logit: W = w * μ(1-μ)
+            for i in 0..n {
+                let eta_i = eta_full[i].clamp(-700.0, 700.0);
+                let mu_i = 1.0 / (1.0 + (-eta_i).exp());
+                let var_i = (mu_i * (1.0 - mu_i)).max(1e-10);
+                w_eff[i] = data.weights[i] * var_i;
+            }
+        } else {
+            // Identity/Gaussian: W = w / σ² (scale_val is σ², so use directly)
+            let inv_scale = 1.0 / scale_val.max(1e-10);
+            for i in 0..n {
+                w_eff[i] = data.weights[i] * inv_scale;
+            }
+        }
+        
+        // Compute g'(u) at the mode using analytic derivatives (same as HMC)
+        let g_prime = compute_analytic_gprime(&eta_base, &result);
+        
+        // Build joint Hessian blocks with CORRECT curvature
+        // A = X' diag(W * g'^2) X + S_base
+        // C = X' diag(W * g') B
+        // D = B' diag(W) B + S_link
+        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+        
+        // Base block: X' diag(W * g'^2) X + S_base (includes g'² for correct GN curvature)
+        for j in 0..p_base {
+            for k in j..p_base {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    let wi = w_eff[i] * g_prime[i] * g_prime[i];
+                    sum += wi * x_matrix[[i, j]] * x_matrix[[i, k]];
+                }
+                joint_hessian[[j, k]] = sum + s_base_accum[[j, k]];
+                if j != k {
+                    joint_hessian[[k, j]] = joint_hessian[[j, k]];
+                }
+            }
+        }
+        
+        // Link block: B' W B + S_link
+        for j in 0..p_link {
+            for k in j..p_link {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    sum += w_eff[i] * b_wiggle[[i, j]] * b_wiggle[[i, k]];
+                }
+                joint_hessian[[p_base + j, p_base + k]] = sum + s_link[[j, k]];
+                if j != k {
+                    joint_hessian[[p_base + k, p_base + j]] = joint_hessian[[p_base + j, p_base + k]];
+                }
+            }
+        }
+        
+        
+        // Cross block: C = X' diag(W * g') B
+        for j in 0..p_base {
+            for k in 0..p_link {
+                let mut sum = 0.0;
+                for i in 0..n {
+                    sum += w_eff[i] * g_prime[i] * x_matrix[[i, j]] * b_wiggle[[i, k]];
+                }
+                joint_hessian[[j, p_base + k]] = sum;
+                joint_hessian[[p_base + k, j]] = sum; // Symmetric
+            }
+        }
+        
+        // Add small ridge for stability
+        for i in 0..dim {
+            joint_hessian[[i, i]] += 1e-4;
+        }
+        
+        let spline = crate::calibrate::hmc::JointSplineArtifacts {
+            knot_range: result.knot_range,
+            knot_vector: result.knot_vector.clone(),
+            link_transform: result.link_transform.clone(),
+            degree: result.degree,
+        };
+        
+        let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        
+        let nuts_config = crate::calibrate::hmc::NutsConfig {
+            n_samples: num_samples,
+            n_warmup: num_warmup,
+            n_chains: 2,
+            ..crate::calibrate::hmc::NutsConfig::default()
+        };
+        
+        match crate::calibrate::hmc::run_joint_nuts_sampling(
+            x_matrix.view(),
+            data.y.view(),
+            data.weights.view(),
+            s_base_accum.view(),
+            s_link.view(),
+            result.beta_base.view(),
+            result.beta_link.view(),
+            joint_hessian.view(),
+            spline,
+            &nuts_config,
+            is_logit,
+            scale_val.sqrt(),  // scale_val is σ², HMC expects σ
+        ) {
+            Ok(nuts_result) => {
+                eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());
+                Some(nuts_result.samples)
+            }
+            Err(e) => {
+                eprintln!("[JOINT-MCMC] WARNING: sampling failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    
+    // Update base_model with MCMC samples
+    let base_model = TrainedModel {
+        config: config_with_constraints,
+        coefficients: mapped_coefficients,
+        lambdas: base_lambdas,
+        hull: hull_opt,
+        penalized_hessian: None,
+        scale: Some(scale_val),
+        calibrator: None,
+        joint_link: Some(joint_link),
+        survival: None,
+        survival_companions: HashMap::new(),
+        mcmc_samples,
+    };
+    result.base_model = Some(base_model);
+    
+    eprintln!(
+        "[JOINT] Optimization complete. Converged: {}, Iterations: {}, Deviance: {:.4}",
+        result.converged, result.backfit_iterations, result.deviance
+    );
+    
+    Ok(result)
+}
+
 /// The main entry point for model training. Orchestrates the REML/BFGS optimization.
 pub fn train_model(
     data: &TrainingData,
@@ -947,6 +1329,7 @@ pub fn train_model(
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -1691,6 +2074,7 @@ pub fn train_model(
         penalized_hessian: Some(penalized_hessian_orig),
         scale: Some(scale_val),
         calibrator: calibrator_opt,
+        joint_link: None,
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
@@ -2847,6 +3231,7 @@ pub fn train_survival_model(
         penalized_hessian: primary_hessian,
         scale: None,
         calibrator: None, // Survival uses artifacts.calibrator
+        joint_link: None,
         survival: Some(final_artifacts),
         survival_companions: companions, // The map of mortality artifacts
         mcmc_samples,

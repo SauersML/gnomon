@@ -13,6 +13,7 @@ pub mod calibrator;
 pub mod estimate;
 pub mod faer_ndarray;
 pub mod hull;
+pub mod joint;
 pub mod model;
 pub mod matrix;
 pub mod pirls;

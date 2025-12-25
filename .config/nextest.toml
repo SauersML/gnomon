@@ -2,11 +2,11 @@
 # See: https://nexte.st/book/configuration.html
 
 [profile.default]
-# Fail any test that takes longer than 3 hours, warn at 60s
-slow-timeout = { period = "3h", terminate-after = 1, warn = "60s" }
+# Fail any test that takes longer than 3 hours
+slow-timeout = { period = "3h", terminate-after = 1 }
 
 [profile.ci]
 # For CI: continue running all tests even if some fail
 fail-fast = false
-# Stricter timeout: kill tests after 1 hour, warn at 30s
-slow-timeout = { period = "1h", terminate-after = 1, warn = "30s" }
+# Stricter timeout: kill tests after 1 hour
+slow-timeout = { period = "1h", terminate-after = 1 }

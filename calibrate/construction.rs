@@ -3295,6 +3295,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,

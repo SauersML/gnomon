@@ -936,13 +936,13 @@ fn select_columns(matrix: &Array2<f64>, indices: &[usize]) -> Array2<f64> {
 }
 
 /// Internal module for implementation details not exposed in the public API.
-mod internal {
+pub mod internal {
     use super::*;
 
     /// Thread-local scratch buffers for spline evaluation. These are reused across
     /// points to reduce allocation and improve cache locality.
     #[derive(Clone, Debug)]
-    pub(super) struct BsplineScratch {
+    pub struct BsplineScratch {
         left: Vec<f64>,
         right: Vec<f64>,
         n: Vec<f64>,
@@ -1950,6 +1950,111 @@ pub fn evaluate_bspline_basis_scalar(
     }
 
     internal::evaluate_splines_at_point_into(x, degree, knot_vector, out, &mut scratch.inner);
+
+    Ok(())
+}
+
+/// Evaluates B-spline basis derivatives at a single scalar point `x` into a provided buffer.
+///
+/// Uses the analytic de Boor derivative formula:
+/// B'_{i,k}(x) = k * (B_{i,k-1}(x)/(t_{i+k}-t_i) - B_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+///
+/// # Arguments
+/// * `x` - The point at which to evaluate
+/// * `knot_vector` - The knot vector
+/// * `degree` - B-spline degree (must be >= 1)
+/// * `out` - Output buffer for derivative values (length = num_basis)
+/// * `scratch` - Scratch space for temporary computation
+pub fn evaluate_bspline_derivative_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let num_basis_lower = knot_vector.len().saturating_sub(degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(1));
+    evaluate_bspline_derivative_scalar_into(x, knot_vector, degree, out, &mut lower_basis, &mut lower_scratch)
+}
+
+/// Zero-allocation version: pass pre-allocated buffers for lower_basis and scratch.
+/// - `lower_basis`: length = knot_vector.len() - degree
+/// - `lower_scratch`: BsplineScratch for degree-1
+pub fn evaluate_bspline_derivative_scalar_into(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    lower_basis: &mut [f64],
+    lower_scratch: &mut internal::BsplineScratch,
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        panic!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        );
+    }
+
+    let num_basis_lower = knot_vector.len() - degree;
+    if lower_basis.len() < num_basis_lower {
+        panic!(
+            "lower_basis buffer too small: {} < {}",
+            lower_basis.len(),
+            num_basis_lower
+        );
+    }
+    
+    // Fill lower basis with zeros
+    for v in lower_basis.iter_mut().take(num_basis_lower) {
+        *v = 0.0;
+    }
+    
+    // Evaluate lower-degree (k-1) basis functions
+    internal::evaluate_splines_at_point_into(
+        x, 
+        degree - 1, 
+        knot_vector, 
+        &mut lower_basis[..num_basis_lower],
+        lower_scratch
+    );
+    
+    // Apply derivative formula: B'_{i,k}(x) = k * (B_{i,k-1}/(t_{i+k}-t_i) - B_{i+1,k-1}/(t_{i+k+1}-t_{i+1}))
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom_left = knot_vector[i + degree] - knot_vector[i];
+        let denom_right = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        
+        let left_term = if denom_left.abs() > 1e-12 && i < num_basis_lower {
+            lower_basis[i] / denom_left
+        } else {
+            0.0
+        };
+        
+        let right_term = if denom_right.abs() > 1e-12 && (i + 1) < num_basis_lower {
+            lower_basis[i + 1] / denom_right
+        } else {
+            0.0
+        };
+        
+        out[i] = k * (left_term - right_term);
+    }
 
     Ok(())
 }

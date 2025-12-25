@@ -110,6 +110,7 @@ fn create_mock_trained_model(
         penalized_hessian: None,
         scale: None,
         calibrator: None,
+        joint_link: None,
         survival: Some(disease_model),
         survival_companions: companions,
         mcmc_samples: None,
@@ -223,7 +224,7 @@ fn test_missing_companion_error() {
             mcmc_enabled: false,
             survival: None
         },
-        coefficients: MappedCoefficients::default(), lambdas: vec![], hull: None, penalized_hessian: None, scale: None, calibrator: None,
+        coefficients: MappedCoefficients::default(), lambdas: vec![], hull: None, penalized_hessian: None, scale: None, calibrator: None, joint_link: None,
         survival: Some(disease_model),
         survival_companions: HashMap::new(),
         mcmc_samples: None,

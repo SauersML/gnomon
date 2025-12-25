@@ -440,6 +440,9 @@ pub struct TrainedModel {
     /// Optional post-fit calibrator model
     #[serde(default)]
     pub calibrator: Option<crate::calibrate::calibrator::CalibratorModel>,
+    /// Optional joint link calibration for single-index models.
+    #[serde(default)]
+    pub joint_link: Option<JointLinkModel>,
     /// Optional survival-specific artifacts (present when training survival models).
     #[serde(default)]
     pub survival: Option<SurvivalModelArtifacts>,
@@ -450,6 +453,16 @@ pub struct TrainedModel {
     /// Present when mcmc_enabled=true during training. Enables honest uncertainty quantification.
     #[serde(default)]
     pub mcmc_samples: Option<Array2<f64>>,
+}
+
+/// Optional joint single-index link data for calibrated predictions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointLinkModel {
+    pub knot_range: (f64, f64),
+    pub knot_vector: Array1<f64>,
+    pub link_transform: Array2<f64>,
+    pub beta_link: Array1<f64>,
+    pub degree: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +704,87 @@ impl TrainedModel {
         Ok(mean)
     }
 
+    /// Posterior mean probability using joint MCMC samples over (β, θ).
+    /// For each sample [β_s | θ_s], computes η_s = Xβ_s + B(Xβ_s)θ_s
+    /// and returns (mean_prob, mean_eta, se_eta) for proper uncertainty quantification.
+    fn joint_mcmc_mean_predictions(
+        &self,
+        x_new: &Array2<f64>,
+        joint: &JointLinkModel,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), ModelError> {
+        let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
+            ModelError::DimensionMismatch("MCMC samples missing for joint prediction.".to_string())
+        })?;
+        let n_samples = samples.nrows();
+        let n_points = x_new.nrows();
+        if n_samples == 0 {
+            return Err(ModelError::DimensionMismatch("MCMC samples are empty.".to_string()));
+        }
+        
+        let p_base = x_new.ncols();
+        let p_link = joint.beta_link.len();
+        let expected_cols = p_base + p_link;
+        if samples.ncols() != expected_cols {
+            return Err(ModelError::DimensionMismatch(format!(
+                "Joint MCMC samples have {} cols, expected {} (p_base={}, p_link={})",
+                samples.ncols(), expected_cols, p_base, p_link
+            )));
+        }
+        
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
+        let n_constrained = joint.link_transform.ncols();
+        
+        let mut prob_sum = Array1::<f64>::zeros(n_points);
+        let mut eta_sum = Array1::<f64>::zeros(n_points);
+        let mut eta_sq_sum = Array1::<f64>::zeros(n_points);
+        let mut raw = vec![0.0; n_raw];
+        let mut constrained = vec![0.0; n_constrained];
+        let mut scratch = basis::SplineScratch::new(joint.degree);
+        
+        for s in 0..n_samples {
+            let beta_s = samples.slice(s![s, 0..p_base]);
+            let theta_s = samples.slice(s![s, p_base..]);
+            let u = x_new.dot(&beta_s.to_owned());
+            
+            for i in 0..n_points {
+                let u_i = u[i];
+                let z_i = ((u_i - min_u) / range_width).clamp(0.0, 1.0);
+                
+                raw.fill(0.0);
+                let eta_i = if basis::evaluate_bspline_basis_scalar(
+                    z_i, joint.knot_vector.view(), joint.degree, &mut raw, &mut scratch
+                ).is_ok() && joint.link_transform.nrows() == n_raw && n_constrained > 0 {
+                    constrained.fill(0.0);
+                    for r in 0..n_raw {
+                        let v = raw[r];
+                        for c in 0..n_constrained { constrained[c] += v * joint.link_transform[[r, c]]; }
+                    }
+                    let mut wiggle = 0.0;
+                    for c in 0..n_constrained.min(theta_s.len()) { wiggle += constrained[c] * theta_s[c]; }
+                    u_i + wiggle
+                } else {
+                    u_i
+                };
+                
+                let eta_clamped = eta_i.clamp(-700.0, 700.0);
+                let p_i = 1.0 / (1.0 + f64::exp(-eta_clamped));
+                prob_sum[i] += p_i;
+                eta_sum[i] += eta_i;
+                eta_sq_sum[i] += eta_i * eta_i;
+            }
+        }
+        
+        let ns = n_samples as f64;
+        let mean_prob = prob_sum.mapv(|p| (p / ns).clamp(1e-8, 1.0 - 1e-8));
+        let mean_eta = eta_sum.mapv(|e| e / ns);
+        let var_eta = (&eta_sq_sum / ns) - (&mean_eta * &mean_eta);
+        let se_eta = var_eta.mapv(|v| v.max(0.0).sqrt());
+        
+        Ok((mean_prob, mean_eta, se_eta))
+    }
+
     /// Detailed predictions including linear predictor, mean response, signed distance
     /// to the peeled hull boundary (negative inside), and optional SEs for eta.
     pub fn predict_detailed(
@@ -724,7 +818,20 @@ impl TrainedModel {
         // Ensure the model family is supported before invoking link-specific logic
         let link_function = self.ensure_gam_link("prediction")?;
 
-        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_some()
+        {
+            // Joint posterior predictive: get mean prob, mean eta, and SE from samples
+            let joint = self.joint_link.as_ref().unwrap();
+            let (mean, eta, se_eta) = self.joint_mcmc_mean_predictions(&x_new, joint)?;
+            return Ok((eta, mean, signed_dist, Some(se_eta)));
+        }
+
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_none()
+        {
             let mean = self.mcmc_mean_logit_predictions(&x_new)?;
             let eta = mean.mapv(Self::logit_from_prob);
             let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
@@ -732,7 +839,13 @@ impl TrainedModel {
         }
 
         // --- Linear predictor and mean ---
-        let eta = x_new.dot(&beta);
+        let eta_base = x_new.dot(&beta);
+        let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
+        let (eta, se_eta_opt) = if let Some(joint) = &self.joint_link {
+            self.apply_joint_link_to_eta(&eta_base, se_eta_opt.as_ref(), joint)
+        } else {
+            (eta_base, se_eta_opt)
+        };
         let mean = match link_function {
             LinkFunction::Logit => {
                 let eta_clamped = eta.mapv(|e| e.clamp(-700.0, 700.0));
@@ -777,9 +890,131 @@ impl TrainedModel {
         // computed here to be a LOWER BOUND on true uncertainty. In sparse regions
         // of covariate space, the reported SE may be overconfident.
         //
-        let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
-
         Ok((eta, mean, signed_dist, se_eta_opt))
+    }
+
+    fn apply_joint_link_to_eta(
+        &self,
+        eta_base: &Array1<f64>,
+        se_eta_opt: Option<&Array1<f64>>,
+        joint: &JointLinkModel,
+    ) -> (Array1<f64>, Option<Array1<f64>>) {
+        let n = eta_base.len();
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
+        let n_constrained = joint.link_transform.ncols();
+        if n_raw == 0 || n_constrained == 0 || joint.beta_link.len() != n_constrained {
+            let se_out = se_eta_opt.map(|se| se.clone());
+            return (eta_base.clone(), se_out);
+        }
+
+        let mut eta_cal = eta_base.clone();
+        let mut eff_se = se_eta_opt.map(|se| se.clone());
+
+        let mut raw = vec![0.0; n_raw];
+        let mut constrained = vec![0.0; n_constrained];
+        let mut raw_plus = vec![0.0; n_raw];
+        let mut raw_minus = vec![0.0; n_raw];
+        let mut plus = vec![0.0; n_constrained];
+        let mut minus = vec![0.0; n_constrained];
+        let mut scratch = basis::SplineScratch::new(joint.degree);
+        let h = 1e-4;
+
+        for i in 0..n {
+            let u = eta_base[i];
+            let z = ((u - min_u) / range_width).clamp(0.0, 1.0);
+            raw.fill(0.0);
+            if basis::evaluate_bspline_basis_scalar(
+                z,
+                joint.knot_vector.view(),
+                joint.degree,
+                &mut raw,
+                &mut scratch,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            constrained.fill(0.0);
+            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained
+            {
+                for r in 0..n_raw {
+                    let v = raw[r];
+                    for c in 0..n_constrained {
+                        constrained[c] += v * joint.link_transform[[r, c]];
+                    }
+                }
+            } else if n_constrained == n_raw {
+                constrained.copy_from_slice(&raw);
+            } else {
+                continue;
+            }
+
+            let mut wiggle = 0.0;
+            for j in 0..n_constrained {
+                wiggle += constrained[j] * joint.beta_link[j];
+            }
+            eta_cal[i] = u + wiggle;
+
+            if let Some(se_vec) = eff_se.as_mut() {
+                let z_plus = (z + h).clamp(0.0, 1.0);
+                let z_minus = (z - h).clamp(0.0, 1.0);
+                let dz = (z_plus - z_minus).max(1e-8);
+                raw_plus.fill(0.0);
+                raw_minus.fill(0.0);
+                if basis::evaluate_bspline_basis_scalar(
+                    z_plus,
+                    joint.knot_vector.view(),
+                    joint.degree,
+                    &mut raw_plus,
+                    &mut scratch,
+                )
+                .is_err()
+                    || basis::evaluate_bspline_basis_scalar(
+                        z_minus,
+                        joint.knot_vector.view(),
+                        joint.degree,
+                        &mut raw_minus,
+                        &mut scratch,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+
+                plus.fill(0.0);
+                minus.fill(0.0);
+                if joint.link_transform.nrows() == n_raw
+                    && joint.link_transform.ncols() == n_constrained
+                {
+                    for r in 0..n_raw {
+                        let vp = raw_plus[r];
+                        let vm = raw_minus[r];
+                        for c in 0..n_constrained {
+                            plus[c] += vp * joint.link_transform[[r, c]];
+                            minus[c] += vm * joint.link_transform[[r, c]];
+                        }
+                    }
+                } else if n_constrained == n_raw {
+                    plus.copy_from_slice(&raw_plus);
+                    minus.copy_from_slice(&raw_minus);
+                } else {
+                    continue;
+                }
+
+                let mut d_wiggle_dz = 0.0;
+                for j in 0..n_constrained {
+                    d_wiggle_dz += (plus[j] - minus[j]) * joint.beta_link[j];
+                }
+                d_wiggle_dz /= dz;
+                let g_prime = 1.0 + d_wiggle_dz / range_width;
+                se_vec[i] = g_prime.abs() * se_vec[i];
+            }
+        }
+
+        (eta_cal, eff_se)
     }
     /// Predicts outcomes for new individuals using the trained model.
     ///
@@ -806,7 +1041,10 @@ impl TrainedModel {
             return Err(ModelError::UnsupportedForSurvival("predict"));
         }
         let link_function = self.ensure_gam_link("prediction")?;
-        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_none()
+        {
             let (x_new, _) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
             return self.mcmc_mean_logit_predictions(&x_new);
         }
@@ -840,7 +1078,10 @@ impl TrainedModel {
         }
 
         let link_function = self.ensure_gam_link("predict_mean")?;
-        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_none()
+        {
             let (x_new, _) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
             return self.mcmc_mean_logit_predictions(&x_new);
         }
@@ -884,7 +1125,10 @@ impl TrainedModel {
             return Err(ModelError::CalibratorMissing);
         }
 
-        if link_function == LinkFunction::Logit && self.mcmc_samples.is_some() {
+        if link_function == LinkFunction::Logit
+            && self.mcmc_samples.is_some()
+            && self.joint_link.is_none()
+        {
             let (x_new, signed_dist) = self.build_prediction_design(p_new, sex_new, pcs_new)?;
             let mean_probs = self.mcmc_mean_logit_predictions(&x_new)?;
             let pred_in = mean_probs.mapv(|p| {
@@ -2199,6 +2443,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -2306,6 +2551,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -2417,6 +2663,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: Some(Array2::<f64>::ones((2, 3))),
@@ -2552,6 +2799,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: Some(artifacts),
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -2636,6 +2884,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
@@ -2956,6 +3205,7 @@ mod tests {
             penalized_hessian: None,
             scale: None,
             calibrator: None,
+            joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
