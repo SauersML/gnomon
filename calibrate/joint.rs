@@ -1369,13 +1369,14 @@ mod tests {
         // Create a simple result with identity link (no wiggle)
         let n_knots = 5;
         let degree = 3;
-        let (_basis, knot_vector) = create_bspline_basis(
+        let (basis, knot_vector) = create_bspline_basis(
             Array1::from_vec(vec![0.0]).view(),
             (0.0, 1.0),
             n_knots,
             degree,
         )
         .expect("basis");
+        drop(basis);
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
         let beta_link = Array1::zeros(num_basis);
         
@@ -1416,13 +1417,14 @@ mod tests {
     fn test_predict_joint_with_se() {
         let n_knots = 5;
         let degree = 3;
-        let (_basis, knot_vector) = create_bspline_basis(
+        let (basis, knot_vector) = create_bspline_basis(
             Array1::from_vec(vec![0.0]).view(),
             (0.0, 1.0),
             n_knots,
             degree,
         )
         .expect("basis");
+        drop(basis);
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
         let beta_link = Array1::zeros(num_basis);
         
