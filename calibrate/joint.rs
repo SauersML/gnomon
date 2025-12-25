@@ -1747,6 +1747,7 @@ mod tests {
             degree,
             link: LinkFunction::Logit,
             base_model: None,
+            s_link_constrained: Array2::eye(num_basis),
         };
         
         // Test with base eta values
@@ -1797,6 +1798,7 @@ mod tests {
             degree,
             link: LinkFunction::Logit,
             base_model: None,
+            s_link_constrained: Array2::eye(num_basis),
         };
         
         let eta_base = Array1::from_vec(vec![0.0, 1.0, 2.0]);
