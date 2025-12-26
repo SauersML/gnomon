@@ -971,9 +971,9 @@ fn compute_joint_penalized_hessian(
         }
     }
     
-    // Add small ridge for stability
+    // Add small ridge for stability (1e-8 is minimal to avoid underestimating SEs)
     for i in 0..dim {
-        joint_hessian[[i, i]] += 1e-4;
+        joint_hessian[[i, i]] += 1e-8;
     }
     
     Some(joint_hessian)
@@ -3273,6 +3273,9 @@ pub fn train_survival_model(
     } else {
         None
     };
+    
+    // Store MCMC samples in artifacts so they're accessible both ways
+    final_artifacts.mcmc_samples = mcmc_samples.clone();
 
     Ok(TrainedModel {
         config,
