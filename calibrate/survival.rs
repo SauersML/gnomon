@@ -1780,6 +1780,10 @@ pub struct SurvivalModelArtifacts {
     /// propagate uncertainty through competing risk models.
     #[serde(default)]
     pub mcmc_samples: Option<Array2<f64>>,
+    /// Optional cross-covariance from a companion model to the primary model coefficients.
+    /// Stored on the companion artifacts so Crude Risk SE can include cross terms.
+    #[serde(default)]
+    pub cross_covariance_to_primary: Option<Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -2854,6 +2858,217 @@ pub fn delta_method_standard_errors(
     Ok(se)
 }
 
+pub fn solve_hessian_matrix(
+    factor: &HessianFactor,
+    rhs: &Array2<f64>,
+) -> Result<Array2<f64>, SurvivalError> {
+    let n = rhs.ncols();
+    let mut out = Array2::<f64>::zeros(rhs.dim());
+    for j in 0..n {
+        let col = rhs.column(j).to_owned();
+        let solved = solve_hessian_vector(factor, &col)?;
+        out.column_mut(j).assign(&solved);
+    }
+    Ok(out)
+}
+
+fn solve_hessian_vector(
+    factor: &HessianFactor,
+    rhs: &Array1<f64>,
+) -> Result<Array1<f64>, SurvivalError> {
+    match factor {
+        HessianFactor::Expected { factor: chol } => {
+            let l = &chol.lower;
+            let dim = l.nrows();
+            let mut y = Array1::<f64>::zeros(dim);
+            for r in 0..dim {
+                let mut sum = 0.0;
+                for c in 0..r {
+                    sum += l[[r, c]] * y[c];
+                }
+                let diag = l[[r, r]];
+                if diag == 0.0 {
+                    return Err(SurvivalError::HessianSingular);
+                }
+                y[r] = (rhs[r] - sum) / diag;
+            }
+            let mut x = Array1::<f64>::zeros(dim);
+            for r_rev in 0..dim {
+                let r = dim - 1 - r_rev;
+                let mut sum = 0.0;
+                for c in (r + 1)..dim {
+                    sum += l[[c, r]] * x[c];
+                }
+                let diag = l[[r, r]];
+                if diag == 0.0 {
+                    return Err(SurvivalError::HessianSingular);
+                }
+                x[r] = (y[r] - sum) / diag;
+            }
+            Ok(x)
+        }
+        HessianFactor::Observed {
+            factor,
+            permutation,
+            ..
+        } => {
+            let dim = factor.lower.nrows();
+            let mut rhs_perm = Array1::<f64>::zeros(dim);
+            for r in 0..dim {
+                rhs_perm[r] = rhs[permutation.forward[r]];
+            }
+            let mut y = Array1::<f64>::zeros(dim);
+            for r in 0..dim {
+                let mut sum = 0.0;
+                for c in 0..r {
+                    sum += factor.lower[[r, c]] * y[c];
+                }
+                y[r] = rhs_perm[r] - sum;
+            }
+
+            let mut inv_diag = Array1::<f64>::zeros(dim);
+            let mut inv_offdiag = Array1::<f64>::zeros(dim.saturating_sub(1));
+            let mut k = 0;
+            while k < dim {
+                if k + 1 < dim && factor.subdiag[k].abs() > 1e-12 {
+                    let d11 = factor.diag[k];
+                    let d22 = factor.diag[k + 1];
+                    let d21 = factor.subdiag[k];
+                    let det = d11 * d22 - d21 * d21;
+                    if det.abs() < 1e-12 {
+                        return Err(SurvivalError::HessianSingular);
+                    }
+                    inv_diag[k] = d22 / det;
+                    inv_diag[k + 1] = d11 / det;
+                    inv_offdiag[k] = -d21 / det;
+                    k += 2;
+                } else {
+                    let d11 = factor.diag[k];
+                    if d11.abs() < 1e-12 {
+                        return Err(SurvivalError::HessianSingular);
+                    }
+                    inv_diag[k] = 1.0 / d11;
+                    if k < dim - 1 {
+                        inv_offdiag[k] = 0.0;
+                    }
+                    k += 1;
+                }
+            }
+
+            let mut z = Array1::<f64>::zeros(dim);
+            k = 0;
+            while k < dim {
+                if k + 1 < dim && factor.subdiag[k].abs() > 1e-12 {
+                    let y1 = y[k];
+                    let y2 = y[k + 1];
+                    z[k] = inv_diag[k] * y1 + inv_offdiag[k] * y2;
+                    z[k + 1] = inv_offdiag[k] * y1 + inv_diag[k + 1] * y2;
+                    k += 2;
+                } else {
+                    z[k] = inv_diag[k] * y[k];
+                    k += 1;
+                }
+            }
+
+            let mut x_perm = Array1::<f64>::zeros(dim);
+            for r_rev in 0..dim {
+                let r = dim - 1 - r_rev;
+                let mut sum = 0.0;
+                for c in (r + 1)..dim {
+                    sum += factor.lower[[c, r]] * x_perm[c];
+                }
+                x_perm[r] = z[r] - sum;
+            }
+
+            let mut x = Array1::<f64>::zeros(dim);
+            for r in 0..dim {
+                x[permutation.inverse[r]] = x_perm[r];
+            }
+            Ok(x)
+        }
+    }
+}
+
+pub fn survival_score_matrix(
+    layout: &SurvivalLayout,
+    data: &SurvivalTrainingData,
+    spec: SurvivalSpec,
+    monotonicity: &MonotonicityPenalty,
+    beta: &Array1<f64>,
+) -> Result<Array2<f64>, SurvivalError> {
+    let expected_dim = layout.combined_exit.ncols();
+    if beta.len() != expected_dim {
+        return Err(SurvivalError::DesignDimensionMismatch);
+    }
+
+    let eta_exit = layout.combined_exit.dot(beta);
+    let eta_entry = layout.combined_entry.dot(beta);
+    let derivative_raw = layout.combined_derivative_exit.dot(beta);
+
+    let n = eta_exit.len();
+    let p = beta.len();
+    let mut score = Array2::<f64>::zeros((n, p));
+    let guard_threshold = spec.derivative_guard.max(f64::EPSILON);
+
+    if monotonicity.derivative_design.nrows() > 0 {
+        let derivative_grid = monotonicity.derivative_design.dot(beta);
+        for (idx, slope) in derivative_grid.iter().enumerate() {
+            if !slope.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            if *slope < MONOTONICITY_TOLERANCE {
+                let age = monotonicity.grid_ages[idx];
+                return Err(SurvivalError::MonotonicityViolation {
+                    age,
+                    derivative: *slope,
+                });
+            }
+        }
+    }
+
+    for i in 0..n {
+        let weight = data.sample_weight[i];
+        if weight == 0.0 {
+            continue;
+        }
+        let d = f64::from(data.event_target[i]);
+        let eta_e = eta_exit[i];
+        let h_e = eta_e.exp();
+        let h_s = eta_entry[i].exp();
+        if !eta_e.is_finite() || !h_e.is_finite() || !h_s.is_finite() {
+            return Err(SurvivalError::NonFiniteLinearPredictor);
+        }
+        let derivative_value = derivative_raw[i];
+        let (log_guard, scale) = if derivative_value <= guard_threshold {
+            (guard_threshold.ln(), 0.0)
+        } else {
+            (derivative_value.ln(), 1.0 / derivative_value)
+        };
+        if !log_guard.is_finite() {
+            return Err(SurvivalError::NonFiniteLinearPredictor);
+        }
+        let x_exit = layout.combined_exit.row(i);
+        let x_entry = layout.combined_entry.row(i);
+        let d_exit = layout.combined_derivative_exit.row(i);
+        let mut grad_row = Array1::<f64>::zeros(p);
+        accumulate_weighted_vector(&mut grad_row, -weight * h_e, &x_exit);
+        accumulate_weighted_vector(&mut grad_row, weight * h_s, &x_entry);
+
+        let mut x_tilde = x_exit.to_owned();
+        Zip::from(&mut x_tilde)
+            .and(&d_exit)
+            .for_each(|value, &deriv| *value += deriv * scale);
+        if d > 0.0 {
+            accumulate_weighted_vector(&mut grad_row, weight * d, &x_tilde);
+        }
+
+        grad_row.mapv_inplace(|value| value * -2.0);
+        score.row_mut(i).assign(&grad_row);
+    }
+
+    Ok(score)
+}
+
 impl SurvivalModelArtifacts {
     /// Apply the logit-risk calibrator to convert conditional risk to calibrated probabilities.
     ///
@@ -3078,6 +3293,7 @@ mod tests {
             }),
             calibrator: Some(identity_calibrator),
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let risks = array![0.2, 0.8];
@@ -3482,6 +3698,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
         let cov_cols =
             model.layout.static_covariates.ncols() + model.layout.extra_static_covariates.ncols();
@@ -3516,6 +3733,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let companion_artifacts = make_artifacts(Vec::new());
@@ -3580,6 +3798,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let companion_artifacts = make_artifacts(Vec::new());
@@ -3619,6 +3838,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let companion_artifacts = make_artifacts(Vec::new());
@@ -3758,6 +3978,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let eta_exit = layout.combined_exit.dot(&beta);
@@ -3843,6 +4064,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         for i in 0..data.age_entry.len() {
@@ -4166,6 +4388,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let hazard = cumulative_hazard(data.age_exit[0], &covariates, &artifacts).unwrap();
@@ -4229,6 +4452,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(layout.static_covariates.ncols() + 1);
         let err = cumulative_hazard(60.0, &mismatched_covs, &artifacts).unwrap_err();
@@ -4258,6 +4482,7 @@ mod tests {
             hessian_factor: None,
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
         let mismatched_covs = Array1::<f64>::zeros(
             layout.static_covariates.ncols() + layout.extra_static_covariates.ncols() + 1,
@@ -4309,6 +4534,7 @@ mod tests {
             }),
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let serialized = serde_json::to_string(&artifacts).unwrap();

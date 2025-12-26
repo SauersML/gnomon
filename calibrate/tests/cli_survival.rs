@@ -1,5 +1,3 @@
-#![cfg(feature = "survival-data")]
-
 use std::fs;
 use std::process::Command;
 

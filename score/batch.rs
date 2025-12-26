@@ -129,8 +129,7 @@ pub fn run_person_major_path(
 //                            Public entry points
 // ========================================================================================
 
-#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
-#[cfg_attr(feature = "no-inline-profiling", inline(never))]
+#[inline]
 pub fn process_tile<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
@@ -156,8 +155,7 @@ pub fn process_tile<'a>(
 // ========================================================================================
 
 /// Processes a single block of individuals.
-#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
-#[cfg_attr(feature = "no-inline-profiling", inline(never))]
+#[inline]
 fn process_block<'a>(
     person_indices_in_block: &'a [OriginalPersonIndex],
     prep_result: &'a PreparationResult,
@@ -236,8 +234,7 @@ fn accumulate_simd_lane(
 
 /// Dispatches a single, pivoted, person-major tile to the compute kernel after
 /// calculating a baseline score and pre-computing sparse indices.
-#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
-#[cfg_attr(feature = "no-inline-profiling", inline(never))]
+#[inline]
 pub(crate) fn process_tile_impl<'a>(
     tile: &'a [EffectAlleleDosage],
     prep_result: &'a PreparationResult,
@@ -454,8 +451,7 @@ pub(crate) fn process_tile_impl<'a>(
 /// A cache-friendly, SIMD-accelerated pivot function using an 8x8 in-register transpose.
 /// This function's sole purpose is to pivot raw genotype dosages from the variant-major
 /// .bed layout to a person-major tile layout. It performs no reconciliation.
-#[cfg_attr(not(feature = "no-inline-profiling"), inline)]
-#[cfg_attr(feature = "no-inline-profiling", inline(never))]
+#[inline]
 fn pivot_tile(
     variant_major_data: &[u8],
     person_indices_in_block: &[OriginalPersonIndex],

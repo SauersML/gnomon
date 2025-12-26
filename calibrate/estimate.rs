@@ -2254,7 +2254,8 @@ pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     base_config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    use crate::calibrate::basis::{clear_basis_cache, create_bspline_basis};
+    use crate::calibrate::basis::create_bspline_basis;
+    use crate::calibrate::survival;
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
         SurvivalError, SurvivalLayout, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
@@ -2267,6 +2268,27 @@ pub fn train_survival_model(
     fn map_error(err: SurvivalError) -> EstimationError {
         EstimationError::InvalidSpecification(err.to_string())
     }
+
+    let has_pc_axes = bundle.data.pcs.ncols() > 0;
+    let hull_opt = if has_pc_axes {
+        let n = bundle.data.pgs.len();
+        let d = 1 + bundle.data.pcs.ncols();
+        let mut x_raw = Array2::zeros((n, d));
+        x_raw.column_mut(0).assign(&bundle.data.pgs);
+        if d > 1 {
+            x_raw.slice_mut(s![.., 1..]).assign(&bundle.data.pcs);
+        }
+        match build_peeled_hull(&x_raw, 3) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                println!("PHC hull construction skipped: {}", e);
+                None
+            }
+        }
+    } else {
+        eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
+        None
+    };
 
     // Local helper to compute log-age extents.
     fn compute_log_age_extents(
@@ -2701,6 +2723,7 @@ pub fn train_survival_model(
 
     // Set up targets: primary and optional mortality
     let mut targets = vec![("primary", std::borrow::Cow::Borrowed(&bundle.data))];
+    let mut mortality_data_opt = None;
     if survival_cfg_owned.model_competing_risk {
         // Clone and swap targets for mortality
         let mut mortality_data = bundle.data.clone();
@@ -2709,6 +2732,7 @@ pub fn train_survival_model(
         // Zero out event_competing to avoid confusion
         mortality_data.event_competing = bundle.data.event_target.clone();
 
+        mortality_data_opt = Some(mortality_data.clone());
         targets.push(("mortality", std::borrow::Cow::Owned(mortality_data)));
     }
 
@@ -2907,7 +2931,7 @@ pub fn train_survival_model(
 
             let n = data_ref.age_entry.len();
             let p_dim = beta.len();
-            let (mut risks, mut logit_design) = if let Some(samples) =
+            let (risks, logit_design) = if let Some(samples) =
                 primary_mcmc_samples.as_ref()
             {
                 const MCMC_CHUNK_SIZE: usize = 32;
@@ -3079,14 +3103,23 @@ pub fn train_survival_model(
             )
             .map_err(map_error)?;
 
+            let dist = if let Some(hull) = &hull_opt {
+                let n = data_ref.pgs.len();
+                let d = 1 + data_ref.pcs.ncols();
+                let mut raw = Array2::zeros((n, d));
+                raw.column_mut(0).assign(&data_ref.pgs);
+                if d > 1 {
+                    raw.slice_mut(s![.., 1..]).assign(&data_ref.pcs);
+                }
+                hull.signed_distance_many(raw.view())
+            } else {
+                Array1::zeros(features_matrix.nrows())
+            };
+
             let features = cal::CalibratorFeatures {
                 pred: features_matrix.column(0).to_owned(),
                 se: features_matrix.column(1).to_owned(),
-                dist: if features_matrix.ncols() > 2 {
-                    features_matrix.column(2).to_owned()
-                } else {
-                    Array1::zeros(features_matrix.nrows())
-                },
+                dist,
                 pred_identity: features_matrix.column(0).to_owned(),
                 fisher_weights: data_ref.sample_weight.clone(),
             };
@@ -3114,8 +3147,8 @@ pub fn train_survival_model(
                 penalty_order_pred: config.penalty_order,
                 penalty_order_se: config.penalty_order,
                 penalty_order_dist: config.penalty_order,
-                distance_enabled: false,
-                distance_hinge: false,
+                distance_enabled: has_pc_axes,
+                distance_hinge: true,
                 prior_weights: Some(features.fisher_weights.clone()),
                 firth: cal::CalibratorSpec::firth_default_for_link(LinkFunction::Logit),
             };
@@ -3179,6 +3212,7 @@ pub fn train_survival_model(
                     standardize_se: schema.standardize_se,
                     standardize_dist: schema.standardize_dist,
                     interaction_center_pred: Some(schema.interaction_center_pred),
+                    se_log_space: schema.se_log_space,
                     se_wiggle_only_drop: schema.se_wiggle_only_drop,
                     dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
                     lambda_pred: lambdas_cal[0],
@@ -3276,6 +3310,7 @@ pub fn train_survival_model(
             hessian_factor,
             calibrator: calibrator_opt_local,
             mcmc_samples: None, // TODO: populate from survival MCMC sampling
+            cross_covariance_to_primary: None,
         };
 
         log_basis_cache_stats(&format!("train_survival_{}", kind));
@@ -3290,6 +3325,44 @@ pub fn train_survival_model(
             };
         } else {
             companions.insert("__internal_mortality".to_string(), artifacts);
+        }
+    }
+
+    if let (Some(primary), Some(mortality_data), Some(mortality_artifacts)) = (
+        primary_artifacts.as_ref(),
+        mortality_data_opt.as_ref(),
+        companions.get_mut("__internal_mortality"),
+    ) {
+        if let (Some(primary_factor), Some(mortality_factor)) = (
+            primary.hessian_factor.as_ref(),
+            mortality_artifacts.hessian_factor.as_ref(),
+        ) {
+            let primary_scores = survival::survival_score_matrix(
+                &layout,
+                &bundle.data,
+                survival_spec,
+                &monotonicity,
+                &primary.coefficients,
+            )
+            .map_err(map_error)?;
+            let mortality_scores = survival::survival_score_matrix(
+                &layout,
+                mortality_data,
+                survival_spec,
+                &monotonicity,
+                &mortality_artifacts.coefficients,
+            )
+            .map_err(map_error)?;
+            let score_cross = primary_scores.t().dot(&mortality_scores);
+            let left_solved =
+                survival::solve_hessian_matrix(primary_factor, &score_cross)
+                    .map_err(map_error)?;
+            let right_solved = survival::solve_hessian_matrix(
+                mortality_factor,
+                &left_solved.t().to_owned(),
+            )
+            .map_err(map_error)?;
+            mortality_artifacts.cross_covariance_to_primary = Some(right_solved.t().to_owned());
         }
     }
 
@@ -3359,7 +3432,7 @@ pub fn train_survival_model(
         config,
         coefficients: mapped_coefficients,
         lambdas: primary_lambdas,
-        hull: None,
+        hull: hull_opt,
         penalized_hessian: primary_hessian,
         scale: None,
         calibrator: None, // Survival uses artifacts.calibrator

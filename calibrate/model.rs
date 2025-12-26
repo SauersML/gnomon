@@ -1431,6 +1431,7 @@ impl TrainedModel {
 
         let coeffs = &artifacts.coefficients;
         let design_width = coeffs.len();
+        let mortality_width = mortality_model.map(|model| model.coefficients.len()).unwrap_or(0);
 
         if let Some(samples) = self.mcmc_samples.as_ref() {
             const MCMC_CHUNK_SIZE: usize = 32;
@@ -1494,6 +1495,16 @@ impl TrainedModel {
             let mut cif_exit = Array1::<f64>::zeros(n);
             let mut conditional_risk = Array1::<f64>::zeros(n);
             let mut gradient = Array2::<f64>::zeros((n, design_width));
+            let mut mortality_gradient = if matches!(risk_type, SurvivalRiskType::Crude)
+                && mortality_width > 0
+                && mortality_model
+                    .and_then(|model| model.hessian_factor.as_ref())
+                    .is_some()
+            {
+                Some(Array2::<f64>::zeros((n, mortality_width)))
+            } else {
+                None
+            };
             let mut logit_risk_sum = Array1::<f64>::zeros(n);
             let mut logit_risk_sq_sum = Array1::<f64>::zeros(n);
             let mortality_ref = if matches!(risk_type, SurvivalRiskType::Crude) {
@@ -1502,7 +1513,17 @@ impl TrainedModel {
                 None
             };
 
-            let n_samples = samples.nrows();
+            let mut n_samples = samples.nrows();
+            if let Some(mortality) = mortality_ref {
+                if let Some(mcmc) = mortality.mcmc_samples.as_ref() {
+                    n_samples = n_samples.min(mcmc.nrows());
+                }
+            }
+            if n_samples == 0 {
+                return Err(ModelError::DimensionMismatch(
+                    "MCMC samples are empty.".to_string(),
+                ));
+            }
             let mut row_start = 0;
             while row_start < n {
                 let row_end = (row_start + ROW_CHUNK_SIZE).min(n);
@@ -1515,6 +1536,14 @@ impl TrainedModel {
                 while sample_start < n_samples {
                     let sample_end = (sample_start + MCMC_CHUNK_SIZE).min(n_samples);
                     let chunk = samples.slice(s![sample_start..sample_end, ..]);
+                    let mortality_chunk = mortality_ref
+                        .and_then(|model| model.mcmc_samples.as_ref())
+                        .filter(|mcmc| {
+                            mcmc.nrows() >= n_samples
+                                && mcmc.ncols() == mortality_width
+                                && mortality_width > 0
+                        })
+                        .map(|mcmc| mcmc.slice(s![sample_start..sample_end, ..]));
                     let eta_entry = design_entry_chunk.dot(&chunk.t());
                     let eta_exit = design_exit_chunk.dot(&chunk.t());
 
@@ -1532,6 +1561,7 @@ impl TrainedModel {
                             cif_exit[idx] += cif_exit_val;
 
                             let mut grad_row_opt = None;
+                            let mut mort_grad_row_opt = None;
                             let mut dr_deta_entry = 0.0;
                             let mut dr_deta_exit = 0.0;
                             let risk_val = match risk_type {
@@ -1566,6 +1596,7 @@ impl TrainedModel {
                                 }
                                 SurvivalRiskType::Crude => {
                                     let mortality = mortality_ref.expect("checked above");
+                                    let mortality_coeffs = mortality_chunk.as_ref().map(|chunk| chunk.row(j));
                                     let result =
                                         survival::calculate_crude_risk_quadrature(
                                             age_entry_chunk[i],
@@ -1574,9 +1605,10 @@ impl TrainedModel {
                                             artifacts,
                                             mortality,
                                             Some(chunk.row(j)),
-                                            None,
+                                            mortality_coeffs,
                                         )?;
                                     grad_row_opt = Some(result.disease_gradient);
+                                    mort_grad_row_opt = Some(result.mortality_gradient);
                                     result.risk
                                 }
                             };
@@ -1607,6 +1639,15 @@ impl TrainedModel {
                                             .and(&grad_row)
                                             .for_each(|a, &b| *a += b);
                                     }
+                                    if let (Some(mut mort_grad_row), Some(ref mut mort_acc)) =
+                                        (mort_grad_row_opt, mortality_gradient.as_mut())
+                                    {
+                                        mort_grad_row.mapv_inplace(|v| v * logistic_scale);
+                                        let mut mort_row = mort_acc.row_mut(idx);
+                                        Zip::from(&mut mort_row)
+                                            .and(&mort_grad_row)
+                                            .for_each(|a, &b| *a += b);
+                                    }
                                 }
                             }
                         }
@@ -1623,6 +1664,9 @@ impl TrainedModel {
             cif_exit.mapv_inplace(|v| v * scale);
             conditional_risk.mapv_inplace(|v| v * scale);
             gradient.mapv_inplace(|v| v * scale);
+            if let Some(ref mut mort_grad) = mortality_gradient {
+                mort_grad.mapv_inplace(|v| v * scale);
+            }
 
             let mut logit_risk = Array1::<f64>::zeros(n);
             for i in 0..n {
@@ -1630,7 +1674,7 @@ impl TrainedModel {
                 logit_risk[i] = (p / (1.0 - p)).ln();
             }
 
-            let logit_risk_se = if n_samples > 1 {
+            let mut logit_risk_se = if n_samples > 1 {
                 let mut se = Array1::<f64>::zeros(n);
                 let n_f = n_samples as f64;
                 for i in 0..n {
@@ -1643,6 +1687,25 @@ impl TrainedModel {
             } else {
                 None
             };
+            if let (Some(mort_grad), Some(mortality)) = (mortality_gradient.as_ref(), mortality_ref)
+            {
+                if let Some(factor) = mortality.hessian_factor.as_ref() {
+                    let mort_se = survival::delta_method_standard_errors(factor, mort_grad)?;
+                    let combined = match logit_risk_se.as_mut() {
+                        Some(se) => {
+                            for i in 0..se.len() {
+                                let var = se[i] * se[i] + mort_se[i] * mort_se[i];
+                                se[i] = var.max(0.0).sqrt();
+                            }
+                            None
+                        }
+                        None => Some(mort_se),
+                    };
+                    if let Some(se) = combined {
+                        logit_risk_se = Some(se);
+                    }
+                }
+            }
 
             return Ok(SurvivalPrediction {
                 cumulative_hazard_entry: hazard_entry,
@@ -1663,6 +1726,16 @@ impl TrainedModel {
         let mut conditional_risk = Array1::<f64>::zeros(n);
         let mut logit_risk = Array1::<f64>::zeros(n);
         let mut gradient = Array2::<f64>::zeros((n, design_width));
+        let mut mortality_gradient = if matches!(risk_type, SurvivalRiskType::Crude)
+            && mortality_width > 0
+            && mortality_model
+                .and_then(|model| model.hessian_factor.as_ref())
+                .is_some()
+        {
+            Some(Array2::<f64>::zeros((n, mortality_width)))
+        } else {
+            None
+        };
 
         // Pre-allocate scratch buffer for zero-allocation loop
         let max_basis = artifacts.age_basis.knot_vector.len().max(100);
@@ -1699,7 +1772,7 @@ impl TrainedModel {
                 ));
             }
 
-            let (risk_val, mut grad_row) = match risk_type {
+            let (risk_val, mut grad_row, mut mort_grad_row_opt) = match risk_type {
                 SurvivalRiskType::Net => {
                     let risk = survival::conditional_absolute_risk(
                         entry_age, exit_age, &cov_row_owned, artifacts,
@@ -1738,7 +1811,7 @@ impl TrainedModel {
                     let grad_entry = design_entry.mapv(|v| v * dr_deta_entry);
                     let grad = grad_exit + grad_entry;
 
-                    (risk, grad)
+                    (risk, grad, None)
                 }
                 SurvivalRiskType::Crude => {
                     let mortality = mortality_model.expect("checked above");
@@ -1747,7 +1820,7 @@ impl TrainedModel {
                         None,
                         None,
                     )?;
-                    (result.risk, result.disease_gradient)
+                    (result.risk, result.disease_gradient, Some(result.mortality_gradient))
                 }
             };
             conditional_risk[i] = risk_val;
@@ -1757,12 +1830,64 @@ impl TrainedModel {
 
             grad_row.mapv_inplace(|v| v * logistic_scale);
             gradient.row_mut(i).assign(&grad_row);
+            if let (Some(mut mort_grad_row), Some(ref mut mort_acc)) =
+                (mort_grad_row_opt.take(), mortality_gradient.as_mut())
+            {
+                mort_grad_row.mapv_inplace(|v| v * logistic_scale);
+                mort_acc.row_mut(i).assign(&mort_grad_row);
+            }
         }
 
-        let logit_risk_se = if let Some(factor) = artifacts.hessian_factor.as_ref() {
-            Some(survival::delta_method_standard_errors(factor, &gradient)?)
-        } else {
-            None
+        let logit_risk_se = match risk_type {
+            SurvivalRiskType::Net => {
+                if let Some(factor) = artifacts.hessian_factor.as_ref() {
+                    Some(survival::delta_method_standard_errors(factor, &gradient)?)
+                } else {
+                    None
+                }
+            }
+            SurvivalRiskType::Crude => {
+                let disease_factor = artifacts.hessian_factor.as_ref();
+                let mortality_factor = mortality_model
+                    .and_then(|mortality| mortality.hessian_factor.as_ref());
+                let mortality_grad = mortality_gradient.as_ref();
+                let cross_cov = mortality_model
+                    .and_then(|mortality| mortality.cross_covariance_to_primary.as_ref());
+
+                let disease_se = disease_factor
+                    .map(|factor| survival::delta_method_standard_errors(factor, &gradient))
+                    .transpose()?;
+                let mortality_se = if let (Some(mg), Some(mf)) = (mortality_grad, mortality_factor) {
+                    Some(survival::delta_method_standard_errors(mf, mg)?)
+                } else {
+                    None
+                };
+
+                match (disease_se, mortality_se) {
+                    (Some(d), Some(m)) => {
+                        let mut out = d.clone();
+                        if let (Some(mg), Some(cov_dm)) = (mortality_grad, cross_cov) {
+                            for i in 0..out.len() {
+                                let g_d = gradient.row(i);
+                                let g_m = mg.row(i);
+                                let cov_gm = cov_dm.dot(&g_m);
+                                let cross = g_d.dot(&cov_gm);
+                                let var = d[i] * d[i] + m[i] * m[i] + 2.0 * cross;
+                                out[i] = var.max(0.0).sqrt();
+                            }
+                        } else {
+                            for i in 0..out.len() {
+                                let var = d[i] * d[i] + m[i] * m[i];
+                                out[i] = var.max(0.0).sqrt();
+                            }
+                        }
+                        Some(out)
+                    }
+                    (Some(d), None) => Some(d),
+                    (None, Some(m)) => Some(m),
+                    (None, None) => None,
+                }
+            }
         };
 
         Ok(SurvivalPrediction {
@@ -2914,6 +3039,7 @@ mod tests {
             }),
             calibrator: None,
             mcmc_samples: None,
+            cross_covariance_to_primary: None,
         };
 
         let config = ModelConfig {

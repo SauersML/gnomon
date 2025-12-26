@@ -80,11 +80,6 @@ inherits = "release"
 debug = 1
 strip = false
 
-[features]
-default = []
-no-inline-profiling = []
-survival-data = []
-
 [dependencies.mini-mcmc]
 git = "https://github.com/SauersML/mini-mcmc"
 branch = "main"

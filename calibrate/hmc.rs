@@ -691,7 +691,6 @@ pub fn run_nuts_sampling(
 // Survival Model HMC Support
 // ============================================================================
 
-#[cfg(feature = "survival-data")]
 mod survival_hmc {
     use super::*;
     use crate::calibrate::survival::{
@@ -777,7 +776,7 @@ mod survival_hmc {
 
             // Create a temporary working model to compute likelihood
             // We need owned copies for the working model
-            let mut model = WorkingModelSurvival {
+            let model = WorkingModelSurvival {
                 layout: Arc::clone(&self.data.layout),
                 sample_weight: Arc::clone(&self.data.sample_weight),
                 event_target: Arc::clone(&self.data.event_target),
@@ -785,6 +784,7 @@ mod survival_hmc {
                 age_exit: Arc::clone(&self.data.age_exit),
                 monotonicity: Arc::clone(&self.data.monotonicity),
                 spec: self.data.spec,
+                time_varying_basis: None,
             };
 
             // Compute state (deviance and gradient in beta space)
@@ -1107,7 +1107,6 @@ mod survival_hmc {
     }
 }
 
-#[cfg(feature = "survival-data")]
 pub use survival_hmc::run_survival_nuts_sampling;
 
 // Legacy type alias for backwards compatibility

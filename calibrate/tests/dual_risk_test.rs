@@ -75,6 +75,7 @@ fn make_constant_hazard_artifacts(hazard_rate: f64) -> SurvivalModelArtifacts {
         hessian_factor: None,
         calibrator: None,
         mcmc_samples: None,
+        cross_covariance_to_primary: None,
     }
 }
 

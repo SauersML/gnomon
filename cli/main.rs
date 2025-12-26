@@ -10,26 +10,19 @@ use std::path::PathBuf;
 use std::process;
 
 use gnomon::calibrate::data::{load_prediction_data, load_training_data};
-use gnomon::calibrate::estimate::train_model;
-#[cfg(feature = "survival-data")]
-use gnomon::calibrate::estimate::train_survival_model;
+use gnomon::calibrate::estimate::{train_model, train_survival_model};
 use gnomon::calibrate::model::BasisConfig;
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalModelConfig;
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalPrediction;
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalRiskType;
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::model::SurvivalTimeVaryingConfig;
 use gnomon::calibrate::model::{
     InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily, TrainedModel,
 };
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival::SurvivalSpec;
-#[cfg(feature = "survival-data")]
 use gnomon::calibrate::survival_data::{
-    SurvivalPredictionData, load_survival_prediction_data, load_survival_training_data,
+    SurvivalPredictionData, has_survival_columns, load_survival_prediction_data,
+    load_survival_training_data,
 };
 use gnomon::map::main as map_cli;
 use gnomon::map::{DEFAULT_LD_WINDOW, LdWindow};
@@ -170,6 +163,14 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match args.model_family {
         ModelFamilyCli::Gam => {
+            if has_survival_columns(&args.training_data)? {
+                println!(
+                    "[AUTO] Detected survival columns in {}; training survival model.",
+                    args.training_data
+                );
+                return train_survival_from_args(&args);
+            }
+
             println!("Loading training data from: {}", args.training_data);
             let data = load_training_data(&args.training_data, args.num_pcs)?;
             println!(
@@ -234,7 +235,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 pc_null_transforms: HashMap::new(),
-                mcmc_enabled: false,
+                mcmc_enabled: true,
                 survival: None,
             };
 
@@ -243,102 +244,100 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             trained_model.save("model.toml")?;
             println!("Model saved to: model.toml");
         }
-        #[cfg(feature = "survival-data")]
         ModelFamilyCli::Survival => {
-            println!(
-                "Loading survival training data from: {}",
-                args.training_data
-            );
-            let bundle = load_survival_training_data(
-                &args.training_data,
-                args.num_pcs,
-                args.survival_guard_delta,
-            )?;
-            println!(
-                "Loaded {} samples with {} PCs",
-                bundle.data.age_entry.len(),
-                bundle.data.pcs.ncols()
-            );
-
-            let mut spec = SurvivalSpec::default();
-            spec.derivative_guard = args.survival_derivative_guard;
-            spec.use_expected_information = args.survival_expected_information;
-
-            let time_varying = if args.survival_enable_time_varying {
-                Some(SurvivalTimeVaryingConfig {
-                    label: Some("pgs_by_age".to_string()),
-                    pgs_basis: BasisConfig {
-                        num_knots: args.survival_time_varying_pgs_knots,
-                        degree: args.survival_time_varying_pgs_degree,
-                    },
-                    pgs_penalty_order: args.survival_time_varying_pgs_penalty_order,
-                    lambda_age: 0.0,
-                    lambda_pgs: 0.0,
-                    lambda_null: 0.0,
-                })
-            } else {
-                None
-            };
-
-            if let Some(settings) = &time_varying {
-                println!(
-                    "Enabling time-varying PGS × age interaction (knots={}, degree={}, penalty order={})",
-                    settings.pgs_basis.num_knots,
-                    settings.pgs_basis.degree,
-                    settings.pgs_penalty_order
-                );
-            }
-
-            let survival_config = SurvivalModelConfig {
-                baseline_basis: BasisConfig {
-                    num_knots: args.survival_baseline_knots,
-                    degree: args.survival_baseline_degree,
-                },
-                guard_delta: args.survival_guard_delta,
-                monotonic_grid_size: args.survival_monotonic_grid,
-                time_varying,
-                model_competing_risk: false,
-            };
-
-            let config = ModelConfig {
-                model_family: ModelFamily::Survival(spec),
-                penalty_order: args.penalty_order,
-                convergence_tolerance: args.convergence_tolerance,
-                max_iterations: args.max_iterations,
-                reml_convergence_tolerance: args.reml_convergence_tolerance,
-                reml_max_iterations: args.reml_max_iterations,
-                firth_bias_reduction: false,
-                reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(
-                ),
-                pgs_basis_config: BasisConfig {
-                    num_knots: 0,
-                    degree: 0,
-                },
-                pc_configs: Vec::new(),
-                pgs_range: (0.0, 0.0),
-                interaction_penalty: InteractionPenaltyKind::Anisotropic,
-                sum_to_zero_constraints: HashMap::new(),
-                knot_vectors: HashMap::new(),
-                range_transforms: HashMap::new(),
-                interaction_centering_means: HashMap::new(),
-                interaction_orth_alpha: HashMap::new(),
-                pc_null_transforms: HashMap::new(),
-                mcmc_enabled: false,
-                survival: Some(survival_config),
-            };
-
-            println!("Training survival model...");
-            let trained_model = train_survival_model(&bundle, &config)?;
-            trained_model.save("model.toml")?;
-            println!("Model saved to: model.toml");
-        }
-        #[cfg(not(feature = "survival-data"))]
-        ModelFamilyCli::Survival => {
-            eprintln!("Error: Survival model support requires the 'survival-data' feature");
-            std::process::exit(1);
+            return train_survival_from_args(&args);
         }
     }
 
+    Ok(())
+}
+
+fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Loading survival training data from: {}",
+        args.training_data
+    );
+    let bundle = load_survival_training_data(
+        &args.training_data,
+        args.num_pcs,
+        args.survival_guard_delta,
+    )?;
+    println!(
+        "Loaded {} samples with {} PCs",
+        bundle.data.age_entry.len(),
+        bundle.data.pcs.ncols()
+    );
+
+    let mut spec = SurvivalSpec::default();
+    spec.derivative_guard = args.survival_derivative_guard;
+    spec.use_expected_information = args.survival_expected_information;
+
+    let time_varying = if args.survival_enable_time_varying {
+        Some(SurvivalTimeVaryingConfig {
+            label: Some("pgs_by_age".to_string()),
+            pgs_basis: BasisConfig {
+                num_knots: args.survival_time_varying_pgs_knots,
+                degree: args.survival_time_varying_pgs_degree,
+            },
+            pgs_penalty_order: args.survival_time_varying_pgs_penalty_order,
+            lambda_age: 0.0,
+            lambda_pgs: 0.0,
+            lambda_null: 0.0,
+        })
+    } else {
+        None
+    };
+
+    if let Some(settings) = &time_varying {
+        println!(
+            "Enabling time-varying PGS × age interaction (knots={}, degree={}, penalty order={})",
+            settings.pgs_basis.num_knots,
+            settings.pgs_basis.degree,
+            settings.pgs_penalty_order
+        );
+    }
+
+    let survival_config = SurvivalModelConfig {
+        baseline_basis: BasisConfig {
+            num_knots: args.survival_baseline_knots,
+            degree: args.survival_baseline_degree,
+        },
+        guard_delta: args.survival_guard_delta,
+        monotonic_grid_size: args.survival_monotonic_grid,
+        time_varying,
+        model_competing_risk: false,
+    };
+
+    let config = ModelConfig {
+        model_family: ModelFamily::Survival(spec),
+        penalty_order: args.penalty_order,
+        convergence_tolerance: args.convergence_tolerance,
+        max_iterations: args.max_iterations,
+        reml_convergence_tolerance: args.reml_convergence_tolerance,
+        reml_max_iterations: args.reml_max_iterations,
+        firth_bias_reduction: false,
+        reml_parallel_threshold: gnomon::calibrate::model::default_reml_parallel_threshold(),
+        pgs_basis_config: BasisConfig {
+            num_knots: 0,
+            degree: 0,
+        },
+        pc_configs: Vec::new(),
+        pgs_range: (0.0, 0.0),
+        interaction_penalty: InteractionPenaltyKind::Anisotropic,
+        sum_to_zero_constraints: HashMap::new(),
+        knot_vectors: HashMap::new(),
+        range_transforms: HashMap::new(),
+        interaction_centering_means: HashMap::new(),
+        interaction_orth_alpha: HashMap::new(),
+        pc_null_transforms: HashMap::new(),
+        mcmc_enabled: true,
+        survival: Some(survival_config),
+    };
+
+    println!("Training survival model...");
+    let trained_model = train_survival_model(&bundle, &config)?;
+    trained_model.save("model.toml")?;
+    println!("Model saved to: model.toml");
     Ok(())
 }
 
@@ -392,69 +391,57 @@ pub fn infer(args: InferArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("Predictions saved to: {output_path}");
         }
         ModelFamily::Survival(_) => {
-            #[cfg(not(feature = "survival-data"))]
-            {
-                println!(
-                    "Loaded survival model, but CLI was built without 'survival-data' feature. \
-                     Rebuild with '--features survival-data' to enable survival inference."
-                );
-                return Ok(());
-            }
+            println!("Loading survival prediction data from: {}", args.test_data);
+            let data = load_survival_prediction_data(&args.test_data, num_pcs)?;
+            println!(
+                "Loaded {} samples for survival prediction",
+                data.age_entry.len()
+            );
 
-            #[cfg(feature = "survival-data")]
-            {
-                println!("Loading survival prediction data from: {}", args.test_data);
-                let data = load_survival_prediction_data(&args.test_data, num_pcs)?;
-                println!(
-                    "Loaded {} samples for survival prediction",
-                    data.age_entry.len()
-                );
+            println!("Generating survival predictions with diagnostics...");
+            let prediction = model.predict_survival(
+                data.age_entry.view(),
+                data.age_exit.view(),
+                data.pgs.view(),
+                data.sex.view(),
+                data.pcs.view(),
+                SurvivalRiskType::Net,
+                Some(&model.survival_companions),
+            )?;
 
-                println!("Generating survival predictions with diagnostics...");
-                let prediction = model.predict_survival(
+            let calibrated_risk = if args.no_calibration {
+                println!("Skipping calibration via --no-calibration flag.");
+                None
+            } else if model
+                .survival
+                .as_ref()
+                .and_then(|artifacts| artifacts.calibrator.as_ref())
+                .is_some()
+            {
+                println!("Calibrator detected. Generating calibrated survival predictions.");
+                match model.predict_survival_calibrated(
                     data.age_entry.view(),
                     data.age_exit.view(),
                     data.pgs.view(),
                     data.sex.view(),
                     data.pcs.view(),
-                    SurvivalRiskType::Net,
                     Some(&model.survival_companions),
-                )?;
+                ) {
+                    Ok(calibrated) => Some(calibrated),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
 
-                let calibrated_risk = if args.no_calibration {
-                    println!("Skipping calibration via --no-calibration flag.");
-                    None
-                } else if model
-                    .survival
-                    .as_ref()
-                    .and_then(|artifacts| artifacts.calibrator.as_ref())
-                    .is_some()
-                {
-                    println!("Calibrator detected. Generating calibrated survival predictions.");
-                    match model.predict_survival_calibrated(
-                        data.age_entry.view(),
-                        data.age_exit.view(),
-                        data.pgs.view(),
-                        data.sex.view(),
-                        data.pcs.view(),
-                        Some(&model.survival_companions),
-                    ) {
-                        Ok(calibrated) => Some(calibrated),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                let output_path = "predictions.tsv";
-                save_survival_predictions(
-                    output_path,
-                    &data,
-                    &prediction,
-                    calibrated_risk.as_ref(),
-                )?;
-                println!("Predictions saved to: {output_path}");
-            }
+            let output_path = "predictions.tsv";
+            save_survival_predictions(
+                output_path,
+                &data,
+                &prediction,
+                calibrated_risk.as_ref(),
+            )?;
+            println!("Predictions saved to: {output_path}");
         }
     }
 
@@ -596,7 +583,6 @@ fn save_predictions_detailed(
     Ok(())
 }
 
-#[cfg(feature = "survival-data")]
 fn save_survival_predictions(
     output_path: &str,
     data: &SurvivalPredictionData,

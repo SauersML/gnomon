@@ -379,44 +379,51 @@ pub fn create_bspline_basis_with_knots(
     }
 
     let num_basis_functions = knot_view.len() - degree - 1;
-    let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
-
-    const PAR_THRESHOLD: usize = 256;
-
-    let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
-        for (mut row, &x) in basis_matrix
-            .axis_iter_mut(Axis(0))
-            .zip(data.iter())
-        {
-            let row_slice = row
-                .as_slice_mut()
-                .expect("basis matrix rows should be contiguous");
-            internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
-        }
-    };
-
-    if let (true, Some(data_slice)) = (data.len() >= PAR_THRESHOLD, data.as_slice()) {
-        bspline_thread_pool().install(|| {
-            basis_matrix
-                .axis_iter_mut(Axis(0))
-                .into_par_iter()
-                .zip(data_slice.par_iter().copied())
-                .for_each_init(
-                    || internal::BsplineScratch::new(degree),
-                    |scratch, (mut row, x)| {
-                        let row_slice = row
-                            .as_slice_mut()
-                            .expect("basis matrix rows should be contiguous");
-                        internal::evaluate_splines_at_point_into(
-                            x, degree, knot_view, row_slice, scratch,
-                        );
-                    },
-                );
-        });
+    let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
+        let (sparse, _) = create_bspline_basis_sparse_with_knots(data.view(), knot_view, degree)?;
+        let dense = sparse.as_ref().to_dense();
+        Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
     } else {
-        let mut scratch = internal::BsplineScratch::new(degree);
-        fill_rows(&mut scratch);
-    }
+        let mut basis_matrix = Array2::zeros((data.len(), num_basis_functions));
+
+        const PAR_THRESHOLD: usize = 256;
+
+        let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
+            for (mut row, &x) in basis_matrix
+                .axis_iter_mut(Axis(0))
+                .zip(data.iter())
+            {
+                let row_slice = row
+                    .as_slice_mut()
+                    .expect("basis matrix rows should be contiguous");
+                internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
+            }
+        };
+
+        if let (true, Some(data_slice)) = (data.len() >= PAR_THRESHOLD, data.as_slice()) {
+            bspline_thread_pool().install(|| {
+                basis_matrix
+                    .axis_iter_mut(Axis(0))
+                    .into_par_iter()
+                    .zip(data_slice.par_iter().copied())
+                    .for_each_init(
+                        || internal::BsplineScratch::new(degree),
+                        |scratch, (mut row, x)| {
+                            let row_slice = row
+                                .as_slice_mut()
+                                .expect("basis matrix rows should be contiguous");
+                            internal::evaluate_splines_at_point_into(
+                                x, degree, knot_view, row_slice, scratch,
+                            );
+                        },
+                    );
+            });
+        } else {
+            let mut scratch = internal::BsplineScratch::new(degree);
+            fill_rows(&mut scratch);
+        }
+        basis_matrix
+    };
 
     let basis_arc = Arc::new(basis_matrix);
     if let Some(key) = cache_key {
@@ -435,7 +442,7 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
     let support_per_row = (degree + 1).saturating_pow(dim as u32) as f64;
     let density = support_per_row / num_basis_cols as f64;
 
-    density < 0.10 && num_basis_cols > 64
+    density < 0.20 && num_basis_cols > 32
 }
 
 /// Creates a sparse B-spline basis matrix using a pre-computed knot vector.

@@ -484,6 +484,17 @@ fn read_tabular(path: &str) -> Result<DataFrame, SurvivalDataError> {
     }
 }
 
+pub fn has_survival_columns(path: &str) -> Result<bool, SurvivalDataError> {
+    let df = read_tabular(path)?;
+    let name_map = build_case_insensitive_map(df.get_column_names());
+    Ok(
+        name_map.contains_key("age_entry")
+            && name_map.contains_key("age_exit")
+            && name_map.contains_key("event_target")
+            && name_map.contains_key("event_competing"),
+    )
+}
+
 fn build_case_insensitive_map<I, S>(names: I) -> HashMap<String, String>
 where
     I: IntoIterator<Item = S>,

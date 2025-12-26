@@ -5,8 +5,6 @@
 pub mod basis;
 pub mod construction;
 pub mod data;
-
-#[cfg(feature = "survival-data")]
 pub mod survival_data;
 
 pub mod calibrator;

@@ -5,6 +5,7 @@ use crate::calibrate::faer_ndarray::{
     array2_to_mat_mut, fast_ata, fast_ata_into, fast_atv, fast_atv_into, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
+use faer::sparse::{SparseColMat, Triplet};
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
@@ -266,8 +267,9 @@ pub struct WorkingModelPirlsResult {
 }
 
 struct GamWorkingModel<'a> {
-    x_transformed: DesignMatrix,
-    x_original: ArrayView2<'a, f64>,
+    x_transformed: Option<DesignMatrix>,
+    x_original_dense: ArrayView2<'a, f64>,
+    x_original_sparse: Option<DesignMatrix>,
     offset: Array1<f64>,
     y: ArrayView1<'a, f64>,
     prior_weights: ArrayView1<'a, f64>,
@@ -282,6 +284,8 @@ struct GamWorkingModel<'a> {
     last_z: Array1<f64>,
     last_penalty_term: f64,
     x_csr: Option<SparseRowMat<usize, f64>>,
+    x_original_csr: Option<SparseRowMat<usize, f64>>,
+    qs: Option<Array2<f64>>,
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
     covariate_se: Option<Array1<f64>>,
@@ -289,7 +293,7 @@ struct GamWorkingModel<'a> {
 
 
 struct GamModelFinalState {
-    x_transformed: DesignMatrix,
+    x_transformed: Option<DesignMatrix>,
     e_transformed: Array2<f64>,
     final_mu: Array1<f64>,
     final_weights: Array1<f64>,
@@ -300,8 +304,9 @@ struct GamModelFinalState {
 
 impl<'a> GamWorkingModel<'a> {
     fn new(
-        x_transformed: DesignMatrix,
-        x_original: ArrayView2<'a, f64>,
+        x_transformed: Option<DesignMatrix>,
+        x_original_dense: ArrayView2<'a, f64>,
+        x_original_sparse: Option<DesignMatrix>,
         offset: ArrayView1<f64>,
         y: ArrayView1<'a, f64>,
         prior_weights: ArrayView1<'a, f64>,
@@ -310,12 +315,21 @@ impl<'a> GamWorkingModel<'a> {
         workspace: PirlsWorkspace,
         link: LinkFunction,
         firth_bias_reduction: bool,
+        qs: Option<Array2<f64>>,
     ) -> Self {
-        let n = x_transformed.nrows();
-        let x_csr = x_transformed.to_csr_cache();
+        let n = if let Some(x_transformed) = &x_transformed {
+            x_transformed.nrows()
+        } else {
+            x_original_dense.nrows()
+        };
+        let x_csr = x_transformed.as_ref().and_then(|matrix| matrix.to_csr_cache());
+        let x_original_csr = x_original_sparse
+            .as_ref()
+            .and_then(|matrix| matrix.to_csr_cache());
         GamWorkingModel {
             x_transformed,
-            x_original,
+            x_original_dense,
+            x_original_sparse,
             offset: offset.to_owned(),
             y,
             prior_weights,
@@ -330,6 +344,8 @@ impl<'a> GamWorkingModel<'a> {
             last_z: Array1::zeros(n),
             last_penalty_term: 0.0,
             x_csr,
+            x_original_csr,
+            qs,
             covariate_se: None,
         }
     }
@@ -352,12 +368,85 @@ impl<'a> GamWorkingModel<'a> {
             penalty_term: self.last_penalty_term,
         }
     }
+
+    fn transformed_matvec(&self, beta: &Array1<f64>) -> Array1<f64> {
+        if let Some(x_transformed) = &self.x_transformed {
+            return x_transformed.matrix_vector_multiply(beta);
+        }
+        let qs = self.qs.as_ref().expect("qs required for implicit design");
+        let beta_orig = qs.dot(beta);
+        if let Some(x_sparse) = &self.x_original_sparse {
+            x_sparse.matrix_vector_multiply(&beta_orig)
+        } else {
+            self.x_original_dense.dot(&beta_orig)
+        }
+    }
+
+    fn transformed_transpose_matvec(&self, vec: &Array1<f64>) -> Array1<f64> {
+        if let Some(x_transformed) = &self.x_transformed {
+            return x_transformed.transpose_vector_multiply(vec);
+        }
+        let qs = self.qs.as_ref().expect("qs required for implicit design");
+        let xtv = if let Some(x_sparse) = &self.x_original_sparse {
+            x_sparse.transpose_vector_multiply(vec)
+        } else {
+            self.x_original_dense.t().dot(vec)
+        };
+        qs.t().dot(&xtv)
+    }
+
+    fn penalized_hessian(&mut self, weights: &Array1<f64>) -> Result<Array2<f64>, EstimationError> {
+        if let Some(x_transformed) = &self.x_transformed {
+            return Ok(match x_transformed {
+                DesignMatrix::Dense(matrix) => {
+                    self.workspace
+                        .sqrt_w
+                        .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
+                    let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
+                    if self.workspace.wx.dim() != matrix.dim() {
+                        self.workspace.wx = Array2::zeros(matrix.dim());
+                    }
+                    self.workspace.wx.assign(matrix);
+                    self.workspace.wx *= &sqrt_w_col;
+                    let xtwx = fast_ata(&self.workspace.wx);
+                    xtwx + &self.s_transformed
+                }
+                DesignMatrix::Sparse(_) => {
+                    let csr = self
+                        .x_csr
+                        .as_ref()
+                        .ok_or_else(|| EstimationError::InvalidInput("missing CSR cache".to_string()))?;
+                    let xtwx = compute_hessian_sparse(csr, weights)?;
+                    xtwx + &self.s_transformed
+                }
+            });
+        }
+
+        let xtwx = if let Some(csr) = &self.x_original_csr {
+            compute_hessian_sparse(csr, weights)?
+        } else {
+            self.workspace
+                .sqrt_w
+                .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
+            let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
+            if self.workspace.wx.dim() != self.x_original_dense.dim() {
+                self.workspace.wx = Array2::zeros(self.x_original_dense.dim());
+            }
+            self.workspace.wx.assign(&self.x_original_dense);
+            self.workspace.wx *= &sqrt_w_col;
+            fast_ata(&self.workspace.wx)
+        };
+
+        let qs = self.qs.as_ref().expect("qs required for implicit design");
+        let tmp = qs.t().dot(&xtwx);
+        Ok(tmp.dot(qs) + &self.s_transformed)
+    }
 }
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
         let mut eta = self.offset.clone();
-        eta += &self.x_transformed.matrix_vector_multiply(beta);
+        eta += &self.transformed_matvec(beta);
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
@@ -383,23 +472,27 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 &mut self.last_z,
             );
         }
-        // Create references for use in this function
-        let mu = &self.last_mu;
-        let weights = &self.last_weights;
+        let mu = self.last_mu.clone();
+        let weights = self.last_weights.clone();
 
 
         if self.firth_bias_reduction {
-            let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
+            let x_transformed = self.x_transformed.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Firth bias reduction requires an explicit transformed design".to_string(),
+                )
+            })?;
+            let (hat_diag, half_log_det) = match (x_transformed, &self.x_csr) {
                 (DesignMatrix::Dense(matrix), _) => compute_firth_hat_and_half_logdet(
                     matrix.view(),
-                    self.x_original,
+                    self.x_original_dense,
                     weights.view(),
                     &self.s_transformed,
                     &mut self.workspace,
                 )?,
                 (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
                     csr,
-                    self.x_original,
+                    self.x_original_dense,
                     weights.view(),
                     &self.s_transformed,
                 )?,
@@ -420,29 +513,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.firth_log_det = None;
         }
 
-        let mut penalized_hessian = match &self.x_transformed {
-            DesignMatrix::Dense(matrix) => {
-                self.workspace
-                    .sqrt_w
-                    .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
-                let sqrt_w_col = self.workspace.sqrt_w.view().insert_axis(Axis(1));
-                if self.workspace.wx.dim() != matrix.dim() {
-                    self.workspace.wx = Array2::zeros(matrix.dim());
-                }
-                self.workspace.wx.assign(matrix);
-                self.workspace.wx *= &sqrt_w_col;
-                let xtwx = fast_ata(&self.workspace.wx);
-                xtwx + &self.s_transformed
-            }
-            DesignMatrix::Sparse(_) => {
-                let csr = self
-                    .x_csr
-                    .as_ref()
-                    .ok_or_else(|| EstimationError::InvalidInput("missing CSR cache".to_string()))?;
-                let xtwx = compute_hessian_sparse(csr, &weights)?;
-                xtwx + &self.s_transformed
-            }
-        };
+        let mut penalized_hessian = self.penalized_hessian(&weights)?;
         for i in 0..penalized_hessian.nrows() {
             for j in 0..i {
                 let val = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -455,10 +526,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mut eta_minus_z = eta.clone();
         eta_minus_z -= z;
         self.workspace.weighted_residual.assign(&eta_minus_z);
-        self.workspace.weighted_residual *= weights;
-        let mut gradient = self
-            .x_transformed
-            .transpose_vector_multiply(&self.workspace.weighted_residual);
+        self.workspace.weighted_residual *= &weights;
+        let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta);
         gradient += &s_beta;
 
@@ -1270,19 +1339,37 @@ pub fn fit_model_for_fixed_rho<'a>(
     } else {
         stable_reparameterization(rs_original, &lambdas.to_vec(), layout)?
     };
-    let x_transformed_dense = x.dot(&reparam_result.qs);
-    let x_transformed = DesignMatrix::Dense(x_transformed_dense.clone());
+    let x_original_sparse = sparse_from_dense_view(x);
+    let use_implicit = matches!(link_function, LinkFunction::Logit)
+        && !config.firth_bias_reduction
+        && x_original_sparse.is_some();
+    let use_explicit = !use_implicit;
+
+    let x_transformed_dense = if use_explicit {
+        Some(x.dot(&reparam_result.qs))
+    } else {
+        None
+    };
+    let x_transformed = x_transformed_dense
+        .as_ref()
+        .map(|matrix| maybe_sparse_design(matrix));
+
+    let x_original_sparse = if use_explicit { None } else { x_original_sparse };
 
     let eb_rows = eb.nrows();
     let e_rows = reparam_result.e_transformed.nrows();
     let mut workspace = PirlsWorkspace::new(
-        x_transformed_dense.nrows(),
-        x_transformed_dense.ncols(),
+        x.nrows(),
+        x.ncols(),
         eb_rows,
         e_rows,
     );
 
     if matches!(link_function, LinkFunction::Identity) {
+        let x_transformed_dense = x_transformed_dense
+            .as_ref()
+            .expect("explicit transform required for identity link");
+        let x_transformed = x_transformed.expect("explicit transform required for identity link");
         let (pls_result, _) = solve_penalized_least_squares(
             x_transformed_dense.view(),
             y,
@@ -1368,6 +1455,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     let mut working_model = GamWorkingModel::new(
         x_transformed,
         x,
+        x_original_sparse,
         offset,
         y,
         prior_weights,
@@ -1376,6 +1464,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         workspace,
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
+        if use_explicit { None } else { Some(reparam_result.qs.clone()) },
     );
     
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
@@ -1455,6 +1544,13 @@ pub fn fit_model_for_fixed_rho<'a>(
         working_summary.status = status.clone();
     }
 
+    let x_transformed = if let Some(x_transformed) = x_transformed {
+        x_transformed
+    } else {
+        let x_transformed_dense = x.dot(&reparam_result.qs);
+        maybe_sparse_design(&x_transformed_dense)
+    };
+
     let pirls_result = PirlsResult {
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
@@ -1477,6 +1573,51 @@ pub fn fit_model_for_fixed_rho<'a>(
     };
 
     Ok((pirls_result, working_summary))
+}
+
+fn maybe_sparse_design(x: &Array2<f64>) -> DesignMatrix {
+    if let Some(sparse) = sparse_from_dense_view(x.view()) {
+        return sparse;
+    }
+    let nrows = x.nrows();
+    let ncols = x.ncols();
+    if nrows == 0 || ncols == 0 {
+        return DesignMatrix::Dense(x.clone());
+    }
+
+    DesignMatrix::Dense(x.clone())
+}
+
+fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
+    let nrows = x.nrows();
+    let ncols = x.ncols();
+    if nrows == 0 || ncols == 0 {
+        return None;
+    }
+
+    const ZERO_EPS: f64 = 1e-12;
+    let mut nnz = 0usize;
+    for &val in x.iter() {
+        if val.abs() > ZERO_EPS {
+            nnz += 1;
+        }
+    }
+    let density = nnz as f64 / (nrows as f64 * ncols as f64);
+    if density >= 0.20 || ncols <= 32 {
+        return None;
+    }
+
+    let mut triplets = Vec::with_capacity(nnz);
+    for (row_idx, row) in x.outer_iter().enumerate() {
+        for (col_idx, &val) in row.iter().enumerate() {
+            if val.abs() > ZERO_EPS {
+                triplets.push(Triplet::new(row_idx, col_idx, val));
+            }
+        }
+    }
+    SparseColMat::try_new_from_triplets(nrows, ncols, &triplets)
+        .ok()
+        .map(DesignMatrix::Sparse)
 }
 
 /// Port of the `R_cond` function from mgcv, which implements the CMSW
