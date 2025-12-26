@@ -1414,83 +1414,33 @@ lemma risk_affine_additive
   -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
 
   -- The formal proof: expand the squared term and integrate term by term
-  calc ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ
-      = ∫ pc, u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
-            + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
-            - 2*u*a * pc.1
-            - 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ := by
-        congr 1; ext pc;
-        simp only [hu]; ring
-      _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-        have i_p2 := hP2_int.const_mul (u^2)
-        have i_c2 := hC2_int.const_mul (β^2)
-        have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
-        have i_pc := hPC_int.const_mul (2 * u * β)
-        have i_p := hP_int.const_mul (2 * u * a)
-        have i_c := hC_int.const_mul (2 * a * β)
-        -- Prove integrability of the positive and negative parts
-        have i_pos := (i_p2.add i_c2).add (i_a2.add i_pc)
-        have i_neg := i_p.add i_c
-        -- Normalize the product term to match the integrable form.
-        have h_mul : ∀ pc : ℝ × (Fin 1 → ℝ),
-            2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩ =
-            2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩) := by
-          intro pc; ring
-        simp_rw [h_mul]
-        -- Rewrite the integrand to match the `f - g` form for `integral_sub`
-        have h_integrand_eq : ∀ᵐ pc ∂μ,
-            (u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩) - 2*u*a*pc.1 - 2*a*β*pc.2 ⟨0, by norm_num⟩) =
-            ((u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩))) -
-              (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩) := by
-          filter_upwards with pc; ring
-        rw[integral_congr_ae h_integrand_eq]
-        -- Help `integral_sub` match by providing the function arguments explicitly.
-        have i_pos' :
-            Integrable
-              (fun pc =>
-                (u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩))) μ := by
-          simpa using i_pos
-        have h_sub :
-            ∫ (pc : ℝ × (Fin 1 → ℝ)),
-                ((u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩))) -
-                  (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩) ∂μ
-              =
-            (∫ (pc : ℝ × (Fin 1 → ℝ)),
-                  (u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩)) ∂μ) -
-              (∫ (pc : ℝ × (Fin 1 → ℝ)), 2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩ ∂μ) := by
-          simpa using (integral_sub
-            (f := fun (pc : ℝ × (Fin 1 → ℝ)) =>
-              (u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩)))
-            (g := fun (pc : ℝ × (Fin 1 → ℝ)) =>
-              2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩)
-            i_pos' i_neg)
-        rw [h_sub]
-        let f : ℝ × (Fin 1 → ℝ) → ℝ := fun pc =>
-          u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2
-        let g : ℝ × (Fin 1 → ℝ) → ℝ := fun pc =>
-          a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩)
-        have h_fin0 : (⟨0, by norm_num⟩ : Fin 1) = 0 := by rfl
-        have i_c2' : Integrable (fun x => β^2*(x.2 0)^2) μ := by
-          simpa [h_fin0] using i_c2
-        have i_pc' : Integrable (fun x => 2*u*β*(x.1*x.2 0)) μ := by
-          simpa [h_fin0] using i_pc
-        have i_c' : Integrable (fun x => 2*a*β*x.2 0) μ := by
-          simpa [h_fin0] using i_c
-        have hC0' : ∫ pc, pc.2 0 ∂μ = 0 := by
-          simpa [h_fin0] using hC0
-        have hPC0' : ∫ pc, pc.1 * pc.2 0 ∂μ = 0 := by
-          simpa [h_fin0] using hPC0
-        have h_add := integral_add (f := f) (g := g) (i_p2.add i_c2) (i_a2.add i_pc)
-        -- Expand `f` and `g` to align with the current integrand shape.
-        simp [f, g, h_fin0] at h_add
-        simp [h_fin0]
-        rw [h_add]
-        rw[integral_add i_p2 i_c2']
-        rw[integral_add i_a2 i_pc']
-        rw[integral_add i_p i_c']
-        simp_rw [integral_const_mul, integral_const]
-        simp [measure_univ, hP2, hPC0', hP0, hC0', hu]
-        ring
+  have h_integrand_eq :
+      (fun pc => (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2) =
+      (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+              + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
+              - 2*u*a * pc.1
+              - 2*a*β * pc.2 ⟨0, by norm_num⟩) := by
+    ext pc; simp only [hu]; ring
+  rw [h_integrand_eq]
+  -- Collect terms for linearity: ∫ (f₁ + f₂ + ... + f₆) = ∫ f₁ + ∫ f₂ + ...
+  have i_p2 := hP2_int.const_mul (u^2)
+  have i_c2 := hC2_int.const_mul (β^2)
+  have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
+  have i_pc := hPC_int.const_mul (2 * u * β)
+  have i_p := hP_int.const_mul (-2 * u * a)
+  have i_c := hC_int.const_mul (-2 * a * β)
+  -- Apply linearity
+  rw [integral_add (i_p2.add i_c2) (i_a2.add (i_pc.add (i_p.add i_c)))]
+  rw [integral_add i_p2 i_c2]
+  rw [integral_add i_a2 (i_pc.add (i_p.add i_c))]
+  rw [integral_add i_pc (i_p.add i_c)]
+  rw [integral_add i_p i_c]
+  -- Pull out constants
+  rw [integral_const_mul, integral_const_mul, integral_const, integral_const_mul, integral_const_mul, integral_const_mul]
+  -- Substitute known integral values
+  rw [hP2, hPC0, hP0, hC0]
+  simp [measure_univ, hu]
+  ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
