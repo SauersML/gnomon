@@ -1437,7 +1437,22 @@ lemma risk_affine_additive
             ((u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩)) - (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩) := by
           filter_upwards with pc; ring
         rw[integral_congr_ae h_integrand_eq]
-        rw[integral_sub i_pos i_neg]
+        -- Help `integral_sub` match by providing the function arguments explicitly.
+        have h_sub :
+            ∫ pc,
+                ((u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩)) -
+                  (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩) ∂μ
+              =
+            (∫ pc,
+                  (u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩) ∂μ) -
+              (∫ pc, 2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+          simpa using (integral_sub
+            (f := fun pc =>
+              (u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩))
+            (g := fun pc =>
+              2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩)
+            i_pos i_neg)
+        rw [h_sub]
         rw[integral_add (i_p2.add i_c2) (i_a2.add i_pc)]
         rw[integral_add i_p2 i_c2]
         rw[integral_add i_a2 i_pc]
