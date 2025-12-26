@@ -1145,14 +1145,10 @@ pub fn train_joint_model(
                 degree: result.degree,
             };
             
-            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-            
+            // Use sensible defaults for MCMC sampling
             let nuts_config = crate::calibrate::hmc::NutsConfig {
-                n_samples: num_samples,
-                n_warmup: num_warmup,
+                n_samples: 500,
+                n_warmup: 500,
                 n_chains: 2,
                 ..crate::calibrate::hmc::NutsConfig::default()
             };
@@ -1862,19 +1858,10 @@ pub fn train_model(
             }
         }
 
-        // Allow overriding NUTS config via env vars for testing
-        let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-        let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-
+        // Use sensible defaults for MCMC sampling
         let nuts_config = hmc::NutsConfig {
-            n_samples: num_samples,
-            n_warmup: num_warmup,
+            n_samples: 1000,
+            n_warmup: 1000,
             ..hmc::NutsConfig::default()
         };
         
@@ -2767,18 +2754,10 @@ pub fn train_survival_model(
             if final_state.hessian.is_empty() {
                 eprintln!("            WARNING: No Hessian available for MCMC; skipping.");
             } else {
-                let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
-                let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
-
+                // Use sensible defaults for MCMC sampling
                 let nuts_config = hmc::NutsConfig {
-                    n_samples: num_samples,
-                    n_warmup: num_warmup,
+                    n_samples: 1000,
+                    n_warmup: 1000,
                     ..hmc::NutsConfig::default()
                 };
 
@@ -3232,18 +3211,10 @@ pub fn train_survival_model(
         } else if let Some(ref hessian) = primary_hessian {
             eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling for survival model...");
 
-            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000);
-            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000);
-
+            // Use sensible defaults for MCMC sampling
             let nuts_config = hmc::NutsConfig {
-                n_samples: num_samples,
-                n_warmup: num_warmup,
+                n_samples: 1000,
+                n_warmup: 1000,
                 ..hmc::NutsConfig::default()
             };
 

@@ -28,10 +28,11 @@ use crate::calibrate::construction::{
     stable_reparameterization_with_invariant, ReparamInvariant, ReparamResult,
 };
 
-// NOTE: We use hard clamp(0,1) everywhere for z standardization.
-// B-splines handle out-of-bounds points naturally via linear extrapolation,
-// and hard clamp is consistent with dz/du = 1/range used in derivative computation.
-// Using soft_clamp would require including its derivative in the chain rule.
+
+// NOTE on z standardization: We use hard clamp(0,1) everywhere.
+// At clamped boundaries (z=0 or z=1), the wiggle contribution is constant (not extrapolated),
+// and g'(u) = 1 (the derivative code explicitly returns 1.0 at boundaries).
+// This is consistent between training and HMC.
 
 /// State for the joint single-index model optimization.
 pub struct JointModelState<'a> {
@@ -309,25 +310,12 @@ impl<'a> JointModelState<'a> {
                 let z_mean: f64 = z.iter().sum::<f64>() / n as f64;
                 let z_var: f64 = z.iter().map(|&v| (v - z_mean).powi(2)).sum::<f64>() / n as f64;
                 let z_has_spread = z_var > 1e-6;
-
-                // Reuse existing transform if it matches AND z has sufficient spread
-                // (if z had no spread when transform was built, it's degenerate)
-                if let Some(ref transform) = self.link_transform {
-                    if transform.ncols() > 0 && transform.nrows() == n_raw && z_has_spread {
-                        let n_constrained = transform.ncols();
-                        if self.beta_link.len() != n_constrained {
-                            self.beta_link = Array1::zeros(n_constrained);
-                            self.n_constrained_basis = n_constrained;
-                        }
-                        return bspline_basis.dot(transform);
-                    }
-                }
                 
-                // Skip constraint building if z has no spread (degenerate case)
+                // Error on degenerate z instead of silently changing dimension
                 if !z_has_spread {
-                    // WARN: This changes model dimension based on data, which is a footgun
-                    eprintln!("[JOINT WARNING] Base predictor z has near-zero variance (var={z_var:.2e}). \
-                              Using unconstrained link basis - model may have identifiability issues.");
+                    eprintln!("[JOINT ERROR] Base predictor z has near-zero variance (var={z_var:.2e}). \
+                              Cannot build identifiable link constraint. Check your data or initial β.");
+                    // Return identity basis to avoid crashing, but this is a fundamental problem
                     let n_constrained = n_raw.saturating_sub(2).max(1);
                     if self.beta_link.len() != n_constrained {
                         self.beta_link = Array1::zeros(n_constrained);
@@ -335,6 +323,9 @@ impl<'a> JointModelState<'a> {
                     }
                     return bspline_basis.slice(ndarray::s![.., ..n_constrained]).to_owned();
                 }
+                
+                // Always rebuild constraint from current z and IRLS weights
+                // (do NOT cache transform - it depends on data that changes each iteration)
                 
                 // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
                 let mut constraint = Array2::<f64>::zeros((n, 2));
@@ -373,10 +364,11 @@ impl<'a> JointModelState<'a> {
                     }
                     Err(_) => {
                         // Fallback: construct a nullspace transform via eigendecomposition.
-                        eprintln!("[JOINT] Orthogonality constraint failed");
+                        // Use IRLS weights (not data weights) for consistency with primary path
+                        eprintln!("[JOINT] Orthogonality constraint failed, using eigendecomposition fallback");
                         let mut weighted_constraints = constraint.clone();
                         for i in 0..n {
-                            let w = self.weights[i];
+                            let w = irls_weights[i];  // Use IRLS weights, not self.weights
                             weighted_constraints[[i, 0]] *= w;
                             weighted_constraints[[i, 1]] *= w;
                         }
