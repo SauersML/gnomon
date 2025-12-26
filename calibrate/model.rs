@@ -524,11 +524,6 @@ pub enum ModelError {
 }
 
 impl TrainedModel {
-    fn logit_from_prob(p: f64) -> f64 {
-        let p = p.clamp(1e-8, 1.0 - 1e-8);
-        (p / (1.0 - p)).ln()
-    }
-
     fn ensure_gam_link(&self, operation: &'static str) -> Result<LinkFunction, ModelError> {
         match &self.config.model_family {
             ModelFamily::Gam(link) => Ok(*link),
@@ -847,6 +842,71 @@ impl TrainedModel {
         Ok(mean)
     }
 
+    /// Compute mean η and SE η directly from MCMC samples for coherent uncertainty.
+    /// 
+    /// Unlike the previous approach which computed logit(E[σ(η)]) and paired it with
+    /// Hessian-based SE (an incoherent pairing), this computes:
+    ///   - mean_eta = E[η] = (1/S) Σ_s (X β_s)
+    ///   - se_eta = sqrt(Var[η]) = sqrt((1/S) Σ_s (X β_s - mean_eta)²)
+    /// 
+    /// This provides a coherent (mean, variance) summary on the logit scale.
+    fn mcmc_mean_and_se_eta(
+        &self,
+        x_new: &Array2<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), ModelError> {
+        const ROW_CHUNK_SIZE: usize = 2048;
+        let samples = self.mcmc_samples.as_ref().ok_or_else(|| {
+            ModelError::DimensionMismatch("MCMC samples missing for prediction.".to_string())
+        })?;
+        let n_samples = samples.nrows();
+        if n_samples == 0 {
+            return Err(ModelError::DimensionMismatch("MCMC samples are empty.".to_string()));
+        }
+        if samples.ncols() != x_new.ncols() {
+            return Err(ModelError::DimensionMismatch(format!(
+                "MCMC sample width {} does not match design columns {}",
+                samples.ncols(), x_new.ncols()
+            )));
+        }
+
+        let n = x_new.nrows();
+        let mut sum_eta = Array1::<f64>::zeros(n);
+        let mut sum_eta_sq = Array1::<f64>::zeros(n);
+        let mut sum_prob = Array1::<f64>::zeros(n);
+        
+        let samples_t = samples.t();
+        let mut start = 0;
+        while start < n {
+            let end = (start + ROW_CHUNK_SIZE).min(n);
+            let x_chunk = x_new.slice(s![start..end, ..]);
+            let etas = x_chunk.dot(&samples_t); // [chunk_size, n_samples]
+            
+            for (i, row) in etas.outer_iter().enumerate() {
+                let idx = start + i;
+                for &eta_s in row.iter() {
+                    let eta_clamped = eta_s.clamp(-700.0, 700.0);
+                    sum_eta[idx] += eta_clamped;
+                    sum_eta_sq[idx] += eta_clamped * eta_clamped;
+                    sum_prob[idx] += 1.0 / (1.0 + f64::exp(-eta_clamped));
+                }
+            }
+            start = end;
+        }
+        
+        let scale = 1.0 / (n_samples as f64);
+        let mean_eta = sum_eta.mapv(|v| v * scale);
+        let mean_prob = sum_prob.mapv(|v| (v * scale).clamp(1e-8, 1.0 - 1e-8));
+        
+        // Var[η] = E[η²] - E[η]²
+        let mut se_eta = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let var_eta = (sum_eta_sq[i] * scale) - (mean_eta[i] * mean_eta[i]);
+            se_eta[i] = var_eta.max(0.0).sqrt();
+        }
+        
+        Ok((mean_prob, mean_eta, se_eta))
+    }
+
     /// Posterior mean probability using joint MCMC samples over (β, θ).
     /// For each sample [β_s | θ_s], computes η_s = Xβ_s + B(Xβ_s)θ_s
     /// and returns (mean_prob, mean_eta, se_eta) for proper uncertainty quantification.
@@ -975,10 +1035,9 @@ impl TrainedModel {
             && self.mcmc_samples.is_some()
             && self.joint_link.is_none()
         {
-            let mean = self.mcmc_mean_logit_predictions(&x_new)?;
-            let eta = mean.mapv(Self::logit_from_prob);
-            let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
-            return Ok((eta, mean, signed_dist, se_eta_opt));
+            // Use coherent MCMC-based mean and SE instead of mixing quantities
+            let (mean, eta, se_eta) = self.mcmc_mean_and_se_eta(&x_new)?;
+            return Ok((eta, mean, signed_dist, Some(se_eta)));
         }
 
         // --- Linear predictor and mean ---

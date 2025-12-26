@@ -1070,9 +1070,9 @@ pub fn train_joint_model(
                 .map(|(&w, &r)| w * r * r)
                 .sum();
             let effective_n = data.y.len() as f64;
-            // DOF = n - (base coeffs + link coeffs), or use edf if available
-            let total_df = (layout.total_coeffs + result.beta_link.len()) as f64;
-            weighted_rss / (effective_n - total_df).max(1.0)
+            // Use EDF from joint fitting if available, otherwise raw param count
+            let edf = result.edf;
+            weighted_rss / (effective_n - edf).max(1.0)
         }
     };
 
@@ -4499,9 +4499,12 @@ pub mod internal {
                 match pirls_result.status {
                     pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                         let penalty = pirls_result.stable_penalty_term;
-                        let penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                        let mut penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                        // Include Firth log-det term in LAML for consistency with inner PIRLS
                         if firth_bias && link_is_logit {
-                            let _ = pirls_result.firth_log_det;
+                            if let Some(firth_log_det) = pirls_result.firth_log_det {
+                                penalised += firth_log_det; // Jeffreys prior contribution
+                            }
                         }
                         Ok(penalised)
                     }
@@ -4519,9 +4522,12 @@ pub mod internal {
                             })
                         } else {
                             let penalty = pirls_result.stable_penalty_term;
-                            let penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                            let mut penalised = -0.5 * pirls_result.deviance - 0.5 * penalty;
+                            // Include Firth log-det term in LAML for consistency with inner PIRLS
                             if firth_bias && link_is_logit {
-                                let _ = pirls_result.firth_log_det;
+                                if let Some(firth_log_det) = pirls_result.firth_log_det {
+                                    penalised += firth_log_det; // Jeffreys prior contribution
+                                }
                             }
                             Ok(penalised)
                         }
@@ -4978,14 +4984,15 @@ pub mod internal {
                     // Penalized log-likelihood part of the score.
                     // Note: Deviance = -2 * log-likelihood + C. So -0.5 * Deviance = log-likelihood - C/2.
                     // Use stable penalty term calculated in P-IRLS
-                    let penalised_ll =
+                    let mut penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
+                    // Include Firth log-det term in LAML for consistency with inner PIRLS
                     if self.config.firth_bias_reduction
                         && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
                     {
-                        // Ignore the Firth log-determinant contribution when assembling
-                        // the outer objective; it only stabilizes the coefficient solve.
-                        let _ = pirls_result.firth_log_det;
+                        if let Some(firth_log_det) = pirls_result.firth_log_det {
+                            penalised_ll += firth_log_det; // Jeffreys prior contribution
+                        }
                     }
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)

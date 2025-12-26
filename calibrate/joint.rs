@@ -295,13 +295,14 @@ impl<'a> JointModelState<'a> {
                 
                 // Skip constraint building if z has no spread (degenerate case)
                 if !z_has_spread {
-                    // Return raw basis with identity transform (will be recomputed later)
+                    // WARN: This changes model dimension based on data, which is a footgun
+                    eprintln!("[JOINT WARNING] Base predictor z has near-zero variance (var={z_var:.2e}). \
+                              Using unconstrained link basis - model may have identifiability issues.");
                     let n_constrained = n_raw.saturating_sub(2).max(1);
                     if self.beta_link.len() != n_constrained {
                         self.beta_link = Array1::zeros(n_constrained);
                         self.n_constrained_basis = n_constrained;
                     }
-                    // Don't freeze a degenerate transform - return unconstrained for now
                     return bspline_basis.slice(ndarray::s![.., ..n_constrained]).to_owned();
                 }
                 
@@ -366,6 +367,9 @@ impl<'a> JointModelState<'a> {
                             .collect();
                         
                         let transform = if null_indices.is_empty() {
+                            // WARN: No null space found means constraint failed - model may confound β and θ
+                            eprintln!("[JOINT WARNING] Orthogonality constraint found no null space - \
+                                      falling back to unconstrained link. Model identifiability may be compromised.");
                             Array2::eye(n_raw)
                         } else {
                             let mut z = Array2::<f64>::zeros((n_raw, null_indices.len()));
@@ -1158,23 +1162,28 @@ impl<'a> JointRemlState<'a> {
                 let log_det_schur = match schur.cholesky(Side::Lower) {
                     Ok(schol) => 2.0 * schol.diag().mapv(|d| d.max(1e-10).ln()).sum(),
                     Err(_) => {
+                        // Schur complement is not positive definite - model is ill-conditioned
+                        // Return infinity cost to steer optimizer away
                         use crate::calibrate::faer_ndarray::FaerEigh;
-                        let (eigs, _) = schur
-                            .clone()
-                            .eigh(Side::Lower)
-                            .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
-                        let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-                        let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-                        eigs.iter().map(|&ev| ev.max(tol).ln()).sum()
+                        let (eigs, _) = match schur.clone().eigh(Side::Lower) {
+                            Ok(result) => result,
+                            Err(_) => return (f64::INFINITY, None),
+                        };
+                        let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
+                        if min_eig <= 0.0 {
+                            eprintln!("[LAML] Schur complement has non-positive eigenvalue: {min_eig}");
+                            return (f64::INFINITY, None);
+                        }
+                        eigs.iter().map(|&ev| ev.ln()).sum()
                     }
                 };
                 log_det + log_det_schur
             }
             Err(_) => {
-                eprintln!("[LAML] Cholesky failed, using trace approximation");
-                let trace_a: f64 = (0..p_base).map(|i| a_mat[[i, i]].max(1e-10).ln()).sum();
-                let trace_d: f64 = (0..p_link).map(|i| d_mat[[i, i]].max(1e-10).ln()).sum();
-                trace_a + trace_d
+                // Joint Hessian is not positive definite - cannot compute valid LAML
+                // Return infinity cost to steer optimizer away
+                eprintln!("[LAML] Joint Hessian Cholesky failed - returning infinity cost");
+                return (f64::INFINITY, None);
             }
         };
         
@@ -1504,9 +1513,37 @@ pub fn fit_joint_model_with_reml<'a>(
     let n_base = reml_state.state.borrow().s_base.len();
     let initial_rho = Array1::from_elem(n_base + 1, 0.0);
     
-    // Run BFGS optimization
+    // Bounded ρ optimization using tanh transformation (consistent with non-joint path)
+    // This prevents exp(ρ) overflow/underflow and keeps Hessians well-conditioned
+    const RHO_BOUND: f64 = 30.0;
+    
+    fn rho_to_z(rho: &Array1<f64>) -> Array1<f64> {
+        rho.mapv(|r| {
+            let ratio = (r / RHO_BOUND).clamp(-0.9999, 0.9999);
+            RHO_BOUND * ratio.atanh()
+        })
+    }
+    
+    fn z_to_rho(z: &Array1<f64>) -> Array1<f64> {
+        z.mapv(|v| RHO_BOUND * (v / RHO_BOUND).tanh())
+    }
+    
+    fn drho_dz(rho: &Array1<f64>) -> Array1<f64> {
+        rho.mapv(|r| (1.0 - (r / RHO_BOUND).powi(2)).max(0.0))
+    }
+    
+    // Run BFGS optimization in transformed (unbounded) z-space
     use wolfe_bfgs::Bfgs;
-    let solver = Bfgs::new(initial_rho.clone(), |rho| reml_state.cost_and_grad(rho))
+    let initial_z = rho_to_z(&initial_rho);
+    
+    let solver = Bfgs::new(initial_z, |z| {
+        let rho = z_to_rho(z);
+        let (cost, grad_rho) = reml_state.cost_and_grad(&rho);
+        // Chain rule: dL/dz = dL/dρ * dρ/dz
+        let jac = drho_dz(&rho);
+        let grad_z = &grad_rho * &jac;
+        (cost, grad_z)
+    })
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
         .with_fp_tolerances(1e2, 1e2)
@@ -1524,7 +1561,8 @@ pub fn fit_joint_model_with_reml<'a>(
         }
     };
     
-    let best_rho = solution.final_point.clone();
+    // Transform back to ρ space
+    let best_rho = z_to_rho(&solution.final_point);
     let _ = reml_state.compute_cost(&best_rho)?;
     Ok(reml_state.into_result())
 }
