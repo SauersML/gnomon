@@ -42,10 +42,10 @@ pub struct JointModelState<'a> {
     beta_link: Array1<f64>,
     /// Penalty matrices for base block (one per λ)
     s_base: Vec<Array2<f64>>,
-    /// Transformed penalty for link block (Z'SZ)
-    s_link_constrained: Array2<f64>,
-    /// Constraint transform Z (basis → constrained basis)
-    link_transform: Array2<f64>,
+    /// Transformed penalty for link block (Z'SZ) - None until build_link_basis is called
+    s_link_constrained: Option<Array2<f64>>,
+    /// Constraint transform Z (basis → constrained basis) - None until build_link_basis is called
+    link_transform: Option<Array2<f64>>,
     /// Current log-smoothing parameters (one per base penalty + one for link)
     rho: Array1<f64>,
     /// Link function (Logit or Identity)
@@ -62,6 +62,9 @@ pub struct JointModelState<'a> {
     knot_vector: Option<Array1<f64>>,
     /// Number of constrained basis functions
     n_constrained_basis: usize,
+    /// Optional per-observation SE for integrated (GHQ) likelihood.
+    /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
+    covariate_se: Option<Array1<f64>>,
 }
 
 /// Configuration for joint model fitting
@@ -151,10 +154,7 @@ impl<'a> JointModelState<'a> {
         let n_penalties = s_base.len() + 1;
         let rho = Array1::zeros(n_penalties);
         
-        // Initialize empty transform and penalty (will be built on first basis construction)
-        let link_transform = Array2::eye(n_constrained);
-        let s_link_constrained = Array2::zeros((n_constrained, n_constrained));
-        
+        // link_transform and s_link_constrained are None until build_link_basis is called
         Self {
             y,
             weights,
@@ -162,8 +162,8 @@ impl<'a> JointModelState<'a> {
             beta_base,
             beta_link,
             s_base,
-            s_link_constrained,
-            link_transform,
+            s_link_constrained: None,
+            link_transform: None,
             rho,
             link,
             layout_base,
@@ -172,7 +172,15 @@ impl<'a> JointModelState<'a> {
             knot_range: None,
             knot_vector: None,
             n_constrained_basis: n_constrained,
+            covariate_se: None,
         }
+    }
+    
+    /// Set per-observation SE for integrated (GHQ) likelihood.
+    /// When set, the joint model uses uncertainty-aware IRLS updates.
+    pub fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
+        self.covariate_se = Some(se);
+        self
     }
     
     /// Set rho (log-lambdas) for REML optimization
@@ -274,13 +282,15 @@ impl<'a> JointModelState<'a> {
 
                 // Reuse existing transform if it matches AND z has sufficient spread
                 // (if z had no spread when transform was built, it's degenerate)
-                if self.link_transform.ncols() > 0 && self.link_transform.nrows() == n_raw && z_has_spread {
-                    let n_constrained = self.link_transform.ncols();
-                    if self.beta_link.len() != n_constrained {
-                        self.beta_link = Array1::zeros(n_constrained);
-                        self.n_constrained_basis = n_constrained;
+                if let Some(ref transform) = self.link_transform {
+                    if transform.ncols() > 0 && transform.nrows() == n_raw && z_has_spread {
+                        let n_constrained = transform.ncols();
+                        if self.beta_link.len() != n_constrained {
+                            self.beta_link = Array1::zeros(n_constrained);
+                            self.n_constrained_basis = n_constrained;
+                        }
+                        return bspline_basis.dot(transform);
                     }
-                    return bspline_basis.dot(&self.link_transform);
                 }
                 
                 // Skip constraint building if z has no spread (degenerate case)
@@ -321,8 +331,8 @@ impl<'a> JointModelState<'a> {
                         let projected_penalty = transform.t().dot(&raw_penalty).dot(&transform);
                         
                         // Store transform and projected penalty
-                        self.link_transform = transform;
-                        self.s_link_constrained = projected_penalty;
+                        self.link_transform = Some(transform);
+                        self.s_link_constrained = Some(projected_penalty);
                         self.n_constrained_basis = n_constrained;
                         if self.beta_link.len() != n_constrained {
                             self.beta_link = Array1::zeros(n_constrained);
@@ -375,8 +385,8 @@ impl<'a> JointModelState<'a> {
                         };
                         let projected_penalty = transform.t().dot(&raw_penalty).dot(&transform);
                         
-                        self.link_transform = transform;
-                        self.s_link_constrained = projected_penalty;
+                        self.link_transform = Some(transform);
+                        self.s_link_constrained = Some(projected_penalty);
                         self.n_constrained_basis = n_constrained;
                         if self.beta_link.len() != n_constrained {
                             self.beta_link = Array1::zeros(n_constrained);
@@ -389,8 +399,8 @@ impl<'a> JointModelState<'a> {
                 // Fallback: return empty basis
                 eprintln!("[JOINT] B-spline basis construction failed");
                 self.beta_link = Array1::zeros(0);
-                self.link_transform = Array2::zeros((0, 0));
-                self.s_link_constrained = Array2::zeros((0, 0));
+                self.link_transform = Some(Array2::zeros((0, 0)));
+                self.s_link_constrained = Some(Array2::zeros((0, 0)));
                 self.n_constrained_basis = 0;
                 Array2::zeros((n, 0))
             }
@@ -413,11 +423,12 @@ impl<'a> JointModelState<'a> {
             Err(_) => Array2::zeros((n, 0)),
         };
         
-        if self.link_transform.ncols() > 0 && self.link_transform.nrows() == b_raw.ncols() {
-            b_raw.dot(&self.link_transform)
-        } else {
-            b_raw
+        if let Some(ref transform) = self.link_transform {
+            if transform.ncols() > 0 && transform.nrows() == b_raw.ncols() {
+                return b_raw.dot(transform);
+            }
         }
+        b_raw
     }
     
     /// Compute standardized z values and range width for current knot range.
@@ -431,7 +442,7 @@ impl<'a> JointModelState<'a> {
     
     /// Return the stored projected penalty for link block (Z'SZ)
     pub fn build_link_penalty(&self) -> Array2<f64> {
-        self.s_link_constrained.clone()
+        self.s_link_constrained.clone().unwrap_or_else(|| Array2::zeros((0, 0)))
     }
     
     /// Solve penalized weighted least squares: (X'WX + λS)β = X'Wz
@@ -513,16 +524,28 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         
-        // Compute working response and weights
-        crate::calibrate::pirls::update_glm_vectors(
-            self.y,
-            &eta,
-            self.link.clone(),
-            self.weights,
-            &mut mu,
-            &mut weights,
-            &mut z_glm,
-        );
+        // Compute working response and weights, using integrated likelihood if SE available
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.y,
+                &eta,
+                se.view(),
+                self.weights,
+                &mut mu,
+                &mut weights,
+                &mut z_glm,
+            );
+        } else {
+            crate::calibrate::pirls::update_glm_vectors(
+                self.y,
+                &eta,
+                self.link.clone(),
+                self.weights,
+                &mut mu,
+                &mut weights,
+                &mut z_glm,
+            );
+        }
         
         // Adjust working response: solve for wiggle coefficient θ where
         // η = u + B_wiggle · θ
@@ -545,15 +568,29 @@ impl<'a> JointModelState<'a> {
         let mut mu_updated = Array1::<f64>::zeros(n);
         let mut weights_updated = Array1::<f64>::zeros(n);
         let mut z_updated = Array1::<f64>::zeros(n);
-        crate::calibrate::pirls::update_glm_vectors(
-            self.y,
-            &eta_updated,
-            self.link.clone(),
-            self.weights,
-            &mut mu_updated,
-            &mut weights_updated,
-            &mut z_updated,
-        );
+        
+        // Use integrated likelihood for final deviance if SE available
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.y,
+                &eta_updated,
+                se.view(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        } else {
+            crate::calibrate::pirls::update_glm_vectors(
+                self.y,
+                &eta_updated,
+                self.link.clone(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        }
         drop(weights_updated);
         drop(z_updated);
         self.compute_deviance(&mu_updated)
@@ -589,15 +626,28 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         
-        crate::calibrate::pirls::update_glm_vectors(
-            self.y,
-            &eta,
-            self.link.clone(),
-            self.weights,
-            &mut mu,
-            &mut weights,
-            &mut z_glm,
-        );
+        // Use integrated likelihood if SE available (Logit only)
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.y,
+                &eta,
+                se.view(),
+                self.weights,
+                &mut mu,
+                &mut weights,
+                &mut z_glm,
+            );
+        } else {
+            crate::calibrate::pirls::update_glm_vectors(
+                self.y,
+                &eta,
+                self.link.clone(),
+                self.weights,
+                &mut mu,
+                &mut weights,
+                &mut z_glm,
+            );
+        }
         
         // Correct working response for β update (Gauss-Newton offset):
         // z_β = z_glm - η + g'(u)·u
@@ -651,15 +701,29 @@ impl<'a> JointModelState<'a> {
         let mut mu_updated = Array1::<f64>::zeros(n);
         let mut weights_updated = Array1::<f64>::zeros(n);
         let mut z_updated = Array1::<f64>::zeros(n);
-        crate::calibrate::pirls::update_glm_vectors(
-            self.y,
-            &eta_updated,
-            self.link.clone(),
-            self.weights,
-            &mut mu_updated,
-            &mut weights_updated,
-            &mut z_updated,
-        );
+        
+        // Use integrated likelihood for final deviance if SE available
+        if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
+            crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.y,
+                &eta_updated,
+                se.view(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        } else {
+            crate::calibrate::pirls::update_glm_vectors(
+                self.y,
+                &eta_updated,
+                self.link.clone(),
+                self.weights,
+                &mut mu_updated,
+                &mut weights_updated,
+                &mut z_updated,
+            );
+        }
         drop(weights_updated);
         drop(z_updated);
         self.compute_deviance(&mu_updated)
@@ -808,10 +872,10 @@ pub fn fit_joint_model<'a>(
         converged,
         knot_range,
         knot_vector,
-        link_transform: state.link_transform.clone(),
+        link_transform: state.link_transform.clone().unwrap_or_else(|| Array2::eye(state.n_constrained_basis)),
         degree: state.degree,
         link: state.link.clone(),
-        s_link_constrained: state.s_link_constrained.clone(),
+        s_link_constrained: state.s_link_constrained.clone().unwrap_or_else(|| Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))),
         base_model: None,
     })
 }
@@ -842,8 +906,8 @@ struct JointRemlSnapshot {
     rho: Array1<f64>,
     knot_range: Option<(f64, f64)>,
     knot_vector: Option<Array1<f64>>,
-    link_transform: Array2<f64>,
-    s_link_constrained: Array2<f64>,
+    link_transform: Option<Array2<f64>>,
+    s_link_constrained: Option<Array2<f64>>,
     n_constrained_basis: usize,
     cached_beta_base: Array1<f64>,
     cached_beta_link: Array1<f64>,
@@ -906,8 +970,13 @@ impl<'a> JointRemlState<'a> {
         layout_base: ModelLayout,
         link: LinkFunction,
         config: &JointModelConfig,
+        covariate_se: Option<Array1<f64>>,
     ) -> Self {
         let mut state = JointModelState::new(y, weights, x_base, s_base, layout_base, link, config);
+        // Set covariate_se for uncertainty-aware IRLS
+        if let Some(se) = covariate_se {
+            state = state.with_covariate_se(se);
+        }
         let u0 = state.base_linear_predictor();
         let _ = state.build_link_basis(&u0);
         let n_base = state.s_base.len();
@@ -1403,10 +1472,10 @@ impl<'a> JointRemlState<'a> {
             converged: cached_converged,
             knot_range,
             knot_vector,
-            link_transform: state.link_transform,
+            link_transform: state.link_transform.unwrap_or_else(|| Array2::eye(state.n_constrained_basis)),
             degree: state.degree,
             link: state.link.clone(),
-            s_link_constrained: state.s_link_constrained,
+            s_link_constrained: state.s_link_constrained.unwrap_or_else(|| Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))),
             base_model: None,
         }
     }
@@ -1423,11 +1492,12 @@ pub fn fit_joint_model_with_reml<'a>(
     layout_base: ModelLayout,
     link: LinkFunction,
     config: &JointModelConfig,
+    covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
     
     // Create REML state
     let reml_state = JointRemlState::new(
-        y, weights, x_base, s_base, layout_base, link, config
+        y, weights, x_base, s_base, layout_base, link, config, covariate_se
     );
     
     // Initial rho = zeros (λ = 1)
@@ -1492,7 +1562,12 @@ fn compute_link_derivative_from_state(
     
     let (z, range_width) = state.standardized_z(u);
     let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
-    let n_constrained = state.link_transform.ncols();
+    
+    // Get link_transform, return early if not set
+    let Some(ref link_transform) = state.link_transform else {
+        return deriv;
+    };
+    let n_constrained = link_transform.ncols();
     if n_raw == 0 || n_constrained == 0 || state.beta_link.len() != n_constrained {
         return deriv;
     }
@@ -1521,10 +1596,10 @@ fn compute_link_derivative_from_state(
         }
         
         // d(wiggle)/dz = B'(z) @ Z @ θ
-        let d_wiggle_dz: f64 = if state.link_transform.nrows() == n_raw {
+        let d_wiggle_dz: f64 = if link_transform.nrows() == n_raw {
             (0..n_constrained).map(|c| {
                 let b_prime_c: f64 = (0..n_raw).map(|r|
-                    deriv_raw[r] * state.link_transform[[r, c]]
+                    deriv_raw[r] * link_transform[[r, c]]
                 ).sum();
                 b_prime_c * state.beta_link[c]
             }).sum()

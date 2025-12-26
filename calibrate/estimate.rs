@@ -840,6 +840,145 @@ fn compute_analytic_gprime(
     g_prime
 }
 
+/// Compute the joint penalized Hessian matrix for the (β, θ) parameters.
+/// 
+/// The Hessian has block structure:
+/// ```text
+/// H = [ X'WX + S_base,  X'Wg'B    ]
+///     [ B'g'WX,         B'WB + S_link ]
+/// ```
+/// where W is the weight matrix (varies by link function), g' is the link derivative.
+fn compute_joint_penalized_hessian(
+    x_matrix: &Array2<f64>,
+    result: &crate::calibrate::joint::JointModelResult,
+    s_list: &[Array2<f64>],
+    weights: ArrayView1<f64>,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+    scale_val: f64,
+) -> Option<Array2<f64>> {
+    let p_base = x_matrix.ncols();
+    let p_link = result.beta_link.len();
+    if p_link == 0 {
+        return None;
+    }
+    let dim = p_base + p_link;
+    let n = y.len();
+    let n_base = result.lambdas.len().saturating_sub(1);
+    
+    // Build combined base penalty: Σλ_k S_k
+    let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
+    for k in 0..n_base {
+        if k < s_list.len() && k < result.lambdas.len() {
+            s_base_accum = s_base_accum + s_list[k].mapv(|v| v * result.lambdas[k]);
+        }
+    }
+    
+    // Link penalty from the REML fit
+    let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
+    let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
+    
+    // Build B-spline basis at mode
+    let eta_base = x_matrix.dot(&result.beta_base);
+    let b_wiggle = {
+        let (min_u, max_u) = result.knot_range;
+        let rw = (max_u - min_u).max(1e-6);
+        let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
+        match crate::calibrate::basis::create_bspline_basis_with_knots(
+            z.view(), result.knot_vector.view(), result.degree
+        ) {
+            Ok((basis, _)) => {
+                let raw = basis.as_ref();
+                if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
+                    raw.dot(&result.link_transform)
+                } else {
+                    Array2::zeros((n, p_link))
+                }
+            }
+            Err(_) => Array2::zeros((n, p_link)),
+        }
+    };
+    
+    // Compute weights W at the mode
+    let wiggle = b_wiggle.dot(&result.beta_link);
+    let eta_full = &eta_base + &wiggle;
+    let mut w_eff = Array1::<f64>::zeros(n);
+    
+    let is_logit = link == LinkFunction::Logit;
+    if is_logit {
+        for i in 0..n {
+            let eta_i = eta_full[i].clamp(-700.0, 700.0);
+            let mu_i = 1.0 / (1.0 + (-eta_i).exp());
+            let var_i = (mu_i * (1.0 - mu_i)).max(1e-10);
+            w_eff[i] = weights[i] * var_i;
+        }
+    } else {
+        let inv_scale = 1.0 / scale_val.max(1e-10);
+        for i in 0..n {
+            w_eff[i] = weights[i] * inv_scale;
+        }
+    }
+    
+    // Compute g'(u) at the mode
+    let g_prime = compute_analytic_gprime(&eta_base, result);
+    
+    // Build joint Hessian blocks
+    let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+    
+    // Compute weighted matrices: sqrt(w*g'^2)*X and sqrt(w)*B
+    let mut x_weighted = x_matrix.to_owned();
+    let mut b_weighted = b_wiggle.clone();
+    for i in 0..n {
+        let sqrt_wg2 = (w_eff[i] * g_prime[i] * g_prime[i]).sqrt();
+        let sqrt_w = w_eff[i].sqrt();
+        for j in 0..p_base {
+            x_weighted[[i, j]] *= sqrt_wg2;
+        }
+        for j in 0..p_link {
+            b_weighted[[i, j]] *= sqrt_w;
+        }
+    }
+    
+    // Base block: X'WX + S_base
+    let xtx = x_weighted.t().dot(&x_weighted);
+    for j in 0..p_base {
+        for k in 0..p_base {
+            joint_hessian[[j, k]] = xtx[[j, k]] + s_base_accum[[j, k]];
+        }
+    }
+    
+    // Link block: B'WB + S_link
+    let btb = b_weighted.t().dot(&b_weighted);
+    for j in 0..p_link {
+        for k in 0..p_link {
+            joint_hessian[[p_base + j, p_base + k]] = btb[[j, k]] + s_link[[j, k]];
+        }
+    }
+    
+    // Cross block: C = X' diag(W * g') B
+    let mut x_gw = x_matrix.to_owned();
+    for i in 0..n {
+        let wg = w_eff[i] * g_prime[i];
+        for j in 0..p_base {
+            x_gw[[i, j]] *= wg;
+        }
+    }
+    let cross = x_gw.t().dot(&b_wiggle);
+    for j in 0..p_base {
+        for k in 0..p_link {
+            joint_hessian[[j, p_base + k]] = cross[[j, k]];
+            joint_hessian[[p_base + k, j]] = cross[[j, k]]; // Symmetric
+        }
+    }
+    
+    // Add small ridge for stability
+    for i in 0..dim {
+        joint_hessian[[i, i]] += 1e-4;
+    }
+    
+    Some(joint_hessian)
+}
+
 /// Train a joint single-index model with flexible link calibration
 /// 
 /// This uses the joint model architecture where the base predictor and
@@ -852,8 +991,6 @@ pub fn train_joint_model(
 ) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
     use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
     use crate::calibrate::model::{map_coefficients, JointLinkModel, TrainedModel};
-    
-    basis::clear_basis_cache();
     
     log::info!(
         "Starting joint model training with REML. {} total samples.",
@@ -898,6 +1035,7 @@ pub fn train_joint_model(
         }
     };
     let s_list_for_mcmc = s_list.clone(); // Clone for MCMC use after fit
+    
     let mut result = fit_joint_model_with_reml(
         data.y.view(),
         data.weights.view(),
@@ -906,6 +1044,7 @@ pub fn train_joint_model(
         layout.clone(),
         link,
         &joint_config,
+        None, // No covariate_se during training - used for prediction with uncertainty
     )?;
 
     // Build a base TrainedModel so predictions can be reproduced.
@@ -967,185 +1106,94 @@ pub fn train_joint_model(
         degree: result.degree,
     };
 
+    // ===== Stage 5: Compute joint Hessian (always, for SE computation) =====
+    eprintln!("[JOINT] Computing joint penalized Hessian for SE computation...");
+    let joint_hessian = compute_joint_penalized_hessian(
+        &x_matrix,
+        &result,
+        &s_list_for_mcmc,
+        data.weights.view(),
+        data.y.view(),
+        link,
+        scale_val,
+    );
 
-    // ===== Stage 5: Joint MCMC sampling (if enabled, supports Logit and Identity) =====
+    // ===== Stage 6: Joint MCMC sampling (if enabled, supports Logit and Identity) =====
     let mcmc_samples = if config.mcmc_enabled {
-        let is_logit = link == LinkFunction::Logit;
-        eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...", if is_logit { "logit" } else { "identity" });
-        
-        let p_base = x_matrix.ncols();
-        let p_link = result.beta_link.len();
-        let dim = p_base + p_link;
-        let n = data.y.len();
-        
-        // Build combined base penalty: Σλ_k S_k
-        let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
-        for k in 0..n_base {
-            if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
-                s_base_accum = s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
-            }
-        }
-        
-        // Use the REAL constrained link penalty from the REML fit
-        let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
-        let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
-        
-        // Build real Gauss-Newton Hessian at the mode (not just penalties)
-        // H = [[X'WX + S_base, X'W·g'·B], [B'·g'·W·X, B'WB + S_link]]
-        // where W = diag(w * μ(1-μ)) at the mode
-        let eta_base = x_matrix.dot(&result.beta_base);
-        let b_wiggle = {
-            let (min_u, max_u) = result.knot_range;
-            let rw = (max_u - min_u).max(1e-6);
-            let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
-            match crate::calibrate::basis::create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
-                Ok((basis, _)) => {
-                    let raw = basis.as_ref();
-                    if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
-                        raw.dot(&result.link_transform)
-                    } else {
-                        // Fallback: return zeros with correct dimensions to avoid panic
-                        Array2::zeros((n, p_link))
-                    }
+        if let Some(ref hessian) = joint_hessian {
+            let is_logit = link == LinkFunction::Logit;
+            eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...", if is_logit { "logit" } else { "identity" });
+            
+            let p_base = x_matrix.ncols();
+            let n_base_penalties = result.lambdas.len().saturating_sub(1);
+            
+            // Build combined base penalty for HMC
+            let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
+            for k in 0..n_base_penalties {
+                if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
+                    s_base_accum = s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
                 }
-                Err(_) => Array2::zeros((n, p_link)),
             }
-        };
-        
-        // Compute weights W at the mode (depends on link type)
-        let wiggle = b_wiggle.dot(&result.beta_link);
-        let eta_full = &eta_base + &wiggle;
-        let mut w_eff = Array1::<f64>::zeros(n);
-        
-        if is_logit {
-            // Logit: W = w * μ(1-μ)
-            for i in 0..n {
-                let eta_i = eta_full[i].clamp(-700.0, 700.0);
-                let mu_i = 1.0 / (1.0 + (-eta_i).exp());
-                let var_i = (mu_i * (1.0 - mu_i)).max(1e-10);
-                w_eff[i] = data.weights[i] * var_i;
+            let link_lambda = result.lambdas.get(n_base_penalties).cloned().unwrap_or(1.0);
+            let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
+            
+            let spline = crate::calibrate::hmc::JointSplineArtifacts {
+                knot_range: result.knot_range,
+                knot_vector: result.knot_vector.clone(),
+                link_transform: result.link_transform.clone(),
+                degree: result.degree,
+            };
+            
+            let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+            let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+            
+            let nuts_config = crate::calibrate::hmc::NutsConfig {
+                n_samples: num_samples,
+                n_warmup: num_warmup,
+                n_chains: 2,
+                ..crate::calibrate::hmc::NutsConfig::default()
+            };
+            
+            match crate::calibrate::hmc::run_joint_nuts_sampling(
+                x_matrix.view(),
+                data.y.view(),
+                data.weights.view(),
+                s_base_accum.view(),
+                s_link.view(),
+                result.beta_base.view(),
+                result.beta_link.view(),
+                hessian.view(),
+                spline,
+                &nuts_config,
+                is_logit,
+                scale_val.sqrt(),
+            ) {
+                Ok(nuts_result) => {
+                    eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());
+                    Some(nuts_result.samples)
+                }
+                Err(e) => {
+                    eprintln!("[JOINT-MCMC] WARNING: sampling failed: {}", e);
+                    None
+                }
             }
         } else {
-            // Identity/Gaussian: W = w / σ² (scale_val is σ², so use directly)
-            let inv_scale = 1.0 / scale_val.max(1e-10);
-            for i in 0..n {
-                w_eff[i] = data.weights[i] * inv_scale;
-            }
-        }
-        
-        // Compute g'(u) at the mode using analytic derivatives (same as HMC)
-        let g_prime = compute_analytic_gprime(&eta_base, &result);
-        
-        // Build joint Hessian blocks with CORRECT curvature
-        // A = X' diag(W * g'^2) X + S_base
-        // C = X' diag(W * g') B
-        // D = B' diag(W) B + S_link
-        let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
-        
-        // Compute weighted matrices once: sqrt(w*g'^2)*X and sqrt(w)*B
-        let mut x_weighted = x_matrix.to_owned();
-        let mut b_weighted = b_wiggle.clone();
-        for i in 0..n {
-            let sqrt_wg2 = (w_eff[i] * g_prime[i] * g_prime[i]).sqrt();
-            let sqrt_w = w_eff[i].sqrt();
-            for j in 0..p_base {
-                x_weighted[[i, j]] *= sqrt_wg2;
-            }
-            for j in 0..p_link {
-                b_weighted[[i, j]] *= sqrt_w;
-            }
-        }
-        
-        // Base block: X'WX + S_base using efficient matrix multiply
-        let xtx = x_weighted.t().dot(&x_weighted);
-        for j in 0..p_base {
-            for k in 0..p_base {
-                joint_hessian[[j, k]] = xtx[[j, k]] + s_base_accum[[j, k]];
-            }
-        }
-        
-        // Link block: B'WB + S_link
-        let btb = b_weighted.t().dot(&b_weighted);
-        for j in 0..p_link {
-            for k in 0..p_link {
-                joint_hessian[[p_base + j, p_base + k]] = btb[[j, k]] + s_link[[j, k]];
-            }
-        }
-        
-        // Cross block: C = X' diag(W * g') B - need different weighting
-        let mut x_gw = x_matrix.to_owned();
-        for i in 0..n {
-            let wg = w_eff[i] * g_prime[i];
-            for j in 0..p_base {
-                x_gw[[i, j]] *= wg;
-            }
-        }
-        let cross = x_gw.t().dot(&b_wiggle);
-        for j in 0..p_base {
-            for k in 0..p_link {
-                joint_hessian[[j, p_base + k]] = cross[[j, k]];
-                joint_hessian[[p_base + k, j]] = cross[[j, k]]; // Symmetric
-            }
-        }
-        
-        // Add small ridge for stability
-        for i in 0..dim {
-            joint_hessian[[i, i]] += 1e-4;
-        }
-        
-        let spline = crate::calibrate::hmc::JointSplineArtifacts {
-            knot_range: result.knot_range,
-            knot_vector: result.knot_vector.clone(),
-            link_transform: result.link_transform.clone(),
-            degree: result.degree,
-        };
-        
-        let num_samples = std::env::var("GNOMON_MCMC_SAMPLES")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-        let num_warmup = std::env::var("GNOMON_MCMC_WARMUP")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-        
-        let nuts_config = crate::calibrate::hmc::NutsConfig {
-            n_samples: num_samples,
-            n_warmup: num_warmup,
-            n_chains: 2,
-            ..crate::calibrate::hmc::NutsConfig::default()
-        };
-        
-        match crate::calibrate::hmc::run_joint_nuts_sampling(
-            x_matrix.view(),
-            data.y.view(),
-            data.weights.view(),
-            s_base_accum.view(),
-            s_link.view(),
-            result.beta_base.view(),
-            result.beta_link.view(),
-            joint_hessian.view(),
-            spline,
-            &nuts_config,
-            is_logit,
-            scale_val.sqrt(),  // scale_val is σ², HMC expects σ
-        ) {
-            Ok(nuts_result) => {
-                eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());
-                Some(nuts_result.samples)
-            }
-            Err(e) => {
-                eprintln!("[JOINT-MCMC] WARNING: sampling failed: {}", e);
-                None
-            }
+            eprintln!("[JOINT-MCMC] WARNING: could not compute joint Hessian, skipping MCMC.");
+            None
         }
     } else {
         None
     };
     
-    // Update base_model with MCMC samples
+    // Update base_model with Hessian and MCMC samples
     let base_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
         lambdas: base_lambdas,
         hull: hull_opt,
-        penalized_hessian: None,
+        penalized_hessian: joint_hessian,
         scale: Some(scale_val),
         calibrator: None,
         joint_link: Some(joint_link),
@@ -1168,8 +1216,6 @@ pub fn train_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    basis::clear_basis_cache();
-
     log::info!(
         "Starting model training with REML. {} total samples.",
         data.y.len()
@@ -2217,8 +2263,6 @@ pub fn train_survival_model(
     }
 
     let mut config = base_config.clone();
-
-    clear_basis_cache();
 
     log::info!("Starting survival model training via penalized Newton updates.");
     eprintln!("\n[STAGE 1/3] Constructing survival layout...");

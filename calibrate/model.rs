@@ -658,6 +658,149 @@ impl TrainedModel {
         Some(vars.mapv(|v| v.max(0.0).sqrt()))
     }
 
+    /// Compute SE for joint model using the full joint Hessian.
+    /// 
+    /// For joint models η = g(Xβ; θ) = Xβ + B(z)θ where z = (u - min)/(max - min) and u = Xβ,
+    /// the full variance propagation is:
+    /// 
+    ///   Var(η_i) = J_i^T H_joint^{-1} J_i
+    /// 
+    /// where J_i = [g'(u_i) × x_i, b_i] is the Jacobian row.
+    /// 
+    /// This properly accounts for uncertainty in BOTH β and θ, not just the simplified
+    /// g'×SE approximation which ignores Var(θ).
+    fn compute_joint_se_from_hessian(
+        &self,
+        x_new: &Array2<f64>,
+        eta_base: &Array1<f64>,
+        joint: &JointLinkModel,
+        link_function: LinkFunction,
+    ) -> Option<Array1<f64>> {
+        let h = self.penalized_hessian.as_ref()?;
+        let p_base = x_new.ncols();
+        let p_link = joint.beta_link.len();
+        let dim = p_base + p_link;
+        
+        // Check dimensions: joint Hessian should be (p_base + p_link) × (p_base + p_link)
+        if h.nrows() != dim || h.ncols() != dim {
+            // Fall back to base-only SE propagation if dimension mismatch
+            return None;
+        }
+        
+        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+        let chol = match h.clone().cholesky(Side::Lower) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        
+        let n = x_new.nrows();
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
+        let n_constrained = joint.link_transform.ncols();
+        
+        if n_raw == 0 || n_constrained == 0 || n_constrained != p_link {
+            return None;
+        }
+        
+        let mut vars = Array1::zeros(n);
+        let mut scratch = crate::calibrate::basis::SplineScratch::new(joint.degree);
+        let mut raw_basis = vec![0.0; n_raw];
+        let mut constrained_basis = vec![0.0; n_constrained];
+        
+        // For derivative computation
+        let mut raw_plus = vec![0.0; n_raw];
+        let mut raw_minus = vec![0.0; n_raw];
+        let h_deriv = 1e-4;
+        
+        // Jacobian row: [g'(u_i) * x_i, b_i]
+        let mut j_row = Array1::<f64>::zeros(dim);
+        
+        for i in 0..n {
+            let u = eta_base[i];
+            let z = ((u - min_u) / range_width).clamp(0.0, 1.0);
+            
+            // Compute constrained basis b_i
+            raw_basis.fill(0.0);
+            if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+                z, joint.knot_vector.view(), joint.degree, &mut raw_basis, &mut scratch
+            ).is_err() {
+                continue;
+            }
+            
+            constrained_basis.fill(0.0);
+            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained {
+                for r in 0..n_raw {
+                    let v = raw_basis[r];
+                    for c in 0..n_constrained {
+                        constrained_basis[c] += v * joint.link_transform[[r, c]];
+                    }
+                }
+            } else if n_constrained == n_raw {
+                constrained_basis.copy_from_slice(&raw_basis);
+            } else {
+                continue;
+            }
+            
+            // Compute g'(u) = 1 + d(wiggle)/dz / range_width via finite difference
+            let z_plus = (z + h_deriv).clamp(0.0, 1.0);
+            let z_minus = (z - h_deriv).clamp(0.0, 1.0);
+            let dz = (z_plus - z_minus).max(1e-8);
+            
+            raw_plus.fill(0.0);
+            raw_minus.fill(0.0);
+            if crate::calibrate::basis::evaluate_bspline_basis_scalar(
+                z_plus, joint.knot_vector.view(), joint.degree, &mut raw_plus, &mut scratch
+            ).is_err() || crate::calibrate::basis::evaluate_bspline_basis_scalar(
+                z_minus, joint.knot_vector.view(), joint.degree, &mut raw_minus, &mut scratch
+            ).is_err() {
+                continue;
+            }
+            
+            let mut d_wiggle_dz = 0.0;
+            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained {
+                for r in 0..n_raw {
+                    let diff = raw_plus[r] - raw_minus[r];
+                    for c in 0..n_constrained {
+                        d_wiggle_dz += diff * joint.link_transform[[r, c]] * joint.beta_link[c];
+                    }
+                }
+            } else if n_constrained == n_raw {
+                for r in 0..n_raw {
+                    d_wiggle_dz += (raw_plus[r] - raw_minus[r]) * joint.beta_link[r];
+                }
+            }
+            d_wiggle_dz /= dz;
+            let g_prime = 1.0 + d_wiggle_dz / range_width;
+            
+            // Build Jacobian row: J_i = [g'(u_i) * x_i, b_i]
+            j_row.fill(0.0);
+            for j in 0..p_base {
+                j_row[j] = g_prime * x_new[[i, j]];
+            }
+            for j in 0..p_link {
+                j_row[p_base + j] = constrained_basis[j];
+            }
+            
+            // Var(η_i) = J_i^T H^{-1} J_i
+            let v = chol.solve_vec(&j_row);
+            let var_i = j_row.dot(&v);
+            
+            vars[i] = if link_function == LinkFunction::Identity {
+                if let Some(scale) = self.scale {
+                    var_i * scale
+                } else {
+                    var_i
+                }
+            } else {
+                var_i
+            };
+        }
+        
+        Some(vars.mapv(|v| v.max(0.0).sqrt()))
+    }
+
     fn mcmc_mean_logit_predictions(
         &self,
         x_new: &Array2<f64>,
@@ -840,11 +983,27 @@ impl TrainedModel {
 
         // --- Linear predictor and mean ---
         let eta_base = x_new.dot(&beta);
-        let se_eta_opt = self.compute_se_eta_from_hessian(&x_new, link_function);
         let (eta, se_eta_opt) = if let Some(joint) = &self.joint_link {
-            self.apply_joint_link_to_eta(&eta_base, se_eta_opt.as_ref(), joint)
+            // For joint models, first try to use the full joint Hessian for SE
+            let joint_se = self.compute_joint_se_from_hessian(&x_new, &eta_base, joint, link_function);
+            
+            // Compute η_cal = u + wiggle(u) (no SE needed from this call since we compute properly above)
+            let (eta_cal, _) = self.apply_joint_link_to_eta(&eta_base, None, joint);
+            
+            // Use joint SE if available, otherwise fall back to simplified propagation
+            let final_se = if joint_se.is_some() {
+                joint_se
+            } else {
+                // Fall back to base SE propagated through g' (imperfect but better than nothing)
+                let base_se = self.compute_se_eta_from_hessian(&x_new, link_function);
+                let (_, propagated_se) = self.apply_joint_link_to_eta(&eta_base, base_se.as_ref(), joint);
+                propagated_se
+            };
+            
+            (eta_cal, final_se)
         } else {
-            (eta_base, se_eta_opt)
+            let se = self.compute_se_eta_from_hessian(&x_new, link_function);
+            (eta_base, se)
         };
         let mean = match link_function {
             LinkFunction::Logit => {

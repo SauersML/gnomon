@@ -1272,6 +1272,9 @@ pub struct WorkingModelSurvival {
     pub age_exit: Arc<Array1<f64>>,
     pub monotonicity: Arc<MonotonicityPenalty>,
     pub spec: SurvivalSpec,
+    /// Time-varying basis descriptor for computing tensor products at arbitrary ages.
+    /// Required for expected Hessian computation when time-varying effects are present.
+    pub time_varying_basis: Option<BasisDescriptor>,
 }
 
 impl WorkingModelSurvival {
@@ -1290,8 +1293,16 @@ impl WorkingModelSurvival {
             age_exit: Arc::new(data.age_exit.clone()),
             monotonicity: Arc::new(monotonicity),
             spec,
+            time_varying_basis: None,
         })
     }
+
+    /// Set the time-varying basis descriptor for expected Hessian computation.
+    pub fn with_time_varying_basis(mut self, basis: Option<BasisDescriptor>) -> Self {
+        self.time_varying_basis = basis;
+        self
+    }
+
 
     fn build_expected_information_hessian(
         &self,
@@ -1333,6 +1344,38 @@ impl WorkingModelSurvival {
             }
 
             let mut design = Array1::<f64>::zeros(p);
+            
+            // Pre-compute PGS basis for this subject if time-varying effects are present
+            let pgs_basis_reduced: Option<Vec<f64>> = if time_cols > 0 {
+                if let Some(ref tv_basis) = self.time_varying_basis {
+                    // PGS is typically the first static covariate
+                    let pgs_value = self.layout.static_covariates[[i, 0]];
+                    let pgs_dim = tv_basis.knot_vector.len().saturating_sub(tv_basis.degree + 1);
+                    if pgs_dim > 1 {
+                        let mut pgs_buff = vec![0.0; pgs_dim];
+                        let mut scratch = SplineScratch::new(tv_basis.degree);
+                        if evaluate_bspline_basis_scalar(
+                            pgs_value,
+                            tv_basis.knot_vector.view(),
+                            tv_basis.degree,
+                            &mut pgs_buff,
+                            &mut scratch,
+                        ).is_ok() {
+                            // Skip first column (same as build_survival_layout logic)
+                            Some(pgs_buff[1..].to_vec())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
             for j in 0..grid_size {
                 if left_bounds[j] >= exit_age {
                     break;
@@ -1345,7 +1388,36 @@ impl WorkingModelSurvival {
                 if right <= left {
                     continue;
                 }
+                
+                // Assign baseline columns from quadrature design
                 design.assign(&self.monotonicity.quadrature_design.row(j));
+                
+                // Compute time-varying columns: tensor product of baseline_basis(grid_age) ⊗ pgs_basis
+                if time_cols > 0 {
+                    if let Some(ref pgs_reduced) = pgs_basis_reduced {
+                        // baseline basis at this grid point is in quadrature_design columns 0..baseline_cols
+                        let baseline_at_grid: Vec<f64> = self.monotonicity.quadrature_design
+                            .row(j)
+                            .slice(s![..baseline_cols])
+                            .iter()
+                            .copied()
+                            .collect();
+                        
+                        // Tensor product: out[k*pgs_len + l] = baseline[k] * pgs[l]
+                        let pgs_len = pgs_reduced.len();
+                        let expected_time_cols = baseline_cols * pgs_len;
+                        if expected_time_cols == time_cols {
+                            let mut idx = baseline_cols;
+                            for &base_val in &baseline_at_grid {
+                                for &pgs_val in pgs_reduced {
+                                    design[idx] = base_val * pgs_val;
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 if static_cols > 0 {
                     design
                         .slice_mut(s![static_offset..extra_offset])
