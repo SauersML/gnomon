@@ -1877,7 +1877,8 @@ pub fn train_model(
             n_warmup: num_warmup,
             ..hmc::NutsConfig::default()
         };
-
+        
+        // HMC samples from the same posterior as training (including Firth if enabled)
         match hmc::run_nuts_sampling(
             x_matrix.view(),
             data.y.view(),
@@ -1886,6 +1887,7 @@ pub fn train_model(
             final_beta_original.view(),
             penalized_hessian_orig.view(),
             matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit),
+            config.firth_bias_reduction, // Pass Firth flag so HMC matches training likelihood
             &nuts_config,
         ) {
             Ok(result) => {

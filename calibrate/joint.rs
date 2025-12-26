@@ -28,27 +28,10 @@ use crate::calibrate::construction::{
     stable_reparameterization_with_invariant, ReparamInvariant, ReparamResult,
 };
 
-/// Soft clamp using smooth sigmoid transition instead of hard clamp.
-/// This makes the model differentiable everywhere, avoiding the kink at boundaries
-/// that breaks Hessian-based reasoning and finite-difference gradients.
-/// 
-/// For z near 0 or 1, uses a smooth interpolation that:
-/// - Matches the identity function in [margin, 1-margin]
-/// - Smoothly transitions to 0 or 1 at boundaries
-#[inline]
-fn soft_clamp(z: f64, margin: f64) -> f64 {
-    if z <= 0.0 {
-        margin * (z / margin).exp() // Smooth approach to 0
-    } else if z >= 1.0 {
-        1.0 - margin * ((1.0 - z) / margin).exp() // Smooth approach to 1
-    } else if z < margin {
-        margin * (1.0 + (z / margin - 1.0).tanh()) / 2.0 // Smooth near 0
-    } else if z > 1.0 - margin {
-        1.0 - margin * (1.0 + ((1.0 - z) / margin - 1.0).tanh()) / 2.0 // Smooth near 1
-    } else {
-        z // Identity in [margin, 1-margin]
-    }
-}
+// NOTE: We use hard clamp(0,1) everywhere for z standardization.
+// B-splines handle out-of-bounds points naturally via linear extrapolation,
+// and hard clamp is consistent with dz/du = 1/range used in derivative computation.
+// Using soft_clamp would require including its derivative in the chain rule.
 
 /// State for the joint single-index model optimization.
 pub struct JointModelState<'a> {
@@ -301,7 +284,7 @@ impl<'a> JointModelState<'a> {
         // Standardize: z = (u - min) / (max - min) to [0, 1]
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base
-            .mapv(|u| soft_clamp((u - min_u) / range_width, 0.01));
+            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         
         // Build B-spline basis on z ∈ [0, 1]
         let data_range = (0.0, 1.0);
@@ -467,7 +450,7 @@ impl<'a> JointModelState<'a> {
         let (min_u, max_u) = self.knot_range.unwrap_or((0.0, 1.0));
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base
-            .mapv(|u| soft_clamp((u - min_u) / range_width, 0.01));
+            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         
         let b_raw = match create_bspline_basis_with_knots(z.view(), knot_vector.view(), self.degree) {
             Ok((basis, _)) => basis.as_ref().clone(),
@@ -487,7 +470,7 @@ impl<'a> JointModelState<'a> {
         let (min_u, max_u) = self.knot_range.unwrap_or((0.0, 1.0));
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base
-            .mapv(|u| soft_clamp((u - min_u) / range_width, 0.01));
+            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         (z, range_width)
     }
     
@@ -960,7 +943,13 @@ pub fn fit_joint_model<'a>(
         let g_prime = compute_link_derivative_from_state(&state, &u, &b_wiggle);
         
         // Update β with damping (Gauss-Newton with offset)
-        let deviance = state.irls_base_step(&b_wiggle, &g_prime, &lambda_base, damping);
+        state.irls_base_step(&b_wiggle, &g_prime, &lambda_base, damping);
+        
+        // Rebuild basis with updated β before computing deviance for convergence check
+        // This ensures we check convergence on the actual model state, not a stale version
+        let u_new = state.base_linear_predictor();
+        let b_new = state.build_link_basis(&u_new);
+        let deviance = state.compute_deviance(&state.compute_eta_full(&u_new, &b_new));
         
         // Check for convergence
         let delta = (prev_deviance - deviance).abs() / (deviance.abs() + 1.0);
@@ -987,8 +976,13 @@ pub fn fit_joint_model<'a>(
     let knot_range = state.knot_range.unwrap_or((0.0, 1.0));
     let knot_vector = state.knot_vector.clone().unwrap_or_else(|| Array1::zeros(0));
     
+    // Rebuild basis with final β and refit θ to ensure consistency
     let u_final = state.base_linear_predictor();
     let b_final = state.build_link_basis(&u_final);
+    
+    // θ is now potentially in wrong coordinates - refit it one more time
+    state.irls_link_step(&b_final, &u_final, lambda_link);
+    
     let eta_final = state.compute_eta_full(&u_final, &b_final);
     let mut mu_final = Array1::<f64>::zeros(state.n_obs());
     let mut weights_final = Array1::<f64>::zeros(state.n_obs());
@@ -1824,7 +1818,7 @@ fn compute_link_derivative_from_result(
     
     let (min_u, max_u) = result.knot_range;
     let range_width = (max_u - min_u).max(1e-6);
-    let z: Array1<f64> = eta_base.mapv(|u| soft_clamp((u - min_u) / range_width, 0.01));
+    let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
     let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
     let n_constrained = result.link_transform.ncols();
     if n_raw == 0 || n_constrained == 0 || result.beta_link.len() != n_constrained {
@@ -1889,7 +1883,7 @@ pub fn predict_joint(
     let range_width = (max_u - min_u).max(1e-6);
     
     // Standardize: z = (u - min) / range
-    let z: Array1<f64> = eta_base.mapv(|u| soft_clamp((u - min_u) / range_width, 0.01));
+    let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
     
     // Build B-spline basis at prediction points using stored parameters
     let b_wiggle = match create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
