@@ -1393,6 +1393,11 @@ lemma risk_affine_additive
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1^2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩)^2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ)
     (β a b : ℝ) :
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
@@ -1434,8 +1439,56 @@ lemma risk_affine_additive
           - 2*u*a * (∫ pc, pc.1 ∂μ)
           - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
         -- This step requires integral linearity and integrability hypotheses
-        -- The integrability of P, P², C, C², PC all follow from the finite moment assumptions
-        admit -- Integral linearity (requires integrability of all terms)
+        have i_P2 : Integrable (fun pc => u^2 * pc.1^2) μ := hP2_int.const_mul (u^2)
+        have i_C2 : Integrable (fun pc => β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
+        have i_a2 : Integrable (fun _ => a^2) μ := by simp
+        have i_PC : Integrable (fun pc => 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩) μ := hPC_int.const_mul (2*u*β)
+        have i_P : Integrable (fun pc => -2*u*a * pc.1) μ := hP_int.const_mul (-2*u*a)
+        have i_C : Integrable (fun pc => -2*a*β * pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (-2*a*β)
+        -- The whole expression is integrable
+        have i_all : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+                                  + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
+                                  - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := by
+          -- Add and subtract terms
+          exact (((((i_P2.add i_C2).add i_a2).add i_PC).sub i_P).sub i_C)
+
+        -- Apply linearity rules in a calc block to avoid timeout
+        calc
+          ∫ (pc : ℝ × (Fin 1 → ℝ)), u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2
+            + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
+            - 2 * u * a * pc.1 - 2 * a * β * pc.2 ⟨0, by norm_num⟩ ∂μ
+          = (∫ pc, u^2 * pc.1^2 ∂μ)
+            + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
+            + (∫ pc, a^2 ∂μ)
+            + (∫ pc, 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
+            - (∫ pc, 2*u*a * pc.1 ∂μ)
+            - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+              simp_rw [integral_add, integral_sub, i_all, i_P, i_C, i_P2, i_C2, i_a2, i_PC]
+              -- Need to associate the additions correctly for simp_rw
+              have h1 : Integrable (u^2 * · ^ 2) μ := i_P2
+              have h2 : Integrable (β^2 * (· ⟨0, _⟩)^2) μ := i_C2
+              have h3 : Integrable (fun _ => a^2) μ := i_a2
+              have h4 : Integrable (2*u*β * · * · ⟨0, _⟩) μ := i_PC
+              have h5 : Integrable (2*u*a * ·) μ := i_P.const_mul (-1)
+              have h6 : Integrable (2*a*β * · ⟨0, _⟩) μ := i_C.const_mul (-1)
+              -- Re-prove with explicit structure
+              have h_add1 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, _⟩)^2) μ := i_P2.add i_C2
+              have h_add2 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, _⟩)^2 + a^2) μ := h_add1.add i_a2
+              have h_add3 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, _⟩)^2 + a^2 + 2*u*β*(pc.1*pc.2 ⟨0, _⟩)) μ := h_add2.add i_PC
+              have h_sub1 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, _⟩)^2 + a^2 + 2*u*β*(pc.1*pc.2 ⟨0, _⟩) - 2*u*a*pc.1) μ := h_add3.sub (i_P.const_mul (-1))
+              rw [integral_sub h_sub1 (i_C.const_mul (-1))]
+              rw [integral_add h_add3 (i_P.const_mul (-1))]
+              rw [integral_add h_add2 i_PC]
+              rw [integral_add h_add1 i_a2]
+              rw [integral_add i_P2 i_C2]
+              -- Pull out constants
+              simp_rw [integral_const_mul, integral_const]
+              ring
+          _ = u^2 * (∫ pc, pc.1^2 ∂μ) + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
+              + 2*u*β * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
+              - 2*u*a * (∫ pc, pc.1 ∂μ)
+              - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+            simp [integral_const_mul, integral_const]
       _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
           + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
         rw [hP2, hPC0, hP0, hC0]
@@ -1451,6 +1504,11 @@ lemma risk_affine_scenario4
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1^2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩)^2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ)
     (a b : ℝ) :
     ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
@@ -1467,7 +1525,7 @@ lemma risk_affine_scenario4
   simp_rw [h_rewrite]
 
   -- Apply the general lemma
-  have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 (-0.8) a b
+  have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 hP_int hC_int hP2_int hC2_int hPC_int (-0.8) a b
 
   -- Simplify (-0.8)² = 0.64
   simp only [neg_mul] at h_gen ⊢
