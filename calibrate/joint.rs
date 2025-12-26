@@ -73,6 +73,8 @@ pub struct JointModelState<'a> {
     covariate_se: Option<Array1<f64>>,
     /// Enable Firth bias reduction for separation protection
     firth_bias_reduction: bool,
+    /// Last full linear predictor (u + wiggle) for weight-aligned constraints.
+    last_eta: Option<Array1<f64>>,
 }
 
 /// Configuration for joint model fitting
@@ -185,6 +187,7 @@ impl<'a> JointModelState<'a> {
             n_constrained_basis: n_constrained,
             covariate_se: None,
             firth_bias_reduction: config.firth_bias_reduction,
+            last_eta: None,
         }
     }
     
@@ -240,27 +243,48 @@ impl<'a> JointModelState<'a> {
     /// Also updates internal state with transform and projected penalty
     /// 
     /// The orthogonality constraint is applied using IRLS working weights
-    /// (w_irls = prior_weights * μ(1-μ)) to align with the optimization metric.
+    /// from the current linear predictor to align with the optimization metric.
     /// 
     /// Returns Err if z has degenerate variance (cannot build identifiable constraint).
     pub fn build_link_basis(&mut self, eta_base: &Array1<f64>) -> Result<Array2<f64>, String> {
         use crate::calibrate::basis::apply_weighted_orthogonality_constraint;
         
-        // Compute IRLS working weights: w_irls = prior_weights * μ(1-μ)
-        // This aligns the constraint metric with the IRLS quadratic approximation
-        let irls_weights: Array1<f64> = match self.link {
-            LinkFunction::Logit => {
-                let mu: Array1<f64> = eta_base.mapv(|e| {
-                    let e_clamped = e.clamp(-700.0, 700.0);
-                    1.0 / (1.0 + f64::exp(-e_clamped))
-                });
-                self.weights.iter()
-                    .zip(mu.iter())
-                    .map(|(&w, &m)| w * m * (1.0 - m))
-                    .collect()
-            }
-            LinkFunction::Identity => self.weights.to_owned(),
+        let eta_for_weights = match &self.last_eta {
+            Some(last) if last.len() == eta_base.len() => last,
+            _ => eta_base,
         };
+
+        // Compute IRLS working weights to align constraint metric with the IRLS quadratic approximation.
+        let mut mu = Array1::<f64>::zeros(eta_base.len());
+        let mut irls_weights = Array1::<f64>::zeros(eta_base.len());
+        let mut z = Array1::<f64>::zeros(eta_base.len());
+        match (&self.link, &self.covariate_se) {
+            (LinkFunction::Logit, Some(se)) => {
+                crate::calibrate::pirls::update_glm_vectors_integrated(
+                    self.y,
+                    eta_for_weights,
+                    se.view(),
+                    self.weights,
+                    &mut mu,
+                    &mut irls_weights,
+                    &mut z,
+                );
+            }
+            (LinkFunction::Logit, None) => {
+                crate::calibrate::pirls::update_glm_vectors(
+                    self.y,
+                    eta_for_weights,
+                    LinkFunction::Logit,
+                    self.weights,
+                    &mut mu,
+                    &mut irls_weights,
+                    &mut z,
+                );
+            }
+            (LinkFunction::Identity, _) => {
+                irls_weights.assign(&self.weights);
+            }
+        }
         
         let n = eta_base.len();
         let k = self.n_link_knots;
@@ -446,7 +470,7 @@ impl<'a> JointModelState<'a> {
                 return b_raw.dot(transform);
             }
         }
-        b_raw
+        Array2::zeros((n, self.beta_link.len()))
     }
     
     /// Compute standardized z values and range width for current knot range.
@@ -536,6 +560,7 @@ impl<'a> JointModelState<'a> {
         } else {
             u.clone()
         };
+        self.last_eta = Some(eta.clone());
         
         // Allocate working vectors
         let mut mu = Array1::<f64>::zeros(n);
@@ -569,7 +594,7 @@ impl<'a> JointModelState<'a> {
         }
         
         // When Firth is enabled for logit, compute Firth correction using hat diagonal
-        // Firth modifies the working response: z_firth = z + h_ii * (0.5 - μ) / (w * μ(1-μ))
+        // Firth modifies the working response: z_firth = z + h_ii * (0.5 - μ) / w_i
         let z_firth = if self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit) && b_wiggle.ncols() > 0 {
             // Compute hat diagonal: h = diag(B(B'WB + λS)^{-1}B'W)
             // For efficiency, use: h_ii = w_i * ||solve(H, b_i)||^2 where b_i is ith row of B√w
@@ -615,11 +640,13 @@ impl<'a> JointModelState<'a> {
                 let solved = chol.solve_mat(&b_row.insert_axis(ndarray::Axis(1))).column(0).to_owned();
                 let h_ii: f64 = solved.iter().map(|x| x * x).sum();
                 
-                // Firth correction to working response: 
-                // Add h_ii * (0.5 - μ_i) / (μ_i(1-μ_i)) term
-                // This biases coefficients toward zero when separation threatens
-                let firth_adj = h_ii * (0.5 - mi) / (mi * (1.0 - mi));
-                z_adj[i] += firth_adj;
+                let wi = weights[i];
+                if wi > 0.0 {
+                    // Firth correction to working response
+                    // This biases coefficients toward zero when separation threatens
+                    let firth_adj = h_ii * (0.5 - mi) / wi;
+                    z_adj[i] += firth_adj;
+                }
             }
             z_adj
         } else {
@@ -789,11 +816,12 @@ impl<'a> JointModelState<'a> {
                     let solved = chol.solve_mat(&x_row.insert_axis(ndarray::Axis(1))).column(0).to_owned();
                     let h_ii: f64 = solved.iter().map(|x| x * x).sum();
                     
-                    // Firth correction to working response
-                    let g = g_prime[i];
-                    let g_safe = if g.abs() < 1e-8 { 1e-8 } else { g.abs() };
-                    let firth_adj = h_ii * (0.5 - mi) / (mi * (1.0 - mi) * g_safe);
-                    z_eff[i] += firth_adj;
+                    let wi = w_eff[i];
+                    if wi > 0.0 {
+                        // Firth correction to working response
+                        let firth_adj = h_ii * (0.5 - mi) / wi;
+                        z_eff[i] += firth_adj;
+                    }
                 }
             }
         }
@@ -817,6 +845,7 @@ impl<'a> JointModelState<'a> {
             Array1::zeros(n)
         };
         let eta_updated: Array1<f64> = &u_updated + &wiggle_updated;
+        self.last_eta = Some(eta_updated.clone());
         let mut mu_updated = Array1::<f64>::zeros(n);
         let mut weights_updated = Array1::<f64>::zeros(n);
         let mut z_updated = Array1::<f64>::zeros(n);
@@ -1111,8 +1140,9 @@ impl<'a> JointRemlState<'a> {
             state = state.with_covariate_se(se);
         }
         let u0 = state.base_linear_predictor();
-        state.build_link_basis(&u0)
-            .map_err(|e| EstimationError::InvalidSpecification(e))?;
+        if let Err(e) = state.build_link_basis(&u0) {
+            eprintln!("[JOINT] Warning during initialization: {e}");
+        }
         let n_base = state.s_base.len();
         let cached_beta_base = state.beta_base.clone();
         let cached_beta_link = state.beta_link.clone();
@@ -1194,7 +1224,8 @@ impl<'a> JointRemlState<'a> {
         Ok(-laml)
     }
     
-    /// Compute LAML at the converged solution
+    /// Compute LAML at the converged solution.
+    /// Note: for nonlinear g(u), this uses a Gauss-Newton Hessian approximation.
     fn compute_laml_at_convergence(&self, state: &JointModelState, lambda_base: &Array1<f64>, lambda_link: f64) -> (f64, Option<f64>) {
         let n = state.n_obs();
         let u = state.base_linear_predictor();
@@ -1203,42 +1234,83 @@ impl<'a> JointRemlState<'a> {
         // Compute eta = u + B_wiggle * theta
         let eta = state.compute_eta_full(&u, &b_wiggle);
         
-        // Compute mu/weights at convergence
+        // Compute mu/weights/residuals at convergence
         let mut mu = Array1::<f64>::zeros(n);
         let mut weights = Array1::<f64>::zeros(n);
-        let mut z = Array1::<f64>::zeros(n);
-        crate::calibrate::pirls::update_glm_vectors(
-            state.y,
-            &eta,
-            state.link.clone(),
-            state.weights,
-            &mut mu,
-            &mut weights,
-            &mut z,
-        );
-        drop(z);
+        let mut residual = Array1::<f64>::zeros(n);
+        match (&state.link, &state.covariate_se) {
+            (LinkFunction::Logit, Some(se)) => {
+                use crate::calibrate::quadrature::logit_posterior_mean_with_deriv;
+                const PROB_EPS: f64 = 1e-8;
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                for i in 0..n {
+                    let e = eta[i].clamp(-700.0, 700.0);
+                    let se_i = se[i].max(0.0);
+                    let (mu_i, dmu_deta) = logit_posterior_mean_with_deriv(e, se_i);
+                    let mu_c = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    mu[i] = mu_c;
+                    let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
+                    let dmu_sq = dmu_deta * dmu_deta;
+                    let w = (dmu_sq / var).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * w;
+                    let denom = dmu_deta.abs().max(MIN_DMU);
+                    residual[i] = weights[i] * (mu_c - state.y[i]) / denom;
+                }
+            }
+            (LinkFunction::Logit, None) => {
+                const PROB_EPS: f64 = 1e-8;
+                const MIN_WEIGHT: f64 = 1e-12;
+                const MIN_DMU: f64 = 1e-6;
+                for i in 0..n {
+                    let e = eta[i].clamp(-700.0, 700.0);
+                    let mu_i = (1.0 / (1.0 + (-e).exp())).clamp(PROB_EPS, 1.0 - PROB_EPS);
+                    mu[i] = mu_i;
+                    let dmu = (mu_i * (1.0 - mu_i)).max(MIN_WEIGHT);
+                    weights[i] = state.weights[i] * dmu;
+                    let denom = dmu.max(MIN_DMU);
+                    residual[i] = weights[i] * (mu_i - state.y[i]) / denom;
+                }
+            }
+            (LinkFunction::Identity, _) => {
+                for i in 0..n {
+                    mu[i] = eta[i];
+                    weights[i] = state.weights[i];
+                    residual[i] = weights[i] * (mu[i] - state.y[i]);
+                }
+            }
+        }
         let deviance = state.compute_deviance(&mu);
         
         // Build joint Jacobian blocks and penalized Hessian via Schur complement
         let p_base = state.x_base.ncols();
         let p_link = b_wiggle.ncols();
         
-        let g_prime = compute_link_derivative_from_state(state, &u, &b_wiggle);
+        let (g_prime, g_second, b_prime_u) = compute_link_derivative_terms_from_state(state, &u);
         
-        // A = X' diag(W * g'^2) X + S_base
+        // A = X' diag(W * g'^2 + r * g'') X + S_base
         let mut w_eff = Array1::<f64>::zeros(n);
         for i in 0..n {
             w_eff[i] = weights[i] * g_prime[i] * g_prime[i];
         }
         let mut x_weighted = state.x_base.to_owned();
         for i in 0..n {
-            let scale = w_eff[i].sqrt();
+            let scale = w_eff[i].max(0.0).sqrt();
             for j in 0..p_base {
                 x_weighted[[i, j]] *= scale;
             }
         }
-        
+
         let mut a_mat = crate::calibrate::faer_ndarray::fast_ata(&x_weighted);
+        let mut x_scaled = state.x_base.to_owned();
+        for i in 0..n {
+            let scale = residual[i] * g_second[i];
+            for j in 0..p_base {
+                x_scaled[[i, j]] *= scale;
+            }
+        }
+        let a_resid = crate::calibrate::faer_ndarray::fast_atb(&state.x_base, &x_scaled);
+        a_mat += &a_resid;
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
             if lambda_k > 0.0 && s_k.nrows() == p_base && s_k.ncols() == p_base {
@@ -1249,7 +1321,7 @@ impl<'a> JointRemlState<'a> {
             a_mat[[i, i]] += 1e-8;
         }
         
-        // C = X' diag(W * g') B
+        // C = X' diag(W * g') B + X' diag(r) B'
         let mut wb = b_wiggle.clone();
         for i in 0..n {
             let scale = weights[i] * g_prime[i];
@@ -1257,6 +1329,14 @@ impl<'a> JointRemlState<'a> {
                 wb[[i, j]] *= scale;
             }
         }
+        let mut wb_resid = b_prime_u.clone();
+        for i in 0..n {
+            let scale = residual[i];
+            for j in 0..p_link {
+                wb_resid[[i, j]] *= scale;
+            }
+        }
+        wb += &wb_resid;
         let c_mat = crate::calibrate::faer_ndarray::fast_atb(&state.x_base, &wb);
         
         // D = B' W B + S_link
@@ -1537,18 +1617,36 @@ impl<'a> JointRemlState<'a> {
             let mut rho_plus = rho.clone();
             rho_plus[k] += h;
             let cost_plus = self.compute_cost(&rho_plus)?;
+            if !cost_plus.is_finite() {
+                snapshot.restore(self);
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "Non-finite LAML in +h finite-difference step.".to_string(),
+                ));
+            }
             
             snapshot.restore(self);
             // Backward step  
             let mut rho_minus = rho.clone();
             rho_minus[k] -= h;
             let cost_minus = self.compute_cost(&rho_minus)?;
+            if !cost_minus.is_finite() {
+                snapshot.restore(self);
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "Non-finite LAML in -h finite-difference step.".to_string(),
+                ));
+            }
             
             // Central difference
             grad[k] = (cost_plus - cost_minus) / (2.0 * h);
         }
         
         snapshot.restore(self);
+
+        if grad.iter().any(|v| !v.is_finite()) {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "Non-finite gradient from finite-difference LAML.".to_string(),
+            ));
+        }
         
         Ok(grad)
     }
@@ -1559,18 +1657,18 @@ impl<'a> JointRemlState<'a> {
             Ok(val) if val.is_finite() => val,
             Ok(_) => {
                 eprintln!("[JOINT][REML] Non-finite cost; returning large penalty.");
-                return (f64::INFINITY, Array1::zeros(rho.len()));
+                return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
             Err(err) => {
                 eprintln!("[JOINT][REML] Cost evaluation failed: {err}");
-                return (f64::INFINITY, Array1::zeros(rho.len()));
+                return (f64::INFINITY, Array1::from_elem(rho.len(), f64::NAN));
             }
         };
         let grad = match self.compute_gradient(rho) {
             Ok(grad) => grad,
             Err(err) => {
                 eprintln!("[JOINT][REML] Gradient evaluation failed: {err}");
-                Array1::zeros(rho.len())
+                Array1::from_elem(rho.len(), f64::NAN)
             }
         };
         (cost, grad)
@@ -1624,6 +1722,7 @@ impl<'a> JointRemlState<'a> {
 /// Fit joint model with proper REML-based lambda selection via BFGS
 /// 
 /// Uses Laplace approximate marginal likelihood (LAML) with numerical gradient.
+/// For nonlinear g(u), the Hessian is Gauss-Newton (approximate).
 pub fn fit_joint_model_with_reml<'a>(
     y: ArrayView1<'a, f64>,
     weights: ArrayView1<'a, f64>,
@@ -1782,6 +1881,105 @@ fn compute_link_derivative_from_state(
     deriv
 }
 
+fn compute_link_derivative_terms_from_state(
+    state: &JointModelState,
+    u: &Array1<f64>,
+) -> (Array1<f64>, Array1<f64>, Array2<f64>) {
+    use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
+    use crate::calibrate::basis::evaluate_bspline_second_derivative_scalar_into;
+    use crate::calibrate::basis::internal::BsplineScratch;
+
+    let n = u.len();
+    let p_link = state.beta_link.len();
+    let mut g_prime = Array1::<f64>::ones(n);
+    let mut g_second = Array1::<f64>::zeros(n);
+    let mut b_prime_u = Array2::<f64>::zeros((n, p_link));
+
+    if p_link == 0 {
+        return (g_prime, g_second, b_prime_u);
+    }
+    let Some(knot_vector) = state.knot_vector.as_ref() else {
+        return (g_prime, g_second, b_prime_u);
+    };
+    let Some(link_transform) = state.link_transform.as_ref() else {
+        return (g_prime, g_second, b_prime_u);
+    };
+
+    let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
+    if n_raw == 0 || link_transform.nrows() != n_raw || link_transform.ncols() != p_link {
+        return (g_prime, g_second, b_prime_u);
+    }
+
+    let (z, range_width) = state.standardized_z(u);
+    let inv_rw = 1.0 / range_width;
+    let inv_rw2 = inv_rw * inv_rw;
+
+    let mut deriv_raw = vec![0.0; n_raw];
+    let num_basis_lower = knot_vector.len().saturating_sub(state.degree);
+    let mut lower_basis = vec![0.0; num_basis_lower];
+    let mut lower_scratch = BsplineScratch::new(state.degree.saturating_sub(1));
+
+    let mut second_raw = vec![0.0; n_raw];
+    let num_basis_lower_second = knot_vector.len().saturating_sub(state.degree - 1);
+    let mut deriv_lower = vec![0.0; num_basis_lower_second.saturating_sub(1)];
+    let mut lower_basis_second = vec![0.0; num_basis_lower_second];
+    let mut lower_scratch_second = BsplineScratch::new(state.degree.saturating_sub(2));
+
+    for i in 0..n {
+        let z_i = z[i];
+        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+            continue;
+        }
+
+        deriv_raw.fill(0.0);
+        if evaluate_bspline_derivative_scalar_into(
+            z_i,
+            knot_vector.view(),
+            state.degree,
+            &mut deriv_raw,
+            &mut lower_basis,
+            &mut lower_scratch,
+        ).is_err() {
+            continue;
+        }
+
+        let mut d_wiggle_dz = 0.0;
+        for c in 0..p_link {
+            let mut b_prime_c = 0.0;
+            for r in 0..n_raw {
+                b_prime_c += deriv_raw[r] * link_transform[[r, c]];
+            }
+            b_prime_u[[i, c]] = b_prime_c * inv_rw;
+            d_wiggle_dz += b_prime_c * state.beta_link[c];
+        }
+        g_prime[i] = 1.0 + d_wiggle_dz * inv_rw;
+
+        second_raw.fill(0.0);
+        if evaluate_bspline_second_derivative_scalar_into(
+            z_i,
+            knot_vector.view(),
+            state.degree,
+            &mut second_raw,
+            &mut deriv_lower,
+            &mut lower_basis_second,
+            &mut lower_scratch_second,
+        ).is_err() {
+            continue;
+        }
+        let mut d2_wiggle_dz2 = 0.0;
+        for c in 0..p_link {
+            let mut b_second_c = 0.0;
+            for r in 0..n_raw {
+                b_second_c += second_raw[r] * link_transform[[r, c]];
+            }
+            d2_wiggle_dz2 += b_second_c * state.beta_link[c];
+        }
+        g_second[i] = d2_wiggle_dz2 * inv_rw2;
+    }
+
+    (g_prime, g_second, b_prime_u)
+}
+
 /// Public version for use in HMC Hessian computation
 pub fn compute_link_derivative_from_result_public(
     result: &JointModelResult,
@@ -1881,7 +2079,7 @@ pub fn predict_joint(
             if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
                 raw.dot(&result.link_transform)
             } else {
-                raw.clone()
+                Array2::zeros((n, result.beta_link.len()))
             }
         }
         Err(_) => Array2::zeros((n, result.beta_link.len())),

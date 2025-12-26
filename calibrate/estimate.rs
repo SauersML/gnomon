@@ -779,65 +779,97 @@ impl core::fmt::Debug for EstimationError {
 
 /// Compute g'(u) using analytic B-spline derivatives (same as HMC).
 /// g(u) = u + B(z(u)) @ θ, so g'(u) = 1 + dB/dz @ θ / range_width
-fn compute_analytic_gprime(
+fn compute_analytic_gprime_terms(
     eta_base: &Array1<f64>,
     result: &crate::calibrate::joint::JointModelResult,
-) -> Array1<f64> {
+) -> (Array1<f64>, Array1<f64>, Array2<f64>) {
     use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
-    
+    use crate::calibrate::basis::evaluate_bspline_second_derivative_scalar_into;
+
     let n = eta_base.len();
     let mut g_prime = Array1::<f64>::ones(n);
-    
+    let mut g_second = Array1::<f64>::zeros(n);
+    let mut b_prime_u = Array2::<f64>::zeros((n, result.beta_link.len()));
+
     let (min_u, max_u) = result.knot_range;
     let rw = (max_u - min_u).max(1e-6);
+    let inv_rw = 1.0 / rw;
+    let inv_rw2 = inv_rw * inv_rw;
     let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
     let n_c = result.link_transform.ncols();
     let theta = &result.beta_link;
-    
-    if n_raw == 0 || n_c == 0 || theta.len() != n_c {
-        return g_prime;
+
+    if n_raw == 0 || n_c == 0 || theta.len() != n_c || result.link_transform.nrows() != n_raw {
+        return (g_prime, g_second, b_prime_u);
     }
-    
-    // Preallocate ALL buffers outside the loop (zero-allocation, same as HMC)
+
     let mut deriv_raw = vec![0.0; n_raw];
     let num_basis_lower = result.knot_vector.len().saturating_sub(result.degree);
     let mut lower_basis = vec![0.0; num_basis_lower];
     let mut lower_scratch = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(1));
-    
+
+    let mut second_raw = vec![0.0; n_raw];
+    let num_basis_lower_second = result.knot_vector.len().saturating_sub(result.degree - 1);
+    let mut deriv_lower = vec![0.0; num_basis_lower_second.saturating_sub(1)];
+    let mut lower_basis_second = vec![0.0; num_basis_lower_second];
+    let mut lower_scratch_second = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(2));
+
     for i in 0..n {
         let u_i = eta_base[i];
         let z_i = ((u_i - min_u) / rw).clamp(0.0, 1.0);
-        
-        // At boundaries, g'(u) = 1 (wiggle is constant)
+
         if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-            g_prime[i] = 1.0;
             continue;
         }
-        
+
         deriv_raw.fill(0.0);
         if evaluate_bspline_derivative_scalar_into(
-            z_i, result.knot_vector.view(), result.degree, 
-            &mut deriv_raw, &mut lower_basis, &mut lower_scratch
+            z_i,
+            result.knot_vector.view(),
+            result.degree,
+            &mut deriv_raw,
+            &mut lower_basis,
+            &mut lower_scratch,
         ).is_err() {
             continue;
         }
-        
-        // d(wiggle)/dz = B'(z) @ Z @ θ
-        let d_wiggle_dz: f64 = if result.link_transform.nrows() == n_raw {
-            (0..n_c).map(|c| {
-                let b_prime_c: f64 = (0..n_raw).map(|r| 
-                    deriv_raw[r] * result.link_transform[[r, c]]
-                ).sum();
-                b_prime_c * theta[c]
-            }).sum()
-        } else {
-            0.0
-        };
-        
-        g_prime[i] = 1.0 + d_wiggle_dz / rw;
+
+        let mut d_wiggle_dz = 0.0;
+        for c in 0..n_c {
+            let mut b_prime_c = 0.0;
+            for r in 0..n_raw {
+                b_prime_c += deriv_raw[r] * result.link_transform[[r, c]];
+            }
+            b_prime_u[[i, c]] = b_prime_c * inv_rw;
+            d_wiggle_dz += b_prime_c * theta[c];
+        }
+        g_prime[i] = 1.0 + d_wiggle_dz * inv_rw;
+
+        second_raw.fill(0.0);
+        if evaluate_bspline_second_derivative_scalar_into(
+            z_i,
+            result.knot_vector.view(),
+            result.degree,
+            &mut second_raw,
+            &mut deriv_lower,
+            &mut lower_basis_second,
+            &mut lower_scratch_second,
+        ).is_err() {
+            continue;
+        }
+
+        let mut d2_wiggle_dz2 = 0.0;
+        for c in 0..n_c {
+            let mut b_second_c = 0.0;
+            for r in 0..n_raw {
+                b_second_c += second_raw[r] * result.link_transform[[r, c]];
+            }
+            d2_wiggle_dz2 += b_second_c * theta[c];
+        }
+        g_second[i] = d2_wiggle_dz2 * inv_rw2;
     }
-    
-    g_prime
+
+    (g_prime, g_second, b_prime_u)
 }
 
 /// Compute the joint penalized Hessian matrix for the (β, θ) parameters.
@@ -919,18 +951,33 @@ fn compute_joint_penalized_hessian(
         }
     }
     
-    // Compute g'(u) at the mode
-    let g_prime = compute_analytic_gprime(&eta_base, result);
+    // Compute g'(u), g''(u), and B'(u) at the mode
+    let (g_prime, g_second, b_prime_u) = compute_analytic_gprime_terms(&eta_base, result);
     
     // Build joint Hessian blocks
     let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
+    
+    // Compute residuals for full observed-information terms
+    let mut residual = Array1::<f64>::zeros(n);
+    if is_logit {
+        for i in 0..n {
+            let eta_i = eta_full[i].clamp(-700.0, 700.0);
+            let mu_i = 1.0 / (1.0 + (-eta_i).exp());
+            residual[i] = weights[i] * (mu_i - y[i]);
+        }
+    } else {
+        let inv_scale = 1.0 / scale_val.max(1e-10);
+        for i in 0..n {
+            residual[i] = weights[i] * (eta_full[i] - y[i]) * inv_scale;
+        }
+    }
     
     // Compute weighted matrices: sqrt(w*g'^2)*X and sqrt(w)*B
     let mut x_weighted = x_matrix.to_owned();
     let mut b_weighted = b_wiggle.clone();
     for i in 0..n {
-        let sqrt_wg2 = (w_eff[i] * g_prime[i] * g_prime[i]).sqrt();
-        let sqrt_w = w_eff[i].sqrt();
+        let sqrt_wg2 = (w_eff[i] * g_prime[i] * g_prime[i]).max(0.0).sqrt();
+        let sqrt_w = w_eff[i].max(0.0).sqrt();
         for j in 0..p_base {
             x_weighted[[i, j]] *= sqrt_wg2;
         }
@@ -939,11 +986,19 @@ fn compute_joint_penalized_hessian(
         }
     }
     
-    // Base block: X'WX + S_base
+    // Base block: X'WX + X' diag(r * g'') X + S_base
     let xtx = x_weighted.t().dot(&x_weighted);
+    let mut x_scaled = x_matrix.to_owned();
+    for i in 0..n {
+        let scale = residual[i] * g_second[i];
+        for j in 0..p_base {
+            x_scaled[[i, j]] *= scale;
+        }
+    }
+    let xtx_resid = crate::calibrate::faer_ndarray::fast_atb(&x_matrix, &x_scaled);
     for j in 0..p_base {
         for k in 0..p_base {
-            joint_hessian[[j, k]] = xtx[[j, k]] + s_base_accum[[j, k]];
+            joint_hessian[[j, k]] = xtx[[j, k]] + xtx_resid[[j, k]] + s_base_accum[[j, k]];
         }
     }
     
@@ -955,15 +1010,23 @@ fn compute_joint_penalized_hessian(
         }
     }
     
-    // Cross block: C = X' diag(W * g') B
-    let mut x_gw = x_matrix.to_owned();
+    // Cross block: C = X' diag(W * g') B + X' diag(r) B'
+    let mut wb = b_wiggle.clone();
     for i in 0..n {
         let wg = w_eff[i] * g_prime[i];
-        for j in 0..p_base {
-            x_gw[[i, j]] *= wg;
+        for j in 0..p_link {
+            wb[[i, j]] *= wg;
         }
     }
-    let cross = x_gw.t().dot(&b_wiggle);
+    let mut wb_resid = b_prime_u.clone();
+    for i in 0..n {
+        let scale = residual[i];
+        for j in 0..p_link {
+            wb_resid[[i, j]] *= scale;
+        }
+    }
+    wb += &wb_resid;
+    let cross = x_matrix.t().dot(&wb);
     for j in 0..p_base {
         for k in 0..p_link {
             joint_hessian[[j, p_base + k]] = cross[[j, k]];
@@ -1016,6 +1079,46 @@ pub fn train_joint_model(
         layout.total_coeffs, layout.num_penalties
     );
     
+    eprintln!("[JOINT] Starting joint optimization with REML...");
+    let link = match config.link_function() {
+        Ok(link) => link,
+        Err(err) => {
+            return Err(EstimationError::InvalidSpecification(err.to_string()));
+        }
+    };
+
+    // Auto-detect Firth for logit models based on data characteristics
+    let firth_enabled = if matches!(link, LinkFunction::Logit) {
+        if config.firth_bias_reduction {
+            true // User explicitly enabled
+        } else {
+            let n = data.y.len();
+            let p = layout.total_coeffs;
+            let prevalence = data.y.iter().filter(|&&y| y > 0.5).count() as f64 / n as f64;
+            let min_prevalence = prevalence.min(1.0 - prevalence);
+            let should_use = min_prevalence < 0.10 || n < 500 || (p as f64 / n as f64) > 0.1;
+            if should_use {
+                eprintln!(
+                    "[AUTO] Enabling Firth bias reduction (prevalence={:.1}%, n={}, p={})",
+                    min_prevalence * 100.0,
+                    n,
+                    p
+                );
+            }
+            should_use
+        }
+    } else {
+        false
+    };
+
+    let config = if firth_enabled != config.firth_bias_reduction {
+        let mut c = config.clone();
+        c.firth_bias_reduction = firth_enabled;
+        std::borrow::Cow::Owned(c)
+    } else {
+        std::borrow::Cow::Borrowed(config)
+    };
+
     // Configure joint model
     let joint_config = JointModelConfig {
         max_backfit_iter: 100,
@@ -1024,14 +1127,6 @@ pub fn train_joint_model(
         reml_tol: 1e-4,
         n_link_knots: 10, // 10 internal knots for flexible link
         firth_bias_reduction: config.firth_bias_reduction, // Inherit from model config
-    };
-    
-    eprintln!("[JOINT] Starting joint optimization with REML...");
-    let link = match config.link_function() {
-        Ok(link) => link,
-        Err(err) => {
-            return Err(EstimationError::InvalidSpecification(err.to_string()));
-        }
     };
     let s_list_for_mcmc = s_list.clone(); // Clone for MCMC use after fit
     
@@ -1048,7 +1143,7 @@ pub fn train_joint_model(
 
     // Build a base TrainedModel so predictions can be reproduced.
     let mapped_coefficients = map_coefficients(&result.beta_base, &layout)?;
-    let mut config_with_constraints = config.clone();
+    let mut config_with_constraints = (*config).clone();
     config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.range_transforms = range_transforms;
@@ -1246,6 +1341,40 @@ pub fn train_model(
             });
         }
     }
+    
+    // Auto-detect Firth for logit models based on data characteristics
+    let firth_enabled = if matches!(config.link_function().expect("link"), LinkFunction::Logit) {
+        if config.firth_bias_reduction {
+            true // User explicitly enabled
+        } else {
+            // Auto-detect: enable Firth if rare events, small sample, or high dimensionality
+            let n = data.y.len();
+            let p = layout.total_coeffs;
+            let prevalence = data.y.iter().filter(|&&y| y > 0.5).count() as f64 / n as f64;
+            let min_prevalence = prevalence.min(1.0 - prevalence);
+            
+            let should_use = min_prevalence < 0.10  // Rare events (<10% prevalence)
+                || n < 500                           // Small sample
+                || (p as f64 / n as f64) > 0.1;      // High dimensionality
+            
+            if should_use {
+                eprintln!("[AUTO] Enabling Firth bias reduction (prevalence={:.1}%, n={}, p={})", 
+                    min_prevalence * 100.0, n, p);
+            }
+            should_use
+        }
+    } else {
+        false // Not logit, Firth not applicable
+    };
+    
+    // Create modified config with auto-detected Firth
+    let config = if firth_enabled != config.firth_bias_reduction {
+        let mut c = config.clone();
+        c.firth_bias_reduction = firth_enabled;
+        std::borrow::Cow::Owned(c)
+    } else {
+        std::borrow::Cow::Borrowed(config)
+    };
 
     // --- Setup the unified state and computation object ---
     // This now encapsulates everything needed for the optimization.
@@ -1255,7 +1384,7 @@ pub fn train_model(
         data.weights.view(),
         s_list.clone(),
         &layout,
-        config,
+        &*config,
         None,
     )?;
 
@@ -1276,7 +1405,7 @@ pub fn train_model(
             Some(reml_state.balanced_penalty_root()),
             None,
             &layout,
-            config,
+            &*config,
             None,
             None, // No SE for base model (not calibrator)
         )?;
@@ -1332,7 +1461,7 @@ pub fn train_model(
         let mapped_coefficients =
             crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
 
-        let mut config_with_constraints = config.clone();
+        let mut config_with_constraints = (*config).clone();
         config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
         config_with_constraints.knot_vectors = knot_vectors;
         config_with_constraints.range_transforms = range_transforms;
@@ -1590,7 +1719,7 @@ pub fn train_model(
             continue;
         }
 
-        match run_bfgs_for_candidate(&label, &reml_state, config, initial_z) {
+        match run_bfgs_for_candidate(&label, &reml_state, &*config, initial_z) {
             Ok((solution, grad_norm_rho, is_stationary)) => {
                 eprintln!(
                     "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
@@ -1625,7 +1754,7 @@ pub fn train_model(
 
         match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
             Ok(()) => {
-                match run_bfgs_for_candidate(&fallback_label, &reml_state, config, fallback_z) {
+                match run_bfgs_for_candidate(&fallback_label, &reml_state, &*config, fallback_z) {
                     Ok((solution, grad_norm_rho, is_stationary)) => {
                         eprintln!(
                             "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
@@ -1752,7 +1881,7 @@ pub fn train_model(
         Some(reml_state.balanced_penalty_root()),
         None,
         &layout,
-        config,
+        &*config,
         warm_start_ref,
         None, // No SE for base model
     )?;
@@ -1808,7 +1937,7 @@ pub fn train_model(
     // Now, map the coefficients from the original basis for user output.
     let mapped_coefficients =
         crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
-    let mut config_with_constraints = config.clone();
+    let mut config_with_constraints = (*config).clone();
     config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
     config_with_constraints.knot_vectors = knot_vectors;
     config_with_constraints.range_transforms = range_transforms;
@@ -2120,13 +2249,7 @@ pub fn train_model(
     Ok(trained_model)
 }
 
-/// Placeholder entry point for survival model training.
-///
-/// The survival family is under active development and end-to-end training
-/// has not been wired into the estimation module yet. For now we surface a
-/// clear error explaining that the functionality is unavailable instead of
-/// leaving the call site undefined.
-#[cfg(feature = "survival-data")]
+/// Entry point for survival model training.
 pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     base_config: &ModelConfig,
@@ -2146,7 +2269,6 @@ pub fn train_survival_model(
     }
 
     // Local helper to compute log-age extents.
-    #[cfg(feature = "survival-data")]
     fn compute_log_age_extents(
         transform: &AgeTransform,
         data: &crate::calibrate::survival::SurvivalTrainingData,

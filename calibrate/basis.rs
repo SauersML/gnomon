@@ -1900,6 +1900,41 @@ mod tests {
             other => panic!("Expected InvalidKnotVector (non-finite), got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_second_derivative_matches_finite_difference() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3;
+        let num_basis = knots.len() - degree - 1;
+        let mut d1 = vec![0.0; num_basis];
+        let mut d1_plus = vec![0.0; num_basis];
+        let mut d1_minus = vec![0.0; num_basis];
+        let mut d2 = vec![0.0; num_basis];
+
+        let x = 0.37;
+        let h = 1e-5;
+
+        evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1)
+            .expect("first derivative");
+        evaluate_bspline_derivative_scalar(x + h, knots.view(), degree, &mut d1_plus)
+            .expect("first derivative +h");
+        evaluate_bspline_derivative_scalar(x - h, knots.view(), degree, &mut d1_minus)
+            .expect("first derivative -h");
+        evaluate_bspline_second_derivative_scalar(x, knots.view(), degree, &mut d2)
+            .expect("second derivative");
+
+        let tol = 1e-3;
+        for i in 0..num_basis {
+            let fd = (d1_plus[i] - d1_minus[i]) / (2.0 * h);
+            assert!(
+                (d2[i] - fd).abs() < tol,
+                "second derivative mismatch at {}: analytic={}, fd={}",
+                i,
+                d2[i],
+                fd
+            );
+        }
+    }
 }
 
 /// Scratch memory for B-spline evaluation to avoid allocations in tight loops.
@@ -2051,6 +2086,114 @@ pub fn evaluate_bspline_derivative_scalar_into(
         };
         
         out[i] = k * (left_term - right_term);
+    }
+
+    Ok(())
+}
+
+/// Evaluates B-spline second derivatives at a single scalar point `x` into a provided buffer.
+///
+/// Uses the derivative recursion:
+/// B''_{i,k}(x) = k * (B'_{i,k-1}(x)/(t_{i+k}-t_i) - B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+pub fn evaluate_bspline_second_derivative_scalar(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+) -> Result<(), BasisError> {
+    if degree < 2 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let num_basis_lower = knot_vector.len().saturating_sub(degree - 1).saturating_sub(1);
+    let mut deriv_lower = vec![0.0; num_basis_lower];
+    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
+    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(2));
+    evaluate_bspline_second_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree,
+        out,
+        &mut deriv_lower,
+        &mut lower_basis,
+        &mut lower_scratch,
+    )
+}
+
+/// Zero-allocation version for second derivatives: pass pre-allocated buffers.
+/// - `deriv_lower`: length = knot_vector.len() - (degree - 1) - 1
+/// - `lower_basis`: length = knot_vector.len() - (degree - 1)
+/// - `lower_scratch`: BsplineScratch for degree-2
+pub fn evaluate_bspline_second_derivative_scalar_into(
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    deriv_lower: &mut [f64],
+    lower_basis: &mut [f64],
+    lower_scratch: &mut internal::BsplineScratch,
+) -> Result<(), BasisError> {
+    if degree < 2 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    let required_knots = degree + 2;
+    if knot_vector.len() < required_knots {
+        return Err(BasisError::InsufficientKnotsForDegree {
+            degree,
+            required: required_knots,
+            provided: knot_vector.len(),
+        });
+    }
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        )));
+    }
+
+    let num_basis_lower = knot_vector.len().saturating_sub(degree - 1).saturating_sub(1);
+    if deriv_lower.len() != num_basis_lower {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-derivative buffer length {} does not match expected length {}",
+            deriv_lower.len(),
+            num_basis_lower
+        )));
+    }
+    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 1);
+    if lower_basis.len() != expected_lower_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Lower-basis buffer length {} does not match expected length {}",
+            lower_basis.len(),
+            expected_lower_basis
+        )));
+    }
+
+    evaluate_bspline_derivative_scalar_into(
+        x,
+        knot_vector,
+        degree - 1,
+        deriv_lower,
+        lower_basis,
+        lower_scratch,
+    )?;
+
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom1 = knot_vector[i + degree] - knot_vector[i];
+        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        let term1 = if denom1.abs() > 0.0 {
+            k * deriv_lower[i] / denom1
+        } else {
+            0.0
+        };
+        let term2 = if denom2.abs() > 0.0 {
+            k * deriv_lower[i + 1] / denom2
+        } else {
+            0.0
+        };
+        out[i] = term1 - term2;
     }
 
     Ok(())

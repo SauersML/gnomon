@@ -130,6 +130,10 @@ pub fn default_reml_parallel_threshold() -> usize {
     4
 }
 
+pub fn default_mcmc_enabled() -> bool {
+    true
+}
+
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +145,8 @@ pub struct ModelConfig {
     pub max_iterations: usize,
     pub reml_convergence_tolerance: f64,
     pub reml_max_iterations: u64,
+    /// Firth bias reduction for logit - auto-detected in training if not set.
+    /// Enabled when: prevalence < 10%, n < 500, or p/n > 0.1
     #[serde(default)]
     pub firth_bias_reduction: bool,
     /// Minimum number of penalties required before enabling REML gradient parallelization.
@@ -211,7 +217,7 @@ impl ModelConfig {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
-            mcmc_enabled: false,
+            mcmc_enabled: true, // Honest uncertainty by default
             survival: None,
         }
     }
@@ -258,7 +264,7 @@ struct ModelConfigSerde {
     interaction_centering_means: HashMap<String, Array1<f64>>,
     interaction_orth_alpha: HashMap<String, Array2<f64>>,
     pc_null_transforms: HashMap<String, Array2<f64>>,
-    #[serde(default)]
+    #[serde(default = "default_mcmc_enabled")]
     mcmc_enabled: bool,
     #[serde(default)]
     survival: Option<SurvivalModelConfig>,
@@ -653,6 +659,97 @@ impl TrainedModel {
         Some(vars.mapv(|v| v.max(0.0).sqrt()))
     }
 
+    fn build_joint_link_basis(
+        &self,
+        eta_base: &Array1<f64>,
+        joint: &JointLinkModel,
+    ) -> Option<Array2<f64>> {
+        if joint.beta_link.is_empty() {
+            return None;
+        }
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+
+        let (basis, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+            z.view(),
+            joint.knot_vector.view(),
+            joint.degree,
+        ).ok()?;
+        let raw = basis.as_ref();
+        if joint.link_transform.nrows() != raw.ncols()
+            || joint.link_transform.ncols() != joint.beta_link.len()
+        {
+            return None;
+        }
+
+        Some(raw.dot(&joint.link_transform))
+    }
+
+    fn compute_joint_link_derivative(
+        &self,
+        eta_base: &Array1<f64>,
+        joint: &JointLinkModel,
+    ) -> Option<Array1<f64>> {
+        use crate::calibrate::basis::evaluate_bspline_derivative_scalar_into;
+        use crate::calibrate::basis::internal::BsplineScratch;
+
+        let n = eta_base.len();
+        let mut deriv = Array1::<f64>::ones(n);
+        if joint.beta_link.is_empty() {
+            return Some(deriv);
+        }
+
+        let (min_u, max_u) = joint.knot_range;
+        let range_width = (max_u - min_u).max(1e-6);
+        let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+
+        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
+        let n_constrained = joint.link_transform.ncols();
+        if n_raw == 0 || n_constrained == 0 || joint.beta_link.len() != n_constrained {
+            return None;
+        }
+        if joint.link_transform.nrows() != n_raw {
+            return None;
+        }
+
+        let mut deriv_raw = vec![0.0; n_raw];
+        let num_basis_lower = joint.knot_vector.len().saturating_sub(joint.degree);
+        let mut lower_basis = vec![0.0; num_basis_lower];
+        let mut lower_scratch = BsplineScratch::new(joint.degree.saturating_sub(1));
+
+        for i in 0..n {
+            let z_i = z[i];
+            if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
+                deriv[i] = 1.0;
+                continue;
+            }
+            deriv_raw.fill(0.0);
+            if evaluate_bspline_derivative_scalar_into(
+                z_i,
+                joint.knot_vector.view(),
+                joint.degree,
+                &mut deriv_raw,
+                &mut lower_basis,
+                &mut lower_scratch,
+            ).is_err() {
+                continue;
+            }
+
+            let mut d_wiggle_dz = 0.0;
+            for c in 0..n_constrained {
+                let mut b_prime_c = 0.0;
+                for r in 0..n_raw {
+                    b_prime_c += deriv_raw[r] * joint.link_transform[[r, c]];
+                }
+                d_wiggle_dz += b_prime_c * joint.beta_link[c];
+            }
+            deriv[i] = 1.0 + d_wiggle_dz / range_width;
+        }
+
+        Some(deriv)
+    }
+
     /// Compute SE for joint model using the full joint Hessian.
     /// 
     /// For joint models η = g(Xβ; θ) = Xβ + B(z)θ where z = (u - min)/(max - min) and u = Xβ,
@@ -690,98 +787,28 @@ impl TrainedModel {
         };
         
         let n = x_new.nrows();
-        let (min_u, max_u) = joint.knot_range;
-        let range_width = (max_u - min_u).max(1e-6);
-        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
-        let n_constrained = joint.link_transform.ncols();
-        
-        if n_raw == 0 || n_constrained == 0 || n_constrained != p_link {
+        let b_wiggle = self.build_joint_link_basis(eta_base, joint)?;
+        if b_wiggle.ncols() != p_link {
             return None;
         }
-        
+        let g_prime = self
+            .compute_joint_link_derivative(eta_base, joint)
+            .unwrap_or_else(|| Array1::<f64>::ones(n));
+
         let mut vars = Array1::zeros(n);
-        let mut scratch = crate::calibrate::basis::SplineScratch::new(joint.degree);
-        let mut raw_basis = vec![0.0; n_raw];
-        let mut constrained_basis = vec![0.0; n_constrained];
-        
-        // For derivative computation
-        let mut raw_plus = vec![0.0; n_raw];
-        let mut raw_minus = vec![0.0; n_raw];
-        let h_deriv = 1e-4;
-        
-        // Jacobian row: [g'(u_i) * x_i, b_i]
         let mut j_row = Array1::<f64>::zeros(dim);
-        
+
         for i in 0..n {
-            let u = eta_base[i];
-            let z = ((u - min_u) / range_width).clamp(0.0, 1.0);
-            
-            // Compute constrained basis b_i
-            raw_basis.fill(0.0);
-            if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-                z, joint.knot_vector.view(), joint.degree, &mut raw_basis, &mut scratch
-            ).is_err() {
-                continue;
-            }
-            
-            constrained_basis.fill(0.0);
-            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained {
-                for r in 0..n_raw {
-                    let v = raw_basis[r];
-                    for c in 0..n_constrained {
-                        constrained_basis[c] += v * joint.link_transform[[r, c]];
-                    }
-                }
-            } else if n_constrained == n_raw {
-                constrained_basis.copy_from_slice(&raw_basis);
-            } else {
-                continue;
-            }
-            
-            // Compute g'(u) = 1 + d(wiggle)/dz / range_width via finite difference
-            let z_plus = (z + h_deriv).clamp(0.0, 1.0);
-            let z_minus = (z - h_deriv).clamp(0.0, 1.0);
-            let dz = (z_plus - z_minus).max(1e-8);
-            
-            raw_plus.fill(0.0);
-            raw_minus.fill(0.0);
-            if crate::calibrate::basis::evaluate_bspline_basis_scalar(
-                z_plus, joint.knot_vector.view(), joint.degree, &mut raw_plus, &mut scratch
-            ).is_err() || crate::calibrate::basis::evaluate_bspline_basis_scalar(
-                z_minus, joint.knot_vector.view(), joint.degree, &mut raw_minus, &mut scratch
-            ).is_err() {
-                continue;
-            }
-            
-            let mut d_wiggle_dz = 0.0;
-            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained {
-                for r in 0..n_raw {
-                    let diff = raw_plus[r] - raw_minus[r];
-                    for c in 0..n_constrained {
-                        d_wiggle_dz += diff * joint.link_transform[[r, c]] * joint.beta_link[c];
-                    }
-                }
-            } else if n_constrained == n_raw {
-                for r in 0..n_raw {
-                    d_wiggle_dz += (raw_plus[r] - raw_minus[r]) * joint.beta_link[r];
-                }
-            }
-            d_wiggle_dz /= dz;
-            let g_prime = 1.0 + d_wiggle_dz / range_width;
-            
-            // Build Jacobian row: J_i = [g'(u_i) * x_i, b_i]
             j_row.fill(0.0);
             for j in 0..p_base {
-                j_row[j] = g_prime * x_new[[i, j]];
+                j_row[j] = g_prime[i] * x_new[[i, j]];
             }
             for j in 0..p_link {
-                j_row[p_base + j] = constrained_basis[j];
+                j_row[p_base + j] = b_wiggle[[i, j]];
             }
-            
-            // Var(η_i) = J_i^T H^{-1} J_i
+
             let v = chol.solve_vec(&j_row);
             let var_i = j_row.dot(&v);
-            
             vars[i] = if link_function == LinkFunction::Identity {
                 if let Some(scale) = self.scale {
                     var_i * scale
@@ -1117,120 +1144,23 @@ impl TrainedModel {
         se_eta_opt: Option<&Array1<f64>>,
         joint: &JointLinkModel,
     ) -> (Array1<f64>, Option<Array1<f64>>) {
-        let n = eta_base.len();
-        let (min_u, max_u) = joint.knot_range;
-        let range_width = (max_u - min_u).max(1e-6);
-        let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
-        let n_constrained = joint.link_transform.ncols();
-        if n_raw == 0 || n_constrained == 0 || joint.beta_link.len() != n_constrained {
-            let se_out = se_eta_opt.map(|se| se.clone());
-            return (eta_base.clone(), se_out);
-        }
-
-        let mut eta_cal = eta_base.clone();
-        let mut eff_se = se_eta_opt.map(|se| se.clone());
-
-        let mut raw = vec![0.0; n_raw];
-        let mut constrained = vec![0.0; n_constrained];
-        let mut raw_plus = vec![0.0; n_raw];
-        let mut raw_minus = vec![0.0; n_raw];
-        let mut plus = vec![0.0; n_constrained];
-        let mut minus = vec![0.0; n_constrained];
-        let mut scratch = basis::SplineScratch::new(joint.degree);
-        let h = 1e-4;
-
-        for i in 0..n {
-            let u = eta_base[i];
-            let z = ((u - min_u) / range_width).clamp(0.0, 1.0);
-            raw.fill(0.0);
-            if basis::evaluate_bspline_basis_scalar(
-                z,
-                joint.knot_vector.view(),
-                joint.degree,
-                &mut raw,
-                &mut scratch,
-            )
-            .is_err()
-            {
-                continue;
+        let b_wiggle = match self.build_joint_link_basis(eta_base, joint) {
+            Some(basis) => basis,
+            None => {
+                let se_out = se_eta_opt.map(|se| se.clone());
+                return (eta_base.clone(), se_out);
             }
+        };
 
-            constrained.fill(0.0);
-            if joint.link_transform.nrows() == n_raw && joint.link_transform.ncols() == n_constrained
-            {
-                for r in 0..n_raw {
-                    let v = raw[r];
-                    for c in 0..n_constrained {
-                        constrained[c] += v * joint.link_transform[[r, c]];
-                    }
-                }
-            } else if n_constrained == n_raw {
-                constrained.copy_from_slice(&raw);
-            } else {
-                continue;
-            }
+        let wiggle = b_wiggle.dot(&joint.beta_link);
+        let eta_cal = eta_base + &wiggle;
 
-            let mut wiggle = 0.0;
-            for j in 0..n_constrained {
-                wiggle += constrained[j] * joint.beta_link[j];
-            }
-            eta_cal[i] = u + wiggle;
-
-            if let Some(se_vec) = eff_se.as_mut() {
-                let z_plus = (z + h).clamp(0.0, 1.0);
-                let z_minus = (z - h).clamp(0.0, 1.0);
-                let dz = (z_plus - z_minus).max(1e-8);
-                raw_plus.fill(0.0);
-                raw_minus.fill(0.0);
-                if basis::evaluate_bspline_basis_scalar(
-                    z_plus,
-                    joint.knot_vector.view(),
-                    joint.degree,
-                    &mut raw_plus,
-                    &mut scratch,
-                )
-                .is_err()
-                    || basis::evaluate_bspline_basis_scalar(
-                        z_minus,
-                        joint.knot_vector.view(),
-                        joint.degree,
-                        &mut raw_minus,
-                        &mut scratch,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-
-                plus.fill(0.0);
-                minus.fill(0.0);
-                if joint.link_transform.nrows() == n_raw
-                    && joint.link_transform.ncols() == n_constrained
-                {
-                    for r in 0..n_raw {
-                        let vp = raw_plus[r];
-                        let vm = raw_minus[r];
-                        for c in 0..n_constrained {
-                            plus[c] += vp * joint.link_transform[[r, c]];
-                            minus[c] += vm * joint.link_transform[[r, c]];
-                        }
-                    }
-                } else if n_constrained == n_raw {
-                    plus.copy_from_slice(&raw_plus);
-                    minus.copy_from_slice(&raw_minus);
-                } else {
-                    continue;
-                }
-
-                let mut d_wiggle_dz = 0.0;
-                for j in 0..n_constrained {
-                    d_wiggle_dz += (plus[j] - minus[j]) * joint.beta_link[j];
-                }
-                d_wiggle_dz /= dz;
-                let g_prime = 1.0 + d_wiggle_dz / range_width;
-                se_vec[i] = g_prime.abs() * se_vec[i];
-            }
-        }
+        let eff_se = se_eta_opt.map(|se| {
+            let g_prime = self
+                .compute_joint_link_derivative(eta_base, joint)
+                .unwrap_or_else(|| Array1::<f64>::ones(eta_base.len()));
+            g_prime.mapv(f64::abs) * se
+        });
 
         (eta_cal, eff_se)
     }
