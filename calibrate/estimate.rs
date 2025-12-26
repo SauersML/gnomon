@@ -1025,6 +1025,7 @@ pub fn train_joint_model(
         max_reml_iter: 50,
         reml_tol: 1e-4,
         n_link_knots: 10, // 10 internal knots for flexible link
+        firth_bias_reduction: config.firth_bias_reduction, // Inherit from model config
     };
     
     eprintln!("[JOINT] Starting joint optimization with REML...");
