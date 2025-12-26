@@ -1437,12 +1437,12 @@ lemma risk_affine_additive
           - (∫ pc, 2*u*a * pc.1 ∂μ)
           - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
         -- Linearity proof
-        have i_p2 : Integrable (fun pc => u^2 * pc.1^2) μ := hP2_int.const_mul (u^2)
-        have i_c2 : Integrable (fun pc => β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
-        have i_a2 : Integrable (fun pc => a^2) μ := integrable_const _
-        have i_pc : Integrable (fun pc => 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩) μ := hPC_int.const_mul (2*u*β)
-        have i_p : Integrable (fun pc => 2*u*a * pc.1) μ := hP_int.const_mul (2*u*a)
-        have i_c : Integrable (fun pc => 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
+        have i_p2 := hP2_int.const_mul (u^2)
+        have i_c2 := hC2_int.const_mul (β^2)
+        have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
+        have i_pc := hPC_int.const_mul (2 * u * β)
+        have i_p := hP_int.const_mul (2 * u * a)
+        have i_c := hC_int.const_mul (2 * a * β)
         -- Combine terms using integral_add and integral_sub
         have i_sum1 := i_p2.add i_c2
         have i_sum2 := i_sum1.add i_a2
