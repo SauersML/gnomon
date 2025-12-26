@@ -1241,6 +1241,18 @@ impl TrainedModel {
     ///   from the stored configuration.
     /// - Computes the final prediction via matrix algebra.
     ///
+    /// # Important: ALO vs Identity Predictor
+    ///
+    /// During **training**, the model uses Approximate Leave-One-Out (ALO) projections
+    /// for stable REML smoothing parameter selection. However, for **prediction**,
+    /// this function uses the standard identity predictor `η = Xβ`. This is intentional:
+    /// - ALO is a diagnostic/tuning tool, not meant for inference
+    /// - New data was not part of the LOO procedure, so ALO doesn't apply
+    /// - Standard GLM prediction semantics are preserved
+    ///
+    /// If you need ALO-adjusted predictions on training data, use the residual
+    /// diagnostics functions instead.
+    ///
     /// # Arguments
     /// * `p_new`: A 1D array view of new PGS values.
     /// * `pcs_new`: A 2D array view of new PC values, with shape `[n_samples, n_pcs]`.

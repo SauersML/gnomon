@@ -601,21 +601,68 @@ impl<'a> JointModelState<'a> {
             );
         }
         
-        // When Firth is enabled for logit, apply Firth-style weighting adjustment
-        // This approximates Jeffreys prior effect without full hat matrix computation
-        if self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit) {
+        // When Firth is enabled for logit, compute Firth correction using hat diagonal
+        // Firth modifies the working response: z_firth = z + h_ii * (0.5 - μ) / (w * μ(1-μ))
+        let z_firth = if self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit) && b_wiggle.ncols() > 0 {
+            // Compute hat diagonal: h = diag(B(B'WB + λS)^{-1}B'W)
+            // For efficiency, use: h_ii = w_i * ||solve(H, b_i)||^2 where b_i is ith row of B√w
+            let penalty = self.build_link_penalty();
+            let p = b_wiggle.ncols();
+            
+            // Build weighted design: B_w = sqrt(W) * B
+            let mut b_weighted = b_wiggle.clone();
             for i in 0..n {
-                // Firth adjustment: inflate weights slightly for extreme μ values
-                let m = mu[i].clamp(1e-8, 1.0 - 1e-8);
-                let firth_adj = 0.5 * (1.0 / (m * (1.0 - m))).min(100.0);
-                weights[i] = (weights[i] + 0.01 * firth_adj).min(weights[i] * 2.0);
+                let sqrt_w = weights[i].max(0.0).sqrt();
+                for j in 0..p {
+                    b_weighted[[i, j]] *= sqrt_w;
+                }
             }
-        }
+            
+            // Build penalized Hessian: H = B'WB + λS
+            let btb = b_weighted.t().dot(&b_weighted);
+            let mut h_pen = btb + &(penalty * lambda_link);
+            // Regularize for stability
+            for j in 0..p {
+                h_pen[[j, j]] += 1e-8;
+            }
+            
+            // Cholesky decomposition
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let chol = match h_pen.cholesky(faer::Side::Lower) {
+                Ok(c) => c,
+                Err(_) => {
+                    // Fall back to standard IRLS if Firth fails
+                    return self.compute_deviance(&self.compute_eta_full(u, b_wiggle));
+                }
+            };
+            
+            // Compute hat diagonal and Firth-adjusted z
+            let mut z_adj = z_glm.clone();
+            for i in 0..n {
+                let mi = mu[i].clamp(1e-8, 1.0 - 1e-8);
+                
+                // h_ii = ||L^{-1} (b_i * sqrt(w_i))||^2
+                let b_row: Array1<f64> = (0..p).map(|j| b_weighted[[i, j]]).collect();
+                
+                // Solve L * v = b_row using Cholesky factor
+                let solved = chol.solve_mat(&b_row.insert_axis(ndarray::Axis(1))).column(0).to_owned();
+                let h_ii: f64 = solved.iter().map(|x| x * x).sum();
+                
+                // Firth correction to working response: 
+                // Add h_ii * (0.5 - μ_i) / (μ_i(1-μ_i)) term
+                // This biases coefficients toward zero when separation threatens
+                let firth_adj = h_ii * (0.5 - mi) / (mi * (1.0 - mi));
+                z_adj[i] += firth_adj;
+            }
+            z_adj
+        } else {
+            z_glm
+        };
         
         // Adjust working response: solve for wiggle coefficient θ where
         // η = u + B_wiggle · θ
-        // So target for θ is: z_adjusted = z_glm - u
-        let z_adjusted: Array1<f64> = &z_glm - u;
+        // So target for θ is: z_adjusted = z_firth - u
+        let z_adjusted: Array1<f64> = &z_firth - u;
         
         // Solve: (B'WB + λS)θ = B'W(z - u)
         if b_wiggle.ncols() > 0 {
