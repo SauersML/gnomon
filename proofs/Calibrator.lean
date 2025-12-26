@@ -1393,7 +1393,13 @@ lemma risk_affine_additive
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (β a b : ℝ) :
+    (β a b : ℝ)
+    -- Integrability hypotheses for linearity
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ) :
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
   -- Let u = 1 - b
@@ -1434,8 +1440,37 @@ lemma risk_affine_additive
           - 2*u*a * (∫ pc, pc.1 ∂μ)
           - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
         -- This step requires integral linearity and integrability hypotheses
+        -- This step requires integral linearity and integrability hypotheses
         -- The integrability of P, P², C, C², PC all follow from the finite moment assumptions
-        admit -- Integral linearity (requires integrability of all terms)
+        have h_int_P2c : Integrable (fun pc => u ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (u ^ 2)
+        have h_int_C2c : Integrable (fun pc => β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2) μ := hC2_int.const_mul (β ^ 2)
+        have h_int_a2 : Integrable (fun _ => a ^ 2) μ := integrable_const (a ^ 2)
+        have h_int_PCc : Integrable (fun pc => 2 * u * β * pc.1 * pc.2 ⟨0, by norm_num⟩) μ := hPC_int.const_mul (2 * u * β)
+        have h_int_Pc : Integrable (fun pc => 2 * u * a * pc.1) μ := hP_int.const_mul (2 * u * a)
+        have h_int_Cc : Integrable (fun pc => 2 * a * β * pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2 * a * β)
+
+        have h_int_pos1 := h_int_P2c.add h_int_C2c
+        have h_int_pos2 := h_int_pos1.add h_int_a2
+        have h_int_sum_pos := h_int_pos2.add h_int_PCc
+        have h_int_sum_neg := h_int_Pc.add h_int_Cc
+
+        -- Rewrite the integrand to group positive and negative terms for integral_sub
+        have h_integrand_rw : (fun pc ↦
+            u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, _⟩)^2 + a^2 + 2*u*β*pc.1*(pc.2 ⟨0, _⟩)
+            - 2*u*a*pc.1 - 2*a*β*pc.2 ⟨0, _⟩) =
+            (fun pc ↦
+              (u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, _⟩)^2 + a^2 + 2*u*β*pc.1*(pc.2 ⟨0, _⟩)) -
+              (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, _⟩)) := by ext pc; ring
+        rw[h_integrand_rw]
+
+        -- Apply linearity rules step-by-step
+        rw [integral_sub h_int_sum_pos h_int_sum_neg]
+        rw [integral_add h_int_pos2 h_int_PCc]
+        rw [integral_add h_int_pos1 h_int_a2]
+        rw [integral_add h_int_P2c h_int_C2c]
+        rw [integral_add h_int_Pc h_int_Cc]
+        simp_rw [integral_const_mul, integral_const]
+        simp [measure_univ]
       _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
           + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
         rw [hP2, hPC0, hP0, hC0]
@@ -1451,7 +1486,13 @@ lemma risk_affine_scenario4
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0)
     (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (a b : ℝ) :
+    (a b : ℝ)
+    -- Integrability hypotheses for linearity
+    (hP_int : Integrable (fun pc => pc.1) μ)
+    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) μ)
+    (hC2_int : Integrable (fun pc => (pc.2 ⟨0, by norm_num⟩) ^ 2) μ)
+    (hPC_int : Integrable (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) μ) :
     ∫ pc, (pc.1 - 0.8 * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ =
       a^2 + (1 - b)^2 + 0.64 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
   -- p - 0.8*c = p + (-0.8)*c, so this is risk_affine_additive with β = -0.8
@@ -1468,6 +1509,7 @@ lemma risk_affine_scenario4
 
   -- Apply the general lemma
   have h_gen := risk_affine_additive μ h_indep hP0 hC0 hPC0 hP2 (-0.8) a b
+    hP_int hC_int hP2_int hC2_int hPC_int
 
   -- Simplify (-0.8)² = 0.64
   simp only [neg_mul] at h_gen ⊢
