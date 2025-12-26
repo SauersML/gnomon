@@ -1414,30 +1414,14 @@ lemma risk_affine_additive
   -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
 
   -- The formal proof: expand the squared term and integrate term by term
-  -- First, we rewrite the integrand algebraically
-  have h_expand : ∀ pc : ℝ × (Fin 1 → ℝ),
-      (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 =
-      u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
-      + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
-      - 2*u*a * pc.1
-      - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
-    intro pc
-    simp only [hu]
-    ring
-
-  -- Rewrite the integral using the expansion
   calc ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ
       = ∫ pc, u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
             + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
             - 2*u*a * pc.1
             - 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ := by
-        congr 1; ext pc; exact h_expand pc
-      _ = (∫ pc, u^2 * pc.1^2 ∂μ) + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + (∫ pc, a^2 ∂μ)
-          + (∫ pc, 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
-          - (∫ pc, 2*u*a * pc.1 ∂μ)
-          - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
-        -- The proof of linearity requires grouping the positive and negative terms
-        -- because `integral_sub` expects `∫ (f - g)` not `∫ f - g - h`.
+        congr 1; ext pc;
+        simp only [hu]; ring
+      _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
         have i_p2 := hP2_int.const_mul (u^2)
         have i_c2 := hC2_int.const_mul (β^2)
         have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
@@ -1452,24 +1436,14 @@ lemma risk_affine_additive
             (u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩ - 2*u*a*pc.1 - 2*a*β*pc.2 ⟨0, by norm_num⟩) =
             ((u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) + (a^2 + 2*u*β*pc.1*pc.2 ⟨0, by norm_num⟩)) - (2*u*a*pc.1 + 2*a*β*pc.2 ⟨0, by norm_num⟩) := by
           filter_upwards with pc; ring
-        rw [integral_congr_ae h_integrand_eq]
-        -- Apply linearity rules
-        rw [integral_sub i_pos i_neg]
-        rw [integral_add (i_p2.add i_c2) (i_a2.add i_pc)]
-        rw [integral_add i_p2 i_c2]
-        rw [integral_add i_a2 i_pc]
-        rw [integral_add i_p i_c]
-        ring
-      _ = u^2 * (∫ pc, pc.1^2 ∂μ) + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
-          + 2*u*β * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
-          - 2*u*a * (∫ pc, pc.1 ∂μ)
-          - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
-        simp_rw [integral_const_mul, integral_const]; simp [measure_univ]
-      _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
-          + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
-        rw [hP2, hPC0, hP0, hC0]
-      _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-        simp only [hu]
+        rw[integral_congr_ae h_integrand_eq]
+        rw[integral_sub i_pos i_neg]
+        rw[integral_add (i_p2.add i_c2) (i_a2.add i_pc)]
+        rw[integral_add i_p2 i_c2]
+        rw[integral_add i_a2 i_pc]
+        rw[integral_add i_p i_c]
+        simp_rw [integral_const_mul, integral_const]
+        simp [measure_univ, hP2, hPC0, hP0, hC0, hu]
         ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
