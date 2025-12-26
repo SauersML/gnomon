@@ -791,6 +791,46 @@ impl<'a> JointModelState<'a> {
             }
         }
         
+        // When Firth is enabled for logit, compute Firth correction for base block
+        // This uses the effective design X_eff = sqrt(w_eff) * X and the base penalty
+        if self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit) {
+            // Build weighted design: X_w = sqrt(w_eff) * X
+            let mut x_weighted = self.x_base.to_owned();
+            for i in 0..n {
+                let sqrt_w = w_eff[i].max(0.0).sqrt();
+                for j in 0..p {
+                    x_weighted[[i, j]] *= sqrt_w;
+                }
+            }
+            
+            // Build penalized Hessian: H = X'W_effX + S
+            let xtx = x_weighted.t().dot(&x_weighted);
+            let mut h_pen = xtx + &penalty;
+            for j in 0..p {
+                h_pen[[j, j]] += 1e-8; // Regularize
+            }
+            
+            // Cholesky decomposition
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            if let Ok(chol) = h_pen.cholesky(faer::Side::Lower) {
+                // Compute hat diagonal and apply Firth adjustment to z_eff
+                for i in 0..n {
+                    let mi = mu[i].clamp(1e-8, 1.0 - 1e-8);
+                    
+                    // h_ii = ||L^{-1}(x_i * sqrt(w_eff_i))||²
+                    let x_row: Array1<f64> = (0..p).map(|j| x_weighted[[i, j]]).collect();
+                    let solved = chol.solve_mat(&x_row.insert_axis(ndarray::Axis(1))).column(0).to_owned();
+                    let h_ii: f64 = solved.iter().map(|x| x * x).sum();
+                    
+                    // Firth correction to working response
+                    let g = g_prime[i];
+                    let g_safe = if g.abs() < 1e-8 { 1e-8 } else { g.abs() };
+                    let firth_adj = h_ii * (0.5 - mi) / (mi * (1.0 - mi) * g_safe);
+                    z_eff[i] += firth_adj;
+                }
+            }
+        }
+        
         // Solve PWLS: (X'W_eff X + S)β = X'W_eff z_eff
         let new_beta = Self::solve_weighted_ls(&self.x_base.to_owned(), &z_eff, &w_eff, &penalty, 1.0);
         
