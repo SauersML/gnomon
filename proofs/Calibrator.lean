@@ -2132,7 +2132,7 @@ avoid numerical instability. This section proves the algebraic equivalence.
 -/
 
 variable {n p : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
-variable [DecidableEq (Fin n)] [DecidableEq (Fin p)]
+variable [DecidableEq (Fin p)]
 
 /-- Quadratic form: βᵀSβ computed as dot product. -/
 noncomputable def quadForm (S : Matrix (Fin p) (Fin p) ℝ) (β : Fin p → ℝ) : ℝ :=
@@ -2214,7 +2214,7 @@ theorem reparameterization_equivalence
 
   rw [h_penalty]
 
-omit [Fintype (Fin n)] [DecidableEq (Fin n)] in
+omit [Fintype (Fin n)] in
 /-- The fitted values are invariant under reparameterization. -/
 theorem fitted_values_invariant
     (X : Matrix (Fin n) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
