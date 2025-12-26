@@ -241,7 +241,9 @@ impl<'a> JointModelState<'a> {
     /// 
     /// The orthogonality constraint is applied using IRLS working weights
     /// (w_irls = prior_weights * μ(1-μ)) to align with the optimization metric.
-    pub fn build_link_basis(&mut self, eta_base: &Array1<f64>) -> Array2<f64> {
+    /// 
+    /// Returns Err if z has degenerate variance (cannot build identifiable constraint).
+    pub fn build_link_basis(&mut self, eta_base: &Array1<f64>) -> Result<Array2<f64>, String> {
         use crate::calibrate::basis::apply_weighted_orthogonality_constraint;
         
         // Compute IRLS working weights: w_irls = prior_weights * μ(1-μ)
@@ -311,17 +313,12 @@ impl<'a> JointModelState<'a> {
                 let z_var: f64 = z.iter().map(|&v| (v - z_mean).powi(2)).sum::<f64>() / n as f64;
                 let z_has_spread = z_var > 1e-6;
                 
-                // Error on degenerate z instead of silently changing dimension
+                // Error on degenerate z - cannot build identifiable constraint
                 if !z_has_spread {
-                    eprintln!("[JOINT ERROR] Base predictor z has near-zero variance (var={z_var:.2e}). \
-                              Cannot build identifiable link constraint. Check your data or initial β.");
-                    // Return identity basis to avoid crashing, but this is a fundamental problem
-                    let n_constrained = n_raw.saturating_sub(2).max(1);
-                    if self.beta_link.len() != n_constrained {
-                        self.beta_link = Array1::zeros(n_constrained);
-                        self.n_constrained_basis = n_constrained;
-                    }
-                    return bspline_basis.slice(ndarray::s![.., ..n_constrained]).to_owned();
+                    return Err(format!(
+                        "Base predictor z has near-zero variance (var={z_var:.2e}). \
+                        Cannot build identifiable link constraint."
+                    ));
                 }
                 
                 // Always rebuild constraint from current z and IRLS weights
@@ -360,7 +357,7 @@ impl<'a> JointModelState<'a> {
                             self.beta_link = Array1::zeros(n_constrained);
                         }
                         
-                        constrained_basis
+                        Ok(constrained_basis)
                     }
                     Err(_) => {
                         // Fallback: construct a nullspace transform via eigendecomposition.
@@ -417,18 +414,13 @@ impl<'a> JointModelState<'a> {
                         if self.beta_link.len() != n_constrained {
                             self.beta_link = Array1::zeros(n_constrained);
                         }
-                        constrained_basis
+                        Ok(constrained_basis)
                     }
                 }
             }
-            Err(_) => {
-                // Fallback: return empty basis
-                eprintln!("[JOINT] B-spline basis construction failed");
-                self.beta_link = Array1::zeros(0);
-                self.link_transform = Some(Array2::zeros((0, 0)));
-                self.s_link_constrained = Some(Array2::zeros((0, 0)));
-                self.n_constrained_basis = 0;
-                Array2::zeros((n, 0))
+            Err(e) => {
+                // B-spline basis construction failed - return error
+                Err(format!("B-spline basis construction failed: {}", e))
             }
         }
     }
@@ -924,7 +916,8 @@ pub fn fit_joint_model<'a>(
         
         // Step A: Given β, build wiggle basis and update link coefficients
         let u = state.base_linear_predictor();
-        let b_wiggle = state.build_link_basis(&u);  // Updates internal state (transform, penalty)
+        let b_wiggle = state.build_link_basis(&u)
+            .map_err(|e| EstimationError::InvalidSpecification(e))?;
         
         // Update link coefficients (θ) via IRLS with u as OFFSET
         let deviance_after_g = state.irls_link_step(&b_wiggle, &u, lambda_link);
@@ -940,7 +933,8 @@ pub fn fit_joint_model<'a>(
         // Rebuild basis with updated β before computing deviance for convergence check
         // This ensures we check convergence on the actual model state, not a stale version
         let u_new = state.base_linear_predictor();
-        let b_new = state.build_link_basis(&u_new);
+        let b_new = state.build_link_basis(&u_new)
+            .map_err(|e| EstimationError::InvalidSpecification(e))?;
         let deviance = state.compute_deviance(&state.compute_eta_full(&u_new, &b_new));
         
         // Check for convergence
@@ -970,7 +964,8 @@ pub fn fit_joint_model<'a>(
     
     // Rebuild basis with final β and refit θ to ensure consistency
     let u_final = state.base_linear_predictor();
-    let b_final = state.build_link_basis(&u_final);
+    let b_final = state.build_link_basis(&u_final)
+        .map_err(|e| EstimationError::InvalidSpecification(e))?;
     
     // θ is now potentially in wrong coordinates - refit it one more time
     state.irls_link_step(&b_final, &u_final, lambda_link);
@@ -1116,7 +1111,8 @@ impl<'a> JointRemlState<'a> {
             state = state.with_covariate_se(se);
         }
         let u0 = state.base_linear_predictor();
-        let _ = state.build_link_basis(&u0);
+        state.build_link_basis(&u0)
+            .map_err(|e| EstimationError::InvalidSpecification(e))?;
         let n_base = state.s_base.len();
         let cached_beta_base = state.beta_base.clone();
         let cached_beta_link = state.beta_link.clone();
@@ -1165,7 +1161,8 @@ impl<'a> JointRemlState<'a> {
             let damping = 0.5 + progress * 0.5;
             
             let u = state.base_linear_predictor();
-            let b_wiggle = state.build_link_basis(&u);
+            let b_wiggle = state.build_link_basis(&u)
+                .map_err(|e| EstimationError::InvalidSpecification(e))?;
             state.irls_link_step(&b_wiggle, &u, lambda_link);
             
             let g_prime = compute_link_derivative_from_state(&state, &u, &b_wiggle);

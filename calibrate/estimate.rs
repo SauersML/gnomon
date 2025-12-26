@@ -971,10 +971,8 @@ fn compute_joint_penalized_hessian(
         }
     }
     
-    // Add small ridge for stability (1e-8 is minimal to avoid underestimating SEs)
-    for i in 0..dim {
-        joint_hessian[[i, i]] += 1e-8;
-    }
+    // Do NOT add unconditional ridge - this would bias SEs downward.
+    // The caller is responsible for ensuring positive-definiteness if needed for inversion.
     
     Some(joint_hessian)
 }
