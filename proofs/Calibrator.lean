@@ -1480,17 +1480,15 @@ lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
     a^2 + (1 - b)^2 + const ≥ const ∧
     (a^2 + (1 - b)^2 + const = const ↔ a = 0 ∧ b = 1) := by
   constructor
-  · -- a² + (1-b)² ≥ 0
-    nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
+  · nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
   · constructor
     · intro h
-      have h1 : a^2 + (1 - b)^2 = 0 := by linarith
-      have ha : a^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
-      have hb : (1 - b)^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
-      constructor
-      · exact sq_eq_zero_iff.mp ha
-      · have : 1 - b = 0 := sq_eq_zero_iff.mp hb
-        linarith
+      have h_zero : a^2 + (1-b)^2 = 0 := by linarith
+      have ha : a^2 = 0 := by nlinarith [sq_nonneg (1-b)]
+      have hb : (1-b)^2 = 0 := by nlinarith [sq_nonneg a]
+      simp [sq_eq_zero_iff] at ha
+      simp [sq_eq_zero_iff, sub_eq_zero] at hb
+      exact ⟨ha, hb.symm⟩
     · rintro ⟨rfl, rfl⟩
       simp
 
