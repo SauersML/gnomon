@@ -606,6 +606,50 @@ lemma optimal_slope_eq_covariance_of_normalized_p
   -- Rearrangement: `E[YP] - b = 0`.
   linarith [h0, hLinPInt]
 
+
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
+lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
+lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
+/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p.
+    This is the key structural simplification.
+
+    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
+lemma linearPredictor_eq_affine_of_raw
+    (model_raw : PhenotypeInformedGAM 1 1 1)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
+  intros p_val c_val
+
+  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
+  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
+  rw [h_decomp]
+
+  -- Step 2: Show base reduces to γ₀₀ for raw model
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    simp [evalSmooth_eq_zero_of_raw h_raw]
+
+  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
+
+  rw [h_base, h_slope]
+
 /-- The key bridge: IsBayesOptimalInRawClass implies the orthogonality conditions.
 
     **Variational Proof (Fundamental Theorem of Least Squares)**:
@@ -634,7 +678,8 @@ lemma rawOptimal_implies_orthogonality
     (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
     (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
     (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
+    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     let a := model.γ₀₀
     let b := model.γₘ₀ ⟨0, by norm_num⟩
     -- Orthogonality with 1:
@@ -757,10 +802,11 @@ lemma optimal_coefficients_for_additive_dgp
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
   -- Step 1: Get the orthogonality conditions from optimality
-  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
   set a := model.γ₀₀ with ha_def
   set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
   obtain ⟨h_orth1, h_orthP⟩ := h_orth
@@ -1313,54 +1359,6 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
 def predictionBias {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) (p_val : ℝ) (c_val : Fin k → ℝ) : ℝ :=
   dgp.trueExpectation p_val c_val - f p_val c_val
 
-/-! ### Helper Lemmas for Scenario 4 (Raw Score Bias)
-
-The following lemmas support the main theorem `raw_score_bias_in_scenario4_simplified`.
-They formalize the L²-projection structure: raw model = projection onto {1, P} subspace. -/
-
-/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
-lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.f₀ₗ_zero l]
-
-/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. -/
-lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
-    (m : Fin 1) (l : Fin 1) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
-  unfold evalSmooth
-  simp [h_raw.fₘₗ_zero m l]
-
-/-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
-    the linear predictor simplifies to an affine function: a + b*p.
-    This is the key structural simplification.
-
-    Proof uses linearPredictor_decomp then shows base and slope simplify for raw models. -/
-lemma linearPredictor_eq_affine_of_raw
-    (model_raw : PhenotypeInformedGAM 1 1 1)
-    (h_raw : IsRawScoreModel model_raw)
-    (h_lin : model_raw.pgsBasis.B 1 = id ∧ model_raw.pgsBasis.B 0 = fun _ => 1) :
-    ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
-  intros p_val c_val
-
-  -- Step 1: Use linearPredictor_decomp to get base + slope * p form
-  have h_decomp := linearPredictor_decomp model_raw h_lin.1 p_val c_val
-  rw [h_decomp]
-
-  -- Step 2: Show base reduces to γ₀₀ for raw model
-  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
-    unfold predictorBase
-    simp [evalSmooth_eq_zero_of_raw h_raw]
-
-  -- Step 3: Show slope reduces to γₘ₀[0] for raw model
-  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
-    unfold predictorSlope
-    simp [evalSmooth_interaction_eq_zero_of_raw h_raw]
-
-  rw [h_base, h_slope]
-
 
 
 
@@ -1577,7 +1575,8 @@ theorem raw_score_bias_in_scenario4_simplified
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp4.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp4.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2) dgp4.jointMeasure)
-    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2 * pc.1) dgp4.jointMeasure) :
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp4.trueExpectation pc.1 pc.2 * pc.1) dgp4.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp4.trueExpectation pc.1 pc.2 - (model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp4.jointMeasure) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp4 (fun p _ => linearPredictor model_raw p c_val) p_val c_val = -0.8 * c_val ⟨0, by norm_num⟩ := by
   intros p_val c_val
@@ -1600,7 +1599,7 @@ theorem raw_score_bias_in_scenario4_simplified
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add
                      h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
-                     hP_int hC_int hP2_int hPC_int hY_int hYP_int
+                     hP_int hC_int hP2_int hPC_int hY_int hYP_int h_resid_sq_int
   obtain ⟨ha, hb⟩ := h_coeffs
 
   -- Step 4: Substitute a=0, b=1 into the predictor
@@ -1641,7 +1640,8 @@ theorem raw_score_bias_general [Fact (p = 1)]
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure) :
+    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model_raw.γ₀₀ + model_raw.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
   ∀ (p_val : ℝ) (c_val : Fin 1 → ℝ),
     predictionBias dgp (fun p _ => linearPredictor model_raw p c_val) p_val c_val
     = β_env * c_val ⟨0, by norm_num⟩ := by
@@ -1659,7 +1659,7 @@ theorem raw_score_bias_general [Fact (p = 1)]
   have h_coeffs := optimal_coefficients_for_additive_dgp model_raw β_env dgp h_dgp
                      h_opt_raw h_pgs_basis_linear h_indep
                      h_means_zero.1 h_means_zero.2 h_var_p_one
-                     hP_int hC_int hP2_int hPC_int hY_int hYP_int
+                     hP_int hC_int hP2_int hPC_int hY_int hYP_int h_resid_sq_int
   obtain ⟨ha, hb⟩ := h_coeffs
 
   -- Step 3: Substitute a=0, b=1 into the predictor
