@@ -1143,13 +1143,9 @@ pub fn train_joint_model(
                 degree: result.degree,
             };
             
-            // Use sensible defaults for MCMC sampling
-            let nuts_config = crate::calibrate::hmc::NutsConfig {
-                n_samples: 500,
-                n_warmup: 500,
-                n_chains: 2,
-                ..crate::calibrate::hmc::NutsConfig::default()
-            };
+            // Smart defaults based on model complexity (base + link params)
+            let n_params = result.beta_base.len() + result.beta_link.len();
+            let nuts_config = crate::calibrate::hmc::NutsConfig::for_dimension(n_params);
             
             match crate::calibrate::hmc::run_joint_nuts_sampling(
                 x_matrix.view(),
@@ -1856,12 +1852,9 @@ pub fn train_model(
             }
         }
 
-        // Use sensible defaults for MCMC sampling
-        let nuts_config = hmc::NutsConfig {
-            n_samples: 1000,
-            n_warmup: 1000,
-            ..hmc::NutsConfig::default()
-        };
+        // Smart defaults based on model complexity
+        let n_params = final_beta_original.len();
+        let nuts_config = hmc::NutsConfig::for_dimension(n_params);
         
         // HMC samples from the same posterior as training (including Firth if enabled)
         match hmc::run_nuts_sampling(
@@ -2752,12 +2745,9 @@ pub fn train_survival_model(
             if final_state.hessian.is_empty() {
                 eprintln!("            WARNING: No Hessian available for MCMC; skipping.");
             } else {
-                // Use sensible defaults for MCMC sampling
-                let nuts_config = hmc::NutsConfig {
-                    n_samples: 1000,
-                    n_warmup: 1000,
-                    ..hmc::NutsConfig::default()
-                };
+                // Smart defaults based on model complexity
+                let n_params = beta.len();
+                let nuts_config = hmc::NutsConfig::for_dimension(n_params);
 
                 match hmc::run_survival_nuts_sampling(
                     layout.clone(),
@@ -3209,12 +3199,9 @@ pub fn train_survival_model(
         } else if let Some(ref hessian) = primary_hessian {
             eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling for survival model...");
 
-            // Use sensible defaults for MCMC sampling
-            let nuts_config = hmc::NutsConfig {
-                n_samples: 1000,
-                n_warmup: 1000,
-                ..hmc::NutsConfig::default()
-            };
+            // Smart defaults based on model complexity
+            let n_params = final_artifacts.coefficients.len();
+            let nuts_config = hmc::NutsConfig::for_dimension(n_params);
 
             match hmc::run_survival_nuts_sampling(
                 layout.clone(),

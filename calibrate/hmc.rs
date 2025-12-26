@@ -497,6 +497,43 @@ impl Default for NutsConfig {
     }
 }
 
+impl NutsConfig {
+    /// Create a config with sample counts tuned for the model dimension.
+    /// 
+    /// Higher dimensions need more samples because:
+    /// - ESS decreases with dimension (autocorrelation grows)
+    /// - Split R-hat needs enough samples per chain to be meaningful
+    /// 
+    /// Rule of thumb: target 100 effective samples per parameter.
+    pub fn for_dimension(n_params: usize) -> Self {
+        // ESS ≈ n_samples / (1 + 2τ) where τ ≈ sqrt(dim) for well-tuned NUTS
+        let effective_autocorr = (n_params as f64).sqrt().max(1.0);
+        
+        // Target: at least 100 effective samples per parameter
+        let target_ess = 100 * n_params;
+        
+        // Samples needed = ESS * (1 + 2τ), with 1.5x safety factor
+        let raw_samples = (target_ess as f64 * (1.0 + 2.0 * effective_autocorr) * 1.5) as usize;
+        
+        // Clamp to reasonable range [500, 10000]
+        let n_samples = raw_samples.clamp(500, 10_000);
+        
+        // Warmup ≈ samples (standard practice for adaptation)
+        let n_warmup = n_samples;
+        
+        // More chains for higher dims (better R-hat estimation)
+        let n_chains = if n_params > 50 { 4 } else { 2 };
+        
+        Self {
+            n_samples,
+            n_warmup,
+            n_chains,
+            target_accept: 0.8,
+            seed: 42,
+        }
+    }
+}
+
 /// Result of NUTS sampling.
 #[derive(Clone, Debug)]
 pub struct NutsResult {
