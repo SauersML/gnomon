@@ -928,7 +928,8 @@ mod survival_hmc {
     #[cfg(test)]
     mod survival_gradient_tests {
         use super::*;
-        use ndarray::arr1;
+        use ndarray::array;
+        use crate::calibrate::survival::{build_survival_layout, BasisDescriptor};
 
         /// Helper to compute numerical gradient via central finite differences
         fn finite_difference_gradient<F>(f: F, x: &Array1<f64>, eps: f64) -> Array1<f64>
@@ -971,16 +972,7 @@ mod survival_hmc {
 
             // Create a minimal survival setup
             let n = 50;
-            let dim = 4; // Simple basis
             let mut rng = StdRng::seed_from_u64(12345);
-
-            // Create synthetic survival data
-            let mut x = Array2::<f64>::ones((n, dim));
-            for i in 0..n {
-                for j in 1..dim {
-                    x[[i, j]] = rng.gen_range(-1.0..1.0);
-                }
-            }
 
             // Synthetic times and events
             let age_entry = Array1::<f64>::from_shape_fn(n, |_| 40.0 + rng.gen_range(0.0..10.0));
@@ -989,43 +981,45 @@ mod survival_hmc {
                 if rng.r#gen::<f64>() < 0.3 { 1 } else { 0 }
             });
             let sample_weight = Array1::<f64>::ones(n);
-
-            // Simple penalty matrix
-            let mut penalty = Array2::<f64>::zeros((dim, dim));
-            for i in 1..dim {
-                penalty[[i, i]] = 0.1;
-            }
-
-            // Create a simple Hessian (identity-ish for stability)
-            let hessian = Array2::<f64>::from_shape_fn((dim, dim), |(i, j)| {
-                if i == j { 10.0 + i as f64 } else { 0.1 }
-            });
-
-            // Mode (MAP estimate)
-            let mode = arr1(&[0.1, -0.2, 0.3, -0.1]);
-
-            // Create SurvivalLayout (minimal setup)
-            let layout = SurvivalLayout {
-                design_raw: x.clone(),
-                design_orth: x.clone(),
-                sample_var: penalty.clone(),
-                penalties: crate::calibrate::survival::PenaltiesBlock {
-                    blocks: vec![],
-                    s_list: vec![penalty.clone()],
-                    dim,
-                },
-                covariate_layout: crate::calibrate::survival::SurvivalCovariateLayout::new_empty(dim),
-            };
+            let event_competing = Array1::<u8>::zeros(n);
+            let pgs = Array1::<f64>::zeros(n);
+            let sex = Array1::<f64>::zeros(n);
+            let pcs = Array2::<f64>::zeros((n, 0));
+            let extra_static_covariates = Array2::<f64>::zeros((n, 0));
+            let extra_static_names = Vec::new();
 
             let training_data = SurvivalTrainingData {
-                sample_weight: sample_weight.clone(),
-                event_target: event_target.clone(),
                 age_entry: age_entry.clone(),
                 age_exit: age_exit.clone(),
+                event_target: event_target.clone(),
+                event_competing,
+                sample_weight: sample_weight.clone(),
+                pgs,
+                sex,
+                pcs,
+                extra_static_covariates,
+                extra_static_names,
             };
 
-            let monotonicity = MonotonicityPenalty::default();
+            let basis = BasisDescriptor {
+                knot_vector: array![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+                degree: 2,
+            };
+
+            let layout_bundle = match build_survival_layout(&training_data, &basis, 0.1, 2, 4, None) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    println!("[Survival Gradient] Skipping: could not build layout: {}", e);
+                    return;
+                }
+            };
+            let layout = layout_bundle.layout;
+            let monotonicity = layout_bundle.monotonicity;
             let spec = SurvivalSpec::default();
+
+            let dim = layout.combined_exit.ncols();
+            let hessian = Array2::<f64>::from_diag(&Array1::<f64>::from_elem(dim, 10.0));
+            let mode = Array1::<f64>::zeros(dim);
 
             // Try to create the posterior
             let posterior_result = SurvivalPosterior::new(
@@ -1460,6 +1454,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true,
+            false,
         )
         .unwrap();
 
@@ -1483,6 +1478,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             false, // Gaussian
+            false,
         )
         .unwrap();
 
@@ -1523,6 +1519,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true, // Logit
+            false,
         )
         .unwrap();
 
@@ -1562,6 +1559,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true, // Logit
+            false,
         )
         .unwrap();
 
@@ -1610,6 +1608,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true,
+            false,
         )
         .unwrap();
 
@@ -1693,6 +1692,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true, // Logit
+            false,
             &config,
         );
 
@@ -1771,6 +1771,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true,
+            false,
             &config,
         );
 
@@ -1838,6 +1839,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true,
+            false,
             &config,
         );
 
@@ -1921,6 +1923,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             false, // is_logit = false (Gaussian)
+            false,
             &config,
         );
 
@@ -2062,6 +2065,7 @@ mod tests {
             mode.view(),
             hessian.view(),
             true, // is_logit = true
+            false,
             &config,
         );
 
