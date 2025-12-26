@@ -346,15 +346,33 @@ impl NutsPosterior {
                 Ok(chol_i) => {
                     let half_log_det: f64 = chol_i.lower_triangular().diag().mapv(f64::ln).sum();
                     
-                    // Gradient: ∂(0.5 log|I|)/∂β requires hat diagonal computation
-                    // Approximate with numerical stability focus: use h_ii * (0.5 - μ_i)
+                    // Exact Firth gradient: ∂(0.5 log|I|)/∂β = X' h * (0.5 - μ)
+                    // where h_i = leverage = x_i' (X'WX)^{-1} x_i * w_i
+                    // Compute (X'WX)^{-1} = L^{-T} L^{-1} where L = chol(X'WX)
+                    let l = chol_i.lower_triangular();
+                    
                     for i in 0..n {
                         let eta_i = eta[i].clamp(-700.0, 700.0);
                         let mu_i = 1.0 / (1.0 + (-eta_i).exp());
                         let mu_clamped = mu_i.clamp(1e-10, 1.0 - 1e-10);
+                        let w_i = w_irls[i].max(1e-10);
                         
-                        // Approximate hat diagonal contribution to Firth gradient
-                        let firth_score = self.data.weights[i] * (0.5 - mu_clamped);
+                        // Compute h_ii = w_i * x_i' (X'WX)^{-1} x_i via L^{-1}(sqrt(w_i)*x_i)
+                        // First solve L v = sqrt(w_i) * x_i
+                        let sqrt_w = w_i.sqrt();
+                        let mut v = Array1::<f64>::zeros(p);
+                        for j in 0..p {
+                            let mut sum = sqrt_w * self.data.x[[i, j]];
+                            for k in 0..j {
+                                sum -= l[[j, k]] * v[k];
+                            }
+                            v[j] = sum / l[[j, j]].max(1e-15);
+                        }
+                        // h_ii = ||v||^2
+                        let h_ii: f64 = v.iter().map(|x| x * x).sum();
+                        
+                        // Firth score contribution: h_ii * (0.5 - μ_i)
+                        let firth_score = h_ii * (0.5 - mu_clamped);
                         for j in 0..p {
                             grad_beta[j] += firth_score * self.data.x[[i, j]];
                         }
