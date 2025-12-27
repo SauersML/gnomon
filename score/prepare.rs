@@ -536,9 +536,6 @@ fn prepare_for_computation_with_retry(
         }
     }
 
-    drop(bim_iter);
-    drop(score_iter);
-
     let region_filter_hits = score_iterator.take_region_filter_hits();
     if let (Some(filters), Some(hit_flags)) = (region_filters.as_ref(), region_filter_hits.as_ref())
     {
@@ -866,12 +863,13 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let score_path = dir.path().join("score.tsv");
-        let mut file = std::fs::File::create(&score_path).expect("create score");
-        writeln!(file, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write header");
-        writeln!(file, "1:100\tA\tG\t0.5").expect("write first line");
-        writeln!(file, "1:150\tC\tT\t0.7").expect("write second line");
-        writeln!(file, "1:180\tC\tT\t0.2").expect("write third line");
-        drop(file);
+        {
+            let mut file = std::fs::File::create(&score_path).expect("create score");
+            writeln!(file, "variant_id\teffect_allele\tother_allele\tScoreA").expect("write header");
+            writeln!(file, "1:100\tA\tG\t0.5").expect("write first line");
+            writeln!(file, "1:150\tC\tT\t0.7").expect("write second line");
+            writeln!(file, "1:180\tC\tT\t0.2").expect("write third line");
+        }
 
         let mut score_name_to_col_index = AHashMap::new();
         score_name_to_col_index.insert("ScoreA".to_string(), ScoreColumnIndex(0));

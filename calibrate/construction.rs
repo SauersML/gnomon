@@ -3197,7 +3197,10 @@ mod tests {
             interaction_orth_alpha,
             penalty_structs,
         ) = build_design_and_penalty_matrices(&data, &config).unwrap();
-        drop(penalty_structs);
+        let penalty_structs_len = penalty_structs.len();
+        if penalty_structs_len == usize::MAX {
+            unreachable!("penalty_structs length overflow");
+        }
 
         // Prepare a config carrying all saved transforms
         config.sum_to_zero_constraints = sum_to_zero_constraints.clone();

@@ -21,12 +21,16 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::LinkFunction;
 use crate::calibrate::basis::{
-    create_bspline_basis, create_bspline_basis_with_knots, create_difference_penalty_matrix,
+    baseline_lambda_seed, create_bspline_basis, create_bspline_basis_with_knots,
+    create_difference_penalty_matrix,
 };
 use crate::calibrate::construction::{
     compute_penalty_square_roots, precompute_reparam_invariant, stable_reparameterization,
     stable_reparameterization_with_invariant, ReparamInvariant, ReparamResult,
 };
+use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
+use crate::calibrate::visualizer;
+use wolfe_bfgs::BfgsSolution;
 
 
 // NOTE on z standardization: We use hard clamp(0,1) everywhere.
@@ -697,8 +701,6 @@ impl<'a> JointModelState<'a> {
                 &mut z_updated,
             );
         }
-        drop(weights_updated);
-        drop(z_updated);
         self.compute_deviance(&mu_updated)
     }
     
@@ -872,8 +874,6 @@ impl<'a> JointModelState<'a> {
                 &mut z_updated,
             );
         }
-        drop(weights_updated);
-        drop(z_updated);
         self.compute_deviance(&mu_updated)
     }
     
@@ -1012,7 +1012,6 @@ pub fn fit_joint_model<'a>(
         &mut weights_final,
         &mut z_final,
     );
-    drop(z_final);
     let g_prime_final = compute_link_derivative_from_state(&state, &u_final, &b_final);
     let edf = JointRemlState::compute_joint_edf(
         &state,
@@ -1060,6 +1059,7 @@ pub struct JointRemlState<'a> {
     last_converged: RefCell<bool>,
     base_reparam_invariant: Option<ReparamInvariant>,
     base_rs_list: Vec<Array2<f64>>,
+    eval_count: RefCell<usize>,
 }
 
 struct JointRemlSnapshot {
@@ -1162,6 +1162,7 @@ impl<'a> JointRemlState<'a> {
             last_converged: RefCell::new(false),
             base_reparam_invariant,
             base_rs_list,
+            eval_count: RefCell::new(0),
         }
     }
     
@@ -1653,6 +1654,11 @@ impl<'a> JointRemlState<'a> {
     
     /// Combined cost and gradient for BFGS
     pub fn cost_and_grad(&self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+        let eval_num = {
+            let mut count = self.eval_count.borrow_mut();
+            *count += 1;
+            *count
+        };
         let cost = match self.compute_cost(rho) {
             Ok(val) if val.is_finite() => val,
             Ok(_) => {
@@ -1671,6 +1677,8 @@ impl<'a> JointRemlState<'a> {
                 Array1::from_elem(rho.len(), f64::NAN)
             }
         };
+        let grad_norm = grad.dot(&grad).sqrt();
+        visualizer::update(cost, grad_norm, "optimizing", eval_num as f64, "eval");
         (cost, grad)
     }
     
@@ -1697,8 +1705,6 @@ impl<'a> JointRemlState<'a> {
             &mut weights,
             &mut z,
         );
-        drop(weights);
-        drop(z);
         let deviance = state.compute_deviance(&mu);
         JointModelResult {
             beta_base: state.beta_base,
@@ -1733,16 +1739,34 @@ pub fn fit_joint_model_with_reml<'a>(
     config: &JointModelConfig,
     covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
+    visualizer::set_stage("joint", "initializing");
     
     // Create REML state
     let reml_state = JointRemlState::new(
         y, weights, x_base, s_base, layout_base, link, config, covariate_se
     );
     
-    // Initial rho = zeros (λ = 1)
     let n_base = reml_state.state.borrow().s_base.len();
-    let initial_rho = Array1::from_elem(n_base + 1, 0.0);
-    
+    let heuristic_lambda = {
+        let state = reml_state.state.borrow();
+        state
+            .knot_vector
+            .as_ref()
+            .map(|knots| baseline_lambda_seed(knots, state.degree, 2))
+    };
+    let heuristic_lambdas = heuristic_lambda.map(|lambda| vec![lambda]);
+    let seed_config = SeedConfig {
+        strategy: SeedStrategy::Exhaustive,
+        bounds: (-12.0, 12.0),
+    };
+    let seed_candidates = generate_rho_candidates(
+        n_base + 1,
+        heuristic_lambdas.as_deref(),
+        &seed_config,
+    );
+    visualizer::set_stage("joint", "seed scan");
+    visualizer::set_progress("Seed scan", 0, Some(seed_candidates.len()));
+
     // Bounded ρ optimization using tanh transformation (consistent with non-joint path)
     // This prevents exp(ρ) overflow/underflow and keeps Hessians well-conditioned
     const RHO_BOUND: f64 = 30.0;
@@ -1762,37 +1786,155 @@ pub fn fit_joint_model_with_reml<'a>(
         rho.mapv(|r| (1.0 - (r / RHO_BOUND).powi(2)).max(0.0))
     }
     
-    // Run BFGS optimization in transformed (unbounded) z-space
     use wolfe_bfgs::Bfgs;
-    let initial_z = rho_to_z(&initial_rho);
-    
-    let solver = Bfgs::new(initial_z, |z| {
-        let rho = z_to_rho(z);
-        let (cost, grad_rho) = reml_state.cost_and_grad(&rho);
-        // Chain rule: dL/dz = dL/dρ * dρ/dz
-        let jac = drho_dz(&rho);
-        let grad_z = &grad_rho * &jac;
-        (cost, grad_z)
-    })
+    const SYM_VS_ASYM_MARGIN: f64 = 1.001;
+
+    let snapshot = JointRemlSnapshot::new(&reml_state);
+    let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+    let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+    let total_candidates = seed_candidates.len();
+    let mut finite_count = 0usize;
+    let mut inf_count = 0usize;
+    let mut fail_count = 0usize;
+
+    for (i, seed) in seed_candidates.iter().enumerate() {
+        visualizer::set_stage("joint", &format!("seed scan {}/{}", i + 1, seed_candidates.len()));
+        visualizer::set_progress("Seed scan", i + 1, Some(seed_candidates.len()));
+        let cost = match reml_state.compute_cost(seed) {
+            Ok(c) if c.is_finite() => {
+                finite_count += 1;
+                c
+            }
+            Ok(_) => {
+                inf_count += 1;
+                continue;
+            }
+            Err(_) => {
+                fail_count += 1;
+                continue;
+            }
+        };
+
+        let is_symmetric = if seed.len() < 2 {
+            true
+        } else {
+            let first_val = seed[0];
+            seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
+        };
+
+        if is_symmetric {
+            if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                best_symmetric_seed = Some((seed.clone(), cost, i));
+            }
+        } else if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+            best_asymmetric_seed = Some((seed.clone(), cost, i));
+        }
+    }
+    snapshot.restore(&reml_state);
+
+    eprintln!(
+        "[JOINT][Seed scan] candidates={} finite={} +inf={} failed={}",
+        total_candidates, finite_count, inf_count, fail_count
+    );
+
+    let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
+        (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
+            *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => false,
+    };
+
+    let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = Vec::new();
+    if pick_asym {
+        if let Some((rho, cost, idx)) = best_asymmetric_seed {
+            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+        if let Some((rho, cost, idx)) = best_symmetric_seed {
+            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+    } else {
+        if let Some((rho, cost, idx)) = best_symmetric_seed {
+            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+        if let Some((rho, cost, idx)) = best_asymmetric_seed {
+            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
+        }
+    }
+
+    if candidate_plans.is_empty() {
+        candidate_plans.push((
+            "fallback-symmetric".to_string(),
+            Array1::zeros(n_base + 1),
+            None,
+            None,
+        ));
+    }
+
+    let mut successful_runs: Vec<(String, BfgsSolution, f64)> = Vec::new();
+    let mut last_error: Option<EstimationError> = None;
+    let total_candidates = candidate_plans.len();
+    let mut candidate_idx = 0usize;
+
+    for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+        candidate_idx += 1;
+        visualizer::set_stage("joint", &format!("candidate {label}"));
+        visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
+        if let Some(idx) = seed_index {
+            eprintln!("[JOINT][Candidate {label}] Seed index: {idx}");
+        }
+        if let Some(cost) = seed_cost {
+            eprintln!("[JOINT][Candidate {label}] Seed cost: {cost:.6}");
+        }
+
+        snapshot.restore(&reml_state);
+        let initial_z = rho_to_z(&rho);
+        let solver = Bfgs::new(initial_z, |z| {
+            let rho = z_to_rho(z);
+            let (cost, grad_rho) = reml_state.cost_and_grad(&rho);
+            let jac = drho_dz(&rho);
+            let grad_z = &grad_rho * &jac;
+            (cost, grad_z)
+        })
         .with_tolerance(config.reml_tol)
         .with_max_iterations(config.max_reml_iter)
         .with_fp_tolerances(1e2, 1e2)
         .with_no_improve_stop(1e-8, 5)
         .with_rng_seed(0xC0FFEE_u64);
-    
-    let solution = match solver.run() {
-        Ok(solution) => solution,
-        Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
-        Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
-        Err(e) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "BFGS failed for joint model: {e:?}"
-            )));
+
+        let solution = match solver.run() {
+            Ok(solution) => solution,
+            Err(wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. }) => *last_solution,
+            Err(wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution }) => *last_solution,
+            Err(e) => {
+                last_error = Some(EstimationError::RemlOptimizationFailed(format!(
+                    "BFGS failed for joint model: {e:?}"
+                )));
+                continue;
+            }
+        };
+        let final_value = solution.final_value;
+        successful_runs.push((label, solution, final_value));
+    }
+
+    let (_, best_solution, _) = match successful_runs
+        .into_iter()
+        .min_by(|a, b| match a.2.partial_cmp(&b.2) {
+            Some(order) => order,
+            None => std::cmp::Ordering::Equal,
+        }) {
+        Some(best) => best,
+        None => {
+            return Err(last_error.unwrap_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "All joint REML candidate runs failed.".to_string(),
+                )
+            }))
         }
     };
-    
-    // Transform back to ρ space
-    let best_rho = z_to_rho(&solution.final_point);
+
+    let best_rho = z_to_rho(&best_solution.final_point);
     let _ = reml_state.compute_cost(&best_rho)?;
     Ok(reml_state.into_result())
 }
@@ -2190,8 +2332,8 @@ mod tests {
             degree,
         )
         .expect("basis");
-        drop(basis);
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
+        assert_eq!(basis.ncols(), num_basis);
         let beta_link = Array1::zeros(num_basis);
         
         let result = JointModelResult {
@@ -2241,8 +2383,8 @@ mod tests {
             degree,
         )
         .expect("basis");
-        drop(basis);
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
+        assert_eq!(basis.ncols(), num_basis);
         let beta_link = Array1::zeros(num_basis);
         
         let result = JointModelResult {

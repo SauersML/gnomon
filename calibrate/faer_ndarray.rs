@@ -62,37 +62,19 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     // Create output matrix
     let mut result = Mat::<f64>::zeros(p, p);
 
-    // Try to use zero-copy view if array is contiguous
-    if let Some(slice) = a.as_slice() {
-        // Standard layout (row-major contiguous)
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        let a_t = a_ref.transpose();
-        
-        // dst = A^T * A
-        matmul(
-            result.as_mut(),
-            Accum::Replace,
-            a_t,
-            a_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    } else {
-        // Non-contiguous: need to copy to contiguous buffer
-        let a_owned: Array2<f64> = a.to_owned();
-        let slice = a_owned.as_slice().expect("owned array should be contiguous");
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        let a_t = a_ref.transpose();
-        
-        matmul(
-            result.as_mut(),
-            Accum::Replace,
-            a_t,
-            a_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    }
+    let a_view = FaerArrayView::new(a);
+    let a_ref = a_view.as_ref();
+    let a_t = a_ref.transpose();
+
+    // dst = A^T * A
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_t,
+        a_ref,
+        1.0,
+        get_global_parallelism(),
+    );
 
     // Convert back to ndarray
     Array2::from_shape_fn((p, p), |(i, j)| result[(i, j)])
@@ -116,31 +98,17 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
 
     let mut out_view = array2_to_mat_mut(out);
 
-    if let Some(slice) = a.as_slice() {
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        let a_t = a_ref.transpose();
-        matmul(
-            out_view.as_mut(),
-            Accum::Replace,
-            a_t,
-            a_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    } else {
-        let a_owned: Array2<f64> = a.to_owned();
-        let slice = a_owned.as_slice().expect("owned array should be contiguous");
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        let a_t = a_ref.transpose();
-        matmul(
-            out_view.as_mut(),
-            Accum::Replace,
-            a_t,
-            a_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    }
+    let a_view = FaerArrayView::new(a);
+    let a_ref = a_view.as_ref();
+    let a_t = a_ref.transpose();
+    matmul(
+        out_view.as_mut(),
+        Accum::Replace,
+        a_t,
+        a_ref,
+        1.0,
+        get_global_parallelism(),
+    );
 }
 
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
@@ -165,25 +133,10 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let mut result = Mat::<f64>::zeros(p, q);
 
-    // Get views, copying if non-contiguous
-    let a_owned: Option<Array2<f64>>;
-    let a_slice: &[f64] = if let Some(s) = a.as_slice() {
-        s
-    } else {
-        a_owned = Some(a.to_owned());
-        a_owned.as_ref().unwrap().as_slice().unwrap()
-    };
-    
-    let b_owned: Option<Array2<f64>>;
-    let b_slice: &[f64] = if let Some(s) = b.as_slice() {
-        s
-    } else {
-        b_owned = Some(b.to_owned());
-        b_owned.as_ref().unwrap().as_slice().unwrap()
-    };
-
-    let a_ref = MatRef::from_row_major_slice(a_slice, n_a, p);
-    let b_ref = MatRef::from_row_major_slice(b_slice, n_b, q);
+    let a_view = FaerArrayView::new(a);
+    let b_view = FaerArrayView::new(b);
+    let a_ref = a_view.as_ref();
+    let b_ref = b_view.as_ref();
     
     // dst = A^T * B
     matmul(
@@ -220,34 +173,18 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
 
     let mut out_view = array1_to_col_mat_mut(out);
 
-    let v_slice = v
-        .as_slice()
-        .expect("vector must expose a contiguous slice");
-    let v_ref = MatRef::from_row_major_slice(v_slice, n, 1);
-
-    if let Some(slice) = a.as_slice() {
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        matmul(
-            out_view.as_mut(),
-            Accum::Replace,
-            a_ref.transpose(),
-            v_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    } else {
-        let a_owned: Array2<f64> = a.to_owned();
-        let slice = a_owned.as_slice().expect("owned array should be contiguous");
-        let a_ref = MatRef::from_row_major_slice(slice, n, p);
-        matmul(
-            out_view.as_mut(),
-            Accum::Replace,
-            a_ref.transpose(),
-            v_ref,
-            1.0,
-            get_global_parallelism(),
-        );
-    }
+    let a_view = FaerArrayView::new(a);
+    let v_view = FaerColView::new(v);
+    let a_ref = a_view.as_ref();
+    let v_ref = v_view.as_ref();
+    matmul(
+        out_view.as_mut(),
+        Accum::Replace,
+        a_ref.transpose(),
+        v_ref,
+        1.0,
+        get_global_parallelism(),
+    );
 }
 
 /// Compute A^T * v using faer's SIMD-optimized GEMV.
@@ -270,25 +207,10 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let mut result = Mat::<f64>::zeros(p, 1);
 
-    // Get views, copying if non-contiguous
-    let a_owned: Option<Array2<f64>>;
-    let a_slice: &[f64] = if let Some(s) = a.as_slice() {
-        s
-    } else {
-        a_owned = Some(a.to_owned());
-        a_owned.as_ref().unwrap().as_slice().unwrap()
-    };
-    
-    let v_owned: Option<Array1<f64>>;
-    let v_slice: &[f64] = if let Some(s) = v.as_slice() {
-        s
-    } else {
-        v_owned = Some(v.to_owned());
-        v_owned.as_ref().unwrap().as_slice().unwrap()
-    };
-
-    let a_ref = MatRef::from_row_major_slice(a_slice, n, p);
-    let v_ref = MatRef::from_row_major_slice(v_slice, n, 1);
+    let a_view = FaerArrayView::new(a);
+    let v_view = FaerColView::new(v);
+    let a_ref = a_view.as_ref();
+    let v_ref = v_view.as_ref();
     
     // dst = A^T * v (treating v as n×1 matrix)
     matmul(

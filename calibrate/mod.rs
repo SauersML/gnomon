@@ -18,3 +18,6 @@ pub mod pirls;
 pub mod survival;
 pub mod quadrature;
 pub mod hmc;
+pub mod seeding;
+pub mod visualizer;
+pub mod types;

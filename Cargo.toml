@@ -51,6 +51,8 @@ noodles-bgzf = "0.43.0"
 reqwest = { version = "0.12.9", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 serde_json = "1.0.145"
 sysinfo = "0.30.12"
+ratatui = "0.30"
+crossterm = "0.28.1"
 
 # Built-in model download and caching
 ureq = "2.10"

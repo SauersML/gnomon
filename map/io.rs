@@ -1703,26 +1703,27 @@ impl PrefetchState {
     }
 
     fn attach(self: &Arc<Self>) -> io::Result<PrefetchTap> {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some((kind, message)) = guard.error.clone() {
-            return Err(io::Error::new(kind, message));
+        {
+            let mut guard = self.inner.lock().unwrap();
+            if let Some((kind, message)) = guard.error.clone() {
+                return Err(io::Error::new(kind, message));
+            }
+            if guard.done {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "spool already complete",
+                ));
+            }
+            if guard.attached > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "spool already has an attached reader",
+                ));
+            }
+            guard.attached = 1;
+            guard.head = 0;
+            guard.len = 0;
         }
-        if guard.done {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "spool already complete",
-            ));
-        }
-        if guard.attached > 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "spool already has an attached reader",
-            ));
-        }
-        guard.attached = 1;
-        guard.head = 0;
-        guard.len = 0;
-        drop(guard);
         self.space_available.notify_all();
         Ok(PrefetchTap {
             state: Arc::clone(self),
@@ -1758,41 +1759,41 @@ impl PrefetchState {
     fn push_chunk(&self, data: &[u8]) -> io::Result<()> {
         let mut offset = 0;
         while offset < data.len() {
-            let mut guard = self.inner.lock().unwrap();
-            while guard.attached > 0 && guard.len == guard.buffer.len() && !guard.shutting_down {
-                guard = self.space_available.wait(guard).unwrap();
-            }
-            if guard.shutting_down {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "spool shutting down",
-                ));
-            }
-            if guard.attached == 0 {
-                guard.head = 0;
-                guard.len = 0;
-                break;
-            }
-            let capacity = guard.buffer.len();
-            let tail = (guard.head + guard.len) % capacity;
-            let available = capacity - guard.len;
-            let chunk = available.min(data.len() - offset);
-            if chunk == 0 {
-                continue;
-            }
-            let first = (capacity - tail).min(chunk);
-            guard.buffer[tail..tail + first].copy_from_slice(&data[offset..offset + first]);
-            guard.len += first;
-            offset += first;
+            {
+                let mut guard = self.inner.lock().unwrap();
+                while guard.attached > 0 && guard.len == guard.buffer.len() && !guard.shutting_down {
+                    guard = self.space_available.wait(guard).unwrap();
+                }
+                if guard.shutting_down {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "spool shutting down",
+                    ));
+                }
+                if guard.attached == 0 {
+                    guard.head = 0;
+                    guard.len = 0;
+                    break;
+                }
+                let capacity = guard.buffer.len();
+                let tail = (guard.head + guard.len) % capacity;
+                let available = capacity - guard.len;
+                let chunk = available.min(data.len() - offset);
+                if chunk == 0 {
+                    continue;
+                }
+                let first = (capacity - tail).min(chunk);
+                guard.buffer[tail..tail + first].copy_from_slice(&data[offset..offset + first]);
+                guard.len += first;
+                offset += first;
 
-            if first < chunk {
-                let second = chunk - first;
-                guard.buffer[..second].copy_from_slice(&data[offset..offset + second]);
-                guard.len += second;
-                offset += second;
+                if first < chunk {
+                    let second = chunk - first;
+                    guard.buffer[..second].copy_from_slice(&data[offset..offset + second]);
+                    guard.len += second;
+                    offset += second;
+                }
             }
-
-            drop(guard);
             self.data_ready.notify_all();
         }
         Ok(())
@@ -1841,38 +1842,39 @@ impl Read for PrefetchTap {
         }
 
         loop {
-            let mut guard = self.state.inner.lock().unwrap();
-            while guard.len == 0 && guard.error.is_none() && !guard.done {
-                guard = self.state.data_ready.wait(guard).unwrap();
-            }
-
-            if let Some((kind, message)) = guard.error.clone() {
-                return Err(io::Error::new(kind, message));
-            }
-
-            if guard.len == 0 {
-                if guard.done {
-                    return Ok(0);
+            let to_read = {
+                let mut guard = self.state.inner.lock().unwrap();
+                while guard.len == 0 && guard.error.is_none() && !guard.done {
+                    guard = self.state.data_ready.wait(guard).unwrap();
                 }
-                continue;
-            }
 
-            let capacity = guard.buffer.len();
-            let to_read = buf.len().min(guard.len);
-            let first = (capacity - guard.head).min(to_read);
-            buf[..first].copy_from_slice(&guard.buffer[guard.head..guard.head + first]);
-            guard.head = (guard.head + first) % capacity;
-            guard.len -= first;
+                if let Some((kind, message)) = guard.error.clone() {
+                    return Err(io::Error::new(kind, message));
+                }
 
-            if first < to_read {
-                let second = to_read - first;
-                buf[first..first + second]
-                    .copy_from_slice(&guard.buffer[guard.head..guard.head + second]);
-                guard.head = (guard.head + second) % capacity;
-                guard.len -= second;
-            }
+                if guard.len == 0 {
+                    if guard.done {
+                        return Ok(0);
+                    }
+                    continue;
+                }
 
-            drop(guard);
+                let capacity = guard.buffer.len();
+                let to_read = buf.len().min(guard.len);
+                let first = (capacity - guard.head).min(to_read);
+                buf[..first].copy_from_slice(&guard.buffer[guard.head..guard.head + first]);
+                guard.head = (guard.head + first) % capacity;
+                guard.len -= first;
+
+                if first < to_read {
+                    let second = to_read - first;
+                    buf[first..first + second]
+                        .copy_from_slice(&guard.buffer[guard.head..guard.head + second]);
+                    guard.head = (guard.head + second) % capacity;
+                    guard.len -= second;
+                }
+                to_read
+            };
             self.state.space_available.notify_all();
             return Ok(to_read);
         }

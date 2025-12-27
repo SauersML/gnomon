@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
-/// 
-/// This implements the rank-normalized split-chain R-hat from Vehtari et al. (2021).
+///
+/// This is the standard split-chain formulation (no rank normalization).
 /// Returns (max_rhat, min_ess) across dimensions.
 fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let n_chains = samples.shape()[0];

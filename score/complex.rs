@@ -687,7 +687,7 @@ pub fn resolve_complex_variants(
     eprintln!("> Resolving {num_rules} complex variant rules...");
 
     let fatal_error_occurred = Arc::new(AtomicBool::new(false));
-    let fatal_error_storage = Mutex::new(None::<FatalError>);
+    let fatal_error_storage = Arc::new(Mutex::new(None::<FatalError>));
 
     let pb = ProgressBar::new(prep_result.num_people_to_score as u64);
     let progress_style = ProgressStyle::with_template(
@@ -701,12 +701,14 @@ pub fn resolve_complex_variants(
 
     // Run the parallel processing in a thread scope
     let final_warnings = thread::scope(|s| {
+        let fatal_error_flag = Arc::clone(&fatal_error_occurred);
+        let fatal_error_slot = Arc::clone(&fatal_error_storage);
         // Progress updater thread
         // Spawn progress updater thread
         let progress_handle = s.spawn({
             let pb_updater = pb.clone();
             let counter_for_updater = Arc::clone(&progress_counter);
-            let error_flag_for_updater = Arc::clone(&fatal_error_occurred);
+            let error_flag_for_updater = Arc::clone(&fatal_error_flag);
             let total_people = prep_result.num_people_to_score as u64;
             move || {
                 while counter_for_updater.load(Ordering::Relaxed) < total_people
@@ -720,10 +722,9 @@ pub fn resolve_complex_variants(
         });
 
         // Main processing thread - collect the result from this one
-        let collector_handle = s.spawn(|| {
-            // Ensure the progress_handle is "used" to avoid unused variable warning
-            // This is a direct dependency that ensures the progress thread stays alive
-            std::mem::drop(progress_handle);
+        let collector_handle = s.spawn(move || {
+            let fatal_error_flag = Arc::clone(&fatal_error_flag);
+            let fatal_error_slot = Arc::clone(&fatal_error_slot);
             final_scores
                 .par_chunks_mut(prep_result.score_names.len())
                 .zip(final_missing_counts.par_chunks_mut(prep_result.score_names.len()))
@@ -736,7 +737,7 @@ pub fn resolve_complex_variants(
                         });
                         let _ = &guard;
 
-                        if fatal_error_occurred.load(Ordering::Relaxed) {
+                        if fatal_error_flag.load(Ordering::Relaxed) {
                             return Err(());
                         }
 
@@ -752,11 +753,11 @@ pub fn resolve_complex_variants(
                                 ) {
                                     Ok(bits) => bits,
                                     Err(err) => {
-                                        if fatal_error_occurred
+                                        if fatal_error_flag
                                             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                                             .is_ok()
                                         {
-                                            *fatal_error_storage.lock().unwrap() =
+                                            *fatal_error_slot.lock().unwrap() =
                                                 Some(FatalError::Io(err.to_string()));
                                         }
                                         return Err(());
@@ -850,8 +851,8 @@ pub fn resolve_complex_variants(
                                                 conflicts,
                                             };
 
-                                            if fatal_error_occurred.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                                                *fatal_error_storage.lock().unwrap() =
+                                            if fatal_error_flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                                                *fatal_error_slot.lock().unwrap() =
                                                     Some(FatalError::Ambiguity(data));
                                             }
                                             return Err(());
@@ -880,7 +881,9 @@ pub fn resolve_complex_variants(
         });
 
         // Wait for the collector thread to finish and get its result
-        collector_handle.join().unwrap_or_default()
+        let collector_result = collector_handle.join().unwrap_or_default();
+        progress_handle.join().ok();
+        collector_result
     });
 
     pb.finish_with_message("Done.");

@@ -1232,15 +1232,17 @@ mod tests {
             assert!(expected > 0, "expected at least one variant in dataset");
         }
 
-        let mut train_source = dataset
-            .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))
-            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
-        let mut model = HwePcaModel::fit_k(&mut train_source, TEST_COMPONENTS)
-            .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
-
-        if let Some(sel) = &selection {
-            model.set_variant_keys(Some(sel.keys.clone()));
-        }
+        let mut model = {
+            let mut train_source = dataset
+                .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))
+                .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+            let mut model = HwePcaModel::fit_k(&mut train_source, TEST_COMPONENTS)
+                .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+            if let Some(sel) = &selection {
+                model.set_variant_keys(Some(sel.keys.clone()));
+            }
+            model
+        };
 
         assert_eq!(model.n_samples(), n_samples);
         let observed_variants = model.n_variants();
@@ -1277,8 +1279,6 @@ mod tests {
             variance_ratio_sum <= 1.0 + 1e-9,
             "explained variance ratios must sum to at most 1 (observed {variance_ratio_sum})"
         );
-
-        drop(train_source);
 
         let mut inference_source = dataset
             .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))

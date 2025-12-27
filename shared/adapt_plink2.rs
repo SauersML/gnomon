@@ -244,15 +244,11 @@ impl PsamInfo {
             fam_rows.push(fam_row);
         }
 
-        let final_columns = if let Some(cols) = columns {
-            cols
-        } else {
+        if columns.is_none() {
             let tokens = header_tokens
                 .ok_or_else(|| PipelineError::Io("Missing .psam header (#FID/#IID…)".into()))?;
-            PsamColumns::from_header(&tokens)?
-        };
-
-        drop(final_columns);
+            PsamColumns::from_header(&tokens)?;
+        }
 
         Ok(Self {
             n_samples: sex_by_sample.len(),
@@ -1061,14 +1057,17 @@ impl ByteRangeSource for VirtualBed {
             let to_copy = remaining_in_block.min(remaining_in_dst);
 
             // Fetch or produce the packed block for this out-variant.
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(buf) = cache.get(out_idx) {
-                let start = within_block;
-                let end = start + to_copy;
-                dst[written..written + to_copy].copy_from_slice(&buf[start..end]);
-            } else {
-                drop(cache); // release lock before decoding
-
+            let mut cache_hit = false;
+            {
+                let mut cache = self.cache.lock().unwrap();
+                if let Some(buf) = cache.get(out_idx) {
+                    let start = within_block;
+                    let end = start + to_copy;
+                    dst[written..written + to_copy].copy_from_slice(&buf[start..end]);
+                    cache_hit = true;
+                }
+            }
+            if !cache_hit {
                 // Decode hard-calls for this (in_idx, alt_ord) into a scratch buffer.
                 let (in_idx, alt_ord) = self
                     .plan

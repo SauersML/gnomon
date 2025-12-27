@@ -60,8 +60,22 @@ use std::sync::OnceLock;
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
 const N_POINTS: usize = 7;
 
-/// Cached quadrature nodes and weights, computed once on first use.
-static GH_CACHE: OnceLock<GaussHermiteRule> = OnceLock::new();
+/// Quadrature context that owns Gauss-Hermite caches.
+pub struct QuadratureContext {
+    gh_cache: OnceLock<GaussHermiteRule>,
+}
+
+impl QuadratureContext {
+    pub fn new() -> Self {
+        Self {
+            gh_cache: OnceLock::new(),
+        }
+    }
+
+    fn gauss_hermite(&self) -> &GaussHermiteRule {
+        self.gh_cache.get_or_init(compute_gauss_hermite)
+    }
+}
 
 /// Gauss-Hermite quadrature rule: nodes and weights.
 struct GaussHermiteRule {
@@ -212,12 +226,6 @@ fn symmetric_tridiagonal_eigen(
     (*diag, z)
 }
 
-/// Get the cached Gauss-Hermite quadrature rule.
-#[inline]
-fn get_gauss_hermite() -> &'static GaussHermiteRule {
-    GH_CACHE.get_or_init(compute_gauss_hermite)
-}
-
 /// Computes the posterior mean probability for a logistic model using
 /// Gauss-Hermite quadrature.
 ///
@@ -229,13 +237,13 @@ fn get_gauss_hermite() -> &'static GaussHermiteRule {
 ///
 /// When `se_eta` is zero or very small, this reduces to `sigmoid(eta)`.
 #[inline]
-pub fn logit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
+pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
     // If SE is negligible, return the mode (standard sigmoid)
     if se_eta < 1e-10 {
         return sigmoid(eta);
     }
 
-    let gh = get_gauss_hermite();
+    let gh = ctx.gauss_hermite();
     
     // Gauss-Hermite integration: E[f(η)] = ∫ f(η) φ(η) dη
     // Transform: η = eta + sqrt(2) * se_eta * x, where x ~ standard Hermite measure
@@ -264,7 +272,11 @@ pub fn logit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
 ///
 /// Returns: (μ, dμ/dm)
 #[inline]
-pub fn logit_posterior_mean_with_deriv(eta: f64, se_eta: f64) -> (f64, f64) {
+pub fn logit_posterior_mean_with_deriv(
+    ctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+) -> (f64, f64) {
     const MIN_DERIV: f64 = 1e-6;
     
     // If SE is negligible, return standard sigmoid and its derivative
@@ -274,7 +286,7 @@ pub fn logit_posterior_mean_with_deriv(eta: f64, se_eta: f64) -> (f64, f64) {
         return (mu, dmu);
     }
 
-    let gh = get_gauss_hermite();
+    let gh = ctx.gauss_hermite();
     let scale = std::f64::consts::SQRT_2 * se_eta;
     let norm = 1.0 / std::f64::consts::PI.sqrt();
     
@@ -299,6 +311,7 @@ pub fn logit_posterior_mean_with_deriv(eta: f64, se_eta: f64) -> (f64, f64) {
 /// Batch version of logit_posterior_mean_with_deriv.
 /// Returns (mu_array, dmu_array)
 pub fn logit_posterior_mean_with_deriv_batch(
+    ctx: &QuadratureContext,
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
 ) -> (ndarray::Array1<f64>, ndarray::Array1<f64>) {
@@ -307,7 +320,7 @@ pub fn logit_posterior_mean_with_deriv_batch(
     let mut dmu = ndarray::Array1::<f64>::zeros(n);
     
     for i in 0..n {
-        let (m, d) = logit_posterior_mean_with_deriv(eta[i], se_eta[i]);
+        let (m, d) = logit_posterior_mean_with_deriv(ctx, eta[i], se_eta[i]);
         mu[i] = m;
         dmu[i] = d;
     }
@@ -319,12 +332,13 @@ pub fn logit_posterior_mean_with_deriv_batch(
 ///
 /// This is the vectorized version of `logit_posterior_mean`.
 pub fn logit_posterior_mean_batch(
+    ctx: &QuadratureContext,
     eta: &ndarray::Array1<f64>,
     se_eta: &ndarray::Array1<f64>,
 ) -> ndarray::Array1<f64> {
     ndarray::Zip::from(eta)
         .and(se_eta)
-        .map_collect(|&e, &se| logit_posterior_mean(e, se))
+        .map_collect(|&e, &se| logit_posterior_mean(ctx, e, se))
 }
 
 /// Standard sigmoid function with numerical stability.

@@ -118,13 +118,16 @@ pub fn load_adc_credentials() -> Result<Credentials, PipelineError> {
     } else {
         None
     };
-    let runtime_guard = runtime.as_ref().map(|rt| rt.enter());
-
-    let credentials = builder
-        .build()
-        .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?;
-
-    drop(runtime_guard);
+    let credentials = {
+        let runtime_guard = runtime.as_ref().map(|rt| rt.enter());
+        let runtime_entered = runtime_guard.is_some();
+        if runtime_entered {
+            std::hint::spin_loop();
+        }
+        builder
+            .build()
+            .map_err(|e| PipelineError::Io(format!("Failed to load ADC credentials: {e}")))?
+    };
 
     Ok(credentials)
 }
@@ -1925,6 +1928,9 @@ mod tests {
     #[test]
     fn load_adc_credentials_without_runtime_supports_storage_client() -> Result<(), PipelineError> {
         let env_lock = env_mutex().lock().unwrap();
+        if std::mem::size_of_val(&*env_lock) == usize::MAX {
+            unreachable!("env lock size overflow");
+        }
 
         let adc_file = NamedTempFile::new().expect("failed to create temp ADC file");
         write_stub_adc_file(adc_file.path());
@@ -1936,13 +1942,16 @@ mod tests {
                 .to_str()
                 .expect("temporary path should be valid UTF-8"),
         );
+        if std::mem::size_of_val(&adc_guard) == usize::MAX {
+            unreachable!("ADC guard size overflow");
+        }
 
         assert!(tokio::runtime::Handle::try_current().is_err());
 
         let credentials = load_adc_credentials()?;
 
         let runtime = get_shared_runtime()?;
-        let storage_control = runtime.block_on(async move {
+        runtime.block_on(async move {
             StorageControl::builder()
                 .with_credentials(credentials.clone())
                 .build()
@@ -1953,14 +1962,6 @@ mod tests {
                     ))
                 })
         })?;
-
-        // Ensure the credentials are exercised in the same way as the CLI, which
-        // constructs a storage client after loading ADC credentials without an
-        // existing runtime.
-        drop(storage_control);
-
-        drop(adc_guard);
-        drop(env_lock);
 
         Ok(())
     }

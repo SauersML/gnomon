@@ -289,6 +289,7 @@ struct GamWorkingModel<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
     covariate_se: Option<Array1<f64>>,
+    quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
 }
 
 
@@ -1946,6 +1947,7 @@ pub fn update_glm_vectors(
 ///   weight = prior × (dμ/dη)² / (μ(1-μ))  
 ///   z = η + (y - μ) / (dμ/dη)
 pub fn update_glm_vectors_integrated(
+    quad_ctx: &crate::calibrate::quadrature::QuadratureContext,
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
@@ -1954,7 +1956,6 @@ pub fn update_glm_vectors_integrated(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
 ) {
-    use crate::calibrate::quadrature::logit_posterior_mean_with_deriv;
     
     const MIN_WEIGHT: f64 = 1e-12;
     const MIN_D_FOR_Z: f64 = 1e-6;
@@ -1966,7 +1967,8 @@ pub fn update_glm_vectors_integrated(
         let se_i = se[i].max(0.0);
         
         // Integrated probability and derivative via GHQ
-        let (mu_i, dmu_deta) = logit_posterior_mean_with_deriv(e, se_i);
+        let (mu_i, dmu_deta) =
+            crate::calibrate::quadrature::logit_posterior_mean_with_deriv(quad_ctx, e, se_i);
         let mu_clamped = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
         mu[i] = mu_clamped;
         
@@ -3752,7 +3754,7 @@ mod tests {
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
         let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(data, config)?;
-        drop(penalty_structs);
+        debug_assert!(!penalty_structs.is_empty());
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
     }

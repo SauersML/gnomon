@@ -1,6 +1,6 @@
 use crate::calibrate::basis::{
-    BasisError, SplineScratch, create_bspline_basis_with_knots, create_difference_penalty_matrix,
-    evaluate_bspline_basis_scalar, null_range_whiten,
+    BasisError, SplineScratch, baseline_lambda_seed, create_bspline_basis_with_knots,
+    create_difference_penalty_matrix, evaluate_bspline_basis_scalar, null_range_whiten,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
@@ -734,34 +734,6 @@ where
     }
 }
 
-/// Compute the initial smoothing weight for the survival baseline spline.
-pub fn baseline_lambda_seed(age_basis: &BasisDescriptor, penalty_order: usize) -> f64 {
-    let mut min_knot = f64::INFINITY;
-    let mut max_knot = f64::NEG_INFINITY;
-    for &value in age_basis.knot_vector.iter() {
-        if !value.is_finite() {
-            continue;
-        }
-        if value < min_knot {
-            min_knot = value;
-        }
-        if value > max_knot {
-            max_knot = value;
-        }
-    }
-
-    let span = if min_knot.is_finite() && max_knot.is_finite() && max_knot > min_knot {
-        max_knot - min_knot
-    } else {
-        1.0
-    };
-    let order = penalty_order.max(1) as f64;
-    let degree = age_basis.degree.max(1) as f64;
-    let normalized_span = (span / (span + 1.0)).max(1e-3);
-    let lambda = 0.5 * (order / (degree + 1.0)) / normalized_span;
-    lambda.clamp(1e-6, 1e3)
-}
-
 pub fn build_survival_layout(
     data: &SurvivalTrainingData,
     age_basis: &BasisDescriptor,
@@ -804,7 +776,8 @@ pub fn build_survival_layout(
 
     let baseline_cols = constrained_exit.ncols();
     let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
-    let baseline_lambda = baseline_lambda_seed(age_basis, baseline_penalty_order);
+    let baseline_lambda =
+        baseline_lambda_seed(&age_basis.knot_vector, age_basis.degree, baseline_penalty_order);
     let mut penalty_blocks = vec![PenaltyBlock {
         matrix: penalty_matrix.clone(),
         lambda: baseline_lambda,
@@ -2423,7 +2396,7 @@ pub fn cumulative_incidence(
     artifacts: &SurvivalModelArtifacts,
 ) -> Result<f64, SurvivalError> {
     let h = cumulative_hazard(age, covariates, artifacts)?;
-    Ok(1.0 - (-h).exp())
+    Ok(-(-h).exp_m1())
 }
 
 /// Compute Net Risk (Hypothetical risk of disease assuming no competing events).
@@ -2439,7 +2412,7 @@ pub fn conditional_absolute_risk(
     let h1 = cumulative_hazard(t1, covariates, artifacts)?;
     // Ensure monotonicity numerically
     let delta_h = (h1 - h0).max(0.0);
-    Ok(1.0 - (-delta_h).exp())
+    Ok(-(-delta_h).exp_m1())
 }
 
 /// Compute Gauss-Legendre quadrature nodes and weights for N points on interval [-1, 1].

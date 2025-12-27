@@ -451,14 +451,15 @@ fn run_single_file_pipeline(
             let spool_file_path = spool_path
                 .clone()
                 .expect("spool path missing despite spooling enabled");
-            let mut state = spool_state
-                .take()
-                .expect("spool state missing despite spooling enabled");
-            state.writer.flush().map_err(|e| {
-                PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
-            })?;
-            drop(state.writer);
-            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            let (offsets, spool_bytes_per_variant) = {
+                let mut state = spool_state
+                    .take()
+                    .expect("spool state missing despite spooling enabled");
+                state.writer.flush().map_err(|e| {
+                    PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
+                })?;
+                (state.offsets, prep_result.spool_bytes_per_variant())
+            };
             let mmap = if spool_bytes_per_variant == 0 {
                 let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
                     PipelineError::Io(format!(
@@ -488,7 +489,7 @@ fn run_single_file_pipeline(
             let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
             let resolver = ComplexVariantResolver::from_spool(
                 Arc::new(mmap),
-                state.offsets,
+                offsets,
                 spool_bytes_per_variant,
                 dense_map,
             );
@@ -797,14 +798,15 @@ fn run_multi_file_pipeline(
             let spool_file_path = spool_path
                 .clone()
                 .expect("spool path missing despite spooling enabled");
-            let mut state = spool_state
-                .take()
-                .expect("spool state missing despite spooling enabled");
-            state.writer.flush().map_err(|e| {
-                PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
-            })?;
-            drop(state.writer);
-            let spool_bytes_per_variant = prep_result.spool_bytes_per_variant();
+            let (offsets, spool_bytes_per_variant) = {
+                let mut state = spool_state
+                    .take()
+                    .expect("spool state missing despite spooling enabled");
+                state.writer.flush().map_err(|e| {
+                    PipelineError::Io(format!("Failed to flush complex variant spool: {e}"))
+                })?;
+                (state.offsets, prep_result.spool_bytes_per_variant())
+            };
             let mmap = if spool_bytes_per_variant == 0 {
                 let mut anon = MmapOptions::new().len(1).map_anon().map_err(|e| {
                     PipelineError::Io(format!(
@@ -834,7 +836,7 @@ fn run_multi_file_pipeline(
             let dense_map = Arc::new(prep_result.spool_dense_map().to_vec());
             let resolver = ComplexVariantResolver::from_spool(
                 Arc::new(mmap),
-                state.offsets,
+                offsets,
                 spool_bytes_per_variant,
                 dense_map,
             );
@@ -1121,44 +1123,48 @@ fn process_dense_stream(
                 let concatenated_data = &mut acc.2;
                 concatenated_data.clear();
 
-                // BufferGuard ensures all variant data buffers are returned to the pool,
-                // even if an error occurs during computation.
-                let guards: Vec<_> = batch
-                    .into_iter()
-                    .map(|wi| {
-                        concatenated_data.extend_from_slice(&wi.data);
-                        BufferGuard {
-                            buffer: Some(wi.data),
-                            pool: &buffer_pool,
-                        }
-                    })
-                    .collect();
+                {
+                    // BufferGuard ensures all variant data buffers are returned to the pool,
+                    // even if an error occurs during computation.
+                    let guards: Vec<_> = batch
+                        .into_iter()
+                        .map(|wi| {
+                            concatenated_data.extend_from_slice(&wi.data);
+                            BufferGuard {
+                                buffer: Some(wi.data),
+                                pool: &buffer_pool,
+                            }
+                        })
+                        .collect();
 
-                let stride = prep_result.stride();
-                let mut weights_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
-                let mut flips_for_batch = Vec::with_capacity(reconciled_indices.len() * stride);
-                for &reconciled_idx in &reconciled_indices {
-                    let src_offset = reconciled_idx.0 as usize * stride;
-                    weights_for_batch.extend_from_slice(
-                        &prep_result.weights_matrix()[src_offset..src_offset + stride],
-                    );
-                    flips_for_batch.extend_from_slice(
-                        &prep_result.flip_mask_matrix()[src_offset..src_offset + stride],
-                    );
+                    let stride = prep_result.stride();
+                    let mut weights_for_batch =
+                        Vec::with_capacity(reconciled_indices.len() * stride);
+                    let mut flips_for_batch =
+                        Vec::with_capacity(reconciled_indices.len() * stride);
+                    for &reconciled_idx in &reconciled_indices {
+                        let src_offset = reconciled_idx.0 as usize * stride;
+                        weights_for_batch.extend_from_slice(
+                            &prep_result.weights_matrix()[src_offset..src_offset + stride],
+                        );
+                        flips_for_batch.extend_from_slice(
+                            &prep_result.flip_mask_matrix()[src_offset..src_offset + stride],
+                        );
+                    }
+
+                    batch::run_person_major_path(
+                        concatenated_data,
+                        &weights_for_batch,
+                        &flips_for_batch,
+                        &reconciled_indices,
+                        prep_result,
+                        &mut acc.0,
+                        &mut acc.1,
+                        &context.tile_pool,
+                    )?;
+
+                    debug_assert!(!guards.is_empty());
                 }
-
-                batch::run_person_major_path(
-                    concatenated_data,
-                    &weights_for_batch,
-                    &flips_for_batch,
-                    &reconciled_indices,
-                    prep_result,
-                    &mut acc.0,
-                    &mut acc.1,
-                    &context.tile_pool,
-                )?;
-
-                drop(guards); // Explicitly drop to return buffers to the pool.
 
                 Ok::<_, PipelineError>(acc)
             },

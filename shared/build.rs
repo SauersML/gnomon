@@ -56,6 +56,17 @@ struct IgnoredTestCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for forbidden drop(...) usage in build scripts
+struct DropUsageCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
+struct EmptyBlockCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -456,6 +467,74 @@ impl IgnoredTestCollector {
             .push_str("\n⚠️ #[ignore] TEST ATTRIBUTES ARE STRICTLY FORBIDDEN IN THIS PROJECT!\n");
         error_msg.push_str("   IGNORING TESTS IS NEVER ALLOWED FOR ANY REASON.\n");
         error_msg.push_str("   Fix the test so it can run properly without being ignored.\n");
+
+        Some(error_msg)
+    }
+}
+
+impl DropUsageCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} disallowed drop(...) usages in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Explicit drop(...) calls are forbidden in this project.\n",
+        );
+        error_msg.push_str(
+            "   Restructure the code to let values go out of scope naturally.\n",
+        );
+
+        Some(error_msg)
+    }
+}
+
+impl EmptyBlockCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} empty control-flow blocks in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str(
+            "\n⚠️ Empty control-flow blocks are forbidden in this project.\n",
+        );
+        error_msg.push_str("   Remove the block or add meaningful logic.\n");
 
         Some(error_msg)
     }
@@ -864,6 +943,60 @@ impl Sink for IgnoredTestCollector {
     }
 }
 
+impl Sink for DropUsageCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 && part.contains("drop(") {
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+
+        let is_drop_definition = line_text.contains("fn drop")
+            || line_text.contains("impl Drop")
+            || line_text.contains("trait Drop");
+
+        if is_pure_comment || is_in_string || is_drop_definition {
+            return Ok(true);
+        }
+
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum EmptyBlockTokenKind {
+    Ident(String),
+    OpenBrace,
+    CloseBrace,
+    Semicolon,
+    Arrow,
+}
+
+#[derive(Clone, Debug)]
+struct EmptyBlockToken {
+    kind: EmptyBlockTokenKind,
+    line: usize,
+    offset: usize,
+    depth: usize,
+}
+
 fn main() {
     install_stage_panic_hook();
     configure_linker_for_low_memory();
@@ -957,6 +1090,35 @@ fn main() {
     );
     emit_stage_detail(&ignored_report);
     all_violations.extend(ignored_test_violations);
+
+    // Scan build scripts for forbidden drop(...) usage
+    update_stage("scan build script drop usage");
+    let drop_usage_violations = scan_for_drop_in_build_scripts();
+    let drop_usage_report = format!(
+        "build script drop scan identified {} violation groups",
+        drop_usage_violations.len()
+    );
+    emit_stage_detail(&drop_usage_report);
+    all_violations.extend(drop_usage_violations);
+
+    // Scan Rust source files for forbidden drop(...) usage
+    update_stage("scan drop usage");
+    let drop_usage_violations = scan_for_drop_usage();
+    let drop_usage_report = format!(
+        "drop usage scan identified {} violation groups",
+        drop_usage_violations.len()
+    );
+    emit_stage_detail(&drop_usage_report);
+    all_violations.extend(drop_usage_violations);
+
+    update_stage("scan empty control-flow blocks");
+    let empty_block_violations = scan_for_empty_control_blocks();
+    let empty_block_report = format!(
+        "empty control-flow block scan identified {} violation groups",
+        empty_block_violations.len()
+    );
+    emit_stage_detail(&empty_block_report);
+    all_violations.extend(empty_block_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -1250,7 +1412,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok()) // Ignore any errors during directory traversal.
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude any target directories.
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories.
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             // Keep only .rs files.
             {
@@ -1315,7 +1477,7 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
@@ -1360,7 +1522,7 @@ fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
                 let path = entry.path();
@@ -1422,7 +1584,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1456,7 +1618,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1491,7 +1653,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1524,7 +1686,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs")
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1563,7 +1725,7 @@ fn scan_for_allow_dead_code() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1616,7 +1778,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
             for entry in WalkDir::new(".")
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
-                .filter(|e: &walkdir::DirEntry| !is_in_target_directory(e.path())) // Exclude target directory
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
                 .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
                 .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
             {
@@ -1657,8 +1819,668 @@ fn scan_for_ignored_tests() -> Vec<String> {
     all_violations
 }
 
+fn scan_for_drop_in_build_scripts() -> Vec<String> {
+    let pattern = r"\bdrop\s*\(";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| {
+                    e.path().file_name().is_some_and(|name| name == OsStr::new("build.rs"))
+                })
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = DropUsageCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating drop usage regex matcher for build scripts: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_drop_usage() -> Vec<String> {
+    let pattern = r"\bdrop\s*\(";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = DropUsageCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating drop usage regex matcher: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_empty_control_blocks() -> Vec<String> {
+    let mut all_violations = Vec::new();
+
+    for entry in WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+        .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+        .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let path = entry.path();
+        let source = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        let mut collector = EmptyBlockCollector::new(path);
+        let violations = find_empty_control_blocks(&source);
+        collector.violations.extend(violations);
+
+        if let Some(error_message) = collector.check_and_get_error_message() {
+            all_violations.push(error_message);
+        }
+    }
+
+    all_violations
+}
+
+fn find_empty_control_blocks(source: &str) -> Vec<String> {
+    let tokens_sanitized = strip_comments_and_strings_for_tokens(source);
+    let content_sanitized = strip_comments_and_strings_for_content(source);
+    let tokens = tokenize_for_empty_block_scan(&tokens_sanitized);
+    let lines: Vec<&str> = source.lines().collect();
+    let mut brace_stack: Vec<usize> = Vec::new();
+    let mut matches = vec![None; tokens.len()];
+
+    for (idx, token) in tokens.iter().enumerate() {
+        match token.kind {
+            EmptyBlockTokenKind::OpenBrace => brace_stack.push(idx),
+            EmptyBlockTokenKind::CloseBrace => {
+                if let Some(open_idx) = brace_stack.pop() {
+                    matches[open_idx] = Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut violations = Vec::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        let Some(close_idx) = matches.get(idx).and_then(|m| *m) else {
+            continue;
+        };
+
+        if !matches!(token.kind, EmptyBlockTokenKind::OpenBrace) {
+            continue;
+        }
+
+        let open_offset = token.offset + 1;
+        let close_offset = tokens[close_idx].offset;
+        if close_offset <= open_offset {
+            continue;
+        }
+
+        if !content_sanitized[open_offset..close_offset]
+            .iter()
+            .all(|byte| byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+
+        let depth = token.depth;
+        let mut control_keyword = None;
+        for prev_idx in (0..idx).rev() {
+            let prev_token = &tokens[prev_idx];
+            if prev_token.depth < depth {
+                break;
+            }
+            if prev_token.depth > depth {
+                continue;
+            }
+            match prev_token.kind {
+                EmptyBlockTokenKind::Semicolon => break,
+                EmptyBlockTokenKind::OpenBrace | EmptyBlockTokenKind::CloseBrace => break,
+                EmptyBlockTokenKind::Arrow => break,
+                EmptyBlockTokenKind::Ident(ref ident) => {
+                    if matches!(
+                        ident.as_str(),
+                        "if" | "else" | "for" | "while" | "loop" | "match"
+                    ) {
+                        control_keyword = Some(ident.as_str());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if control_keyword.is_none() {
+            continue;
+        }
+
+        let line_number = token.line;
+        let line_text = lines
+            .get(line_number.saturating_sub(1))
+            .copied()
+            .unwrap_or("")
+            .trim_end();
+        violations.push(format!("{line_number}:{line_text}"));
+    }
+
+    violations
+}
+
+fn strip_comments_and_strings_for_tokens(source: &str) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        LineComment,
+        BlockComment(usize),
+        StringLiteral,
+        CharLiteral,
+        RawString(usize),
+    }
+
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut state = State::Normal;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => {
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::LineComment;
+                    continue;
+                }
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::BlockComment(1);
+                    continue;
+                }
+                if let Some((hashes, consumed)) = raw_string_start(bytes, i) {
+                    for _ in 0..consumed {
+                        out.push(b' ');
+                    }
+                    i += consumed;
+                    state = State::RawString(hashes);
+                    continue;
+                }
+                if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b' ');
+                    i += 1;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push(b' ');
+                    i += 1;
+                    state = State::CharLiteral;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+            State::LineComment => {
+                if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                    state = State::Normal;
+                } else {
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            State::BlockComment(depth) => {
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::BlockComment(depth + 1);
+                    continue;
+                }
+                if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    if depth == 1 {
+                        state = State::Normal;
+                    } else {
+                        state = State::BlockComment(depth - 1);
+                    }
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            State::StringLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b' ');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            State::CharLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push(b' ');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            State::RawString(hashes) => {
+                if b == b'"' && raw_string_end(bytes, i, hashes) {
+                    out.push(b' ');
+                    i += 1;
+                    for _ in 0..hashes {
+                        out.push(b' ');
+                        i += 1;
+                    }
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn strip_comments_and_strings_for_content(source: &str) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        LineComment,
+        BlockComment(usize),
+        StringLiteral,
+        CharLiteral,
+        RawString(usize),
+    }
+
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut state = State::Normal;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => {
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::LineComment;
+                    continue;
+                }
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::BlockComment(1);
+                    continue;
+                }
+                if let Some((hashes, consumed)) = raw_string_start(bytes, i) {
+                    for _ in 0..consumed {
+                        out.push(b'x');
+                    }
+                    i += consumed;
+                    state = State::RawString(hashes);
+                    continue;
+                }
+                if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::StringLiteral;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::CharLiteral;
+                    continue;
+                }
+                out.push(b);
+                i += 1;
+            }
+            State::LineComment => {
+                if b == b'\n' {
+                    out.push(b'\n');
+                    i += 1;
+                    state = State::Normal;
+                } else {
+                    out.push(b' ');
+                    i += 1;
+                }
+            }
+            State::BlockComment(depth) => {
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    state = State::BlockComment(depth + 1);
+                    continue;
+                }
+                if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    if depth == 1 {
+                        state = State::Normal;
+                    } else {
+                        state = State::BlockComment(depth - 1);
+                    }
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            State::StringLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b'x');
+                }
+                i += 1;
+            }
+            State::CharLiteral => {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    out.push(b'x');
+                    out.push(b'x');
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push(b'x');
+                    i += 1;
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b'x');
+                }
+                i += 1;
+            }
+            State::RawString(hashes) => {
+                if b == b'"' && raw_string_end(bytes, i, hashes) {
+                    out.push(b'x');
+                    i += 1;
+                    for _ in 0..hashes {
+                        out.push(b'x');
+                        i += 1;
+                    }
+                    state = State::Normal;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                } else {
+                    out.push(b'x');
+                }
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn raw_string_start(bytes: &[u8], idx: usize) -> Option<(usize, usize)> {
+    let offset = if bytes.get(idx) == Some(&b'r') {
+        1
+    } else if bytes.get(idx) == Some(&b'b') && bytes.get(idx + 1) == Some(&b'r') {
+        2
+    } else {
+        return None;
+    };
+
+    let mut hashes = 0usize;
+    let mut j = idx + offset;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+
+    Some((hashes, j + 1 - idx))
+}
+
+fn raw_string_end(bytes: &[u8], idx: usize, hashes: usize) -> bool {
+    if bytes.get(idx) != Some(&b'"') {
+        return false;
+    }
+    for h in 0..hashes {
+        if bytes.get(idx + 1 + h) != Some(&b'#') {
+            return false;
+        }
+    }
+    true
+}
+
+fn tokenize_for_empty_block_scan(sanitized: &[u8]) -> Vec<EmptyBlockToken> {
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    let mut line = 1usize;
+
+    while i < sanitized.len() {
+        let b = sanitized[i];
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            i += 1;
+            while i < sanitized.len()
+                && (sanitized[i].is_ascii_alphanumeric() || sanitized[i] == b'_')
+            {
+                i += 1;
+            }
+            let ident = String::from_utf8_lossy(&sanitized[start..i]).to_string();
+            tokens.push(EmptyBlockToken {
+                kind: EmptyBlockTokenKind::Ident(ident),
+                line,
+                offset: start,
+                depth: 0,
+            });
+            continue;
+        }
+
+        if b == b'=' && sanitized.get(i + 1) == Some(&b'>') {
+            tokens.push(EmptyBlockToken {
+                kind: EmptyBlockTokenKind::Arrow,
+                line,
+                offset: i,
+                depth: 0,
+            });
+            i += 2;
+            continue;
+        }
+
+        let kind = match b {
+            b'{' => Some(EmptyBlockTokenKind::OpenBrace),
+            b'}' => Some(EmptyBlockTokenKind::CloseBrace),
+            b';' => Some(EmptyBlockTokenKind::Semicolon),
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            tokens.push(EmptyBlockToken {
+                kind,
+                line,
+                offset: i,
+                depth: 0,
+            });
+        }
+        i += 1;
+    }
+
+    let mut depth = 0usize;
+    for token in &mut tokens {
+        token.depth = depth;
+        match token.kind {
+            EmptyBlockTokenKind::OpenBrace => depth += 1,
+            EmptyBlockTokenKind::CloseBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    tokens
+}
+
+fn is_in_hidden_directory(path: impl AsRef<Path>) -> bool {
+    path.as_ref().components().any(|component| {
+        if let Component::Normal(name) = component {
+            let name_str = name.to_string_lossy();
+            name_str.starts_with('.')
+        } else {
+            false
+        }
+    })
+}
+
 fn is_in_target_directory(path: impl AsRef<Path>) -> bool {
     path.as_ref()
         .components()
         .any(|component| matches!(component, Component::Normal(name) if name == "target"))
+}
+
+fn is_in_ignored_directory(path: impl AsRef<Path>) -> bool {
+    is_in_target_directory(path.as_ref()) || is_in_hidden_directory(path.as_ref())
 }

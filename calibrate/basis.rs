@@ -92,6 +92,34 @@ pub struct BasisCacheStats {
     pub misses: u64,
 }
 
+/// Compute a heuristic smoothing weight based on knot span, penalty order, and spline degree.
+pub fn baseline_lambda_seed(knot_vector: &Array1<f64>, degree: usize, penalty_order: usize) -> f64 {
+    let mut min_knot = f64::INFINITY;
+    let mut max_knot = f64::NEG_INFINITY;
+    for &value in knot_vector.iter() {
+        if !value.is_finite() {
+            continue;
+        }
+        if value < min_knot {
+            min_knot = value;
+        }
+        if value > max_knot {
+            max_knot = value;
+        }
+    }
+
+    let span = if min_knot.is_finite() && max_knot.is_finite() && max_knot > min_knot {
+        max_knot - min_knot
+    } else {
+        1.0
+    };
+    let order = penalty_order.max(1) as f64;
+    let degree = degree.max(1) as f64;
+    let normalized_span = (span / (span + 1.0)).max(1e-3);
+    let lambda = 0.5 * (order / (degree + 1.0)) / normalized_span;
+    lambda.clamp(1e-6, 1e3)
+}
+
 const DEFAULT_BASIS_CACHE_CAPACITY: usize = 1_000;
 const BASIS_CACHE_MAX_POINTS: usize = 20_000;
 const BASIS_CACHE_MIN_DEGREE: usize = 2;
@@ -388,7 +416,9 @@ pub fn create_bspline_basis_with_knots(
 
         const PAR_THRESHOLD: usize = 256;
 
+        let support = degree + 1;
         let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
+            let mut values = vec![0.0; support];
             for (mut row, &x) in basis_matrix
                 .axis_iter_mut(Axis(0))
                 .zip(data.iter())
@@ -396,7 +426,17 @@ pub fn create_bspline_basis_with_knots(
                 let row_slice = row
                     .as_slice_mut()
                     .expect("basis matrix rows should be contiguous");
-                internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
+                let start_col =
+                    internal::evaluate_splines_sparse_into(x, degree, knot_view, &mut values, scratch);
+                for (offset, &v) in values.iter().enumerate() {
+                    if v == 0.0 {
+                        continue;
+                    }
+                    let col_j = start_col + offset;
+                    if col_j < num_basis_functions {
+                        row_slice[col_j] = v;
+                    }
+                }
             }
         };
 
@@ -407,14 +447,27 @@ pub fn create_bspline_basis_with_knots(
                     .into_par_iter()
                     .zip(data_slice.par_iter().copied())
                     .for_each_init(
-                        || internal::BsplineScratch::new(degree),
-                        |scratch, (mut row, x)| {
+                        || (internal::BsplineScratch::new(degree), vec![0.0; support]),
+                        |(scratch, values), (mut row, x)| {
                             let row_slice = row
                                 .as_slice_mut()
                                 .expect("basis matrix rows should be contiguous");
-                            internal::evaluate_splines_at_point_into(
-                                x, degree, knot_view, row_slice, scratch,
+                            let start_col = internal::evaluate_splines_sparse_into(
+                                x,
+                                degree,
+                                knot_view,
+                                values,
+                                scratch,
                             );
+                            for (offset, &v) in values.iter().enumerate() {
+                                if v == 0.0 {
+                                    continue;
+                                }
+                                let col_j = start_col + offset;
+                                if col_j < num_basis_functions {
+                                    row_slice[col_j] = v;
+                                }
+                            }
                         },
                     );
             });
@@ -636,7 +689,9 @@ pub fn create_bspline_basis(
 
     const PAR_THRESHOLD: usize = 256;
 
+    let support = degree + 1;
     let mut fill_rows = |scratch: &mut internal::BsplineScratch| {
+        let mut values = vec![0.0; support];
         for (mut row, &x) in basis_matrix
             .axis_iter_mut(Axis(0))
             .zip(data.iter())
@@ -644,7 +699,17 @@ pub fn create_bspline_basis(
             let row_slice = row
                 .as_slice_mut()
                 .expect("basis matrix rows should be contiguous");
-            internal::evaluate_splines_at_point_into(x, degree, knot_view, row_slice, scratch);
+            let start_col =
+                internal::evaluate_splines_sparse_into(x, degree, knot_view, &mut values, scratch);
+            for (offset, &v) in values.iter().enumerate() {
+                if v == 0.0 {
+                    continue;
+                }
+                let col_j = start_col + offset;
+                if col_j < num_basis_functions {
+                    row_slice[col_j] = v;
+                }
+            }
         }
     };
 
@@ -655,14 +720,27 @@ pub fn create_bspline_basis(
                 .into_par_iter()
                 .zip(data_slice.par_iter().copied())
                 .for_each_init(
-                    || internal::BsplineScratch::new(degree),
-                    |scratch, (mut row, x)| {
+                    || (internal::BsplineScratch::new(degree), vec![0.0; support]),
+                    |(scratch, values), (mut row, x)| {
                         let row_slice = row
                             .as_slice_mut()
                             .expect("basis matrix rows should be contiguous");
-                        internal::evaluate_splines_at_point_into(
-                            x, degree, knot_view, row_slice, scratch,
+                        let start_col = internal::evaluate_splines_sparse_into(
+                            x,
+                            degree,
+                            knot_view,
+                            values,
+                            scratch,
                         );
+                        for (offset, &v) in values.iter().enumerate() {
+                            if v == 0.0 {
+                                continue;
+                            }
+                            let col_j = start_col + offset;
+                            if col_j < num_basis_functions {
+                                row_slice[col_j] = v;
+                            }
+                        }
                     },
                 );
         });

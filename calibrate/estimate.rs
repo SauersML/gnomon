@@ -40,11 +40,13 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
+use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
+use crate::calibrate::visualizer;
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError};
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
 use faer::{Par, Side, get_global_parallelism, set_global_parallelism};
@@ -1072,7 +1074,7 @@ pub fn train_joint_model(
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
     
-    drop(penalty_structs);
+    debug_assert!(!penalty_structs.is_empty());
     
     eprintln!(
         "[JOINT] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -1306,8 +1308,14 @@ pub fn train_model(
         "Starting model training with REML. {} total samples.",
         data.y.len()
     );
+    let vis_guard = visualizer::init_guard(config.reml_max_iterations > 0);
+    if vis_guard.is_active() {
+        visualizer::set_stage("stage-0", "init");
+    }
+    let result = (|| {
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
+    visualizer::set_stage("stage-1", "constructing design/penalties");
     let (
         x_matrix,
         s_list,
@@ -1320,7 +1328,7 @@ pub fn train_model(
         interaction_orth_alpha,
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
-    drop(penalty_structs);
+    debug_assert!(!penalty_structs.is_empty());
     log_layout_info(&layout);
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -1391,6 +1399,7 @@ pub fn train_model(
     // Fast-path: if there are no penalties, skip outer REML/BFGS optimization entirely.
     // Fit a single unpenalized model via P-IRLS and finalize.
     if layout.num_penalties == 0 {
+        visualizer::set_stage("stage-2", "no penalties; PIRLS only");
         eprintln!("\n[STAGE 2/3] Skipping smoothing parameter optimization (no penalties)...");
         eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
 
@@ -1516,67 +1525,28 @@ pub fn train_model(
 
     // Multi-start seeding with asymmetric perturbations to break symmetry
     // This prevents the optimizer from getting trapped when PC penalties are identical
-    let mut seed_candidates = Vec::new();
+    visualizer::set_stage("stage-2", "seed scan");
+    let heuristic_lambdas = knot_vectors
+        .get("pgs")
+        .map(|knots| {
+            basis::baseline_lambda_seed(
+                knots,
+                config.pgs_basis_config.degree,
+                config.penalty_order,
+            )
+        })
+        .map(|lambda| vec![lambda]);
 
-    // Symmetric base seeds
-    // Include genuinely small-λ and large-λ seeds to explore a broader landscape
-    let base_values: &[f64] = &[
-        12.0, 10.0, 8.0, 6.0, 4.0, 2.0, 0.0, -2.0, -4.0, -6.0, -8.0, -10.0, -12.0,
-    ];
-    for &val in base_values {
-        seed_candidates.push(Array1::from_elem(layout.num_penalties, val));
-    }
-
-    // Ensure each penalty index is explored individually (useful when only one needs extreme smoothing)
-    for idx in 0..layout.num_penalties {
-        for &val in &[12.0, 4.0, -4.0, -12.0] {
-            let mut seed = Array1::zeros(layout.num_penalties);
-            seed[idx] = val;
-            seed_candidates.push(seed);
-        }
-    }
-
-    // Pairwise asymmetric seeds to break symmetry between every pair of penalties
-    if layout.num_penalties >= 2 {
-        let pair_templates: &[(f64, f64)] = &[(12.0, 0.0), (8.0, -4.0), (6.0, -2.0)];
-
-        for i in 0..layout.num_penalties {
-            for j in (i + 1)..layout.num_penalties {
-                for &(hi, lo) in pair_templates {
-                    let mut seed_ij = Array1::zeros(layout.num_penalties);
-                    seed_ij[i] = hi;
-                    seed_ij[j] = lo;
-                    seed_candidates.push(seed_ij);
-
-                    let mut seed_ji = Array1::zeros(layout.num_penalties);
-                    seed_ji[i] = lo;
-                    seed_ji[j] = hi;
-                    seed_candidates.push(seed_ji);
-                }
-            }
-        }
-    }
-    // Extend shorter seeds to match layout.num_penalties
-    for seed in &mut seed_candidates {
-        // Convert to Vec, resize, then back to Array1
-        let mut vec_seed = seed.to_vec();
-        vec_seed.resize(layout.num_penalties, 0.0); // Fill/trim to exact length
-        *seed = Array1::from_vec(vec_seed);
-    }
-
-    // Deduplicate seeds to avoid redundant evaluations and noisy diagnostics
-    {
-        use std::collections::HashSet;
-        let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        let mut unique: Vec<Array1<f64>> = Vec::with_capacity(seed_candidates.len());
-        for s in seed_candidates.into_iter() {
-            let key: Vec<u64> = s.iter().map(|&v| v.to_bits()).collect();
-            if seen.insert(key) {
-                unique.push(s);
-            }
-        }
-        seed_candidates = unique;
-    }
+    let seed_config = SeedConfig {
+        strategy: SeedStrategy::Exhaustive,
+        bounds: (-12.0, 12.0),
+    };
+    let seed_candidates = generate_rho_candidates(
+        layout.num_penalties,
+        heuristic_lambdas.as_deref(),
+        &seed_config,
+    );
+    visualizer::set_progress("Seed scan", 0, Some(seed_candidates.len()));
 
     // Evaluate all seeds, separating symmetric from asymmetric candidates
     let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
@@ -1584,39 +1554,54 @@ pub fn train_model(
 
     // We'll do a single mandatory gradient check after we select the initial point
 
+    let total_candidates = seed_candidates.len();
+    let mut finite_count = 0usize;
+    let mut inf_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut min_cost = f64::INFINITY;
+    let mut max_cost = f64::NEG_INFINITY;
+    let mut best_idx = 0usize;
+    let mut best_summary = String::new();
+
     for (i, seed) in seed_candidates.iter().enumerate() {
+        visualizer::set_stage("stage-2", &format!("seed scan {}/{}", i + 1, seed_candidates.len()));
+        visualizer::set_progress("Seed scan", i + 1, Some(seed_candidates.len()));
+        let summarize_seed = || {
+            let mut entries: Vec<String> = Vec::new();
+            for (idx, &val) in seed.iter().enumerate() {
+                if val.abs() > 1e-9 {
+                    entries.push(format!("{}:{:.1}", idx, val));
+                }
+            }
+            let nonzero = entries.len();
+            let total = seed.len();
+            if entries.is_empty() {
+                format!("nonzero=0/{} rho=[]", total)
+            } else {
+                format!("nonzero={}/{} rho=[{}]", nonzero, total, entries.join(", "))
+            }
+        };
+        let seed_summary = summarize_seed();
         // We'll do the gradient check after selecting the initial point, not here
         let cost = match reml_state.compute_cost(seed) {
             Ok(c) if c.is_finite() => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> cost = {:.6}",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    c
-                );
+                finite_count += 1;
+                if c < min_cost {
+                    min_cost = c;
+                    best_idx = i;
+                    best_summary = seed_summary.clone();
+                }
+                if c > max_cost {
+                    max_cost = c;
+                }
                 c
             }
             Ok(_) => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> +inf cost",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>()
-                );
+                inf_count += 1;
                 continue;
             }
-            Err(e) => {
-                eprintln!(
-                    "[Seed {}] rho = {:?} -> failed ({:?})",
-                    i,
-                    seed.iter()
-                        .map(|&x| format!("{:.1}", x))
-                        .collect::<Vec<_>>(),
-                    e
-                );
+            Err(_) => {
+                fail_count += 1;
                 continue;
             }
         };
@@ -1638,6 +1623,25 @@ pub fn train_model(
             best_asymmetric_seed = Some((seed.clone(), cost, i));
             eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
         }
+    }
+    if finite_count == 0 {
+        eprintln!(
+            "[Seed scan] candidates={} finite=0 +inf={} failed={}",
+            total_candidates, inf_count, fail_count
+        );
+    } else {
+        eprintln!(
+            "[Seed scan] candidates={} finite={} +inf={} failed={} best_cost={:.6} (seed {}: {}) cost_range=[{:.6}, {:.6}]",
+            total_candidates,
+            finite_count,
+            inf_count,
+            fail_count,
+            min_cost,
+            best_idx,
+            best_summary,
+            min_cost,
+            max_cost
+        );
     }
 
     // Robust asymmetric preference to avoid symmetry trap
@@ -1695,12 +1699,19 @@ pub fn train_model(
     }
 
     eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
+    visualizer::set_stage("stage-2", "BFGS candidates");
+    visualizer::set_progress("Candidates", 0, Some(candidate_plans.len()));
 
     let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)> =
         Vec::new();
     let mut last_error: Option<EstimationError> = None;
+    let total_candidates = candidate_plans.len();
+    let mut candidate_idx = 0usize;
 
     for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+        candidate_idx += 1;
+        visualizer::set_stage("stage-2", &format!("candidate {label}"));
+        visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
         eprintln!("\n[Candidate {label}] Evaluating seed");
         if let Some(idx) = seed_index {
             eprintln!("  -> Seed index: {idx}");
@@ -1721,6 +1732,7 @@ pub fn train_model(
 
         match run_bfgs_for_candidate(&label, &reml_state, &*config, initial_z) {
             Ok((solution, grad_norm_rho, is_stationary)) => {
+                visualizer::set_stage("stage-2", &format!("candidate {label} done"));
                 eprintln!(
                     "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
                     solution.iterations, solution.final_value
@@ -1743,6 +1755,8 @@ pub fn train_model(
     }
 
     if successful_runs.is_empty() {
+        visualizer::set_stage("stage-2", "fallback candidate");
+        visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
         eprintln!(
             "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
         );
@@ -1840,6 +1854,9 @@ pub fn train_model(
         ..
     } = best_solution;
 
+    visualizer::set_stage("stage-2", &format!("winner {best_label}"));
+    visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
+
     eprintln!(
         "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
     );
@@ -1866,26 +1883,28 @@ pub fn train_model(
     );
 
     eprintln!("\n[STAGE 3/4] Fitting final model with optimal parameters...");
+    visualizer::set_stage("stage-3", "final PIRLS");
 
     // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
     // and return the result along with the transformation matrix used.
-    let warm_start_holder = reml_state.warm_start_beta.borrow();
-    let warm_start_ref = warm_start_holder.as_ref();
-    let (final_fit, _) = pirls::fit_model_for_fixed_rho(
-        final_rho_clamped.view(),
-        reml_state.x(), // Use original X
-        reml_state.offset(),
-        reml_state.y(),
-        reml_state.weights(),     // Pass weights
-        reml_state.rs_list_ref(), // Pass original penalty matrices
-        Some(reml_state.balanced_penalty_root()),
-        None,
-        &layout,
-        &*config,
-        warm_start_ref,
-        None, // No SE for base model
-    )?;
-    drop(warm_start_holder);
+    let (final_fit, _) = {
+        let warm_start_holder = reml_state.warm_start_beta.borrow();
+        let warm_start_ref = warm_start_holder.as_ref();
+        pirls::fit_model_for_fixed_rho(
+            final_rho_clamped.view(),
+            reml_state.x(), // Use original X
+            reml_state.offset(),
+            reml_state.y(),
+            reml_state.weights(),     // Pass weights
+            reml_state.rs_list_ref(), // Pass original penalty matrices
+            Some(reml_state.balanced_penalty_root()),
+            None,
+            &layout,
+            &*config,
+            warm_start_ref,
+            None, // No SE for base model
+        )?
+    };
 
     // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
     // Keep the REML-chosen smoothing; log-only diagnostics can be added upstream if needed.
@@ -2247,6 +2266,8 @@ pub fn train_model(
     log_basis_cache_stats("train_model");
 
     Ok(trained_model)
+    })();
+    result
 }
 
 /// Entry point for survival model training.
@@ -2254,12 +2275,12 @@ pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     base_config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    use crate::calibrate::basis::create_bspline_basis;
+    use crate::calibrate::basis::{baseline_lambda_seed, create_bspline_basis};
     use crate::calibrate::survival;
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
         SurvivalError, SurvivalLayout, SurvivalLayoutBundle, SurvivalModelArtifacts, SurvivalSpec,
-        TensorProductConfig, WorkingModelSurvival, baseline_lambda_seed,
+        TensorProductConfig, WorkingModelSurvival,
     };
     use ndarray::{Array1, Array2};
     use std::collections::HashMap;
@@ -2403,19 +2424,27 @@ pub fn train_survival_model(
     let (log_entry, log_min, log_max) =
         compute_log_age_extents(&bundle.age_transform, &bundle.data)?;
 
-    let (basis_arc, knot_vector) = create_bspline_basis(
-        log_entry.view(),
-        (log_min, log_max),
-        survival_cfg_owned.baseline_basis.num_knots,
-        survival_cfg_owned.baseline_basis.degree,
-    )?;
-    drop(basis_arc);
+    let knot_vector = {
+        let (basis_arc, knot_vector) = create_bspline_basis(
+            log_entry.view(),
+            (log_min, log_max),
+            survival_cfg_owned.baseline_basis.num_knots,
+            survival_cfg_owned.baseline_basis.degree,
+        )?;
+        if basis_arc.ncols() == 0 {
+            return Err(EstimationError::InvalidSpecification(
+                "baseline basis has zero columns".to_string(),
+            ));
+        }
+        knot_vector
+    };
     let age_basis = BasisDescriptor {
         knot_vector,
         degree: survival_cfg_owned.baseline_basis.degree,
     };
 
-    let baseline_lambda = baseline_lambda_seed(&age_basis, config.penalty_order);
+    let baseline_lambda =
+        baseline_lambda_seed(&age_basis.knot_vector, age_basis.degree, config.penalty_order);
 
     if let Some(survival_cfg_mut) = config.survival.as_mut() {
         if let Some(time_varying) = survival_cfg_mut.time_varying.as_mut() {
@@ -2452,15 +2481,21 @@ pub fn train_survival_model(
             );
             None
         } else {
-            let (pgs_basis_arc, pgs_knots) = create_bspline_basis(
-                bundle.data.pgs.view(),
-                (min_pgs, max_pgs),
-                settings.pgs_basis.num_knots,
-                settings.pgs_basis.degree,
-            )
-            .map_err(|err| map_error(err.into()))?;
-            drop(pgs_basis_arc);
-
+            let pgs_knots = {
+                let (pgs_basis_arc, pgs_knots) = create_bspline_basis(
+                    bundle.data.pgs.view(),
+                    (min_pgs, max_pgs),
+                    settings.pgs_basis.num_knots,
+                    settings.pgs_basis.degree,
+                )
+                .map_err(|err| map_error(err.into()))?;
+                if pgs_basis_arc.ncols() == 0 {
+                    return Err(EstimationError::InvalidSpecification(
+                        "time-varying PGS basis has zero columns".to_string(),
+                    ));
+                }
+                pgs_knots
+            };
             Some(TensorProductConfig {
                 label: settings.label.clone(),
                 pgs_basis: BasisDescriptor {
@@ -3715,32 +3750,15 @@ fn evaluate_fd_pair(
     attempt: usize,
     log_lines: &mut Vec<String>,
 ) -> Result<(f64, f64), EstimationError> {
-    log_lines.push(format!(
-        "[FD RIDGE] ---- Coordinate {coord} (attempt {}, rho = {:+.6e}, h = {:.3e}) ----",
-        attempt + 1,
-        rho[coord],
-        base_h
-    ));
-
     let mut rho_p = rho.clone();
     rho_p[coord] += 0.5 * base_h;
     let mut rho_m = rho.clone();
     rho_m[coord] -= 0.5 * base_h;
     let f_p = reml_state.compute_cost(&rho_p)?;
     let ridge_p = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-    log_lines.push(format!(
-        "[FD RIDGE]    +0.5h cost = {:+.9e} | ridge = {ridge_p:.3e} | rho = {:?}",
-        f_p,
-        rho_p.to_vec()
-    ));
 
     let f_m = reml_state.compute_cost(&rho_m)?;
     let ridge_m = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-    log_lines.push(format!(
-        "[FD RIDGE]    -0.5h cost = {:+.9e} | ridge = {ridge_m:.3e} | rho = {:?}",
-        f_m,
-        rho_m.to_vec()
-    ));
     let d_small = (f_p - f_m) / base_h;
 
     let h2 = 2.0 * base_h;
@@ -3750,24 +3768,30 @@ fn evaluate_fd_pair(
     rho_m2[coord] -= 0.5 * h2;
     let f_p2 = reml_state.compute_cost(&rho_p2)?;
     let ridge_p2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-    log_lines.push(format!(
-        "[FD RIDGE]    +1.0h cost = {:+.9e} | ridge = {ridge_p2:.3e} | rho = {:?}",
-        f_p2,
-        rho_p2.to_vec()
-    ));
 
     let f_m2 = reml_state.compute_cost(&rho_m2)?;
     let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
-    log_lines.push(format!(
-        "[FD RIDGE]    -1.0h cost = {:+.9e} | ridge = {ridge_m2:.3e} | rho = {:?}",
-        f_m2,
-        rho_m2.to_vec()
-    ));
     let d_big = (f_p2 - f_m2) / h2;
 
+    let (ridge_min, ridge_max) = [ridge_p, ridge_m, ridge_p2, ridge_m2].iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(min, max), &v| (min.min(v), max.max(v)),
+    );
     log_lines.push(format!(
-        "[FD RIDGE]    d_small = {:+.9e}, d_big = {:+.9e}",
-        d_small, d_big
+        "[FD RIDGE] coord {coord} attempt {} rho={:+.6e} h={:.3e} \
+f(+/-0.5h)={:+.9e}/{:+.9e} f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} \
+ridge=[{:.3e},{:.3e}]",
+        attempt + 1,
+        rho[coord],
+        base_h,
+        f_p,
+        f_m,
+        f_p2,
+        f_m2,
+        d_small,
+        d_big,
+        ridge_min,
+        ridge_max
     ));
 
     Ok((d_small, d_big))
@@ -3803,14 +3827,22 @@ fn compute_fd_gradient(
     let mut fd_grad = Array1::zeros(rho.len());
 
     let mut log_lines: Vec<String> = Vec::new();
+    let (rho_min, rho_max) = rho.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(min, max), &v| (min.min(v), max.max(v)),
+    );
+    let rho_summary = format!(
+        "len={} range=[{:.3e},{:.3e}]",
+        rho.len(),
+        rho_min,
+        rho_max
+    );
     match reml_state.last_ridge_used() {
         Some(ridge) => log_lines.push(format!(
-            "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho = {:?}",
-            rho.to_vec()
+            "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho {rho_summary}",
         )),
         None => log_lines.push(format!(
-            "[FD RIDGE] No cached baseline ridge available for rho = {:?}",
-            rho.to_vec()
+            "[FD RIDGE] No cached baseline ridge available for rho {rho_summary}",
         )),
     }
 
@@ -3852,7 +3884,8 @@ fn compute_fd_gradient(
 
         fd_grad[i] = derivative.unwrap_or(f64::NAN);
         log_lines.push(format!(
-            "[FD RIDGE]    chosen derivative = {:+.9e}",
+            "[FD RIDGE] coord {} chosen derivative = {:+.9e}",
+            i,
             fd_grad[i]
         ));
     }
@@ -4157,12 +4190,218 @@ pub mod internal {
         consecutive_cost_errors: RefCell<usize>,
         last_cost_error_msg: RefCell<Option<String>>,
         current_eval_bundle: RefCell<Option<EvalShared>>,
+        gnomon_last: RefCell<Option<GnomonAgg>>,
+        gnomon_repeat: RefCell<u64>,
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RefCell<Option<Array1<f64>>>,
         warm_start_enabled: Cell<bool>,
     }
 
+    #[derive(Clone)]
+    struct GnomonKey {
+        rho: Vec<f64>,
+        smooth: Vec<f64>,
+        stab_cond: f64,
+        raw_cond: f64,
+    }
+
+    #[derive(Clone)]
+    struct GnomonAgg {
+        key: GnomonKey,
+        count: u64,
+        laml_min: f64,
+        laml_max: f64,
+        edf_min: f64,
+        edf_max: f64,
+        trace_min: f64,
+        trace_max: f64,
+    }
+
+    impl GnomonKey {
+        fn approx_eq(&self, other: &Self) -> bool {
+            approx_vec(&self.rho, &other.rho, 1e-6, 1e-9)
+                && approx_vec(&self.smooth, &other.smooth, 1e-6, 1e-9)
+                && approx_cond(self.stab_cond, other.stab_cond)
+                && approx_cond(self.raw_cond, other.raw_cond)
+        }
+
+        fn format_compact(&self) -> String {
+            let rho_compact = format_compact_series(&self.rho, |v| format!("{:.3}", v));
+            let smooth_compact = format_compact_series(&self.smooth, |v| format!("{:.2e}", v));
+            let stable_cond_display = format_cond(self.stab_cond);
+            let raw_cond_display = format_cond(self.raw_cond);
+            format!(
+                "rho={} | smooth={} | κ(stable/raw)={}/{}",
+                rho_compact,
+                smooth_compact,
+                stable_cond_display,
+                raw_cond_display
+            )
+        }
+    }
+
+    impl GnomonAgg {
+        fn new(key: GnomonKey, laml: f64, edf: f64, trace: f64) -> Self {
+            Self {
+                key,
+                count: 1,
+                laml_min: laml,
+                laml_max: laml,
+                edf_min: edf,
+                edf_max: edf,
+                trace_min: trace,
+                trace_max: trace,
+            }
+        }
+
+        fn update(&mut self, laml: f64, edf: f64, trace: f64) {
+            self.count += 1;
+            if laml < self.laml_min {
+                self.laml_min = laml;
+            }
+            if laml > self.laml_max {
+                self.laml_max = laml;
+            }
+            if edf < self.edf_min {
+                self.edf_min = edf;
+            }
+            if edf > self.edf_max {
+                self.edf_max = edf;
+            }
+            if trace < self.trace_min {
+                self.trace_min = trace;
+            }
+            if trace > self.trace_max {
+                self.trace_max = trace;
+            }
+        }
+
+        fn format_summary(&self) -> String {
+            let key = self.key.format_compact();
+            let laml = format_range(self.laml_min, self.laml_max, |v| format!("{:.6e}", v));
+            let edf = format_range(self.edf_min, self.edf_max, |v| format!("{:.6}", v));
+            let trace = format_range(self.trace_min, self.trace_max, |v| format!("{:.6}", v));
+            format!("{key} | LAML={laml} | EDF={edf} | tr(H^-1 Sλ)={trace}")
+        }
+    }
+
+    fn approx_f64(a: f64, b: f64, rel: f64, abs: f64) -> bool {
+        (a - b).abs() <= abs + rel * a.abs().max(b.abs())
+    }
+
+    fn approx_cond(a: f64, b: f64) -> bool {
+        if a.is_nan() && b.is_nan() {
+            true
+        } else {
+            approx_f64(a, b, 1e-6, 1e-6)
+        }
+    }
+
+    fn approx_vec(values: &[f64], other: &[f64], rel: f64, abs: f64) -> bool {
+        if values.len() != other.len() {
+            return false;
+        }
+        values
+            .iter()
+            .zip(other.iter())
+            .all(|(&a, &b)| approx_f64(a, b, rel, abs))
+    }
+
+    fn format_cond(cond: f64) -> String {
+        if cond.is_finite() {
+            format!("{:.3e}", cond)
+        } else {
+            "N/A".to_string()
+        }
+    }
+
+    fn format_range<F>(min: f64, max: f64, fmt: F) -> String
+    where
+        F: Fn(f64) -> String,
+    {
+        if approx_f64(min, max, 1e-6, 1e-9) {
+            fmt(min)
+        } else {
+            format!("[{}, {}]", fmt(min), fmt(max))
+        }
+    }
+
+    fn format_compact_series<F>(values: &[f64], fmt: F) -> String
+    where
+        F: Fn(f64) -> String,
+    {
+        if values.is_empty() {
+            return "[]".to_string();
+        }
+        if values.len() == 1 {
+            return format!("[{}]", fmt(values[0]));
+        }
+        let first = values[0];
+        let last = values[values.len() - 1];
+        let step = values[1] - values[0];
+        let uniform_step = values
+            .windows(2)
+            .all(|pair| approx_f64(pair[1] - pair[0], step, 1e-6, 1e-9));
+        if uniform_step {
+            return format!("[{}..{} step {}]", fmt(first), fmt(last), fmt(step));
+        }
+        let (min, max) = values.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(min, max), &v| (min.min(v), max.max(v)),
+        );
+        format!("[{}..{}] n={}", fmt(min), fmt(max), values.len())
+    }
+
     impl<'a> RemlState<'a> {
+        fn log_gnomon_cost(
+            &self,
+            rho: &Array1<f64>,
+            lambdas: &[f64],
+            laml: f64,
+            stab_cond: f64,
+            raw_cond: f64,
+            edf: f64,
+            trace_h_inv_s_lambda: f64,
+        ) {
+            const GNOMON_REPEAT_EMIT: u64 = 25;
+            let key = GnomonKey {
+                rho: rho.to_vec(),
+                smooth: lambdas.to_vec(),
+                stab_cond,
+                raw_cond,
+            };
+
+            let mut last_opt = self.gnomon_last.borrow_mut();
+            let mut repeat = self.gnomon_repeat.borrow_mut();
+
+            if let Some(last) = last_opt.as_mut() {
+                if last.key.approx_eq(&key) {
+                    last.update(laml, edf, trace_h_inv_s_lambda);
+                    *repeat += 1;
+                    if *repeat >= GNOMON_REPEAT_EMIT {
+                        println!(
+                            "[GNOMON COST] (x{}) {}",
+                            last.count,
+                            last.format_summary()
+                        );
+                        *repeat = 0;
+                    }
+                    return;
+                }
+
+                if last.count > 0 {
+                    println!("[GNOMON COST] (x{}) {}", last.count, last.format_summary());
+                }
+            }
+
+            println!(
+                "[GNOMON COST] {}",
+                GnomonAgg::new(key.clone(), laml, edf, trace_h_inv_s_lambda).format_summary()
+            );
+            *last_opt = Some(GnomonAgg::new(key, laml, edf, trace_h_inv_s_lambda));
+            *repeat = 0;
+        }
+
         pub fn reset_optimizer_tracking(&self) {
             *self.eval_count.borrow_mut() = 0;
             *self.last_cost.borrow_mut() = f64::INFINITY;
@@ -4170,6 +4409,8 @@ pub mod internal {
             *self.consecutive_cost_errors.borrow_mut() = 0;
             *self.last_cost_error_msg.borrow_mut() = None;
             self.current_eval_bundle.borrow_mut().take();
+            self.gnomon_last.borrow_mut().take();
+            *self.gnomon_repeat.borrow_mut() = 0;
         }
 
         /// Compute soft prior cost without needing workspace
@@ -4369,6 +4610,8 @@ pub mod internal {
                 consecutive_cost_errors: RefCell::new(0),
                 last_cost_error_msg: RefCell::new(None),
                 current_eval_bundle: RefCell::new(None),
+                gnomon_last: RefCell::new(None),
+                gnomon_repeat: RefCell::new(0),
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RefCell::new(None),
                 warm_start_enabled: Cell::new(true),
@@ -4512,51 +4755,27 @@ pub mod internal {
         /// # Returns
         fn factorize_faer(&self, h: &Array2<f64>) -> FaerFactor {
             let mut planner = RidgePlanner::new(h);
-            let cond_display = planner
-                .cond_estimate()
-                .map(|c| format!("{c:.2e}"))
-                .unwrap_or_else(|| "unavailable".to_string());
             loop {
                 let ridge = planner.ridge();
                 if ridge > 0.0 {
                     let regularized = add_ridge(h, ridge);
                     let view = FaerArrayView::new(&regularized);
                     if let Ok(f) = FaerLlt::new(view.as_ref(), Side::Lower) {
-                        log::warn!(
-                            "LLᵀ succeeded after adding ridge {:.3e} (cond ≈ {})",
-                            ridge,
-                            cond_display
-                        );
                         return FaerFactor::Llt(f);
                     }
                     if let Ok(f) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-                        log::warn!(
-                            "LLᵀ failed; using faer LDLᵀ with ridge {:.3e} (cond ≈ {})",
-                            ridge,
-                            cond_display
-                        );
                         return FaerFactor::Ldlt(f);
                     }
                     if planner.attempts() >= MAX_FACTORIZATION_ATTEMPTS {
-                        log::warn!(
-                            "LLᵀ/LDLᵀ failed even with ridge {:.3e}; falling back to LBLᵀ (cond ≈ {})",
-                            ridge,
-                            cond_display
-                        );
                         let f = FaerLblt::new(view.as_ref(), Side::Lower);
                         return FaerFactor::Lblt(f);
                     }
                 } else {
                     let h_view = FaerArrayView::new(h);
                     if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                        println!("Using faer LLᵀ for Hessian solves");
                         return FaerFactor::Llt(f);
                     }
                     if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                        log::warn!(
-                            "LLᵀ failed; using faer LDLᵀ for Hessian solves (cond ≈ {})",
-                            cond_display
-                        );
                         return FaerFactor::Ldlt(f);
                     }
                 }
@@ -4694,7 +4913,9 @@ pub mod internal {
 
             let faer_guard = FaerParallelismGuard::new(Par::Seq);
             let faer_parallelism = faer_guard.current_parallelism();
-            std::hint::black_box(faer_parallelism);
+            if matches!(faer_parallelism, Par::Seq) {
+                std::hint::spin_loop();
+            }
             let grad_values = (0..len)
                 .into_par_iter()
                 .map(|k| -> Result<f64, EstimationError> {
@@ -4823,33 +5044,26 @@ pub mod internal {
                     return Ok(cached);
                 }
 
-            // Convert rho to lambda for logging (we use the same conversion inside fit_model_for_fixed_rho)
-            let lambdas_for_logging = rho.mapv(f64::exp);
-            println!(
-                "  -> P-IRLS eval | Smooth: [{:.2e}, {:.2e}, ...]",
-                lambdas_for_logging.get(0).unwrap_or(&0.0),
-                lambdas_for_logging.get(1).unwrap_or(&0.0)
-            );
-
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
-            let warm_start_holder = self.warm_start_beta.borrow();
-            let warm_start_ref = warm_start_holder.as_ref();
-            let pirls_result = pirls::fit_model_for_fixed_rho(
-                rho.view(),
-                self.x,
-                self.offset.view(),
-                self.y,
-                self.weights,
-                &self.rs_list,
-                Some(&self.balanced_penalty_root),
-                Some(&self.reparam_invariant),
-                self.layout,
-                self.config,
-                warm_start_ref,
-                None, // No SE for base model
-            );
-            drop(warm_start_holder);
+            let pirls_result = {
+                let warm_start_holder = self.warm_start_beta.borrow();
+                let warm_start_ref = warm_start_holder.as_ref();
+                pirls::fit_model_for_fixed_rho(
+                    rho.view(),
+                    self.x,
+                    self.offset.view(),
+                    self.y,
+                    self.weights,
+                    &self.rs_list,
+                    Some(&self.balanced_penalty_root),
+                    Some(&self.reparam_invariant),
+                    self.layout,
+                    self.config,
+                    warm_start_ref,
+                    None, // No SE for base model
+                )
+            };
 
             if let Err(e) = &pirls_result {
                 println!("[GNOMON COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
@@ -4917,11 +5131,6 @@ pub mod internal {
         /// For Gaussian models (Identity link), this is the exact REML score.
         /// For non-Gaussian GLMs, this is the LAML (Laplace Approximate Marginal Likelihood) score.
         pub fn compute_cost(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-            println!(
-                "[GNOMON COST] ==> Received rho from optimizer: {:?}",
-                p.to_vec()
-            );
-
             let bundle = match self.obtain_eval_bundle(p) {
                 Ok(bundle) => bundle,
                 Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -5070,7 +5279,6 @@ pub mod internal {
                     // We maintain this behavior for strict mgcv compatibility.
                     let n = self.y.len() as f64;
                     // Number of coefficients (transformed basis)
-                    let _ = pirls_result.beta_transformed.len() as f64; // keep for clarity
 
                     // Calculate PENALIZED deviance D_p = ||y - Xβ̂||² + β̂'S_λβ̂
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
@@ -5082,7 +5290,6 @@ pub mod internal {
                     // Work directly in the transformed basis for efficiency and numerical stability
                     // This avoids transforming matrices back to the original basis unnecessarily
                     // Penalty roots are available in reparam_result if needed
-                    let _ = &pirls_result.reparam_result.rs_transformed;
 
                     // Nullspace dimension M_p is constant with respect to ρ.  Use it to profile φ
                     // following the standard REML identity φ = D_p / (n - M_p).
@@ -5237,20 +5444,14 @@ pub mod internal {
                         })
                         .unwrap_or(f64::NAN);
 
-                    let stable_cond_display = if stab_cond.is_finite() {
-                        format!("{:.3e}", stab_cond)
-                    } else {
-                        "N/A".to_string()
-                    };
-                    let raw_cond_display = if raw_cond.is_finite() {
-                        format!("{:.3e}", raw_cond)
-                    } else {
-                        "N/A".to_string()
-                    };
-
-                    println!(
-                        "[GNOMON COST] Final LAML score: {:.6e} | Hessian κ (stable/raw): {} / {} | EDF: {:.6} | tr(H^-1 Sλ): {:.6}",
-                        laml, stable_cond_display, raw_cond_display, edf, trace_h_inv_s_lambda
+                    self.log_gnomon_cost(
+                        &p,
+                        lambdas.as_slice().unwrap_or(&[]),
+                        laml,
+                        stab_cond,
+                        raw_cond,
+                        edf,
+                        trace_h_inv_s_lambda,
                     );
 
                     let prior_cost = self.compute_soft_prior_cost(p);
@@ -5294,6 +5495,28 @@ pub mod internal {
                             let jac = jacobian_drho_dz_from_rho(&rho);
                             let grad_z = &grad * &jac;
                             let grad_norm = grad_z.dot(&grad_z).sqrt();
+                            let last_cost_before = *self.last_cost.borrow();
+                            let status = if eval_num == 1 {
+                                "Initializing"
+                            } else if cost < last_cost_before {
+                                "Improving"
+                            } else {
+                                "Exploring"
+                            };
+                            let eval_state = if eval_num == 1 {
+                                "initial"
+                            } else if cost < last_cost_before {
+                                "accepted"
+                            } else {
+                                "trial"
+                            };
+                            crate::calibrate::visualizer::update(
+                                cost,
+                                grad_norm,
+                                status,
+                                eval_num as f64,
+                                eval_state,
+                            );
 
                             // --- Correct State Management: Only Update on Actual Improvement ---
                             if eval_num == 1 {
@@ -5565,13 +5788,14 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
             let rs_transposed = &reparam_result.rs_transposed;
 
-            let mut workspace_ref = self.workspace.lock().unwrap();
-            let workspace = &mut *workspace_ref;
-            let len = p.len();
-            workspace.reset_for_eval(len);
-            workspace.set_lambda_values(p);
-            workspace.zero_cost_gradient(len);
-            let lambdas = workspace.lambda_view(len).to_owned();
+            let (gradient_result, gradient_snapshot) = {
+                let mut workspace_ref = self.workspace.lock().unwrap();
+                let workspace = &mut *workspace_ref;
+                let len = p.len();
+                workspace.reset_for_eval(len);
+                workspace.set_lambda_values(p);
+                workspace.zero_cost_gradient(len);
+                let lambdas = workspace.lambda_view(len).to_owned();
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
@@ -5600,7 +5824,6 @@ pub mod internal {
             }
 
             // --- Extract common components ---
-            let _ = self.config.reml_parallel_threshold;
 
             let n = self.y.len() as f64;
 
@@ -5808,23 +6031,72 @@ pub mod internal {
                             self.numeric_half_logh_grad_with_workspace(p, workspace)?;
 
                         let k_count = lambdas.len();
-                        let beta_ref = beta_transformed;
-                        let mut beta_terms = Array1::<f64>::zeros(k_count);
-                        for k in 0..k_count {
-                            let r_k = &rs_transformed[k];
-                            let r_beta = r_k.dot(beta_ref);
-                            let s_k_beta = r_k.t().dot(&r_beta);
-                            beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
-                        }
-
                         let det1_values = &pirls_result.reparam_result.det1;
                         let mut laml_grad = Vec::with_capacity(k_count);
-                        for k in 0..k_count {
-                            let log_det_h_grad_term = numeric_logh_grad[k];
-                            let log_det_s_grad_term = 0.5 * det1_values[k];
-                            let gradient_value =
-                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
-                            laml_grad.push(gradient_value);
+                        let firth_enabled = self.config.firth_bias_reduction;
+                        if firth_enabled {
+                            let g_pll =
+                                self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
+                            for k in 0..k_count {
+                                let log_det_h_grad_term = numeric_logh_grad[k];
+                                let log_det_s_grad_term = 0.5 * det1_values[k];
+                                let gradient_value =
+                                    g_pll[k] + log_det_h_grad_term - log_det_s_grad_term;
+                                laml_grad.push(gradient_value);
+                            }
+                        } else {
+                            let beta_ref = beta_transformed;
+                            let mut beta_terms = Array1::<f64>::zeros(k_count);
+                            for k in 0..k_count {
+                                let r_k = &rs_transformed[k];
+                                let r_beta = r_k.dot(beta_ref);
+                                let s_k_beta = r_k.t().dot(&r_beta);
+                                beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                            }
+
+                            let residual_grad = {
+                                let eta = pirls_result
+                                    .solve_mu
+                                    .mapv(|m| logit_from_prob(m));
+                                let working_residual = &eta - &pirls_result.solve_working_response;
+                                let weighted_residual =
+                                    &pirls_result.solve_weights * &working_residual;
+                                let gradient_data = pirls_result
+                                    .x_transformed
+                                    .transpose_vector_multiply(&weighted_residual);
+                                let s_beta = reparam_result.s_transformed.dot(beta_ref);
+                                gradient_data + s_beta
+                            };
+
+                            let delta_opt = if residual_grad.iter().all(|v| v.is_finite()) {
+                                let factor_g = self.get_faer_factor(p, h_eff);
+                                let rhs_view = FaerColView::new(&residual_grad);
+                                let solved = factor_g.solve(rhs_view.as_ref());
+                                let mut delta = Array1::zeros(residual_grad.len());
+                                for i in 0..delta.len() {
+                                    delta[i] = solved[(i, 0)];
+                                }
+                                Some(delta)
+                            } else {
+                                None
+                            };
+
+                            for k in 0..k_count {
+                                let log_det_h_grad_term = numeric_logh_grad[k];
+                                let log_det_s_grad_term = 0.5 * det1_values[k];
+                                let mut gradient_value = 0.5 * beta_terms[k]
+                                    + log_det_h_grad_term
+                                    - log_det_s_grad_term;
+                                if let Some(delta_ref) = delta_opt.as_ref() {
+                                    let r_k = &rs_transformed[k];
+                                    let r_beta = r_k.dot(beta_ref);
+                                    let s_k_beta = r_k.t().dot(&r_beta);
+                                    let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                                    let correction = -0.5 * delta_ref.dot(&u_k);
+                                    gradient_value += correction;
+                                }
+                                laml_grad.push(gradient_value);
+                            }
                         }
                         workspace
                             .cost_gradient_view(len)
@@ -5833,23 +6105,24 @@ pub mod internal {
                 }
             }
 
-            let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
-            let prior_grad = prior_grad_view.to_owned();
-            {
-                let mut cost_gradient_view = workspace.cost_gradient_view(len);
-                cost_gradient_view += &prior_grad;
-            }
+                let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
+                let prior_grad = prior_grad_view.to_owned();
+                {
+                    let mut cost_gradient_view = workspace.cost_gradient_view(len);
+                    cost_gradient_view += &prior_grad;
+                }
 
-            // Capture the gradient snapshot before releasing the workspace borrow so
-            // that diagnostics can continue without holding the RefCell borrow.
-            let gradient_result = workspace.cost_gradient_view_const(len).to_owned();
-            let gradient_snapshot = if p.is_empty() {
-                None
-            } else {
-                Some(gradient_result.clone())
+                // Capture the gradient snapshot before releasing the workspace borrow so
+                // that diagnostics can continue without holding the RefCell borrow.
+                let gradient_result = workspace.cost_gradient_view_const(len).to_owned();
+                let gradient_snapshot = if p.is_empty() {
+                    None
+                } else {
+                    Some(gradient_result.clone())
+                };
+
+                (gradient_result, gradient_snapshot)
             };
-
-            drop(workspace_ref);
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
             // The gradient buffer stored in the workspace already holds -∇V(ρ),
@@ -7534,7 +7807,7 @@ pub mod internal {
                     let (x_tr, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                         build_design_and_penalty_matrices(&data_train, &trained.config)
                             .expect("layout");
-                    drop(penalty_structs);
+                    debug_assert!(!penalty_structs.is_empty());
 
                     if penalty_labels.is_none() {
                         let (labels, types) = assign_penalty_labels(&layout);
@@ -8613,7 +8886,7 @@ pub mod internal {
             // --- Build model structure ---
             let (x_matrix, mut s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            drop(penalty_structs);
+            debug_assert!(!penalty_structs.is_empty());
 
             assert!(
                 layout.num_penalties > 0,
@@ -8964,7 +9237,7 @@ pub mod internal {
             // Test with extreme lambda values that might cause issues
             let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            drop(penalty_structs);
+            debug_assert!(!penalty_structs.is_empty());
 
             // Try with very large lambda values (exp(10) ~ 22000)
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
@@ -9108,7 +9381,7 @@ pub mod internal {
             // Test that we can at least compute cost without getting infinity
             let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            drop(penalty_structs);
+            debug_assert!(!penalty_structs.is_empty());
 
             let reml_state = internal::RemlState::new(
                 data.y.view(),
@@ -9542,7 +9815,7 @@ pub mod internal {
             let (x_matrix, s_list, layout, constraints, _, _, _, _, _, penalty_structs) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
-            drop(penalty_structs);
+            debug_assert!(!penalty_structs.is_empty());
 
             // In the pure pre-centering approach, the PC basis is constrained first.
             // Let's examine if the columns approximately sum to zero, but don't enforce it
@@ -10762,7 +11035,7 @@ mod optimizer_progress_tests {
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
         let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config)?;
-        drop(penalty_structs);
+        debug_assert!(!penalty_structs.is_empty());
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),
@@ -11196,13 +11469,6 @@ mod gradient_validation_tests {
         use rand::Rng;
         use ndarray::Array2;
 
-        // Force Fast MCMC for this test
-        // This relies on the implementation in estimate.rs respecting these variables
-        unsafe {
-            std::env::set_var("GNOMON_MCMC_SAMPLES", "10");
-            std::env::set_var("GNOMON_MCMC_WARMUP", "10");
-        }
-
         // 1. Create simple data (N=50)
         let n = 50;
         let mut rng = StdRng::seed_from_u64(42);
@@ -11257,8 +11523,16 @@ mod gradient_validation_tests {
         let samples = model.mcmc_samples.unwrap();
         println!("Generated MCMC samples with shape: {:?}", samples.shape());
         
-        // 10 samples × 4 chains = 40 total samples
-        assert_eq!(samples.nrows(), 40, "Should have 40 posterior samples (10 per chain × 4 chains)");
+        let expected_config = hmc::NutsConfig::for_dimension(samples.ncols());
+        let expected_rows = expected_config.n_samples * expected_config.n_chains;
+        assert_eq!(
+            samples.nrows(),
+            expected_rows,
+            "Should have {} posterior samples ({} per chain × {} chains)",
+            expected_rows,
+            expected_config.n_samples,
+            expected_config.n_chains
+        );
         assert!(samples.ncols() > 0, "Should have some parameters");
     }
 
@@ -11277,12 +11551,6 @@ mod gradient_validation_tests {
         use rand::Rng;
         use rand_distr::{Distribution, StudentT};
         use ndarray::Array2;
-
-        // === Setup: Fast MCMC for testing ===
-        unsafe {
-            std::env::set_var("GNOMON_MCMC_SAMPLES", "100");
-            std::env::set_var("GNOMON_MCMC_WARMUP", "50");
-        }
 
         // === Generate heavy-tailed data ===
         // Using Student's t with df=3 creates heavier tails than Gaussian
@@ -11502,10 +11770,6 @@ mod gradient_validation_tests {
 
         // === Cleanup ===
         std::fs::remove_file(&temp_path).ok();
-        unsafe {
-            std::env::remove_var("GNOMON_MCMC_SAMPLES");
-            std::env::remove_var("GNOMON_MCMC_WARMUP");
-        }
 
         println!("[MCMC E2E] Test passed! MCMC integration verified with disk I/O.");
     }
