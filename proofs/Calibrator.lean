@@ -1438,21 +1438,28 @@ lemma risk_affine_additive
       have i_p1 : Integrable (fun x => 2*u*a * x.1) μ := hP_int.const_mul (2*u*a)
       have i_c1 : Integrable (fun x => 2*a*β * x.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
 
-      -- Apply linearity rules one by one
-      have h_lin_sub_distrib: ∀ (pc : ℝ × (Fin 1 → ℝ)),
-          u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2 * u * a * pc.1 - 2 * a * β * pc.2 ⟨0, by norm_num⟩ =
-          u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - (2 * u * a * pc.1 + 2 * a * β * pc.2 ⟨0, by norm_num⟩) := by
+      -- To apply linearity, we first group the positive and negative terms. A `calc` block
+      -- is more robust than a long `rw` chain for this kind of algebraic manipulation
+      -- inside integrals, as it is less sensitive to syntactic details of the expression.
+      have h_group : ∀ (pc : ℝ × (Fin 1 → ℝ)),
+        u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩
+        =
+        (u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) - (2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩) := by
         intro pc; ring
-      simp_rw [h_lin_sub_distrib]
-      rw [integral_sub (i_p2.add (i_c2.add (i_a2.add i_pc))) (i_p1.add i_c1)]
-      rw [integral_add (i_p2.add (i_c2.add i_a2)) i_pc]
-      rw [integral_add (i_p2.add i_c2) i_a2]
-      rw [integral_add i_p2 i_c2]
-      rw [integral_add i_p1 i_c1]
 
-    _ = a^2 + u^2 + β^2 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.2 ⟨0, by norm_num⟩ ^ 2 ∂μ := by
+      -- Rewrite the integral using this grouping, which prepares it for `integral_sub`.
+      refine (integral_congr_ae (ae_of_all _ h_group)).trans ?_
+
+      -- Apply linearity rules now that the expression is properly grouped.
+      have i_pos_terms := i_p2.add (i_c2.add (i_a2.add i_pc))
+      have i_neg_terms := i_p1.add i_c1
+      rw [integral_sub i_pos_terms i_neg_terms, integral_add (i_p2.add (i_c2.add i_a2)) i_pc,
+          integral_add (i_p2.add i_c2) i_a2, integral_add i_p2 i_c2, integral_add i_p1 i_c1]
+
+    _ = a^2 + (1 - b)^2 + β^2 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.2 ⟨0, by norm_num⟩ ^ 2 ∂μ := by
       -- Pull out constants and substitute known integral values
-      simp [integral_const_mul, integral_const, hP2, hP0, hu]
+      simp_rw [integral_const_mul, integral_const, hP2, hP0, hPC0, hC0]
+      rw [hu]
       ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
