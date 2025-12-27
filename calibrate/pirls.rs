@@ -18,7 +18,7 @@ use faer::sparse::linalg::matmul::{
     SparseMatMulInfo,
 };
 use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
-use faer::{Accum, Par, Side, get_global_parallelism};
+use faer::{Accum, Par, Side, get_global_parallelism, Unbind};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -219,7 +219,7 @@ pub struct PirlsWorkspace {
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
     // Cached sparse XtWX workspace (symbolic + scratch)
-    pub sparse_xtwx_cache: Option<SparseXtWxCache>,
+    pub(crate) sparse_xtwx_cache: Option<SparseXtWxCache>,
 }
 
 impl PirlsWorkspace {
@@ -605,7 +605,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     }
 }
 
-struct SparseXtWxCache {
+pub(crate) struct SparseXtWxCache {
     x_t: SparseColMat<usize, f64>,
     xtwx_symbolic: SymbolicSparseColMat<usize>,
     xtwx_values: Vec<f64>,
@@ -683,7 +683,7 @@ impl SparseXtWxCache {
         let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
         let mut stack = MemStack::new(&mut self.scratch);
         let xtwx_symbolic = self.xtwx_symbolic.as_ref();
-        let mut xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
+        let xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
         sparse_sparse_matmul_numeric(
             xtwx_mut,
             Accum::Replace,
