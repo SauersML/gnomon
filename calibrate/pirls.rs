@@ -256,7 +256,7 @@ pub struct WorkingModelIterationInfo {
 
 #[derive(Clone)]
 pub struct WorkingModelPirlsResult {
-    pub beta: Array1<f64>,
+    pub beta: Coefficients,
     pub state: WorkingState,
     pub status: PirlsStatus,
     pub iterations: usize,
@@ -373,7 +373,7 @@ impl<'a> GamWorkingModel<'a> {
         }
     }
 
-    fn transformed_matvec(&self, beta: &Array1<f64>) -> Array1<f64> {
+    fn transformed_matvec(&self, beta: &Coefficients) -> Array1<f64> {
         if let Some(x_transformed) = &self.x_transformed {
             return x_transformed.matrix_vector_multiply(beta);
         }
@@ -448,7 +448,7 @@ impl<'a> GamWorkingModel<'a> {
 }
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+    fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         let mut eta = self.offset.clone();
         eta += &self.transformed_matvec(beta);
 
@@ -543,7 +543,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.last_penalty_term = penalty_term;
 
         Ok(WorkingState {
-            eta,
+            eta: LinearPredictor::new(eta),
             gradient,
             hessian: penalized_hessian,
             deviance,
@@ -856,7 +856,7 @@ fn default_beta_guess(
 
 pub fn run_working_model_pirls<M, F>(
     model: &mut M,
-    mut beta: Array1<f64>,
+    mut beta: Coefficients,
     options: &WorkingModelPirlsOptions,
     mut iteration_callback: F,
 ) -> Result<WorkingModelPirlsResult, EstimationError>
@@ -905,7 +905,7 @@ where
         let mut last_error: Option<EstimationError> = None;
 
         let (candidate_beta, candidate_state, candidate_penalized) = loop {
-            let candidate_beta = &beta + &(direction.mapv(|v| step * v));
+            let candidate_beta = Coefficients::new(&*beta + &(direction.mapv(|v| step * v)));
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized =
@@ -1162,7 +1162,7 @@ pub enum PirlsStatus {
 #[derive(Clone)]
 pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
-    pub beta_transformed: Array1<f64>,
+    pub beta_transformed: Coefficients,
     pub penalized_hessian_transformed: Array2<f64>,
     // CRITICAL: Single stabilized Hessian for consistent cost/gradient computation
     pub stabilized_hessian_transformed: Array2<f64>,
@@ -1290,7 +1290,7 @@ fn detect_logit_instability(
 /// This architecture ensures optimal numerical stability throughout the entire
 /// fitting process by working in a well-conditioned parameter space.
 pub fn fit_model_for_fixed_rho<'a>(
-    rho_vec: ArrayView1<f64>,
+    rho: LogSmoothingParamsView<'_>,
     x: ArrayView2<'a, f64>,
     offset: ArrayView1<f64>,
     y: ArrayView1<'a, f64>,
@@ -1300,12 +1300,12 @@ pub fn fit_model_for_fixed_rho<'a>(
     reparam_invariant: Option<&crate::calibrate::construction::ReparamInvariant>,
     layout: &ModelLayout,
     config: &ModelConfig,
-    warm_start_beta: Option<&Array1<f64>>,
+    warm_start_beta: Option<&Coefficients>,
     // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
     covariate_se: Option<&Array1<f64>>,
-    quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    let lambdas = rho_vec.mapv(f64::exp);
+    let quad_ctx = crate::calibrate::quadrature::QuadratureContext::new();
+    let lambdas = rho.exp();
 
     let link_function = match config.model_family {
         ModelFamily::Gam(link) => link,
@@ -1415,7 +1415,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let max_abs_eta = final_mu.iter().copied().map(f64::abs).fold(0.0, f64::max);
 
         let working_state = WorkingState {
-            eta: final_mu.clone(),
+            eta: LinearPredictor::new(final_mu.clone()),
             gradient: gradient.clone(),
             hessian: penalized_hessian.clone(),
             deviance,
@@ -1471,7 +1471,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
         if use_explicit { None } else { Some(reparam_result.qs.clone()) },
-        quad_ctx,
+        &quad_ctx,
     );
     
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
@@ -1508,7 +1508,7 @@ pub fn fit_model_for_fixed_rho<'a>(
 
     let mut working_summary = run_working_model_pirls(
         &mut working_model,
-        initial_beta,
+        Coefficients::new(initial_beta),
         &options,
         &mut iteration_logger,
     )?;
@@ -2039,7 +2039,7 @@ pub fn calculate_deviance(
 #[derive(Clone)]
 pub struct StablePLSResult {
     /// Solution vector beta
-    pub beta: Array1<f64>,
+    pub beta: Coefficients,
     /// Final penalized Hessian matrix
     pub penalized_hessian: Array2<f64>,
     /// Effective degrees of freedom
@@ -2226,7 +2226,7 @@ pub fn solve_penalized_least_squares(
 
         return Ok((
             StablePLSResult {
-                beta: beta_transformed,
+                beta: Coefficients::new(beta_transformed),
                 penalized_hessian: workspace.xtwx_buf.clone(),
                 edf: rank as f64, // EDF = rank in unpenalized LS
                 scale: 1.0,
@@ -2393,7 +2393,7 @@ pub fn solve_penalized_least_squares(
 
             Ok(Some((
                 StablePLSResult {
-                    beta: beta_transformed,
+                    beta: Coefficients::new(beta_transformed),
                     penalized_hessian: penalized.clone(),
                     edf,
                     scale,
@@ -2755,7 +2755,7 @@ pub fn solve_penalized_least_squares(
             }
         }
         let rel_asym = asym_sum / (1.0 + abs_sum);
-        debug_assert!(
+        assert!(
             rel_asym < 1e-10,
             "Penalized Hessian not symmetric (rel_asym={})",
             rel_asym
@@ -2811,7 +2811,7 @@ pub fn solve_penalized_least_squares(
     // Return the result
     Ok((
         StablePLSResult {
-            beta: beta_transformed,
+            beta: Coefficients::new(beta_transformed),
             penalized_hessian,
             edf,
             scale,
@@ -3231,7 +3231,7 @@ mod tests {
 
         let offset = Array1::<f64>::zeros(data.y.len());
         let (pirls_result, _) = fit_model_for_fixed_rho(
-            rho_vec.view(),
+            LogSmoothingParamsView::new(rho_vec.view()),
             x_matrix.view(),
             offset.view(),
             data.y.view(),
@@ -3474,7 +3474,7 @@ mod tests {
     }
 
     impl WorkingModel for IdentityGamWorkingModel {
-        fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
             let eta = self.design.dot(beta);
             let mut mu = Array1::zeros(self.response.len());
             let mut weights = Array1::zeros(self.response.len());
@@ -3512,7 +3512,7 @@ mod tests {
             );
 
             Ok(WorkingState {
-                eta,
+                eta: LinearPredictor::new(eta),
                 gradient,
                 hessian,
                 deviance,
@@ -3760,7 +3760,7 @@ mod tests {
     ) -> Result<(Array2<f64>, Vec<Array2<f64>>, ModelLayout), Box<dyn std::error::Error>> {
         let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(data, config)?;
-        debug_assert!(!penalty_structs.is_empty());
+        assert!(!penalty_structs.is_empty());
         let rs_original = compute_penalty_square_roots(&s_list)?;
         Ok((x_matrix, rs_original, layout))
     }
@@ -3878,7 +3878,7 @@ mod tests {
         // Call the function with first rho vector
         let offset = Array1::<f64>::zeros(n_samples);
         let (result1, _) = super::fit_model_for_fixed_rho(
-            rho_vec1.view(),
+            LogSmoothingParamsView::new(rho_vec1.view()),
             x.view(),
             offset.view(),
             y.view(),
@@ -3895,7 +3895,7 @@ mod tests {
 
         // Call the function with second rho vector
         let (result2, _) = super::fit_model_for_fixed_rho(
-            rho_vec2.view(),
+            LogSmoothingParamsView::new(rho_vec2.view()),
             x.view(),
             offset.view(),
             y.view(),
@@ -4013,7 +4013,7 @@ mod tests {
         // === PHASE 5: Execute the target function ===
         let offset = Array1::<f64>::zeros(data.y.len());
         let (pirls_result, _) = fit_model_for_fixed_rho(
-            rho_vec.view(),
+            LogSmoothingParamsView::new(rho_vec.view()),
             x_matrix.view(),
             offset.view(),
             data.y.view(),

@@ -496,7 +496,7 @@ impl<'model> HwePcaProjector<'model> {
                 }
             }
         } else if alignment_out.is_some() {
-            debug_assert!(
+            assert!(
                 opts.missing_axis_renormalization,
                 "alignment_out should be None when renormalization is disabled",
             );

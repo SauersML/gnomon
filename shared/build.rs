@@ -67,6 +67,11 @@ struct EmptyBlockCollector {
     file_path: PathBuf,
 }
 
+struct DebugAssertCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -540,6 +545,37 @@ impl EmptyBlockCollector {
     }
 }
 
+impl DebugAssertCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} debug_assert! usages in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str("\n⚠️ debug_assert! is forbidden in this project.\n");
+        error_msg.push_str("   Use assert! instead.\n");
+
+        Some(error_msg)
+    }
+}
+
 // Implement the `Sink` trait for our collector.
 // The `matched` method is called by the searcher for every line that matches the regex.
 impl Sink for ViolationCollector {
@@ -980,6 +1016,39 @@ impl Sink for DropUsageCollector {
     }
 }
 
+impl Sink for DebugAssertCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        let is_pure_comment = line_text.trim_start().starts_with("//")
+            || (line_text.contains("/*")
+                && !line_text.contains("*/match")
+                && !line_text.contains("*/let"));
+
+        let mut is_in_string = false;
+        if line_text.contains("\"") {
+            let parts: Vec<&str> = line_text.split('\"').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if i % 2 == 1 && part.contains("debug_assert!") {
+                    is_in_string = true;
+                    break;
+                }
+            }
+        }
+
+        if is_pure_comment || is_in_string {
+            return Ok(true);
+        }
+
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum EmptyBlockTokenKind {
     Ident(String),
@@ -1119,6 +1188,15 @@ fn main() {
     );
     emit_stage_detail(&empty_block_report);
     all_violations.extend(empty_block_violations);
+
+    update_stage("scan debug_assert usage");
+    let debug_assert_violations = scan_for_debug_assert_usage();
+    let debug_assert_report = format!(
+        "debug_assert scan identified {} violation groups",
+        debug_assert_violations.len()
+    );
+    emit_stage_detail(&debug_assert_report);
+    all_violations.extend(debug_assert_violations);
 
     // If any violations were found, print them all and exit with error
     if !all_violations.is_empty() {
@@ -1932,6 +2010,51 @@ fn scan_for_empty_control_blocks() -> Vec<String> {
 
         if let Some(error_message) = collector.check_and_get_error_message() {
             all_violations.push(error_message);
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_debug_assert_usage() -> Vec<String> {
+    let pattern = r"\bdebug_assert!\s*\(";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                if std::fs::read_to_string(path).is_err() {
+                    continue;
+                }
+
+                let mut collector = DebugAssertCollector::new(path);
+
+                if searcher
+                    .search_path(&matcher, path, &mut collector)
+                    .is_err()
+                {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating debug_assert regex matcher: {}",
+                e
+            ));
         }
     }
 

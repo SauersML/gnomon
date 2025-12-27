@@ -264,7 +264,7 @@ impl ManagedStageBar {
     }
 
     fn update(&self, processed_variants: usize) {
-        debug_assert!(self.units == StageUnits::Variants);
+        assert!(self.units == StageUnits::Variants);
         match &self.mode {
             StageBarMode::Determinate { total } => {
                 let capped = processed_variants.min(*total as usize) as u64;

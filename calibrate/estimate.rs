@@ -1074,7 +1074,7 @@ pub fn train_joint_model(
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
     
-    debug_assert!(!penalty_structs.is_empty());
+    assert!(!penalty_structs.is_empty());
     
     eprintln!(
         "[JOINT] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -1312,7 +1312,6 @@ pub fn train_model(
     if vis_guard.is_active() {
         visualizer::set_stage("stage-0", "init");
     }
-    let quad_ctx = crate::calibrate::quadrature::QuadratureContext::new();
     let result = (|| {
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
@@ -1329,7 +1328,7 @@ pub fn train_model(
         interaction_orth_alpha,
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
-    debug_assert!(!penalty_structs.is_empty());
+    assert!(!penalty_structs.is_empty());
     log_layout_info(&layout);
     eprintln!(
         "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
@@ -1418,7 +1417,6 @@ pub fn train_model(
             &*config,
             None,
             None, // No SE for base model (not calibrator)
-            &quad_ctx,
         )?;
 
         // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
@@ -7809,7 +7807,7 @@ pub mod internal {
                     let (x_tr, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                         build_design_and_penalty_matrices(&data_train, &trained.config)
                             .expect("layout");
-                    debug_assert!(!penalty_structs.is_empty());
+                    assert!(!penalty_structs.is_empty());
 
                     if penalty_labels.is_none() {
                         let (labels, types) = assign_penalty_labels(&layout);
@@ -8888,7 +8886,7 @@ pub mod internal {
             // --- Build model structure ---
             let (x_matrix, mut s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            debug_assert!(!penalty_structs.is_empty());
+            assert!(!penalty_structs.is_empty());
 
             assert!(
                 layout.num_penalties > 0,
@@ -9239,7 +9237,7 @@ pub mod internal {
             // Test with extreme lambda values that might cause issues
             let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            debug_assert!(!penalty_structs.is_empty());
+            assert!(!penalty_structs.is_empty());
 
             // Try with very large lambda values (exp(10) ~ 22000)
             let extreme_rho = Array1::from_elem(layout.num_penalties, 10.0);
@@ -9383,7 +9381,7 @@ pub mod internal {
             // Test that we can at least compute cost without getting infinity
             let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
                 build_design_and_penalty_matrices(&data, &config).unwrap();
-            debug_assert!(!penalty_structs.is_empty());
+            assert!(!penalty_structs.is_empty());
 
             let reml_state = internal::RemlState::new(
                 data.y.view(),
@@ -9817,7 +9815,7 @@ pub mod internal {
             let (x_matrix, s_list, layout, constraints, _, _, _, _, _, penalty_structs) =
                 internal::build_design_and_penalty_matrices(&training_data, &config)
                     .expect("Failed to build design matrix");
-            debug_assert!(!penalty_structs.is_empty());
+            assert!(!penalty_structs.is_empty());
 
             // In the pure pre-centering approach, the PC basis is constrained first.
             // Let's examine if the columns approximately sum to zero, but don't enforce it
@@ -11037,7 +11035,7 @@ mod optimizer_progress_tests {
         // Stage: Build matrices and the REML state to evaluate cost at specific rho values
         let (x_matrix, s_list, layout, _, _, _, _, _, _, penalty_structs) =
             build_design_and_penalty_matrices(&data, &config)?;
-        debug_assert!(!penalty_structs.is_empty());
+        assert!(!penalty_structs.is_empty());
         let reml_state = internal::RemlState::new(
             data.y.view(),
             x_matrix.view(),

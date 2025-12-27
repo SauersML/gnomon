@@ -1163,7 +1163,7 @@ fn process_dense_stream(
                         &context.tile_pool,
                     )?;
 
-                    debug_assert!(!guards.is_empty());
+                    assert!(!guards.is_empty());
                 }
 
                 Ok::<_, PipelineError>(acc)

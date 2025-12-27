@@ -112,7 +112,7 @@ impl ComplexVariantResolver {
                     return Ok(0b01);
                 }
                 let final_byte_offset = offset + compact_idx as u64;
-                debug_assert!(
+                assert!(
                     (compact_idx as u64) < *bytes_per_spooled_variant,
                     "compact index {} exceeds spool stride {}",
                     compact_idx,

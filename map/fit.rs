@@ -700,7 +700,7 @@ impl VariantStatsCache {
             return;
         }
 
-        debug_assert!(variant_range.start == self.write_pos);
+        assert!(variant_range.start == self.write_pos);
 
         let filled = block.ncols();
         {
@@ -771,8 +771,8 @@ impl VariantStatsCache {
 
         self.write_pos = end;
 
-        debug_assert!(self.frequencies.len() >= end);
-        debug_assert!(self.scales.len() >= end);
+        assert!(self.frequencies.len() >= end);
+        assert!(self.scales.len() >= end);
     }
 
     fn finalize(&mut self) {
@@ -2899,7 +2899,7 @@ impl LdRingBuffer {
         len: usize,
         scratch: &'a mut LdWindowScratch,
     ) -> LdWindowView<'a> {
-        debug_assert!(start + len <= self.len);
+        assert!(start + len <= self.len);
         let capacity = self.capacity();
         if capacity == 0 || len == 0 {
             return LdWindowView {

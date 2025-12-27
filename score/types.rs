@@ -359,7 +359,7 @@ impl EffectAlleleDosage {
     /// Creates a new dosage, asserting the value is valid in debug builds.
     #[inline(always)]
     pub fn new(value: u8) -> Self {
-        debug_assert!(value <= 3, "Invalid dosage value created: {value}");
+        assert!(value <= 3, "Invalid dosage value created: {value}");
         Self(value)
     }
 }

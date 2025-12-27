@@ -75,14 +75,14 @@ impl<'a> SpoolPlan<'a> {
         );
 
         for (dst_idx, &orig_byte_idx) in self.compact_byte_index.iter().enumerate() {
-            debug_assert!(
+            assert!(
                 dst_idx < self.scratch.len(),
                 "scratch index {} out of bounds for buffer of length {}",
                 dst_idx,
                 self.scratch.len()
             );
             let byte_index = orig_byte_idx as usize;
-            debug_assert!(
+            assert!(
                 byte_index < buffer.len(),
                 "original byte index {} out of bounds for buffer of length {}",
                 byte_index,

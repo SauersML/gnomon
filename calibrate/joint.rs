@@ -24,6 +24,7 @@ use crate::calibrate::basis::{
     baseline_lambda_seed, create_bspline_basis, create_bspline_basis_with_knots,
     create_difference_penalty_matrix,
 };
+use crate::calibrate::quadrature::QuadratureContext;
 use crate::calibrate::construction::{
     compute_penalty_square_roots, precompute_reparam_invariant, stable_reparameterization,
     stable_reparameterization_with_invariant, ReparamInvariant, ReparamResult,
@@ -75,6 +76,7 @@ pub struct JointModelState<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
     covariate_se: Option<Array1<f64>>,
+    quad_ctx: &'a QuadratureContext,
     /// Enable Firth bias reduction for separation protection
     firth_bias_reduction: bool,
     /// Last full linear predictor (u + wiggle) for weight-aligned constraints.
@@ -153,6 +155,7 @@ impl<'a> JointModelState<'a> {
         layout_base: ModelLayout,
         link: LinkFunction,
         config: &JointModelConfig,
+        quad_ctx: &'a QuadratureContext,
     ) -> Self {
         let n_base = x_base.ncols();
         let degree = 3; // Cubic B-splines
@@ -190,6 +193,7 @@ impl<'a> JointModelState<'a> {
             knot_vector: None,
             n_constrained_basis: n_constrained,
             covariate_se: None,
+            quad_ctx,
             firth_bias_reduction: config.firth_bias_reduction,
             last_eta: None,
         }
@@ -1133,8 +1137,10 @@ impl<'a> JointRemlState<'a> {
         link: LinkFunction,
         config: &JointModelConfig,
         covariate_se: Option<Array1<f64>>,
+        quad_ctx: &'a QuadratureContext,
     ) -> Self {
-        let mut state = JointModelState::new(y, weights, x_base, s_base, layout_base, link, config);
+        let mut state =
+            JointModelState::new(y, weights, x_base, s_base, layout_base, link, config, quad_ctx);
         // Set covariate_se for uncertainty-aware IRLS
         if let Some(se) = covariate_se {
             state = state.with_covariate_se(se);

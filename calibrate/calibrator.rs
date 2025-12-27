@@ -435,7 +435,7 @@ pub fn compute_alo_features(
         let t_chunk = t_chunk_storage.as_ref();
         let s_col_stride = s_chunk.col_stride();
         let t_col_stride = t_chunk.col_stride();
-        debug_assert!(s_col_stride >= 0 && t_col_stride >= 0);
+        assert!(s_col_stride >= 0 && t_col_stride >= 0);
         let s_col_stride = s_col_stride as usize;
         let t_col_stride = t_col_stride as usize;
         let s_ptr = s_chunk.as_ptr();

@@ -2628,9 +2628,7 @@ impl VcfLikeVariantBlockSource {
                 }
         }
 
-        if filled == 0 && self.stream_exhausted {
-            // No additional matches in this pass.
-        }
+        assert!(!(filled == 0 && self.stream_exhausted));
 
         self.emitted += filled;
         Ok(filled)

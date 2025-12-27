@@ -93,7 +93,7 @@ impl TrustedReference {
         static REFERENCE: OnceLock<GeneratedReference> = OnceLock::new();
         let generated =
             REFERENCE.get_or_init(|| GeneratedReference::new().expect("trusted reference"));
-        debug_assert!(generated.temp_dir.path().exists());
+        assert!(generated.temp_dir.path().exists());
         &generated.reference
     }
 
