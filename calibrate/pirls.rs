@@ -492,48 +492,46 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 &mut self.last_z,
             );
         }
-        {
-            let mu = &self.last_mu;
-            let weights = &self.last_weights;
-            if self.firth_bias_reduction {
-                let x_transformed = self.x_transformed.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "Firth bias reduction requires an explicit transformed design".to_string(),
-                    )
-                })?;
-                let (hat_diag, half_log_det) = match (x_transformed, &self.x_csr) {
-                    (DesignMatrix::Dense(matrix), _) => compute_firth_hat_and_half_logdet(
-                        matrix.view(),
-                        self.x_original_dense,
-                        weights.view(),
-                        &self.s_transformed,
-                        &mut self.workspace,
-                    )?,
-                    (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
-                        csr,
-                        self.x_original_dense,
-                        weights.view(),
-                        &self.s_transformed,
-                    )?,
-                    (DesignMatrix::Sparse(_), None) => {
-                        return Err(EstimationError::InvalidInput(
-                            "missing CSR cache for Firth computation".to_string(),
-                        ));
-                    }
-                };
-                self.firth_log_det = Some(half_log_det);
-                for i in 0..self.last_z.len() {
-                    let wi = weights[i];
-                    if wi > 0.0 {
-                        self.last_z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
-                    }
+        let weights = self.last_weights.clone();
+        let mu = self.last_mu.clone();
+        if self.firth_bias_reduction {
+            let x_transformed = self.x_transformed.as_ref().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Firth bias reduction requires an explicit transformed design".to_string(),
+                )
+            })?;
+            let (hat_diag, half_log_det) = match (x_transformed, &self.x_csr) {
+                (DesignMatrix::Dense(matrix), _) => compute_firth_hat_and_half_logdet(
+                    matrix.view(),
+                    self.x_original_dense,
+                    weights.view(),
+                    &self.s_transformed,
+                    &mut self.workspace,
+                )?,
+                (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
+                    csr,
+                    self.x_original_dense,
+                    weights.view(),
+                    &self.s_transformed,
+                )?,
+                (DesignMatrix::Sparse(_), None) => {
+                    return Err(EstimationError::InvalidInput(
+                        "missing CSR cache for Firth computation".to_string(),
+                    ));
                 }
-            } else {
-                self.firth_log_det = None;
+            };
+            self.firth_log_det = Some(half_log_det);
+            for i in 0..self.last_z.len() {
+                let wi = weights[i];
+                if wi > 0.0 {
+                    self.last_z[i] += hat_diag[i] * (0.5 - mu[i]) / wi;
+                }
             }
+        } else {
+            self.firth_log_det = None;
         }
 
-        let mut penalized_hessian = self.penalized_hessian(&self.last_weights)?;
+        let mut penalized_hessian = self.penalized_hessian(&weights)?;
         for i in 0..penalized_hessian.nrows() {
             for j in 0..i {
                 let val = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
@@ -550,12 +548,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.workspace
             .weighted_residual
             .assign(&self.workspace.working_residual);
-        self.workspace.weighted_residual *= &self.last_weights;
+        self.workspace.weighted_residual *= &weights;
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
 
-        let deviance = calculate_deviance(self.y, &self.last_mu, self.link, self.prior_weights);
+        let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
 
         let penalty_term = beta.as_ref().dot(&s_beta);
 
