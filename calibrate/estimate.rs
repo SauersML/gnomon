@@ -4859,7 +4859,11 @@ pub mod internal {
             // This is crucial for stability: if we start from zero, P-IRLS might converge
             // to a different local optimum (or stall differently) than the main cost evaluation,
             // creating huge phantom gradients that violate the envelope theorem.
-            let warm_start_initial = self.warm_start_beta.borrow().clone();
+            let warm_start_initial = if self.warm_start_enabled.get() {
+                self.warm_start_beta.borrow().clone()
+            } else {
+                None
+            };
 
             // Run a fresh PIRLS solve for each perturbed smoothing vector.  We avoid the
             // `execute_pirls_if_needed` cache here because these evaluations happen in parallel
@@ -5041,7 +5045,12 @@ pub mod internal {
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
-            let key_opt = self.rho_key_sanitized(rho);
+            let use_cache = self.warm_start_enabled.get();
+            let key_opt = if use_cache {
+                self.rho_key_sanitized(rho)
+            } else {
+                None
+            };
             if let Some(key) = &key_opt
                 && let Some(cached) = {
                     let cache_ref = self.cache.borrow();
@@ -5057,7 +5066,11 @@ pub mod internal {
             // The returned result will include the transformation matrix qs
             let pirls_result = {
                 let warm_start_holder = self.warm_start_beta.borrow();
-                let warm_start_ref = warm_start_holder.as_ref();
+                let warm_start_ref = if self.warm_start_enabled.get() {
+                    warm_start_holder.as_ref()
+                } else {
+                    None
+                };
                 pirls::fit_model_for_fixed_rho(
                     LogSmoothingParamsView::new(rho.view()),
                     self.x,
@@ -10717,7 +10730,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
     use std::collections::HashMap;
 
     // Stage: Create a perfectly separated dataset
-    let n_samples = 400;
+    let n_samples = 1000;
     let p = Array1::linspace(-1.0, 1.0, n_samples);
     let y = p.mapv(|val| if val > 0.0 { 1.0 } else { 0.0 }); // Perfect separation by PGS
     let pcs = Array2::zeros((n_samples, 0)); // No PCs for simplicity

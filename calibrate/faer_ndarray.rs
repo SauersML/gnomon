@@ -21,10 +21,16 @@ pub enum FaerLinalgError {
 
 #[inline]
 pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
-    assert!(
-        array.is_standard_layout(),
-        "array2_to_mat_mut expects standard layout storage"
-    );
+    if !array.is_standard_layout() {
+        let (nrows, ncols) = array.dim();
+        let mut standard = Array2::<f64>::zeros((nrows, ncols));
+        for i in 0..nrows {
+            for j in 0..ncols {
+                standard[(i, j)] = array[(i, j)];
+            }
+        }
+        *array = standard;
+    }
     let (nrows, ncols) = array.dim();
     let slice = array
         .as_slice_memory_order_mut()

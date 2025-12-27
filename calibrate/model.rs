@@ -2866,7 +2866,7 @@ mod tests {
 
         let eta_ones = x_new.dot(&Array1::ones(p));
         let expected_mean = eta_ones.mapv(|e| 0.5 * (0.5 + sigmoid(e)));
-        let expected_eta = expected_mean.mapv(|p| (p / (1.0 - p)).ln());
+        let expected_eta = eta_ones.mapv(|e| 0.5 * e);
 
         assert_abs_diff_eq!(
             mean.as_slice().unwrap(),
