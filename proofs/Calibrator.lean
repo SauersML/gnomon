@@ -1414,14 +1414,14 @@ lemma risk_affine_additive
   -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
 
   -- The formal proof: expand the squared term and integrate term by term
-  have h_integrand_eq :
-      (fun pc => (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2) =
-      (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+  have h_integrand_eq (pc : ℝ × (Fin 1 → ℝ)) :
+      (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 =
+      u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
               + 2*u*β * pc.1 * pc.2 ⟨0, by norm_num⟩
               - 2*u*a * pc.1
-              - 2*a*β * pc.2 ⟨0, by norm_num⟩) := by
-    ext pc; simp only [hu]; ring
-  rw [h_integrand_eq]
+              - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
+    simp only [hu]; ring
+  simp_rw [h_integrand_eq]
   -- Collect terms for linearity: ∫ (f₁ + f₂ + ... + f₆) = ∫ f₁ + ∫ f₂ + ...
   have i_p2 := hP2_int.const_mul (u^2)
   have i_c2 := hC2_int.const_mul (β^2)
