@@ -1414,7 +1414,7 @@ lemma risk_affine_additive
   -- ∫ -2aβC = -2aβ · 0 = 0 (by hC0)
 
   -- The formal proof: expand the squared term and integrate term by term.
-  have h_integrand_expand : ∀ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) ^ 2 =
+  have h_integrand_expand : ∀ (pc : ℝ × (Fin 1 → ℝ)), (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 =
       u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
       + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
       - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
