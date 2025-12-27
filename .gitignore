@@ -7,6 +7,8 @@ build
 *.tsv
 t.py
 calibrate/tests/__pycache__/
+**/__pycache__/
+/.worktrees/
 calibrate/tests/bench_workdir/
 report.md
 diff.txt
