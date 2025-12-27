@@ -1431,38 +1431,28 @@ lemma risk_affine_additive
         + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
         - ((∫ pc, 2*u*a * pc.1 ∂μ) + (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ)) := by
       -- Justify linearity by proving integrability of each term
-      have i_p2 := hP2_int.const_mul (u^2)
-      have i_c2 := hC2_int.const_mul (β^2)
+      have i_p2 : Integrable (fun x => u ^ 2 * x.1 ^ 2) μ := hP2_int.const_mul (u^2)
+      have i_c2 : Integrable (fun x => β^2 * (x.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
       have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
-      have i_pc := hPC_int.const_mul (2 * u * β)
-      have i_p1 := hP_int.const_mul (2 * u * a)
-      have i_c1 := hC_int.const_mul (2 * a * β)
+      have i_pc : Integrable (fun x => 2*u*β * (x.1 * x.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul (2*u*β)
+      have i_p1 : Integrable (fun x => 2*u*a * x.1) μ := hP_int.const_mul (2*u*a)
+      have i_c1 : Integrable (fun x => 2*a*β * x.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
+
       -- Apply linearity rules one by one
-      have h_lin1 : ∫ (pc : ℝ × (Fin 1 → ℝ)), u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - (2 * u * a * pc.1 + 2 * a * β * pc.2 ⟨0, by norm_num⟩) ∂μ =
-          (∫ pc, u^2 * pc.1^2 ∂μ) + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + (∫ pc, a^2 ∂μ)
-          + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
-          - ((∫ pc, 2*u*a * pc.1 ∂μ) + (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ)) := by
-        have i_p2 := hP2_int.const_mul (u^2)
-        have i_c2 := hC2_int.const_mul (β^2)
-        have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
-        have i_pc := hPC_int.const_mul (2 * u * β)
-        have i_p1 := hP_int.const_mul (2 * u * a)
-        have i_c1 := hC_int.const_mul (2 * a * β)
-        have h_sub_integrable := (i_p2.add (i_c2.add (i_a2.add i_pc))).sub (i_p1.add i_c1)
-        have h_sub_distrib: ∀ (pc : ℝ × (Fin 1 → ℝ)),
-            u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2 * u * a * pc.1 - 2 * a * β * pc.2 ⟨0, by norm_num⟩ =
-            u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - (2 * u * a * pc.1 + 2 * a * β * pc.2 ⟨0, by norm_num⟩) := by
-          intro pc; ring
-        simp_rw [h_sub_distrib]
-        rw [integral_sub h_sub_integrable.1 h_sub_integrable.2]
-        rw [integral_add (i_p2.add (i_c2.add i_a2)) i_pc]
-        rw [integral_add (i_p2.add i_c2) i_a2]
-        rw [integral_add i_p2 i_c2]
-        rw [integral_add i_p1 i_c1]
-      rw[h_lin1]
+      have h_lin_sub_distrib: ∀ (pc : ℝ × (Fin 1 → ℝ)),
+          u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2 * u * a * pc.1 - 2 * a * β * pc.2 ⟨0, by norm_num⟩ =
+          u ^ 2 * pc.1 ^ 2 + β ^ 2 * pc.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - (2 * u * a * pc.1 + 2 * a * β * pc.2 ⟨0, by norm_num⟩) := by
+        intro pc; ring
+      simp_rw [h_lin_sub_distrib]
+      rw [integral_sub (i_p2.add (i_c2.add (i_a2.add i_pc))) (i_p1.add i_c1)]
+      rw [integral_add (i_p2.add (i_c2.add i_a2)) i_pc]
+      rw [integral_add (i_p2.add i_c2) i_a2]
+      rw [integral_add i_p2 i_c2]
+      rw [integral_add i_p1 i_c1]
+
     _ = a^2 + u^2 + β^2 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.2 ⟨0, by norm_num⟩ ^ 2 ∂μ := by
       -- Pull out constants and substitute known integral values
-      simp [integral_const_mul, integral_const, hP2, hPC0, hP0, hC0, measure_univ, hu]
+      simp [integral_const_mul, integral_const, hP2, hP0, hu]
       ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
