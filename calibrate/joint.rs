@@ -76,7 +76,7 @@ pub struct JointModelState<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
     covariate_se: Option<Array1<f64>>,
-    quad_ctx: &'a QuadratureContext,
+    quad_ctx: QuadratureContext,
     /// Enable Firth bias reduction for separation protection
     firth_bias_reduction: bool,
     /// Last full linear predictor (u + wiggle) for weight-aligned constraints.
@@ -155,7 +155,7 @@ impl<'a> JointModelState<'a> {
         layout_base: ModelLayout,
         link: LinkFunction,
         config: &JointModelConfig,
-        quad_ctx: &'a QuadratureContext,
+        quad_ctx: QuadratureContext,
     ) -> Self {
         let n_base = x_base.ncols();
         let degree = 3; // Cubic B-splines
@@ -269,7 +269,7 @@ impl<'a> JointModelState<'a> {
         match (&self.link, &self.covariate_se) {
             (LinkFunction::Logit, Some(se)) => {
                 crate::calibrate::pirls::update_glm_vectors_integrated(
-                    self.quad_ctx,
+                    &self.quad_ctx,
                     self.y,
                     eta_for_weights,
                     se.view(),
@@ -581,8 +581,8 @@ impl<'a> JointModelState<'a> {
         // from pirls.rs which maintains Hessian state. For now, we use standard GLM vectors
         // but the flag triggers Firth in the outer LAML cost (via config passthrough).
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::calibrate::pirls::update_glm_vectors_integrated(
-                self.quad_ctx,
+                crate::calibrate::pirls::update_glm_vectors_integrated(
+                    &self.quad_ctx,
                 self.y,
                 &eta,
                 se.view(),
@@ -687,8 +687,8 @@ impl<'a> JointModelState<'a> {
         
         // Use integrated likelihood for final deviance if SE available
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::calibrate::pirls::update_glm_vectors_integrated(
-                self.quad_ctx,
+                crate::calibrate::pirls::update_glm_vectors_integrated(
+                    &self.quad_ctx,
                 self.y,
                 &eta_updated,
                 se.view(),
@@ -743,8 +743,8 @@ impl<'a> JointModelState<'a> {
         
         // Use integrated likelihood if SE available (Logit only)
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
-            crate::calibrate::pirls::update_glm_vectors_integrated(
-                self.quad_ctx,
+                crate::calibrate::pirls::update_glm_vectors_integrated(
+                    &self.quad_ctx,
                 self.y,
                 &eta,
                 se.view(),
@@ -863,7 +863,7 @@ impl<'a> JointModelState<'a> {
         // Use integrated likelihood for final deviance if SE available
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             crate::calibrate::pirls::update_glm_vectors_integrated(
-                self.quad_ctx,
+                &self.quad_ctx,
                 self.y,
                 &eta_updated,
                 se.view(),
@@ -927,7 +927,7 @@ pub fn fit_joint_model<'a>(
 ) -> Result<JointModelResult, EstimationError> {
     let quad_ctx = QuadratureContext::new();
     let mut state = JointModelState::new(
-        y, weights, x_base, s_base, layout_base, link, config, &quad_ctx
+        y, weights, x_base, s_base, layout_base, link, config, quad_ctx
     );
     
     let mut prev_deviance = f64::INFINITY;
@@ -1143,7 +1143,7 @@ impl<'a> JointRemlState<'a> {
         link: LinkFunction,
         config: &JointModelConfig,
         covariate_se: Option<Array1<f64>>,
-        quad_ctx: &'a QuadratureContext,
+        quad_ctx: QuadratureContext,
     ) -> Self {
         let mut state =
             JointModelState::new(y, weights, x_base, s_base, layout_base, link, config, quad_ctx);
@@ -1261,7 +1261,7 @@ impl<'a> JointRemlState<'a> {
                     let se_i = se[i].max(0.0);
                     let (mu_i, dmu_deta) =
                         crate::calibrate::quadrature::logit_posterior_mean_with_deriv(
-                            state.quad_ctx,
+                            &state.quad_ctx,
                             e,
                             se_i,
                         );
@@ -1760,7 +1760,7 @@ pub fn fit_joint_model_with_reml<'a>(
     
     // Create REML state
     let reml_state = JointRemlState::new(
-        y, weights, x_base, s_base, layout_base, link, config, covariate_se, &quad_ctx
+        y, weights, x_base, s_base, layout_base, link, config, covariate_se, quad_ctx
     );
     
     let n_base = reml_state.state.borrow().s_base.len();
@@ -2333,7 +2333,7 @@ mod tests {
             layout,
             LinkFunction::Logit,
             &config,
-            &quad_ctx,
+            quad_ctx,
         );
         
         assert_eq!(state.beta_base.len(), p);

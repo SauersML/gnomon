@@ -2,7 +2,7 @@ use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condi
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
-    array2_to_mat_mut, fast_ata, fast_ata_into, fast_atv, fast_atv_into,
+    array2_to_mat_mut, fast_ata_into, fast_atv, fast_atv_into,
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
@@ -114,7 +114,7 @@ impl<'a> GamLogitWorkingModel<'a> {
 
     fn update_state(&mut self, beta: &Coefficients) -> WorkingState {
         let mut eta = self.offset.clone();
-        eta += &self.design.dot(beta);
+        eta += &self.design.dot(beta.as_ref());
 
         const MIN_DMU_DETA: f64 = 1e-6;
         const PROB_EPS: f64 = 1e-8;
@@ -134,7 +134,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         let working_residual = &eta_clamped - &self.working_response;
         let weighted_residual = &self.weights * &working_residual;
         fast_atv_into(&self.design, &weighted_residual, &mut self.grad_data_buf);
-        let grad_penalty = self.penalty.dot(beta);
+        let grad_penalty = self.penalty.dot(beta.as_ref());
         let mut gradient = self.grad_data_buf.clone();
         gradient += &grad_penalty;
 
@@ -174,7 +174,7 @@ impl<'a> GamLogitWorkingModel<'a> {
             self.prior_weights.view(),
         );
 
-        let penalty_term = beta.dot(&grad_penalty);
+        let penalty_term = beta.as_ref().dot(&grad_penalty);
 
         WorkingState {
             eta: LinearPredictor::new(eta_clamped),
@@ -198,6 +198,7 @@ pub struct PirlsWorkspace {
     pub sqrt_w: Array1<f64>,
     pub wx: Array2<f64>,
     pub wz: Array1<f64>,
+    pub eta_buf: Array1<f64>,
     // Stage 2/4 assembly (use max needed sizes)
     pub scaled_matrix: Array2<f64>,    // (<= p + eb_rows) x p
     pub final_aug_matrix: Array2<f64>, // (<= p + e_rows) x p
@@ -224,6 +225,7 @@ impl PirlsWorkspace {
             sqrt_w: Array1::zeros(n),
             wx: Array2::zeros((n, p)),
             wz: Array1::zeros(n),
+            eta_buf: Array1::zeros(n),
             scaled_matrix: Array2::zeros((scaled_rows_max, p)),
             final_aug_matrix: Array2::zeros((final_aug_rows_max, p)),
             rhs_full: Array1::zeros(final_aug_rows_max),
@@ -290,7 +292,7 @@ struct GamWorkingModel<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses update_glm_vectors_integrated for uncertainty-aware fitting.
     covariate_se: Option<Array1<f64>>,
-    quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
+    quad_ctx: crate::calibrate::quadrature::QuadratureContext,
 }
 
 
@@ -318,7 +320,7 @@ impl<'a> GamWorkingModel<'a> {
         link: LinkFunction,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
-        quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
+        quad_ctx: crate::calibrate::quadrature::QuadratureContext,
     ) -> Self {
         let n = if let Some(x_transformed) = &x_transformed {
             x_transformed.nrows()
@@ -378,7 +380,7 @@ impl<'a> GamWorkingModel<'a> {
             return x_transformed.matrix_vector_multiply(beta);
         }
         let qs = self.qs.as_ref().expect("qs required for implicit design");
-        let beta_orig = qs.dot(beta);
+        let beta_orig = qs.dot(beta.as_ref());
         if let Some(x_sparse) = &self.x_original_sparse {
             x_sparse.matrix_vector_multiply(&beta_orig)
         } else {
@@ -412,8 +414,13 @@ impl<'a> GamWorkingModel<'a> {
                     }
                     self.workspace.wx.assign(matrix);
                     self.workspace.wx *= &sqrt_w_col;
-                    let xtwx = fast_ata(&self.workspace.wx);
-                    xtwx + &self.s_transformed
+                    if self.workspace.xtwx_buf.dim() != (matrix.ncols(), matrix.ncols()) {
+                        self.workspace.xtwx_buf = Array2::zeros((matrix.ncols(), matrix.ncols()));
+                    }
+                    fast_ata_into(&self.workspace.wx, &mut self.workspace.xtwx_buf);
+                    let mut xtwx = self.workspace.xtwx_buf.clone();
+                    xtwx += &self.s_transformed;
+                    xtwx
                 }
                 DesignMatrix::Sparse(_) => {
                     let csr = self
@@ -438,7 +445,12 @@ impl<'a> GamWorkingModel<'a> {
             }
             self.workspace.wx.assign(&self.x_original_dense);
             self.workspace.wx *= &sqrt_w_col;
-            fast_ata(&self.workspace.wx)
+            if self.workspace.xtwx_buf.dim() != (self.x_original_dense.ncols(), self.x_original_dense.ncols()) {
+                self.workspace.xtwx_buf =
+                    Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
+            }
+            fast_ata_into(&self.workspace.wx, &mut self.workspace.xtwx_buf);
+            self.workspace.xtwx_buf.clone()
         };
 
         let qs = self.qs.as_ref().expect("qs required for implicit design");
@@ -449,16 +461,19 @@ impl<'a> GamWorkingModel<'a> {
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
-        let mut eta = self.offset.clone();
-        eta += &self.transformed_matvec(beta);
+        if self.workspace.eta_buf.len() != self.offset.len() {
+            self.workspace.eta_buf = Array1::zeros(self.offset.len());
+        }
+        self.workspace.eta_buf.assign(&self.offset);
+        self.workspace.eta_buf += &self.transformed_matvec(beta);
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
         // This coherently accounts for uncertainty in the base prediction.
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             update_glm_vectors_integrated(
-                self.quad_ctx,
+                &self.quad_ctx,
                 self.y,
-                &eta,
+                &self.workspace.eta_buf,
                 se.view(),
                 self.prior_weights,
                 &mut self.last_mu,
@@ -469,7 +484,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // Standard GLM update (canonical logit or identity)
             update_glm_vectors(
                 self.y,
-                &eta,
+                &self.workspace.eta_buf,
                 self.link,
                 self.prior_weights,
                 &mut self.last_mu,
@@ -477,8 +492,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 &mut self.last_z,
             );
         }
-        let mu = self.last_mu.clone();
-        let weights = self.last_weights.clone();
+        let mu = &self.last_mu;
+        let weights = &self.last_weights;
 
 
         if self.firth_bias_reduction {
@@ -528,22 +543,26 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
 
         let z = &self.last_z;
-        let mut eta_minus_z = eta.clone();
-        eta_minus_z -= z;
-        self.workspace.weighted_residual.assign(&eta_minus_z);
-        self.workspace.weighted_residual *= &weights;
+        self.workspace
+            .working_residual
+            .assign(&self.workspace.eta_buf);
+        self.workspace.working_residual -= z;
+        self.workspace
+            .weighted_residual
+            .assign(&self.workspace.working_residual);
+        self.workspace.weighted_residual *= weights;
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
-        let s_beta = self.s_transformed.dot(beta);
+        let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
 
-        let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
+        let deviance = calculate_deviance(self.y, mu, self.link, self.prior_weights);
 
-        let penalty_term = beta.dot(&s_beta);
+        let penalty_term = beta.as_ref().dot(&s_beta);
 
         self.last_penalty_term = penalty_term;
 
         Ok(WorkingState {
-            eta: LinearPredictor::new(eta),
+            eta: LinearPredictor::new(self.workspace.eta_buf.clone()),
             gradient,
             hessian: penalized_hessian,
             deviance,
@@ -743,46 +762,33 @@ fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let rhs = gradient.mapv(|v| -v);
-    let rhs_view = FaerColView::new(&rhs);
+    let rhs_view = FaerColView::new(gradient);
     let h_view = FaerArrayView::new(hessian);
-    let mut last_err: Option<FaerLinalgError> = None;
-
-    match FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        Ok(ch) => {
-            let sol = ch.solve(rhs_view.as_ref());
-            let solution = Array1::from_shape_fn(rhs.len(), |i| sol[(i, 0)]);
-            return Ok(solution);
-        }
-        Err(err) => {
-            last_err = Some(FaerLinalgError::Cholesky(err));
-        }
+    if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+        let sol = ch.solve(rhs_view.as_ref());
+        let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
+        return Ok(solution);
     }
 
-    match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+    let ldlt_err = match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
         Ok(ld) => {
             let sol = ld.solve(rhs_view.as_ref());
-            let solution = Array1::from_shape_fn(rhs.len(), |i| sol[(i, 0)]);
+            let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
             return Ok(solution);
         }
-        Err(err) => {
-            last_err = Some(FaerLinalgError::Ldlt(err));
-        }
-    }
+        Err(err) => FaerLinalgError::Ldlt(err),
+    };
 
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
     let sol = lb.solve(rhs_view.as_ref());
-    if sol.nrows() == rhs.len() && sol.ncols() == 1 {
-        let solution = Array1::from_shape_fn(rhs.len(), |i| sol[(i, 0)]);
+    if sol.nrows() == gradient.len() && sol.ncols() == 1 {
+        let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
         if solution.iter().all(|v| v.is_finite()) {
             return Ok(solution);
         }
     }
 
-    let err = last_err.unwrap_or(FaerLinalgError::Ldlt(
-        faer::linalg::solvers::LdltError::ZeroPivot { index: 0 },
-    ));
-    Err(EstimationError::LinearSystemSolveFailed(err))
+    Err(EstimationError::LinearSystemSolveFailed(ldlt_err))
 }
 
 fn default_beta_guess(
@@ -1206,7 +1212,7 @@ fn detect_logit_instability(
             / n
     };
 
-    let beta_norm = summary.beta.dot(&summary.beta).sqrt();
+    let beta_norm = summary.beta.as_ref().dot(summary.beta.as_ref()).sqrt();
     let dev_per_sample = summary.state.deviance / n;
 
     let mut has_pos = false;
@@ -1362,7 +1368,7 @@ pub fn fit_model_for_fixed_rho<'a>(
 
         let prior_weights_owned = prior_weights.to_owned();
         let mut eta = offset.to_owned();
-        eta += &x_transformed_dense.dot(&beta_transformed);
+        eta += &x_transformed_dense.dot(beta_transformed.as_ref());
         let final_mu = eta.clone();
         let final_z = y.to_owned();
 
@@ -1370,10 +1376,10 @@ pub fn fit_model_for_fixed_rho<'a>(
         weighted_residual -= &final_z;
         weighted_residual *= &prior_weights_owned;
         let gradient_data = fast_atv(&x_transformed_dense, &weighted_residual);
-        let s_beta = reparam_result.s_transformed.dot(&beta_transformed);
+        let s_beta = reparam_result.s_transformed.dot(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
-        let penalty_term = beta_transformed.dot(&s_beta);
+        let penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
         ensure_positive_definite(&mut stabilized_hessian)?;
@@ -1438,7 +1444,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
         if use_explicit { None } else { Some(reparam_result.qs.clone()) },
-        &quad_ctx,
+        quad_ctx,
     );
     
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
@@ -1450,8 +1456,8 @@ pub fn fit_model_for_fixed_rho<'a>(
     let beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == layout.total_coeffs)
         .map(|beta| beta.to_owned())
-        .unwrap_or_else(|| default_beta_guess(layout, link_function, y, prior_weights));
-    let initial_beta = reparam_result.qs.t().dot(&beta_guess_original);
+        .unwrap_or_else(|| Coefficients::new(default_beta_guess(layout, link_function, y, prior_weights)));
+    let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
 
     let options = WorkingModelPirlsOptions {
         max_iterations: config.max_iterations,
@@ -3189,6 +3195,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -3296,7 +3303,7 @@ mod tests {
 
         // Verify that the fitted values are still close to the target
         // Even with reduced rank, we should get good predictions
-        let fitted = x.dot(&solution.beta);
+        let fitted = x.dot(solution.beta.as_ref());
         let residual_sum_sq: f64 = weights
             .iter()
             .zip(z.iter())
@@ -3442,7 +3449,7 @@ mod tests {
 
     impl WorkingModel for IdentityGamWorkingModel {
         fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
-            let eta = self.design.dot(beta);
+            let eta = self.design.dot(beta.as_ref());
             let mut mu = Array1::zeros(self.response.len());
             let mut weights = Array1::zeros(self.response.len());
             let mut z = Array1::zeros(self.response.len());
@@ -3831,6 +3838,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -3891,7 +3899,7 @@ mod tests {
         );
 
         // As a secondary check, confirm the coefficient estimates are also different
-        let beta_diff = (&result1.beta_transformed - &result2.beta_transformed)
+        let beta_diff = (result1.beta_transformed.as_ref() - result2.beta_transformed.as_ref())
             .mapv(|x| x.abs())
             .sum();
         assert!(
@@ -3970,6 +3978,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -4022,7 +4031,7 @@ mod tests {
         let beta_original = pirls_result
             .reparam_result
             .qs
-            .dot(&pirls_result.beta_transformed);
+            .dot(pirls_result.beta_transformed.as_ref());
 
         // Map the flat vector to a structured object to easily isolate the spline part.
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
@@ -4108,6 +4117,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -4156,7 +4166,7 @@ mod tests {
         let beta_original = pirls_result
             .reparam_result
             .qs
-            .dot(&pirls_result.beta_transformed);
+            .dot(pirls_result.beta_transformed.as_ref());
         let mapped_coeffs = map_coefficients(&beta_original, &layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
 
@@ -4244,7 +4254,7 @@ mod tests {
             .pirls_result
             .reparam_result
             .qs
-            .dot(&result.pirls_result.beta_transformed);
+            .dot(result.pirls_result.beta_transformed.as_ref());
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
 
@@ -4311,7 +4321,7 @@ mod tests {
             .pirls_result
             .reparam_result
             .qs
-            .dot(&result.pirls_result.beta_transformed);
+            .dot(result.pirls_result.beta_transformed.as_ref());
         let mapped_coeffs = map_coefficients(&beta_original, &result.layout)?;
         let pgs_spline_coeffs = mapped_coeffs.main_effects.pgs;
 
@@ -4402,7 +4412,7 @@ mod tests {
         let sqrt_w = w.mapv(f64::sqrt);
         let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
         let wz = &sqrt_w * &z;
-        let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
+        let grad = wx.t().dot(&(wx.dot(res.beta.as_ref()) - &wz));
 
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         assert!(
@@ -4412,7 +4422,7 @@ mod tests {
         );
 
         // And ensure residual is orthogonal to the column space in the weighted sense
-        let resid = &wz - &wx.dot(&res.beta);
+        let resid = &wz - &wx.dot(res.beta.as_ref());
         let ortho_check = wx.t().dot(&resid);
         let inf_norm2 = ortho_check.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         assert!(inf_norm2 < 1e-10, "Residual not orthogonal: {}", inf_norm2);
@@ -4460,7 +4470,7 @@ mod tests {
         )
         .expect("solver ok");
 
-        let mu1 = x.dot(&res.beta);
+        let mu1 = x.dot(res.beta.as_ref());
         let dev1: f64 = (&y - &mu1).mapv(|r| r * r).sum();
 
         assert!(
@@ -4531,7 +4541,7 @@ mod tests {
         let sqrt_w_old = w_old.mapv(f64::sqrt);
         let wx_old = &x * &sqrt_w_old.view().insert_axis(ndarray::Axis(1));
         let wz_old = &sqrt_w_old * &z_old;
-        let grad_old = wx_old.t().dot(&(wx_old.dot(&res.beta) - &wz_old)); // S=0 here
+        let grad_old = wx_old.t().dot(&(wx_old.dot(res.beta.as_ref()) - &wz_old)); // S=0 here
         let inf_old = grad_old.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         assert!(
             inf_old < 1e-8,
@@ -4540,7 +4550,7 @@ mod tests {
         );
 
         // Now recompute eta, mu, and updated weights at the accepted beta
-        let eta1 = x.dot(&res.beta);
+        let eta1 = x.dot(res.beta.as_ref());
         // Use same approach for the second update_glm_vectors call
         let (w_new, z_new) = {
             let mut mu = Array1::zeros(n);
@@ -4562,7 +4572,7 @@ mod tests {
         let wx_new = &x * &sqrt_w_new.view().insert_axis(ndarray::Axis(1));
         let wz_new = &sqrt_w_new * &z_new;
 
-        let grad_new = wx_new.t().dot(&(wx_new.dot(&res.beta) - &wz_new));
+        let grad_new = wx_new.t().dot(&(wx_new.dot(res.beta.as_ref()) - &wz_new));
         let inf_new = grad_new.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
 
         // This SHOULD NOT be required to be tiny for convergence right after one step.
@@ -4610,7 +4620,7 @@ mod tests {
         assert_eq!(rank, 2);
 
         // Fitted values must equal the weighted projection of z onto Col(X)
-        let fitted = x.dot(&res.beta);
+        let fitted = x.dot(res.beta.as_ref());
         let rss: f64 = (&z - &fitted).mapv(|r| r * r).sum();
 
         assert!(
@@ -4623,7 +4633,7 @@ mod tests {
         let sqrt_w = w.mapv(f64::sqrt);
         let wx = &x * &sqrt_w.view().insert_axis(ndarray::Axis(1));
         let wz = &sqrt_w * &z;
-        let grad = wx.t().dot(&(wx.dot(&res.beta) - &wz));
+        let grad = wx.t().dot(&(wx.dot(res.beta.as_ref()) - &wz));
         let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
         assert!(
             inf_norm < 1e-10,

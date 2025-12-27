@@ -1,6 +1,7 @@
 use crate::calibrate::basis::{
     BasisError, SplineScratch, baseline_lambda_seed, create_bspline_basis_with_knots,
-    create_difference_penalty_matrix, evaluate_bspline_basis_scalar, null_range_whiten,
+    create_bspline_basis_with_knots_derivative, create_difference_penalty_matrix,
+    evaluate_bspline_basis_scalar, null_range_whiten,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
@@ -560,27 +561,12 @@ fn evaluate_basis_and_derivative(
         descriptor.degree,
     )?;
     let basis = (*basis_arc).clone();
-
-    let eps = 1e-6;
-    let mut perturbed_plus = log_ages.to_owned();
-    let mut perturbed_minus = log_ages.to_owned();
-    perturbed_plus.mapv_inplace(|v| v + eps);
-    perturbed_minus.mapv_inplace(|v| v - eps);
-    let (basis_plus_arc, _) = create_bspline_basis_with_knots(
-        perturbed_plus.view(),
+    let (derivative_arc, _) = create_bspline_basis_with_knots_derivative(
+        log_ages,
         descriptor.knot_vector.view(),
         descriptor.degree,
     )?;
-    let (basis_minus_arc, _) = create_bspline_basis_with_knots(
-        perturbed_minus.view(),
-        descriptor.knot_vector.view(),
-        descriptor.degree,
-    )?;
-    let basis_plus = (*basis_plus_arc).clone();
-    let basis_minus = (*basis_minus_arc).clone();
-    let mut derivative = basis_plus;
-    derivative -= &basis_minus;
-    derivative.mapv_inplace(|v| v / (2.0 * eps));
+    let derivative = (*derivative_arc).clone();
 
     Ok((basis, derivative))
 }
@@ -3104,14 +3090,11 @@ impl SurvivalModelArtifacts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::calibrator::{CalibratorModel, CalibratorSpec};
-    use crate::calibrate::model::{BasisConfig, LinkFunction};
     use approx::assert_abs_diff_eq;
     use log::Level;
     use logtest::Logger;
     use ndarray::array;
     use serde_json;
-    use serial_test::serial;
 
     fn manual_inverse(matrix: &Array2<f64>) -> Array2<f64> {
         let det = matrix[[0, 0]] * matrix[[1, 1]] - matrix[[0, 1]] * matrix[[1, 0]];

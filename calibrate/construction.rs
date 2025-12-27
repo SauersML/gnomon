@@ -2785,6 +2785,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         }
     }
@@ -2892,6 +2893,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -3395,6 +3397,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         }
     }

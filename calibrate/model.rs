@@ -2708,6 +2708,7 @@ mod tests {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -2817,6 +2818,7 @@ mod tests {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 mcmc_enabled: true,
+                calibrator_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -2929,6 +2931,7 @@ mod tests {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 mcmc_enabled: true,
+                calibrator_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -3062,6 +3065,7 @@ mod tests {
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: Some(SurvivalModelConfig {
                 baseline_basis: BasisConfig {
                     num_knots: basis.knot_vector.len(),
@@ -3151,6 +3155,7 @@ mod tests {
                 interaction_centering_means: HashMap::new(),
                 interaction_orth_alpha: HashMap::new(),
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {
@@ -3266,6 +3271,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -3355,6 +3361,7 @@ mod tests {
             interaction_centering_means: HashMap::new(),
             interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -3419,6 +3426,7 @@ mod tests {
                 interaction_centering_means: interaction_centering_means.clone(),
                 interaction_orth_alpha: interaction_orth_alpha.clone(),
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             },
             coefficients: MappedCoefficients {

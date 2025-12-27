@@ -8,7 +8,6 @@ use crate::calibrate::faer_ndarray::{FaerColView, fast_ata};
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
-use crate::calibrate::types::LogSmoothingParamsView;
 
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -388,7 +387,7 @@ pub fn compute_alo_features(
     let xtwx_view = FaerArrayView::new(&xtwx);
     let mut aii = Array1::<f64>::zeros(n);
     let mut se_naive = Array1::<f64>::zeros(n);
-    let eta_hat = x_dense.dot(&base.beta_transformed);
+    let eta_hat = x_dense.dot(base.beta_transformed.as_ref());
     let z = &base.solve_working_response;
 
     let mut diag_counter = 0;
@@ -2438,6 +2437,7 @@ mod tests {
     use crate::calibrate::estimate::evaluate_external_gradients;
     use crate::calibrate::faer_ndarray::FaerCholesky;
     use crate::calibrate::model::ModelConfig;
+    use crate::calibrate::types::LogSmoothingParamsView;
     use faer::Mat as FaerMat;
     use faer::Side;
     use faer::linalg::solvers::Llt as FaerLlt;
@@ -2560,7 +2560,7 @@ mod tests {
         )
         .expect("pirls");
 
-        let beta = pirls.reparam_result.qs.dot(&pirls.beta_transformed);
+        let beta = pirls.reparam_result.qs.dot(pirls.beta_transformed.as_ref());
         let mut eta = x.dot(&beta);
         eta += &offset;
 
@@ -3030,7 +3030,7 @@ mod tests {
 
     #[cfg(test)]
     fn beta_in_original_basis(fit: &pirls::PirlsResult) -> Array1<f64> {
-        fit.reparam_result.qs.dot(&fit.beta_transformed)
+        fit.reparam_result.qs.dot(fit.beta_transformed.as_ref())
     }
 
     // ===== ALO Correctness Tests =====
@@ -3342,7 +3342,7 @@ mod tests {
         let s_all = factor.solve(rhs_view.as_ref());
         let s_all_nd = Array2::from_shape_fn((p_dim, n), |(i, j)| s_all[(i, j)]);
 
-        let eta_hat = x_full_dense.dot(&full_fit.beta_transformed);
+        let eta_hat = x_full_dense.dot(full_fit.beta_transformed.as_ref());
         let z = &full_fit.solve_working_response;
         let phi = 1.0_f64;
 

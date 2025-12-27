@@ -13,14 +13,6 @@ impl Coefficients {
     pub fn zeros(len: usize) -> Self {
         Self(Array1::zeros(len))
     }
-
-    pub fn into_inner(self) -> Array1<f64> {
-        self.0
-    }
-
-    pub fn as_view(&self) -> ArrayView1<'_, f64> {
-        self.0.view()
-    }
 }
 
 impl Deref for Coefficients {
@@ -34,6 +26,12 @@ impl Deref for Coefficients {
 impl DerefMut for Coefficients {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl AsRef<Array1<f64>> for Coefficients {
+    fn as_ref(&self) -> &Array1<f64> {
+        &self.0
     }
 }
 
@@ -61,14 +59,6 @@ impl LinearPredictor {
     pub fn zeros(len: usize) -> Self {
         Self(Array1::zeros(len))
     }
-
-    pub fn into_inner(self) -> Array1<f64> {
-        self.0
-    }
-
-    pub fn as_view(&self) -> ArrayView1<'_, f64> {
-        self.0.view()
-    }
 }
 
 impl Deref for LinearPredictor {
@@ -82,6 +72,12 @@ impl Deref for LinearPredictor {
 impl DerefMut for LinearPredictor {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl AsRef<Array1<f64>> for LinearPredictor {
+    fn as_ref(&self) -> &Array1<f64> {
+        &self.0
     }
 }
 
@@ -104,14 +100,6 @@ pub struct LogSmoothingParams(pub Array1<f64>);
 impl LogSmoothingParams {
     pub fn new(values: Array1<f64>) -> Self {
         Self(values)
-    }
-
-    pub fn exp(&self) -> Array1<f64> {
-        self.0.mapv(f64::exp)
-    }
-
-    pub fn as_view(&self) -> ArrayView1<'_, f64> {
-        self.0.view()
     }
 }
 
@@ -152,10 +140,6 @@ impl<'a> LogSmoothingParamsView<'a> {
 
     pub fn exp(&self) -> Array1<f64> {
         self.0.mapv(f64::exp)
-    }
-
-    pub fn as_view(&self) -> ArrayView1<'a, f64> {
-        self.0
     }
 }
 

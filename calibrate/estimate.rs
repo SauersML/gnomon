@@ -1446,7 +1446,8 @@ pub fn train_model(
             _ => {}
         }
 
-        let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
+        let final_beta_original =
+            final_fit.reparam_result.qs.dot(final_fit.beta_transformed.as_ref());
         // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
         let qs = &final_fit.reparam_result.qs;
         let penalized_hessian_orig = qs
@@ -1914,7 +1915,8 @@ pub fn train_model(
 
     // Transform the final, optimal coefficients from the stable basis
     // back to the original, interpretable basis.
-    let final_beta_original = final_fit.reparam_result.qs.dot(&final_fit.beta_transformed);
+    let final_beta_original =
+        final_fit.reparam_result.qs.dot(final_fit.beta_transformed.as_ref());
     // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
     let qs = &final_fit.reparam_result.qs;
     let penalized_hessian_orig = qs
@@ -2177,7 +2179,7 @@ pub fn train_model(
                 lambda_pred_param: lambdas_cal[1],
                 lambda_se: lambdas_cal[2],
                 lambda_dist: lambdas_cal[3],
-                coefficients: beta_cal,
+                coefficients: beta_cal.into(),
                 column_spans: schema.column_spans,
                 pred_param_range: schema.pred_param_range.clone(),
                 scale: if config.link_function().expect("link_function called on survival model") == LinkFunction::Identity {
@@ -3072,8 +3074,8 @@ pub fn train_survival_model(
                     let design_entry = layout.combined_entry.row(i);
                     let design_exit = layout.combined_exit.row(i);
 
-                    let eta_entry = design_entry.dot(&beta);
-                    let eta_exit = design_exit.dot(&beta);
+                    let eta_entry: f64 = design_entry.dot(beta.as_ref());
+                    let eta_exit: f64 = design_exit.dot(beta.as_ref());
 
                     if !eta_entry.is_finite() || !eta_exit.is_finite() {
                         return Err(EstimationError::CalibratorTrainingFailed(
@@ -3094,8 +3096,8 @@ pub fn train_survival_model(
                     let exp_neg_exit = (-h_exit).exp();
                     let f_entry = 1.0 - exp_neg_entry;
                     let f_exit = 1.0 - exp_neg_exit;
-                    let delta_raw = f_exit - f_entry;
-                    let denom_raw = 1.0 - f_entry;
+                    let delta_raw: f64 = f_exit - f_entry;
+                    let denom_raw: f64 = 1.0 - f_entry;
                     let delta = delta_raw.max(0.0);
                     let denom = denom_raw.max(crate::calibrate::survival::DEFAULT_RISK_EPSILON);
                     let risk_val = if denom > 0.0 { delta / denom } else { 0.0 };
@@ -3255,7 +3257,7 @@ pub fn train_survival_model(
                     lambda_pred_param: lambdas_cal[1],
                     lambda_se: lambdas_cal[2],
                     lambda_dist: lambdas_cal[3],
-                    coefficients: beta_cal,
+                    coefficients: beta_cal.into(),
                     column_spans: schema.column_spans,
                     pred_param_range: schema.pred_param_range,
                     scale: None,
@@ -3333,7 +3335,7 @@ pub fn train_survival_model(
         let lambdas_vec: Vec<f64> = layout.penalties.blocks.iter().map(|b| b.lambda).collect();
 
         let artifacts = SurvivalModelArtifacts {
-            coefficients: beta.clone(),
+            coefficients: beta.clone().into(),
             age_basis: age_basis.clone(),
             time_varying_basis: time_varying_basis.clone(),
             static_covariate_layout,
@@ -3597,7 +3599,10 @@ pub fn optimize_external_design(
     )?;
 
     // Map beta back to original basis
-    let beta_orig = pirls_res.reparam_result.qs.dot(&pirls_res.beta_transformed);
+    let beta_orig = pirls_res
+        .reparam_result
+        .qs
+        .dot(pirls_res.beta_transformed.as_ref());
 
     // Weighted residual sum of squares for Gaussian models
     let n = y_o.len() as f64;
@@ -4728,7 +4733,8 @@ pub mod internal {
             }
             match pr.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                    let beta_original = pr.reparam_result.qs.dot(&pr.beta_transformed);
+                    let beta_original =
+                        pr.reparam_result.qs.dot(pr.beta_transformed.as_ref());
                     self.warm_start_beta
                         .borrow_mut()
                         .replace(Coefficients::new(beta_original));
@@ -5785,7 +5791,7 @@ pub mod internal {
             }
 
             // --- Extract stable transformed quantities ---
-            let beta_transformed = &pirls_result.beta_transformed;
+            let beta_transformed = pirls_result.beta_transformed.as_ref();
             let reparam_result = &pirls_result.reparam_result;
             // Use cached X·Qs from PIRLS
             let rs_transformed = &reparam_result.rs_transformed;
@@ -6451,6 +6457,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -6912,6 +6919,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -7113,6 +7121,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -7211,6 +7220,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -7492,6 +7502,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -7610,6 +7621,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -8762,6 +8774,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -8883,6 +8896,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -9099,6 +9113,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
             // Clear PC configurations
@@ -9234,6 +9249,7 @@ pub mod internal {
                 interaction_orth_alpha: HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -9378,6 +9394,7 @@ pub mod internal {
                 interaction_orth_alpha: HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -9568,6 +9585,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
             // This creates way too many parameters for 30 data points
@@ -9692,6 +9710,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -9811,6 +9830,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -9962,6 +9982,7 @@ pub mod internal {
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
                     mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
                 };
                 simple_config.model_family = ModelFamily::Gam(link_function);
@@ -10109,6 +10130,7 @@ pub mod internal {
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
                     mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
                 };
 
@@ -10291,6 +10313,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -10486,6 +10509,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -10612,6 +10636,7 @@ pub mod internal {
                 interaction_orth_alpha: std::collections::HashMap::new(),
 
                 mcmc_enabled: false,
+                calibrator_enabled: false,
                 survival: None,
             };
 
@@ -10729,6 +10754,7 @@ fn test_train_model_fails_gracefully_on_perfect_separation() {
         interaction_orth_alpha: HashMap::new(),
 
         mcmc_enabled: false,
+        calibrator_enabled: false,
         survival: None,
     };
 
@@ -10817,6 +10843,7 @@ fn test_indefinite_hessian_detection_and_retreat() {
         interaction_orth_alpha: std::collections::HashMap::new(),
 
         mcmc_enabled: false,
+        calibrator_enabled: false,
         survival: None,
     };
 
@@ -11032,6 +11059,7 @@ mod optimizer_progress_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
 
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -11146,6 +11174,7 @@ mod reparam_consistency_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
 
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -11317,6 +11346,7 @@ mod gradient_validation_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
 
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -11514,6 +11544,7 @@ mod gradient_validation_tests {
             interaction_orth_alpha: std::collections::HashMap::new(),
 
             mcmc_enabled: true, // ENABLE MCMC
+            calibrator_enabled: false,
             survival: None,
         };
 
@@ -11643,6 +11674,7 @@ mod gradient_validation_tests {
             interaction_centering_means: std::collections::HashMap::new(),
             interaction_orth_alpha: std::collections::HashMap::new(),
             mcmc_enabled: true,
+            calibrator_enabled: false,
             survival: None,
         };
 

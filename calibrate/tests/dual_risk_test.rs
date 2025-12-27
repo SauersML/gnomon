@@ -103,6 +103,7 @@ fn create_mock_trained_model(
             sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
             pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None
         },
         coefficients: MappedCoefficients::default(),
@@ -223,6 +224,7 @@ fn test_missing_companion_error() {
             sum_to_zero_constraints: HashMap::new(), knot_vectors: HashMap::new(), range_transforms: HashMap::new(),
             pc_null_transforms: HashMap::new(), interaction_centering_means: HashMap::new(), interaction_orth_alpha: HashMap::new(),
             mcmc_enabled: false,
+            calibrator_enabled: false,
             survival: None
         },
         coefficients: MappedCoefficients::default(), lambdas: vec![], hull: None, penalized_hessian: None, scale: None, calibrator: None, joint_link: None,
