@@ -1312,6 +1312,7 @@ pub fn train_model(
     if vis_guard.is_active() {
         visualizer::set_stage("stage-0", "init");
     }
+    let quad_ctx = crate::calibrate::quadrature::QuadratureContext::new();
     let result = (|| {
 
     eprintln!("\n[STAGE 1/3] Constructing model structure...");
@@ -1417,6 +1418,7 @@ pub fn train_model(
             &*config,
             None,
             None, // No SE for base model (not calibrator)
+            &quad_ctx,
         )?;
 
         // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
