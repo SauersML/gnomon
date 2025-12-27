@@ -1,4 +1,4 @@
-use crate::calibrate::basis::{self, create_bspline_basis};
+use crate::calibrate::basis::{self, create_bspline_basis, create_bspline_basis_nd_with_knots};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
@@ -1662,9 +1662,39 @@ pub fn build_design_and_penalty_matrices(
                     row_wise_tensor_product(pgs_int_basis, pc_int_basis)
                 }
                 InteractionPenaltyKind::Anisotropic => {
-                    let pgs_int_basis = &pgs_main_basis_unc;
-                    let pc_int_basis = &pc_unconstrained_bases_main[pc_idx];
-                    row_wise_tensor_product(pgs_int_basis, pc_int_basis)
+                    let pgs_knots = knot_vectors.get("pgs").ok_or_else(|| {
+                        EstimationError::LayoutError(
+                            "Missing PGS knot vector for tensor interaction".to_string(),
+                        )
+                    })?;
+                    let pc_knots = knot_vectors.get(pc_name).ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "Missing knot vector for tensor interaction PC {pc_name}",
+                        ))
+                    })?;
+                    let (tensor_full_arc, _) = create_bspline_basis_nd_with_knots(
+                        &[data.p.view(), data.pcs.column(pc_idx).view()],
+                        &[pgs_knots.view(), pc_knots.view()],
+                        &[
+                            config.pgs_basis_config.degree,
+                            pc_config.basis_config.degree,
+                        ],
+                    )?;
+                    let tensor_full = (*tensor_full_arc).clone();
+                    let k_pgs = pgs_knots.len() - config.pgs_basis_config.degree - 1;
+                    let k_pc = pc_knots.len() - pc_config.basis_config.degree - 1;
+                    if k_pgs < 2 || k_pc < 2 {
+                        return Err(EstimationError::LayoutError(format!(
+                            "Tensor interaction requires at least 2 basis functions per dimension (pgs={k_pgs}, pc={k_pc})",
+                        )));
+                    }
+                    let mut keep_cols = Vec::with_capacity((k_pgs - 1) * (k_pc - 1));
+                    for i in 1..k_pgs {
+                        for j in 1..k_pc {
+                            keep_cols.push(i * k_pc + j);
+                        }
+                    }
+                    tensor_full.select(Axis(1), &keep_cols)
                 }
             };
 
