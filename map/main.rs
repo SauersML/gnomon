@@ -1232,7 +1232,7 @@ mod tests {
             assert!(expected > 0, "expected at least one variant in dataset");
         }
 
-        let mut model = {
+        let model = {
             let mut train_source = dataset
                 .block_source_with_selection(selection.as_ref().map(|sel| sel.indices.as_slice()))
                 .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
