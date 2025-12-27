@@ -356,7 +356,8 @@ mod tests {
     #[test]
     fn test_computed_nodes_symmetric() {
         // Verify computed nodes are symmetric around zero
-        let gh = get_gauss_hermite();
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
         for i in 0..N_POINTS / 2 {
             let j = N_POINTS - 1 - i;
             assert_relative_eq!(gh.nodes[i], -gh.nodes[j], epsilon = 1e-12);
@@ -368,7 +369,8 @@ mod tests {
     #[test]
     fn test_computed_weights_symmetric() {
         // Verify computed weights are symmetric
-        let gh = get_gauss_hermite();
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
         for i in 0..N_POINTS / 2 {
             let j = N_POINTS - 1 - i;
             assert_relative_eq!(gh.weights[i], gh.weights[j], epsilon = 1e-12);
@@ -378,7 +380,8 @@ mod tests {
     #[test]
     fn test_weights_sum_to_sqrt_pi() {
         // Verify weights sum to sqrt(pi) for physicist's Hermite
-        let gh = get_gauss_hermite();
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
         let sum: f64 = gh.weights.iter().sum();
         assert_relative_eq!(sum, std::f64::consts::PI.sqrt(), epsilon = 1e-10);
     }
@@ -388,7 +391,8 @@ mod tests {
         // When SE is zero, posterior mean should equal mode
         let eta = 1.5;
         let se = 0.0;
-        let mean = logit_posterior_mean(eta, se);
+        let ctx = QuadratureContext::new();
+        let mean = logit_posterior_mean(&ctx, eta, se);
         let mode = sigmoid(eta);
         assert_relative_eq!(mean, mode, epsilon = 1e-10);
     }
@@ -398,7 +402,8 @@ mod tests {
         // At eta=0 (50% probability), mean should still be ~50%
         let eta = 0.0;
         let se = 1.0;
-        let mean = logit_posterior_mean(eta, se);
+        let ctx = QuadratureContext::new();
+        let mean = logit_posterior_mean(&ctx, eta, se);
         // Due to symmetry of sigmoid around 0, mean ≈ mode
         assert_relative_eq!(mean, 0.5, epsilon = 0.01);
     }
@@ -408,7 +413,8 @@ mod tests {
         // At extreme eta, mean should be pulled toward 0.5
         let eta = 3.0; // mode = sigmoid(3) ≈ 0.953
         let se = 1.0;
-        let mean = logit_posterior_mean(eta, se);
+        let ctx = QuadratureContext::new();
+        let mean = logit_posterior_mean(&ctx, eta, se);
         let mode = sigmoid(eta);
 
         // Mean should be less than mode (shrunk toward 0.5)
@@ -423,7 +429,8 @@ mod tests {
         let eta = 2.0;
         let se = 0.8;
 
-        let quad_mean = logit_posterior_mean(eta, se);
+        let ctx = QuadratureContext::new();
+        let quad_mean = logit_posterior_mean(&ctx, eta, se);
 
         // Monte Carlo with 100,000 samples
         let n_samples = 100_000;
@@ -449,7 +456,8 @@ mod tests {
     fn test_quadrature_integrates_x_squared() {
         // The quadrature should exactly integrate x² against exp(-x²)
         // ∫ x² exp(-x²) dx = sqrt(π)/2
-        let gh = get_gauss_hermite();
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
         let mut sum = 0.0;
         for i in 0..N_POINTS {
             sum += gh.weights[i] * gh.nodes[i] * gh.nodes[i];
@@ -462,7 +470,8 @@ mod tests {
     fn test_quadrature_integrates_x_fourth() {
         // The quadrature should exactly integrate x⁴ against exp(-x²)
         // ∫ x⁴ exp(-x²) dx = 3*sqrt(π)/4
-        let gh = get_gauss_hermite();
+        let ctx = QuadratureContext::new();
+        let gh = ctx.gauss_hermite();
         let mut sum = 0.0;
         for i in 0..N_POINTS {
             let x = gh.nodes[i];

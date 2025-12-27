@@ -2,9 +2,7 @@ use gnomon::calibrate::calibrator::{
     CalibratorFeatures, CalibratorModel, CalibratorSpec, auc, build_calibrator_design,
     fit_calibrator, predict_calibrator,
 };
-use gnomon::calibrate::model::{
-    BasisConfig, LinkFunction, calibrator_enabled, reset_calibrator_flag, set_calibrator_enabled,
-};
+use gnomon::calibrate::model::{BasisConfig, LinkFunction};
 use gnomon::calibrate::survival::{
     CholeskyFactor, HessianFactor, delta_method_standard_errors, survival_calibrator_features,
 };
@@ -27,18 +25,6 @@ fn auc_lower_confidence_bound(num_positive: usize, num_negative: usize, z_value:
     let standard_error = variance.sqrt();
     let lower = 0.5 - z_value * standard_error;
     lower.max(0.0)
-}
-
-#[test]
-fn calibration_toggle_round_trip() {
-    reset_calibrator_flag();
-    assert!(calibrator_enabled());
-
-    set_calibrator_enabled(false);
-    assert!(!calibrator_enabled());
-
-    reset_calibrator_flag();
-    assert!(calibrator_enabled());
 }
 
 fn make_survival_factor() -> HessianFactor {

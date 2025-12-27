@@ -6,6 +6,7 @@ use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerSvd, ldlt_rook};
 use crate::calibrate::pirls::{WorkingModel as PirlsWorkingModel, WorkingState};
+use crate::calibrate::types::{Coefficients, LinearPredictor};
 use log::warn;
 use ndarray::prelude::*;
 use ndarray::{ArrayBase, Data, Ix1, Zip, concatenate};
@@ -1667,7 +1668,7 @@ impl WorkingModelSurvival {
             }
 
         Ok(WorkingState {
-            eta: eta_exit,
+            eta: LinearPredictor::new(eta_exit),
             gradient,
             hessian,
             deviance,
@@ -1677,7 +1678,7 @@ impl WorkingModelSurvival {
 }
 
 impl PirlsWorkingModel for WorkingModelSurvival {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+    fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         self.update_state(beta)
             .map_err(|err| EstimationError::InvalidSpecification(err.to_string()))
     }
@@ -3104,9 +3105,7 @@ impl SurvivalModelArtifacts {
 mod tests {
     use super::*;
     use crate::calibrate::calibrator::{CalibratorModel, CalibratorSpec};
-    use crate::calibrate::model::{
-        BasisConfig, LinkFunction, reset_calibrator_flag, set_calibrator_enabled,
-    };
+    use crate::calibrate::model::{BasisConfig, LinkFunction};
     use approx::assert_abs_diff_eq;
     use log::Level;
     use logtest::Logger;
@@ -3185,116 +3184,6 @@ mod tests {
             extra_static_covariates: Array2::<f64>::zeros((3, 0)),
             extra_static_names: Vec::new(),
         }
-    }
-
-    #[test]
-    #[serial]
-    fn apply_logit_risk_calibrator_respects_toggle() {
-        reset_calibrator_flag();
-        let data = toy_training_data();
-        let basis = BasisDescriptor {
-            knot_vector: array![0.0, 0.0, 0.0, 0.33, 0.66, 1.0, 1.0, 1.0],
-            degree: 2,
-        };
-        let layout_bundle = build_survival_layout(&data, &basis, 0.1, 2, 4, None).unwrap();
-        let layout = layout_bundle.layout;
-        let p = layout.combined_exit.ncols();
-
-        let identity_calibrator = CalibratorModel {
-            spec: CalibratorSpec {
-                link: LinkFunction::Logit,
-                pred_basis: BasisConfig {
-                    num_knots: 2,
-                    degree: 1,
-                },
-                se_basis: BasisConfig {
-                    num_knots: 2,
-                    degree: 1,
-                },
-                dist_basis: BasisConfig {
-                    num_knots: 2,
-                    degree: 1,
-                },
-                penalty_order_pred: 2,
-                penalty_order_se: 2,
-                penalty_order_dist: 2,
-                distance_enabled: false,
-                distance_hinge: false,
-                prior_weights: None,
-                firth: None,
-            },
-            knots_pred: Array1::zeros(0),
-            knots_se: Array1::zeros(0),
-            knots_dist: Array1::zeros(0),
-            pred_constraint_transform: Array2::zeros((0, 0)),
-            stz_se: Array2::zeros((0, 0)),
-            stz_dist: Array2::zeros((0, 0)),
-            penalty_nullspace_dims: (0, 0, 0, 0),
-            standardize_pred: (0.0, 1.0),
-            standardize_se: (0.0, 1.0),
-            standardize_dist: (0.0, 1.0),
-            interaction_center_pred: None,
-            se_log_space: true,
-            se_wiggle_only_drop: false,
-            dist_wiggle_only_drop: false,
-            lambda_pred: 1.0,
-            lambda_pred_param: 1.0,
-            lambda_se: 1.0,
-            lambda_dist: 1.0,
-            coefficients: Array1::zeros(0),
-            column_spans: (0..0, 0..0, 0..0),
-            pred_param_range: 0..0,
-            scale: None,
-            assumes_frequency_weights: true,
-        };
-
-        let artifacts = SurvivalModelArtifacts {
-            coefficients: Array1::<f64>::zeros(p),
-            age_basis: basis.clone(),
-            time_varying_basis: None,
-            static_covariate_layout: make_covariate_layout(&layout),
-            penalties: vec![baseline_penalty_descriptor(&layout, 2, 0.5)],
-            age_transform: layout.age_transform,
-            reference_constraint: layout.reference_constraint.clone(),
-            monotonicity: layout.monotonicity.clone(),
-            interaction_metadata: Vec::new(),
-            companion_models: Vec::new(),
-            hessian_factor: Some(HessianFactor::Expected {
-                factor: CholeskyFactor {
-                    lower: Array2::<f64>::eye(p),
-                },
-            }),
-            calibrator: Some(identity_calibrator),
-            mcmc_samples: None,
-            cross_covariance_to_primary: None,
-        };
-
-        let risks = array![0.2, 0.8];
-        let mut design = Array2::<f64>::zeros((2, p));
-        if p > 0 {
-            design[[0, 0]] = 1.0;
-        }
-        if p > 1 {
-            design[[1, 1]] = 1.0;
-        }
-
-        // We assume enabled by default or we enable it
-        set_calibrator_enabled(true);
-        let calibrated = artifacts
-            .apply_logit_risk_calibrator(&risks, None, &design, None)
-            .unwrap();
-        assert_eq!(calibrated.len(), risks.len());
-        // Since coeffs are zero, output should be transformed but likely different if standardization or basis shifts.
-        // We just check that toggling it off yields original values.
-
-        set_calibrator_enabled(false);
-        let bypass = artifacts
-            .apply_logit_risk_calibrator(&risks, None, &design, None)
-            .unwrap();
-        for (cal, base) in bypass.iter().zip(risks.iter()) {
-            assert_abs_diff_eq!(*cal, *base, epsilon = 1e-12);
-        }
-        reset_calibrator_flag();
     }
 
     #[test]

@@ -176,7 +176,7 @@ metadata so predictions can reproduce the post-hoc correction faithfully.
    hull from the polygenic score and principal components. The hull and its
    signed-distance function inform both the calibrator and future prediction
    time clamping.
-5. **Optional calibrator fitting** – If `model::calibrator_enabled()` returns
+5. **Optional calibrator fitting** – If `ModelConfig.calibrator_enabled` is
    true, `estimate::train_model` computes approximate leave-one-out (ALO)
    diagnostics from the converged fit using `calibrator::compute_alo_features`.
    Those diagnostics (baseline predictor, its standard error, and the signed

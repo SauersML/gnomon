@@ -40,6 +40,9 @@ use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
+use crate::calibrate::types::{
+    Coefficients, LinearPredictor, LogSmoothingParams, LogSmoothingParamsView,
+};
 use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
 use crate::calibrate::visualizer;
 
@@ -1405,7 +1408,7 @@ pub fn train_model(
 
         let zero_rho = Array1::<f64>::zeros(0);
         let (final_fit, _) = pirls::fit_model_for_fixed_rho(
-            zero_rho.view(),
+            LogSmoothingParamsView::new(zero_rho.view()),
             reml_state.x(),
             reml_state.offset(),
             reml_state.y(),
@@ -1891,7 +1894,7 @@ pub fn train_model(
         let warm_start_holder = reml_state.warm_start_beta.borrow();
         let warm_start_ref = warm_start_holder.as_ref();
         pirls::fit_model_for_fixed_rho(
-            final_rho_clamped.view(),
+            LogSmoothingParamsView::new(final_rho_clamped.view()),
             reml_state.x(), // Use original X
             reml_state.offset(),
             reml_state.y(),
@@ -2031,7 +2034,7 @@ pub fn train_model(
     };
 
     // ===== Calibrator training (post-fit layer; loud behavior) =====
-    let calibrator_opt = if !crate::calibrate::model::calibrator_enabled() {
+    let calibrator_opt = if !config.calibrator_enabled {
         eprintln!("[CAL] Calibrator disabled by flag; skipping post-process calibration.");
         None
     } else {
@@ -2636,9 +2639,9 @@ pub fn train_survival_model(
                 return Ok((
                     0.0,
                     crate::calibrate::pirls::WorkingModelPirlsResult {
-                        beta: Array1::zeros(0),
+                        beta: Coefficients::zeros(0),
                         state: crate::calibrate::pirls::WorkingState {
-                            eta: Array1::zeros(0),
+                            eta: LinearPredictor::zeros(0),
                             gradient: Array1::zeros(0),
                             hessian: Array2::zeros((0, 0)),
                             deviance: 0.0,
@@ -2683,7 +2686,7 @@ pub fn train_survival_model(
             let mut model = WorkingModelSurvival::new(layout, self.data, monotonicity, self.spec)
                 .map_err(map_error)?;
             let p = model.layout.combined_exit.ncols();
-            let beta0 = Array1::<f64>::zeros(p);
+            let beta0 = Coefficients::zeros(p);
             let result = crate::calibrate::pirls::run_working_model_pirls(
                 &mut model,
                 beta0,
@@ -2877,7 +2880,7 @@ pub fn train_survival_model(
         let p = layout.combined_exit.ncols();
         let pirls_outcome = crate::calibrate::pirls::run_working_model_pirls(
             &mut model,
-            Array1::<f64>::zeros(p),
+            Coefficients::zeros(p),
             &options,
             |info| {
                 eprintln!(
@@ -2955,9 +2958,7 @@ pub fn train_survival_model(
         }
 
         // Restore FULL Calibrator Logic for the primary model
-        let calibrator_opt_local = if kind == "primary"
-            && crate::calibrate::model::calibrator_enabled()
-        {
+        let calibrator_opt_local = if kind == "primary" && config.calibrator_enabled {
             eprintln!(
                 "{} [CAL] Calibrator enabled; extracting survival calibration features...",
                 label_prefix
@@ -3581,7 +3582,7 @@ pub fn optimize_external_design(
     let iters = std::cmp::max(1, iters);
     let final_rho = to_rho_from_z(&final_point);
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
-        final_rho.view(),
+        LogSmoothingParamsView::new(final_rho.view()),
         x_o.view(),
         offset_o.view(),
         y_o.view(),
@@ -4193,7 +4194,7 @@ pub mod internal {
         gnomon_last: RefCell<Option<GnomonAgg>>,
         gnomon_repeat: RefCell<u64>,
         workspace: Mutex<RemlWorkspace>,
-        pub(super) warm_start_beta: RefCell<Option<Array1<f64>>>,
+        pub(super) warm_start_beta: RefCell<Option<Coefficients>>,
         warm_start_enabled: Cell<bool>,
     }
 
@@ -4728,7 +4729,9 @@ pub mod internal {
             match pr.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
                     let beta_original = pr.reparam_result.qs.dot(&pr.beta_transformed);
-                    self.warm_start_beta.borrow_mut().replace(beta_original);
+                    self.warm_start_beta
+                        .borrow_mut()
+                        .replace(Coefficients::new(beta_original));
                 }
                 _ => {
                     self.warm_start_beta.borrow_mut().take();
@@ -4858,7 +4861,7 @@ pub mod internal {
             // synchronization across threads.
             let evaluate_penalised_ll = |rho_vec: &Array1<f64>| -> Result<f64, EstimationError> {
                 let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
-                    rho_vec.view(),
+                    LogSmoothingParamsView::new(rho_vec.view()),
                     x,
                     offset_view,
                     y,
@@ -5050,7 +5053,7 @@ pub mod internal {
                 let warm_start_holder = self.warm_start_beta.borrow();
                 let warm_start_ref = warm_start_holder.as_ref();
                 pirls::fit_model_for_fixed_rho(
-                    rho.view(),
+                    LogSmoothingParamsView::new(rho.view()),
                     self.x,
                     self.offset.view(),
                     self.y,
@@ -5471,14 +5474,14 @@ pub mod internal {
             };
 
             // Map from unbounded z to bounded rho via rho = RHO_BOUND * tanh(z / RHO_BOUND)
-            let rho = z.mapv(|v| {
+            let rho = LogSmoothingParams::new(z.mapv(|v| {
                 if v.is_finite() {
                     let scaled = v / RHO_BOUND;
                     RHO_BOUND * scaled.tanh()
                 } else {
                     0.0
                 }
-            });
+            }));
 
             // Attempt to compute the cost and gradient.
             let cost_result = self.compute_cost(&rho);
@@ -7509,7 +7512,7 @@ pub mod internal {
 
             let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
             crate::calibrate::pirls::fit_model_for_fixed_rho(
-                rho.view(),
+                LogSmoothingParamsView::new(rho.view()),
                 x.view(),
                 reml_state.offset(),
                 data.y.view(),
@@ -7627,7 +7630,7 @@ pub mod internal {
 
             let rho = Array1::zeros(layout.num_penalties); // λ=1 across penalties
             crate::calibrate::pirls::fit_model_for_fixed_rho(
-                rho.view(),
+                LogSmoothingParamsView::new(rho.view()),
                 x.view(),
                 reml_state.offset(),
                 data.y.view(),
@@ -7910,7 +7913,7 @@ pub mod internal {
                     let rho = Array1::from(rho_values.clone());
                     let offset = Array1::<f64>::zeros(data_train.y.len());
                     let (pirls_res, _) = crate::calibrate::pirls::fit_model_for_fixed_rho(
-                        rho.view(),
+                        LogSmoothingParamsView::new(rho.view()),
                         x_tr.view(),
                         offset.view(),
                         data_train.y.view(),
@@ -9251,7 +9254,7 @@ pub mod internal {
 
             let offset = Array1::<f64>::zeros(data.y.len());
             let result = crate::calibrate::pirls::fit_model_for_fixed_rho(
-                extreme_rho.view(),
+                LogSmoothingParamsView::new(extreme_rho.view()),
                 x_matrix.view(),
                 offset.view(),
                 data.y.view(),

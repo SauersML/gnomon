@@ -8,6 +8,7 @@ use crate::calibrate::faer_ndarray::{FaerColView, fast_ata};
 use crate::calibrate::hull::PeeledHull;
 use crate::calibrate::model::{BasisConfig, LinkFunction};
 use crate::calibrate::pirls::{self, PirlsStatus}; // for PirlsResult
+use crate::calibrate::types::LogSmoothingParamsView;
 
 use faer::Mat as FaerMat;
 use faer::Side;
@@ -2479,7 +2480,7 @@ mod tests {
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
         let (pirls, _) = pirls::fit_model_for_fixed_rho(
-            rho_arr.view(),
+            LogSmoothingParamsView::new(rho_arr.view()),
             x,
             offset,
             y,
@@ -2544,7 +2545,7 @@ mod tests {
         let rs_list = compute_penalty_square_roots(rs_blocks).expect("penalty roots");
 
         let (pirls, _) = pirls::fit_model_for_fixed_rho(
-            rho_arr.view(),
+            LogSmoothingParamsView::new(rho_arr.view()),
             x,
             offset,
             y,
@@ -3010,7 +3011,7 @@ mod tests {
         let cfg = ModelConfig::external(link, 1e-10, 100, matches!(link, LinkFunction::Logit));
 
         let (pirls_result, _) = pirls::fit_model_for_fixed_rho(
-            rho.view(),
+            LogSmoothingParamsView::new(rho.view()),
             x.view(),
             offset.view(),
             y.view(),
@@ -4250,7 +4251,7 @@ mod tests {
         let rho_high = Array1::from_elem(penalties_with_ridge.len(), 15.0);
 
         let (fit_low, _) = pirls::fit_model_for_fixed_rho(
-            rho_low.view(),
+            LogSmoothingParamsView::new(rho_low.view()),
             x_with_ridge.view(),
             offset_with_ridge.view(),
             y.view(),
@@ -4265,7 +4266,7 @@ mod tests {
         )
         .expect("fixed-rho PIRLS (low)");
         let (fit_high, _) = pirls::fit_model_for_fixed_rho(
-            rho_high.view(),
+            LogSmoothingParamsView::new(rho_high.view()),
             x_with_ridge.view(),
             offset_with_ridge.view(),
             y.view(),

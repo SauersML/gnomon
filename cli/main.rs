@@ -154,7 +154,6 @@ pub struct TermsArgs {
 }
 
 pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
-    gnomon::calibrate::model::set_calibrator_enabled(!args.no_calibration);
     if args.no_calibration {
         println!("Post-process calibration disabled via --no-calibration flag.");
     } else {
@@ -236,6 +235,7 @@ pub fn train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 interaction_orth_alpha: HashMap::new(),
                 pc_null_transforms: HashMap::new(),
                 mcmc_enabled: true,
+                calibrator_enabled: !args.no_calibration,
                 survival: None,
             };
 
@@ -331,6 +331,7 @@ fn train_survival_from_args(args: &TrainArgs) -> Result<(), Box<dyn std::error::
         interaction_orth_alpha: HashMap::new(),
         pc_null_transforms: HashMap::new(),
         mcmc_enabled: true,
+        calibrator_enabled: !args.no_calibration,
         survival: Some(survival_config),
     };
 
@@ -761,9 +762,6 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let Cli { command } = cli;
-
-    // Ensure each invocation starts with calibration enabled unless explicitly disabled.
-    gnomon::calibrate::model::reset_calibrator_flag();
 
     let result = match command {
         Some(Commands::Score {

@@ -269,6 +269,7 @@ impl<'a> JointModelState<'a> {
         match (&self.link, &self.covariate_se) {
             (LinkFunction::Logit, Some(se)) => {
                 crate::calibrate::pirls::update_glm_vectors_integrated(
+                    self.quad_ctx,
                     self.y,
                     eta_for_weights,
                     se.view(),
@@ -581,6 +582,7 @@ impl<'a> JointModelState<'a> {
         // but the flag triggers Firth in the outer LAML cost (via config passthrough).
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.quad_ctx,
                 self.y,
                 &eta,
                 se.view(),
@@ -686,6 +688,7 @@ impl<'a> JointModelState<'a> {
         // Use integrated likelihood for final deviance if SE available
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.quad_ctx,
                 self.y,
                 &eta_updated,
                 se.view(),
@@ -741,6 +744,7 @@ impl<'a> JointModelState<'a> {
         // Use integrated likelihood if SE available (Logit only)
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.quad_ctx,
                 self.y,
                 &eta,
                 se.view(),
@@ -859,6 +863,7 @@ impl<'a> JointModelState<'a> {
         // Use integrated likelihood for final deviance if SE available
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             crate::calibrate::pirls::update_glm_vectors_integrated(
+                self.quad_ctx,
                 self.y,
                 &eta_updated,
                 se.view(),
@@ -920,8 +925,9 @@ pub fn fit_joint_model<'a>(
     link: LinkFunction,
     config: &JointModelConfig,
 ) -> Result<JointModelResult, EstimationError> {
+    let quad_ctx = QuadratureContext::new();
     let mut state = JointModelState::new(
-        y, weights, x_base, s_base, layout_base, link, config
+        y, weights, x_base, s_base, layout_base, link, config, &quad_ctx
     );
     
     let mut prev_deviance = f64::INFINITY;
@@ -1247,14 +1253,18 @@ impl<'a> JointRemlState<'a> {
         let mut residual = Array1::<f64>::zeros(n);
         match (&state.link, &state.covariate_se) {
             (LinkFunction::Logit, Some(se)) => {
-                use crate::calibrate::quadrature::logit_posterior_mean_with_deriv;
                 const PROB_EPS: f64 = 1e-8;
                 const MIN_WEIGHT: f64 = 1e-12;
                 const MIN_DMU: f64 = 1e-6;
                 for i in 0..n {
                     let e = eta[i].clamp(-700.0, 700.0);
                     let se_i = se[i].max(0.0);
-                    let (mu_i, dmu_deta) = logit_posterior_mean_with_deriv(e, se_i);
+                    let (mu_i, dmu_deta) =
+                        crate::calibrate::quadrature::logit_posterior_mean_with_deriv(
+                            state.quad_ctx,
+                            e,
+                            se_i,
+                        );
                     let mu_c = mu_i.clamp(PROB_EPS, 1.0 - PROB_EPS);
                     mu[i] = mu_c;
                     let var = (mu_c * (1.0 - mu_c)).max(PROB_EPS);
@@ -1746,10 +1756,11 @@ pub fn fit_joint_model_with_reml<'a>(
     covariate_se: Option<Array1<f64>>,
 ) -> Result<JointModelResult, EstimationError> {
     visualizer::set_stage("joint", "initializing");
+    let quad_ctx = QuadratureContext::new();
     
     // Create REML state
     let reml_state = JointRemlState::new(
-        y, weights, x_base, s_base, layout_base, link, config, covariate_se
+        y, weights, x_base, s_base, layout_base, link, config, covariate_se, &quad_ctx
     );
     
     let n_base = reml_state.state.borrow().s_base.len();
@@ -2242,6 +2253,7 @@ pub fn predict_joint(
     };
     
     // Compute effective SE if base SE provided
+    let quad_ctx = QuadratureContext::new();
     let (probabilities, effective_se) = if let Some(se) = se_base {
         // Compute link derivative for uncertainty propagation
         let deriv = compute_link_derivative_from_result(result, eta_base, &b_wiggle);
@@ -2251,7 +2263,7 @@ pub fn predict_joint(
         
         let probs = match result.link {
             LinkFunction::Logit => (0..n)
-                .map(|i| crate::calibrate::quadrature::logit_posterior_mean(eta_cal[i], eff_se[i]))
+                .map(|i| crate::calibrate::quadrature::logit_posterior_mean(&quad_ctx, eta_cal[i], eff_se[i]))
                 .collect::<Array1<f64>>(),
             LinkFunction::Identity => eta_cal.clone(),
         };
@@ -2311,6 +2323,7 @@ mod tests {
         let s = vec![Array2::eye(p)];
         let layout = ModelLayout::external(p, 1);
         let config = JointModelConfig::default();
+        let quad_ctx = QuadratureContext::new();
         
         let state = JointModelState::new(
             y.view(),
@@ -2320,6 +2333,7 @@ mod tests {
             layout,
             LinkFunction::Logit,
             &config,
+            &quad_ctx,
         );
         
         assert_eq!(state.beta_base.len(), p);

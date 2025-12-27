@@ -12,28 +12,6 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use thiserror::Error;
 
-// Global toggle for the optional post-process calibrator layer.
-// Enabled by default. Wire this to a CLI flag like `--no-calibrate` by
-// calling `model::set_calibrator_enabled(false)` before training/prediction.
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Default state for the post-process calibrator toggle. Calibration should be enabled unless
-/// a caller explicitly opts out.
-const CALIBRATOR_ENABLED_DEFAULT: bool = true;
-static CALIBRATOR_ENABLED: AtomicBool = AtomicBool::new(CALIBRATOR_ENABLED_DEFAULT);
-pub fn set_calibrator_enabled(enabled: bool) {
-    CALIBRATOR_ENABLED.store(enabled, Ordering::SeqCst);
-}
-pub fn calibrator_enabled() -> bool {
-    CALIBRATOR_ENABLED.load(Ordering::SeqCst)
-}
-
-/// Reset the calibrator toggle back to its default state. Useful for CLI entry points so each
-/// invocation starts with calibration enabled by default.
-pub fn reset_calibrator_flag() {
-    set_calibrator_enabled(CALIBRATOR_ENABLED_DEFAULT);
-}
-
 // --- Public Data Structures ---
 // These structs define the public, human-readable format of the trained model
 // when serialized to a TOML file.
@@ -134,6 +112,10 @@ pub fn default_mcmc_enabled() -> bool {
     true
 }
 
+pub fn default_calibrator_enabled() -> bool {
+    true
+}
+
 /// The complete blueprint of a trained model.
 /// Contains all hyperparameters and structural information needed for prediction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +164,9 @@ pub struct ModelConfig {
     /// When true, runs NUTS sampler to generate posterior samples stored in TrainedModel.
     #[serde(default)]
     pub mcmc_enabled: bool,
+    /// Enable post-process calibration when a calibrator is available.
+    #[serde(default = "default_calibrator_enabled")]
+    pub calibrator_enabled: bool,
     #[serde(default)]
     pub survival: Option<SurvivalModelConfig>,
 }
@@ -218,6 +203,7 @@ impl ModelConfig {
             interaction_orth_alpha: HashMap::new(),
             pc_null_transforms: HashMap::new(),
             mcmc_enabled: true, // Honest uncertainty by default
+            calibrator_enabled: true,
             survival: None,
         }
     }
@@ -266,6 +252,8 @@ struct ModelConfigSerde {
     pc_null_transforms: HashMap<String, Array2<f64>>,
     #[serde(default = "default_mcmc_enabled")]
     mcmc_enabled: bool,
+    #[serde(default = "default_calibrator_enabled")]
+    calibrator_enabled: bool,
     #[serde(default)]
     survival: Option<SurvivalModelConfig>,
 }
@@ -293,6 +281,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_orth_alpha,
             pc_null_transforms,
             mcmc_enabled,
+            calibrator_enabled,
             survival,
         } = helper;
 
@@ -320,6 +309,7 @@ impl From<ModelConfigSerde> for ModelConfig {
             interaction_orth_alpha,
             pc_null_transforms,
             mcmc_enabled,
+            calibrator_enabled,
             survival,
         }
     }
@@ -347,6 +337,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_orth_alpha,
             pc_null_transforms,
             mcmc_enabled,
+            calibrator_enabled,
             survival,
         } = config;
 
@@ -376,6 +367,7 @@ impl From<ModelConfig> for ModelConfigSerde {
             interaction_orth_alpha,
             pc_null_transforms,
             mcmc_enabled,
+            calibrator_enabled,
             survival,
         }
     }
@@ -1248,6 +1240,7 @@ impl TrainedModel {
 
         let (eta, mode_mean, _, se_eta_opt) = self.predict_detailed(p_new, sex_new, pcs_new)?;
 
+        let quad_ctx = crate::calibrate::quadrature::QuadratureContext::new();
         match link_function {
             LinkFunction::Identity => {
                 // For identity link, mean = mode, no quadrature needed
@@ -1257,7 +1250,11 @@ impl TrainedModel {
                 // Use quadrature if SE is available
                 match se_eta_opt {
                     Some(se_eta) => {
-                        Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(&eta, &se_eta))
+                        Ok(crate::calibrate::quadrature::logit_posterior_mean_batch(
+                            &quad_ctx,
+                            &eta,
+                            &se_eta,
+                        ))
                     }
                     None => {
                         // No SE available, fall back to mode
