@@ -6,14 +6,19 @@ use crate::calibrate::faer_ndarray::{
 };
 use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
+use dyn_stack::{MemBuffer, MemStack};
 use faer::sparse::{SparseColMat, Triplet};
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
-use faer::{Accum, Side, get_global_parallelism};
-use faer::sparse::SparseRowMat;
+use faer::sparse::linalg::matmul::{
+    sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch, sparse_sparse_matmul_symbolic,
+    SparseMatMulInfo,
+};
+use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
+use faer::{Accum, Par, Side, get_global_parallelism};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
@@ -213,6 +218,8 @@ pub struct PirlsWorkspace {
     pub xtwx_buf: Array2<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
+    // Cached sparse XtWX workspace (symbolic + scratch)
+    pub sparse_xtwx_cache: Option<SparseXtWxCache>,
 }
 
 impl PirlsWorkspace {
@@ -234,7 +241,28 @@ impl PirlsWorkspace {
             delta_eta: Array1::zeros(n),
             xtwx_buf: Array2::zeros((p, p)),
             vec_buf_p: Array1::zeros(p),
+            sparse_xtwx_cache: None,
         }
+    }
+
+    fn sparse_xtwx(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let rebuild = match self.sparse_xtwx_cache.as_ref() {
+            Some(cache) => !cache.matches(x),
+            None => true,
+        };
+        if rebuild {
+            self.sparse_xtwx_cache = Some(SparseXtWxCache::new(x)?);
+        }
+
+        let cache = self
+            .sparse_xtwx_cache
+            .as_mut()
+            .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
+        cache.compute_dense(x, weights)
     }
 }
 
@@ -422,18 +450,26 @@ impl<'a> GamWorkingModel<'a> {
                     xtwx += &self.s_transformed;
                     xtwx
                 }
-                DesignMatrix::Sparse(_) => {
-                    let csr = self
-                        .x_csr
-                        .as_ref()
-                        .ok_or_else(|| EstimationError::InvalidInput("missing CSR cache".to_string()))?;
-                    let xtwx = compute_hessian_sparse(csr, weights)?;
+                DesignMatrix::Sparse(matrix) => {
+                    let xtwx = self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
+                        let csr = self.x_csr.as_ref().ok_or_else(|| {
+                            EstimationError::InvalidInput("missing CSR cache".to_string())
+                        })?;
+                        compute_hessian_sparse(csr, weights)
+                    })?;
                     xtwx + &self.s_transformed
                 }
             });
         }
 
-        let xtwx = if let Some(csr) = &self.x_original_csr {
+        let xtwx = if let Some(DesignMatrix::Sparse(matrix)) = &self.x_original_sparse {
+            self.workspace.sparse_xtwx(matrix, weights).or_else(|_| {
+                let csr = self.x_original_csr.as_ref().ok_or_else(|| {
+                    EstimationError::InvalidInput("missing CSR cache".to_string())
+                })?;
+                compute_hessian_sparse(csr, weights)
+            })?
+        } else if let Some(csr) = &self.x_original_csr {
             compute_hessian_sparse(csr, weights)?
         } else {
             self.workspace
@@ -569,6 +605,113 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
     }
 }
 
+struct SparseXtWxCache {
+    x_t: SparseColMat<usize, f64>,
+    xtwx_symbolic: SymbolicSparseColMat<usize>,
+    xtwx_values: Vec<f64>,
+    wx_values: Vec<f64>,
+    info: SparseMatMulInfo,
+    scratch: MemBuffer,
+    par: Par,
+    nrows: usize,
+    ncols: usize,
+    nnz: usize,
+}
+
+impl SparseXtWxCache {
+    fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
+        let x_t = x
+            .as_ref()
+            .transpose()
+            .to_col_major()
+            .map_err(|_| EstimationError::InvalidInput("failed to build X^T cache".to_string()))?;
+        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(x_t.symbolic(), x.symbolic())
+            .map_err(|_| {
+                EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
+            })?;
+        let xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
+        let wx_values = vec![0.0; x.val().len()];
+        let par = sparse_xtwx_par(x.ncols());
+        let scratch =
+            MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
+                xtwx_symbolic.as_ref(),
+                par,
+            ));
+        Ok(Self {
+            x_t,
+            xtwx_symbolic,
+            xtwx_values,
+            wx_values,
+            info,
+            scratch,
+            par,
+            nrows: x.nrows(),
+            ncols: x.ncols(),
+            nnz: x.val().len(),
+        })
+    }
+
+    fn matches(&self, x: &SparseColMat<usize, f64>) -> bool {
+        self.nrows == x.nrows() && self.ncols == x.ncols() && self.nnz == x.val().len()
+    }
+
+    fn compute_dense(
+        &mut self,
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        if weights.len() != self.nrows {
+            return Err(EstimationError::InvalidInput(format!(
+                "weights length {} does not match design rows {}",
+                weights.len(),
+                self.nrows
+            )));
+        }
+
+        let x_ref = x.as_ref();
+        for col in 0..self.ncols {
+            let rows = x_ref.row_idx_of_col_raw(col);
+            let x_vals = x_ref.val_of_col(col);
+            let range = x_ref.col_range(col);
+            let wx_vals = &mut self.wx_values[range];
+            for ((dst, &src), row) in wx_vals.iter_mut().zip(x_vals.iter()).zip(rows.iter()) {
+                let w = weights[row.unbound()].max(0.0);
+                *dst = src * w.sqrt();
+            }
+        }
+
+        let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
+        let mut stack = MemStack::new(&mut self.scratch);
+        let xtwx_symbolic = self.xtwx_symbolic.as_ref();
+        let mut xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
+        sparse_sparse_matmul_numeric(
+            xtwx_mut,
+            Accum::Replace,
+            self.x_t.as_ref(),
+            wx_ref,
+            1.0,
+            &self.info,
+            self.par,
+            &mut stack,
+        );
+
+        let xtwx_ref = SparseColMatRef::new(xtwx_symbolic, &self.xtwx_values);
+        let dense = xtwx_ref.to_dense();
+        Ok(Array2::from_shape_fn(
+            (dense.nrows(), dense.ncols()),
+            |(i, j)| dense[(i, j)],
+        ))
+    }
+}
+
+fn sparse_xtwx_par(ncols: usize) -> Par {
+    if ncols < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    }
+}
+
 fn compute_hessian_sparse(
     x: &SparseRowMat<usize, f64>,
     weights: &Array1<f64>,
@@ -597,17 +740,19 @@ fn compute_hessian_sparse(
                         return local;
                     }
                     let vals = x_view.val_of_row(row);
-                    let cols: Vec<usize> = x_view.col_idx_of_row(row).collect();
+                    let cols = x_view.col_idx_of_row_raw(row);
                     if cols.len() != vals.len() {
                         mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
                         return local;
                     }
                     for (idx_a, &col_a) in cols.iter().enumerate() {
                         let val_a = vals[idx_a];
+                        let col_a = col_a.unbound();
                         let scaled = w * val_a;
                         let row_offset_a = col_a * ncols;
                         for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
                             let val_b = vals[idx_b];
+                            let col_b = col_b.unbound();
                             let delta = scaled * val_b;
                             local[row_offset_a + col_b] += delta;
                             if col_a != col_b {
@@ -631,27 +776,29 @@ fn compute_hessian_sparse(
         let mut local = vec![0.0_f64; ncols * ncols];
         for row in 0..nrows {
             let w = weights[row].max(0.0);
-            if w == 0.0 {
-                continue;
-            }
-            let vals = x_view.val_of_row(row);
-            let cols: Vec<usize> = x_view.col_idx_of_row(row).collect();
-            if cols.len() != vals.len() {
-                mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Err(EstimationError::InvalidInput(
-                    "sparse row value/index length mismatch".to_string(),
-                ));
-            }
-            for (idx_a, &col_a) in cols.iter().enumerate() {
-                let val_a = vals[idx_a];
-                let scaled = w * val_a;
-                let row_offset_a = col_a * ncols;
-                for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
-                    let val_b = vals[idx_b];
-                    let delta = scaled * val_b;
-                    local[row_offset_a + col_b] += delta;
-                    if col_a != col_b {
-                        local[col_b * ncols + col_a] += delta;
+        if w == 0.0 {
+            continue;
+        }
+        let vals = x_view.val_of_row(row);
+        let cols = x_view.col_idx_of_row_raw(row);
+        if cols.len() != vals.len() {
+            mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(EstimationError::InvalidInput(
+                "sparse row value/index length mismatch".to_string(),
+            ));
+        }
+        for (idx_a, &col_a) in cols.iter().enumerate() {
+            let val_a = vals[idx_a];
+            let col_a = col_a.unbound();
+            let scaled = w * val_a;
+            let row_offset_a = col_a * ncols;
+            for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
+                let val_b = vals[idx_b];
+                let col_b = col_b.unbound();
+                let delta = scaled * val_b;
+                local[row_offset_a + col_b] += delta;
+                if col_a != col_b {
+                    local[col_b * ncols + col_a] += delta;
                     }
                 }
             }
@@ -724,9 +871,9 @@ fn compute_firth_hat_and_half_logdet_sparse(
     for i in 0..p {
         identity[[i, i]] = 1.0;
     }
-    let identity_view = FaerArrayView::new(&identity);
-    let h_inv = chol_faer.solve(identity_view.as_ref());
-    let h_inv_arr = Array2::from_shape_fn((p, p), |(i, j)| h_inv[(i, j)]);
+    let mut identity_view = array2_to_mat_mut(&mut identity);
+    chol_faer.solve_in_place(identity_view.as_mut());
+    let h_inv_arr = identity;
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     let x_view = x_transformed.as_ref();
@@ -736,7 +883,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
             continue;
         }
         let vals = x_view.val_of_row(i);
-        let cols: Vec<usize> = x_view.col_idx_of_row(i).collect();
+        let cols = x_view.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
             return Err(EstimationError::InvalidInput(
                 "sparse row value/index length mismatch".to_string(),
@@ -745,8 +892,10 @@ fn compute_firth_hat_and_half_logdet_sparse(
         let mut quad = 0.0;
         for (idx_a, &col_a) in cols.iter().enumerate() {
             let val_a = vals[idx_a];
+            let col_a = col_a.unbound();
             for (idx_b, &col_b) in cols.iter().enumerate() {
                 let val_b = vals[idx_b];
+                let col_b = col_b.unbound();
                 quad += val_a * h_inv_arr[[col_a, col_b]] * val_b;
             }
         }
@@ -760,30 +909,33 @@ fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
-    let rhs_view = FaerColView::new(gradient);
     let h_view = FaerArrayView::new(hessian);
     if let Ok(ch) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-        let sol = ch.solve(rhs_view.as_ref());
-        let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
-        return Ok(solution);
+        let mut rhs = gradient.to_owned();
+        let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+        ch.solve_in_place(rhs_view.as_mut());
+        rhs.mapv_inplace(|v| -v);
+        return Ok(rhs);
     }
 
     let ldlt_err = match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
         Ok(ld) => {
-            let sol = ld.solve(rhs_view.as_ref());
-            let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
-            return Ok(solution);
+            let mut rhs = gradient.to_owned();
+            let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+            ld.solve_in_place(rhs_view.as_mut());
+            rhs.mapv_inplace(|v| -v);
+            return Ok(rhs);
         }
         Err(err) => FaerLinalgError::Ldlt(err),
     };
 
     let lb = FaerLblt::new(h_view.as_ref(), Side::Lower);
-    let sol = lb.solve(rhs_view.as_ref());
-    if sol.nrows() == gradient.len() && sol.ncols() == 1 {
-        let solution = Array1::from_shape_fn(gradient.len(), |i| -sol[(i, 0)]);
-        if solution.iter().all(|v| v.is_finite()) {
-            return Ok(solution);
-        }
+    let mut rhs = gradient.to_owned();
+    let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+    lb.solve_in_place(rhs_view.as_mut());
+    rhs.mapv_inplace(|v| -v);
+    if rhs.iter().all(|v| v.is_finite()) {
+        return Ok(rhs);
     }
 
     Err(EstimationError::LinearSystemSolveFailed(ldlt_err))
@@ -4855,15 +5007,15 @@ fn compute_firth_hat_and_half_logdet(
             condition_number: f64::INFINITY,
         }
     })?;
-    let rhs = workspace.wx.t().to_owned();
-    let rhs_view = FaerArrayView::new(&rhs);
-    let sol = chol_faer.solve(rhs_view.as_ref());
+    let mut rhs = workspace.wx.t().to_owned();
+    let mut rhs_view = array2_to_mat_mut(&mut rhs);
+    chol_faer.solve_in_place(rhs_view.as_mut());
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     for i in 0..n {
         let mut acc = 0.0;
         for k in 0..p {
-            let val = sol[(k, i)];
+            let val = rhs[(k, i)];
             acc += val * workspace.wx[[i, k]];
         }
         hat_diag[i] = acc;

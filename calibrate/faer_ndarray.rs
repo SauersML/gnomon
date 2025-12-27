@@ -3,7 +3,7 @@ use faer::diag::{Diag, DiagMut, DiagRef};
 use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
 use faer::linalg::solvers::{self, Solve};
 use faer::linalg::svd::{self, ComputeSvdVectors};
-use faer::{Auto, Mat, MatMut, MatRef, Side, Spec, get_global_parallelism};
+use faer::{Auto, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use thiserror::Error;
 
@@ -67,13 +67,18 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     let a_t = a_ref.transpose();
 
     // dst = A^T * A
+    let par = if n < 128 || p < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
     matmul(
         result.as_mut(),
         Accum::Replace,
         a_t,
         a_ref,
         1.0,
-        get_global_parallelism(),
+        par,
     );
 
     // Convert back to ndarray
@@ -101,13 +106,18 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     let a_view = FaerArrayView::new(a);
     let a_ref = a_view.as_ref();
     let a_t = a_ref.transpose();
+    let par = if n < 128 || p < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
     matmul(
         out_view.as_mut(),
         Accum::Replace,
         a_t,
         a_ref,
         1.0,
-        get_global_parallelism(),
+        par,
     );
 }
 
@@ -139,13 +149,18 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let b_ref = b_view.as_ref();
     
     // dst = A^T * B
+    let par = if n_a < 128 || p < 128 || q < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
     matmul(
         result.as_mut(),
         Accum::Replace,
         a_ref.transpose(),
         b_ref,
         1.0,
-        get_global_parallelism(),
+        par,
     );
 
     Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
@@ -177,13 +192,18 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     let v_view = FaerColView::new(v);
     let a_ref = a_view.as_ref();
     let v_ref = v_view.as_ref();
+    let par = if n < 128 || p < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
     matmul(
         out_view.as_mut(),
         Accum::Replace,
         a_ref.transpose(),
         v_ref,
         1.0,
-        get_global_parallelism(),
+        par,
     );
 }
 
@@ -213,13 +233,18 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = v_view.as_ref();
     
     // dst = A^T * v (treating v as n×1 matrix)
+    let par = if n < 128 || p < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
     matmul(
         result.as_mut(),
         Accum::Replace,
         a_ref.transpose(),
         v_ref,
         1.0,
-        get_global_parallelism(),
+        par,
     );
 
     Array1::from_shape_fn(p, |i| result[(i, 0)])
@@ -502,15 +527,17 @@ pub struct FaerCholeskyFactor {
 
 impl FaerCholeskyFactor {
     pub fn solve_vec(&self, rhs: &Array1<f64>) -> Array1<f64> {
-        let rhs_view = FaerColView::new(rhs);
-        let sol = self.factor.solve(rhs_view.as_ref());
-        Array1::from_shape_fn(rhs.len(), |i| sol[(i, 0)])
+        let mut rhs = rhs.to_owned();
+        let mut rhs_view = array1_to_col_mat_mut(&mut rhs);
+        self.factor.solve_in_place(rhs_view.as_mut());
+        rhs
     }
 
     pub fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let rhs_view = FaerArrayView::new(rhs);
-        let sol = self.factor.solve(rhs_view.as_ref());
-        mat_to_array(sol.as_ref())
+        let mut rhs = rhs.to_owned();
+        let mut rhs_view = array2_to_mat_mut(&mut rhs);
+        self.factor.solve_in_place(rhs_view.as_mut());
+        rhs
     }
 
     pub fn diag(&self) -> Array1<f64> {
