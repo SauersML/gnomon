@@ -5,6 +5,7 @@ use crate::calibrate::faer_ndarray::{
     array2_to_mat_mut, fast_ata, fast_ata_into, fast_atv, fast_atv_into, ldlt_rook,
 };
 use crate::calibrate::matrix::DesignMatrix;
+use crate::calibrate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use faer::sparse::{SparseColMat, Triplet};
 use crate::calibrate::model::{LinkFunction, ModelConfig, ModelFamily};
 use faer::linalg::matmul::matmul;
@@ -22,12 +23,12 @@ use std::{
 };
 
 pub trait WorkingModel {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError>;
+    fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkingState {
-    pub eta: Array1<f64>,
+    pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
     pub hessian: Array2<f64>,
     pub deviance: f64,
@@ -111,7 +112,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         self.working_response.view()
     }
 
-    fn update_state(&mut self, beta: &Array1<f64>) -> WorkingState {
+    fn update_state(&mut self, beta: &Coefficients) -> WorkingState {
         let mut eta = self.offset.clone();
         eta += &self.design.dot(beta);
 
@@ -176,7 +177,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         let penalty_term = beta.dot(&grad_penalty);
 
         WorkingState {
-            eta: eta_clamped,
+            eta: LinearPredictor::new(eta_clamped),
             gradient,
             hessian,
             deviance,
@@ -186,7 +187,7 @@ impl<'a> GamLogitWorkingModel<'a> {
 }
 
 impl<'a> WorkingModel for GamLogitWorkingModel<'a> {
-    fn update(&mut self, beta: &Array1<f64>) -> Result<WorkingState, EstimationError> {
+    fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         Ok(self.update_state(beta))
     }
 }
@@ -317,6 +318,7 @@ impl<'a> GamWorkingModel<'a> {
         link: LinkFunction,
         firth_bias_reduction: bool,
         qs: Option<Array2<f64>>,
+        quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
     ) -> Self {
         let n = if let Some(x_transformed) = &x_transformed {
             x_transformed.nrows()
@@ -348,6 +350,7 @@ impl<'a> GamWorkingModel<'a> {
             x_original_csr,
             qs,
             covariate_se: None,
+            quad_ctx,
         }
     }
     
@@ -453,6 +456,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // This coherently accounts for uncertainty in the base prediction.
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
             update_glm_vectors_integrated(
+                self.quad_ctx,
                 self.y,
                 &eta,
                 se.view(),
@@ -1299,6 +1303,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     warm_start_beta: Option<&Array1<f64>>,
     // Optional per-observation SE for integrated (GHQ) likelihood in calibrator fitting.
     covariate_se: Option<&Array1<f64>>,
+    quad_ctx: &'a crate::calibrate::quadrature::QuadratureContext,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let lambdas = rho_vec.mapv(f64::exp);
 
@@ -1466,6 +1471,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         link_function,
         config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit),
         if use_explicit { None } else { Some(reparam_result.qs.clone()) },
+        quad_ctx,
     );
     
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
