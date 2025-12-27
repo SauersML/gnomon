@@ -1418,7 +1418,7 @@ lemma risk_affine_additive
       u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
       + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
       - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
-    intro pc; simp only [hu]; ring
+    intro (pc : ℝ × (Fin 1 → ℝ)); simp only [hu]; ring
 
   -- Rewrite the integral with the expanded integrand
   rw [integral_congr_ae (ae_of_all _ h_integrand_expand)]
