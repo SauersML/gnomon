@@ -51,7 +51,7 @@ use crate::calibrate::visualizer;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
-    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
+    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, FaerQr,
 };
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
@@ -4949,6 +4949,109 @@ pub mod internal {
             Ok(g_view.to_owned())
         }
 
+        fn firth_hessian_logit(
+            &self,
+            x: &Array2<f64>,
+            mu: &Array1<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            let n = x.nrows();
+            let p = x.ncols();
+            if n == 0 || p == 0 {
+                return Ok(Array2::zeros((p, p)));
+            }
+
+            let mut w_raw = Array1::<f64>::zeros(n);
+            let mut alpha = Array1::<f64>::zeros(n);
+            let mut delta = Array1::<f64>::zeros(n);
+            let mut gamma = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mu_i = mu[i].clamp(1e-8, 1.0 - 1e-8);
+                let w_i = mu_i * (1.0 - mu_i);
+                let one_minus2 = 1.0 - 2.0 * mu_i;
+                w_raw[i] = w_i;
+                alpha[i] = 0.5 * one_minus2;
+                delta[i] = w_i * one_minus2;
+                gamma[i] = -w_i;
+            }
+
+            let mut xw = x.to_owned();
+            for i in 0..n {
+                let scale = w_raw[i].sqrt();
+                if scale == 0.0 {
+                    continue;
+                }
+                xw.row_mut(i).mapv_inplace(|v| v * scale);
+            }
+            let (q, _) = xw.qr().map_err(EstimationError::EigendecompositionFailed)?;
+            let q_cols = q.ncols();
+
+            let mut h = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mut acc = 0.0;
+                for k in 0..q_cols {
+                    let v = q[[i, k]];
+                    acc += v * v;
+                }
+                h[i] = acc;
+            }
+
+            let mut term1 = Array2::<f64>::zeros((p, p));
+            for i in 0..n {
+                let weight = h[i] * gamma[i];
+                if weight == 0.0 {
+                    continue;
+                }
+                for j in 0..p {
+                    let xij = x[[i, j]];
+                    for l in 0..p {
+                        term1[[j, l]] += weight * xij * x[[i, l]];
+                    }
+                }
+            }
+
+            let rs_dim = q_cols * q_cols;
+            let mut a_mat = Array2::<f64>::zeros((p, rs_dim));
+            let mut d_mat = Array2::<f64>::zeros((p, rs_dim));
+            for i in 0..n {
+                let w_i = w_raw[i];
+                if w_i == 0.0 {
+                    continue;
+                }
+                let inv_sqrt = 1.0 / w_i.sqrt();
+                let a_scale = alpha[i] * inv_sqrt;
+                let d_scale = delta[i] * inv_sqrt;
+                let mut q_outer = vec![0.0; rs_dim];
+                for r in 0..q_cols {
+                    let qir = q[[i, r]];
+                    for s in 0..q_cols {
+                        q_outer[r * q_cols + s] = qir * q[[i, s]];
+                    }
+                }
+                for j in 0..p {
+                    let xij = x[[i, j]];
+                    if xij == 0.0 {
+                        continue;
+                    }
+                    for idx in 0..rs_dim {
+                        let v = q_outer[idx];
+                        a_mat[[j, idx]] += xij * a_scale * v;
+                        d_mat[[j, idx]] += xij * d_scale * v;
+                    }
+                }
+            }
+
+            let term2 = a_mat.dot(&d_mat.t());
+            let mut h_phi = term1 - term2;
+            for i in 0..p {
+                for j in 0..i {
+                    let v = 0.5 * (h_phi[[i, j]] + h_phi[[j, i]]);
+                    h_phi[[i, j]] = v;
+                    h_phi[[j, i]] = v;
+                }
+            }
+            Ok(h_phi)
+        }
+
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
             self.x
@@ -6019,7 +6122,34 @@ pub mod internal {
                 _ => {
                     // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
                     // Replace FD with implicit differentiation for logit models.
-                    if !matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit) {
+                    // When Firth bias reduction is enabled, the inner objective is:
+                    //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
+                    //                 + 0.5 * log|X' W(beta) X|
+                    // with W depending on beta (logit: w_i = mu_i (1 - mu_i)).
+                    // Stationarity: grad_beta L* = 0, so the implicit derivative uses
+                    // H_total = X' W X + S_lambda - d^2/d beta^2 (0.5 * log|X' W X|).
+                    //
+                    // Exact Firth derivatives (let K = (X' W X)^{-1}):
+                    //   Phi(beta) = 0.5 * log|X' W X|
+                    //   grad Phi_j = 0.5 * tr(K X' (dW/d beta_j) X)
+                    //             = 0.5 * sum_i h_i * (d w_i / d eta_i) * x_ij
+                    //   where h_i = x_i' K x_i (leverages in weighted space).
+                    //
+                    //   Hessian:
+                    //     d^2 Phi / (d beta_j d beta_l) =
+                    //       -0.5 * tr(K X' (dW/d beta_l) X K X' (dW/d beta_j) X)
+                    //       +0.5 * sum_i h_i * (d^2 w_i / d eta_i^2) * x_ij * x_il
+                    //
+                    // This curvature enters H_total and therefore d beta_hat / d rho_k.
+                    // Our analytic LAML gradient uses H_pen = X' W X + S_lambda only,
+                    // so it is inconsistent with the Firth-adjusted objective unless
+                    // we add H_phi. Below we compute H_phi and use H_total for the
+                    // implicit solve (d beta_hat / d rho). If that fails, we fall
+                    // back to H_pen for stability.
+                    if !matches!(
+                        self.config.link_function().expect("link_function called on survival model"),
+                        LinkFunction::Logit
+                    ) {
                         let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                         let g_half_logh =
                             self.numeric_half_logh_grad_with_workspace(p, workspace)?;
@@ -6047,9 +6177,41 @@ pub mod internal {
                             beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
                         }
 
-                        // Use the stabilized Hessian factorization for both the log|H| trace
-                        // term and the implicit gradient correction below.
+                        // Use the stabilized Hessian factorization for the log|H| trace term.
                         let factor_g = self.get_faer_factor(p, h_eff);
+                        let mut factor_imp: Option<FaerFactor> = None;
+                        if self.config.firth_bias_reduction {
+                            let x_dense = match &pirls_result.x_transformed {
+                                DesignMatrix::Dense(x_dense) => x_dense.clone(),
+                                DesignMatrix::Sparse(x_sparse) => {
+                                    let dense = x_sparse.as_ref().to_dense();
+                                    Array2::from_shape_fn(
+                                        (dense.nrows(), dense.ncols()),
+                                        |(i, j)| dense[(i, j)],
+                                    )
+                                }
+                            };
+                            match self.firth_hessian_logit(&x_dense, &pirls_result.solve_mu) {
+                                Ok(h_phi) => {
+                                    let mut h_total = h_eff.to_owned();
+                                    h_total -= &h_phi;
+                                    for i in 0..h_total.nrows() {
+                                        for j in 0..i {
+                                            let v = 0.5 * (h_total[[i, j]] + h_total[[j, i]]);
+                                            h_total[[i, j]] = v;
+                                            h_total[[j, i]] = v;
+                                        }
+                                    }
+                                    factor_imp = Some(self.factorize_faer(&h_total));
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "Firth Hessian computation failed; falling back to H_pen in implicit solve: {:?}",
+                                        err
+                                    );
+                                }
+                            }
+                        }
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
                         // blocks as the Gaussian path. This is the partial derivative
@@ -6264,7 +6426,10 @@ pub mod internal {
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
                             let rhs_view = FaerColView::new(&grad_beta);
-                            let solved = factor_g.solve(rhs_view.as_ref());
+                            let solved = match &factor_imp {
+                                Some(factor) => factor.solve(rhs_view.as_ref()),
+                                None => factor_g.solve(rhs_view.as_ref()),
+                            };
                             let mut delta = Array1::zeros(grad_beta.len());
                             for i in 0..delta.len() {
                                 delta[i] = solved[(i, 0)];
