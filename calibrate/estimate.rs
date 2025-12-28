@@ -6034,12 +6034,6 @@ pub mod internal {
                             .assign(&Array1::from_vec(laml_grad));
                         // Continue to prior-gradient adjustment below.
                     } else {
-                        // Numeric ½·log|H| gradient keeps the LAML derivative consistent with
-                        // the stabilized Hessian and the (lambda-dependent) reparameterization.
-                        // This avoids analytic drift in small-λ regimes where fd(cost) checks fail.
-                        let numeric_logh_grad =
-                            self.numeric_half_logh_grad_with_workspace(p, workspace)?;
-
                         let k_count = lambdas.len();
                         let det1_values = &pirls_result.reparam_result.det1;
                         let mut laml_grad = Vec::with_capacity(k_count);
@@ -6050,6 +6044,60 @@ pub mod internal {
                             let r_beta = r_k.dot(beta_ref);
                             let s_k_beta = r_k.t().dot(&r_beta);
                             beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                        }
+
+                        // Use the stabilized Hessian factorization for both the log|H| trace
+                        // term and the implicit gradient correction below.
+                        let factor_g = self.get_faer_factor(p, h_eff);
+
+                        // Compute trace(H^{-1} S_k) using the same reparameterized penalty
+                        // blocks as the Gaussian path. This is the partial derivative
+                        // ∂/∂ρ_k (0.5 log|H|) with β held fixed; the β-dependence is handled
+                        // separately via the implicit correction term to avoid double counting.
+                        workspace.reset_block_ranges();
+                        let mut total_rank = 0;
+                        for rt in rs_transposed {
+                            let cols = rt.ncols();
+                            workspace.block_ranges.push((total_rank, total_rank + cols));
+                            total_rank += cols;
+                        }
+                        if total_rank > 0 {
+                            workspace.concat.fill(0.0);
+                            let rows = h_eff.nrows();
+                            for ((start, end), rt) in
+                                workspace.block_ranges.iter().zip(rs_transposed.iter())
+                            {
+                                if *end > *start {
+                                    workspace
+                                        .concat
+                                        .slice_mut(s![..rows, *start..*end])
+                                        .assign(rt);
+                                }
+                            }
+                            let rows = h_eff.nrows();
+                            let cols = total_rank;
+                            {
+                                let mut solved_slice =
+                                    workspace.solved.slice_mut(s![..rows, ..cols]);
+                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
+                                if let Some(slice) = solved_slice.as_slice_mut() {
+                                    let mut solved_view =
+                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
+                                    factor_g.solve_in_place(solved_view.as_mut());
+                                } else {
+                                    let mut temp =
+                                        faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
+                                    factor_g.solve_in_place(temp.as_mut());
+                                    for j in 0..cols {
+                                        for i in 0..rows {
+                                            solved_slice[(i, j)] = temp[(i, j)];
+                                        }
+                                    }
+                                }
+                            }
+                            workspace.solved_rows = h_eff.nrows();
+                        } else {
+                            workspace.solved_rows = 0;
                         }
 
                         let residual_grad = {
@@ -6088,7 +6136,6 @@ pub mod internal {
                                     w_prime[i] = self.weights[i] * w_base * (1.0 - 2.0 * mu_i);
                                 }
 
-                                let factor_g = self.get_faer_factor(p, h_eff);
                                 let mut leverage = Array1::<f64>::zeros(n);
                                 let chunk_cols = 1024usize;
                                 match &pirls_result.x_transformed {
@@ -6207,7 +6254,6 @@ pub mod internal {
                         }
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
-                            let factor_g = self.get_faer_factor(p, h_eff);
                             let rhs_view = FaerColView::new(&grad_beta);
                             let solved = factor_g.solve(rhs_view.as_ref());
                             let mut delta = Array1::zeros(grad_beta.len());
@@ -6220,7 +6266,29 @@ pub mod internal {
                         };
 
                         for k in 0..k_count {
-                            let log_det_h_grad_term = numeric_logh_grad[k];
+                            let log_det_h_grad_term = if workspace.solved_rows > 0 {
+                                let (start, end) = workspace.block_ranges[k];
+                                if end > start {
+                                    let solved_block = workspace
+                                        .solved
+                                        .slice(s![..workspace.solved_rows, start..end]);
+                                    let rt_block = workspace
+                                        .concat
+                                        .slice(s![..workspace.solved_rows, start..end]);
+                                    let trace_h_inv_s_k = kahan_sum(
+                                        solved_block
+                                            .iter()
+                                            .zip(rt_block.iter())
+                                            .map(|(&x, &y)| x * y),
+                                    );
+                                    let tra1 = lambdas[k] * trace_h_inv_s_k;
+                                    tra1 / 2.0
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
                             let log_det_s_grad_term = 0.5 * det1_values[k];
                             let mut gradient_value =
                                 0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
