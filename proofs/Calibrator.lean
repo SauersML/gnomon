@@ -1422,12 +1422,12 @@ lemma risk_affine_additive
 
   -- The formal proof expands the integrand and applies linearity.
   -- First, show all terms are integrable.
-  have i_p2 : Integrable (fun x => u ^ 2 * x.1 ^ 2) μ := hP2_int.const_mul (u^2)
-  have i_c2 : Integrable (fun x => β^2 * (x.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
+  have i_p2 : Integrable (fun pc => u ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (u^2)
+  have i_c2 : Integrable (fun pc => β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
   have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
-  have i_pc : Integrable (fun x => 2*u*β * (x.1 * x.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul (2*u*β)
-  have i_p1 : Integrable (fun x => 2*u*a * x.1) μ := hP_int.const_mul (2*u*a)
-  have i_c1 : Integrable (fun x => 2*a*β * x.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
+  have i_pc : Integrable (fun pc => 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul (2*u*β)
+  have i_p1 : Integrable (fun pc => 2*u*a * pc.1) μ := hP_int.const_mul (2*u*a)
+  have i_c1 : Integrable (fun pc => 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
 
   -- Now, use a calc block to show the integral equality step-by-step.
   calc
@@ -1445,24 +1445,29 @@ lemma risk_affine_additive
         + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
         - ((∫ pc, 2*u*a * pc.1 ∂μ)
         + (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ)) := by
-      -- The previous rewrite was too brittle. A robust `calc` block is better.
-      have i_term1 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2*u*a * pc.1) μ := by
-        exact (((i_p2.add i_c2).add (i_a2.add i_pc)).sub i_p1)
-      have i_term2 : Integrable (fun pc => 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := i_c1
-      rw [integral_sub i_term1 i_term2]
-      have i_term3 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := by
-        exact (i_p2.add i_c2).add (i_a2.add i_pc)
-      have i_term4 : Integrable (fun pc => 2*u*a*pc.1) μ := i_p1
-      rw[integral_sub i_term3 i_term4]
-      have i_term5 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2) μ := by
-        exact (i_p2.add i_c2).add i_a2
-      have i_term6 : Integrable (fun pc => 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := i_pc
-      rw[integral_add i_term5 i_term6]
-      have i_term7 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := by
-        exact i_p2.add i_c2
-      have i_term8 : Integrable (fun pc => a^2) μ := i_a2
-      rw[integral_add i_term7 i_term8]
-      rw[integral_add i_p2 i_c2]
+      -- The `rw` chain was too brittle. A robust `calc` block is better.
+      -- First, prove the algebraic rearrangement needed for the linearity steps.
+      have h_rearrange :
+          (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+                    + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
+                    - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩) =
+          (fun pc => ((u^2 * pc.1^2
+                    + β^2 * (pc.2 ⟨0, by norm_num⟩)^2)
+                    + a^2)
+                    + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
+                    - (2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩)) := by
+        funext pc; ring
+      rw [h_rearrange]
+      -- Now apply linearity rules, which should succeed on the grouped expression.
+      have i_sub1 : Integrable (fun pc => 2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := i_p1.add i_c1
+      have i_add1 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩)) μ := (i_p2.add i_c2).add (i_a2.add i_pc)
+      rw [integral_sub i_add1 i_sub1]
+      rw [integral_add i_p1 i_c1]
+      have i_add2 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2 + a^2) μ := (i_p2.add i_c2).add i_a2
+      rw [integral_add i_add2 i_pc]
+      have i_add3 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) μ := i_p2.add i_c2
+      rw [integral_add i_add3 i_a2]
+      rw [integral_add i_p2 i_c2]
       ring
 
     -- Step 3: Pull out constants and substitute known integral values.
