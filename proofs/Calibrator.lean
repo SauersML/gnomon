@@ -1449,16 +1449,14 @@ lemma risk_affine_additive
       -- Apply linearity rules now that the expression is properly grouped.
       have i_pos_terms := i_p2.add (i_c2.add (i_a2.add i_pc))
       have i_neg_terms := i_p1.add i_c1
-      rw [integral_sub i_pos_terms i_neg_terms]
-      rw [integral_add (i_p2.add (i_c2.add i_a2)) i_pc]
-      rw [integral_add (i_p2.add i_c2) i_a2]
-      rw [integral_add i_p2 i_c2]
-      rw [integral_add i_p1 i_c1]
-
+      rw [integral_sub i_pos_terms i_neg_terms,
+          integral_add (i_p2.add (i_c2.add i_a2)) i_pc,
+          integral_add (i_p2.add i_c2) i_a2,
+          integral_add i_p2 i_c2,
+          integral_add i_p1 i_c1]
     _ = a^2 + (1 - b)^2 + β^2 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.2 ⟨0, by norm_num⟩ ^ 2 ∂μ := by
       -- Pull out constants and substitute known integral values
-      simp_rw [integral_const_mul, integral_const, hP2, hP0, hPC0, hC0]
-      rw [hu]
+      simp only [integral_const_mul, integral_const, hP2, hP0, hPC0, hC0, hu]
       ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
