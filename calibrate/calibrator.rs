@@ -2496,7 +2496,20 @@ mod tests {
         .expect("pirls");
 
         let penalised_ll = -0.5 * pirls.deviance - 0.5 * pirls.stable_penalty_term;
-        let log_det_s = pirls.reparam_result.log_det;
+        let log_det_s = if pirls.ridge_used > 0.0 {
+            let mut s_ridge = pirls.reparam_result.s_transformed.clone();
+            let p = s_ridge.nrows();
+            for i in 0..p {
+                s_ridge[[i, i]] += pirls.ridge_used;
+            }
+            let chol_s = s_ridge
+                .clone()
+                .cholesky(Side::Lower)
+                .expect("S+ridge SPD");
+            2.0 * chol_s.diag().mapv(|v: f64| v.ln()).sum()
+        } else {
+            pirls.reparam_result.log_det
+        };
         let chol = pirls
             .stabilized_hessian_transformed
             .clone()
@@ -2578,7 +2591,20 @@ mod tests {
             .cholesky(Side::Lower)
             .expect("H SPD");
         let log_det_h = 2.0 * chol.diag().mapv(|v: f64| v.ln()).sum();
-        let log_det_s = pirls.reparam_result.log_det;
+        let log_det_s = if pirls.ridge_used > 0.0 {
+            let mut s_ridge = pirls.reparam_result.s_transformed.clone();
+            let p = s_ridge.nrows();
+            for i in 0..p {
+                s_ridge[[i, i]] += pirls.ridge_used;
+            }
+            let chol_s = s_ridge
+                .clone()
+                .cholesky(Side::Lower)
+                .expect("S+ridge SPD");
+            2.0 * chol_s.diag().mapv(|v: f64| v.ln()).sum()
+        } else {
+            pirls.reparam_result.log_det
+        };
 
         neg_ll + penalty + 0.5 * log_det_h - 0.5 * log_det_s
     }

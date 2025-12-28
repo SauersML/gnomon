@@ -1331,6 +1331,9 @@ pub struct PirlsResult {
     pub penalized_hessian_transformed: Array2<f64>,
     // CRITICAL: Single stabilized Hessian for consistent cost/gradient computation
     pub stabilized_hessian_transformed: Array2<f64>,
+    // Ridge added to make the stabilized Hessian positive definite. When > 0, this
+    // ridge is treated as a literal penalty term (0.5 * ridge * ||beta||^2).
+    pub ridge_used: f64,
 
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
@@ -1571,10 +1574,16 @@ pub fn fit_model_for_fixed_rho<'a>(
         let s_beta = reparam_result.s_transformed.dot(beta_transformed.as_ref());
         let mut gradient = gradient_data;
         gradient += &s_beta;
-        let penalty_term = beta_transformed.as_ref().dot(&s_beta);
+        let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
-        ensure_positive_definite(&mut stabilized_hessian)?;
+        let ridge_used =
+            ensure_positive_definite_with_ridge(&mut stabilized_hessian, "PIRLS penalized Hessian")?;
+        if ridge_used > 0.0 {
+            let ridge_penalty = ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
+            penalty_term += ridge_penalty;
+            gradient += &beta_transformed.as_ref().mapv(|v| ridge_used * v);
+        }
 
         let gradient_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let max_abs_eta = final_mu.iter().copied().map(f64::abs).fold(0.0, f64::max);
@@ -1585,7 +1594,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             hessian: penalized_hessian.clone(),
             deviance,
             penalty_term,
-            ridge_used: 0.0,
+            ridge_used,
         };
 
         let working_summary = WorkingModelPirlsResult {
@@ -1604,6 +1613,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             beta_transformed,
             penalized_hessian_transformed: penalized_hessian,
             stabilized_hessian_transformed: stabilized_hessian,
+            ridge_used,
             deviance,
             edf,
             stable_penalty_term: penalty_term,
@@ -1734,6 +1744,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilized_hessian_transformed,
+        ridge_used: working_summary.state.ridge_used,
         deviance: working_summary.state.deviance,
         edf,
         stable_penalty_term: penalty_term,

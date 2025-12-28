@@ -4361,6 +4361,34 @@ pub mod internal {
     }
 
     impl<'a> RemlState<'a> {
+        fn log_det_s_with_ridge(
+            s_transformed: &Array2<f64>,
+            ridge: f64,
+            base_log_det: f64,
+        ) -> Result<f64, EstimationError> {
+            if ridge <= 0.0 {
+                return Ok(base_log_det);
+            }
+
+            // When a stabilization ridge is treated as an explicit penalty term,
+            // the penalty matrix becomes S_λ + ridge * I. The LAML cost must use
+            // log|S_λ + ridge I|_+ for exact consistency. Without this, the cost
+            // would be evaluating a different prior than the one implied by the
+            // PIRLS stationarity condition and the stabilized Hessian.
+            let p = s_transformed.nrows();
+            let mut s_ridge = s_transformed.clone();
+            for i in 0..p {
+                s_ridge[[i, i]] += ridge;
+            }
+            let chol = s_ridge.clone().cholesky(Side::Lower).map_err(|_| {
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
+            })?;
+            let log_det = 2.0 * chol.diag().mapv(f64::ln).sum();
+            Ok(log_det)
+        }
+
         fn log_gnomon_cost(
             &self,
             rho: &Array1<f64>,
@@ -4442,107 +4470,23 @@ pub mod internal {
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
         ///
-        /// If the penalized Hessian is positive definite, it's returned as-is with ridge=0.0.
-        /// If not, a small ridge is added to ensure positive definiteness, and that
-        /// ridged matrix is returned along with the ridge value used.
+        /// PIRLS now folds any stabilization ridge directly into the penalized objective,
+        /// so the stabilized Hessian should already be PD. We do not add a second ridge
+        /// here; if the stabilized Hessian is still indefinite, we abort so that the
+        /// objective/gradient remain exact rather than silently drifting.
         fn effective_hessian(
             &self,
             pr: &PirlsResult,
         ) -> Result<(Array2<f64>, f64), EstimationError> {
-            // NOTE: PIRLS now folds any stabilization ridge directly into the
-            // penalized objective (see pirls.rs). That means the stabilized Hessian
-            // returned by PIRLS should already be PD. This helper is retained as a
-            // safety net for pathological cases, but ridge use here should be rare.
             let base = pr.stabilized_hessian_transformed.clone();
 
             if base.cholesky(Side::Lower).is_ok() {
-                return Ok((base, 0.0));
+                return Ok((base, pr.ridge_used));
             }
 
-            let p = base.nrows();
-            let diag_scale = {
-                let denom = (p as f64).max(1.0);
-                let raw = base.diag().iter().map(|v| v.abs()).sum::<f64>() / denom;
-                if raw.is_finite() && raw > 0.0 {
-                    raw
-                } else {
-                    1.0
-                }
-            };
-
-            let min_target = LAML_RIDGE.max(1e-9);
-            let mut ridge = min_target;
-            if let Ok((eigs, _)) = base.eigh(Side::Lower)
-                && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
-                    && min_eig.is_finite() {
-                        if min_eig < min_target {
-                            ridge = (min_target - min_eig).max(min_target);
-                        } else if min_eig < 0.0 {
-                            ridge = (-min_eig) + min_target;
-                        }
-                    }
-
-            if !ridge.is_finite() || ridge <= 0.0 {
-                ridge = min_target;
-            }
-
-            let mut attempt = 0usize;
-            let mut current = ridge;
-
-            loop {
-                let mut h_eff = base.clone();
-                if current > 0.0 {
-                    for i in 0..p {
-                        h_eff[[i, i]] += current;
-                    }
-                }
-
-                if h_eff.cholesky(Side::Lower).is_ok() {
-                    if current > 0.0 {
-                        log::warn!(
-                            "Added ridge {:.3e} to stabilized Hessian to recover positive definiteness",
-                            current
-                        );
-                    }
-                    return Ok((h_eff, current));
-                }
-
-                attempt += 1;
-                if attempt > 20 {
-                    let fallback = diag_scale.max(1.0) * 1e6;
-                    let mut h_eff = base.clone();
-                    for i in 0..p {
-                        h_eff[[i, i]] += fallback;
-                    }
-                    match h_eff.cholesky(Side::Lower) {
-                        Ok(_) => {
-                            log::error!(
-                                "Extremely large ridge {:.3e} applied to stabilized Hessian after repeated failures",
-                                fallback
-                            );
-                            return Ok((h_eff, fallback));
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "Failed to recover positive definiteness even after applying ridge {:.3e}",
-                                fallback
-                            );
-                            return Err(EstimationError::ModelIsIllConditioned {
-                                condition_number: f64::INFINITY,
-                            });
-                        }
-                    }
-                }
-
-                let scale_factor = 10f64.powi(attempt as i32);
-                current = (current * 10.0)
-                    .max(diag_scale * scale_factor)
-                    .max(min_target * scale_factor);
-
-                if !current.is_finite() || current <= 0.0 {
-                    current = diag_scale.max(1.0);
-                }
-            }
+            Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })
         }
 
         pub(super) fn new(
@@ -5344,7 +5288,11 @@ pub mod internal {
                     let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
 
                     // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
-                    let log_det_s_plus = pirls_result.reparam_result.log_det;
+                    let log_det_s_plus = Self::log_det_s_with_ridge(
+                        &pirls_result.reparam_result.s_transformed,
+                        ridge_used,
+                        pirls_result.reparam_result.log_det,
+                    )?;
 
                     // Standard REML expression from Wood (2017), Section 6.5.1
                     // V = (n/2)log(2πσ²) + D_p/(2σ²) + ½log|H| - ½log|S_λ|_+ + (M_p-1)/2 log(2πσ²)
@@ -5375,7 +5323,11 @@ pub mod internal {
                     }
 
                     // Use the stabilized log|Sλ|_+ from the reparameterization (consistent with gradient)
-                    let log_det_s = pirls_result.reparam_result.log_det;
+                    let log_det_s = Self::log_det_s_with_ridge(
+                        &pirls_result.reparam_result.s_transformed,
+                        ridge_used,
+                        pirls_result.reparam_result.log_det,
+                    )?;
 
                     // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
                     // that will also be used in the gradient calculation
@@ -5811,6 +5763,48 @@ pub mod internal {
                 workspace.set_lambda_values(p);
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
+                // When we treat a stabilization ridge as a true penalty term, the
+                // penalty matrix becomes S_λ + ridge * I.  For exactness, both the
+                // log|S| term in the cost and the derivative d/dρ_k log|S| must be
+                // computed using this ridged matrix.  The derivative is:
+                //
+                //   det1[k] = d/dρ_k log|S_λ + ridge I|
+                //           = λ_k * tr((S_λ + ridge I)^{-1} S_k)
+                //
+                // which can be evaluated without explicitly forming S_k by using
+                // the penalty roots R_k (S_k = R_kᵀ R_k).
+                let det1_values = if ridge_used > 0.0 {
+                    // If a stabilization ridge is treated as an explicit penalty term,
+                    // the penalty matrix becomes S_λ + ridge * I. The gradient term
+                    // d/dρ_k log|S_λ + ridge I| uses:
+                    //   det1[k] = λ_k * tr((S_λ + ridge I)^{-1} S_k)
+                    let p_dim = reparam_result.s_transformed.nrows();
+                    let mut s_ridge = reparam_result.s_transformed.clone();
+                    for i in 0..p_dim {
+                        s_ridge[[i, i]] += ridge_used;
+                    }
+                    let s_view = FaerArrayView::new(&s_ridge);
+                    let chol = FaerLlt::new(s_view.as_ref(), Side::Lower).map_err(|_| {
+                        EstimationError::ModelIsIllConditioned {
+                            condition_number: f64::INFINITY,
+                        }
+                    })?;
+
+                    let mut det1 = Array1::<f64>::zeros(len);
+                    for (k, rt) in rs_transposed.iter().enumerate() {
+                        if rt.ncols() == 0 {
+                            continue;
+                        }
+                        let mut rhs = rt.to_owned();
+                        let mut rhs_view = array2_to_mat_mut(&mut rhs);
+                        chol.solve_in_place(rhs_view.as_mut());
+                        let trace = kahan_sum(rhs.iter().zip(rt.iter()).map(|(&x, &y)| x * y));
+                        det1[k] = lambdas[k] * trace;
+                    }
+                    det1
+                } else {
+                    reparam_result.det1.clone()
+                };
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
             // CRITICAL: Use the same effective Hessian as the cost function for consistency
@@ -5966,7 +5960,7 @@ pub mod internal {
                     }
 
                     let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
-                    let det1_values = &pirls_result.reparam_result.det1;
+                    let det1_values = &det1_values;
                     let beta_ref = beta_transformed;
                     let solved_rows = workspace.solved_rows;
                     let block_ranges_ref = &workspace.block_ranges;
@@ -6027,7 +6021,7 @@ pub mod internal {
                         let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
                         let g_half_logh =
                             self.numeric_half_logh_grad_with_workspace(p, workspace)?;
-                        let det1_full = pirls_result.reparam_result.det1.clone();
+                        let det1_full = det1_values.clone();
                         let mut laml_grad = Vec::with_capacity(lambdas.len());
                         for k in 0..lambdas.len() {
                             let gradient_value =
@@ -6040,7 +6034,7 @@ pub mod internal {
                         // Continue to prior-gradient adjustment below.
                     } else {
                         let k_count = lambdas.len();
-                        let det1_values = &pirls_result.reparam_result.det1;
+                        let det1_values = &det1_values;
                         let mut laml_grad = Vec::with_capacity(k_count);
                         let beta_ref = beta_transformed;
                         let mut beta_terms = Array1::<f64>::zeros(k_count);
