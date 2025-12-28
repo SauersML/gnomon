@@ -2112,7 +2112,6 @@ def SpansNullspace (Z : Matrix (Fin m) (Fin (m - k)) ℝ)
     Actually: Zᵀ · (Bᵀ W C) has shape (m-k) × k, while M · Z = 0 where M = (Bᵀ W C)ᵀ
 
     The key relation is: Zᵀ · A = (Aᵀ · Z)ᵀ, so if Aᵀ · Z = 0, then Zᵀ · A = 0. -/
-omit [Fintype (Fin k)] [DecidableEq (Fin n)] [DecidableEq (Fin m)] [DecidableEq (Fin k)] in
 theorem constraint_projection_correctness
     (B : Matrix (Fin n) (Fin m) ℝ)
     (C : Matrix (Fin n) (Fin k) ℝ)
@@ -2145,8 +2144,6 @@ theorem constraint_projection_correctness
   rw [h4, h3]
   simp only [Matrix.transpose_zero]
 
-omit [Fintype (Fin n)] [Fintype (Fin k)] [DecidableEq (Fin n)] [DecidableEq (Fin m)]
-    [DecidableEq (Fin k)] in
 /-- The constrained basis preserves the column space spanned by valid coefficients. -/
 theorem constrained_basis_spans_subspace
     (B : Matrix (Fin n) (Fin m) ℝ)
