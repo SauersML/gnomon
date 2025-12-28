@@ -1418,7 +1418,7 @@ lemma risk_affine_additive
       u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
       + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
       - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
-    intro (pc : ℝ × (Fin 1 → ℝ)); simp only [hu]; ring
+    intro (pc : ℝ × (Fin 1 → ℝ)); simp only [hu]; ring_nf
 
   -- The formal proof expands the integrand and applies linearity.
   -- First, show all terms are integrable.
@@ -1443,32 +1443,24 @@ lemma risk_affine_additive
         + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
         + (∫ pc, a^2 ∂μ)
         + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
-        - ((∫ pc, 2*u*a * pc.1 ∂μ)
-        + (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ)) := by
-      -- The `rw` chain was too brittle. A robust `calc` block is better.
-      -- First, prove the algebraic rearrangement needed for the linearity steps.
-      have h_rearrange :
-          (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
-                    + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
-                    - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩) =
-          (fun pc => ((u^2 * pc.1^2
-                    + β^2 * (pc.2 ⟨0, by norm_num⟩)^2)
-                    + a^2)
-                    + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
-                    - (2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩)) := by
-        funext pc; ring
-      rw [h_rearrange]
-      -- Now apply linearity rules, which should succeed on the grouped expression.
-      have i_sub1 : Integrable (fun pc => 2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩) μ := i_p1.add i_c1
-      have i_add1 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β*(pc.1*pc.2 ⟨0, by norm_num⟩)) μ := (i_p2.add i_c2).add (i_a2.add i_pc)
-      rw [integral_sub i_add1 i_sub1]
-      rw [integral_add i_p1 i_c1]
-      have i_add2 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2 + a^2) μ := (i_p2.add i_c2).add i_a2
-      rw [integral_add i_add2 i_pc]
-      have i_add3 : Integrable (fun pc => u^2*pc.1^2 + β^2*(pc.2 ⟨0, by norm_num⟩)^2) μ := i_p2.add i_c2
-      rw [integral_add i_add3 i_a2]
+        - (∫ pc, 2*u*a * pc.1 ∂μ)
+        - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+      have i_add1 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+                                        + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
+                                        - 2*u*a * pc.1) μ := by
+        exact (((i_p2.add i_c2).add i_a2).add i_pc).sub i_p1
+      rw [integral_sub i_add1 i_c1]
+      have i_add2 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
+                                        + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := by
+        exact ((i_p2.add i_c2).add i_a2).add i_pc
+      rw [integral_sub i_add2 i_p1]
+      have i_add3 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2) μ := by
+        exact (i_p2.add i_c2).add i_a2
+      rw [integral_add i_add3 i_pc]
+      have i_add4 : Integrable (fun pc => u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2) μ := by
+        exact i_p2.add i_c2
+      rw [integral_add i_add4 i_a2]
       rw [integral_add i_p2 i_c2]
-      ring
 
     -- Step 3: Pull out constants and substitute known integral values.
     _ = u^2 * (∫ pc, pc.1^2 ∂μ)
@@ -1478,7 +1470,7 @@ lemma risk_affine_additive
         - 2*u*a * (∫ pc, pc.1 ∂μ)
         - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
       -- Apply integral_const_mul and integral_const for each term.
-      simp [integral_const_mul, integral_const]
+      simp [integral_const_mul, integral_const]; ring
 
     -- Step 4: Substitute moment conditions (hP2=1, hPC0=0, hP0=0, hC0=0) and simplify.
     _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
