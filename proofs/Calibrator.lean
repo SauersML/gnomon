@@ -1420,43 +1420,61 @@ lemma risk_affine_additive
       - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩ := by
     intro (pc : ℝ × (Fin 1 → ℝ)); simp only [hu]; ring
 
-  -- The formal proof uses a calc block for clarity and robustness.
+  -- The formal proof expands the integrand and applies linearity.
+  -- First, show all terms are integrable.
+  have i_p2 : Integrable (fun x => u ^ 2 * x.1 ^ 2) μ := hP2_int.const_mul (u^2)
+  have i_c2 : Integrable (fun x => β^2 * (x.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
+  have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
+  have i_pc : Integrable (fun x => 2*u*β * (x.1 * x.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul (2*u*β)
+  have i_p1 : Integrable (fun x => 2*u*a * x.1) μ := hP_int.const_mul (2*u*a)
+  have i_c1 : Integrable (fun x => 2*a*β * x.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
+
+  -- Now, use a calc block to show the integral equality step-by-step.
   calc
     ∫ pc, (pc.1 + β * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1))^2 ∂μ
+    -- Step 1: Expand the squared term inside the integral.
     _ = ∫ pc, u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2
               + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)
               - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ := by
       exact integral_congr_ae (ae_of_all _ h_integrand_expand)
-    _ = (∫ pc, u^2 * pc.1^2 ∂μ) + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + (∫ pc, a^2 ∂μ)
-        + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
-        - ((∫ pc, 2*u*a * pc.1 ∂μ) + (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ)) := by
-      -- Justify linearity by proving integrability of each term
-      have i_p2 : Integrable (fun x => u ^ 2 * x.1 ^ 2) μ := hP2_int.const_mul (u^2)
-      have i_c2 : Integrable (fun x => β^2 * (x.2 ⟨0, by norm_num⟩)^2) μ := hC2_int.const_mul (β^2)
-      have i_a2 : Integrable (fun (_ : ℝ × (Fin 1 → ℝ)) => a ^ 2) μ := integrable_const _
-      have i_pc : Integrable (fun x => 2*u*β * (x.1 * x.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul (2*u*β)
-      have i_p1 : Integrable (fun x => 2*u*a * x.1) μ := hP_int.const_mul (2*u*a)
-      have i_c1 : Integrable (fun x => 2*a*β * x.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul (2*a*β)
 
-      -- To apply linearity, we first group the positive and negative terms.
-      have h_group : ∀ (pc : ℝ × (Fin 1 → ℝ)),
-        u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩
-        =
-        (u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩)) - (2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩) := by
-        intro pc; ring
-      -- Rewrite the integral using this grouping, which prepares it for `integral_sub`.
-      rw [integral_congr_ae (ae_of_all _ h_group)]
-      -- Apply linearity rules now that the expression is properly grouped.
-      have i_pos_terms := i_p2.add (i_c2.add (i_a2.add i_pc))
-      have i_neg_terms := i_p1.add i_c1
-      rw [integral_sub i_pos_terms i_neg_terms,
-          integral_add (i_p2.add (i_c2.add i_a2)) i_pc,
-          integral_add (i_p2.add i_c2) i_a2,
-          integral_add i_p2 i_c2,
-          integral_add i_p1 i_c1]
-    _ = a^2 + (1 - b)^2 + β^2 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.2 ⟨0, by norm_num⟩ ^ 2 ∂μ := by
-      -- Pull out constants and substitute known integral values
-      simp only [integral_const_mul, integral_const, hP2, hP0, hPC0, hC0, hu]
+    -- Step 2: Apply linearity of the integral.
+    _ = (∫ pc, u^2 * pc.1^2 ∂μ)
+        + (∫ pc, β^2 * (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
+        + (∫ pc, a^2 ∂μ)
+        + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
+        - (∫ pc, 2*u*a * pc.1 ∂μ)
+        - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+      -- Justify splitting the integral by applying linearity rules on the integrable terms.
+      have i_pos1 := i_p2.add i_c2
+      have i_pos2 := i_pos1.add i_a2
+      have i_pos3 := i_pos2.add i_pc
+      have i_neg1 := i_pos3.sub i_p1
+      rw [integral_sub i_neg1 i_c1,
+          integral_add i_pos3 (i_p1.neg),
+          integral_add i_pos2 i_pc,
+          integral_add i_pos1 i_a2,
+          integral_add i_p2 i_c2]
+      simp [integral_neg]
+
+    -- Step 3: Pull out constants and substitute known integral values.
+    _ = u^2 * (∫ pc, pc.1^2 ∂μ)
+        + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ)
+        + a^2
+        + 2*u*β * (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ)
+        - 2*u*a * (∫ pc, pc.1 ∂μ)
+        - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
+      -- Apply integral_const_mul and integral_const for each term.
+      simp [integral_const_mul, integral_const]
+
+    -- Step 4: Substitute moment conditions (hP2=1, hPC0=0, hP0=0, hC0=0) and simplify.
+    _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
+        + 2*u*β * 0 - 2*u*a * 0 - 2*a*β * 0 := by
+      rw [hP2, hPC0, hP0, hC0]
+
+    -- Step 5: Final algebraic simplification.
+    _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
+      rw [hu]
       ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
