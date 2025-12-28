@@ -1465,6 +1465,76 @@ pub fn build_design_and_penalty_matrices(
 
     // Range transformations will be returned directly to the caller
 
+    let mut apply_interaction_penalty_transform = |penalty_indices: &[usize],
+                                                   interaction_cols: &[usize],
+                                                   main_cols: &[usize],
+                                                   alpha: &Array2<f64>|
+     -> Result<(), EstimationError> {
+        if penalty_indices.is_empty() {
+            return Ok(());
+        }
+        if alpha.nrows() != main_cols.len() || alpha.ncols() != interaction_cols.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "Orthogonalization alpha has shape {}x{}, expected {}x{}",
+                alpha.nrows(),
+                alpha.ncols(),
+                main_cols.len(),
+                interaction_cols.len()
+            )));
+        }
+
+        for &penalty_idx in penalty_indices {
+            let penalty = s_list[penalty_idx].as_ref().ok_or_else(|| {
+                EstimationError::LayoutError(format!(
+                    "Penalty matrix {} was not constructed",
+                    penalty_idx
+                ))
+            })?;
+            let s_int = penalty.block_dense();
+            if s_int.nrows() != interaction_cols.len() || s_int.ncols() != interaction_cols.len()
+            {
+                return Err(EstimationError::LayoutError(format!(
+                    "Penalty block {} has shape {}x{}, expected {}x{}",
+                    penalty_idx,
+                    s_int.nrows(),
+                    s_int.ncols(),
+                    interaction_cols.len(),
+                    interaction_cols.len()
+                )));
+            }
+
+            let s_mm = alpha.dot(&s_int).dot(&alpha.t());
+            let s_mt = -alpha.dot(&s_int);
+            let s_tm = -s_int.dot(&alpha.t());
+
+            let mut s_full = Array2::<f64>::zeros((p, p));
+            for (i_m, &row) in main_cols.iter().enumerate() {
+                for (j_m, &col) in main_cols.iter().enumerate() {
+                    s_full[[row, col]] = s_mm[[i_m, j_m]];
+                }
+            }
+            for (i_m, &row) in main_cols.iter().enumerate() {
+                for (j_t, &col) in interaction_cols.iter().enumerate() {
+                    s_full[[row, col]] = s_mt[[i_m, j_t]];
+                    s_full[[col, row]] = s_tm[[j_t, i_m]];
+                }
+            }
+            for (i_t, &row) in interaction_cols.iter().enumerate() {
+                for (j_t, &col) in interaction_cols.iter().enumerate() {
+                    s_full[[row, col]] = s_int[[i_t, j_t]];
+                }
+            }
+
+            let s_full = sanitize_symmetric(&s_full);
+            s_list[penalty_idx] = Some(PenaltyMatrix {
+                col_range: 0..p,
+                representation: PenaltyRepresentation::Dense(s_full),
+            });
+        }
+
+        Ok(())
+    };
+
     // Stage: Assemble the full design matrix `X` using the layout as the guide
     // Following a strict canonical order to match the coefficient flattening logic in model.rs
     let mut x_matrix = Array2::zeros((n_samples, layout.total_coeffs));
@@ -1637,6 +1707,19 @@ pub fn build_design_and_penalty_matrices(
         interaction_orth_alpha.insert(interaction_key.clone(), alpha);
         interaction_centering_means
             .insert(interaction_key.clone(), Array1::zeros(sex_pgs_orth.ncols()));
+        let sex_interaction_cols: Vec<usize> = col_range.clone().collect();
+        let mut main_cols = Vec::with_capacity(m_cols);
+        main_cols.push(layout.intercept_col);
+        main_cols.push(sex_main);
+        main_cols.extend(layout.pgs_main_cols.clone());
+        apply_interaction_penalty_transform(
+            &block.penalty_indices,
+            &sex_interaction_cols,
+            &main_cols,
+            interaction_orth_alpha
+                .get(&interaction_key)
+                .expect("sex×PGS alpha missing"),
+        )?;
         x_matrix.slice_mut(s![.., col_range]).assign(&sex_pgs_orth);
     }
 
@@ -1815,7 +1898,25 @@ pub fn build_design_and_penalty_matrices(
 
             // Store zero means for backward compatibility
             let zeros = Array1::zeros(tensor_orth.ncols());
-            interaction_centering_means.insert(interaction_key, zeros);
+            interaction_centering_means.insert(interaction_key.clone(), zeros);
+
+            let interaction_cols: Vec<usize> = col_range.clone().collect();
+            let mut main_cols = Vec::with_capacity(m_cols);
+            main_cols.push(layout.intercept_col);
+            if let Some(sex_col) = layout.sex_col {
+                main_cols.push(sex_col);
+            }
+            main_cols.extend(layout.pgs_main_cols.clone());
+            main_cols.extend(layout.pc_null_cols[pc_idx].clone());
+            main_cols.extend(pc_block.col_range.clone());
+            apply_interaction_penalty_transform(
+                &tensor_block.penalty_indices,
+                &interaction_cols,
+                &main_cols,
+                interaction_orth_alpha
+                    .get(&interaction_key)
+                    .expect("interaction alpha missing"),
+            )?;
 
             // Assign the orthogonalized tensor block to design matrix (no extra centering)
             x_matrix.slice_mut(s![.., col_range]).assign(&tensor_orth);
@@ -3065,10 +3166,23 @@ mod tests {
             }
         }
 
-        // Outside the interaction block should remain zero
+        let mut interaction_main_cols = Vec::new();
+        interaction_main_cols.push(layout.intercept_col);
+        if let Some(sex_col) = layout.sex_col {
+            interaction_main_cols.push(sex_col);
+        }
+        interaction_main_cols.extend(layout.pgs_main_cols.clone());
+        interaction_main_cols.extend(layout.pc_null_cols[0].clone());
+        interaction_main_cols.extend(pc_range_block.col_range.clone());
+
+        // Outside the interaction+main-effect support should remain zero
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
-                if !(col_range.contains(&r) && col_range.contains(&c)) {
+                let allow = col_range.contains(&r)
+                    || col_range.contains(&c)
+                    || interaction_main_cols.contains(&r)
+                    || interaction_main_cols.contains(&c);
+                if !allow {
                     assert_abs_diff_eq!(s_interaction_pgs[[r, c]], 0.0, epsilon = 1e-12);
                     assert_abs_diff_eq!(s_interaction_pc[[r, c]], 0.0, epsilon = 1e-12);
                     assert_abs_diff_eq!(s_interaction_null[[r, c]], 0.0, epsilon = 1e-12);
@@ -3110,9 +3224,20 @@ mod tests {
             }
         }
 
+        let mut sex_main_cols = Vec::new();
+        sex_main_cols.push(layout.intercept_col);
+        if let Some(sex_col) = layout.sex_col {
+            sex_main_cols.push(sex_col);
+        }
+        sex_main_cols.extend(layout.pgs_main_cols.clone());
+
         for r in 0..layout.total_coeffs {
             for c in 0..layout.total_coeffs {
-                if !(sex_range.contains(&r) && sex_range.contains(&c)) {
+                let allow = sex_range.contains(&r)
+                    || sex_range.contains(&c)
+                    || sex_main_cols.contains(&r)
+                    || sex_main_cols.contains(&c);
+                if !allow {
                     assert_abs_diff_eq!(s_sex_pgs_wiggle_block[[r, c]], 0.0, epsilon = 1e-12);
                 }
             }

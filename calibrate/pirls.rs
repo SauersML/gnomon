@@ -1224,6 +1224,8 @@ fn record_penalized_deviance(value: f64) {
 
 const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
+const PLS_NUGGET_SCALE: f64 = 1e-8;
+const PLS_NUGGET_MIN: f64 = 1e-12;
 
 fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
     matrix
@@ -1560,6 +1562,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         let beta_transformed = pls_result.beta;
         let penalized_hessian = pls_result.penalized_hessian;
         let edf = pls_result.edf;
+        let base_ridge = pls_result.ridge_used;
 
         let prior_weights_owned = prior_weights.to_owned();
         let mut eta = offset.to_owned();
@@ -1577,8 +1580,9 @@ pub fn fit_model_for_fixed_rho<'a>(
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
-        let ridge_used =
+        let extra_ridge =
             ensure_positive_definite_with_ridge(&mut stabilized_hessian, "PIRLS penalized Hessian")?;
+        let ridge_used = base_ridge + extra_ridge;
         if ridge_used > 0.0 {
             let ridge_penalty = ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
             penalty_term += ridge_penalty;
@@ -2229,18 +2233,18 @@ pub struct StablePLSResult {
     pub edf: f64,
     /// Scale parameter estimate
     pub scale: f64,
+    /// Ridge added to ensure the SPD solve is well-posed.
+    pub ridge_used: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlsFallbackReason {
-    IllConditioned,
     FactorizationFailed,
 }
 
 impl PlsFallbackReason {
     fn as_str(&self) -> &'static str {
         match self {
-            PlsFallbackReason::IllConditioned => "ill_conditioned",
             PlsFallbackReason::FactorizationFailed => "factorization_failed",
         }
     }
@@ -2413,6 +2417,7 @@ pub fn solve_penalized_least_squares(
                 penalized_hessian: workspace.xtwx_buf.clone(),
                 edf: rank as f64, // EDF = rank in unpenalized LS
                 scale: 1.0,
+                ridge_used: 0.0,
             },
             rank,
         ));
@@ -2487,7 +2492,15 @@ pub fn solve_penalized_least_squares(
             }
         }
 
-        let mut solve_spd = |penalized: &Array2<f64>,
+        let diag_scale = max_abs_diag(&penalized_hessian);
+        let nugget = (diag_scale * PLS_NUGGET_SCALE).max(PLS_NUGGET_MIN);
+        if nugget > 0.0 {
+            for i in 0..p_dim {
+                penalized_hessian[[i, i]] += nugget;
+            }
+        }
+
+        let solve_spd = |penalized: &Array2<f64>,
                              chol: &FaerLlt<f64>,
                              ridge_used: f64,
                              cond_est: Option<f64>|
@@ -2508,8 +2521,9 @@ pub fn solve_penalized_least_squares(
                 Err(_) => false,
             };
             if cond_bad {
-                diagnostics.record_fallback(PlsFallbackReason::IllConditioned);
-                return Ok(None);
+                log::warn!(
+                    "Penalized Hessian condition is poor after ridge; proceeding with SPD solve."
+                );
             }
 
             let rk_rows = e_transformed.nrows();
@@ -2580,16 +2594,18 @@ pub fn solve_penalized_least_squares(
                     penalized_hessian: penalized.clone(),
                     edf,
                     scale,
+                    ridge_used,
                 },
                 p_dim,
             )))
         };
 
         let (chol_opt, ridge_used, cond_est) = attempt_spd_cholesky(&mut penalized_hessian);
+        let total_ridge = ridge_used + nugget;
         match chol_opt {
             Some(chol) => {
                 if let Some(result) =
-                    solve_spd(&penalized_hessian, &chol, ridge_used, cond_est)?
+                    solve_spd(&penalized_hessian, &chol, total_ridge, cond_est)?
                 {
                     return Ok(result);
                 }
@@ -2998,6 +3014,7 @@ pub fn solve_penalized_least_squares(
             penalized_hessian,
             edf,
             scale,
+            ridge_used: 0.0,
         },
         rank,
     ))
