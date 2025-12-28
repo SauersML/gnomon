@@ -1445,17 +1445,25 @@ lemma risk_affine_additive
         + (∫ pc, 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) ∂μ)
         - (∫ pc, 2*u*a * pc.1 ∂μ)
         - (∫ pc, 2*a*β * pc.2 ⟨0, by norm_num⟩ ∂μ) := by
-      -- Justify splitting the integral by applying linearity rules on the integrable terms.
-      have i_pos1 := i_p2.add i_c2
-      have i_pos2 := i_pos1.add i_a2
-      have i_pos3 := i_pos2.add i_pc
-      have i_neg1 := i_pos3.sub i_p1
-      rw [integral_sub i_neg1 i_c1,
-          integral_add i_pos3 (i_p1.neg),
-          integral_add i_pos2 i_pc,
-          integral_add i_pos1 i_a2,
-          integral_add i_p2 i_c2]
-      simp [integral_neg]
+      -- The rewrite tactic was too brittle. We now prove this explicitly.
+      -- First, group the positive and negative terms and prove they are integrable.
+      have i_pos_terms : Integrable (fun x => u ^ 2 * x.1 ^ 2 + β ^ 2 * x.2 ⟨0, by norm_num⟩ ^ 2 + a ^ 2 + 2 * u * β * (x.1 * x.2 ⟨0, by norm_num⟩)) μ := by
+        exact (i_p2.add i_c2).add (i_a2.add i_pc)
+      have i_neg_terms : Integrable (fun x => 2 * u * a * x.1 + 2 * a * β * x.2 ⟨0, by norm_num⟩) μ := by
+        exact i_p1.add i_c1
+      -- Now, rewrite the integrand to match the grouped form for subtraction.
+      have h_integrand_rw : ∀ pc,
+          u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - (2*u*a * pc.1 + 2*a*β * pc.2 ⟨0, by norm_num⟩) =
+          u^2 * pc.1^2 + β^2 * (pc.2 ⟨0, by norm_num⟩)^2 + a^2 + 2*u*β * (pc.1 * pc.2 ⟨0, by norm_num⟩) - 2*u*a * pc.1 - 2*a*β * pc.2 ⟨0, by norm_num⟩
+          := by intro pc; ring
+      simp_rw [h_integrand_rw]
+      -- Apply linearity for subtraction and addition.
+      rw [integral_sub i_pos_terms i_neg_terms,
+          integral_add (i_p2.add i_c2) (i_a2.add i_pc),
+          integral_add i_p2 i_c2,
+          integral_add i_a2 i_pc,
+          integral_add i_p1 i_c1]
+      ring
 
     -- Step 3: Pull out constants and substitute known integral values.
     _ = u^2 * (∫ pc, pc.1^2 ∂μ)
