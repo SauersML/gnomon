@@ -1470,7 +1470,7 @@ lemma risk_affine_additive
         - 2*u*a * (∫ pc, pc.1 ∂μ)
         - 2*a*β * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ) := by
       -- Apply integral_const_mul and integral_const for each term.
-      simp [integral_const_mul, integral_const]; ring
+      simp [integral_const_mul, integral_const]
 
     -- Step 4: Substitute moment conditions (hP2=1, hPC0=0, hP0=0, hC0=0) and simplify.
     _ = u^2 * 1 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) + a^2
@@ -1479,7 +1479,7 @@ lemma risk_affine_additive
 
     -- Step 5: Final algebraic simplification.
     _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
-      rw [hu]
+      rw [hu]; ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
