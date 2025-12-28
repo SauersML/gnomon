@@ -50,7 +50,9 @@ use crate::calibrate::visualizer;
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
-use crate::calibrate::faer_ndarray::{FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError};
+use crate::calibrate::faer_ndarray::{
+    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
+};
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
 use faer::{Par, Side, get_global_parallelism, set_global_parallelism};

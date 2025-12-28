@@ -122,7 +122,7 @@ impl<'a> GamLogitWorkingModel<'a> {
         self.working_response.view()
     }
 
-    fn update_state(&mut self, beta: &Coefficients) -> WorkingState {
+    fn update_state(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
         let mut eta = self.offset.clone();
         eta += &self.design.dot(beta.as_ref());
 
@@ -206,20 +206,20 @@ impl<'a> GamLogitWorkingModel<'a> {
             gradient += &beta.as_ref().mapv(|v| ridge_used * v);
         }
 
-        WorkingState {
+        Ok(WorkingState {
             eta: LinearPredictor::new(eta_clamped),
             gradient,
             hessian,
             deviance,
             penalty_term,
             ridge_used,
-        }
+        })
     }
 }
 
 impl<'a> WorkingModel for GamLogitWorkingModel<'a> {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
-        Ok(self.update_state(beta))
+        self.update_state(beta)
     }
 }
 
