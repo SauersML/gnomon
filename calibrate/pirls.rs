@@ -38,6 +38,11 @@ pub struct WorkingState {
     pub hessian: Array2<f64>,
     pub deviance: f64,
     pub penalty_term: f64,
+    // Ridge added to ensure positive definiteness of the penalized Hessian.
+    // This is treated as an explicit penalty term (0.5 * ridge * ||beta||^2),
+    // so the PIRLS objective, the Hessian used for log|H|, and the gradient
+    // remain mathematically consistent.
+    pub ridge_used: f64,
 }
 
 /// Lightweight helper for Gaussian GAMs with an identity link.
@@ -172,6 +177,19 @@ impl<'a> GamLogitWorkingModel<'a> {
             }
         }
 
+        // Ensure the Hessian is PD for both the PIRLS update and the outer LAML
+        // objective. If we must add a ridge, we treat it as an explicit penalty:
+        //
+        //   l_p(β; ρ) = l(β) - 0.5 * βᵀ S_λ β - 0.5 * ridge * ||β||²
+        //
+        // This makes the PIRLS optimum consistent with the stabilized log|H|
+        // term used by the LAML objective and its gradient. Without this, the
+        // cost would be evaluated on H + ridge*I while β still satisfies the
+        // *unridged* stationarity condition, breaking the envelope-theorem
+        // assumptions and yielding FD/analytic gradient mismatches.
+        let ridge_used =
+            ensure_positive_definite_with_ridge(&mut hessian, "PIRLS penalized Hessian")?;
+
         let deviance = calculate_deviance(
             self.response.view(),
             &self.mu,
@@ -179,7 +197,14 @@ impl<'a> GamLogitWorkingModel<'a> {
             self.prior_weights.view(),
         );
 
-        let penalty_term = beta.as_ref().dot(&grad_penalty);
+        let mut penalty_term = beta.as_ref().dot(&grad_penalty);
+        if ridge_used > 0.0 {
+            let ridge_penalty = ridge_used * beta.as_ref().dot(beta.as_ref());
+            penalty_term += ridge_penalty;
+            // Ridge contributes +ridge * beta to the gradient because the objective
+            // now includes 0.5 * ridge * ||beta||^2.
+            gradient += &beta.as_ref().mapv(|v| ridge_used * v);
+        }
 
         WorkingState {
             eta: LinearPredictor::new(eta_clamped),
@@ -187,6 +212,7 @@ impl<'a> GamLogitWorkingModel<'a> {
             hessian,
             deviance,
             penalty_term,
+            ridge_used,
         }
     }
 }
@@ -589,9 +615,24 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let s_beta = self.s_transformed.dot(beta.as_ref());
         gradient += &s_beta;
 
+        // Match the stabilized Hessian used by the outer LAML objective.
+        // If a ridge is needed, we treat it as an explicit penalty term:
+        //
+        //   l_p(β; ρ) = l(β) - 0.5 * βᵀ S_λ β - 0.5 * ridge * ||β||²
+        //
+        // This keeps the PIRLS fixed point aligned with the stabilized Hessian
+        // that drives log|H| and the implicit-gradient correction.
+        let ridge_used =
+            ensure_positive_definite_with_ridge(&mut penalized_hessian, "PIRLS penalized Hessian")?;
+
         let deviance = calculate_deviance(self.y, &mu, self.link, self.prior_weights);
 
-        let penalty_term = beta.as_ref().dot(&s_beta);
+        let mut penalty_term = beta.as_ref().dot(&s_beta);
+        if ridge_used > 0.0 {
+            let ridge_penalty = ridge_used * beta.as_ref().dot(beta.as_ref());
+            penalty_term += ridge_penalty;
+            gradient += &beta.as_ref().mapv(|v| ridge_used * v);
+        }
 
         self.last_penalty_term = penalty_term;
 
@@ -601,6 +642,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             hessian: penalized_hessian,
             deviance,
             penalty_term,
+            ridge_used,
         })
     }
 }
@@ -1543,6 +1585,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             hessian: penalized_hessian.clone(),
             deviance,
             penalty_term,
+            ridge_used: 0.0,
         };
 
         let working_summary = WorkingModelPirlsResult {
@@ -3647,6 +3690,7 @@ mod tests {
                 hessian,
                 deviance,
                 penalty_term: 0.0,
+                ridge_used: 0.0,
             })
         }
     }
@@ -5038,9 +5082,21 @@ fn ensure_positive_definite_with_label(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<(), EstimationError> {
+    ensure_positive_definite_with_ridge(hess, label).map(|_| ())
+}
+
+// Return the ridge added while enforcing positive definiteness. This is used
+// by PIRLS to keep the objective/gradient/log|H| consistent when we must add
+// diagonal stabilization. The returned ridge is a literal extra penalty term:
+//   l_p(β) := l(β) - 0.5 βᵀ S β - 0.5 * ridge * ||β||²
+// so the gradient gains + ridge * β and the Hessian gains + ridge * I.
+fn ensure_positive_definite_with_ridge(
+    hess: &mut Array2<f64>,
+    label: &str,
+) -> Result<f64, EstimationError> {
     // If already PD, do nothing
     if hess.cholesky(Side::Lower).is_ok() {
-        return Ok(());
+        return Ok(0.0);
     }
 
     let cond_est = calculate_condition_number(hess).ok();
@@ -5081,7 +5137,7 @@ fn ensure_positive_definite_with_label(
                     cond_display
                 );
             }
-            return Ok(());
+            return Ok(total_added);
         }
 
         if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {

@@ -2649,6 +2649,7 @@ pub fn train_survival_model(
                             hessian: Array2::zeros((0, 0)),
                             deviance: 0.0,
                             penalty_term: 0.0,
+                            ridge_used: 0.0,
                         },
                         status: crate::calibrate::pirls::PirlsStatus::Converged,
                         iterations: 0,
@@ -4448,6 +4449,10 @@ pub mod internal {
             &self,
             pr: &PirlsResult,
         ) -> Result<(Array2<f64>, f64), EstimationError> {
+            // NOTE: PIRLS now folds any stabilization ridge directly into the
+            // penalized objective (see pirls.rs). That means the stabilized Hessian
+            // returned by PIRLS should already be PD. This helper is retained as a
+            // safety net for pathological cases, but ridge use here should be rare.
             let base = pr.stabilized_hessian_transformed.clone();
 
             if base.cholesky(Side::Lower).is_ok() {
@@ -6111,7 +6116,15 @@ pub mod internal {
                                 .x_transformed
                                 .transpose_vector_multiply(&weighted_residual);
                             let s_beta = reparam_result.s_transformed.dot(beta_ref);
-                            gradient_data + s_beta
+                            // If PIRLS added a stabilization ridge, the objective being
+                            // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
+                            // therefore gains + ridge * β, which must be included here
+                            // so the implicit correction matches the stabilized objective.
+                            if ridge_used > 0.0 {
+                                gradient_data + s_beta + beta_ref.mapv(|v| ridge_used * v)
+                            } else {
+                                gradient_data + s_beta
+                            }
                         };
 
                         // Exact LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:

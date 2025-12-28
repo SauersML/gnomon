@@ -1659,6 +1659,7 @@ impl WorkingModelSurvival {
             hessian,
             deviance,
             penalty_term,
+            ridge_used: 0.0,
         })
     }
 }
