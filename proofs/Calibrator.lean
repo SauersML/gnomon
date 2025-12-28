@@ -1480,7 +1480,6 @@ lemma risk_affine_additive
     -- Step 5: Final algebraic simplification.
     _ = a^2 + (1 - b)^2 + β^2 * (∫ pc, (pc.2 ⟨0, by norm_num⟩)^2 ∂μ) := by
       rw [hu]
-      ring
 
 /-- Corollary: Risk formula for Scenario 4 (β = -0.8).
     This is just `risk_affine_additive` with β = -0.8. -/
@@ -2113,6 +2112,7 @@ def SpansNullspace (Z : Matrix (Fin m) (Fin (m - k)) ℝ)
     Actually: Zᵀ · (Bᵀ W C) has shape (m-k) × k, while M · Z = 0 where M = (Bᵀ W C)ᵀ
 
     The key relation is: Zᵀ · A = (Aᵀ · Z)ᵀ, so if Aᵀ · Z = 0, then Zᵀ · A = 0. -/
+omit [Fintype (Fin k)] [DecidableEq (Fin n)] [DecidableEq (Fin m)] [DecidableEq (Fin k)] in
 theorem constraint_projection_correctness
     (B : Matrix (Fin n) (Fin m) ℝ)
     (C : Matrix (Fin n) (Fin k) ℝ)
