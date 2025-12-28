@@ -1609,13 +1609,19 @@ pub fn fit_model_for_fixed_rho<'a>(
         .unwrap_or_else(|| Coefficients::new(default_beta_guess(layout, link_function, y, prior_weights)));
     let initial_beta = reparam_result.qs.t().dot(beta_guess_original.as_ref());
 
+    let firth_active =
+        config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
     let options = WorkingModelPirlsOptions {
-        max_iterations: config.max_iterations,
+        // Firth logit fits often need more inner iterations to settle.
+        max_iterations: if firth_active {
+            config.max_iterations.max(200)
+        } else {
+            config.max_iterations
+        },
         convergence_tolerance: config.convergence_tolerance,
-        max_step_halving: 30,
-        min_step_size: 1e-10,
-        firth_bias_reduction: config.firth_bias_reduction
-            && matches!(link_function, LinkFunction::Logit),
+        max_step_halving: if firth_active { 60 } else { 30 },
+        min_step_size: if firth_active { 1e-12 } else { 1e-10 },
+        firth_bias_reduction: firth_active,
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {

@@ -39,6 +39,7 @@ use crate::calibrate::construction::{
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
 use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
+use crate::calibrate::matrix::DesignMatrix;
 use crate::calibrate::pirls::{self, PirlsResult};
 use crate::calibrate::types::{
     Coefficients, LinearPredictor, LogSmoothingParams, LogSmoothingParamsView,
@@ -403,8 +404,8 @@ fn run_gradient_check(
         return Ok(());
     }
 
-    let g_analytic = reml_state.with_warm_start_disabled(|| reml_state.compute_gradient(rho))?;
-    let g_fd = reml_state.with_warm_start_disabled(|| compute_fd_gradient(reml_state, rho))?;
+    let g_analytic = reml_state.compute_gradient(rho)?;
+    let g_fd = compute_fd_gradient(reml_state, rho)?;
 
     let dot = g_analytic.dot(&g_fd);
     let n_a = g_analytic.dot(&g_analytic).sqrt();
@@ -3962,8 +3963,8 @@ pub fn evaluate_external_gradients(
         Some(opts.nullspace_dims.clone()),
     )?;
 
-    let analytic_grad = reml_state.with_warm_start_disabled(|| reml_state.compute_gradient(rho))?;
-    let fd_grad = reml_state.with_warm_start_disabled(|| compute_fd_gradient(&reml_state, rho))?;
+    let analytic_grad = reml_state.compute_gradient(rho)?;
+    let fd_grad = compute_fd_gradient(&reml_state, rho)?;
 
     Ok((analytic_grad, fd_grad))
 }
@@ -4745,15 +4746,6 @@ pub mod internal {
             }
         }
 
-        pub(super) fn with_warm_start_disabled<F, R>(&self, f: F) -> R
-        where
-            F: FnOnce() -> R,
-        {
-            let previous = self.warm_start_enabled.replace(false);
-            let result = f();
-            self.warm_start_enabled.set(previous);
-            result
-        }
         /// Returns the per-penalty square-root matrices in the transformed coefficient basis
         /// without any λ weighting. Each returned R_k satisfies S_k = R_kᵀ R_k in that basis.
         /// Using these avoids accidental double counting of λ when forming derivatives.
@@ -4854,6 +4846,7 @@ pub mod internal {
             let firth_bias = config.firth_bias_reduction;
             let link_is_logit = matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit);
             let balanced_root = &self.balanced_penalty_root;
+            let reparam_invariant = &self.reparam_invariant;
 
             // Capture the current best beta to warm-start the gradient probes.
             // This is crucial for stability: if we start from zero, P-IRLS might converge
@@ -4878,7 +4871,7 @@ pub mod internal {
                     weights,
                     rs_list,
                     Some(balanced_root),
-                    None,
+                    Some(reparam_invariant),
                     layout,
                     config,
                     warm_start_initial.as_ref(),
@@ -5045,12 +5038,7 @@ pub mod internal {
             rho: &Array1<f64>,
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
-            let use_cache = self.warm_start_enabled.get();
-            let key_opt = if use_cache {
-                self.rho_key_sanitized(rho)
-            } else {
-                None
-            };
+            let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt
                 && let Some(cached) = {
                     let cache_ref = self.cache.borrow();
@@ -6055,70 +6043,197 @@ pub mod internal {
                         let k_count = lambdas.len();
                         let det1_values = &pirls_result.reparam_result.det1;
                         let mut laml_grad = Vec::with_capacity(k_count);
-                        let firth_enabled = self.config.firth_bias_reduction;
-                        if firth_enabled {
-                            let g_pll =
-                                self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
-                            for k in 0..k_count {
-                                let log_det_h_grad_term = numeric_logh_grad[k];
-                                let log_det_s_grad_term = 0.5 * det1_values[k];
-                                let gradient_value =
-                                    g_pll[k] + log_det_h_grad_term - log_det_s_grad_term;
-                                laml_grad.push(gradient_value);
+                        let beta_ref = beta_transformed;
+                        let mut beta_terms = Array1::<f64>::zeros(k_count);
+                        for k in 0..k_count {
+                            let r_k = &rs_transformed[k];
+                            let r_beta = r_k.dot(beta_ref);
+                            let s_k_beta = r_k.t().dot(&r_beta);
+                            beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                        }
+
+                        let residual_grad = {
+                            let eta = pirls_result
+                                .solve_mu
+                                .mapv(|m| logit_from_prob(m));
+                            let working_residual = &eta - &pirls_result.solve_working_response;
+                            let weighted_residual =
+                                &pirls_result.solve_weights * &working_residual;
+                            let gradient_data = pirls_result
+                                .x_transformed
+                                .transpose_vector_multiply(&weighted_residual);
+                            let s_beta = reparam_result.s_transformed.dot(beta_ref);
+                            gradient_data + s_beta
+                        };
+
+                        // Exact LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
+                        //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
+                        // For logit, H = Xᵀ W X + S and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
+                        // so ∂log|H|/∂β = Xᵀ (k ∘ w') with k_i = x_iᵀ H^{-1} x_i.
+                        // We include 0.5 * Xᵀ (k ∘ w') to make the implicit gradient exact.
+                        let logh_beta_grad = if let LinkFunction::Logit = self
+                            .config
+                            .link_function()
+                            .expect("link_function called on survival model")
+                        {
+                            let mu = &pirls_result.solve_mu;
+                            let n = mu.len();
+                            if n == 0 {
+                                None
+                            } else {
+                                let mut w_prime = Array1::<f64>::zeros(n);
+                                for i in 0..n {
+                                    let mu_i = mu[i];
+                                    let w_base = mu_i * (1.0 - mu_i);
+                                    w_prime[i] = self.weights[i] * w_base * (1.0 - 2.0 * mu_i);
+                                }
+
+                                let factor_g = self.get_faer_factor(p, h_eff);
+                                let mut leverage = Array1::<f64>::zeros(n);
+                                let chunk_cols = 1024usize;
+                                match &pirls_result.x_transformed {
+                                    DesignMatrix::Dense(x_dense) => {
+                                        let p_dim = x_dense.ncols();
+                                        for chunk_start in (0..n).step_by(chunk_cols) {
+                                            let chunk_end = (chunk_start + chunk_cols).min(n);
+                                            let width = chunk_end - chunk_start;
+                                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                                            for (local, row_idx) in
+                                                (chunk_start..chunk_end).enumerate()
+                                            {
+                                                rhs
+                                                    .column_mut(local)
+                                                    .assign(&x_dense.row(row_idx));
+                                            }
+                                            let rhs_view = FaerArrayView::new(&rhs);
+                                            let sol = factor_g.solve(rhs_view.as_ref());
+                                            for local in 0..width {
+                                                let row_idx = chunk_start + local;
+                                                let mut acc = 0.0;
+                                                for j in 0..p_dim {
+                                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
+                                                }
+                                                leverage[row_idx] = acc;
+                                            }
+                                        }
+                                    }
+                                    DesignMatrix::Sparse(x_sparse) => {
+                                        let p_dim = x_sparse.ncols();
+                                        let csr_opt = x_sparse.as_ref().to_row_major().ok();
+                                        if let Some(x_csr) = csr_opt {
+                                            let symbolic = x_csr.symbolic();
+                                            let values = x_csr.val();
+                                            let row_ptr = symbolic.row_ptr();
+                                            let col_idx = symbolic.col_idx();
+                                            for chunk_start in (0..n).step_by(chunk_cols) {
+                                                let chunk_end =
+                                                    (chunk_start + chunk_cols).min(n);
+                                                let width = chunk_end - chunk_start;
+                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                                                for (local, row_idx) in
+                                                    (chunk_start..chunk_end).enumerate()
+                                                {
+                                                    let start = row_ptr[row_idx];
+                                                    let end = row_ptr[row_idx + 1];
+                                                    for idx in start..end {
+                                                        let col = col_idx[idx];
+                                                        rhs[(col, local)] = values[idx];
+                                                    }
+                                                }
+                                                let rhs_view = FaerArrayView::new(&rhs);
+                                                let sol = factor_g.solve(rhs_view.as_ref());
+                                                for (local, row_idx) in
+                                                    (chunk_start..chunk_end).enumerate()
+                                                {
+                                                    let mut acc = 0.0;
+                                                    let start = row_ptr[row_idx];
+                                                    let end = row_ptr[row_idx + 1];
+                                                    for idx in start..end {
+                                                        let col = col_idx[idx];
+                                                        acc += values[idx] * sol[(col, local)];
+                                                    }
+                                                    leverage[row_idx] = acc;
+                                                }
+                                            }
+                                        } else {
+                                            let x_dense = x_sparse.as_ref().to_dense();
+                                            let x_dense = Array2::from_shape_fn(
+                                                (x_dense.nrows(), x_dense.ncols()),
+                                                |(i, j)| x_dense[(i, j)],
+                                            );
+                                            let p_dim = x_dense.ncols();
+                                            for chunk_start in (0..n).step_by(chunk_cols) {
+                                                let chunk_end =
+                                                    (chunk_start + chunk_cols).min(n);
+                                                let width = chunk_end - chunk_start;
+                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                                                for (local, row_idx) in
+                                                    (chunk_start..chunk_end).enumerate()
+                                                {
+                                                    rhs
+                                                        .column_mut(local)
+                                                        .assign(&x_dense.row(row_idx));
+                                                }
+                                                let rhs_view = FaerArrayView::new(&rhs);
+                                                let sol = factor_g.solve(rhs_view.as_ref());
+                                                for (local, row_idx) in
+                                                    (chunk_start..chunk_end).enumerate()
+                                                {
+                                                    let mut acc = 0.0;
+                                                    for j in 0..p_dim {
+                                                        acc +=
+                                                            x_dense[[row_idx, j]] * sol[(j, local)];
+                                                    }
+                                                    leverage[row_idx] = acc;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let mut weight_vec = Array1::<f64>::zeros(n);
+                                for i in 0..n {
+                                    weight_vec[i] = leverage[i] * w_prime[i];
+                                }
+                                Some(pirls_result.x_transformed.transpose_vector_multiply(&weight_vec))
                             }
                         } else {
-                            let beta_ref = beta_transformed;
-                            let mut beta_terms = Array1::<f64>::zeros(k_count);
-                            for k in 0..k_count {
+                            None
+                        };
+
+                        let mut grad_beta = residual_grad.clone();
+                        if let Some(logh_grad) = logh_beta_grad {
+                            grad_beta += &(0.5 * logh_grad);
+                        }
+
+                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
+                            let factor_g = self.get_faer_factor(p, h_eff);
+                            let rhs_view = FaerColView::new(&grad_beta);
+                            let solved = factor_g.solve(rhs_view.as_ref());
+                            let mut delta = Array1::zeros(grad_beta.len());
+                            for i in 0..delta.len() {
+                                delta[i] = solved[(i, 0)];
+                            }
+                            Some(delta)
+                        } else {
+                            None
+                        };
+
+                        for k in 0..k_count {
+                            let log_det_h_grad_term = numeric_logh_grad[k];
+                            let log_det_s_grad_term = 0.5 * det1_values[k];
+                            let mut gradient_value =
+                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
+                            if let Some(delta_ref) = delta_opt.as_ref() {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
                                 let s_k_beta = r_k.t().dot(&r_beta);
-                                beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                                let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                                // Indirect term from chain rule: -(H^{-1} g)^T (∂S/∂ρ_k β) = -δᵀ u_k.
+                                let correction = -1.0 * delta_ref.dot(&u_k);
+                                gradient_value += correction;
                             }
-
-                            let residual_grad = {
-                                let eta = pirls_result
-                                    .solve_mu
-                                    .mapv(|m| logit_from_prob(m));
-                                let working_residual = &eta - &pirls_result.solve_working_response;
-                                let weighted_residual =
-                                    &pirls_result.solve_weights * &working_residual;
-                                let gradient_data = pirls_result
-                                    .x_transformed
-                                    .transpose_vector_multiply(&weighted_residual);
-                                let s_beta = reparam_result.s_transformed.dot(beta_ref);
-                                gradient_data + s_beta
-                            };
-
-                            let delta_opt = if residual_grad.iter().all(|v| v.is_finite()) {
-                                let factor_g = self.get_faer_factor(p, h_eff);
-                                let rhs_view = FaerColView::new(&residual_grad);
-                                let solved = factor_g.solve(rhs_view.as_ref());
-                                let mut delta = Array1::zeros(residual_grad.len());
-                                for i in 0..delta.len() {
-                                    delta[i] = solved[(i, 0)];
-                                }
-                                Some(delta)
-                            } else {
-                                None
-                            };
-
-                            for k in 0..k_count {
-                                let log_det_h_grad_term = numeric_logh_grad[k];
-                                let log_det_s_grad_term = 0.5 * det1_values[k];
-                                let mut gradient_value = 0.5 * beta_terms[k]
-                                    + log_det_h_grad_term
-                                    - log_det_s_grad_term;
-                                if let Some(delta_ref) = delta_opt.as_ref() {
-                                    let r_k = &rs_transformed[k];
-                                    let r_beta = r_k.dot(beta_ref);
-                                    let s_k_beta = r_k.t().dot(&r_beta);
-                                    let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
-                                    let correction = -0.5 * delta_ref.dot(&u_k);
-                                    gradient_value += correction;
-                                }
-                                laml_grad.push(gradient_value);
-                            }
+                            laml_grad.push(gradient_value);
                         }
                         workspace
                             .cost_gradient_view(len)
@@ -6724,10 +6839,9 @@ pub mod internal {
             let rho = Array1::from(vec![0.30_f64, -0.45_f64]);
 
             let g_analytic = state
-                .with_warm_start_disabled(|| state.compute_gradient(&rho))
+                .compute_gradient(&rho)
                 .expect("analytic gradient should evaluate");
-            let g_fd = state
-                .with_warm_start_disabled(|| compute_fd_gradient(&state, &rho))
+            let g_fd = compute_fd_gradient(&state, &rho)
                 .expect("finite-difference gradient should evaluate");
 
             let dot = g_analytic.dot(&g_fd);
