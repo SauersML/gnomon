@@ -4550,6 +4550,125 @@ pub mod internal {
     }
 
     impl<'a> RemlState<'a> {
+        // Row-wise squared norms: diag(M) when M = C C^T.
+        // This is the "diag of Gram" trick to avoid n×n matrices.
+        fn row_norms_squared(matrix: &Array2<f64>) -> Array1<f64> {
+            let mut out = Array1::<f64>::zeros(matrix.nrows());
+            for i in 0..matrix.nrows() {
+                let mut acc = 0.0;
+                for j in 0..matrix.ncols() {
+                    let v = matrix[(i, j)];
+                    acc += v * v;
+                }
+                out[i] = acc;
+            }
+            out
+        }
+
+        // Compute T = (B ⊙ B)^T V without forming B ⊙ B.
+        // Each row i contributes vec(b_i b_i^T) * v_i^T, which is O(p^2) per row.
+        // This is exact and avoids n×n intermediates.
+        fn khatri_rao_transpose_mul(b: &Array2<f64>, v: &Array2<f64>) -> Array2<f64> {
+            let n = b.nrows();
+            let p = b.ncols();
+            let m = v.ncols();
+            let mut out = Array2::<f64>::zeros((p * p, m));
+            for i in 0..n {
+                for a in 0..p {
+                    let ba = b[(i, a)];
+                    if ba == 0.0 {
+                        continue;
+                    }
+                    for bcol in 0..p {
+                        let coeff = ba * b[(i, bcol)];
+                        if coeff == 0.0 {
+                            continue;
+                        }
+                        let idx = a + bcol * p;
+                        for j in 0..m {
+                            out[(idx, j)] += coeff * v[(i, j)];
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        // Forward solve for L X = RHS with L lower-triangular.
+        // Used for L^{-1} and L^{-T} applications without explicit inverses.
+        fn solve_lower_triangular(l: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+            let dim = l.nrows();
+            let cols = rhs.ncols();
+            let mut out = Array2::<f64>::zeros((dim, cols));
+            for j in 0..cols {
+                for i in 0..dim {
+                    let mut sum = rhs[(i, j)];
+                    for k in 0..i {
+                        sum -= l[(i, k)] * out[(k, j)];
+                    }
+                    let diag = l[(i, i)];
+                    if diag.abs() < 1e-15 {
+                        out[(i, j)] = 0.0;
+                    } else {
+                        out[(i, j)] = sum / diag;
+                    }
+                }
+            }
+            out
+        }
+
+        // Backward solve for U X = RHS with U upper-triangular.
+        // Used for L^{-T} applications by passing U = L^T.
+        fn solve_upper_triangular(u: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+            let dim = u.nrows();
+            let cols = rhs.ncols();
+            let mut out = Array2::<f64>::zeros((dim, cols));
+            for j in 0..cols {
+                for i in (0..dim).rev() {
+                    let mut sum = rhs[(i, j)];
+                    for k in (i + 1)..dim {
+                        sum -= u[(i, k)] * out[(k, j)];
+                    }
+                    let diag = u[(i, i)];
+                    if diag.abs() < 1e-15 {
+                        out[(i, j)] = 0.0;
+                    } else {
+                        out[(i, j)] = sum / diag;
+                    }
+                }
+            }
+            out
+        }
+
+        // Reverse-mode for A = L L^T (Cholesky).
+        // Given L̄ = ∂J/∂L (lower-triangular), return Ā = ∂J/∂A.
+        //
+        // Exact formula (Giles 2008):
+        //   S = L^T L̄
+        //   S = Φ(S)  (keep lower triangle, half diagonal)
+        //   Ā = L^{-T} (S + S^T) L^{-1}
+        //
+        // This enforces symmetry and respects the triangular dof of L.
+        fn chol_reverse(l: &Array2<f64>, grad_l: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
+            // S = L^T L̄
+            let mut s = l.t().dot(grad_l);
+            let dim = s.nrows();
+            // Φ: keep lower triangle, halve the diagonal
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    s[(i, j)] = 0.0;
+                }
+                s[(i, i)] *= 0.5;
+            }
+            // sym(Φ(·)) = S + S^T (since S has half diag and lower triangle only).
+            let sym = &s + &s.t().to_owned();
+            // Left solve: Z = L^{-T} sym
+            let z = Self::solve_upper_triangular(&l.t().to_owned(), &sym);
+            // Right solve: Ā = Z L^{-1} by solving L * Ā^T = Z^T
+            let a_bar_t = Self::solve_lower_triangular(l, &z.t().to_owned());
+            Ok(a_bar_t.t().to_owned())
+        }
+
         fn log_det_s_with_ridge(
             s_transformed: &Array2<f64>,
             ridge: f64,
@@ -5160,59 +5279,59 @@ pub mod internal {
                 return Ok(Array2::zeros((p, p)));
             }
 
-            let mut w_prime = Array1::<f64>::zeros(n);
-            let mut w_double = Array1::<f64>::zeros(n);
+            // Match the GLM weight clamp in update_glm_vectors:
+            // dmu is clamped to MIN_WEIGHT before forming weights.
+            const MIN_WEIGHT: f64 = 1e-12;
+
+            let mut w_base = Array1::<f64>::zeros(n);
+            let mut u = Array1::<f64>::zeros(n);
+            let mut v = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let mu_i = mu[i];
-                let w_base = mu_i * (1.0 - mu_i);
-                if w_base < Self::MIN_DMU_DETA {
+                let dmu = mu_i * (1.0 - mu_i);
+                w_base[i] = dmu;
+                // u = w'/w, v = w''/w for logit with clamped W.
+                // If dmu is clamped, w is constant => derivatives are zero.
+                if dmu < MIN_WEIGHT {
+                    u[i] = 0.0;
+                    v[i] = 0.0;
                     continue;
                 }
                 let one_minus2 = 1.0 - 2.0 * mu_i;
-                let w = weights[i];
-                w_prime[i] = w * one_minus2;
-                w_double[i] = w * (one_minus2 * one_minus2 - 2.0 * w_base);
+                u[i] = one_minus2;
+                v[i] = one_minus2 * one_minus2 - 2.0 * dmu;
             }
 
-            let w_sqrt = weights.mapv(|w| w.max(0.0).sqrt());
-            let mut xw = x_trans_dense.clone();
-            for i in 0..n {
-                let s = w_sqrt[i];
-                if s != 1.0 {
-                    xw.row_mut(i).mapv_inplace(|v| v * s);
-                }
-            }
-            let fisher = xw.t().dot(&xw);
-            let factor_f = self.factorize_faer(&fisher);
+            // Build thin factor B for H_hat = B B^T with B = W^{1/2} X L_f^{-T}.
+            // This avoids forming the n×n hat matrix.
+            let b = self.firth_hat_basis(x_trans_dense.view(), weights.view())?;
+            // h_i = diag(H_hat)_i = ||b_i||^2
+            let h = Self::row_norms_squared(&b);
 
-            let rhs = x_trans_dense.t().to_owned();
-            let rhs_view = FaerArrayView::new(&rhs);
-            let sol = factor_f.solve(rhs_view.as_ref());
-            let mut f_inv_xt = Array2::<f64>::zeros((p, n));
-            for i in 0..p {
-                for j in 0..n {
-                    f_inv_xt[(i, j)] = sol[(i, j)];
-                }
-            }
-            let m = x_trans_dense.dot(&f_inv_xt); // M = X_t F^{-1} X_t^T
-
+            // term1 = X^T diag(h ⊙ v) X, where v = w''/w.
             let mut x_weighted = x_trans_dense.clone();
             for i in 0..n {
-                let scale = m[(i, i)] * w_double[i];
+                // term1 = X^T diag(h ⊙ v) X
+                let scale = h[i] * v[i];
                 if scale != 1.0 {
                     x_weighted.row_mut(i).mapv_inplace(|v| v * scale);
                 }
             }
             let term1 = x_trans_dense.t().dot(&x_weighted);
 
-            let mut b = m.mapv(|v| v * v);
+            // term2 = X^T (diag(u) (H_hat∘H_hat) diag(u)) X.
+            // This equals Y^T (H_hat∘H_hat) Y with Y = diag(u) X,
+            // and we evaluate it exactly using Khatri–Rao without n×n.
+            let mut y = x_trans_dense.clone();
             for i in 0..n {
-                let wi = w_prime[i];
-                for k in 0..n {
-                    b[(i, k)] *= wi * w_prime[k];
+                let s = u[i];
+                if s != 1.0 {
+                    y.row_mut(i).mapv_inplace(|v| v * s);
                 }
             }
-            let term2 = x_trans_dense.t().dot(&b.dot(&x_trans_dense));
+            // T = (B ⊙ B)^T Y, so term2 = T^T T = Y^T (H_hat∘H_hat) Y
+            let t = Self::khatri_rao_transpose_mul(&b, &y);
+            let term2 = t.t().dot(&t);
 
             let mut h_phi = term1;
             h_phi -= &term2;
@@ -5248,142 +5367,270 @@ pub mod internal {
         ) -> Result<Array1<f64>, EstimationError> {
             let x = self.dense_design_matrix(x_transformed);
             let n = x.nrows();
-            let p = x.ncols();
             if n == 0 || p == 0 || mu.len() != n {
                 return Ok(Array1::zeros(p));
             }
 
+            // Match the GLM weight clamp in update_glm_vectors:
+            // dmu is clamped to MIN_WEIGHT before forming weights.
+            const MIN_WEIGHT: f64 = 1e-12;
+
             let mut w_base = Array1::<f64>::zeros(n);
             let mut u = Array1::<f64>::zeros(n);
+            let mut v = Array1::<f64>::zeros(n);
+            let mut v_eta = Array1::<f64>::zeros(n);
+            let mut u_eta = Array1::<f64>::zeros(n);
             let mut w_prime = Array1::<f64>::zeros(n);
-            let mut w_double = Array1::<f64>::zeros(n);
-            let mut w_double_eta = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let mu_i = mu[i];
                 let w_b = mu_i * (1.0 - mu_i);
                 w_base[i] = w_b;
+                // When dmu is clamped, w is constant => all derivatives are zero.
+                if w_b < MIN_WEIGHT {
+                    u[i] = 0.0;
+                    v[i] = 0.0;
+                    v_eta[i] = 0.0;
+                    u_eta[i] = 0.0;
+                    w_prime[i] = 0.0;
+                    continue;
+                }
                 let u_i = 1.0 - 2.0 * mu_i;
                 u[i] = u_i;
-                let w_i = weights[i];
-                w_prime[i] = w_i * u_i;
-                w_double[i] = w_i * (u_i * u_i - 2.0 * w_b);
-                w_double_eta[i] = w_i * u_i * (u_i * u_i - 8.0 * w_b);
+                // v = w''/w = u^2 - 2*dmu for logit.
+                v[i] = u_i * u_i - 2.0 * w_b;
+                // dv/deta = -6 * dmu * u.
+                v_eta[i] = -6.0 * w_b * u_i;
+                // du/deta = -2*dmu.
+                u_eta[i] = -2.0 * w_b;
+                // w' = dw/deta = w * u.
+                w_prime[i] = weights[i] * u_i;
             }
 
-            let w_sqrt = weights.mapv(|w| w.max(0.0).sqrt());
-            let mut xw = x.clone();
+            // Forward thin factors:
+            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T
+            //   C = X L_t^{-T}           with M_h = X H_total^{-1} X^T = C C^T
+            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
+            let c = self.h_total_factor(x.view(), h_total)?;
+
+            // Diagonal summaries (no n×n):
+            //   h_i = diag(H_hat)_i = ||b_i||^2
+            //   m_i = diag(M_h)_i = ||c_i||^2
+            let h = Self::row_norms_squared(&b);
+            let mdiag = Self::row_norms_squared(&c);
+
+            // g_eta accumulates ∂J/∂eta (per-observation), then g_beta = X^T g_eta.
+            // Start with the "penalized Hessian" contribution:
+            //   g_eta += mdiag ⊙ w'  where w' = d/deta (weights), clamped to 0 when dmu is clamped.
+            let mut g_eta = &mdiag * &w_prime;
+            // v_eta = dv/deta for v = w''/w (logit closed form)
             for i in 0..n {
-                let s = w_sqrt[i];
+                g_eta[i] += -0.5 * mdiag[i] * h[i] * v_eta[i];
+            }
+
+            // Backprop through the H_phi diagonal term:
+            //   0.5 * sum_i mdiag_i * h_i * v_i
+            // gives ∂/∂b_i = - mdiag_i * v_i * b_i (the factor 0.5 cancels the 2 from ||b_i||^2).
+            //
+            // Backprop through H_phi off-diagonal term:
+            //   H_phi_off = 0.5 * X^T (diag(u) (H_hat∘H_hat) diag(u)) X
+            // We implement the exact reverse pass using Khatri–Rao.
+            let mut grad_b = Array2::<f64>::zeros((n, p));
+            for i in 0..n {
+                // term1 contributes: -0.5 * mdiag_i * v_i * d(||b_i||^2)
+                let scale = mdiag[i] * v[i];
+                if scale != 0.0 {
+                    for j in 0..p {
+                        grad_b[(i, j)] -= scale * b[(i, j)];
+                    }
+                }
+            }
+
+            // V = diag(u) C, so V V^T = diag(u) M_h diag(u)
+            // and T = (B⊙B)^T V gives the Hadamard-square contraction.
+            let mut v = c.clone();
+            for i in 0..n {
+                let scale = u[i];
+                if scale != 1.0 {
+                    v.row_mut(i).mapv_inplace(|vv| vv * scale);
+                }
+            }
+            // T = (B ⊙ B)^T V, which equals vec-wise contraction with H_hat∘H_hat.
+            let t = Self::khatri_rao_transpose_mul(&b, &v);
+
+            // Reverse for Khatri–Rao contraction (exact, no n×n):
+            //   T = (B⊙B)^T V
+            //   S_off = 0.5 ||T||_F^2  =>  T̄ = T
+            //   A = B⊙B, so Ā_i = V_i T^T = u_i (c_i T^T)
+            //   For each row i, reshape g_i = T c_i into G_i (p×p),
+            //   then ∂/∂b_i = u_i (G_i + G_i^T) b_i.
+            let mut g_u = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let c_i = c.row(i).to_owned();
+                let g_i = t.dot(&c_i);
+                let b_i = b.row(i);
+                let mut tmp1 = vec![0.0; p];
+                let mut tmp2 = vec![0.0; p];
+                let mut gu = 0.0;
+                for a in 0..p {
+                    for bcol in 0..p {
+                        let idx = a + bcol * p;
+                        let g_ab = g_i[idx];
+                        let ba = b_i[a];
+                        let bb = b_i[bcol];
+                        gu += g_ab * ba * bb;
+                        tmp1[a] += g_ab * bb;
+                        tmp2[bcol] += g_ab * ba;
+                    }
+                }
+                // g_u captures ∂S_off/∂u_i via V = diag(u) C.
+                g_u[i] = gu;
+                let scale = u[i];
+                if scale != 0.0 {
+                    for j in 0..p {
+                        grad_b[(i, j)] += scale * (tmp1[j] + tmp2[j]);
+                    }
+                }
+            }
+
+            // Chain u_eta (du/deta = -2 dmu) into g_eta, with clamp → 0 when dmu is clamped.
+            for i in 0..n {
+                g_eta[i] += g_u[i] * u_eta[i];
+            }
+
+            // Reverse-mode through B = X_w L_f^{-T}.
+            // Forward: B^T = L_f^{-1} X_w^T
+            // Backward (triangular solve):
+            //   X_w^T̄ += L_f^{-T} B̄^T
+            //   L_f̄   += -tril( (L_f^{-T} B̄^T) B^T )
+            // This is the exact reverse of Y = L^{-1} B.
+            let g_y = grad_b.t().to_owned();
+            let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
+            let d_l = {
+                let temp = d_xw.dot(&b);
+                let mut out = temp.to_owned();
+                for i in 0..p {
+                    for j in (i + 1)..p {
+                        out[(i, j)] = 0.0;
+                    }
+                }
+                out.mapv(|v| -v)
+            };
+
+            // Cholesky reverse-mode: L_f = chol(F), so this yields ∂J/∂F.
+            let g_f = Self::chol_reverse(&l_f, &d_l)?;
+            // F = X_w^T X_w, so ∂J/∂X_w += 2 X_w g_f.
+            let mut g_xw = xw.dot(&g_f);
+            g_xw.mapv_inplace(|v| 2.0 * v);
+            // Also add the direct adjoint from the triangular solve.
+            g_xw += &d_xw.t().to_owned();
+
+            // Backprop through X_w = diag(sqrt(w)) X.
+            // ∂J/∂w_i = (1/(2 sqrt(w_i))) * sum_j x_ij * (∂J/∂X_w)_ij.
+            for i in 0..n {
+                let w_i = weights[i];
+                if w_i <= 0.0 {
+                    continue;
+                }
+                let denom = w_i.sqrt();
+                let mut acc = 0.0;
+                for j in 0..p {
+                    acc += x[(i, j)] * g_xw[(i, j)];
+                }
+                let g_w = 0.5 * acc / denom;
+                // Chain to eta using w' = dw/deta (logit)
+                g_eta[i] += g_w * w_prime[i];
+            }
+
+            // Final chain: g_beta = X^T g_eta.
+            let g_beta = x.t().dot(&g_eta);
+            Ok(g_beta)
+        }
+
+        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
+        // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
+        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
+        // Returns only B for use in the Firth Hessian path.
+        fn firth_hat_basis(
+            &self,
+            x: ArrayView2<'_, f64>,
+            weights: ArrayView1<'_, f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let n = x.nrows();
+            let mut xw = x.to_owned();
+            for i in 0..n {
+                let s = weights[i].max(0.0).sqrt();
                 if s != 1.0 {
                     xw.row_mut(i).mapv_inplace(|v| v * s);
                 }
             }
             let fisher = xw.t().dot(&xw);
-            let factor_f = self.factorize_faer(&fisher);
-
-            let rhs = x.t().to_owned();
-            let rhs_view = FaerArrayView::new(&rhs);
-            let sol = factor_f.solve(rhs_view.as_ref());
-            let mut k_inv_xt = Array2::<f64>::zeros((p, n));
-            for i in 0..p {
-                for j in 0..n {
-                    k_inv_xt[(i, j)] = sol[(i, j)];
+            let chol = fisher.cholesky(Side::Lower).map_err(|_| {
+                EstimationError::HessianNotPositiveDefinite {
+                    min_eigenvalue: f64::NEG_INFINITY,
                 }
-            }
-            let k_inv = {
-                let identity = Array2::<f64>::eye(p);
-                let identity_view = FaerArrayView::new(&identity);
-                let solved = factor_f.solve(identity_view.as_ref());
-                let mut out = Array2::<f64>::zeros((p, p));
-                for i in 0..p {
-                    for j in 0..p {
-                        out[(i, j)] = solved[(i, j)];
-                    }
-                }
-                out
-            };
-            let m = x.dot(&k_inv_xt); // X K X^T
-
-            let factor_h = self.factorize_faer(h_total);
-            let h_rhs = x.t().to_owned();
-            let h_rhs_view = FaerArrayView::new(&h_rhs);
-            let h_sol = factor_h.solve(h_rhs_view.as_ref());
-            let mut h_inv_xt = Array2::<f64>::zeros((p, n));
-            for i in 0..p {
-                for j in 0..n {
-                    h_inv_xt[(i, j)] = h_sol[(i, j)];
-                }
-            }
-            let m_h = x.dot(&h_inv_xt); // X H_total^{-1} X^T
-
-            let mut g_beta = Array1::<f64>::zeros(p);
-            let outer_wp = {
-                let mut out = Array2::<f64>::zeros((n, n));
-                for i in 0..n {
-                    for k in 0..n {
-                        out[(i, k)] = w_prime[i] * w_prime[k];
-                    }
-                }
-                out
-            };
-
-            for j in 0..p {
-                let mut dw = Array1::<f64>::zeros(n);
-                let mut dw_prime = Array1::<f64>::zeros(n);
-                let mut dw_double = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    let x_ij = x[(i, j)];
-                    dw[i] = w_prime[i] * x_ij;
-                    dw_prime[i] = w_double[i] * x_ij;
-                    dw_double[i] = w_double_eta[i] * x_ij;
-                }
-
-                let mut x_dw = x.clone();
-                for i in 0..n {
-                    let s = dw[i];
-                    if s != 1.0 {
-                        x_dw.row_mut(i).mapv_inplace(|v| v * s);
-                    }
-                }
-                let d_i = x.t().dot(&x_dw);
-                let d_k = -k_inv.dot(&d_i).dot(&k_inv);
-                let d_m = x.dot(&d_k).dot(&x.t());
-
-                let mut da = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    let dm_ii = d_m[(i, i)];
-                    da[i] = dm_ii * w_double[i] + m[(i, i)] * dw_double[i];
-                }
-
-                let mut d_b = Array2::<f64>::zeros((n, n));
-                for i in 0..n {
-                    for k in 0..n {
-                        let m_ik = m[(i, k)];
-                        let d_m_ik = d_m[(i, k)];
-                        let term1 = 2.0 * m_ik * d_m_ik * outer_wp[(i, k)];
-                        let term2 = m_ik * m_ik * (dw_prime[i] * w_prime[k] + w_prime[i] * dw_prime[k]);
-                        d_b[(i, k)] = term1 + term2;
-                    }
-                }
-
-                let mut g_pen = 0.0;
-                let mut g_phi_diag = 0.0;
-                let mut g_phi_off = 0.0;
-                for i in 0..n {
-                    g_pen += dw[i] * m_h[(i, i)];
-                    g_phi_diag += da[i] * m_h[(i, i)];
-                }
-                for i in 0..n {
-                    for k in 0..n {
-                        g_phi_off += d_b[(i, k)] * m_h[(i, k)];
-                    }
-                }
-
-                g_beta[j] = g_pen - 0.5 * g_phi_diag + 0.5 * g_phi_off;
-            }
-
-            Ok(g_beta)
+            })?;
+            let l = chol.lower_triangular();
+            // Solve L_f * Y = X_w^T  =>  B = Y^T = X_w L_f^{-T}
+            let y = Self::solve_lower_triangular(&l, &xw.t().to_owned());
+            let b = y.t().to_owned();
+            Ok(b)
         }
+
+        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
+        // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
+        fn firth_hat_factor(
+            &self,
+            x: ArrayView2<'_, f64>,
+            weights: ArrayView1<'_, f64>,
+        ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), EstimationError> {
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let n = x.nrows();
+            let p = x.ncols();
+            let mut xw = x.to_owned();
+            for i in 0..n {
+                let s = weights[i].max(0.0).sqrt();
+                if s != 1.0 {
+                    xw.row_mut(i).mapv_inplace(|v| v * s);
+                }
+            }
+            let fisher = xw.t().dot(&xw);
+            let chol = fisher.cholesky(Side::Lower).map_err(|_| {
+                EstimationError::HessianNotPositiveDefinite {
+                    min_eigenvalue: f64::NEG_INFINITY,
+                }
+            })?;
+            let l = chol.lower_triangular();
+            // Solve L_f * Y = X_w^T  =>  B = Y^T = X_w L_f^{-T}
+            let y = Self::solve_lower_triangular(&l, &xw.t().to_owned());
+            let b = y.t().to_owned();
+            Ok((b, l, xw))
+        }
+
+        // Build C = X L_t^{-T} for M_h = X H_total^{-1} X^T = C C^T.
+        fn h_total_factor(
+            &self,
+            x: ArrayView2<'_, f64>,
+            h_total: &Array2<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let chol = h_total.cholesky(Side::Lower).map_err(|_| {
+                let min_eig = h_total
+                    .clone()
+                    .eigh(Side::Lower)
+                    .ok()
+                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                    .unwrap_or(f64::NAN);
+                EstimationError::HessianNotPositiveDefinite {
+                    min_eigenvalue: min_eig,
+                }
+            })?;
+            let l = chol.lower_triangular();
+            let y = Self::solve_lower_triangular(&l, &x.t().to_owned());
+            let c = y.t().to_owned();
+            Ok(c)
+        }
+
 
 
         // Accessor methods for private fields
@@ -6557,7 +6804,7 @@ pub mod internal {
 
                         // Use the stabilized Hessian factorization for the log|H| trace term.
                         let mut factor_g = self.get_faer_factor(p, h_eff);
-                        let mut factor_imp: Option<FaerFactor> = None;
+                        let factor_imp: Option<FaerFactor> = None;
                         let mut g_beta_total: Option<Array1<f64>> = None;
                         if self.config.firth_bias_reduction
                             && matches!(
@@ -6574,8 +6821,19 @@ pub mod internal {
                             )?;
                             let mut h_total = h_eff.clone();
                             h_total -= &h_phi;
-                            factor_imp = Some(self.factorize_faer(&h_total));
-                            factor_g = Arc::new(self.factorize_faer(&h_total));
+                            let h_view = FaerArrayView::new(&h_total);
+                            let chol = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
+                                let min_eig = h_total
+                                    .clone()
+                                    .eigh(Side::Lower)
+                                    .ok()
+                                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                                    .unwrap_or(f64::NAN);
+                                EstimationError::HessianNotPositiveDefinite {
+                                    min_eigenvalue: min_eig,
+                                }
+                            })?;
+                            factor_g = Arc::new(FaerFactor::Llt(chol));
                             g_beta_total = Some(self.firth_logh_total_grad(
                                 &pirls_result.x_transformed,
                                 &pirls_result.solve_mu,
@@ -6823,23 +7081,33 @@ pub mod internal {
                             None
                         };
 
-                        let mut grad_beta = residual_grad.clone();
-                        if let Some(logh_grad) = logh_beta_grad {
-                            // At the PIRLS optimum (with or without Firth), the
-                            // residual term cancels, leaving +0.5 * ∂log|H|/∂β.
-                            grad_beta += &(0.5 * &logh_grad);
-                            let res_inf = residual_grad
-                                .iter()
-                                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                            let logh_inf =
-                                logh_grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                            let grad_inf =
-                                grad_beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                            if logh_inf < 1e-8 || grad_inf < 1e-8 {
-                                eprintln!(
-                                    "[GRAD DIAG] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
-                                    res_inf, logh_inf, grad_inf
-                                );
+                        let mut grad_beta = if self.config.firth_bias_reduction {
+                            if let Some(logh_grad) = logh_beta_grad.as_ref() {
+                                0.5 * logh_grad
+                            } else {
+                                Array1::<f64>::zeros(residual_grad.len())
+                            }
+                        } else {
+                            residual_grad.clone()
+                        };
+                        if !self.config.firth_bias_reduction {
+                            if let Some(logh_grad) = logh_beta_grad {
+                                // At the PIRLS optimum (with or without Firth), the
+                                // residual term cancels, leaving +0.5 * ∂log|H|/∂β.
+                                grad_beta += &(0.5 * &logh_grad);
+                                let res_inf = residual_grad
+                                    .iter()
+                                    .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                                let logh_inf =
+                                    logh_grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                                let grad_inf =
+                                    grad_beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                                if logh_inf < 1e-8 || grad_inf < 1e-8 {
+                                    eprintln!(
+                                        "[GRAD DIAG] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
+                                        res_inf, logh_inf, grad_inf
+                                    );
+                                }
                             }
                         }
 
@@ -8275,10 +8543,17 @@ pub mod internal {
             2.0 * chol.diag().mapv(f64::ln).sum()
         }
 
+        fn log_det_h_total_for_rho(
+            state: &internal::RemlState<'_>,
+            rho: &Array1<f64>,
+        ) -> f64 {
+            let pr = state.execute_pirls_if_needed(rho).expect("pirls");
+            log_det_h_total_for_beta(state, &pr, pr.beta_transformed.as_ref())
+        }
+
         #[test]
-        #[ignore]
         fn test_firth_logh_total_grad_matches_numeric_beta() {
-            let (state, rho0) = build_logit_small_lambda_state_firth(60, 4242);
+            let (state, rho0) = build_logit_small_lambda_state_firth(200, 4242);
             let pr = state.execute_pirls_if_needed(&rho0).expect("pirls");
             let beta = pr.beta_transformed.clone();
             let x = match &pr.x_transformed {
@@ -8343,6 +8618,94 @@ pub mod internal {
                 fmt_vec(&g_num)
             );
             assert!(rel < 1e-2, "Firth log|H_total| grad mismatch: rel L2={:.3e}", rel);
+        }
+
+        #[test]
+        fn test_firth_gradient_matches_numeric_components() {
+            let (state, rho0) = build_logit_small_lambda_state_firth(200, 9090);
+            let g_fd = fd_cost_grad(&state, &rho0);
+            let g_an = state.compute_gradient(&rho0).expect("grad");
+            let g_pll = state.numeric_penalised_ll_grad(&rho0).expect("g_pll");
+            let g_log_s = dlog_s(&state, &rho0);
+
+            let mut g_logh = Array1::<f64>::zeros(rho0.len());
+            for k in 0..rho0.len() {
+                let h = (1e-4 * (1.0 + rho0[k].abs())).max(1e-5);
+                let mut rp = rho0.clone();
+                let mut rm = rho0.clone();
+                rp[k] += 0.5 * h;
+                rm[k] -= 0.5 * h;
+                let hp = log_det_h_total_for_rho(&state, &rp);
+                let hm = log_det_h_total_for_rho(&state, &rm);
+                g_logh[k] = 0.5 * (hp - hm) / h;
+            }
+
+            let g_true = &g_pll + &g_logh - &(0.5 * &g_log_s);
+
+            eprintln!("\n[Firth grad] g_fd   = {}", fmt_vec(&g_fd));
+            eprintln!("[Firth grad] g_an   = {}", fmt_vec(&g_an));
+            eprintln!("[Firth grad] g_true = {}", fmt_vec(&g_true));
+            eprintln!("[Firth grad] pll    = {}", fmt_vec(&g_pll));
+            eprintln!("[Firth grad] 1/2logH= {}", fmt_vec(&g_logh));
+            eprintln!("[Firth grad] -1/2logS= {}", fmt_vec(&(-0.5 * &g_log_s)));
+
+            // Break down the analytic log|H_total| derivative for inspection.
+            let pr = state.execute_pirls_if_needed(&rho0).expect("pirls");
+            let (h_eff, _) = state.effective_hessian(&pr).expect("h_eff");
+            let h_phi = state
+                .firth_hessian_logit(&pr.x_transformed, &pr.solve_mu, &pr.solve_weights)
+                .expect("h_phi");
+            let mut h_total = h_eff.clone();
+            h_total -= &h_phi;
+            let factor_g = state.factorize_faer(&h_total);
+
+            let g_beta_total = state
+                .firth_logh_total_grad(
+                    &pr.x_transformed,
+                    &pr.solve_mu,
+                    &pr.solve_weights,
+                    &h_total,
+                )
+                .expect("g_beta_total");
+            let g_beta_half = 0.5 * &g_beta_total;
+            let rhs_view = FaerColView::new(&g_beta_half);
+            let delta = factor_g.solve(rhs_view.as_ref());
+
+            let lambdas = rho0.mapv(f64::exp);
+            let rs_transposed = &pr.reparam_result.rs_transposed;
+            let mut g_logh_an = Array1::<f64>::zeros(rho0.len());
+            for k in 0..rho0.len() {
+                let rt_arr = &rs_transposed[k];
+                let rt_view = FaerArrayView::new(rt_arr);
+                let x = factor_g.solve(rt_view.as_ref());
+                let trace = faer_frob_inner(x.as_ref(), rt_view.as_ref());
+                let explicit = 0.5 * lambdas[k] * trace;
+                let r_k = &pr.reparam_result.rs_transformed[k];
+                let r_beta = r_k.dot(pr.beta_transformed.as_ref());
+                let s_k_beta = r_k.t().dot(&r_beta);
+                let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                let mut delta_vec = Array1::<f64>::zeros(u_k.len());
+                for i in 0..u_k.len() {
+                    delta_vec[i] = delta[(i, 0)];
+                }
+                let implicit = -delta_vec.dot(&u_k);
+                g_logh_an[k] = explicit + implicit;
+            }
+            eprintln!("[Firth grad] logH(an) = {}", fmt_vec(&g_logh_an));
+
+            let n_true = g_true.mapv(|x| x * x).sum().sqrt().max(1e-12);
+            let rel_an_true = (&g_an - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
+            let rel_fd_true = (&g_fd - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
+            assert!(
+                rel_an_true <= 1e-2,
+                "g_an vs g_true rel L2: {:.3e}",
+                rel_an_true
+            );
+            assert!(
+                rel_fd_true <= 1e-2,
+                "g_fd vs g_true rel L2: {:.3e}",
+                rel_fd_true
+            );
         }
 
         #[test]
