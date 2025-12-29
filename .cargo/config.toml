@@ -1,7 +1,6 @@
 [build]
 rustflags = [
   "-C", "target-cpu=native",
-  "-C", "link-arg=-Wl,-no_dead_strip",
 ]
 
 [alias]
