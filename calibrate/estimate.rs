@@ -4222,10 +4222,13 @@ pub mod internal {
         count: u64,
         laml_min: f64,
         laml_max: f64,
+        laml_last: f64,
         edf_min: f64,
         edf_max: f64,
+        edf_last: f64,
         trace_min: f64,
         trace_max: f64,
+        trace_last: f64,
     }
 
     impl GnomonKey {
@@ -4258,15 +4261,21 @@ pub mod internal {
                 count: 1,
                 laml_min: laml,
                 laml_max: laml,
+                laml_last: laml,
                 edf_min: edf,
                 edf_max: edf,
+                edf_last: edf,
                 trace_min: trace,
                 trace_max: trace,
+                trace_last: trace,
             }
         }
 
         fn update(&mut self, laml: f64, edf: f64, trace: f64) {
             self.count += 1;
+            self.laml_last = laml;
+            self.edf_last = edf;
+            self.trace_last = trace;
             if laml < self.laml_min {
                 self.laml_min = laml;
             }
@@ -4292,7 +4301,13 @@ pub mod internal {
             let laml = format_range(self.laml_min, self.laml_max, |v| format!("{:.6e}", v));
             let edf = format_range(self.edf_min, self.edf_max, |v| format!("{:.6}", v));
             let trace = format_range(self.trace_min, self.trace_max, |v| format!("{:.6}", v));
-            format!("{key} | LAML={laml} | EDF={edf} | tr(H^-1 Sλ)={trace}")
+            let laml_last = format!("{:.6e}", self.laml_last);
+            let edf_last = format!("{:.6}", self.edf_last);
+            let trace_last = format!("{:.6}", self.trace_last);
+            format!(
+                "{key} | count={} | LAML={laml} last={laml_last} | EDF={edf} last={edf_last} | tr(H^-1 Sλ)={trace} last={trace_last}",
+                self.count
+            )
         }
     }
 
@@ -4418,18 +4433,14 @@ pub mod internal {
                     last.update(laml, edf, trace_h_inv_s_lambda);
                     *repeat += 1;
                     if *repeat >= GNOMON_REPEAT_EMIT {
-                        println!(
-                            "[GNOMON COST] (x{}) {}",
-                            last.count,
-                            last.format_summary()
-                        );
+                        println!("[GNOMON COST] {}", last.format_summary());
                         *repeat = 0;
                     }
                     return;
                 }
 
-                if last.count > 0 {
-                    println!("[GNOMON COST] (x{}) {}", last.count, last.format_summary());
+                if last.count > 1 {
+                    println!("[GNOMON COST] {}", last.format_summary());
                 }
             }
 
@@ -5033,7 +5044,7 @@ pub mod internal {
             let fisher = xw.t().dot(&xw);
             let factor_f = self.factorize_faer(&fisher);
 
-            let mut rhs = x_orig.t().to_owned();
+            let rhs = x_orig.t().to_owned();
             let rhs_view = FaerArrayView::new(&rhs);
             let sol = factor_f.solve(rhs_view.as_ref());
             let mut f_inv_xt = Array2::<f64>::zeros((p, n));
@@ -5076,6 +5087,7 @@ pub mod internal {
 
             Ok(h_phi)
         }
+
 
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
