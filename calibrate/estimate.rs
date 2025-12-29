@@ -6704,10 +6704,11 @@ pub mod internal {
                                 let s_k_beta = r_k.t().dot(&r_beta);
                                 let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
                                 // Indirect term from chain rule:
-                                // dβ/dρ_k = H^{-1} (∂g/∂ρ_k) with g = score - Sβ (+ Firth),
-                                // so ∂g/∂ρ_k = -S_k β and dβ/dρ_k = H^{-1} S_k β.
-                                // Hence the implicit correction is +δᵀ u_k.
-                                let correction = delta_ref.dot(&u_k);
+                                // dV/dρ_k = ∂V/∂ρ_k + (∇β V)ᵀ dβ/dρ_k.
+                                // Differentiate stationarity g = score - Sβ (+ Firth): ∂g/∂β = -H,
+                                // ∂g/∂ρ_k = -S_k β, so dβ/dρ_k = -H^{-1} S_k β and
+                                // the implicit correction is -(∇β V)ᵀ H^{-1} (S_k β) = -δᵀ u_k.
+                                let correction = -delta_ref.dot(&u_k);
                                 gradient_value += correction;
                             }
                             laml_grad.push(gradient_value);
