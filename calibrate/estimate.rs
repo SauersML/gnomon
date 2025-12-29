@@ -3878,10 +3878,10 @@ fn compute_fd_gradient(
         )),
     }
 
-    for i in 0..rho.len() {
-        let h_rel = 1e-4_f64 * (1.0 + rho[i].abs());
-        let h_abs = 1e-5_f64;
-        let mut base_h = h_rel.max(h_abs);
+        for i in 0..rho.len() {
+            let h_rel = 1e-4_f64 * (1.0 + rho[i].abs());
+            let h_abs = 1e-5_f64;
+            let mut base_h = h_rel.max(h_abs);
 
         log_lines.push(format!(
             "[FD RIDGE] coord {i} rho={:+.6e}",
@@ -3891,6 +3891,13 @@ fn compute_fd_gradient(
         let mut d_small = 0.0;
         let mut d_big = 0.0;
         let mut derivative: Option<f64> = None;
+        let mut best_rel_gap = f64::INFINITY;
+        let mut best_derivative: Option<f64> = None;
+        let mut last_rel_gap = f64::INFINITY;
+        let mut refine_steps = 0usize;
+        let mut rel_gap_first = None;
+        let mut rel_gap_max = 0.0;
+        let h_start = base_h;
 
         for attempt in 0..=FD_MAX_REFINEMENTS {
             let eval = evaluate_fd_pair(reml_state, rho, i, base_h)?;
@@ -3901,10 +3908,30 @@ fn compute_fd_gradient(
             let rel_gap = (d_small - d_big).abs() / denom;
             let same_sign = fd_same_sign(d_small, d_big);
 
+            if same_sign {
+                if rel_gap <= best_rel_gap {
+                    best_rel_gap = rel_gap;
+                    best_derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+                }
+                if rel_gap > last_rel_gap {
+                    // Smaller steps are worsening the agreement; keep the best seen.
+                    derivative = best_derivative;
+                    break;
+                }
+                last_rel_gap = rel_gap;
+            }
+
             let refining = same_sign
                 && rel_gap > FD_REL_GAP_THRESHOLD
                 && base_h * 0.5 >= FD_MIN_BASE_STEP;
-            if attempt == 0 || refining || attempt == FD_MAX_REFINEMENTS {
+            if attempt == 0 {
+                rel_gap_first = Some(rel_gap);
+            }
+            if rel_gap.is_finite() && rel_gap > rel_gap_max {
+                rel_gap_max = rel_gap;
+            }
+            let last_attempt = attempt == FD_MAX_REFINEMENTS || !refining;
+            if attempt == 0 || last_attempt {
                 if attempt == 0 {
                     log_lines.push(format!(
                         "[FD RIDGE]   attempt {} h={:.3e} f(+/-0.5h)={:+.9e}/{:+.9e} \
@@ -3937,10 +3964,7 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}]",
 
             if same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP {
                 base_h *= 0.5;
-                log_lines.push(format!(
-                    "[FD RIDGE]    rel_gap={:.3e} > {:.2}; h -> {:.3e}",
-                    rel_gap, FD_REL_GAP_THRESHOLD, base_h
-                ));
+                refine_steps += 1;
                 continue;
             }
 
@@ -3950,10 +3974,25 @@ rel_gap={:.3e} ridge=[{:.3e},{:.3e}]",
 
         if derivative.is_none() {
             let same_sign = fd_same_sign(d_small, d_big);
-            derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+            if same_sign {
+                derivative = best_derivative.or_else(|| {
+                    Some(select_fd_derivative(d_small, d_big, same_sign))
+                });
+            } else {
+                derivative = Some(select_fd_derivative(d_small, d_big, same_sign));
+            }
         }
 
         fd_grad[i] = derivative.unwrap_or(f64::NAN);
+        let rel_gap_first = rel_gap_first.unwrap_or(f64::NAN);
+        log_lines.push(format!(
+            "[FD RIDGE]   refine steps={} h_start={:.3e} h_final={:.3e} rel_gap_first={:.3e} rel_gap_max={:.3e}",
+            refine_steps,
+            h_start,
+            base_h,
+            rel_gap_first,
+            rel_gap_max
+        ));
         log_lines.push(format!(
             "[FD RIDGE]   chosen derivative = {:+.9e}",
             fd_grad[i]
@@ -5105,39 +5144,6 @@ pub mod internal {
             Ok(g_view.to_owned())
         }
 
-        fn numeric_laml_grad_with_workspace(
-            &self,
-            rho: &Array1<f64>,
-            workspace: &mut RemlWorkspace,
-        ) -> Result<Array1<f64>, EstimationError> {
-            let len = rho.len();
-            if len == 0 {
-                return Ok(Array1::zeros(0));
-            }
-
-            let mut g_view = workspace.grad_secondary.slice_mut(s![..len]);
-            g_view.fill(0.0);
-
-            for k in 0..len {
-                let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
-                let h_abs = 1e-5_f64;
-                let h = h_rel.max(h_abs);
-
-                workspace.rho_plus.assign(rho);
-                workspace.rho_plus[k] += 0.5 * h;
-                workspace.rho_minus.assign(rho);
-                workspace.rho_minus[k] -= 0.5 * h;
-
-                let fp = self.compute_cost(&workspace.rho_plus)?
-                    - self.compute_soft_prior_cost(&workspace.rho_plus);
-                let fm = self.compute_cost(&workspace.rho_minus)?
-                    - self.compute_soft_prior_cost(&workspace.rho_minus);
-                g_view[k] = (fp - fm) / h;
-            }
-
-            Ok(g_view.to_owned())
-        }
-
         const MIN_DMU_DETA: f64 = 1e-6;
 
         fn firth_hessian_logit(
@@ -5147,15 +5153,7 @@ pub mod internal {
             weights: &Array1<f64>,
         ) -> Result<Array2<f64>, EstimationError> {
             let n = mu.len();
-            let x_trans_dense = match x_transformed {
-                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
-                DesignMatrix::Sparse(x_sparse) => {
-                    let dense = x_sparse.as_ref().to_dense();
-                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| {
-                        dense[(i, j)]
-                    })
-                }
-            };
+            let x_trans_dense = self.dense_design_matrix(x_transformed);
             let n_x = x_trans_dense.nrows();
             let p = x_trans_dense.ncols();
             if n == 0 || p == 0 || n != n_x {
@@ -5229,6 +5227,162 @@ pub mod internal {
             }
 
             Ok(h_phi)
+        }
+
+        fn dense_design_matrix(&self, x_transformed: &DesignMatrix) -> Array2<f64> {
+            match x_transformed {
+                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
+                DesignMatrix::Sparse(x_sparse) => {
+                    let dense = x_sparse.as_ref().to_dense();
+                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+                }
+            }
+        }
+
+        fn firth_logh_total_grad(
+            &self,
+            x_transformed: &DesignMatrix,
+            mu: &Array1<f64>,
+            weights: &Array1<f64>,
+            h_total: &Array2<f64>,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let x = self.dense_design_matrix(x_transformed);
+            let n = x.nrows();
+            let p = x.ncols();
+            if n == 0 || p == 0 || mu.len() != n {
+                return Ok(Array1::zeros(p));
+            }
+
+            let mut w_base = Array1::<f64>::zeros(n);
+            let mut u = Array1::<f64>::zeros(n);
+            let mut w_prime = Array1::<f64>::zeros(n);
+            let mut w_double = Array1::<f64>::zeros(n);
+            let mut w_double_eta = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mu_i = mu[i];
+                let w_b = mu_i * (1.0 - mu_i);
+                w_base[i] = w_b;
+                let u_i = 1.0 - 2.0 * mu_i;
+                u[i] = u_i;
+                let w_i = weights[i];
+                w_prime[i] = w_i * u_i;
+                w_double[i] = w_i * (u_i * u_i - 2.0 * w_b);
+                w_double_eta[i] = w_i * u_i * (u_i * u_i - 8.0 * w_b);
+            }
+
+            let w_sqrt = weights.mapv(|w| w.max(0.0).sqrt());
+            let mut xw = x.clone();
+            for i in 0..n {
+                let s = w_sqrt[i];
+                if s != 1.0 {
+                    xw.row_mut(i).mapv_inplace(|v| v * s);
+                }
+            }
+            let fisher = xw.t().dot(&xw);
+            let factor_f = self.factorize_faer(&fisher);
+
+            let rhs = x.t().to_owned();
+            let rhs_view = FaerArrayView::new(&rhs);
+            let sol = factor_f.solve(rhs_view.as_ref());
+            let mut k_inv_xt = Array2::<f64>::zeros((p, n));
+            for i in 0..p {
+                for j in 0..n {
+                    k_inv_xt[(i, j)] = sol[(i, j)];
+                }
+            }
+            let k_inv = {
+                let identity = Array2::<f64>::eye(p);
+                let identity_view = FaerArrayView::new(&identity);
+                let solved = factor_f.solve(identity_view.as_ref());
+                let mut out = Array2::<f64>::zeros((p, p));
+                for i in 0..p {
+                    for j in 0..p {
+                        out[(i, j)] = solved[(i, j)];
+                    }
+                }
+                out
+            };
+            let m = x.dot(&k_inv_xt); // X K X^T
+
+            let factor_h = self.factorize_faer(h_total);
+            let h_rhs = x.t().to_owned();
+            let h_rhs_view = FaerArrayView::new(&h_rhs);
+            let h_sol = factor_h.solve(h_rhs_view.as_ref());
+            let mut h_inv_xt = Array2::<f64>::zeros((p, n));
+            for i in 0..p {
+                for j in 0..n {
+                    h_inv_xt[(i, j)] = h_sol[(i, j)];
+                }
+            }
+            let m_h = x.dot(&h_inv_xt); // X H_total^{-1} X^T
+
+            let mut g_beta = Array1::<f64>::zeros(p);
+            let outer_wp = {
+                let mut out = Array2::<f64>::zeros((n, n));
+                for i in 0..n {
+                    for k in 0..n {
+                        out[(i, k)] = w_prime[i] * w_prime[k];
+                    }
+                }
+                out
+            };
+
+            for j in 0..p {
+                let mut dw = Array1::<f64>::zeros(n);
+                let mut dw_prime = Array1::<f64>::zeros(n);
+                let mut dw_double = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let x_ij = x[(i, j)];
+                    dw[i] = w_prime[i] * x_ij;
+                    dw_prime[i] = w_double[i] * x_ij;
+                    dw_double[i] = w_double_eta[i] * x_ij;
+                }
+
+                let mut x_dw = x.clone();
+                for i in 0..n {
+                    let s = dw[i];
+                    if s != 1.0 {
+                        x_dw.row_mut(i).mapv_inplace(|v| v * s);
+                    }
+                }
+                let d_i = x.t().dot(&x_dw);
+                let d_k = -k_inv.dot(&d_i).dot(&k_inv);
+                let d_m = x.dot(&d_k).dot(&x.t());
+
+                let mut da = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let dm_ii = d_m[(i, i)];
+                    da[i] = dm_ii * w_double[i] + m[(i, i)] * dw_double[i];
+                }
+
+                let mut d_b = Array2::<f64>::zeros((n, n));
+                for i in 0..n {
+                    for k in 0..n {
+                        let m_ik = m[(i, k)];
+                        let d_m_ik = d_m[(i, k)];
+                        let term1 = 2.0 * m_ik * d_m_ik * outer_wp[(i, k)];
+                        let term2 = m_ik * m_ik * (dw_prime[i] * w_prime[k] + w_prime[i] * dw_prime[k]);
+                        d_b[(i, k)] = term1 + term2;
+                    }
+                }
+
+                let mut g_pen = 0.0;
+                let mut g_phi_diag = 0.0;
+                let mut g_phi_off = 0.0;
+                for i in 0..n {
+                    g_pen += dw[i] * m_h[(i, i)];
+                    g_phi_diag += da[i] * m_h[(i, i)];
+                }
+                for i in 0..n {
+                    for k in 0..n {
+                        g_phi_off += d_b[(i, k)] * m_h[(i, k)];
+                    }
+                }
+
+                g_beta[j] = g_pen - 0.5 * g_phi_diag + 0.5 * g_phi_off;
+            }
+
+            Ok(g_beta)
         }
 
 
@@ -5616,18 +5770,47 @@ pub mod internal {
 
                     // Log-determinant of the penalized Hessian.
                     // Keep cost/gradient consistent by using the same stabilized H as the gradient.
-                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
-                        let min_eig = h_eff
-                            .clone()
-                            .eigh(Side::Lower)
-                            .ok()
-                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                            .unwrap_or(f64::NAN);
-                        EstimationError::HessianNotPositiveDefinite {
-                            min_eigenvalue: min_eig,
-                        }
-                    })?;
-                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
+                    let log_det_h = if self.config.firth_bias_reduction
+                        && matches!(
+                            self.config
+                                .link_function()
+                                .expect("link_function called on survival model"),
+                            LinkFunction::Logit
+                        )
+                    {
+                        let h_phi = self.firth_hessian_logit(
+                            &pirls_result.x_transformed,
+                            &pirls_result.solve_mu,
+                            &pirls_result.solve_weights,
+                        )?;
+                        let mut h_total = h_eff.clone();
+                        h_total -= &h_phi;
+                        let chol = h_total.clone().cholesky(Side::Lower).map_err(|_| {
+                            let min_eig = h_total
+                                .clone()
+                                .eigh(Side::Lower)
+                                .ok()
+                                .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                                .unwrap_or(f64::NAN);
+                            EstimationError::HessianNotPositiveDefinite {
+                                min_eigenvalue: min_eig,
+                            }
+                        })?;
+                        2.0 * chol.diag().mapv(f64::ln).sum()
+                    } else {
+                        let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                            let min_eig = h_eff
+                                .clone()
+                                .eigh(Side::Lower)
+                                .ok()
+                                .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                                .unwrap_or(f64::NAN);
+                            EstimationError::HessianNotPositiveDefinite {
+                                min_eigenvalue: min_eig,
+                            }
+                        })?;
+                        2.0 * chol.diag().mapv(f64::ln).sum()
+                    };
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
@@ -6040,6 +6223,7 @@ pub mod internal {
             let rs_transformed = &reparam_result.rs_transformed;
             let rs_transposed = &reparam_result.rs_transposed;
 
+            let mut includes_prior = false;
             let (gradient_result, gradient_snapshot) = {
                 let mut workspace_ref = self.workspace.lock().unwrap();
                 let workspace = &mut *workspace_ref;
@@ -6345,21 +6529,18 @@ pub mod internal {
                             .assign(&Array1::from_vec(laml_grad));
                         // Continue to prior-gradient adjustment below.
                     } else {
-                    let use_numeric_firth =
-                        self.config.firth_bias_reduction && self.layout.penalty_map.is_empty();
+                    let use_numeric_firth = false;
                     let clamp_nonsmooth = self.config.firth_bias_reduction
                         && pirls_result
                             .solve_mu
                             .iter()
                             .any(|&mu| mu * (1.0 - mu) < Self::MIN_DMU_DETA);
                     if use_numeric_firth || clamp_nonsmooth {
-                        // When IRLS clamps weights or for tiny external fits, the objective is
-                        // effectively non-smooth in β. Use a full numeric LAML derivative to
-                        // stay consistent with the cost surface.
-                        let g_laml = self.numeric_laml_grad_with_workspace(p, workspace)?;
-                        workspace
-                            .cost_gradient_view(len)
-                            .assign(&g_laml);
+                        // When IRLS clamps weights, the cost surface can be non-smooth in β.
+                        // Use the same FD scheme as the gradient check to stay consistent.
+                        let g_laml = super::compute_fd_gradient(self, p)?;
+                        includes_prior = true;
+                        workspace.cost_gradient_view(len).assign(&g_laml);
                         // Continue to prior-gradient adjustment below.
                     } else {
                         let k_count = lambdas.len();
@@ -6375,8 +6556,9 @@ pub mod internal {
                         }
 
                         // Use the stabilized Hessian factorization for the log|H| trace term.
-                        let factor_g = self.get_faer_factor(p, h_eff);
+                        let mut factor_g = self.get_faer_factor(p, h_eff);
                         let mut factor_imp: Option<FaerFactor> = None;
+                        let mut g_beta_total: Option<Array1<f64>> = None;
                         if self.config.firth_bias_reduction
                             && matches!(
                                 self.config
@@ -6393,6 +6575,13 @@ pub mod internal {
                             let mut h_total = h_eff.clone();
                             h_total -= &h_phi;
                             factor_imp = Some(self.factorize_faer(&h_total));
+                            factor_g = Arc::new(self.factorize_faer(&h_total));
+                            g_beta_total = Some(self.firth_logh_total_grad(
+                                &pirls_result.x_transformed,
+                                &pirls_result.solve_mu,
+                                &pirls_result.solve_weights,
+                                &h_total,
+                            )?);
                         }
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
@@ -6476,7 +6665,16 @@ pub mod internal {
                         // For logit, H = Xᵀ W X + S and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
                         // so ∂log|H|/∂β = Xᵀ (k ∘ w') with k_i = x_iᵀ H^{-1} x_i.
                         // We include 0.5 * Xᵀ (k ∘ w') to make the implicit gradient exact.
-                        let logh_beta_grad = if let LinkFunction::Logit = self
+                        let logh_beta_grad = if self.config.firth_bias_reduction
+                            && matches!(
+                                self.config
+                                    .link_function()
+                                    .expect("link_function called on survival model"),
+                                LinkFunction::Logit
+                            )
+                        {
+                            g_beta_total.clone()
+                        } else if let LinkFunction::Logit = self
                             .config
                             .link_function()
                             .expect("link_function called on survival model")
@@ -6721,11 +6919,13 @@ pub mod internal {
                 }
             }
 
-                let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
-                let prior_grad = prior_grad_view.to_owned();
-                {
-                    let mut cost_gradient_view = workspace.cost_gradient_view(len);
-                    cost_gradient_view += &prior_grad;
+                if !includes_prior {
+                    let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
+                    let prior_grad = prior_grad_view.to_owned();
+                    {
+                        let mut cost_gradient_view = workspace.cost_gradient_view(len);
+                        cost_gradient_view += &prior_grad;
+                    }
                 }
 
                 // Capture the gradient snapshot before releasing the workspace borrow so
