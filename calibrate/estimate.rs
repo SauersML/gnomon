@@ -4985,6 +4985,98 @@ pub mod internal {
 
         const MIN_DMU_DETA: f64 = 1e-6;
 
+        fn firth_hessian_logit(
+            &self,
+            x_transformed: &DesignMatrix,
+            mu: &Array1<f64>,
+            weights: &Array1<f64>,
+        ) -> Result<Array2<f64>, EstimationError> {
+            let x_orig = self.x();
+            let n = x_orig.nrows();
+            let p = x_orig.ncols();
+            if n == 0 || p == 0 {
+                return Ok(Array2::zeros((p, p)));
+            }
+
+            let x_trans_dense = match x_transformed {
+                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
+                DesignMatrix::Sparse(x_sparse) => {
+                    let dense = x_sparse.as_ref().to_dense();
+                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| {
+                        dense[(i, j)]
+                    })
+                }
+            };
+
+            let mut w_prime = Array1::<f64>::zeros(n);
+            let mut w_double = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mu_i = mu[i];
+                let w_base = mu_i * (1.0 - mu_i);
+                if w_base < Self::MIN_DMU_DETA {
+                    continue;
+                }
+                let one_minus2 = 1.0 - 2.0 * mu_i;
+                let w = weights[i];
+                w_prime[i] = w * one_minus2;
+                w_double[i] = w * (one_minus2 * one_minus2 - 2.0 * w_base);
+            }
+
+            let w_sqrt = weights.mapv(|w| w.max(0.0).sqrt());
+            let mut xw = x_orig.to_owned();
+            for i in 0..n {
+                let s = w_sqrt[i];
+                if s != 1.0 {
+                    xw.row_mut(i).mapv_inplace(|v| v * s);
+                }
+            }
+            let fisher = xw.t().dot(&xw);
+            let factor_f = self.factorize_faer(&fisher);
+
+            let mut rhs = x_orig.t().to_owned();
+            let rhs_view = FaerArrayView::new(&rhs);
+            let sol = factor_f.solve(rhs_view.as_ref());
+            let mut f_inv_xt = Array2::<f64>::zeros((p, n));
+            for i in 0..p {
+                for j in 0..n {
+                    f_inv_xt[(i, j)] = sol[(i, j)];
+                }
+            }
+            let m = x_orig.dot(&f_inv_xt); // M = X F^{-1} X^T
+
+            let mut x_weighted = x_trans_dense.clone();
+            for i in 0..n {
+                let scale = m[(i, i)] * w_double[i];
+                if scale != 1.0 {
+                    x_weighted.row_mut(i).mapv_inplace(|v| v * scale);
+                }
+            }
+            let term1 = x_trans_dense.t().dot(&x_weighted);
+
+            let mut b = m.mapv(|v| v * v);
+            for i in 0..n {
+                let wi = w_prime[i];
+                for k in 0..n {
+                    b[(i, k)] *= wi * w_prime[k];
+                }
+            }
+            let term2 = x_trans_dense.t().dot(&b.dot(&x_trans_dense));
+
+            let mut h_phi = term1;
+            h_phi -= &term2;
+            h_phi.mapv_inplace(|v| 0.5 * v);
+
+            for i in 0..p {
+                for j in 0..i {
+                    let v = 0.5 * (h_phi[(i, j)] + h_phi[(j, i)]);
+                    h_phi[(i, j)] = v;
+                    h_phi[(j, i)] = v;
+                }
+            }
+
+            Ok(h_phi)
+        }
+
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
             self.x
@@ -6129,7 +6221,24 @@ pub mod internal {
 
                         // Use the stabilized Hessian factorization for the log|H| trace term.
                         let factor_g = self.get_faer_factor(p, h_eff);
-                        let factor_imp: Option<FaerFactor> = None;
+                        let mut factor_imp: Option<FaerFactor> = None;
+                        if self.config.firth_bias_reduction
+                            && matches!(
+                                self.config
+                                    .link_function()
+                                    .expect("link_function called on survival model"),
+                                LinkFunction::Logit
+                            )
+                        {
+                            let h_phi = self.firth_hessian_logit(
+                                &pirls_result.x_transformed,
+                                &pirls_result.solve_mu,
+                                &pirls_result.solve_weights,
+                            )?;
+                            let mut h_total = h_eff.clone();
+                            h_total -= &h_phi;
+                            factor_imp = Some(self.factorize_faer(&h_total));
+                        }
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
                         // blocks as the Gaussian path. This is the partial derivative
@@ -6161,15 +6270,14 @@ pub mod internal {
                                 let mut solved_slice =
                                     workspace.solved.slice_mut(s![..rows, ..cols]);
                                 solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                                let factor_ref = factor_imp.as_ref().unwrap_or(&factor_g);
                                 if let Some(slice) = solved_slice.as_slice_mut() {
                                     let mut solved_view =
                                         faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_ref.solve_in_place(solved_view.as_mut());
+                                    factor_g.solve_in_place(solved_view.as_mut());
                                 } else {
                                     let mut temp =
                                         faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                    factor_ref.solve_in_place(temp.as_mut());
+                                    factor_g.solve_in_place(temp.as_mut());
                                     for j in 0..cols {
                                         for i in 0..rows {
                                             solved_slice[(i, j)] = temp[(i, j)];
@@ -6237,7 +6345,7 @@ pub mod internal {
 
                                 let mut leverage = Array1::<f64>::zeros(n);
                                 let chunk_cols = 1024usize;
-                                let leverage_factor = factor_imp.as_ref().unwrap_or(&factor_g);
+                                let leverage_factor = &factor_g;
                                 match &pirls_result.x_transformed {
                                     DesignMatrix::Dense(x_dense) => {
                                         let p_dim = x_dense.ncols();
