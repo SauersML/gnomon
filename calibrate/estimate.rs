@@ -32,33 +32,32 @@ use self::internal::RemlState;
 use crate::calibrate::basis;
 use crate::calibrate::calibrator::active_penalty_nullspace_dims;
 use crate::calibrate::construction::{
-    ModelLayout, ReparamInvariant, build_design_and_penalty_matrices,
-    calculate_condition_number, compute_penalty_square_roots,
-    create_balanced_penalty_root, precompute_reparam_invariant,
+    ModelLayout, ReparamInvariant, build_design_and_penalty_matrices, calculate_condition_number,
+    compute_penalty_square_roots, create_balanced_penalty_root, precompute_reparam_invariant,
 };
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::hull::build_peeled_hull;
-use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::matrix::DesignMatrix;
+use crate::calibrate::model::{LinkFunction, ModelConfig, TrainedModel};
 use crate::calibrate::pirls::{self, PirlsResult};
+use crate::calibrate::seeding::{SeedConfig, SeedStrategy, generate_rho_candidates};
 use crate::calibrate::types::{
     Coefficients, LinearPredictor, LogSmoothingParams, LogSmoothingParamsView,
 };
-use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
 use crate::calibrate::visualizer;
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
-    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, FaerQr,
+    FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, FaerQr, array2_to_mat_mut,
 };
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
-use faer::{Par, Side, get_global_parallelism, set_global_parallelism};
 use faer::linalg::solvers::{
     Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
 };
+use faer::{Par, Side, get_global_parallelism, set_global_parallelism};
 
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
@@ -814,13 +813,15 @@ fn compute_analytic_gprime_terms(
     let mut deriv_raw = vec![0.0; n_raw];
     let num_basis_lower = result.knot_vector.len().saturating_sub(result.degree);
     let mut lower_basis = vec![0.0; num_basis_lower];
-    let mut lower_scratch = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(1));
+    let mut lower_scratch =
+        crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(1));
 
     let mut second_raw = vec![0.0; n_raw];
     let num_basis_lower_second = result.knot_vector.len().saturating_sub(result.degree - 1);
     let mut deriv_lower = vec![0.0; num_basis_lower_second.saturating_sub(1)];
     let mut lower_basis_second = vec![0.0; num_basis_lower_second];
-    let mut lower_scratch_second = crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(2));
+    let mut lower_scratch_second =
+        crate::calibrate::basis::internal::BsplineScratch::new(result.degree.saturating_sub(2));
 
     for i in 0..n {
         let u_i = eta_base[i];
@@ -838,7 +839,9 @@ fn compute_analytic_gprime_terms(
             &mut deriv_raw,
             &mut lower_basis,
             &mut lower_scratch,
-        ).is_err() {
+        )
+        .is_err()
+        {
             continue;
         }
 
@@ -862,7 +865,9 @@ fn compute_analytic_gprime_terms(
             &mut deriv_lower,
             &mut lower_basis_second,
             &mut lower_scratch_second,
-        ).is_err() {
+        )
+        .is_err()
+        {
             continue;
         }
 
@@ -881,7 +886,7 @@ fn compute_analytic_gprime_terms(
 }
 
 /// Compute the joint penalized Hessian matrix for the (β, θ) parameters.
-/// 
+///
 /// The Hessian has block structure:
 /// ```text
 /// H = [ X'WX + S_base,  X'Wg'B    ]
@@ -905,7 +910,7 @@ fn compute_joint_penalized_hessian(
     let dim = p_base + p_link;
     let n = y.len();
     let n_base = result.lambdas.len().saturating_sub(1);
-    
+
     // Build combined base penalty: Σλ_k S_k
     let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
     for k in 0..n_base {
@@ -913,11 +918,11 @@ fn compute_joint_penalized_hessian(
             s_base_accum = s_base_accum + s_list[k].mapv(|v| v * result.lambdas[k]);
         }
     }
-    
+
     // Link penalty from the REML fit
     let link_lambda = result.lambdas.get(n_base).cloned().unwrap_or(1.0);
     let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
-    
+
     // Build B-spline basis at mode
     let eta_base = x_matrix.dot(&result.beta_base);
     let b_wiggle = {
@@ -925,11 +930,14 @@ fn compute_joint_penalized_hessian(
         let rw = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
         match crate::calibrate::basis::create_bspline_basis_with_knots(
-            z.view(), result.knot_vector.view(), result.degree
+            z.view(),
+            result.knot_vector.view(),
+            result.degree,
         ) {
             Ok((basis, _)) => {
                 let raw = basis.as_ref();
-                if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
+                if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols()
+                {
                     raw.dot(&result.link_transform)
                 } else {
                     Array2::zeros((n, p_link))
@@ -938,12 +946,12 @@ fn compute_joint_penalized_hessian(
             Err(_) => Array2::zeros((n, p_link)),
         }
     };
-    
+
     // Compute weights W at the mode
     let wiggle = b_wiggle.dot(&result.beta_link);
     let eta_full = &eta_base + &wiggle;
     let mut w_eff = Array1::<f64>::zeros(n);
-    
+
     let is_logit = link == LinkFunction::Logit;
     if is_logit {
         for i in 0..n {
@@ -958,13 +966,13 @@ fn compute_joint_penalized_hessian(
             w_eff[i] = weights[i] * inv_scale;
         }
     }
-    
+
     // Compute g'(u), g''(u), and B'(u) at the mode
     let (g_prime, g_second, b_prime_u) = compute_analytic_gprime_terms(&eta_base, result);
-    
+
     // Build joint Hessian blocks
     let mut joint_hessian = Array2::<f64>::zeros((dim, dim));
-    
+
     // Compute residuals for full observed-information terms
     let mut residual = Array1::<f64>::zeros(n);
     if is_logit {
@@ -979,7 +987,7 @@ fn compute_joint_penalized_hessian(
             residual[i] = weights[i] * (eta_full[i] - y[i]) * inv_scale;
         }
     }
-    
+
     // Compute weighted matrices: sqrt(w*g'^2)*X and sqrt(w)*B
     let mut x_weighted = x_matrix.to_owned();
     let mut b_weighted = b_wiggle.clone();
@@ -993,7 +1001,7 @@ fn compute_joint_penalized_hessian(
             b_weighted[[i, j]] *= sqrt_w;
         }
     }
-    
+
     // Base block: X'WX + X' diag(r * g'') X + S_base
     let xtx = x_weighted.t().dot(&x_weighted);
     let mut x_scaled = x_matrix.to_owned();
@@ -1009,7 +1017,7 @@ fn compute_joint_penalized_hessian(
             joint_hessian[[j, k]] = xtx[[j, k]] + xtx_resid[[j, k]] + s_base_accum[[j, k]];
         }
     }
-    
+
     // Link block: B'WB + S_link
     let btb = b_weighted.t().dot(&b_weighted);
     for j in 0..p_link {
@@ -1017,7 +1025,7 @@ fn compute_joint_penalized_hessian(
             joint_hessian[[p_base + j, p_base + k]] = btb[[j, k]] + s_link[[j, k]];
         }
     }
-    
+
     // Cross block: C = X' diag(W * g') B + X' diag(r) B'
     let mut wb = b_wiggle.clone();
     for i in 0..n {
@@ -1041,31 +1049,31 @@ fn compute_joint_penalized_hessian(
             joint_hessian[[p_base + k, j]] = cross[[j, k]]; // Symmetric
         }
     }
-    
+
     // Do NOT add unconditional ridge - this would bias SEs downward.
     // The caller is responsible for ensuring positive-definiteness if needed for inversion.
-    
+
     Some(joint_hessian)
 }
 
 /// Train a joint single-index model with flexible link calibration
-/// 
+///
 /// This uses the joint model architecture where the base predictor and
 /// flexible link are fitted together in one optimization with REML.
-/// 
+///
 /// The model is: η = g(Xβ) where g is a learned flexible link function.
 pub fn train_joint_model(
     data: &TrainingData,
     config: &ModelConfig,
 ) -> Result<crate::calibrate::joint::JointModelResult, EstimationError> {
-    use crate::calibrate::joint::{fit_joint_model_with_reml, JointModelConfig};
-    use crate::calibrate::model::{map_coefficients, JointLinkModel, TrainedModel};
-    
+    use crate::calibrate::joint::{JointModelConfig, fit_joint_model_with_reml};
+    use crate::calibrate::model::{JointLinkModel, TrainedModel, map_coefficients};
+
     log::info!(
         "Starting joint model training with REML. {} total samples.",
         data.y.len()
     );
-    
+
     eprintln!("\n[JOINT] Constructing model structure...");
     let (
         x_matrix,
@@ -1079,14 +1087,14 @@ pub fn train_joint_model(
         interaction_orth_alpha,
         penalty_structs,
     ) = build_design_and_penalty_matrices(data, config)?;
-    
+
     assert!(!penalty_structs.is_empty());
-    
+
     eprintln!(
         "[JOINT] Model structure built. Total Coeffs: {}, Penalties: {}",
         layout.total_coeffs, layout.num_penalties
     );
-    
+
     eprintln!("[JOINT] Starting joint optimization with REML...");
     let link = match config.link_function() {
         Ok(link) => link,
@@ -1137,7 +1145,7 @@ pub fn train_joint_model(
         firth_bias_reduction: config.firth_bias_reduction, // Inherit from model config
     };
     let s_list_for_mcmc = s_list.clone(); // Clone for MCMC use after fit
-    
+
     let mut result = fit_joint_model_with_reml(
         data.y.view(),
         data.weights.view(),
@@ -1224,32 +1232,36 @@ pub fn train_joint_model(
     let mcmc_samples = if config.mcmc_enabled {
         if let Some(ref hessian) = joint_hessian {
             let is_logit = link == LinkFunction::Logit;
-            eprintln!("[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...", if is_logit { "logit" } else { "identity" });
-            
+            eprintln!(
+                "[JOINT-MCMC] Starting joint (β,θ) NUTS sampling (link={})...",
+                if is_logit { "logit" } else { "identity" }
+            );
+
             let p_base = x_matrix.ncols();
             let n_base_penalties = result.lambdas.len().saturating_sub(1);
-            
+
             // Build combined base penalty for HMC
             let mut s_base_accum = Array2::<f64>::zeros((p_base, p_base));
             for k in 0..n_base_penalties {
                 if k < s_list_for_mcmc.len() && k < result.lambdas.len() {
-                    s_base_accum = s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
+                    s_base_accum =
+                        s_base_accum + s_list_for_mcmc[k].mapv(|v| v * result.lambdas[k]);
                 }
             }
             let link_lambda = result.lambdas.get(n_base_penalties).cloned().unwrap_or(1.0);
             let s_link = result.s_link_constrained.mapv(|v| v * link_lambda);
-            
+
             let spline = crate::calibrate::hmc::JointSplineArtifacts {
                 knot_range: result.knot_range,
                 knot_vector: result.knot_vector.clone(),
                 link_transform: result.link_transform.clone(),
                 degree: result.degree,
             };
-            
+
             // Smart defaults based on model complexity (base + link params)
             let n_params = result.beta_base.len() + result.beta_link.len();
             let nuts_config = crate::calibrate::hmc::NutsConfig::for_dimension(n_params);
-            
+
             match crate::calibrate::hmc::run_joint_nuts_sampling(
                 x_matrix.view(),
                 data.y.view(),
@@ -1265,7 +1277,10 @@ pub fn train_joint_model(
                 scale_val.sqrt(),
             ) {
                 Ok(nuts_result) => {
-                    eprintln!("[JOINT-MCMC] Generated {} joint samples.", nuts_result.samples.nrows());
+                    eprintln!(
+                        "[JOINT-MCMC] Generated {} joint samples.",
+                        nuts_result.samples.nrows()
+                    );
                     Some(nuts_result.samples)
                 }
                 Err(e) => {
@@ -1280,7 +1295,7 @@ pub fn train_joint_model(
     } else {
         None
     };
-    
+
     // Update base_model with Hessian and MCMC samples
     let base_model = TrainedModel {
         config: config_with_constraints,
@@ -1296,12 +1311,12 @@ pub fn train_joint_model(
         mcmc_samples,
     };
     result.base_model = Some(base_model);
-    
+
     eprintln!(
         "[JOINT] Optimization complete. Converged: {}, Iterations: {}, Deviance: {:.4}",
         result.converged, result.backfit_iterations, result.deviance
     );
-    
+
     Ok(result)
 }
 
@@ -1319,164 +1334,689 @@ pub fn train_model(
         visualizer::set_stage("stage-0", "init");
     }
     let result = (|| {
+        eprintln!("\n[STAGE 1/3] Constructing model structure...");
+        visualizer::set_stage("stage-1", "constructing design/penalties");
+        let (
+            x_matrix,
+            s_list,
+            layout,
+            sum_to_zero_constraints,
+            knot_vectors,
+            range_transforms,
+            pc_null_transforms,
+            interaction_centering_means,
+            interaction_orth_alpha,
+            penalty_structs,
+        ) = build_design_and_penalty_matrices(data, config)?;
+        assert!(!penalty_structs.is_empty());
+        log_layout_info(&layout);
+        eprintln!(
+            "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
+            layout.total_coeffs, layout.num_penalties
+        );
 
-    eprintln!("\n[STAGE 1/3] Constructing model structure...");
-    visualizer::set_stage("stage-1", "constructing design/penalties");
-    let (
-        x_matrix,
-        s_list,
-        layout,
-        sum_to_zero_constraints,
-        knot_vectors,
-        range_transforms,
-        pc_null_transforms,
-        interaction_centering_means,
-        interaction_orth_alpha,
-        penalty_structs,
-    ) = build_design_and_penalty_matrices(data, config)?;
-    assert!(!penalty_structs.is_empty());
-    log_layout_info(&layout);
-    eprintln!(
-        "[STAGE 1/3] Model structure built. Total Coeffs: {}, Penalties: {}",
-        layout.total_coeffs, layout.num_penalties
-    );
-
-    if matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Identity) {
-        let design_condition = calculate_condition_number(&x_matrix)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD {
-            let reported_condition = if design_condition.is_finite() {
-                design_condition
-            } else {
-                f64::INFINITY
-            };
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: reported_condition,
-            });
-        }
-    }
-    
-    // Auto-detect Firth for logit models based on data characteristics
-    let firth_enabled = if matches!(config.link_function().expect("link"), LinkFunction::Logit) {
-        if config.firth_bias_reduction {
-            true // User explicitly enabled
-        } else {
-            // Auto-detect: enable Firth if rare events, small sample, or high dimensionality
-            let n = data.y.len();
-            let p = layout.total_coeffs;
-            let prevalence = data.y.iter().filter(|&&y| y > 0.5).count() as f64 / n as f64;
-            let min_prevalence = prevalence.min(1.0 - prevalence);
-            
-            let should_use = min_prevalence < 0.10  // Rare events (<10% prevalence)
-                || n < 500                           // Small sample
-                || (p as f64 / n as f64) > 0.1;      // High dimensionality
-            
-            if should_use {
-                eprintln!("[AUTO] Enabling Firth bias reduction (prevalence={:.1}%, n={}, p={})", 
-                    min_prevalence * 100.0, n, p);
+        if matches!(
+            config
+                .link_function()
+                .expect("link_function called on survival model"),
+            LinkFunction::Identity
+        ) {
+            let design_condition = calculate_condition_number(&x_matrix)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            if !design_condition.is_finite() || design_condition > DESIGN_MATRIX_CONDITION_THRESHOLD
+            {
+                let reported_condition = if design_condition.is_finite() {
+                    design_condition
+                } else {
+                    f64::INFINITY
+                };
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: reported_condition,
+                });
             }
-            should_use
         }
-    } else {
-        false // Not logit, Firth not applicable
-    };
-    
-    // Create modified config with auto-detected Firth
-    let config = if firth_enabled != config.firth_bias_reduction {
-        let mut c = config.clone();
-        c.firth_bias_reduction = firth_enabled;
-        std::borrow::Cow::Owned(c)
-    } else {
-        std::borrow::Cow::Borrowed(config)
-    };
 
-    // --- Setup the unified state and computation object ---
-    // This now encapsulates everything needed for the optimization.
-    let reml_state = internal::RemlState::new(
-        data.y.view(),
-        x_matrix.view(),
-        data.weights.view(),
-        s_list.clone(),
-        &layout,
-        &*config,
-        None,
-    )?;
+        // Auto-detect Firth for logit models based on data characteristics
+        let firth_enabled = if matches!(config.link_function().expect("link"), LinkFunction::Logit)
+        {
+            if config.firth_bias_reduction {
+                true // User explicitly enabled
+            } else {
+                // Auto-detect: enable Firth if rare events, small sample, or high dimensionality
+                let n = data.y.len();
+                let p = layout.total_coeffs;
+                let prevalence = data.y.iter().filter(|&&y| y > 0.5).count() as f64 / n as f64;
+                let min_prevalence = prevalence.min(1.0 - prevalence);
 
-    // Fast-path: if there are no penalties, skip outer REML/BFGS optimization entirely.
-    // Fit a single unpenalized model via P-IRLS and finalize.
-    if layout.num_penalties == 0 {
-        visualizer::set_stage("stage-2", "no penalties; PIRLS only");
-        eprintln!("\n[STAGE 2/3] Skipping smoothing parameter optimization (no penalties)...");
-        eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
+                let should_use = min_prevalence < 0.10  // Rare events (<10% prevalence)
+                || n < 500                           // Small sample
+                || (p as f64 / n as f64) > 0.1; // High dimensionality
 
-        let zero_rho = Array1::<f64>::zeros(0);
-        let (final_fit, _) = pirls::fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(zero_rho.view()),
-            reml_state.x(),
-            reml_state.offset(),
-            reml_state.y(),
-            reml_state.weights(),
-            reml_state.rs_list_ref(),
-            Some(reml_state.balanced_penalty_root()),
-            None,
+                if should_use {
+                    eprintln!(
+                        "[AUTO] Enabling Firth bias reduction (prevalence={:.1}%, n={}, p={})",
+                        min_prevalence * 100.0,
+                        n,
+                        p
+                    );
+                }
+                should_use
+            }
+        } else {
+            false // Not logit, Firth not applicable
+        };
+
+        // Create modified config with auto-detected Firth
+        let config = if firth_enabled != config.firth_bias_reduction {
+            let mut c = config.clone();
+            c.firth_bias_reduction = firth_enabled;
+            std::borrow::Cow::Owned(c)
+        } else {
+            std::borrow::Cow::Borrowed(config)
+        };
+
+        // --- Setup the unified state and computation object ---
+        // This now encapsulates everything needed for the optimization.
+        let reml_state = internal::RemlState::new(
+            data.y.view(),
+            x_matrix.view(),
+            data.weights.view(),
+            s_list.clone(),
             &layout,
             &*config,
             None,
-            None, // No SE for base model (not calibrator)
         )?;
 
-        // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
-        match final_fit.status {
-            crate::calibrate::pirls::PirlsStatus::Unstable => {
-                // Perfect or quasi-perfect separation detected
-                return Err(EstimationError::PerfectSeparationDetected {
-                    iteration: final_fit.iteration,
-                    max_abs_eta: final_fit.max_abs_eta,
-                });
-            }
-            crate::calibrate::pirls::PirlsStatus::MaxIterationsReached => {
-                if final_fit.last_gradient_norm > 1.0 {
-                    return Err(EstimationError::PirlsDidNotConverge {
-                        max_iterations: final_fit.iteration,
-                        last_change: final_fit.last_gradient_norm,
+        // Fast-path: if there are no penalties, skip outer REML/BFGS optimization entirely.
+        // Fit a single unpenalized model via P-IRLS and finalize.
+        if layout.num_penalties == 0 {
+            visualizer::set_stage("stage-2", "no penalties; PIRLS only");
+            eprintln!("\n[STAGE 2/3] Skipping smoothing parameter optimization (no penalties)...");
+            eprintln!("[STAGE 3/3] Fitting final model with optimal parameters...");
+
+            let zero_rho = Array1::<f64>::zeros(0);
+            let (final_fit, _) = pirls::fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(zero_rho.view()),
+                reml_state.x(),
+                reml_state.offset(),
+                reml_state.y(),
+                reml_state.weights(),
+                reml_state.rs_list_ref(),
+                Some(reml_state.balanced_penalty_root()),
+                None,
+                &layout,
+                &*config,
+                None,
+                None, // No SE for base model (not calibrator)
+            )?;
+
+            // IMPORTANT: In the unpenalized path, map unstable PIRLS status to a proper error
+            match final_fit.status {
+                crate::calibrate::pirls::PirlsStatus::Unstable => {
+                    // Perfect or quasi-perfect separation detected
+                    return Err(EstimationError::PerfectSeparationDetected {
+                        iteration: final_fit.iteration,
+                        max_abs_eta: final_fit.max_abs_eta,
                     });
                 }
-                log::warn!(
-                    "Final P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
-                    final_fit.last_gradient_norm
-                );
+                crate::calibrate::pirls::PirlsStatus::MaxIterationsReached => {
+                    if final_fit.last_gradient_norm > 1.0 {
+                        return Err(EstimationError::PirlsDidNotConverge {
+                            max_iterations: final_fit.iteration,
+                            last_change: final_fit.last_gradient_norm,
+                        });
+                    }
+                    log::warn!(
+                        "Final P-IRLS reached max iterations but gradient norm {:.3e} is acceptable.",
+                        final_fit.last_gradient_norm
+                    );
+                }
+                _ => {}
             }
-            _ => {}
+
+            let final_beta_original = final_fit
+                .reparam_result
+                .qs
+                .dot(final_fit.beta_transformed.as_ref());
+            // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
+            let qs = &final_fit.reparam_result.qs;
+            let penalized_hessian_orig = qs
+                .dot(&final_fit.penalized_hessian_transformed)
+                .dot(&qs.t());
+            // Compute scale for Identity; 1.0 for Logit
+            let scale_val = match config
+                .link_function()
+                .expect("link_function called on survival model")
+            {
+                LinkFunction::Logit => 1.0,
+                LinkFunction::Identity => {
+                    // Weighted RSS over residuals divided by (n - edf)
+                    let mut fitted = reml_state.offset().to_owned();
+                    fitted += &x_matrix.dot(&final_beta_original);
+                    let residuals = reml_state.y().to_owned() - &fitted;
+                    let weighted_rss: f64 = data
+                        .weights
+                        .iter()
+                        .zip(residuals.iter())
+                        .map(|(&w, &r)| w * r * r)
+                        .sum();
+                    let effective_n = data.y.len() as f64;
+                    weighted_rss / (effective_n - final_fit.edf).max(1.0)
+                }
+            };
+            let mapped_coefficients =
+                crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
+
+            let mut config_with_constraints = (*config).clone();
+            config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
+            config_with_constraints.knot_vectors = knot_vectors;
+            config_with_constraints.range_transforms = range_transforms;
+            config_with_constraints.interaction_centering_means = interaction_centering_means;
+            config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
+            config_with_constraints.pc_null_transforms = pc_null_transforms;
+
+            // Build PHC hull as in the standard path
+            let hull_opt = if config.pc_configs.is_empty() {
+                eprintln!(
+                    "[CAL] Skipping PHC hull construction: no principal components available."
+                );
+                None
+            } else {
+                let n = data.p.len();
+                let d = 1 + config.pc_configs.len();
+                let mut x_raw = ndarray::Array2::zeros((n, d));
+                x_raw.column_mut(0).assign(&data.p);
+                if d > 1 {
+                    let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+                    x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+                }
+                match build_peeled_hull(&x_raw, 3) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        println!("PHC hull construction skipped: {}", e);
+                        None
+                    }
+                }
+            };
+
+            let trained_model = TrainedModel {
+                config: config_with_constraints,
+                coefficients: mapped_coefficients,
+                lambdas: vec![],
+                hull: hull_opt,
+                penalized_hessian: Some(penalized_hessian_orig),
+                scale: Some(scale_val),
+                calibrator: None,
+                joint_link: None,
+                survival: None,
+                survival_companions: HashMap::new(),
+                mcmc_samples: None,
+            };
+
+            trained_model
+                .assert_layout_consistency_with_layout(&layout)
+                .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
+
+            log_basis_cache_stats("train_model");
+
+            return Ok(trained_model);
         }
 
-        let final_beta_original =
-            final_fit.reparam_result.qs.dot(final_fit.beta_transformed.as_ref());
+        // Multi-start seeding with asymmetric perturbations to break symmetry
+        // This prevents the optimizer from getting trapped when PC penalties are identical
+        visualizer::set_stage("stage-2", "seed scan");
+        let heuristic_lambdas = knot_vectors
+            .get("pgs")
+            .map(|knots| {
+                basis::baseline_lambda_seed(
+                    knots,
+                    config.pgs_basis_config.degree,
+                    config.penalty_order,
+                )
+            })
+            .map(|lambda| vec![lambda]);
+
+        let seed_config = SeedConfig {
+            strategy: SeedStrategy::Exhaustive,
+            bounds: (-12.0, 12.0),
+        };
+        let seed_candidates = generate_rho_candidates(
+            layout.num_penalties,
+            heuristic_lambdas.as_deref(),
+            &seed_config,
+        );
+        visualizer::set_progress("Seed scan", 0, Some(seed_candidates.len()));
+
+        // Evaluate all seeds, separating symmetric from asymmetric candidates
+        let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+        let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
+
+        // We'll do a single mandatory gradient check after we select the initial point
+
+        let total_candidates = seed_candidates.len();
+        let mut finite_count = 0usize;
+        let mut inf_count = 0usize;
+        let mut fail_count = 0usize;
+        let mut min_cost = f64::INFINITY;
+        let mut max_cost = f64::NEG_INFINITY;
+        let mut best_idx = 0usize;
+        let mut best_summary = String::new();
+
+        for (i, seed) in seed_candidates.iter().enumerate() {
+            visualizer::set_stage(
+                "stage-2",
+                &format!("seed scan {}/{}", i + 1, seed_candidates.len()),
+            );
+            visualizer::set_progress("Seed scan", i + 1, Some(seed_candidates.len()));
+            let summarize_seed = || {
+                let mut entries: Vec<String> = Vec::new();
+                for (idx, &val) in seed.iter().enumerate() {
+                    if val.abs() > 1e-9 {
+                        entries.push(format!("{}:{:.1}", idx, val));
+                    }
+                }
+                let nonzero = entries.len();
+                let total = seed.len();
+                if entries.is_empty() {
+                    format!("nonzero=0/{} rho=[]", total)
+                } else {
+                    format!("nonzero={}/{} rho=[{}]", nonzero, total, entries.join(", "))
+                }
+            };
+            let seed_summary = summarize_seed();
+            // We'll do the gradient check after selecting the initial point, not here
+            let cost = match reml_state.compute_cost(seed) {
+                Ok(c) if c.is_finite() => {
+                    finite_count += 1;
+                    if c < min_cost {
+                        min_cost = c;
+                        best_idx = i;
+                        best_summary = seed_summary.clone();
+                    }
+                    if c > max_cost {
+                        max_cost = c;
+                    }
+                    c
+                }
+                Ok(_) => {
+                    inf_count += 1;
+                    continue;
+                }
+                Err(_) => {
+                    fail_count += 1;
+                    continue;
+                }
+            };
+
+            // Check if seed is symmetric (all penalties equal within tiny tolerance)
+            let is_symmetric = if seed.len() < 2 {
+                true
+            } else {
+                let first_val = seed[0];
+                seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
+            };
+
+            if is_symmetric {
+                if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                    best_symmetric_seed = Some((seed.clone(), cost, i));
+                    eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
+                }
+            } else if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
+                best_asymmetric_seed = Some((seed.clone(), cost, i));
+                eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
+            }
+        }
+        if finite_count == 0 {
+            eprintln!(
+                "[Seed scan] candidates={} finite=0 +inf={} failed={}",
+                total_candidates, inf_count, fail_count
+            );
+        } else {
+            eprintln!(
+                "[Seed scan] candidates={} finite={} +inf={} failed={} best_cost={:.6} (seed {}: {}) cost_range=[{:.6}, {:.6}]",
+                total_candidates,
+                finite_count,
+                inf_count,
+                fail_count,
+                min_cost,
+                best_idx,
+                best_summary,
+                min_cost,
+                max_cost
+            );
+        }
+
+        // Robust asymmetric preference to avoid symmetry trap
+        let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
+            (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
+                // Prefer asymmetric unless symmetric is significantly better (> 0.1% + small absolute margin)
+                *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => false,
+        };
+
+        let asym_candidate = best_asymmetric_seed;
+        let sym_candidate = best_symmetric_seed;
+        let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> =
+            Vec::new();
+
+        if pick_asym {
+            if let Some((rho, cost, idx)) = asym_candidate {
+                eprintln!(
+                    "[Init] Using best asymmetric seed #{} (cost = {:.6})",
+                    idx, cost
+                );
+                candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
+            }
+            if let Some((rho, cost, idx)) = sym_candidate {
+                eprintln!(
+                    "[Init] Also queueing best symmetric seed #{} (cost = {:.6})",
+                    idx, cost
+                );
+                candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+            }
+        } else {
+            if let Some((rho, cost, idx)) = sym_candidate {
+                eprintln!("[Init] Using symmetric seed #{} (cost = {:.6})", idx, cost);
+                candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
+            }
+            if let Some((rho, cost, idx)) = asym_candidate {
+                eprintln!(
+                    "[Init] Also queueing best asymmetric seed #{} (cost = {:.6})",
+                    idx, cost
+                );
+                candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
+            }
+        }
+
+        if candidate_plans.is_empty() {
+            eprintln!("[Init] All seeds failed; using ramped asymmetric fallback.");
+            candidate_plans.push((
+                "fallback-asymmetric".to_string(),
+                build_asymmetric_fallback(layout.num_penalties),
+                None,
+                None,
+            ));
+        }
+
+        eprintln!(
+            "\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)..."
+        );
+        visualizer::set_stage("stage-2", "BFGS candidates");
+        visualizer::set_progress("Candidates", 0, Some(candidate_plans.len()));
+
+        let mut successful_runs: Vec<(
+            String,
+            Option<usize>,
+            Option<f64>,
+            BfgsSolution,
+            f64,
+            bool,
+        )> = Vec::new();
+        let mut last_error: Option<EstimationError> = None;
+        let total_candidates = candidate_plans.len();
+        let mut candidate_idx = 0usize;
+
+        for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
+            candidate_idx += 1;
+            visualizer::set_stage("stage-2", &format!("candidate {label}"));
+            visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
+            eprintln!("\n[Candidate {label}] Evaluating seed");
+            if let Some(idx) = seed_index {
+                eprintln!("  -> Seed index: {idx}");
+            }
+            if let Some(cost) = seed_cost {
+                eprintln!("  -> Seed cost: {cost:.6}");
+            }
+
+            reml_state.reset_optimizer_tracking();
+            let initial_z = to_z_from_rho(&rho);
+            let initial_rho = to_rho_from_z(&initial_z);
+
+            if let Err(err) = run_gradient_check(&label, &reml_state, &initial_rho) {
+                eprintln!("[Candidate {label}] Gradient check failed: {err}");
+                last_error = Some(err);
+                continue;
+            }
+
+            match run_bfgs_for_candidate(&label, &reml_state, &*config, initial_z) {
+                Ok((solution, grad_norm_rho, is_stationary)) => {
+                    visualizer::set_stage("stage-2", &format!("candidate {label} done"));
+                    eprintln!(
+                        "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
+                        solution.iterations, solution.final_value
+                    );
+                    successful_runs.push((
+                        label,
+                        seed_index,
+                        seed_cost,
+                        solution,
+                        grad_norm_rho,
+                        is_stationary,
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("[Candidate {label}] BFGS failed: {err}");
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if successful_runs.is_empty() {
+            visualizer::set_stage("stage-2", "fallback candidate");
+            visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
+            eprintln!(
+                "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
+            );
+            reml_state.reset_optimizer_tracking();
+            let fallback_rho = build_asymmetric_fallback(layout.num_penalties);
+            let fallback_z = to_z_from_rho(&fallback_rho);
+            let fallback_rho_checked = to_rho_from_z(&fallback_z);
+            let fallback_label = "fallback-retry".to_string();
+
+            match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
+                Ok(()) => {
+                    match run_bfgs_for_candidate(&fallback_label, &reml_state, &*config, fallback_z)
+                    {
+                        Ok((solution, grad_norm_rho, is_stationary)) => {
+                            eprintln!(
+                                "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
+                                solution.iterations, solution.final_value
+                            );
+                            successful_runs.push((
+                                fallback_label,
+                                None,
+                                None,
+                                solution,
+                                grad_norm_rho,
+                                is_stationary,
+                            ));
+                        }
+                        Err(err) => {
+                            eprintln!("[Fallback] BFGS failed: {err}");
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[Fallback] Gradient check failed: {err}");
+                    last_error = Some(err);
+                }
+            }
+
+            if successful_runs.is_empty() {
+                return Err(last_error.unwrap_or_else(|| {
+                    EstimationError::RemlOptimizationFailed(
+                        "All candidate seeds failed, including fallback retry.".to_string(),
+                    )
+                }));
+            }
+        }
+
+        let (stationary_runs, non_stationary_runs): (
+            Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
+            Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
+        ) = successful_runs.into_iter().partition(|entry| entry.5);
+
+        let select_by_final_value =
+            |entries: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>| {
+                entries.into_iter().min_by(|a, b| {
+                    match a.3.final_value.partial_cmp(&b.3.final_value) {
+                        Some(order) => order,
+                        None => std::cmp::Ordering::Equal,
+                    }
+                })
+            };
+
+        let (
+            best_label,
+            best_seed_index,
+            best_seed_cost,
+            best_solution,
+            best_grad_norm_rho,
+            best_stationary,
+        ) = if let Some(best) = select_by_final_value(stationary_runs) {
+            best
+        } else {
+            let fallback = non_stationary_runs
+                .into_iter()
+                .min_by(|a, b| match a.4.partial_cmp(&b.4) {
+                    Some(order) => order,
+                    None => std::cmp::Ordering::Equal,
+                })
+                .unwrap();
+            eprintln!(
+                "\n[Winner] WARNING: no stationary candidates found; selecting minimal rho gradient norm ({:.3e}).",
+                fallback.4
+            );
+            log::warn!(
+                "REML optimizer could not find a stationary candidate; using minimal rho gradient norm {:.3e}.",
+                fallback.4
+            );
+            fallback
+        };
+
+        let BfgsSolution {
+            final_point: final_z,
+            final_value,
+            iterations,
+            ..
+        } = best_solution;
+
+        visualizer::set_stage("stage-2", &format!("winner {best_label}"));
+        visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
+
+        eprintln!(
+            "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
+        );
+        if let Some(idx) = best_seed_index {
+            eprintln!("  -> Originating seed index: {idx}");
+        }
+        if let Some(cost) = best_seed_cost {
+            eprintln!("  -> Seed cost: {cost:.6}");
+        }
+        eprintln!(
+            "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
+            best_grad_norm_rho, best_stationary
+        );
+        log::info!("REML optimization completed successfully");
+
+        // --- Finalize the Model (same as before) ---
+        // Map final unconstrained point to bounded rho, then clamp for safety
+        let final_rho = to_rho_from_z(&final_z);
+        let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
+        let final_lambda = final_rho_clamped.mapv(f64::exp);
+        log::info!(
+            "Final estimated smoothing parameters (lambda): {:?}",
+            &final_lambda.to_vec()
+        );
+
+        eprintln!("\n[STAGE 3/4] Fitting final model with optimal parameters...");
+        visualizer::set_stage("stage-3", "final PIRLS");
+
+        // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
+        // and return the result along with the transformation matrix used.
+        let (final_fit, _) = {
+            let warm_start_holder = reml_state.warm_start_beta.borrow();
+            let warm_start_ref = warm_start_holder.as_ref();
+            pirls::fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(final_rho_clamped.view()),
+                reml_state.x(), // Use original X
+                reml_state.offset(),
+                reml_state.y(),
+                reml_state.weights(),     // Pass weights
+                reml_state.rs_list_ref(), // Pass original penalty matrices
+                Some(reml_state.balanced_penalty_root()),
+                None,
+                &layout,
+                &*config,
+                warm_start_ref,
+                None, // No SE for base model
+            )?
+        };
+
+        // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
+        // Keep the REML-chosen smoothing; log-only diagnostics can be added upstream if needed.
+
+        // Transform the final, optimal coefficients from the stable basis
+        // back to the original, interpretable basis.
+        let final_beta_original = final_fit
+            .reparam_result
+            .qs
+            .dot(final_fit.beta_transformed.as_ref());
         // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
         let qs = &final_fit.reparam_result.qs;
         let penalized_hessian_orig = qs
             .dot(&final_fit.penalized_hessian_transformed)
             .dot(&qs.t());
         // Compute scale for Identity; 1.0 for Logit
-        let scale_val = match config.link_function().expect("link_function called on survival model") {
+        let scale_val = match config
+            .link_function()
+            .expect("link_function called on survival model")
+        {
             LinkFunction::Logit => 1.0,
             LinkFunction::Identity => {
-                // Weighted RSS over residuals divided by (n - edf)
                 let mut fitted = reml_state.offset().to_owned();
-                fitted += &x_matrix.dot(&final_beta_original);
+                fitted += &reml_state.x().dot(&final_beta_original);
                 let residuals = reml_state.y().to_owned() - &fitted;
-                let weighted_rss: f64 = data
-                    .weights
+                let weighted_rss: f64 = reml_state
+                    .weights()
                     .iter()
                     .zip(residuals.iter())
                     .map(|(&w, &r)| w * r * r)
                     .sum();
-                let effective_n = data.y.len() as f64;
+                let effective_n = reml_state.y().len() as f64;
                 weighted_rss / (effective_n - final_fit.edf).max(1.0)
             }
         };
+
+        if let LinkFunction::Identity = config
+            .link_function()
+            .expect("link_function called on survival model")
+        {
+            let dp = final_fit.deviance + final_fit.stable_penalty_term;
+            let (dp_c, _) = smooth_floor_dp(dp);
+            let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
+            let mp = layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+            let denom = (reml_state.y().len() as f64 - mp).max(LAML_RIDGE);
+            let phi = dp_c / denom;
+            let rho_near_bounds = final_lambda
+                .iter()
+                .any(|&lambda| lambda.ln().abs() >= (RHO_BOUND - 1.0));
+            if !phi.is_finite() || phi <= DP_FLOOR || (final_fit.edf <= 1e-6 && rho_near_bounds) {
+                let condition_number = calculate_condition_number(&penalized_hessian_orig)
+                    .ok()
+                    .unwrap_or(f64::INFINITY);
+                return Err(EstimationError::ModelIsIllConditioned { condition_number });
+            }
+        }
+
+        // Now, map the coefficients from the original basis for user output.
         let mapped_coefficients =
             crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
-
         let mut config_with_constraints = (*config).clone();
         config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
         config_with_constraints.knot_vectors = knot_vectors;
@@ -1485,11 +2025,9 @@ pub fn train_model(
         config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
         config_with_constraints.pc_null_transforms = pc_null_transforms;
 
-        // Build PHC hull as in the standard path
-        let hull_opt = if config.pc_configs.is_empty() {
-            eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
-            None
-        } else {
+        let has_pc_axes = !config.pc_configs.is_empty();
+        // Build Peeled Hull Clamping (PHC) hull from training predictors
+        let hull_opt = if has_pc_axes {
             let n = data.p.len();
             let d = 1 + config.pc_configs.len();
             let mut x_raw = ndarray::Array2::zeros((n, d));
@@ -1505,20 +2043,315 @@ pub fn train_model(
                     None
                 }
             }
+        } else {
+            eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
+            None
+        };
+        // Generate MCMC posterior samples if requested
+        let mcmc_samples = if config.mcmc_enabled {
+            eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling...");
+            let dim = final_beta_original.len();
+
+            // Reconstruct the penalty matrix sum(lambda_i * S_i)
+            // NOTE: final_lambda is ALREADY in lambda scale (exp(rho)), NOT rho scale!
+            let mut s_accum = Array2::<f64>::zeros((dim, dim));
+            for (i, &lambda) in final_lambda.iter().enumerate() {
+                if i < s_list.len() {
+                    s_accum = s_accum + s_list[i].mapv(|v| v * lambda);
+                }
+            }
+
+            // Smart defaults based on model complexity
+            let n_params = final_beta_original.len();
+            let nuts_config = hmc::NutsConfig::for_dimension(n_params);
+
+            // HMC samples from the same posterior as training (including Firth if enabled)
+            match hmc::run_nuts_sampling(
+                x_matrix.view(),
+                data.y.view(),
+                data.weights.view(),
+                s_accum.view(),
+                final_beta_original.view(),
+                penalized_hessian_orig.view(),
+                matches!(
+                    config
+                        .link_function()
+                        .expect("link_function called on survival model"),
+                    LinkFunction::Logit
+                ),
+                config.firth_bias_reduction, // Pass Firth flag so HMC matches training likelihood
+                &nuts_config,
+            ) {
+                Ok(result) => {
+                    eprintln!(
+                        "            Generated {} MCMC samples.",
+                        result.samples.nrows()
+                    );
+                    Some(result.samples)
+                }
+                Err(e) => {
+                    log::warn!("MCMC sampling failed: {}", e);
+                    eprintln!("            WARNING: MCMC sampling failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // ===== Calibrator training (post-fit layer; loud behavior) =====
+        let calibrator_opt = if !config.calibrator_enabled {
+            eprintln!("[CAL] Calibrator disabled by flag; skipping post-process calibration.");
+            None
+        } else {
+            eprintln!("[CAL] Calibrator enabled; starting post-process calibration...");
+            use crate::calibrate::calibrator as cal;
+            // Build raw predictor matrix used for hull and distance
+            let n = data.p.len();
+            let d = 1 + config.pc_configs.len();
+            let mut x_raw = ndarray::Array2::zeros((n, d));
+            x_raw.column_mut(0).assign(&data.p);
+            if d > 1 {
+                let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
+                x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
+            }
+
+            // Compute ALO features from the base fit (fail loud if any error)
+            let mut features = cal::compute_alo_features(
+                &final_fit,
+                reml_state.y(),
+                x_raw.view(),
+                hull_opt.as_ref(),
+                config
+                    .link_function()
+                    .expect("link_function called on survival model"),
+            )
+            .map_err(|e| {
+                EstimationError::CalibratorTrainingFailed(format!(
+                    "feature computation failed: {}",
+                    e
+                ))
+            })?;
+            if matches!(
+                config
+                    .link_function()
+                    .expect("link_function called on survival model"),
+                LinkFunction::Logit
+            ) && let Some(ref samples) = mcmc_samples
+            {
+                let mean_logit = mean_logit_from_samples(x_matrix.view(), samples)?;
+                features.pred = mean_logit.clone();
+                features.pred_identity = mean_logit;
+            }
+
+            // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
+            // This ensures the calibrator lives in the same function class as the base smooth
+            let base_num_knots = config.pgs_basis_config.num_knots;
+            let base_degree = config.pgs_basis_config.degree;
+            let base_penalty_order = config.penalty_order;
+
+            eprintln!(
+                "[CAL] Using base PGS smooth parameters: num_knots={}, degree={}, penalty_order={}",
+                base_num_knots, base_degree, base_penalty_order
+            );
+
+            let spec = cal::CalibratorSpec {
+                link: config
+                    .link_function()
+                    .expect("link_function called on survival model"),
+                // Use identical parameters for all three calibrator smooths
+                pred_basis: crate::calibrate::model::BasisConfig {
+                    num_knots: base_num_knots,
+                    degree: base_degree,
+                },
+                se_basis: crate::calibrate::model::BasisConfig {
+                    num_knots: base_num_knots,
+                    degree: base_degree,
+                },
+                dist_basis: crate::calibrate::model::BasisConfig {
+                    num_knots: base_num_knots,
+                    degree: base_degree,
+                },
+                penalty_order_pred: base_penalty_order,
+                penalty_order_se: base_penalty_order,
+                penalty_order_dist: base_penalty_order,
+                distance_enabled: has_pc_axes,
+                distance_hinge: true,
+                prior_weights: Some(reml_state.weights().to_owned()),
+                firth: cal::CalibratorSpec::firth_default_for_link(
+                    config
+                        .link_function()
+                        .expect("link_function called on survival model"),
+                ),
+            };
+
+            // Build design and penalties for calibrator
+            eprintln!("[CAL] Building calibrator design and penalties...");
+            let (x_cal, penalties_cal, schema, offset) =
+                cal::build_calibrator_design(&features, &spec).map_err(|e| {
+                    EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e))
+                })?;
+
+            if x_cal.ncols() == 0 {
+                eprintln!(
+                    "[CAL] Calibrator design has zero columns; skipping calibrator fit and using the identity mapping."
+                );
+                None
+            } else {
+                eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
+                let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties_cal);
+
+                // Note: We use integrated (GHQ) likelihood instead of weight deflation.
+                // The SE is passed through to PIRLS which uses update_glm_vectors_integrated.
+                // This is the principled approach: integrate over uncertainty, don't re-weight.
+
+                let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
+                    reml_state.y(),
+                    features.fisher_weights.view(),
+                    x_cal.view(),
+                    offset.view(),
+                    &penalties_cal,
+                    &penalty_nullspace_dims,
+                    config
+                        .link_function()
+                        .expect("link_function called on survival model"),
+                    &spec,
+                )
+                .map_err(|e| {
+                    EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
+                })?;
+
+                eprintln!(
+                    "[CAL] Done. lambdas: pred={:.3e}, pred_param={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}{}",
+                    lambdas_cal[0],
+                    lambdas_cal[1],
+                    lambdas_cal[2],
+                    lambdas_cal[3],
+                    edf_pair.0,
+                    edf_pair.1,
+                    edf_pair.2,
+                    edf_pair.3,
+                    if config
+                        .link_function()
+                        .expect("link_function called on survival model")
+                        == LinkFunction::Identity
+                    {
+                        format!("; scale={:.3e}", scale_cal)
+                    } else {
+                        String::new()
+                    }
+                );
+
+                let mut spec_for_model = spec.clone();
+                spec_for_model.prior_weights = None; // Do not persist training weights in the saved model
+
+                let model = cal::CalibratorModel {
+                    spec: spec_for_model,
+                    knots_pred: schema.knots_pred,
+                    knots_se: schema.knots_se,
+                    knots_dist: schema.knots_dist,
+                    pred_constraint_transform: schema.pred_constraint_transform,
+                    stz_se: schema.stz_se,
+                    stz_dist: schema.stz_dist,
+                    penalty_nullspace_dims: schema.penalty_nullspace_dims,
+                    standardize_pred: schema.standardize_pred,
+                    standardize_se: schema.standardize_se,
+                    standardize_dist: schema.standardize_dist,
+                    interaction_center_pred: Some(schema.interaction_center_pred),
+                    se_log_space: schema.se_log_space,
+                    se_wiggle_only_drop: schema.se_wiggle_only_drop,
+                    dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
+                    lambda_pred: lambdas_cal[0],
+                    lambda_pred_param: lambdas_cal[1],
+                    lambda_se: lambdas_cal[2],
+                    lambda_dist: lambdas_cal[3],
+                    coefficients: beta_cal.into(),
+                    column_spans: schema.column_spans,
+                    pred_param_range: schema.pred_param_range.clone(),
+                    scale: if config
+                        .link_function()
+                        .expect("link_function called on survival model")
+                        == LinkFunction::Identity
+                    {
+                        Some(scale_cal)
+                    } else {
+                        None
+                    },
+                    assumes_frequency_weights: true,
+                };
+
+                // Detailed one-time summary after calibration ends
+                let deg_pred = spec.pred_basis.degree;
+                let deg_se = spec.se_basis.degree;
+                let deg_dist = spec.dist_basis.degree;
+                let m_pred_int =
+                    (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
+                let m_se_int =
+                    (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
+                let m_dist_int =
+                    (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
+                let rho_pred = model.lambda_pred.ln();
+                let rho_pred_param = model.lambda_pred_param.ln();
+                let rho_se = model.lambda_se.ln();
+                let rho_dist = model.lambda_dist.ln();
+                println!(
+                    concat!(
+                        "[CAL][train] summary:\n",
+                        "  design: n={}, p={}, pred_wiggle_cols={}, pred_param_cols={}, se_cols={}, dist_cols={}\n",
+                        "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
+                        "  penalty: order_pred={}, order_se={}, order_dist={}\n",
+                        "  lambdas: pred={:.3e} (rho={:.3}), pred_param={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
+                        "  edf:     pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
+                        "  opt:     iterations={}, final_grad_norm={:.3e}"
+                    ),
+                    x_cal.nrows(),
+                    x_cal.ncols(),
+                    model.column_spans.0.len(),
+                    model.pred_param_range.len(),
+                    model.column_spans.1.len(),
+                    model.column_spans.2.len(),
+                    deg_pred,
+                    m_pred_int,
+                    deg_se,
+                    m_se_int,
+                    deg_dist,
+                    m_dist_int,
+                    spec.penalty_order_pred,
+                    spec.penalty_order_se,
+                    spec.penalty_order_dist,
+                    model.lambda_pred,
+                    rho_pred,
+                    model.lambda_pred_param,
+                    rho_pred_param,
+                    model.lambda_se,
+                    rho_se,
+                    model.lambda_dist,
+                    rho_dist,
+                    edf_pair.0,
+                    edf_pair.1,
+                    edf_pair.2,
+                    edf_pair.3,
+                    (edf_pair.0 + edf_pair.1 + edf_pair.2 + edf_pair.3),
+                    fit_meta.0,
+                    fit_meta.1
+                );
+
+                Some(model)
+            }
         };
 
         let trained_model = TrainedModel {
             config: config_with_constraints,
             coefficients: mapped_coefficients,
-            lambdas: vec![],
+            lambdas: final_lambda.to_vec(),
             hull: hull_opt,
             penalized_hessian: Some(penalized_hessian_orig),
             scale: Some(scale_val),
-            calibrator: None,
+            calibrator: calibrator_opt,
             joint_link: None,
             survival: None,
             survival_companions: HashMap::new(),
-            mcmc_samples: None,
+            mcmc_samples,
         };
 
         trained_model
@@ -1527,753 +2360,7 @@ pub fn train_model(
 
         log_basis_cache_stats("train_model");
 
-        return Ok(trained_model);
-    }
-
-    // Multi-start seeding with asymmetric perturbations to break symmetry
-    // This prevents the optimizer from getting trapped when PC penalties are identical
-    visualizer::set_stage("stage-2", "seed scan");
-    let heuristic_lambdas = knot_vectors
-        .get("pgs")
-        .map(|knots| {
-            basis::baseline_lambda_seed(
-                knots,
-                config.pgs_basis_config.degree,
-                config.penalty_order,
-            )
-        })
-        .map(|lambda| vec![lambda]);
-
-    let seed_config = SeedConfig {
-        strategy: SeedStrategy::Exhaustive,
-        bounds: (-12.0, 12.0),
-    };
-    let seed_candidates = generate_rho_candidates(
-        layout.num_penalties,
-        heuristic_lambdas.as_deref(),
-        &seed_config,
-    );
-    visualizer::set_progress("Seed scan", 0, Some(seed_candidates.len()));
-
-    // Evaluate all seeds, separating symmetric from asymmetric candidates
-    let mut best_symmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-    let mut best_asymmetric_seed: Option<(Array1<f64>, f64, usize)> = None;
-
-    // We'll do a single mandatory gradient check after we select the initial point
-
-    let total_candidates = seed_candidates.len();
-    let mut finite_count = 0usize;
-    let mut inf_count = 0usize;
-    let mut fail_count = 0usize;
-    let mut min_cost = f64::INFINITY;
-    let mut max_cost = f64::NEG_INFINITY;
-    let mut best_idx = 0usize;
-    let mut best_summary = String::new();
-
-    for (i, seed) in seed_candidates.iter().enumerate() {
-        visualizer::set_stage("stage-2", &format!("seed scan {}/{}", i + 1, seed_candidates.len()));
-        visualizer::set_progress("Seed scan", i + 1, Some(seed_candidates.len()));
-        let summarize_seed = || {
-            let mut entries: Vec<String> = Vec::new();
-            for (idx, &val) in seed.iter().enumerate() {
-                if val.abs() > 1e-9 {
-                    entries.push(format!("{}:{:.1}", idx, val));
-                }
-            }
-            let nonzero = entries.len();
-            let total = seed.len();
-            if entries.is_empty() {
-                format!("nonzero=0/{} rho=[]", total)
-            } else {
-                format!("nonzero={}/{} rho=[{}]", nonzero, total, entries.join(", "))
-            }
-        };
-        let seed_summary = summarize_seed();
-        // We'll do the gradient check after selecting the initial point, not here
-        let cost = match reml_state.compute_cost(seed) {
-            Ok(c) if c.is_finite() => {
-                finite_count += 1;
-                if c < min_cost {
-                    min_cost = c;
-                    best_idx = i;
-                    best_summary = seed_summary.clone();
-                }
-                if c > max_cost {
-                    max_cost = c;
-                }
-                c
-            }
-            Ok(_) => {
-                inf_count += 1;
-                continue;
-            }
-            Err(_) => {
-                fail_count += 1;
-                continue;
-            }
-        };
-
-        // Check if seed is symmetric (all penalties equal within tiny tolerance)
-        let is_symmetric = if seed.len() < 2 {
-            true
-        } else {
-            let first_val = seed[0];
-            seed.iter().all(|&val| (val - first_val).abs() < 1e-9)
-        };
-
-        if is_symmetric {
-            if cost < best_symmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-                best_symmetric_seed = Some((seed.clone(), cost, i));
-                eprintln!("[Seed {}] NEW BEST SYMMETRIC (cost = {:.6})", i, cost);
-            }
-        } else if cost < best_asymmetric_seed.as_ref().map_or(f64::INFINITY, |s| s.1) {
-            best_asymmetric_seed = Some((seed.clone(), cost, i));
-            eprintln!("[Seed {}] NEW BEST ASYMMETRIC (cost = {:.6})", i, cost);
-        }
-    }
-    if finite_count == 0 {
-        eprintln!(
-            "[Seed scan] candidates={} finite=0 +inf={} failed={}",
-            total_candidates, inf_count, fail_count
-        );
-    } else {
-        eprintln!(
-            "[Seed scan] candidates={} finite={} +inf={} failed={} best_cost={:.6} (seed {}: {}) cost_range=[{:.6}, {:.6}]",
-            total_candidates,
-            finite_count,
-            inf_count,
-            fail_count,
-            min_cost,
-            best_idx,
-            best_summary,
-            min_cost,
-            max_cost
-        );
-    }
-
-    // Robust asymmetric preference to avoid symmetry trap
-    let pick_asym = match (best_asymmetric_seed.as_ref(), best_symmetric_seed.as_ref()) {
-        (Some((_, asym_cost, _)), Some((_, sym_cost, _))) => {
-            // Prefer asymmetric unless symmetric is significantly better (> 0.1% + small absolute margin)
-            *asym_cost <= *sym_cost * SYM_VS_ASYM_MARGIN + 1e-6
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => false,
-    };
-
-    let asym_candidate = best_asymmetric_seed;
-    let sym_candidate = best_symmetric_seed;
-    let mut candidate_plans: Vec<(String, Array1<f64>, Option<usize>, Option<f64>)> = Vec::new();
-
-    if pick_asym {
-        if let Some((rho, cost, idx)) = asym_candidate {
-            eprintln!(
-                "[Init] Using best asymmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = sym_candidate {
-            eprintln!(
-                "[Init] Also queueing best symmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-    } else {
-        if let Some((rho, cost, idx)) = sym_candidate {
-            eprintln!("[Init] Using symmetric seed #{} (cost = {:.6})", idx, cost);
-            candidate_plans.push(("best-symmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-        if let Some((rho, cost, idx)) = asym_candidate {
-            eprintln!(
-                "[Init] Also queueing best asymmetric seed #{} (cost = {:.6})",
-                idx, cost
-            );
-            candidate_plans.push(("best-asymmetric".to_string(), rho, Some(idx), Some(cost)));
-        }
-    }
-
-    if candidate_plans.is_empty() {
-        eprintln!("[Init] All seeds failed; using ramped asymmetric fallback.");
-        candidate_plans.push((
-            "fallback-asymmetric".to_string(),
-            build_asymmetric_fallback(layout.num_penalties),
-            None,
-            None,
-        ));
-    }
-
-    eprintln!("\n[STAGE 2/3] Optimizing smoothing parameters via BFGS (multi-candidate search)...");
-    visualizer::set_stage("stage-2", "BFGS candidates");
-    visualizer::set_progress("Candidates", 0, Some(candidate_plans.len()));
-
-    let mut successful_runs: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)> =
-        Vec::new();
-    let mut last_error: Option<EstimationError> = None;
-    let total_candidates = candidate_plans.len();
-    let mut candidate_idx = 0usize;
-
-    for (label, rho, seed_index, seed_cost) in candidate_plans.into_iter() {
-        candidate_idx += 1;
-        visualizer::set_stage("stage-2", &format!("candidate {label}"));
-        visualizer::set_progress("Candidates", candidate_idx, Some(total_candidates));
-        eprintln!("\n[Candidate {label}] Evaluating seed");
-        if let Some(idx) = seed_index {
-            eprintln!("  -> Seed index: {idx}");
-        }
-        if let Some(cost) = seed_cost {
-            eprintln!("  -> Seed cost: {cost:.6}");
-        }
-
-        reml_state.reset_optimizer_tracking();
-        let initial_z = to_z_from_rho(&rho);
-        let initial_rho = to_rho_from_z(&initial_z);
-
-        if let Err(err) = run_gradient_check(&label, &reml_state, &initial_rho) {
-            eprintln!("[Candidate {label}] Gradient check failed: {err}");
-            last_error = Some(err);
-            continue;
-        }
-
-        match run_bfgs_for_candidate(&label, &reml_state, &*config, initial_z) {
-            Ok((solution, grad_norm_rho, is_stationary)) => {
-                visualizer::set_stage("stage-2", &format!("candidate {label} done"));
-                eprintln!(
-                    "[Candidate {label}] Completed BFGS in {} iterations with final value {:.6}",
-                    solution.iterations, solution.final_value
-                );
-                successful_runs.push((
-                    label,
-                    seed_index,
-                    seed_cost,
-                    solution,
-                    grad_norm_rho,
-                    is_stationary,
-                ));
-                continue;
-            }
-            Err(err) => {
-                eprintln!("[Candidate {label}] BFGS failed: {err}");
-                last_error = Some(err);
-            }
-        }
-    }
-
-    if successful_runs.is_empty() {
-        visualizer::set_stage("stage-2", "fallback candidate");
-        visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
-        eprintln!(
-            "\n[Fallback] Retrying with ramped asymmetric fallback after candidate failures."
-        );
-        reml_state.reset_optimizer_tracking();
-        let fallback_rho = build_asymmetric_fallback(layout.num_penalties);
-        let fallback_z = to_z_from_rho(&fallback_rho);
-        let fallback_rho_checked = to_rho_from_z(&fallback_z);
-        let fallback_label = "fallback-retry".to_string();
-
-        match run_gradient_check(&fallback_label, &reml_state, &fallback_rho_checked) {
-            Ok(()) => {
-                match run_bfgs_for_candidate(&fallback_label, &reml_state, &*config, fallback_z) {
-                    Ok((solution, grad_norm_rho, is_stationary)) => {
-                        eprintln!(
-                            "[Fallback] Completed BFGS in {} iterations with final value {:.6}",
-                            solution.iterations, solution.final_value
-                        );
-                        successful_runs.push((
-                            fallback_label,
-                            None,
-                            None,
-                            solution,
-                            grad_norm_rho,
-                            is_stationary,
-                        ));
-                    }
-                    Err(err) => {
-                        eprintln!("[Fallback] BFGS failed: {err}");
-                        last_error = Some(err);
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[Fallback] Gradient check failed: {err}");
-                last_error = Some(err);
-            }
-        }
-
-        if successful_runs.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "All candidate seeds failed, including fallback retry.".to_string(),
-                )
-            }));
-        }
-    }
-
-    let (stationary_runs, non_stationary_runs): (
-        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
-        Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>,
-    ) = successful_runs.into_iter().partition(|entry| entry.5);
-
-    let select_by_final_value =
-        |entries: Vec<(String, Option<usize>, Option<f64>, BfgsSolution, f64, bool)>| {
-            entries
-                .into_iter()
-                .min_by(|a, b| match a.3.final_value.partial_cmp(&b.3.final_value) {
-                    Some(order) => order,
-                    None => std::cmp::Ordering::Equal,
-                })
-        };
-
-    let (
-        best_label,
-        best_seed_index,
-        best_seed_cost,
-        best_solution,
-        best_grad_norm_rho,
-        best_stationary,
-    ) = if let Some(best) = select_by_final_value(stationary_runs) {
-        best
-    } else {
-        let fallback = non_stationary_runs
-            .into_iter()
-            .min_by(|a, b| match a.4.partial_cmp(&b.4) {
-                Some(order) => order,
-                None => std::cmp::Ordering::Equal,
-            })
-            .unwrap();
-        eprintln!(
-            "\n[Winner] WARNING: no stationary candidates found; selecting minimal rho gradient norm ({:.3e}).",
-            fallback.4
-        );
-        log::warn!(
-            "REML optimizer could not find a stationary candidate; using minimal rho gradient norm {:.3e}.",
-            fallback.4
-        );
-        fallback
-    };
-
-    let BfgsSolution {
-        final_point: final_z,
-        final_value,
-        iterations,
-        ..
-    } = best_solution;
-
-    visualizer::set_stage("stage-2", &format!("winner {best_label}"));
-    visualizer::set_progress("Candidates", total_candidates, Some(total_candidates));
-
-    eprintln!(
-        "\n[Winner] Using candidate {best_label} with final value {final_value:.6} (iterations: {iterations})"
-    );
-    if let Some(idx) = best_seed_index {
-        eprintln!("  -> Originating seed index: {idx}");
-    }
-    if let Some(cost) = best_seed_cost {
-        eprintln!("  -> Seed cost: {cost:.6}");
-    }
-    eprintln!(
-        "  -> rho-space gradient norm at winner: {:.3e} (stationary: {})",
-        best_grad_norm_rho, best_stationary
-    );
-    log::info!("REML optimization completed successfully");
-
-    // --- Finalize the Model (same as before) ---
-    // Map final unconstrained point to bounded rho, then clamp for safety
-    let final_rho = to_rho_from_z(&final_z);
-    let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
-    let final_lambda = final_rho_clamped.mapv(f64::exp);
-    log::info!(
-        "Final estimated smoothing parameters (lambda): {:?}",
-        &final_lambda.to_vec()
-    );
-
-    eprintln!("\n[STAGE 3/4] Fitting final model with optimal parameters...");
-    visualizer::set_stage("stage-3", "final PIRLS");
-
-    // Perform the P-IRLS fit ONCE. This will do its own internal reparameterization
-    // and return the result along with the transformation matrix used.
-    let (final_fit, _) = {
-        let warm_start_holder = reml_state.warm_start_beta.borrow();
-        let warm_start_ref = warm_start_holder.as_ref();
-        pirls::fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(final_rho_clamped.view()),
-            reml_state.x(), // Use original X
-            reml_state.offset(),
-            reml_state.y(),
-            reml_state.weights(),     // Pass weights
-            reml_state.rs_list_ref(), // Pass original penalty matrices
-            Some(reml_state.balanced_penalty_root()),
-            None,
-            &layout,
-            &*config,
-            warm_start_ref,
-            None, // No SE for base model
-        )?
-    };
-
-    // Note: Do NOT override optimizer-selected lambdas based on EDF diagnostics.
-    // Keep the REML-chosen smoothing; log-only diagnostics can be added upstream if needed.
-
-    // Transform the final, optimal coefficients from the stable basis
-    // back to the original, interpretable basis.
-    let final_beta_original =
-        final_fit.reparam_result.qs.dot(final_fit.beta_transformed.as_ref());
-    // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
-    let qs = &final_fit.reparam_result.qs;
-    let penalized_hessian_orig = qs
-        .dot(&final_fit.penalized_hessian_transformed)
-        .dot(&qs.t());
-    // Compute scale for Identity; 1.0 for Logit
-    let scale_val = match config.link_function().expect("link_function called on survival model") {
-        LinkFunction::Logit => 1.0,
-        LinkFunction::Identity => {
-            let mut fitted = reml_state.offset().to_owned();
-            fitted += &reml_state.x().dot(&final_beta_original);
-            let residuals = reml_state.y().to_owned() - &fitted;
-            let weighted_rss: f64 = reml_state
-                .weights()
-                .iter()
-                .zip(residuals.iter())
-                .map(|(&w, &r)| w * r * r)
-                .sum();
-            let effective_n = reml_state.y().len() as f64;
-            weighted_rss / (effective_n - final_fit.edf).max(1.0)
-        }
-    };
-
-    if let LinkFunction::Identity = config.link_function().expect("link_function called on survival model") {
-        let dp = final_fit.deviance + final_fit.stable_penalty_term;
-        let (dp_c, _) = smooth_floor_dp(dp);
-        let penalty_rank = final_fit.reparam_result.e_transformed.nrows();
-        let mp = layout.total_coeffs.saturating_sub(penalty_rank) as f64;
-        let denom = (reml_state.y().len() as f64 - mp).max(LAML_RIDGE);
-        let phi = dp_c / denom;
-        let rho_near_bounds = final_lambda
-            .iter()
-            .any(|&lambda| lambda.ln().abs() >= (RHO_BOUND - 1.0));
-        if !phi.is_finite() || phi <= DP_FLOOR || (final_fit.edf <= 1e-6 && rho_near_bounds) {
-            let condition_number = calculate_condition_number(&penalized_hessian_orig)
-                .ok()
-                .unwrap_or(f64::INFINITY);
-            return Err(EstimationError::ModelIsIllConditioned { condition_number });
-        }
-    }
-
-    // Now, map the coefficients from the original basis for user output.
-    let mapped_coefficients =
-        crate::calibrate::model::map_coefficients(&final_beta_original, &layout)?;
-    let mut config_with_constraints = (*config).clone();
-    config_with_constraints.sum_to_zero_constraints = sum_to_zero_constraints;
-    config_with_constraints.knot_vectors = knot_vectors;
-    config_with_constraints.range_transforms = range_transforms;
-    config_with_constraints.interaction_centering_means = interaction_centering_means;
-    config_with_constraints.interaction_orth_alpha = interaction_orth_alpha;
-    config_with_constraints.pc_null_transforms = pc_null_transforms;
-
-    let has_pc_axes = !config.pc_configs.is_empty();
-    // Build Peeled Hull Clamping (PHC) hull from training predictors
-    let hull_opt = if has_pc_axes {
-        let n = data.p.len();
-        let d = 1 + config.pc_configs.len();
-        let mut x_raw = ndarray::Array2::zeros((n, d));
-        x_raw.column_mut(0).assign(&data.p);
-        if d > 1 {
-            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
-            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
-        }
-        match build_peeled_hull(&x_raw, 3) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                println!("PHC hull construction skipped: {}", e);
-                None
-            }
-        }
-    } else {
-        eprintln!("[CAL] Skipping PHC hull construction: no principal components available.");
-        None
-    };
-    // Generate MCMC posterior samples if requested
-    let mcmc_samples = if config.mcmc_enabled {
-        eprintln!("\n[STAGE 4/4] Running HMC/NUTS posterior sampling...");
-        let dim = final_beta_original.len();
-
-        // Reconstruct the penalty matrix sum(lambda_i * S_i)
-        // NOTE: final_lambda is ALREADY in lambda scale (exp(rho)), NOT rho scale!
-        let mut s_accum = Array2::<f64>::zeros((dim, dim));
-        for (i, &lambda) in final_lambda.iter().enumerate() {
-            if i < s_list.len() {
-                s_accum = s_accum + s_list[i].mapv(|v| v * lambda);
-            }
-        }
-
-        // Smart defaults based on model complexity
-        let n_params = final_beta_original.len();
-        let nuts_config = hmc::NutsConfig::for_dimension(n_params);
-        
-        // HMC samples from the same posterior as training (including Firth if enabled)
-        match hmc::run_nuts_sampling(
-            x_matrix.view(),
-            data.y.view(),
-            data.weights.view(),
-            s_accum.view(),
-            final_beta_original.view(),
-            penalized_hessian_orig.view(),
-            matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit),
-            config.firth_bias_reduction, // Pass Firth flag so HMC matches training likelihood
-            &nuts_config,
-        ) {
-            Ok(result) => {
-                eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
-                Some(result.samples)
-            }
-            Err(e) => {
-                log::warn!("MCMC sampling failed: {}", e);
-                eprintln!("            WARNING: MCMC sampling failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // ===== Calibrator training (post-fit layer; loud behavior) =====
-    let calibrator_opt = if !config.calibrator_enabled {
-        eprintln!("[CAL] Calibrator disabled by flag; skipping post-process calibration.");
-        None
-    } else {
-        eprintln!("[CAL] Calibrator enabled; starting post-process calibration...");
-        use crate::calibrate::calibrator as cal;
-        // Build raw predictor matrix used for hull and distance
-        let n = data.p.len();
-        let d = 1 + config.pc_configs.len();
-        let mut x_raw = ndarray::Array2::zeros((n, d));
-        x_raw.column_mut(0).assign(&data.p);
-        if d > 1 {
-            let pcs_slice = data.pcs.slice(ndarray::s![.., 0..config.pc_configs.len()]);
-            x_raw.slice_mut(ndarray::s![.., 1..]).assign(&pcs_slice);
-        }
-
-        // Compute ALO features from the base fit (fail loud if any error)
-        let mut features = cal::compute_alo_features(
-            &final_fit,
-            reml_state.y(),
-            x_raw.view(),
-            hull_opt.as_ref(),
-            config.link_function().expect("link_function called on survival model"),
-        )
-        .map_err(|e| {
-            EstimationError::CalibratorTrainingFailed(format!("feature computation failed: {}", e))
-        })?;
-        if matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
-            && let Some(ref samples) = mcmc_samples {
-                let mean_logit = mean_logit_from_samples(x_matrix.view(), samples)?;
-                features.pred = mean_logit.clone();
-                features.pred_identity = mean_logit;
-            }
-
-        // Use the base PGS smooth parameters for all calibrator splines - mathematically aligned approach
-        // This ensures the calibrator lives in the same function class as the base smooth
-        let base_num_knots = config.pgs_basis_config.num_knots;
-        let base_degree = config.pgs_basis_config.degree;
-        let base_penalty_order = config.penalty_order;
-
-        eprintln!(
-            "[CAL] Using base PGS smooth parameters: num_knots={}, degree={}, penalty_order={}",
-            base_num_knots, base_degree, base_penalty_order
-        );
-
-        let spec = cal::CalibratorSpec {
-            link: config.link_function().expect("link_function called on survival model"),
-            // Use identical parameters for all three calibrator smooths
-            pred_basis: crate::calibrate::model::BasisConfig {
-                num_knots: base_num_knots,
-                degree: base_degree,
-            },
-            se_basis: crate::calibrate::model::BasisConfig {
-                num_knots: base_num_knots,
-                degree: base_degree,
-            },
-            dist_basis: crate::calibrate::model::BasisConfig {
-                num_knots: base_num_knots,
-                degree: base_degree,
-            },
-            penalty_order_pred: base_penalty_order,
-            penalty_order_se: base_penalty_order,
-            penalty_order_dist: base_penalty_order,
-            distance_enabled: has_pc_axes,
-            distance_hinge: true,
-            prior_weights: Some(reml_state.weights().to_owned()),
-            firth: cal::CalibratorSpec::firth_default_for_link(config.link_function().expect("link_function called on survival model")),
-        };
-
-        // Build design and penalties for calibrator
-        eprintln!("[CAL] Building calibrator design and penalties...");
-        let (x_cal, penalties_cal, schema, offset) = cal::build_calibrator_design(&features, &spec)
-            .map_err(|e| {
-                EstimationError::CalibratorTrainingFailed(format!("design build failed: {}", e))
-            })?;
-
-        if x_cal.ncols() == 0 {
-            eprintln!(
-                "[CAL] Calibrator design has zero columns; skipping calibrator fit and using the identity mapping."
-            );
-            None
-        } else {
-            eprintln!("[CAL] Fitting post-process calibrator (shared REML/BFGS)...");
-            let penalty_nullspace_dims = active_penalty_nullspace_dims(&schema, &penalties_cal);
-            
-            // Note: We use integrated (GHQ) likelihood instead of weight deflation.
-            // The SE is passed through to PIRLS which uses update_glm_vectors_integrated.
-            // This is the principled approach: integrate over uncertainty, don't re-weight.
-            
-            let (beta_cal, lambdas_cal, scale_cal, edf_pair, fit_meta) = cal::fit_calibrator(
-                reml_state.y(),
-                features.fisher_weights.view(),
-                x_cal.view(),
-                offset.view(),
-                &penalties_cal,
-                &penalty_nullspace_dims,
-                config.link_function().expect("link_function called on survival model"),
-                &spec,
-            )
-            .map_err(|e| {
-                EstimationError::CalibratorTrainingFailed(format!("optimizer failed: {}", e))
-            })?;
-
-            eprintln!(
-                "[CAL] Done. lambdas: pred={:.3e}, pred_param={:.3e}, se={:.3e}, dist={:.3e}; edf: pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}{}",
-                lambdas_cal[0],
-                lambdas_cal[1],
-                lambdas_cal[2],
-                lambdas_cal[3],
-                edf_pair.0,
-                edf_pair.1,
-                edf_pair.2,
-                edf_pair.3,
-                if config.link_function().expect("link_function called on survival model") == LinkFunction::Identity {
-                    format!("; scale={:.3e}", scale_cal)
-                } else {
-                    String::new()
-                }
-            );
-
-            let mut spec_for_model = spec.clone();
-            spec_for_model.prior_weights = None; // Do not persist training weights in the saved model
-
-            let model = cal::CalibratorModel {
-                spec: spec_for_model,
-                knots_pred: schema.knots_pred,
-                knots_se: schema.knots_se,
-                knots_dist: schema.knots_dist,
-                pred_constraint_transform: schema.pred_constraint_transform,
-                stz_se: schema.stz_se,
-                stz_dist: schema.stz_dist,
-                penalty_nullspace_dims: schema.penalty_nullspace_dims,
-                standardize_pred: schema.standardize_pred,
-                standardize_se: schema.standardize_se,
-                standardize_dist: schema.standardize_dist,
-                interaction_center_pred: Some(schema.interaction_center_pred),
-                se_log_space: schema.se_log_space,
-                se_wiggle_only_drop: schema.se_wiggle_only_drop,
-                dist_wiggle_only_drop: schema.dist_wiggle_only_drop,
-                lambda_pred: lambdas_cal[0],
-                lambda_pred_param: lambdas_cal[1],
-                lambda_se: lambdas_cal[2],
-                lambda_dist: lambdas_cal[3],
-                coefficients: beta_cal.into(),
-                column_spans: schema.column_spans,
-                pred_param_range: schema.pred_param_range.clone(),
-                scale: if config.link_function().expect("link_function called on survival model") == LinkFunction::Identity {
-                    Some(scale_cal)
-                } else {
-                    None
-                },
-                assumes_frequency_weights: true,
-            };
-
-            // Detailed one-time summary after calibration ends
-            let deg_pred = spec.pred_basis.degree;
-            let deg_se = spec.se_basis.degree;
-            let deg_dist = spec.dist_basis.degree;
-            let m_pred_int =
-                (model.knots_pred.len() as isize - 2 * (deg_pred as isize + 1)).max(0) as usize;
-            let m_se_int =
-                (model.knots_se.len() as isize - 2 * (deg_se as isize + 1)).max(0) as usize;
-            let m_dist_int =
-                (model.knots_dist.len() as isize - 2 * (deg_dist as isize + 1)).max(0) as usize;
-            let rho_pred = model.lambda_pred.ln();
-            let rho_pred_param = model.lambda_pred_param.ln();
-            let rho_se = model.lambda_se.ln();
-            let rho_dist = model.lambda_dist.ln();
-            println!(
-                concat!(
-                    "[CAL][train] summary:\n",
-                    "  design: n={}, p={}, pred_wiggle_cols={}, pred_param_cols={}, se_cols={}, dist_cols={}\n",
-                    "  bases:  pred: degree={}, internal_knots={} | se: degree={}, internal_knots={} | dist: degree={}, internal_knots={}\n",
-                    "  penalty: order_pred={}, order_se={}, order_dist={}\n",
-                    "  lambdas: pred={:.3e} (rho={:.3}), pred_param={:.3e} (rho={:.3}), se={:.3e} (rho={:.3}), dist={:.3e} (rho={:.3})\n",
-                    "  edf:     pred={:.2}, pred_param={:.2}, se={:.2}, dist={:.2}, total={:.2}\n",
-                    "  opt:     iterations={}, final_grad_norm={:.3e}"
-                ),
-                x_cal.nrows(),
-                x_cal.ncols(),
-                model.column_spans.0.len(),
-                model.pred_param_range.len(),
-                model.column_spans.1.len(),
-                model.column_spans.2.len(),
-                deg_pred,
-                m_pred_int,
-                deg_se,
-                m_se_int,
-                deg_dist,
-                m_dist_int,
-                spec.penalty_order_pred,
-                spec.penalty_order_se,
-                spec.penalty_order_dist,
-                model.lambda_pred,
-                rho_pred,
-                model.lambda_pred_param,
-                rho_pred_param,
-                model.lambda_se,
-                rho_se,
-                model.lambda_dist,
-                rho_dist,
-                edf_pair.0,
-                edf_pair.1,
-                edf_pair.2,
-                edf_pair.3,
-                (edf_pair.0 + edf_pair.1 + edf_pair.2 + edf_pair.3),
-                fit_meta.0,
-                fit_meta.1
-            );
-
-            Some(model)
-        }
-    };
-
-    let trained_model = TrainedModel {
-        config: config_with_constraints,
-        coefficients: mapped_coefficients,
-        lambdas: final_lambda.to_vec(),
-        hull: hull_opt,
-        penalized_hessian: Some(penalized_hessian_orig),
-        scale: Some(scale_val),
-        calibrator: calibrator_opt,
-        joint_link: None,
-        survival: None,
-        survival_companions: HashMap::new(),
-        mcmc_samples,
-    };
-
-    trained_model
-        .assert_layout_consistency_with_layout(&layout)
-        .map_err(|err| EstimationError::LayoutError(err.to_string()))?;
-
-    log_basis_cache_stats("train_model");
-
-    Ok(trained_model)
+        Ok(trained_model)
     })();
     result
 }
@@ -2451,8 +2538,11 @@ pub fn train_survival_model(
         degree: survival_cfg_owned.baseline_basis.degree,
     };
 
-    let baseline_lambda =
-        baseline_lambda_seed(&age_basis.knot_vector, age_basis.degree, config.penalty_order);
+    let baseline_lambda = baseline_lambda_seed(
+        &age_basis.knot_vector,
+        age_basis.degree,
+        config.penalty_order,
+    );
 
     if let Some(survival_cfg_mut) = config.survival.as_mut() {
         if let Some(time_varying) = survival_cfg_mut.time_varying.as_mut() {
@@ -2973,9 +3063,7 @@ pub fn train_survival_model(
 
             let n = data_ref.age_entry.len();
             let p_dim = beta.len();
-            let (risks, logit_design) = if let Some(samples) =
-                primary_mcmc_samples.as_ref()
-            {
+            let (risks, logit_design) = if let Some(samples) = primary_mcmc_samples.as_ref() {
                 const MCMC_CHUNK_SIZE: usize = 32;
                 const ROW_CHUNK_SIZE: usize = 2048;
                 let mut risks = Array1::<f64>::zeros(n);
@@ -2987,8 +3075,7 @@ pub fn train_survival_model(
                     let row_end = (row_start + ROW_CHUNK_SIZE).min(n);
                     let design_entry_chunk =
                         layout.combined_entry.slice(s![row_start..row_end, ..]);
-                    let design_exit_chunk =
-                        layout.combined_exit.slice(s![row_start..row_end, ..]);
+                    let design_exit_chunk = layout.combined_exit.slice(s![row_start..row_end, ..]);
 
                     let mut sample_start = 0;
                     while sample_start < n_samples {
@@ -3042,13 +3129,13 @@ pub fn train_survival_model(
                                 let numerator = if delta_raw > 0.0 { delta } else { 0.0 };
                                 let dnum = if delta_raw > 0.0 { -d_f_entry } else { 0.0 };
                                 let dden = -d_f_entry;
-                                let dr_deta_entry =
-                                    if denom_raw > crate::calibrate::survival::DEFAULT_RISK_EPSILON {
-                                        (dnum * denom_raw - numerator * dden)
-                                            / (denom_raw * denom_raw)
-                                    } else {
-                                        0.0
-                                    };
+                                let dr_deta_entry = if denom_raw
+                                    > crate::calibrate::survival::DEFAULT_RISK_EPSILON
+                                {
+                                    (dnum * denom_raw - numerator * dden) / (denom_raw * denom_raw)
+                                } else {
+                                    0.0
+                                };
 
                                 let logistic_scale = 1.0 / (risk_clamped * (1.0 - risk_clamped));
                                 {
@@ -3216,11 +3303,11 @@ pub fn train_survival_model(
                 let penalty_nullspace_dims =
                     cal::active_penalty_nullspace_dims(&schema, &penalties_cal);
                 let outcomes = data_ref.event_target.mapv(|value| f64::from(value));
-                
+
                 // Note: We use integrated (GHQ) likelihood instead of weight deflation.
                 // The SE is passed through to PIRLS which uses update_glm_vectors_integrated.
                 // This is the principled approach: integrate over uncertainty, don't re-weight.
-                
+
                 let (beta_cal, lambdas_cal, _, edf_pair, fit_meta) = cal::fit_calibrator(
                     outcomes.view(),
                     features.fisher_weights.view(),
@@ -3397,13 +3484,10 @@ pub fn train_survival_model(
             .map_err(map_error)?;
             let score_cross = primary_scores.t().dot(&mortality_scores);
             let left_solved =
-                survival::solve_hessian_matrix(primary_factor, &score_cross)
+                survival::solve_hessian_matrix(primary_factor, &score_cross).map_err(map_error)?;
+            let right_solved =
+                survival::solve_hessian_matrix(mortality_factor, &left_solved.t().to_owned())
                     .map_err(map_error)?;
-            let right_solved = survival::solve_hessian_matrix(
-                mortality_factor,
-                &left_solved.t().to_owned(),
-            )
-            .map_err(map_error)?;
             mortality_artifacts.cross_covariance_to_primary = Some(right_solved.t().to_owned());
         }
     }
@@ -3450,7 +3534,10 @@ pub fn train_survival_model(
                 &nuts_config,
             ) {
                 Ok(result) => {
-                    eprintln!("            Generated {} MCMC samples.", result.samples.nrows());
+                    eprintln!(
+                        "            Generated {} MCMC samples.",
+                        result.samples.nrows()
+                    );
                     Some(result.samples)
                 }
                 Err(e) => {
@@ -3466,7 +3553,7 @@ pub fn train_survival_model(
     } else {
         None
     };
-    
+
     // Store MCMC samples in artifacts so they're accessible both ways
     final_artifacts.mcmc_samples = mcmc_samples.clone();
 
@@ -3532,9 +3619,10 @@ pub fn optimize_external_design(
     let p = x.ncols();
     let k = s_list.len();
     let layout = ModelLayout::external(p, k);
-    let firth_active = opts.firth.as_ref().is_some_and(|spec| {
-        spec.enabled && matches!(opts.link, LinkFunction::Logit)
-    });
+    let firth_active = opts
+        .firth
+        .as_ref()
+        .is_some_and(|spec| spec.enabled && matches!(opts.link, LinkFunction::Logit));
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
@@ -3783,10 +3871,11 @@ fn evaluate_fd_pair(
     let ridge_m2 = reml_state.last_ridge_used().unwrap_or(f64::NAN);
     let d_big = (f_p2 - f_m2) / h2;
 
-    let (ridge_min, ridge_max) = [ridge_p, ridge_m, ridge_p2, ridge_m2].iter().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(min, max), &v| (min.min(v), max.max(v)),
-    );
+    let (ridge_min, ridge_max) = [ridge_p, ridge_m, ridge_p2, ridge_m2]
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+            (min.min(v), max.max(v))
+        });
     log_lines.push(format!(
         "[FD RIDGE] coord {coord} attempt {} rho={:+.6e} h={:.3e} \
 f(+/-0.5h)={:+.9e}/{:+.9e} f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} \
@@ -3837,16 +3926,12 @@ fn compute_fd_gradient(
     let mut fd_grad = Array1::zeros(rho.len());
 
     let mut log_lines: Vec<String> = Vec::new();
-    let (rho_min, rho_max) = rho.iter().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(min, max), &v| (min.min(v), max.max(v)),
-    );
-    let rho_summary = format!(
-        "len={} range=[{:.3e},{:.3e}]",
-        rho.len(),
-        rho_min,
-        rho_max
-    );
+    let (rho_min, rho_max) = rho
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+            (min.min(v), max.max(v))
+        });
+    let rho_summary = format!("len={} range=[{:.3e},{:.3e}]", rho.len(), rho_min, rho_max);
     match reml_state.last_ridge_used() {
         Some(ridge) => log_lines.push(format!(
             "[FD RIDGE] Baseline cached ridge: {ridge:.3e} for rho {rho_summary}",
@@ -3895,8 +3980,7 @@ fn compute_fd_gradient(
         fd_grad[i] = derivative.unwrap_or(f64::NAN);
         log_lines.push(format!(
             "[FD RIDGE] coord {} chosen derivative = {:+.9e}",
-            i,
-            fd_grad[i]
+            i, fd_grad[i]
         ));
     }
 
@@ -3944,9 +4028,10 @@ pub fn evaluate_external_gradients(
     use crate::calibrate::model::ModelConfig;
 
     let layout = ModelLayout::external(p, s_list.len());
-    let firth_active = opts.firth.as_ref().is_some_and(|spec| {
-        spec.enabled && matches!(opts.link, LinkFunction::Logit)
-    });
+    let firth_active = opts
+        .firth
+        .as_ref()
+        .is_some_and(|spec| spec.enabled && matches!(opts.link, LinkFunction::Logit));
     let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
 
     let s_vec: Vec<Array2<f64>> = s_list.to_vec();
@@ -4242,10 +4327,7 @@ pub mod internal {
             let raw_cond_display = format_cond(self.raw_cond);
             format!(
                 "rho={} | smooth={} | κ(stable/raw)={}/{}",
-                rho_compact,
-                smooth_compact,
-                stable_cond_display,
-                raw_cond_display
+                rho_compact, smooth_compact, stable_cond_display, raw_cond_display
             )
         }
     }
@@ -4355,10 +4437,11 @@ pub mod internal {
         if uniform_step {
             return format!("[{}..{} step {}]", fmt(first), fmt(last), fmt(step));
         }
-        let (min, max) = values.iter().fold(
-            (f64::INFINITY, f64::NEG_INFINITY),
-            |(min, max), &v| (min.min(v), max.max(v)),
-        );
+        let (min, max) = values
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
         format!("[{}..{}] n={}", fmt(min), fmt(max), values.len())
     }
 
@@ -4417,11 +4500,7 @@ pub mod internal {
                     last.update(laml, edf, trace_h_inv_s_lambda);
                     *repeat += 1;
                     if *repeat >= GNOMON_REPEAT_EMIT {
-                        println!(
-                            "[GNOMON COST] (x{}) {}",
-                            last.count,
-                            last.format_summary()
-                        );
+                        println!("[GNOMON COST] (x{}) {}", last.count, last.format_summary());
                         *repeat = 0;
                     }
                     return;
@@ -4613,9 +4692,10 @@ pub mod internal {
         fn obtain_eval_bundle(&self, rho: &Array1<f64>) -> Result<EvalShared, EstimationError> {
             let key = self.rho_key_sanitized(rho);
             if let Some(existing) = self.current_eval_bundle.borrow().as_ref()
-                && existing.matches(&key) {
-                    return Ok(existing.clone());
-                }
+                && existing.matches(&key)
+            {
+                return Ok(existing.clone());
+            }
             let bundle = self.prepare_eval_bundle_with_key(rho, key)?;
             *self.current_eval_bundle.borrow_mut() = Some(bundle.clone());
             Ok(bundle)
@@ -4685,8 +4765,7 @@ pub mod internal {
             }
             match pr.status {
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                    let beta_original =
-                        pr.reparam_result.qs.dot(pr.beta_transformed.as_ref());
+                    let beta_original = pr.reparam_result.qs.dot(pr.beta_transformed.as_ref());
                     self.warm_start_beta
                         .borrow_mut()
                         .replace(Coefficients::new(beta_original));
@@ -4751,9 +4830,10 @@ pub mod internal {
             // hits across repeated EDF/gradient evaluations for the same smoothing parameters.
             let key_opt = self.rho_key_sanitized(rho);
             if let Some(key) = &key_opt
-                && let Some(f) = self.faer_factor_cache.borrow().get(key) {
-                    return Arc::clone(f);
-                }
+                && let Some(f) = self.faer_factor_cache.borrow().get(key)
+            {
+                return Arc::clone(f);
+            }
             let fact = Arc::new(self.factorize_faer(h));
 
             if let Some(key) = key_opt {
@@ -4795,7 +4875,12 @@ pub mod internal {
             let layout = self.layout;
             let config = self.config;
             let firth_bias = config.firth_bias_reduction;
-            let link_is_logit = matches!(config.link_function().expect("link_function called on survival model"), LinkFunction::Logit);
+            let link_is_logit = matches!(
+                config
+                    .link_function()
+                    .expect("link_function called on survival model"),
+                LinkFunction::Logit
+            );
             let balanced_root = &self.balanced_penalty_root;
             let reparam_invariant = &self.reparam_invariant;
 
@@ -5097,12 +5182,13 @@ pub mod internal {
                 && let Some(cached) = {
                     let cache_ref = self.cache.borrow();
                     cache_ref.get(key).cloned()
-                } {
-                    if self.warm_start_enabled.get() {
-                        self.update_warm_start_from(cached.as_ref());
-                    }
-                    return Ok(cached);
                 }
+            {
+                if self.warm_start_enabled.get() {
+                    self.update_warm_start_from(cached.as_ref());
+                }
+                return Ok(cached);
+            }
 
             // Run P-IRLS with original matrices to perform fresh reparameterization
             // The returned result will include the transformation matrix qs
@@ -5284,33 +5370,37 @@ pub mod internal {
             const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             if ridge_used > 0.0
                 && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
-                    && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
-                        eprintln!("[Diag] H min_eig={:.3e}", min_eig);
+                && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
+            {
+                eprintln!("[Diag] H min_eig={:.3e}", min_eig);
 
-                        if min_eig <= 0.0 {
-                            log::warn!(
-                                "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
-                                ridge_used
-                            );
-                        }
+                if min_eig <= 0.0 {
+                    log::warn!(
+                        "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
+                        ridge_used
+                    );
+                }
 
-                        if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                            let condition_number = calculate_condition_number(
-                                &pirls_result.penalized_hessian_transformed,
-                            )
+                if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                    let condition_number =
+                        calculate_condition_number(&pirls_result.penalized_hessian_transformed)
                             .ok()
                             .unwrap_or(f64::INFINITY);
 
-                            log::warn!(
-                                "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
-                                condition_number
-                            );
-                        }
-                    }
+                    log::warn!(
+                        "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
+                        condition_number
+                    );
+                }
+            }
             // Use stable penalty calculation - no need to reconstruct matrices
             // The penalty term is already calculated stably in the P-IRLS loop
 
-            match self.config.link_function().expect("link_function called on survival model") {
+            match self
+                .config
+                .link_function()
+                .expect("link_function called on survival model")
+            {
                 LinkFunction::Identity => {
                     // For Gaussian models, use the exact REML score
                     // From Wood (2017), Chapter 6, Eq. 6.24:
@@ -5420,7 +5510,12 @@ pub mod internal {
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
                     // Include Firth log-det term in LAML for consistency with inner PIRLS
                     if self.config.firth_bias_reduction
-                        && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
+                        && matches!(
+                            self.config
+                                .link_function()
+                                .expect("link_function called on survival model"),
+                            LinkFunction::Logit
+                        )
                     {
                         if let Some(firth_log_det) = pirls_result.firth_log_det {
                             penalised_ll += firth_log_det; // Jeffreys prior contribution
@@ -5911,312 +6006,116 @@ pub mod internal {
                     reparam_result.det1.clone()
                 };
 
-            // --- Use Single Stabilized Hessian from P-IRLS ---
-            // CRITICAL: Use the same effective Hessian as the cost function for consistency
-            if ridge_used > 0.0 {
-                log::debug!(
-                    "Gradient path added ridge {:.3e} to stabilized Hessian for consistency",
-                    ridge_used
-                );
-            }
-
-            // Check that the stabilized effective Hessian is still numerically valid.
-            // If even the ridged matrix is indefinite, the PIRLS fit is unreliable and we retreat.
-            if let Ok((eigenvalues, _)) = h_eff.eigh(Side::Lower) {
-                let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
-                if min_eig < SEVERE_INDEFINITENESS {
-                    // The matrix was severely indefinite - signal a need to retreat
-                    log::warn!(
-                        "Severely indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
-                        min_eig
+                // --- Use Single Stabilized Hessian from P-IRLS ---
+                // CRITICAL: Use the same effective Hessian as the cost function for consistency
+                if ridge_used > 0.0 {
+                    log::debug!(
+                        "Gradient path added ridge {:.3e} to stabilized Hessian for consistency",
+                        ridge_used
                     );
-                    // Generate an informed retreat direction based on current parameters
-                    let retreat_grad = p.mapv(|v| -(v.abs() + 1.0));
-                    return Ok(retreat_grad);
                 }
-            }
 
-            // --- Extract common components ---
-
-            let n = self.y.len() as f64;
-
-            // Implement Wood (2011) exact REML/LAML gradient formulas
-            // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
-
-            match self.config.link_function().expect("link_function called on survival model") {
-                LinkFunction::Identity => {
-                    // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
-
-                    // Calculate scale parameter using the regular REML profiling
-                    // φ = D_p / (n - M_p), where M_p is the penalty nullspace dimension.
-                    let rss = pirls_result.deviance;
-
-                    // Use stable penalty term calculated in P-IRLS
-                    let penalty = pirls_result.stable_penalty_term;
-                    let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
-                    let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
-
-                    let factor_g = self.get_faer_factor(p, h_eff);
-                    let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
-                    let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
-                    let scale = dp_c / (n - mp).max(LAML_RIDGE);
-
-                    if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
-                        eprintln!(
-                            "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
-                            dp_c
+                // Check that the stabilized effective Hessian is still numerically valid.
+                // If even the ridged matrix is indefinite, the PIRLS fit is unreliable and we retreat.
+                if let Ok((eigenvalues, _)) = h_eff.eigh(Side::Lower) {
+                    let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                    const SEVERE_INDEFINITENESS: f64 = -1e-4; // Threshold for severe problems
+                    if min_eig < SEVERE_INDEFINITENESS {
+                        // The matrix was severely indefinite - signal a need to retreat
+                        log::warn!(
+                            "Severely indefinite Hessian detected in gradient (min_eig={:.2e}); returning robust retreat gradient.",
+                            min_eig
                         );
-                        let mut grad_total_view =
-                            workspace.grad_secondary.slice_mut(s![..lambdas.len()]);
-                        grad_total_view.fill(0.0);
-                        for k in 0..lambdas.len() {
-                            let h = 1e-3_f64 * (1.0 + p[k].abs());
-                            if h == 0.0 {
-                                continue;
-                            }
-                            workspace.rho_plus.assign(p);
-                            workspace.rho_plus[k] += h;
-                            workspace.rho_minus.assign(p);
-                            workspace.rho_minus[k] -= h;
-                            let cost_plus = self.compute_cost(&workspace.rho_plus)?;
-                            let cost_minus = self.compute_cost(&workspace.rho_minus)?;
-                            grad_total_view[k] = (cost_plus - cost_minus) / (2.0 * h);
-                        }
-                        return Ok(grad_total_view.to_owned());
+                        // Generate an informed retreat direction based on current parameters
+                        let retreat_grad = p.mapv(|v| -(v.abs() + 1.0));
+                        return Ok(retreat_grad);
                     }
+                }
 
-                    // Three-term gradient computation following mgcv gdi1
-                    // for k in 0..lambdas.len() {
-                    //   We'll calculate s_k_beta for all cases, as it's needed for both paths
-                    //   For Identity link, this is all we need due to envelope theorem
-                    //   For other links, we'll use it to compute dβ/dρ_k
+                // --- Extract common components ---
 
-                    //   Use transformed penalty matrix for consistent gradient calculation
-                    //   let s_k_beta = reparam_result.rs_transformed[k].dot(beta);
+                let n = self.y.len() as f64;
 
-                    // For the Gaussian/REML case, the Envelope Theorem applies: at the P-IRLS optimum,
-                    // the indirect derivative through β cancels out for the deviance part, leaving only
-                    // the direct penalty term derivative. This simplification is not available for
-                    // non-Gaussian models where the weight matrix depends on β.
+                // Implement Wood (2011) exact REML/LAML gradient formulas
+                // Reference: gam.fit3.R line 778: REML1 <- oo$D1/(2*scale*gamma) + oo$trA1/2 - rp$det1/2
 
-                    // factor_g already computed above; reuse it for trace terms
+                match self
+                    .config
+                    .link_function()
+                    .expect("link_function called on survival model")
+                {
+                    LinkFunction::Identity => {
+                        // GAUSSIAN REML GRADIENT - Wood (2011) Section 6.6.1
 
-                    // When the penalized deviance collapses to the numerical floor, the Hessian
-                    // can become so ill-conditioned that the analytic ½·log|H| derivative loses
-                    // fidelity.  Switch to an exact finite-difference evaluation in that regime
-                    // to match the cost function.
-                    let use_numeric_logh = dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH;
-                    let numeric_logh_grad = if use_numeric_logh {
-                        eprintln!(
-                            "[REML WARNING] Switching ½·log|H| gradient to numeric finite differences; dp_c={:.3e}.",
-                            dp_c
-                        );
-                        Some(self.numeric_half_logh_grad_with_workspace(p, workspace)?)
-                    } else {
-                        None
-                    };
+                        // Calculate scale parameter using the regular REML profiling
+                        // φ = D_p / (n - M_p), where M_p is the penalty nullspace dimension.
+                        let rss = pirls_result.deviance;
 
-                    workspace.reset_block_ranges();
-                    let mut total_rank = 0;
-                    for rt in rs_transposed {
-                        let cols = rt.ncols();
-                        workspace.block_ranges.push((total_rank, total_rank + cols));
-                        total_rank += cols;
-                    }
-                    workspace.solved_rows = h_eff.nrows();
+                        // Use stable penalty term calculated in P-IRLS
+                        let penalty = pirls_result.stable_penalty_term;
+                        let dp = rss + penalty; // Penalized deviance (a.k.a. D_p)
+                        let (dp_c, dp_c_grad) = smooth_floor_dp(dp);
 
-                    if numeric_logh_grad.is_none() && total_rank > 0 {
-                        workspace.concat.fill(0.0);
-                        let rows = h_eff.nrows();
-                        for ((start, end), rt) in
-                            workspace.block_ranges.iter().zip(rs_transposed.iter())
-                        {
-                            if *end > *start {
-                                workspace
-                                    .concat
-                                    .slice_mut(s![..rows, *start..*end])
-                                    .assign(rt);
-                            }
-                        }
-                        let rows = h_eff.nrows();
-                        let cols = total_rank;
-                        {
-                            let mut solved_slice = workspace.solved.slice_mut(s![..rows, ..cols]);
-                            solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                            if let Some(slice) = solved_slice.as_slice_mut() {
-                                let mut solved_view =
-                                    faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                factor_g.solve_in_place(solved_view.as_mut());
-                            } else {
-                                let mut temp =
-                                    faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                factor_g.solve_in_place(temp.as_mut());
-                                for j in 0..cols {
-                                    for i in 0..rows {
-                                        solved_slice[(i, j)] = temp[(i, j)];
-                                    }
+                        let factor_g = self.get_faer_factor(p, h_eff);
+                        let penalty_rank = pirls_result.reparam_result.e_transformed.nrows();
+                        let mp = self.layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+                        let scale = dp_c / (n - mp).max(LAML_RIDGE);
+
+                        if dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH {
+                            eprintln!(
+                                "[REML WARNING] Penalized deviance {:.3e} near DP_FLOOR; using central differences for entire gradient.",
+                                dp_c
+                            );
+                            let mut grad_total_view =
+                                workspace.grad_secondary.slice_mut(s![..lambdas.len()]);
+                            grad_total_view.fill(0.0);
+                            for k in 0..lambdas.len() {
+                                let h = 1e-3_f64 * (1.0 + p[k].abs());
+                                if h == 0.0 {
+                                    continue;
                                 }
+                                workspace.rho_plus.assign(p);
+                                workspace.rho_plus[k] += h;
+                                workspace.rho_minus.assign(p);
+                                workspace.rho_minus[k] -= h;
+                                let cost_plus = self.compute_cost(&workspace.rho_plus)?;
+                                let cost_minus = self.compute_cost(&workspace.rho_minus)?;
+                                grad_total_view[k] = (cost_plus - cost_minus) / (2.0 * h);
                             }
+                            return Ok(grad_total_view.to_owned());
                         }
-                        workspace.solved_rows = rows;
-                    } else {
-                        workspace.solved_rows = 0;
-                    }
 
-                    let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
-                    let det1_values = &det1_values;
-                    let beta_ref = beta_transformed;
-                    let solved_rows = workspace.solved_rows;
-                    let block_ranges_ref = &workspace.block_ranges;
-                    let solved_ref = &workspace.solved;
-                    let concat_ref = &workspace.concat;
-                    let compute_gaussian_grad = |k: usize| -> f64 {
-                        let r_k = &rs_transformed[k];
-                        // Avoid forming S_k: compute S_k β = Rᵀ (R β)
-                        let r_beta = r_k.dot(beta_ref);
-                        let s_k_beta_transformed = r_k.t().dot(&r_beta);
+                        // Three-term gradient computation following mgcv gdi1
+                        // for k in 0..lambdas.len() {
+                        //   We'll calculate s_k_beta for all cases, as it's needed for both paths
+                        //   For Identity link, this is all we need due to envelope theorem
+                        //   For other links, we'll use it to compute dβ/dρ_k
 
-                        // Component 1: derivative of the penalized deviance.
-                        // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
-                        let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
-                        let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
+                        //   Use transformed penalty matrix for consistent gradient calculation
+                        //   let s_k_beta = reparam_result.rs_transformed[k].dot(beta);
 
-                        // Component 2: derivative of the penalized Hessian determinant.
-                        let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
-                            g[k]
-                        } else if solved_rows > 0 {
-                            let (start, end) = block_ranges_ref[k];
-                            if end > start {
-                                let solved_block = solved_ref.slice(s![..solved_rows, start..end]);
-                                let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
-                                let trace_h_inv_s_k = kahan_sum(
-                                    solved_block
-                                        .iter()
-                                        .zip(rt_block.iter())
-                                        .map(|(&x, &y)| x * y),
-                                );
-                                let tra1 = lambdas[k] * trace_h_inv_s_k;
-                                tra1 / 2.0
-                            } else {
-                                0.0
-                            }
+                        // For the Gaussian/REML case, the Envelope Theorem applies: at the P-IRLS optimum,
+                        // the indirect derivative through β cancels out for the deviance part, leaving only
+                        // the direct penalty term derivative. This simplification is not available for
+                        // non-Gaussian models where the weight matrix depends on β.
+
+                        // factor_g already computed above; reuse it for trace terms
+
+                        // When the penalized deviance collapses to the numerical floor, the Hessian
+                        // can become so ill-conditioned that the analytic ½·log|H| derivative loses
+                        // fidelity.  Switch to an exact finite-difference evaluation in that regime
+                        // to match the cost function.
+                        let use_numeric_logh = dp_c <= DP_FLOOR + DP_FLOOR_SMOOTH_WIDTH;
+                        let numeric_logh_grad = if use_numeric_logh {
+                            eprintln!(
+                                "[REML WARNING] Switching ½·log|H| gradient to numeric finite differences; dp_c={:.3e}.",
+                                dp_c
+                            );
+                            Some(self.numeric_half_logh_grad_with_workspace(p, workspace)?)
                         } else {
-                            0.0
+                            None
                         };
 
-                        // Component 3: derivative of the penalty pseudo-determinant.
-                        let log_det_s_grad_term = 0.5 * det1_values[k];
-
-                        deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
-                    };
-
-                    let mut gaussian_grad = Vec::with_capacity(lambdas.len());
-                    for k in 0..lambdas.len() {
-                        gaussian_grad.push(compute_gaussian_grad(k));
-                    }
-                    workspace
-                        .cost_gradient_view(len)
-                        .assign(&Array1::from_vec(gaussian_grad));
-                }
-                _ => {
-                    // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
-                    // Replace FD with implicit differentiation for logit models.
-                    // When Firth bias reduction is enabled, the inner objective is:
-                    //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
-                    //                 + 0.5 * log|X' W(beta) X|
-                    // with W depending on beta (logit: w_i = mu_i (1 - mu_i)).
-                    // Stationarity: grad_beta L* = 0, so the implicit derivative uses
-                    // H_total = X' W X + S_lambda - d^2/d beta^2 (0.5 * log|X' W X|).
-                    //
-                    // Exact Firth derivatives (let K = (X' W X)^{-1}):
-                    //   Phi(beta) = 0.5 * log|X' W X|
-                    //   grad Phi_j = 0.5 * tr(K X' (dW/d beta_j) X)
-                    //             = 0.5 * sum_i h_i * (d w_i / d eta_i) * x_ij
-                    //   where h_i = x_i' K x_i (leverages in weighted space).
-                    //
-                    //   Hessian:
-                    //     d^2 Phi / (d beta_j d beta_l) =
-                    //       -0.5 * tr(K X' (dW/d beta_l) X K X' (dW/d beta_j) X)
-                    //       +0.5 * sum_i h_i * (d^2 w_i / d eta_i^2) * x_ij * x_il
-                    //
-                    // This curvature enters H_total and therefore d beta_hat / d rho_k.
-                    // Our analytic LAML gradient uses H_pen = X' W X + S_lambda only,
-                    // so it is inconsistent with the Firth-adjusted objective unless
-                    // we add H_phi. Below we compute H_phi and use H_total for the
-                    // implicit solve (d beta_hat / d rho). If that fails, we fall
-                    // back to H_pen for stability.
-                    if !matches!(
-                        self.config.link_function().expect("link_function called on survival model"),
-                        LinkFunction::Logit
-                    ) {
-                        let g_pll = self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
-                        let g_half_logh =
-                            self.numeric_half_logh_grad_with_workspace(p, workspace)?;
-                        let det1_full = det1_values.clone();
-                        let mut laml_grad = Vec::with_capacity(lambdas.len());
-                        for k in 0..lambdas.len() {
-                            let gradient_value =
-                                g_pll[k] + g_half_logh[k] - 0.5 * det1_full[k];
-                            laml_grad.push(gradient_value);
-                        }
-                        workspace
-                            .cost_gradient_view(len)
-                            .assign(&Array1::from_vec(laml_grad));
-                        // Continue to prior-gradient adjustment below.
-                    } else {
-                        let k_count = lambdas.len();
-                        let det1_values = &det1_values;
-                        let mut laml_grad = Vec::with_capacity(k_count);
-                        let beta_ref = beta_transformed;
-                        let mut beta_terms = Array1::<f64>::zeros(k_count);
-                        for k in 0..k_count {
-                            let r_k = &rs_transformed[k];
-                            let r_beta = r_k.dot(beta_ref);
-                            let s_k_beta = r_k.t().dot(&r_beta);
-                            beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
-                        }
-
-                        // Use the stabilized Hessian factorization for the log|H| trace term.
-                        let factor_g = self.get_faer_factor(p, h_eff);
-                        let mut factor_imp: Option<FaerFactor> = None;
-                        if self.config.firth_bias_reduction {
-                            let x_dense = match &pirls_result.x_transformed {
-                                DesignMatrix::Dense(x_dense) => x_dense.clone(),
-                                DesignMatrix::Sparse(x_sparse) => {
-                                    let dense = x_sparse.as_ref().to_dense();
-                                    Array2::from_shape_fn(
-                                        (dense.nrows(), dense.ncols()),
-                                        |(i, j)| dense[(i, j)],
-                                    )
-                                }
-                            };
-                            match self.firth_hessian_logit(&x_dense, &pirls_result.solve_mu) {
-                                Ok(h_phi) => {
-                                    let mut h_total = h_eff.to_owned();
-                                    h_total -= &h_phi;
-                                    for i in 0..h_total.nrows() {
-                                        for j in 0..i {
-                                            let v = 0.5 * (h_total[[i, j]] + h_total[[j, i]]);
-                                            h_total[[i, j]] = v;
-                                            h_total[[j, i]] = v;
-                                        }
-                                    }
-                                    factor_imp = Some(self.factorize_faer(&h_total));
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "Firth Hessian computation failed; falling back to H_pen in implicit solve: {:?}",
-                                        err
-                                    );
-                                }
-                            }
-                        }
-
-                        // Compute trace(H^{-1} S_k) using the same reparameterized penalty
-                        // blocks as the Gaussian path. This is the partial derivative
-                        // ∂/∂ρ_k (0.5 log|H|) with β held fixed; the β-dependence is handled
-                        // separately via the implicit correction term to avoid double counting.
                         workspace.reset_block_ranges();
                         let mut total_rank = 0;
                         for rt in rs_transposed {
@@ -6224,7 +6123,9 @@ pub mod internal {
                             workspace.block_ranges.push((total_rank, total_rank + cols));
                             total_rank += cols;
                         }
-                        if total_rank > 0 {
+                        workspace.solved_rows = h_eff.nrows();
+
+                        if numeric_logh_grad.is_none() && total_rank > 0 {
                             workspace.concat.fill(0.0);
                             let rows = h_eff.nrows();
                             for ((start, end), rt) in
@@ -6258,197 +6159,38 @@ pub mod internal {
                                     }
                                 }
                             }
-                            workspace.solved_rows = h_eff.nrows();
+                            workspace.solved_rows = rows;
                         } else {
                             workspace.solved_rows = 0;
                         }
 
-                        let residual_grad = {
-                            let eta = pirls_result
-                                .solve_mu
-                                .mapv(|m| logit_from_prob(m));
-                            let working_residual = &eta - &pirls_result.solve_working_response;
-                            let weighted_residual =
-                                &pirls_result.solve_weights * &working_residual;
-                            let gradient_data = pirls_result
-                                .x_transformed
-                                .transpose_vector_multiply(&weighted_residual);
-                            let s_beta = reparam_result.s_transformed.dot(beta_ref);
-                            // If PIRLS added a stabilization ridge, the objective being
-                            // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
-                            // therefore gains + ridge * β, which must be included here
-                            // so the implicit correction matches the stabilized objective.
-                            if ridge_used > 0.0 {
-                                gradient_data + s_beta + beta_ref.mapv(|v| ridge_used * v)
-                            } else {
-                                gradient_data + s_beta
-                            }
-                        };
+                        let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
+                        let det1_values = &det1_values;
+                        let beta_ref = beta_transformed;
+                        let solved_rows = workspace.solved_rows;
+                        let block_ranges_ref = &workspace.block_ranges;
+                        let solved_ref = &workspace.solved;
+                        let concat_ref = &workspace.concat;
+                        let compute_gaussian_grad = |k: usize| -> f64 {
+                            let r_k = &rs_transformed[k];
+                            // Avoid forming S_k: compute S_k β = Rᵀ (R β)
+                            let r_beta = r_k.dot(beta_ref);
+                            let s_k_beta_transformed = r_k.t().dot(&r_beta);
 
-                        // Exact LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
-                        //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
-                        // For logit, H = Xᵀ W X + S and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
-                        // so ∂log|H|/∂β = Xᵀ (k ∘ w') with k_i = x_iᵀ H^{-1} x_i.
-                        // We include 0.5 * Xᵀ (k ∘ w') to make the implicit gradient exact.
-                        let logh_beta_grad = if let LinkFunction::Logit = self
-                            .config
-                            .link_function()
-                            .expect("link_function called on survival model")
-                        {
-                            let mu = &pirls_result.solve_mu;
-                            let n = mu.len();
-                            if n == 0 {
-                                None
-                            } else {
-                                let mut w_prime = Array1::<f64>::zeros(n);
-                                for i in 0..n {
-                                    let mu_i = mu[i];
-                                    let w_base = mu_i * (1.0 - mu_i);
-                                    w_prime[i] = self.weights[i] * w_base * (1.0 - 2.0 * mu_i);
-                                }
+                            // Component 1: derivative of the penalized deviance.
+                            // For Gaussian models, the Envelope Theorem simplifies this to only the penalty term.
+                            let d1 = lambdas[k] * beta_ref.dot(&s_k_beta_transformed);
+                            let deviance_grad_term = dp_c_grad * (d1 / (2.0 * scale));
 
-                                let mut leverage = Array1::<f64>::zeros(n);
-                                let chunk_cols = 1024usize;
-                                match &pirls_result.x_transformed {
-                                    DesignMatrix::Dense(x_dense) => {
-                                        let p_dim = x_dense.ncols();
-                                        for chunk_start in (0..n).step_by(chunk_cols) {
-                                            let chunk_end = (chunk_start + chunk_cols).min(n);
-                                            let width = chunk_end - chunk_start;
-                                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                            for (local, row_idx) in
-                                                (chunk_start..chunk_end).enumerate()
-                                            {
-                                                rhs
-                                                    .column_mut(local)
-                                                    .assign(&x_dense.row(row_idx));
-                                            }
-                                            let rhs_view = FaerArrayView::new(&rhs);
-                                            let sol = factor_g.solve(rhs_view.as_ref());
-                                            for local in 0..width {
-                                                let row_idx = chunk_start + local;
-                                                let mut acc = 0.0;
-                                                for j in 0..p_dim {
-                                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                                                }
-                                                leverage[row_idx] = acc;
-                                            }
-                                        }
-                                    }
-                                    DesignMatrix::Sparse(x_sparse) => {
-                                        let p_dim = x_sparse.ncols();
-                                        let csr_opt = x_sparse.as_ref().to_row_major().ok();
-                                        if let Some(x_csr) = csr_opt {
-                                            let symbolic = x_csr.symbolic();
-                                            let values = x_csr.val();
-                                            let row_ptr = symbolic.row_ptr();
-                                            let col_idx = symbolic.col_idx();
-                                            for chunk_start in (0..n).step_by(chunk_cols) {
-                                                let chunk_end =
-                                                    (chunk_start + chunk_cols).min(n);
-                                                let width = chunk_end - chunk_start;
-                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let start = row_ptr[row_idx];
-                                                    let end = row_ptr[row_idx + 1];
-                                                    for idx in start..end {
-                                                        let col = col_idx[idx];
-                                                        rhs[(col, local)] = values[idx];
-                                                    }
-                                                }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = factor_g.solve(rhs_view.as_ref());
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let mut acc = 0.0;
-                                                    let start = row_ptr[row_idx];
-                                                    let end = row_ptr[row_idx + 1];
-                                                    for idx in start..end {
-                                                        let col = col_idx[idx];
-                                                        acc += values[idx] * sol[(col, local)];
-                                                    }
-                                                    leverage[row_idx] = acc;
-                                                }
-                                            }
-                                        } else {
-                                            let x_dense = x_sparse.as_ref().to_dense();
-                                            let x_dense = Array2::from_shape_fn(
-                                                (x_dense.nrows(), x_dense.ncols()),
-                                                |(i, j)| x_dense[(i, j)],
-                                            );
-                                            let p_dim = x_dense.ncols();
-                                            for chunk_start in (0..n).step_by(chunk_cols) {
-                                                let chunk_end =
-                                                    (chunk_start + chunk_cols).min(n);
-                                                let width = chunk_end - chunk_start;
-                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    rhs
-                                                        .column_mut(local)
-                                                        .assign(&x_dense.row(row_idx));
-                                                }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = factor_g.solve(rhs_view.as_ref());
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let mut acc = 0.0;
-                                                    for j in 0..p_dim {
-                                                        acc +=
-                                                            x_dense[[row_idx, j]] * sol[(j, local)];
-                                                    }
-                                                    leverage[row_idx] = acc;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let mut weight_vec = Array1::<f64>::zeros(n);
-                                for i in 0..n {
-                                    weight_vec[i] = leverage[i] * w_prime[i];
-                                }
-                                Some(pirls_result.x_transformed.transpose_vector_multiply(&weight_vec))
-                            }
-                        } else {
-                            None
-                        };
-
-                        let mut grad_beta = residual_grad.clone();
-                        if let Some(logh_grad) = logh_beta_grad {
-                            grad_beta += &(0.5 * logh_grad);
-                        }
-
-                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
-                            let rhs_view = FaerColView::new(&grad_beta);
-                            let solved = match &factor_imp {
-                                Some(factor) => factor.solve(rhs_view.as_ref()),
-                                None => factor_g.solve(rhs_view.as_ref()),
-                            };
-                            let mut delta = Array1::zeros(grad_beta.len());
-                            for i in 0..delta.len() {
-                                delta[i] = solved[(i, 0)];
-                            }
-                            Some(delta)
-                        } else {
-                            None
-                        };
-
-                        for k in 0..k_count {
-                            let log_det_h_grad_term = if workspace.solved_rows > 0 {
-                                let (start, end) = workspace.block_ranges[k];
+                            // Component 2: derivative of the penalized Hessian determinant.
+                            let log_det_h_grad_term = if let Some(g) = numeric_logh_grad_ref {
+                                g[k]
+                            } else if solved_rows > 0 {
+                                let (start, end) = block_ranges_ref[k];
                                 if end > start {
-                                    let solved_block = workspace
-                                        .solved
-                                        .slice(s![..workspace.solved_rows, start..end]);
-                                    let rt_block = workspace
-                                        .concat
-                                        .slice(s![..workspace.solved_rows, start..end]);
+                                    let solved_block =
+                                        solved_ref.slice(s![..solved_rows, start..end]);
+                                    let rt_block = concat_ref.slice(s![..solved_rows, start..end]);
                                     let trace_h_inv_s_k = kahan_sum(
                                         solved_block
                                             .iter()
@@ -6463,26 +6205,570 @@ pub mod internal {
                             } else {
                                 0.0
                             };
+
+                            // Component 3: derivative of the penalty pseudo-determinant.
                             let log_det_s_grad_term = 0.5 * det1_values[k];
-                            let mut gradient_value =
-                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
-                            if let Some(delta_ref) = delta_opt.as_ref() {
-                                let r_k = &rs_transformed[k];
-                                let r_beta = r_k.dot(beta_ref);
-                                let s_k_beta = r_k.t().dot(&r_beta);
-                                let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
-                                // Indirect term from chain rule: -(H^{-1} g)^T (∂S/∂ρ_k β) = -δᵀ u_k.
-                                let correction = -1.0 * delta_ref.dot(&u_k);
-                                gradient_value += correction;
-                            }
-                            laml_grad.push(gradient_value);
+
+                            deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
+                        };
+
+                        let mut gaussian_grad = Vec::with_capacity(lambdas.len());
+                        for k in 0..lambdas.len() {
+                            gaussian_grad.push(compute_gaussian_grad(k));
                         }
                         workspace
                             .cost_gradient_view(len)
-                            .assign(&Array1::from_vec(laml_grad));
+                            .assign(&Array1::from_vec(gaussian_grad));
+                    }
+                    _ => {
+                        // NON-GAUSSIAN LAML GRADIENT - Wood (2011) Appendix D
+                        // Replace FD with implicit differentiation for logit models.
+                        // When Firth bias reduction is enabled, the inner objective is:
+                        //   L*(beta, rho) = l(beta) - 0.5 * beta' S_lambda beta
+                        //                 + 0.5 * log|X' W(beta) X|
+                        // with W depending on beta (logit: w_i = mu_i (1 - mu_i)).
+                        // Stationarity: grad_beta L* = 0, so the implicit derivative uses
+                        // H_total = X' W X + S_lambda - d^2/d beta^2 (0.5 * log|X' W X|).
+                        //
+                        // Exact Firth derivatives (let K = (X' W X)^{-1}):
+                        //   Phi(beta) = 0.5 * log|X' W X|
+                        //   grad Phi_j = 0.5 * tr(K X' (dW/d beta_j) X)
+                        //             = 0.5 * sum_i h_i * (d w_i / d eta_i) * x_ij
+                        //   where h_i = x_i' K x_i (leverages in weighted space).
+                        //
+                        //   Hessian:
+                        //     d^2 Phi / (d beta_j d beta_l) =
+                        //       -0.5 * tr(K X' (dW/d beta_l) X K X' (dW/d beta_j) X)
+                        //       +0.5 * sum_i h_i * (d^2 w_i / d eta_i^2) * x_ij * x_il
+                        //
+                        // This curvature enters H_total and therefore d beta_hat / d rho_k.
+                        // Our analytic LAML gradient uses H_pen = X' W X + S_lambda only,
+                        // so it is inconsistent with the Firth-adjusted objective unless
+                        // we add H_phi. Below we compute H_phi and use H_total for the
+                        // implicit solve (d beta_hat / d rho). If that fails, we fall
+                        // back to H_pen for stability.
+                        if !matches!(
+                            self.config
+                                .link_function()
+                                .expect("link_function called on survival model"),
+                            LinkFunction::Logit
+                        ) {
+                            let g_pll =
+                                self.numeric_penalised_ll_grad_with_workspace(p, workspace)?;
+                            let g_half_logh =
+                                self.numeric_half_logh_grad_with_workspace(p, workspace)?;
+                            let det1_full = det1_values.clone();
+                            let mut laml_grad = Vec::with_capacity(lambdas.len());
+                            for k in 0..lambdas.len() {
+                                let gradient_value = g_pll[k] + g_half_logh[k] - 0.5 * det1_full[k];
+                                laml_grad.push(gradient_value);
+                            }
+                            workspace
+                                .cost_gradient_view(len)
+                                .assign(&Array1::from_vec(laml_grad));
+                            // Continue to prior-gradient adjustment below.
+                        } else {
+                            let k_count = lambdas.len();
+                            let det1_values = &det1_values;
+                            let mut laml_grad = Vec::with_capacity(k_count);
+                            let beta_ref = beta_transformed;
+                            let mut beta_terms = Array1::<f64>::zeros(k_count);
+                            for k in 0..k_count {
+                                let r_k = &rs_transformed[k];
+                                let r_beta = r_k.dot(beta_ref);
+                                let s_k_beta = r_k.t().dot(&r_beta);
+                                beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+                            }
+
+                            // Use the stabilized Hessian factorization for the log|H| trace term.
+                            let factor_g = self.get_faer_factor(p, h_eff);
+                            let mut factor_imp: Option<FaerFactor> = None;
+                            if self.config.firth_bias_reduction {
+                                let x_dense = match &pirls_result.x_transformed {
+                                    DesignMatrix::Dense(x_dense) => x_dense.clone(),
+                                    DesignMatrix::Sparse(x_sparse) => {
+                                        let dense = x_sparse.as_ref().to_dense();
+                                        Array2::from_shape_fn(
+                                            (dense.nrows(), dense.ncols()),
+                                            |(i, j)| dense[(i, j)],
+                                        )
+                                    }
+                                };
+                                match self.firth_hessian_logit(&x_dense, &pirls_result.solve_mu) {
+                                    Ok(h_phi) => {
+                                        let mut h_total = h_eff.to_owned();
+                                        h_total -= &h_phi;
+                                        for i in 0..h_total.nrows() {
+                                            for j in 0..i {
+                                                let v = 0.5 * (h_total[[i, j]] + h_total[[j, i]]);
+                                                h_total[[i, j]] = v;
+                                                h_total[[j, i]] = v;
+                                            }
+                                        }
+                                        factor_imp = Some(self.factorize_faer(&h_total));
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Firth Hessian computation failed; falling back to H_pen in implicit solve: {:?}",
+                                            err
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Compute trace(H^{-1} S_k) using the same reparameterized penalty
+                            // blocks as the Gaussian path. This is the partial derivative
+                            // ∂/∂ρ_k (0.5 log|H|) with β held fixed; the β-dependence is handled
+                            // separately via the implicit correction term to avoid double counting.
+                            workspace.reset_block_ranges();
+                            let mut total_rank = 0;
+                            for rt in rs_transposed {
+                                let cols = rt.ncols();
+                                workspace.block_ranges.push((total_rank, total_rank + cols));
+                                total_rank += cols;
+                            }
+                            if total_rank > 0 {
+                                workspace.concat.fill(0.0);
+                                let rows = h_eff.nrows();
+                                for ((start, end), rt) in
+                                    workspace.block_ranges.iter().zip(rs_transposed.iter())
+                                {
+                                    if *end > *start {
+                                        workspace
+                                            .concat
+                                            .slice_mut(s![..rows, *start..*end])
+                                            .assign(rt);
+                                    }
+                                }
+                                let rows = h_eff.nrows();
+                                let cols = total_rank;
+                                {
+                                    let mut solved_slice =
+                                        workspace.solved.slice_mut(s![..rows, ..cols]);
+                                    solved_slice
+                                        .assign(&workspace.concat.slice(s![..rows, ..cols]));
+                                    if let Some(slice) = solved_slice.as_slice_mut() {
+                                        let mut solved_view =
+                                            faer::MatMut::from_row_major_slice_mut(
+                                                slice, rows, cols,
+                                            );
+                                        factor_g.solve_in_place(solved_view.as_mut());
+                                    } else {
+                                        let mut temp = faer::Mat::from_fn(rows, cols, |i, j| {
+                                            solved_slice[(i, j)]
+                                        });
+                                        factor_g.solve_in_place(temp.as_mut());
+                                        for j in 0..cols {
+                                            for i in 0..rows {
+                                                solved_slice[(i, j)] = temp[(i, j)];
+                                            }
+                                        }
+                                    }
+                                }
+                                workspace.solved_rows = h_eff.nrows();
+                            } else {
+                                workspace.solved_rows = 0;
+                            }
+
+                            let residual_grad = {
+                                let eta = pirls_result.solve_mu.mapv(|m| logit_from_prob(m));
+                                let working_residual = &eta - &pirls_result.solve_working_response;
+                                let weighted_residual =
+                                    &pirls_result.solve_weights * &working_residual;
+                                let gradient_data = pirls_result
+                                    .x_transformed
+                                    .transpose_vector_multiply(&weighted_residual);
+                                let s_beta = reparam_result.s_transformed.dot(beta_ref);
+                                // If PIRLS added a stabilization ridge, the objective being
+                                // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
+                                // therefore gains + ridge * β, which must be included here
+                                // so the implicit correction matches the stabilized objective.
+                                if ridge_used > 0.0 {
+                                    gradient_data + s_beta + beta_ref.mapv(|v| ridge_used * v)
+                                } else {
+                                    gradient_data + s_beta
+                                }
+                            };
+
+                            // Exact LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
+                            //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
+                            // For logit, H = Xᵀ W X + S and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
+                            // so ∂log|H|/∂β = Xᵀ (k ∘ w') with k_i = x_iᵀ H^{-1} x_i.
+                            // We include 0.5 * Xᵀ (k ∘ w') to make the implicit gradient exact.
+                            let logh_beta_grad = if let LinkFunction::Logit = self
+                                .config
+                                .link_function()
+                                .expect("link_function called on survival model")
+                            {
+                                let mu = &pirls_result.solve_mu;
+                                let n = mu.len();
+                                if n == 0 {
+                                    None
+                                } else {
+                                    let mut w_prime = Array1::<f64>::zeros(n);
+                                    for i in 0..n {
+                                        let mu_i = mu[i];
+                                        let w_base = mu_i * (1.0 - mu_i);
+                                        w_prime[i] = self.weights[i] * w_base * (1.0 - 2.0 * mu_i);
+                                    }
+
+                                    let mut leverage = Array1::<f64>::zeros(n);
+                                    let chunk_cols = 1024usize;
+                                    match &pirls_result.x_transformed {
+                                        DesignMatrix::Dense(x_dense) => {
+                                            let p_dim = x_dense.ncols();
+                                            for chunk_start in (0..n).step_by(chunk_cols) {
+                                                let chunk_end = (chunk_start + chunk_cols).min(n);
+                                                let width = chunk_end - chunk_start;
+                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                                                for (local, row_idx) in
+                                                    (chunk_start..chunk_end).enumerate()
+                                                {
+                                                    rhs.column_mut(local)
+                                                        .assign(&x_dense.row(row_idx));
+                                                }
+                                                let rhs_view = FaerArrayView::new(&rhs);
+                                                let sol = factor_g.solve(rhs_view.as_ref());
+                                                for local in 0..width {
+                                                    let row_idx = chunk_start + local;
+                                                    let mut acc = 0.0;
+                                                    for j in 0..p_dim {
+                                                        acc +=
+                                                            x_dense[[row_idx, j]] * sol[(j, local)];
+                                                    }
+                                                    leverage[row_idx] = acc;
+                                                }
+                                            }
+                                        }
+                                        DesignMatrix::Sparse(x_sparse) => {
+                                            let p_dim = x_sparse.ncols();
+                                            let csr_opt = x_sparse.as_ref().to_row_major().ok();
+                                            if let Some(x_csr) = csr_opt {
+                                                let symbolic = x_csr.symbolic();
+                                                let values = x_csr.val();
+                                                let row_ptr = symbolic.row_ptr();
+                                                let col_idx = symbolic.col_idx();
+                                                for chunk_start in (0..n).step_by(chunk_cols) {
+                                                    let chunk_end =
+                                                        (chunk_start + chunk_cols).min(n);
+                                                    let width = chunk_end - chunk_start;
+                                                    let mut rhs =
+                                                        Array2::<f64>::zeros((p_dim, width));
+                                                    for (local, row_idx) in
+                                                        (chunk_start..chunk_end).enumerate()
+                                                    {
+                                                        let start = row_ptr[row_idx];
+                                                        let end = row_ptr[row_idx + 1];
+                                                        for idx in start..end {
+                                                            let col = col_idx[idx];
+                                                            rhs[(col, local)] = values[idx];
+                                                        }
+                                                    }
+                                                    let rhs_view = FaerArrayView::new(&rhs);
+                                                    let sol = factor_g.solve(rhs_view.as_ref());
+                                                    for (local, row_idx) in
+                                                        (chunk_start..chunk_end).enumerate()
+                                                    {
+                                                        let mut acc = 0.0;
+                                                        let start = row_ptr[row_idx];
+                                                        let end = row_ptr[row_idx + 1];
+                                                        for idx in start..end {
+                                                            let col = col_idx[idx];
+                                                            acc += values[idx] * sol[(col, local)];
+                                                        }
+                                                        leverage[row_idx] = acc;
+                                                    }
+                                                }
+                                            } else {
+                                                let x_dense = x_sparse.as_ref().to_dense();
+                                                let x_dense = Array2::from_shape_fn(
+                                                    (x_dense.nrows(), x_dense.ncols()),
+                                                    |(i, j)| x_dense[(i, j)],
+                                                );
+                                                let p_dim = x_dense.ncols();
+                                                for chunk_start in (0..n).step_by(chunk_cols) {
+                                                    let chunk_end =
+                                                        (chunk_start + chunk_cols).min(n);
+                                                    let width = chunk_end - chunk_start;
+                                                    let mut rhs =
+                                                        Array2::<f64>::zeros((p_dim, width));
+                                                    for (local, row_idx) in
+                                                        (chunk_start..chunk_end).enumerate()
+                                                    {
+                                                        rhs.column_mut(local)
+                                                            .assign(&x_dense.row(row_idx));
+                                                    }
+                                                    let rhs_view = FaerArrayView::new(&rhs);
+                                                    let sol = factor_g.solve(rhs_view.as_ref());
+                                                    for (local, row_idx) in
+                                                        (chunk_start..chunk_end).enumerate()
+                                                    {
+                                                        let mut acc = 0.0;
+                                                        for j in 0..p_dim {
+                                                            acc += x_dense[[row_idx, j]]
+                                                                * sol[(j, local)];
+                                                        }
+                                                        leverage[row_idx] = acc;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let mut weight_vec = Array1::<f64>::zeros(n);
+                                    for i in 0..n {
+                                        weight_vec[i] = leverage[i] * w_prime[i];
+                                    }
+                                    Some(
+                                        pirls_result
+                                            .x_transformed
+                                            .transpose_vector_multiply(&weight_vec),
+                                    )
+                                }
+                            } else {
+                                None
+                            };
+
+                            let firth_beta_grad = if self.config.firth_bias_reduction
+                                && matches!(
+                                    self.config
+                                        .link_function()
+                                        .expect("link_function called on survival model"),
+                                    LinkFunction::Logit
+                                ) {
+                                let x_orig = self.x();
+                                let weights = &pirls_result.solve_weights;
+                                let mu = &pirls_result.solve_mu;
+
+                                let n = x_orig.nrows();
+                                let p_dim = x_orig.ncols();
+
+                                if n == 0 || p_dim == 0 {
+                                    None
+                                } else {
+                                    let mut fisher = Array2::<f64>::zeros((p_dim, p_dim));
+                                    for i in 0..n {
+                                        let wi = weights[i].max(0.0);
+                                        if wi == 0.0 {
+                                            continue;
+                                        }
+
+                                        let xi = x_orig.row(i);
+                                        for j in 0..p_dim {
+                                            let xij = xi[j];
+                                            if xij == 0.0 {
+                                                continue;
+                                            }
+                                            for k in 0..p_dim {
+                                                let xik = xi[k];
+                                                if xik == 0.0 {
+                                                    continue;
+                                                }
+                                                fisher[[j, k]] += wi * xij * xik;
+                                            }
+                                        }
+                                    }
+
+                                    for d in 0..p_dim {
+                                        fisher[[d, d]] += 1e-8;
+                                    }
+
+                                    match fisher.cholesky(Side::Lower) {
+                                        Ok(chol) => {
+                                            let l = chol.lower_triangular();
+                                            let mut grad = Array1::<f64>::zeros(p_dim);
+
+                                            for i in 0..n {
+                                                let mu_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                                                let wi = weights[i].max(1e-10);
+                                                let sqrt_w = wi.sqrt();
+                                                let xi = x_orig.row(i);
+
+                                                let mut v = Array1::<f64>::zeros(p_dim);
+                                                for j in 0..p_dim {
+                                                    let mut sum = sqrt_w * xi[j];
+                                                    for k in 0..j {
+                                                        sum -= l[[j, k]] * v[k];
+                                                    }
+                                                    v[j] = sum / l[[j, j]].max(1e-15);
+                                                }
+
+                                                let h_ii: f64 = v.iter().map(|x| x * x).sum();
+                                                let firth_score = h_ii * (0.5 - mu_i);
+                                                for j in 0..p_dim {
+                                                    grad[j] += firth_score * xi[j];
+                                                }
+                                            }
+
+                                            Some(grad)
+                                        }
+                                        Err(err) => {
+                                            log::warn!(
+                                                "Firth Fisher factorization failed; omitting Jeffreys gradient: {:?}",
+                                                err
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let firth_beta_grad = if self.config.firth_bias_reduction
+                                && matches!(
+                                    self.config
+                                        .link_function()
+                                        .expect("link_function called on survival model"),
+                                    LinkFunction::Logit
+                                )
+                            {
+                                let x_orig = self.x();
+                                let weights = &pirls_result.solve_weights;
+                                let mu = &pirls_result.solve_mu;
+
+                                let n = x_orig.nrows();
+                                let p_dim = x_orig.ncols();
+
+                                if n == 0 || p_dim == 0 {
+                                    None
+                                } else {
+                                    let mut fisher = Array2::<f64>::zeros((p_dim, p_dim));
+                                    for i in 0..n {
+                                        let wi = weights[i].max(0.0);
+                                        if wi == 0.0 {
+                                            continue;
+                                        }
+
+                                        let xi = x_orig.row(i);
+                                        for j in 0..p_dim {
+                                            let xij = xi[j];
+                                            if xij == 0.0 {
+                                                continue;
+                                            }
+                                            for k in 0..p_dim {
+                                                let xik = xi[k];
+                                                if xik == 0.0 {
+                                                    continue;
+                                                }
+                                                fisher[[j, k]] += wi * xij * xik;
+                                            }
+                                        }
+                                    }
+
+                                    for d in 0..p_dim {
+                                        fisher[[d, d]] += 1e-8;
+                                    }
+
+                                    match fisher.cholesky(Side::Lower) {
+                                        Ok(chol) => {
+                                            let l = chol.lower_triangular();
+                                            let mut grad = Array1::<f64>::zeros(p_dim);
+
+                                            for i in 0..n {
+                                                let mu_i = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                                                let wi = weights[i].max(1e-10);
+                                                let sqrt_w = wi.sqrt();
+                                                let xi = x_orig.row(i);
+
+                                                let mut v = Array1::<f64>::zeros(p_dim);
+                                                for j in 0..p_dim {
+                                                    let mut sum = sqrt_w * xi[j];
+                                                    for k in 0..j {
+                                                        sum -= l[[j, k]] * v[k];
+                                                    }
+                                                    v[j] = sum / l[[j, j]].max(1e-15);
+                                                }
+
+                                                let h_ii: f64 = v.iter().map(|x| x * x).sum();
+                                                let firth_score = h_ii * (0.5 - mu_i);
+                                                for j in 0..p_dim {
+                                                    grad[j] += firth_score * xi[j];
+                                                }
+                                            }
+
+                                            Some(grad)
+                                        }
+                                        Err(err) => {
+                                            log::warn!(
+                                                "Firth Fisher factorization failed; omitting Jeffreys gradient: {:?}",
+                                                err
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let mut grad_beta = residual_grad.clone();
+                            if let Some(logh_grad) = logh_beta_grad {
+                                grad_beta += &(0.5 * logh_grad);
+                            }
+                            if let Some(firth_grad) = firth_beta_grad {
+                                grad_beta += &firth_grad;
+                            }
+
+                            let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
+                                let rhs_view = FaerColView::new(&grad_beta);
+                                let solved = match &factor_imp {
+                                    Some(factor) => factor.solve(rhs_view.as_ref()),
+                                    None => factor_g.solve(rhs_view.as_ref()),
+                                };
+                                let mut delta = Array1::zeros(grad_beta.len());
+                                for i in 0..delta.len() {
+                                    delta[i] = solved[(i, 0)];
+                                }
+                                Some(delta)
+                            } else {
+                                None
+                            };
+
+                            for k in 0..k_count {
+                                let log_det_h_grad_term = if workspace.solved_rows > 0 {
+                                    let (start, end) = workspace.block_ranges[k];
+                                    if end > start {
+                                        let solved_block = workspace
+                                            .solved
+                                            .slice(s![..workspace.solved_rows, start..end]);
+                                        let rt_block = workspace
+                                            .concat
+                                            .slice(s![..workspace.solved_rows, start..end]);
+                                        let trace_h_inv_s_k = kahan_sum(
+                                            solved_block
+                                                .iter()
+                                                .zip(rt_block.iter())
+                                                .map(|(&x, &y)| x * y),
+                                        );
+                                        let tra1 = lambdas[k] * trace_h_inv_s_k;
+                                        tra1 / 2.0
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                };
+                                let log_det_s_grad_term = 0.5 * det1_values[k];
+                                let mut gradient_value =
+                                    0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
+                                if let Some(delta_ref) = delta_opt.as_ref() {
+                                    let r_k = &rs_transformed[k];
+                                    let r_beta = r_k.dot(beta_ref);
+                                    let s_k_beta = r_k.t().dot(&r_beta);
+                                    let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                                    // Indirect term from chain rule: -(H^{-1} g)^T (∂S/∂ρ_k β) = -δᵀ u_k.
+                                    let correction = -1.0 * delta_ref.dot(&u_k);
+                                    gradient_value += correction;
+                                }
+                                laml_grad.push(gradient_value);
+                            }
+                            workspace
+                                .cost_gradient_view(len)
+                                .assign(&Array1::from_vec(laml_grad));
+                        }
                     }
                 }
-            }
 
                 let (_, prior_grad_view) = workspace.soft_prior_cost_and_grad(p);
                 let prior_grad = prior_grad_view.to_owned();
@@ -10351,8 +10637,8 @@ pub mod internal {
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
                     mcmc_enabled: false,
-                calibrator_enabled: false,
-                survival: None,
+                    calibrator_enabled: false,
+                    survival: None,
                 };
                 simple_config.model_family = ModelFamily::Gam(link_function);
                 simple_config.pgs_basis_config.num_knots = 4; // Use a reasonable number of knots
@@ -10499,8 +10785,8 @@ pub mod internal {
                     interaction_orth_alpha: std::collections::HashMap::new(),
 
                     mcmc_enabled: false,
-                calibrator_enabled: false,
-                survival: None,
+                    calibrator_enabled: false,
+                    survival: None,
                 };
 
                 // Use a simple basis with fewer knots to reduce complexity
@@ -11866,17 +12152,19 @@ mod gradient_validation_tests {
     }
     #[test]
     fn test_hmc_integration_runs() {
+        use ndarray::Array2;
+        use rand::Rng;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::Rng;
-        use ndarray::Array2;
 
         // 1. Create simple data (N=50)
         let n = 50;
         let mut rng = StdRng::seed_from_u64(42);
         let p: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
         let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
-        let y: Array1<f64> = (0..n).map(|_| if rng.gen_bool(0.5) { 1.0 } else { 0.0 }).collect(); // Random Y
+        let y: Array1<f64> = (0..n)
+            .map(|_| if rng.gen_bool(0.5) { 1.0 } else { 0.0 })
+            .collect(); // Random Y
         let weights = Array1::<f64>::ones(n);
         let pcs = Array2::<f64>::zeros((n, 0)); // No PCs
 
@@ -11899,7 +12187,7 @@ mod gradient_validation_tests {
             firth_bias_reduction: false,
             reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
             pgs_basis_config: BasisConfig {
-                num_knots: 2,  // Minimal knots for fast sampling
+                num_knots: 2, // Minimal knots for fast sampling
                 degree: 1,    // Linear spline = fewer params
             },
             pc_configs: vec![],
@@ -11922,10 +12210,13 @@ mod gradient_validation_tests {
         let model = train_model(&data, &config).expect("Training should succeed");
 
         // 4. Verify samples
-        assert!(model.mcmc_samples.is_some(), "MCMC samples should be present");
+        assert!(
+            model.mcmc_samples.is_some(),
+            "MCMC samples should be present"
+        );
         let samples = model.mcmc_samples.unwrap();
         println!("Generated MCMC samples with shape: {:?}", samples.shape());
-        
+
         let expected_config = hmc::NutsConfig::for_dimension(samples.ncols());
         let expected_rows = expected_config.n_samples * expected_config.n_chains;
         assert_eq!(
@@ -11949,11 +12240,11 @@ mod gradient_validation_tests {
     /// 4. AUC is preserved (MCMC doesn't break discrimination)
     #[test]
     fn test_mcmc_end_to_end_with_disk_io() {
+        use ndarray::Array2;
+        use rand::Rng;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
-        use rand::Rng;
         use rand_distr::{Distribution, StudentT};
-        use ndarray::Array2;
 
         // === Generate heavy-tailed data ===
         // Using Student's t with df=3 creates heavier tails than Gaussian
@@ -11977,12 +12268,12 @@ mod gradient_validation_tests {
             // PGS from heavy-tailed distribution (creates outliers)
             let pgs: f64 = t_dist.sample(&mut rng) * 0.8;
             let sex = (i % 2) as f64;
-            
+
             // True linear predictor with heavy-tailed noise
             let eta = beta_intercept + beta_pgs * pgs + beta_sex * sex;
             let noise: f64 = t_dist.sample(&mut rng) * 0.3; // Heavy-tailed noise
             let eta_noisy = eta + noise;
-            
+
             // Binary outcome via logistic
             let prob = 1.0 / (1.0 + (-eta_noisy).exp());
             let y = if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 };
@@ -12051,23 +12342,39 @@ mod gradient_validation_tests {
         let model = train_model(&data, &config).expect("Training should succeed");
 
         // === Verify structural integrity ===
-        assert!(model.mcmc_samples.is_some(), "MCMC samples should be present");
+        assert!(
+            model.mcmc_samples.is_some(),
+            "MCMC samples should be present"
+        );
         let samples = model.mcmc_samples.as_ref().unwrap();
-        println!("[MCMC E2E] Generated {} samples with {} parameters", samples.nrows(), samples.ncols());
-        
+        println!(
+            "[MCMC E2E] Generated {} samples with {} parameters",
+            samples.nrows(),
+            samples.ncols()
+        );
+
         // Variance check: chains should have moved
         let sample_std = samples.std_axis(ndarray::Axis(0), 0.0);
         let min_std = sample_std.iter().cloned().fold(f64::INFINITY, f64::min);
-        assert!(min_std > 1e-6, "MCMC chains should have non-zero variance (got min_std={:.6e})", min_std);
+        assert!(
+            min_std > 1e-6,
+            "MCMC chains should have non-zero variance (got min_std={:.6e})",
+            min_std
+        );
 
         // Finite check
-        assert!(samples.iter().all(|x| x.is_finite()), "All MCMC samples should be finite");
+        assert!(
+            samples.iter().all(|x| x.is_finite()),
+            "All MCMC samples should be finite"
+        );
 
         // === Save to disk ===
         let temp_path = std::env::temp_dir().join("gnomon_mcmc_test_model.toml");
         let temp_path_str = temp_path.to_string_lossy().to_string();
         println!("[MCMC E2E] Saving model to: {}", temp_path_str);
-        model.save(&temp_path_str).expect("Model save should succeed");
+        model
+            .save(&temp_path_str)
+            .expect("Model save should succeed");
 
         // === Load from disk ===
         println!("[MCMC E2E] Loading model from disk...");
@@ -12075,9 +12382,16 @@ mod gradient_validation_tests {
             .expect("Model load should succeed");
 
         // Verify samples survived serialization
-        assert!(loaded_model.mcmc_samples.is_some(), "MCMC samples should persist through disk I/O");
+        assert!(
+            loaded_model.mcmc_samples.is_some(),
+            "MCMC samples should persist through disk I/O"
+        );
         let loaded_samples = loaded_model.mcmc_samples.as_ref().unwrap();
-        assert_eq!(loaded_samples.shape(), samples.shape(), "Sample shape should be preserved");
+        assert_eq!(
+            loaded_samples.shape(),
+            samples.shape(),
+            "Sample shape should be preserved"
+        );
 
         // === Inference: MCMC vs MAP ===
         let p_test_arr = Array1::from_vec(p_test.clone());
@@ -12085,59 +12399,70 @@ mod gradient_validation_tests {
         let pcs_test_arr = Array2::<f64>::zeros((n_test, 0));
 
         // MCMC-based prediction (using loaded model with samples)
-        let pred_mcmc = loaded_model.predict(
-            p_test_arr.view(),
-            sex_test_arr.view(),
-            pcs_test_arr.view(),
-        ).expect("MCMC prediction should succeed");
+        let pred_mcmc = loaded_model
+            .predict(p_test_arr.view(), sex_test_arr.view(), pcs_test_arr.view())
+            .expect("MCMC prediction should succeed");
 
         // MAP prediction (strip samples to force mode-based prediction)
         let mut model_no_mcmc = loaded_model;
         model_no_mcmc.mcmc_samples = None;
-        let pred_map = model_no_mcmc.predict(
-            p_test_arr.view(),
-            sex_test_arr.view(),
-            pcs_test_arr.view(),
-        ).expect("MAP prediction should succeed");
+        let pred_map = model_no_mcmc
+            .predict(p_test_arr.view(), sex_test_arr.view(), pcs_test_arr.view())
+            .expect("MAP prediction should succeed");
 
         // === Verify predictions differ (Jensen's inequality) ===
-        let max_diff = pred_mcmc.iter()
+        let max_diff = pred_mcmc
+            .iter()
             .zip(pred_map.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        println!("[MCMC E2E] Max difference between MCMC and MAP predictions: {:.6}", max_diff);
-        assert!(max_diff > 1e-6, "MCMC and MAP predictions should differ (Jensen's inequality)");
+        println!(
+            "[MCMC E2E] Max difference between MCMC and MAP predictions: {:.6}",
+            max_diff
+        );
+        assert!(
+            max_diff > 1e-6,
+            "MCMC and MAP predictions should differ (Jensen's inequality)"
+        );
 
         // === Calculate Brier scores ===
         let y_test_arr = Array1::from_vec(y_test.clone());
-        
-        let brier_mcmc: f64 = pred_mcmc.iter()
-            .zip(y_test_arr.iter())
-            .map(|(&p, &y)| (y - p).powi(2))
-            .sum::<f64>() / n_test as f64;
 
-        let brier_map: f64 = pred_map.iter()
+        let brier_mcmc: f64 = pred_mcmc
+            .iter()
             .zip(y_test_arr.iter())
             .map(|(&p, &y)| (y - p).powi(2))
-            .sum::<f64>() / n_test as f64;
+            .sum::<f64>()
+            / n_test as f64;
+
+        let brier_map: f64 = pred_map
+            .iter()
+            .zip(y_test_arr.iter())
+            .map(|(&p, &y)| (y - p).powi(2))
+            .sum::<f64>()
+            / n_test as f64;
 
         println!("[MCMC E2E] Brier score (MCMC): {:.6}", brier_mcmc);
         println!("[MCMC E2E] Brier score (MAP):  {:.6}", brier_map);
 
         // MCMC should be competitive (may not always beat MAP due to randomness,
         // but should be close). We assert it's not dramatically worse.
-        assert!(brier_mcmc < brier_map + 0.05, 
+        assert!(
+            brier_mcmc < brier_map + 0.05,
             "MCMC Brier ({:.4}) should not be dramatically worse than MAP Brier ({:.4})",
-            brier_mcmc, brier_map);
+            brier_mcmc,
+            brier_map
+        );
 
         // === Calculate AUC (discrimination should be preserved) ===
         fn calculate_auc(y: &[f64], pred: &Array1<f64>) -> f64 {
-            let mut pairs: Vec<(f64, f64)> = y.iter().zip(pred.iter()).map(|(&y, &p)| (y, p)).collect();
+            let mut pairs: Vec<(f64, f64)> =
+                y.iter().zip(pred.iter()).map(|(&y, &p)| (y, p)).collect();
             pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            
+
             let n_pos = pairs.iter().filter(|(y, _)| *y > 0.5).count() as f64;
             let n_neg = pairs.iter().filter(|(y, _)| *y <= 0.5).count() as f64;
-            
+
             if n_pos == 0.0 || n_neg == 0.0 {
                 return 0.5; // Undefined, return chance
             }
@@ -12161,16 +12486,26 @@ mod gradient_validation_tests {
         println!("[MCMC E2E] AUC (MAP):  {:.4}", auc_map);
 
         // AUC should be similar (MCMC shouldn't hurt discrimination)
-        assert!((auc_mcmc - auc_map).abs() < 0.1,
-            "AUC difference should be small: MCMC={:.4}, MAP={:.4}", auc_mcmc, auc_map);
+        assert!(
+            (auc_mcmc - auc_map).abs() < 0.1,
+            "AUC difference should be small: MCMC={:.4}, MAP={:.4}",
+            auc_mcmc,
+            auc_map
+        );
 
         // Both AUCs should indicate some discrimination
         assert!(auc_mcmc > 0.55, "MCMC AUC should be better than chance");
         assert!(auc_map > 0.55, "MAP AUC should be better than chance");
 
         // All predictions should be valid probabilities
-        assert!(pred_mcmc.iter().all(|&p| p >= 0.0 && p <= 1.0), "MCMC predictions should be valid probabilities");
-        assert!(pred_map.iter().all(|&p| p >= 0.0 && p <= 1.0), "MAP predictions should be valid probabilities");
+        assert!(
+            pred_mcmc.iter().all(|&p| p >= 0.0 && p <= 1.0),
+            "MCMC predictions should be valid probabilities"
+        );
+        assert!(
+            pred_map.iter().all(|&p| p >= 0.0 && p <= 1.0),
+            "MAP predictions should be valid probabilities"
+        );
 
         // === Cleanup ===
         std::fs::remove_file(&temp_path).ok();
