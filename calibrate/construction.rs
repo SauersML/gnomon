@@ -2358,47 +2358,60 @@ pub fn stable_reparameterization_with_invariant(
     let (s_eigenvalues_raw, s_eigenvectors) =
         robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
 
-    let max_eigenval = s_eigenvalues_raw
+    // Use STRUCTURAL RANK to ensure consistency between log|S|_+ and log|H|.
+    //
+    // Previously, the code used a relative tolerance (max_eigenval * 1e-12) to filter
+    // eigenvalues. This caused gradient mismatches for anisotropic tensor product
+    // penalties where the eigenvalue spectrum spans 10+ orders of magnitude:
+    // - As lambda increases, the tolerance threshold rises
+    // - Valid structural modes with smaller coefficients fall below the rising threshold
+    // - These modes are dropped from log|S|_+ but remain in log|H| (Cholesky doesn't filter)
+    // - Result: FD gradient sees cost growing (via log|H|) while analytic assumes cancellation
+    //
+    // The fix: use the precomputed structural rank (penalized_rank) which is the number
+    // of non-null penalty dimensions based on the model geometry, not the current lambda.
+    // Sort eigenvalues descending and take exactly the top `penalized_rank` values.
+    
+    // Sort eigenvalues descending with their indices
+    let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
         .iter()
-        .fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tolerance = if max_eigenval > 0.0 {
-        max_eigenval * 1e-12
-    } else {
-        1e-12
-    };
-    let penalty_rank = s_eigenvalues_raw
-        .iter()
-        .filter(|&&ev| ev > tolerance)
-        .count();
+        .enumerate()
+        .map(|(i, &ev)| (i, ev))
+        .collect();
+    sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Take exactly the top `penalized_rank` eigenvalues (structural rank from invariant)
+    let structural_rank = penalized_rank.min(sorted_eigs.len());
+    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.into_iter().take(structural_rank).collect();
+    
+    // Tiny absolute floor to prevent ln(0) - we never filter structural modes
+    let ln_floor = 1e-300_f64;
 
-    let mut e_transformed_mat = Mat::<f64>::zeros(penalty_rank, p);
-    let mut row_idx = 0;
-    for (i, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            for row in 0..p {
-                e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, i)] * sqrt_eigenval;
-            }
-            row_idx += 1;
+    let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
+    for (row_idx, &(eig_idx, eigenval)) in selected_eigs.iter().enumerate() {
+        let safe_eigenval = eigenval.max(ln_floor);
+        let sqrt_eigenval = safe_eigenval.sqrt();
+        for row in 0..p {
+            e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, eig_idx)] * sqrt_eigenval;
         }
     }
 
-    let log_det: f64 = s_eigenvalues_raw
+    let log_det: f64 = selected_eigs
         .iter()
-        .filter(|&&ev| ev > tolerance)
-        .map(|&ev| ev.ln())
+        .map(|&(_, ev)| ev.max(ln_floor).ln())
         .sum();
 
     let mut det1_vec = vec![0.0; lambdas.len()];
 
+    // Build S⁺ using the selected eigenvalues (structural rank)
     let mut s_plus = Mat::<f64>::zeros(p, p);
-    for (idx, &eigenval) in s_eigenvalues_raw.iter().enumerate() {
-        if eigenval > tolerance {
+    for &(eig_idx, eigenval) in selected_eigs.iter() {
+        if eigenval > ln_floor {
             let inv = 1.0 / eigenval;
             for i in 0..p {
-                let vi = s_eigenvectors[(i, idx)];
+                let vi = s_eigenvectors[(i, eig_idx)];
                 for j in 0..p {
-                    s_plus[(i, j)] += inv * vi * s_eigenvectors[(j, idx)];
+                    s_plus[(i, j)] += inv * vi * s_eigenvectors[(j, eig_idx)];
                 }
             }
         }
