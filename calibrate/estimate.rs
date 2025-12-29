@@ -551,12 +551,30 @@ fn run_gradient_check(
             "  - (no masked per-component offenders; failing gate(s) were global)".to_string()
         };
 
+        let a_inf = g_analytic
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let f_inf = g_fd
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let near_zero = g_analytic.iter().filter(|v| v.abs() < 1e-8).count();
+
+        let collapse_hint = if a_inf < 1e-6 && f_inf > 1e-3 {
+            " (analytic ~0, FD large)"
+        } else {
+            ""
+        };
         let msg = format!(
-            "[Candidate {label}] Gradient check FAILED\nGates:\n  {}\nMask: tau_abs={:.1e}, tau_rel={:.1e} (||g||_inf={:.3e})\nOffenders (top {}):\n{}",
+            "[Candidate {label}] Gradient check FAILED\nGates:\n  {}\nMask: tau_abs={:.1e}, tau_rel={:.1e} (||g||_inf={:.3e})\nDiag: max|g_analytic|={:.3e}, max|g_fd|={:.3e}, near_zero={}/{}{}\nOffenders (top {}):\n{}",
             gates.join("\n  "),
             1e-6_f64,
             1e-3_f64 * g_inf,
             g_inf,
+            a_inf,
+            f_inf,
+            near_zero,
+            g_analytic.len(),
+            collapse_hint,
             top_k,
             offenders_str
         );
@@ -3789,11 +3807,9 @@ fn evaluate_fd_pair(
         |(min, max), &v| (min.min(v), max.max(v)),
     );
     log_lines.push(format!(
-        "[FD RIDGE] coord {coord} attempt {} rho={:+.6e} h={:.3e} \
-f(+/-0.5h)={:+.9e}/{:+.9e} f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} \
-ridge=[{:.3e},{:.3e}]",
+        "[FD RIDGE]   attempt {} h={:.3e} f(+/-0.5h)={:+.9e}/{:+.9e} \
+f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} ridge=[{:.3e},{:.3e}]",
         attempt + 1,
-        rho[coord],
         base_h,
         f_p,
         f_m,
@@ -3862,6 +3878,11 @@ fn compute_fd_gradient(
         let h_abs = 1e-5_f64;
         let mut base_h = h_rel.max(h_abs);
 
+        log_lines.push(format!(
+            "[FD RIDGE] coord {i} rho={:+.6e}",
+            rho[i]
+        ));
+
         let mut d_small = 0.0;
         let mut d_big = 0.0;
         let mut derivative: Option<f64> = None;
@@ -3878,8 +3899,8 @@ fn compute_fd_gradient(
             if same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP {
                 base_h *= 0.5;
                 log_lines.push(format!(
-                    "[FD RIDGE]    rel_gap={:.3e} > {:.2}; reducing h to {:.3e} for coordinate {}",
-                    rel_gap, FD_REL_GAP_THRESHOLD, base_h, i
+                    "[FD RIDGE]    rel_gap={:.3e} > {:.2}; h -> {:.3e}",
+                    rel_gap, FD_REL_GAP_THRESHOLD, base_h
                 ));
                 continue;
             }
@@ -3895,8 +3916,7 @@ fn compute_fd_gradient(
 
         fd_grad[i] = derivative.unwrap_or(f64::NAN);
         log_lines.push(format!(
-            "[FD RIDGE] coord {} chosen derivative = {:+.9e}",
-            i,
+            "[FD RIDGE]   chosen derivative = {:+.9e}",
             fd_grad[i]
         ));
     }
@@ -4210,16 +4230,19 @@ pub mod internal {
 
     #[derive(Clone)]
     struct GnomonKey {
-        rho: Vec<f64>,
-        smooth: Vec<f64>,
-        stab_cond: f64,
-        raw_cond: f64,
+        compact: String,
     }
 
     #[derive(Clone)]
     struct GnomonAgg {
         key: GnomonKey,
         count: u64,
+        stab_cond_min: f64,
+        stab_cond_max: f64,
+        stab_cond_last: f64,
+        raw_cond_min: f64,
+        raw_cond_max: f64,
+        raw_cond_last: f64,
         laml_min: f64,
         laml_max: f64,
         laml_last: f64,
@@ -4232,33 +4255,41 @@ pub mod internal {
     }
 
     impl GnomonKey {
+        fn new(rho: &[f64], smooth: &[f64], stab_cond: f64, raw_cond: f64) -> Self {
+            let rho_compact = format_compact_series(rho, |v| format!("{:.3}", v));
+            let smooth_compact = format_compact_series(smooth, |v| format!("{:.2e}", v));
+            let compact = format!("rho={} | smooth={}", rho_compact, smooth_compact);
+            let compact = compact.replace("-0.000", "0.000");
+            Self { compact }
+        }
+
         fn approx_eq(&self, other: &Self) -> bool {
-            approx_vec(&self.rho, &other.rho, 1e-6, 1e-9)
-                && approx_vec(&self.smooth, &other.smooth, 1e-6, 1e-9)
-                && approx_cond(self.stab_cond, other.stab_cond)
-                && approx_cond(self.raw_cond, other.raw_cond)
+            self.compact == other.compact
         }
 
         fn format_compact(&self) -> String {
-            let rho_compact = format_compact_series(&self.rho, |v| format!("{:.3}", v));
-            let smooth_compact = format_compact_series(&self.smooth, |v| format!("{:.2e}", v));
-            let stable_cond_display = format_cond(self.stab_cond);
-            let raw_cond_display = format_cond(self.raw_cond);
-            format!(
-                "rho={} | smooth={} | κ(stable/raw)={}/{}",
-                rho_compact,
-                smooth_compact,
-                stable_cond_display,
-                raw_cond_display
-            )
+            self.compact.clone()
         }
     }
 
     impl GnomonAgg {
-        fn new(key: GnomonKey, laml: f64, edf: f64, trace: f64) -> Self {
+        fn new(
+            key: GnomonKey,
+            laml: f64,
+            edf: f64,
+            trace: f64,
+            stab_cond: f64,
+            raw_cond: f64,
+        ) -> Self {
             Self {
                 key,
                 count: 1,
+                stab_cond_min: stab_cond,
+                stab_cond_max: stab_cond,
+                stab_cond_last: stab_cond,
+                raw_cond_min: raw_cond,
+                raw_cond_max: raw_cond,
+                raw_cond_last: raw_cond,
                 laml_min: laml,
                 laml_max: laml,
                 laml_last: laml,
@@ -4271,11 +4302,25 @@ pub mod internal {
             }
         }
 
-        fn update(&mut self, laml: f64, edf: f64, trace: f64) {
+        fn update(&mut self, laml: f64, edf: f64, trace: f64, stab_cond: f64, raw_cond: f64) {
             self.count += 1;
             self.laml_last = laml;
             self.edf_last = edf;
             self.trace_last = trace;
+            self.stab_cond_last = stab_cond;
+            self.raw_cond_last = raw_cond;
+            if stab_cond < self.stab_cond_min {
+                self.stab_cond_min = stab_cond;
+            }
+            if stab_cond > self.stab_cond_max {
+                self.stab_cond_max = stab_cond;
+            }
+            if raw_cond < self.raw_cond_min {
+                self.raw_cond_min = raw_cond;
+            }
+            if raw_cond > self.raw_cond_max {
+                self.raw_cond_max = raw_cond;
+            }
             if laml < self.laml_min {
                 self.laml_min = laml;
             }
@@ -4298,15 +4343,57 @@ pub mod internal {
 
         fn format_summary(&self) -> String {
             let key = self.key.format_compact();
-            let laml = format_range(self.laml_min, self.laml_max, |v| format!("{:.6e}", v));
-            let edf = format_range(self.edf_min, self.edf_max, |v| format!("{:.6}", v));
-            let trace = format_range(self.trace_min, self.trace_max, |v| format!("{:.6}", v));
-            let laml_last = format!("{:.6e}", self.laml_last);
-            let edf_last = format!("{:.6}", self.edf_last);
-            let trace_last = format!("{:.6}", self.trace_last);
+            let metric = |label: &str,
+                          min: f64,
+                          max: f64,
+                          last: f64,
+                          fmt: &dyn Fn(f64) -> String| {
+                if approx_f64(min, max, 1e-6, 1e-9) && approx_f64(min, last, 1e-6, 1e-9) {
+                    format!("{label}={}", fmt(min))
+                } else {
+                    let range = format_range(min, max, |v| fmt(v));
+                    format!("{label}={range} last={}", fmt(last))
+                }
+            };
+            let kappa = if approx_f64(self.stab_cond_min, self.stab_cond_max, 1e-6, 1e-9)
+                && approx_f64(self.raw_cond_min, self.raw_cond_max, 1e-6, 1e-9)
+                && approx_f64(self.stab_cond_min, self.stab_cond_last, 1e-6, 1e-9)
+                && approx_f64(self.raw_cond_min, self.raw_cond_last, 1e-6, 1e-9)
+            {
+                format!(
+                    "κ(stable/raw)={}/{}",
+                    format_cond(self.stab_cond_min),
+                    format_cond(self.raw_cond_min)
+                )
+            } else {
+                let stable = format_range(self.stab_cond_min, self.stab_cond_max, format_cond);
+                let raw = format_range(self.raw_cond_min, self.raw_cond_max, format_cond);
+                format!(
+                    "κ(stable/raw)={stable}/{raw} last={}/{}",
+                    format_cond(self.stab_cond_last),
+                    format_cond(self.raw_cond_last)
+                )
+            };
+            let laml = metric("LAML", self.laml_min, self.laml_max, self.laml_last, &|v| {
+                format!("{:.6e}", v)
+            });
+            let edf = metric("EDF", self.edf_min, self.edf_max, self.edf_last, &|v| {
+                format!("{:.6}", v)
+            });
+            let trace = metric(
+                "tr(H^-1 Sλ)",
+                self.trace_min,
+                self.trace_max,
+                self.trace_last,
+                &|v| format!("{:.6}", v),
+            );
+            let count = if self.count > 1 {
+                format!(" | count={}", self.count)
+            } else {
+                String::new()
+            };
             format!(
-                "{key} | count={} | LAML={laml} last={laml_last} | EDF={edf} last={edf_last} | tr(H^-1 Sλ)={trace} last={trace_last}",
-                self.count
+                "{key}{count} | {kappa} | {laml} | {edf} | {trace}",
             )
         }
     }
@@ -4315,30 +4402,32 @@ pub mod internal {
         (a - b).abs() <= abs + rel * a.abs().max(b.abs())
     }
 
-    fn approx_cond(a: f64, b: f64) -> bool {
-        if a.is_nan() && b.is_nan() {
-            true
-        } else {
-            approx_f64(a, b, 1e-6, 1e-6)
-        }
-    }
-
-    fn approx_vec(values: &[f64], other: &[f64], rel: f64, abs: f64) -> bool {
-        if values.len() != other.len() {
-            return false;
-        }
-        values
-            .iter()
-            .zip(other.iter())
-            .all(|(&a, &b)| approx_f64(a, b, rel, abs))
-    }
-
     fn format_cond(cond: f64) -> String {
         if cond.is_finite() {
-            format!("{:.3e}", cond)
+            format!("{:.2e}", cond)
         } else {
             "N/A".to_string()
         }
+    }
+
+    fn quantize_value(value: f64, rel: f64, abs: f64) -> f64 {
+        if value == 0.0 {
+            return 0.0;
+        }
+        let scale = abs.max(rel * value.abs());
+        let quantized = (value / scale).round() * scale;
+        if quantized == 0.0 {
+            0.0
+        } else {
+            quantized
+        }
+    }
+
+    fn quantize_vec(values: &[f64], rel: f64, abs: f64) -> Vec<f64> {
+        values
+            .iter()
+            .map(|&value| quantize_value(value, rel, abs))
+            .collect()
     }
 
     fn format_range<F>(min: f64, max: f64, fmt: F) -> String
@@ -4417,20 +4506,19 @@ pub mod internal {
             edf: f64,
             trace_h_inv_s_lambda: f64,
         ) {
-            const GNOMON_REPEAT_EMIT: u64 = 25;
-            let key = GnomonKey {
-                rho: rho.to_vec(),
-                smooth: lambdas.to_vec(),
-                stab_cond,
-                raw_cond,
-            };
+            const GNOMON_REPEAT_EMIT: u64 = 50;
+            let rho_q = quantize_vec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
+            let smooth_q = quantize_vec(lambdas, 5e-3, 1e-6);
+            let stab_q = quantize_value(stab_cond, 5e-3, 1e-6);
+            let raw_q = quantize_value(raw_cond, 5e-3, 1e-6);
+            let key = GnomonKey::new(&rho_q, &smooth_q, stab_q, raw_q);
 
             let mut last_opt = self.gnomon_last.borrow_mut();
             let mut repeat = self.gnomon_repeat.borrow_mut();
 
             if let Some(last) = last_opt.as_mut() {
                 if last.key.approx_eq(&key) {
-                    last.update(laml, edf, trace_h_inv_s_lambda);
+                    last.update(laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
                     *repeat += 1;
                     if *repeat >= GNOMON_REPEAT_EMIT {
                         println!("[GNOMON COST] {}", last.format_summary());
@@ -4446,9 +4534,10 @@ pub mod internal {
 
             println!(
                 "[GNOMON COST] {}",
-                GnomonAgg::new(key.clone(), laml, edf, trace_h_inv_s_lambda).format_summary()
+                GnomonAgg::new(key.clone(), laml, edf, trace_h_inv_s_lambda, stab_q, raw_q)
+                    .format_summary()
             );
-            *last_opt = Some(GnomonAgg::new(key, laml, edf, trace_h_inv_s_lambda));
+            *last_opt = Some(GnomonAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q));
             *repeat = 0;
         }
 
@@ -6344,15 +6433,15 @@ pub mod internal {
                                 None
                             } else {
                                 let mut w_prime = Array1::<f64>::zeros(n);
+                                let mut clamped = 0usize;
                                 for i in 0..n {
                                     let mu_i = mu[i];
                                     let w_base = mu_i * (1.0 - mu_i);
                                     if w_base < Self::MIN_DMU_DETA {
-                                        w_prime[i] = 0.0;
-                                    } else {
-                                        let one_minus2 = 1.0 - 2.0 * mu_i;
-                                        w_prime[i] = pirls_result.solve_weights[i] * one_minus2;
+                                        clamped += 1;
                                     }
+                                    let one_minus2 = 1.0 - 2.0 * mu_i;
+                                    w_prime[i] = pirls_result.solve_weights[i] * one_minus2;
                                 }
 
                                 let mut leverage = Array1::<f64>::zeros(n);
@@ -6407,8 +6496,8 @@ pub mod internal {
                                                         rhs[(col, local)] = values[idx];
                                                     }
                                                 }
-                                            let rhs_view = FaerArrayView::new(&rhs);
-                                            let sol = leverage_factor.solve(rhs_view.as_ref());
+                                                let rhs_view = FaerArrayView::new(&rhs);
+                                                let sol = leverage_factor.solve(rhs_view.as_ref());
                                                 for (local, row_idx) in
                                                     (chunk_start..chunk_end).enumerate()
                                                 {
@@ -6441,8 +6530,8 @@ pub mod internal {
                                                         .column_mut(local)
                                                         .assign(&x_dense.row(row_idx));
                                                 }
-                                            let rhs_view = FaerArrayView::new(&rhs);
-                                            let sol = leverage_factor.solve(rhs_view.as_ref());
+                                                let rhs_view = FaerArrayView::new(&rhs);
+                                                let sol = leverage_factor.solve(rhs_view.as_ref());
                                                 for (local, row_idx) in
                                                     (chunk_start..chunk_end).enumerate()
                                                 {
@@ -6462,17 +6551,63 @@ pub mod internal {
                                 for i in 0..n {
                                     weight_vec[i] = leverage[i] * w_prime[i];
                                 }
-                                Some(pirls_result.x_transformed.transpose_vector_multiply(&weight_vec))
+                                let logh_grad =
+                                    pirls_result.x_transformed.transpose_vector_multiply(&weight_vec);
+                                let logh_norm = logh_grad
+                                    .iter()
+                                    .map(|v| v.abs())
+                                    .fold(0.0_f64, |a, b| a.max(b));
+                                if clamped > 0 && logh_norm < 1e-8 {
+                                    eprintln!(
+                                        "[GRAD DIAG] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
+                                        clamped,
+                                        n,
+                                        logh_norm
+                                    );
+                                }
+                                Some(logh_grad)
                             }
                         } else {
                             None
                         };
 
                         let mut grad_beta = residual_grad.clone();
+                        if self.config.firth_bias_reduction {
+                            // PIRLS folds the Firth score into the working response, so
+                            // residual_grad already includes -∂Φ/∂β. The outer LAML cost,
+                            // however, also includes the explicit -Φ term. To obtain the
+                            // correct ∂V/∂β for the implicit correction we add back +∂Φ/∂β.
+                            let mut firth_weight = Array1::<f64>::zeros(pirls_result.solve_mu.len());
+                            for i in 0..pirls_result.solve_mu.len() {
+                                firth_weight[i] =
+                                    pirls_result.solve_mu[i] * (1.0 - pirls_result.solve_mu[i]);
+                            }
+                            let mut firth_score = Array1::<f64>::zeros(firth_weight.len());
+                            for i in 0..firth_weight.len() {
+                                firth_score[i] = (0.5 - pirls_result.solve_mu[i]) * firth_weight[i];
+                            }
+                            let firth_grad = pirls_result
+                                .x_transformed
+                                .transpose_vector_multiply(&firth_score);
+                            grad_beta += &firth_grad;
+                        }
                         if let Some(logh_grad) = logh_beta_grad {
-                            // dV/dβ always contributes 0.5 * ∂log|H|/∂β because the Firth
-                            // penalty lives inside penalised_ll (via log|X'WX|), not in log|H|.
+                            // At the PIRLS optimum (with or without Firth), the
+                            // residual term cancels, leaving +0.5 * ∂log|H|/∂β.
                             grad_beta += &(0.5 * logh_grad);
+                            let res_inf = residual_grad
+                                .iter()
+                                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                            let logh_inf =
+                                logh_grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                            let grad_inf =
+                                grad_beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                            if logh_inf < 1e-8 || grad_inf < 1e-8 {
+                                eprintln!(
+                                    "[GRAD DIAG] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
+                                    res_inf, logh_inf, grad_inf
+                                );
+                            }
                         }
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
@@ -6484,6 +6619,17 @@ pub mod internal {
                             let mut delta = Array1::zeros(grad_beta.len());
                             for i in 0..delta.len() {
                                 delta[i] = solved[(i, 0)];
+                            }
+                            let delta_inf =
+                                delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                            if delta_inf < 1e-8 {
+                                eprintln!(
+                                    "[GRAD DIAG] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
+                                    delta_inf,
+                                    grad_beta
+                                        .iter()
+                                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                                );
                             }
                             Some(delta)
                         } else {
@@ -6522,8 +6668,11 @@ pub mod internal {
                                 let r_beta = r_k.dot(beta_ref);
                                 let s_k_beta = r_k.t().dot(&r_beta);
                                 let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
-                                // Indirect term from chain rule: -(H^{-1} g)^T (∂S/∂ρ_k β) = -δᵀ u_k.
-                                let correction = -1.0 * delta_ref.dot(&u_k);
+                                // Indirect term from chain rule:
+                                // dβ/dρ_k = H^{-1} (∂g/∂ρ_k) with g = score - Sβ (+ Firth),
+                                // so ∂g/∂ρ_k = -S_k β and dβ/dρ_k = H^{-1} S_k β.
+                                // Hence the implicit correction is +δᵀ u_k.
+                                let correction = delta_ref.dot(&u_k);
                                 gradient_value += correction;
                             }
                             laml_grad.push(gradient_value);
