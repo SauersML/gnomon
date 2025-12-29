@@ -38,6 +38,7 @@ pub struct WorkingState {
     pub hessian: Array2<f64>,
     pub deviance: f64,
     pub penalty_term: f64,
+    pub firth_log_det: Option<f64>,
     // Ridge added to ensure positive definiteness of the penalized Hessian.
     // This is treated as an explicit penalty term (0.5 * ridge * ||beta||^2),
     // so the PIRLS objective, the Hessian used for log|H|, and the gradient
@@ -212,6 +213,7 @@ impl<'a> GamLogitWorkingModel<'a> {
             hessian,
             deviance,
             penalty_term,
+            firth_log_det: None,
             ridge_used,
         })
     }
@@ -631,6 +633,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             hessian: penalized_hessian,
             deviance,
             penalty_term,
+            firth_log_det: self.firth_log_det,
             ridge_used,
         })
     }
@@ -1025,10 +1028,21 @@ where
     let mut iterations = 0usize;
     let mut final_state: Option<WorkingState> = None;
 
+    let penalized_objective = |state: &WorkingState| {
+        let mut value = state.deviance + state.penalty_term;
+        if options.firth_bias_reduction {
+            if let Some(firth_log_det) = state.firth_log_det {
+                // Firth adds +0.5 log|I| to log-likelihood, so deviance is reduced by 2*log_det.
+                value -= 2.0 * firth_log_det;
+            }
+        }
+        value
+    };
+
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
-        let current_penalized = state.deviance + state.penalty_term;
+        let current_penalized = penalized_objective(&state);
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
         let mut direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
@@ -1060,15 +1074,10 @@ where
             let candidate_beta = Coefficients::new(&*beta + &(direction.mapv(|v| step * v)));
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
-                    let candidate_penalized =
-                        candidate_state.deviance + candidate_state.penalty_term;
-                    let accept_step = if options.firth_bias_reduction {
-                        true
-                    } else {
-                        candidate_penalized.is_finite()
-                            && (candidate_penalized <= current_penalized * (1.0 + 1e-12)
-                                || (current_penalized - candidate_penalized).abs() < 1e-12)
-                    };
+                    let candidate_penalized = penalized_objective(&candidate_state);
+                    let accept_step = candidate_penalized.is_finite()
+                        && (candidate_penalized <= current_penalized * (1.0 + 1e-12)
+                            || (current_penalized - candidate_penalized).abs() < 1e-12);
                     if accept_step {
                         break (candidate_beta, candidate_state, candidate_penalized);
                     }
@@ -1585,6 +1594,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             hessian: penalized_hessian.clone(),
             deviance,
             penalty_term,
+            firth_log_det: None,
             ridge_used,
         };
 
@@ -3730,6 +3740,7 @@ mod tests {
                 hessian,
                 deviance,
                 penalty_term: 0.0,
+                firth_log_det: None,
                 ridge_used: 0.0,
             })
         }

@@ -2651,6 +2651,7 @@ pub fn train_survival_model(
                             hessian: Array2::zeros((0, 0)),
                             deviance: 0.0,
                             penalty_term: 0.0,
+                            firth_log_det: None,
                             ridge_used: 0.0,
                         },
                         status: crate::calibrate::pirls::PirlsStatus::Converged,
