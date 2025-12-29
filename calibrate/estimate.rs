@@ -2670,6 +2670,7 @@ pub fn train_survival_model(
                             deviance: 0.0,
                             penalty_term: 0.0,
                             firth_log_det: None,
+                            firth_hat_diag: None,
                             ridge_used: 0.0,
                         },
                         status: crate::calibrate::pirls::PirlsStatus::Converged,
@@ -3771,14 +3772,23 @@ const FD_REL_GAP_THRESHOLD: f64 = 0.2;
 const FD_MIN_BASE_STEP: f64 = 1e-6;
 const FD_MAX_REFINEMENTS: usize = 4;
 
+struct FdEval {
+    f_p: f64,
+    f_m: f64,
+    f_p2: f64,
+    f_m2: f64,
+    d_small: f64,
+    d_big: f64,
+    ridge_min: f64,
+    ridge_max: f64,
+}
+
 fn evaluate_fd_pair(
     reml_state: &internal::RemlState,
     rho: &Array1<f64>,
     coord: usize,
     base_h: f64,
-    attempt: usize,
-    log_lines: &mut Vec<String>,
-) -> Result<(f64, f64), EstimationError> {
+) -> Result<FdEval, EstimationError> {
     let mut rho_p = rho.clone();
     rho_p[coord] += 0.5 * base_h;
     let mut rho_m = rho.clone();
@@ -3806,11 +3816,8 @@ fn evaluate_fd_pair(
         (f64::INFINITY, f64::NEG_INFINITY),
         |(min, max), &v| (min.min(v), max.max(v)),
     );
-    log_lines.push(format!(
-        "[FD RIDGE]   attempt {} h={:.3e} f(+/-0.5h)={:+.9e}/{:+.9e} \
-f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} ridge=[{:.3e},{:.3e}]",
-        attempt + 1,
-        base_h,
+
+    Ok(FdEval {
         f_p,
         f_m,
         f_p2,
@@ -3818,10 +3825,8 @@ f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} ridge=[{:.3e},{:.3e}]",
         d_small,
         d_big,
         ridge_min,
-        ridge_max
-    ));
-
-    Ok((d_small, d_big))
+        ridge_max,
+    })
 }
 
 fn fd_same_sign(d_small: f64, d_big: f64) -> bool {
@@ -3888,13 +3893,47 @@ fn compute_fd_gradient(
         let mut derivative: Option<f64> = None;
 
         for attempt in 0..=FD_MAX_REFINEMENTS {
-            let pair = evaluate_fd_pair(reml_state, rho, i, base_h, attempt, &mut log_lines)?;
-            d_small = pair.0;
-            d_big = pair.1;
+            let eval = evaluate_fd_pair(reml_state, rho, i, base_h)?;
+            d_small = eval.d_small;
+            d_big = eval.d_big;
 
             let denom = d_small.abs().max(d_big.abs()).max(1e-12);
             let rel_gap = (d_small - d_big).abs() / denom;
             let same_sign = fd_same_sign(d_small, d_big);
+
+            let refining = same_sign
+                && rel_gap > FD_REL_GAP_THRESHOLD
+                && base_h * 0.5 >= FD_MIN_BASE_STEP;
+            if attempt == 0 || refining || attempt == FD_MAX_REFINEMENTS {
+                if attempt == 0 {
+                    log_lines.push(format!(
+                        "[FD RIDGE]   attempt {} h={:.3e} f(+/-0.5h)={:+.9e}/{:+.9e} \
+f(+/-1h)={:+.9e}/{:+.9e} d_small={:+.9e} d_big={:+.9e} ridge=[{:.3e},{:.3e}]",
+                        attempt + 1,
+                        base_h,
+                        eval.f_p,
+                        eval.f_m,
+                        eval.f_p2,
+                        eval.f_m2,
+                        d_small,
+                        d_big,
+                        eval.ridge_min,
+                        eval.ridge_max
+                    ));
+                } else {
+                    log_lines.push(format!(
+                        "[FD RIDGE]   attempt {} h={:.3e} d_small={:+.9e} d_big={:+.9e} \
+rel_gap={:.3e} ridge=[{:.3e},{:.3e}]",
+                        attempt + 1,
+                        base_h,
+                        d_small,
+                        d_big,
+                        rel_gap,
+                        eval.ridge_min,
+                        eval.ridge_max
+                    ));
+                }
+            }
 
             if same_sign && rel_gap > FD_REL_GAP_THRESHOLD && base_h * 0.5 >= FD_MIN_BASE_STEP {
                 base_h *= 0.5;
@@ -4223,6 +4262,7 @@ pub mod internal {
         current_eval_bundle: RefCell<Option<EvalShared>>,
         gnomon_last: RefCell<Option<GnomonAgg>>,
         gnomon_repeat: RefCell<u64>,
+        gnomon_last_emit: RefCell<u64>,
         workspace: Mutex<RemlWorkspace>,
         pub(super) warm_start_beta: RefCell<Option<Coefficients>>,
         warm_start_enabled: Cell<bool>,
@@ -4258,7 +4298,10 @@ pub mod internal {
         fn new(rho: &[f64], smooth: &[f64], stab_cond: f64, raw_cond: f64) -> Self {
             let rho_compact = format_compact_series(rho, |v| format!("{:.3}", v));
             let smooth_compact = format_compact_series(smooth, |v| format!("{:.2e}", v));
-            let compact = format!("rho={} | smooth={}", rho_compact, smooth_compact);
+            let compact = format!(
+                "rho={} | smooth={} | κ(stable/raw)={:.3e}/{:.3e}",
+                rho_compact, smooth_compact, stab_cond, raw_cond
+            );
             let compact = compact.replace("-0.000", "0.000");
             Self { compact }
         }
@@ -4507,6 +4550,7 @@ pub mod internal {
             trace_h_inv_s_lambda: f64,
         ) {
             const GNOMON_REPEAT_EMIT: u64 = 50;
+            const GNOMON_MIN_EMIT_GAP: u64 = 200;
             let rho_q = quantize_vec(rho.as_slice().unwrap_or_default(), 5e-3, 1e-6);
             let smooth_q = quantize_vec(lambdas, 5e-3, 1e-6);
             let stab_q = quantize_value(stab_cond, 5e-3, 1e-6);
@@ -4515,29 +4559,38 @@ pub mod internal {
 
             let mut last_opt = self.gnomon_last.borrow_mut();
             let mut repeat = self.gnomon_repeat.borrow_mut();
+            let mut last_emit = self.gnomon_last_emit.borrow_mut();
+            let eval_idx = *self.eval_count.borrow();
 
             if let Some(last) = last_opt.as_mut() {
                 if last.key.approx_eq(&key) {
                     last.update(laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
                     *repeat += 1;
-                    if *repeat >= GNOMON_REPEAT_EMIT {
+                    if *repeat >= GNOMON_REPEAT_EMIT
+                        && eval_idx.saturating_sub(*last_emit) >= GNOMON_MIN_EMIT_GAP
+                    {
                         println!("[GNOMON COST] {}", last.format_summary());
                         *repeat = 0;
+                        *last_emit = eval_idx;
                     }
                     return;
                 }
 
-                if last.count > 1 {
+                let emit_prev = last.count > 1
+                    && eval_idx.saturating_sub(*last_emit) >= GNOMON_MIN_EMIT_GAP;
+                if emit_prev {
                     println!("[GNOMON COST] {}", last.format_summary());
+                    *last_emit = eval_idx;
                 }
             }
 
-            println!(
-                "[GNOMON COST] {}",
-                GnomonAgg::new(key.clone(), laml, edf, trace_h_inv_s_lambda, stab_q, raw_q)
-                    .format_summary()
-            );
-            *last_opt = Some(GnomonAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q));
+            let new_agg =
+                GnomonAgg::new(key, laml, edf, trace_h_inv_s_lambda, stab_q, raw_q);
+            if eval_idx.saturating_sub(*last_emit) >= GNOMON_MIN_EMIT_GAP {
+                println!("[GNOMON COST] {}", new_agg.format_summary());
+                *last_emit = eval_idx;
+            }
+            *last_opt = Some(new_agg);
             *repeat = 0;
         }
 
@@ -4550,6 +4603,7 @@ pub mod internal {
             self.current_eval_bundle.borrow_mut().take();
             self.gnomon_last.borrow_mut().take();
             *self.gnomon_repeat.borrow_mut() = 0;
+            *self.gnomon_last_emit.borrow_mut() = 0;
         }
 
         /// Compute soft prior cost without needing workspace
@@ -4671,6 +4725,7 @@ pub mod internal {
                 current_eval_bundle: RefCell::new(None),
                 gnomon_last: RefCell::new(None),
                 gnomon_repeat: RefCell::new(0),
+                gnomon_last_emit: RefCell::new(0),
                 workspace: Mutex::new(workspace),
                 warm_start_beta: RefCell::new(None),
                 warm_start_enabled: Cell::new(true),
@@ -5091,13 +5146,7 @@ pub mod internal {
             mu: &Array1<f64>,
             weights: &Array1<f64>,
         ) -> Result<Array2<f64>, EstimationError> {
-            let x_orig = self.x();
-            let n = x_orig.nrows();
-            let p = x_orig.ncols();
-            if n == 0 || p == 0 {
-                return Ok(Array2::zeros((p, p)));
-            }
-
+            let n = mu.len();
             let x_trans_dense = match x_transformed {
                 DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
                 DesignMatrix::Sparse(x_sparse) => {
@@ -5107,6 +5156,11 @@ pub mod internal {
                     })
                 }
             };
+            let n_x = x_trans_dense.nrows();
+            let p = x_trans_dense.ncols();
+            if n == 0 || p == 0 || n != n_x {
+                return Ok(Array2::zeros((p, p)));
+            }
 
             let mut w_prime = Array1::<f64>::zeros(n);
             let mut w_double = Array1::<f64>::zeros(n);
@@ -5123,7 +5177,7 @@ pub mod internal {
             }
 
             let w_sqrt = weights.mapv(|w| w.max(0.0).sqrt());
-            let mut xw = x_orig.to_owned();
+            let mut xw = x_trans_dense.clone();
             for i in 0..n {
                 let s = w_sqrt[i];
                 if s != 1.0 {
@@ -5133,7 +5187,7 @@ pub mod internal {
             let fisher = xw.t().dot(&xw);
             let factor_f = self.factorize_faer(&fisher);
 
-            let rhs = x_orig.t().to_owned();
+            let rhs = x_trans_dense.t().to_owned();
             let rhs_view = FaerArrayView::new(&rhs);
             let sol = factor_f.solve(rhs_view.as_ref());
             let mut f_inv_xt = Array2::<f64>::zeros((p, n));
@@ -5142,7 +5196,7 @@ pub mod internal {
                     f_inv_xt[(i, j)] = sol[(i, j)];
                 }
             }
-            let m = x_orig.dot(&f_inv_xt); // M = X F^{-1} X^T
+            let m = x_trans_dense.dot(&f_inv_xt); // M = X_t F^{-1} X_t^T
 
             let mut x_weighted = x_trans_dense.clone();
             for i in 0..n {
@@ -6572,29 +6626,10 @@ pub mod internal {
                         };
 
                         let mut grad_beta = residual_grad.clone();
-                        if self.config.firth_bias_reduction {
-                            // PIRLS folds the Firth score into the working response, so
-                            // residual_grad already includes -∂Φ/∂β. The outer LAML cost,
-                            // however, also includes the explicit -Φ term. To obtain the
-                            // correct ∂V/∂β for the implicit correction we add back +∂Φ/∂β.
-                            let mut firth_weight = Array1::<f64>::zeros(pirls_result.solve_mu.len());
-                            for i in 0..pirls_result.solve_mu.len() {
-                                firth_weight[i] =
-                                    pirls_result.solve_mu[i] * (1.0 - pirls_result.solve_mu[i]);
-                            }
-                            let mut firth_score = Array1::<f64>::zeros(firth_weight.len());
-                            for i in 0..firth_weight.len() {
-                                firth_score[i] = (0.5 - pirls_result.solve_mu[i]) * firth_weight[i];
-                            }
-                            let firth_grad = pirls_result
-                                .x_transformed
-                                .transpose_vector_multiply(&firth_score);
-                            grad_beta += &firth_grad;
-                        }
                         if let Some(logh_grad) = logh_beta_grad {
                             // At the PIRLS optimum (with or without Firth), the
                             // residual term cancels, leaving +0.5 * ∂log|H|/∂β.
-                            grad_beta += &(0.5 * logh_grad);
+                            grad_beta += &(0.5 * &logh_grad);
                             let res_inf = residual_grad
                                 .iter()
                                 .fold(0.0_f64, |acc, &v| acc.max(v.abs()));

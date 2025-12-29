@@ -1,8 +1,10 @@
 [build]
 rustflags = [
   "-C", "target-cpu=native",
-  "-C", "link-arg=-Wl,-ld_classic",
 ]
 
 [alias]
 build = "clippy -- -D warnings"
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "14.4"

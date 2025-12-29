@@ -39,6 +39,7 @@ pub struct WorkingState {
     pub deviance: f64,
     pub penalty_term: f64,
     pub firth_log_det: Option<f64>,
+    pub firth_hat_diag: Option<Array1<f64>>,
     // Ridge added to ensure positive definiteness of the penalized Hessian.
     // This is treated as an explicit penalty term (0.5 * ridge * ||beta||^2),
     // so the PIRLS objective, the Hessian used for log|H|, and the gradient
@@ -214,6 +215,7 @@ impl<'a> GamLogitWorkingModel<'a> {
             deviance,
             penalty_term,
             firth_log_det: None,
+            firth_hat_diag: None,
             ridge_used,
         })
     }
@@ -558,6 +560,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
+        let mut firth_hat_diag: Option<Array1<f64>> = None;
         if self.firth_bias_reduction {
             let (hat_diag, half_log_det) = match (&self.x_original_sparse, &self.x_original_csr) {
                 (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
@@ -574,6 +577,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 )?,
             };
             self.firth_log_det = Some(half_log_det);
+            firth_hat_diag = Some(hat_diag.clone());
             for i in 0..self.last_z.len() {
                 let wi = weights[i];
                 if wi > 0.0 {
@@ -634,6 +638,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             deviance,
             penalty_term,
             firth_log_det: self.firth_log_det,
+            firth_hat_diag,
             ridge_used,
         })
     }
@@ -1346,6 +1351,8 @@ pub struct PirlsResult {
     /// Optional Jeffreys prior log-determinant contribution (½ log |H|) when
     /// Firth bias reduction is active.
     pub firth_log_det: Option<f64>,
+    /// Optional hat diagonal from the Fisher information (Firth).
+    pub firth_hat_diag: Option<Array1<f64>>,
 
     // The final IRLS weights at convergence
     pub final_weights: Array1<f64>,
@@ -1595,6 +1602,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             deviance,
             penalty_term,
             firth_log_det: None,
+            firth_hat_diag: None,
             ridge_used,
         };
 
@@ -1619,6 +1627,7 @@ pub fn fit_model_for_fixed_rho<'a>(
             edf,
             stable_penalty_term: penalty_term,
             firth_log_det: None,
+            firth_hat_diag: None,
             final_weights: prior_weights_owned.clone(),
             final_mu: final_mu.clone(),
             solve_weights: prior_weights_owned,
@@ -1775,6 +1784,7 @@ pub fn fit_model_for_fixed_rho<'a>(
         edf,
         stable_penalty_term: penalty_term,
         firth_log_det,
+        firth_hat_diag: working_summary.state.firth_hat_diag.clone(),
         final_weights: final_weights.clone(),
         final_mu: final_mu.clone(),
         solve_weights: final_weights.clone(),
@@ -3741,6 +3751,7 @@ mod tests {
                 deviance,
                 penalty_term: 0.0,
                 firth_log_det: None,
+                firth_hat_diag: None,
                 ridge_used: 0.0,
             })
         }
