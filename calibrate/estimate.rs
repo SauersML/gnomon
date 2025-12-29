@@ -6192,6 +6192,10 @@ pub mod internal {
                                 .x_transformed
                                 .transpose_vector_multiply(&weighted_residual);
                             let s_beta = reparam_result.s_transformed.dot(beta_ref);
+                            // When Firth bias reduction is active, the working response already
+                            // includes the Jeffreys adjustment via the hat diagonal. That means
+                            // the Firth score term is embedded in this residual gradient; do not
+                            // add any extra ∂log|I|/∂β term here or it will be double-counted.
                             // If PIRLS added a stabilization ridge, the objective being
                             // optimized is l_p(β) - 0.5 * ridge * ||β||². The gradient
                             // therefore gains + ridge * β, which must be included here
