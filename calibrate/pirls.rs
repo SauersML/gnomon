@@ -557,30 +557,19 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let weights = self.last_weights.clone();
         let mu = self.last_mu.clone();
         if self.firth_bias_reduction {
-            let x_transformed = self.x_transformed.as_ref().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Firth bias reduction requires an explicit transformed design".to_string(),
-                )
-            })?;
-            let (hat_diag, half_log_det) = match (x_transformed, &self.x_csr) {
-                (DesignMatrix::Dense(matrix), _) => compute_firth_hat_and_half_logdet(
-                    matrix.view(),
-                    self.x_original_dense,
-                    weights.view(),
-                    &mut self.workspace,
-                )?,
-                (DesignMatrix::Sparse(_), Some(csr)) => {
+            let (hat_diag, half_log_det) = match (&self.x_original_sparse, &self.x_original_csr) {
+                (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
                     compute_firth_hat_and_half_logdet_sparse(
                         csr,
                         self.x_original_dense,
                         weights.view(),
                     )?
                 }
-                (DesignMatrix::Sparse(_), None) => {
-                    return Err(EstimationError::InvalidInput(
-                        "missing CSR cache for Firth computation".to_string(),
-                    ));
-                }
+                _ => compute_firth_hat_and_half_logdet(
+                    self.x_original_dense,
+                    weights.view(),
+                    &mut self.workspace,
+                )?,
             };
             self.firth_log_det = Some(half_log_det);
             for i in 0..self.last_z.len() {
@@ -860,14 +849,14 @@ fn compute_hessian_sparse(
 }
 
 fn compute_firth_hat_and_half_logdet_sparse(
-    x_transformed: &SparseRowMat<usize, f64>,
+    x_original_csr: &SparseRowMat<usize, f64>,
     x_original: ArrayView2<f64>,
     weights: ArrayView1<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    let n = x_transformed.nrows();
-    let p = x_transformed.ncols();
+    let n = x_original_csr.nrows();
+    let p = x_original_csr.ncols();
 
-    let xtwx_transformed = compute_hessian_sparse(x_transformed, &weights.to_owned())?;
+    let xtwx_transformed = compute_hessian_sparse(x_original_csr, &weights.to_owned())?;
     let mut stabilized = xtwx_transformed;
     for i in 0..p {
         for j in 0..i {
@@ -916,7 +905,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let h_inv_arr = identity;
 
     let mut hat_diag = Array1::<f64>::zeros(n);
-    let x_view = x_transformed.as_ref();
+    let x_view = x_original_csr.as_ref();
     for i in 0..n {
         let w = weights[i];
         if w <= 0.0 {
@@ -1733,8 +1722,14 @@ pub fn fit_model_for_fixed_rho<'a>(
         }
     }
     if matches!(status, PirlsStatus::MaxIterationsReached) && firth_active {
-        if working_summary.state.deviance.is_finite() && working_summary.max_abs_eta < 30.0 {
-            // Firth keeps logits bounded; accept stable finite solutions even if gradients stall.
+        let dev_scale = working_summary.state.deviance.abs().max(1.0);
+        let dev_tol = options.convergence_tolerance * dev_scale;
+        let step_floor = options.min_step_size * 2.0;
+        if working_summary.last_deviance_change.abs() <= dev_tol
+            || working_summary.last_step_size <= step_floor
+        {
+            // Firth-adjusted fits can stall; accept when the objective stops changing
+            // or steps have shrunk to the minimum scale.
             status = PirlsStatus::StalledAtValidMinimum;
             working_summary.status = status.clone();
         }
@@ -5042,22 +5037,21 @@ mod tests {
 /// This mirrors the outer objective/gradient stabilization (H_eff = H or H + c I),
 /// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
 fn compute_firth_hat_and_half_logdet(
-    x_transformed: ArrayView2<f64>,
     x_original: ArrayView2<f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    let n = x_transformed.nrows();
-    let p = x_transformed.ncols();
+    let n = x_original.nrows();
+    let p = x_original.ncols();
 
     workspace
         .sqrt_w
         .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
-    if workspace.wx.dim() != x_transformed.dim() {
-        workspace.wx = Array2::zeros(x_transformed.dim());
+    if workspace.wx.dim() != x_original.dim() {
+        workspace.wx = Array2::zeros(x_original.dim());
     }
-    workspace.wx.assign(&x_transformed);
+    workspace.wx.assign(&x_original);
     workspace.wx *= &sqrt_w_col;
 
     let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
