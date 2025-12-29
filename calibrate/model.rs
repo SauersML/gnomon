@@ -183,7 +183,9 @@ impl ModelConfig {
         ModelConfig {
             model_family: ModelFamily::Gam(link),
             penalty_order: 2,
-            convergence_tolerance: 1e-6,
+            // Align PIRLS tolerance with external REML tolerance to avoid over-iterating
+            // on small calibrator fits where the outer loop is already coarse.
+            convergence_tolerance: reml_tol,
             max_iterations: 500,
             reml_convergence_tolerance: reml_tol,
             reml_max_iterations: reml_max_iter as u64,

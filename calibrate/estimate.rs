@@ -51,7 +51,7 @@ use crate::calibrate::visualizer;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
-    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, FaerQr,
+    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
 };
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
@@ -4949,108 +4949,40 @@ pub mod internal {
             Ok(g_view.to_owned())
         }
 
-        fn firth_hessian_logit(
+        fn numeric_laml_grad_with_workspace(
             &self,
-            x: &Array2<f64>,
-            mu: &Array1<f64>,
-        ) -> Result<Array2<f64>, EstimationError> {
-            let n = x.nrows();
-            let p = x.ncols();
-            if n == 0 || p == 0 {
-                return Ok(Array2::zeros((p, p)));
+            rho: &Array1<f64>,
+            workspace: &mut RemlWorkspace,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let len = rho.len();
+            if len == 0 {
+                return Ok(Array1::zeros(0));
             }
 
-            let mut w_raw = Array1::<f64>::zeros(n);
-            let mut alpha = Array1::<f64>::zeros(n);
-            let mut delta = Array1::<f64>::zeros(n);
-            let mut gamma = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mu_i = mu[i].clamp(1e-8, 1.0 - 1e-8);
-                let w_i = mu_i * (1.0 - mu_i);
-                let one_minus2 = 1.0 - 2.0 * mu_i;
-                w_raw[i] = w_i;
-                alpha[i] = 0.5 * one_minus2;
-                delta[i] = w_i * one_minus2;
-                gamma[i] = -w_i;
+            let mut g_view = workspace.grad_secondary.slice_mut(s![..len]);
+            g_view.fill(0.0);
+
+            for k in 0..len {
+                let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
+                let h_abs = 1e-5_f64;
+                let h = h_rel.max(h_abs);
+
+                workspace.rho_plus.assign(rho);
+                workspace.rho_plus[k] += 0.5 * h;
+                workspace.rho_minus.assign(rho);
+                workspace.rho_minus[k] -= 0.5 * h;
+
+                let fp = self.compute_cost(&workspace.rho_plus)?
+                    - self.compute_soft_prior_cost(&workspace.rho_plus);
+                let fm = self.compute_cost(&workspace.rho_minus)?
+                    - self.compute_soft_prior_cost(&workspace.rho_minus);
+                g_view[k] = (fp - fm) / h;
             }
 
-            let mut xw = x.to_owned();
-            for i in 0..n {
-                let scale = w_raw[i].sqrt();
-                if scale == 0.0 {
-                    continue;
-                }
-                xw.row_mut(i).mapv_inplace(|v| v * scale);
-            }
-            let (q, _) = xw.qr().map_err(EstimationError::EigendecompositionFailed)?;
-            let q_cols = q.ncols();
-
-            let mut h = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mut acc = 0.0;
-                for k in 0..q_cols {
-                    let v = q[[i, k]];
-                    acc += v * v;
-                }
-                h[i] = acc;
-            }
-
-            let mut term1 = Array2::<f64>::zeros((p, p));
-            for i in 0..n {
-                let weight = h[i] * gamma[i];
-                if weight == 0.0 {
-                    continue;
-                }
-                for j in 0..p {
-                    let xij = x[[i, j]];
-                    for l in 0..p {
-                        term1[[j, l]] += weight * xij * x[[i, l]];
-                    }
-                }
-            }
-
-            let rs_dim = q_cols * q_cols;
-            let mut a_mat = Array2::<f64>::zeros((p, rs_dim));
-            let mut d_mat = Array2::<f64>::zeros((p, rs_dim));
-            for i in 0..n {
-                let w_i = w_raw[i];
-                if w_i == 0.0 {
-                    continue;
-                }
-                let inv_sqrt = 1.0 / w_i.sqrt();
-                let a_scale = alpha[i] * inv_sqrt;
-                let d_scale = delta[i] * inv_sqrt;
-                let mut q_outer = vec![0.0; rs_dim];
-                for r in 0..q_cols {
-                    let qir = q[[i, r]];
-                    for s in 0..q_cols {
-                        q_outer[r * q_cols + s] = qir * q[[i, s]];
-                    }
-                }
-                for j in 0..p {
-                    let xij = x[[i, j]];
-                    if xij == 0.0 {
-                        continue;
-                    }
-                    for idx in 0..rs_dim {
-                        let v = q_outer[idx];
-                        a_mat[[j, idx]] += xij * a_scale * v;
-                        d_mat[[j, idx]] += xij * d_scale * v;
-                    }
-                }
-            }
-
-            let term2 = a_mat.dot(&d_mat.t());
-            let mut h_phi = term1 - term2;
-            for i in 0..p {
-                for j in 0..i {
-                    let v = 0.5 * (h_phi[[i, j]] + h_phi[[j, i]]);
-                    h_phi[[i, j]] = v;
-                    h_phi[[j, i]] = v;
-                }
-            }
-            Ok(h_phi)
+            Ok(g_view.to_owned())
         }
+
+        const MIN_DMU_DETA: f64 = 1e-6;
 
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
@@ -5434,8 +5366,8 @@ pub mod internal {
                         pirls_result.reparam_result.log_det,
                     )?;
 
-                    // Log-determinant of the penalized Hessian: use the EFFECTIVE Hessian
-                    // that will also be used in the gradient calculation
+                    // Log-determinant of the penalized Hessian.
+                    // Keep cost/gradient consistent by using the same stabilized H as the gradient.
                     let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
                         let min_eig = h_eff
                             .clone()
@@ -6165,6 +6097,23 @@ pub mod internal {
                             .assign(&Array1::from_vec(laml_grad));
                         // Continue to prior-gradient adjustment below.
                     } else {
+                    let use_numeric_firth =
+                        self.config.firth_bias_reduction && self.layout.penalty_map.is_empty();
+                    let clamp_nonsmooth = self.config.firth_bias_reduction
+                        && pirls_result
+                            .solve_mu
+                            .iter()
+                            .any(|&mu| mu * (1.0 - mu) < Self::MIN_DMU_DETA);
+                    if use_numeric_firth || clamp_nonsmooth {
+                        // When IRLS clamps weights or for tiny external fits, the objective is
+                        // effectively non-smooth in β. Use a full numeric LAML derivative to
+                        // stay consistent with the cost surface.
+                        let g_laml = self.numeric_laml_grad_with_workspace(p, workspace)?;
+                        workspace
+                            .cost_gradient_view(len)
+                            .assign(&g_laml);
+                        // Continue to prior-gradient adjustment below.
+                    } else {
                         let k_count = lambdas.len();
                         let det1_values = &det1_values;
                         let mut laml_grad = Vec::with_capacity(k_count);
@@ -6179,39 +6128,7 @@ pub mod internal {
 
                         // Use the stabilized Hessian factorization for the log|H| trace term.
                         let factor_g = self.get_faer_factor(p, h_eff);
-                        let mut factor_imp: Option<FaerFactor> = None;
-                        if self.config.firth_bias_reduction {
-                            let x_dense = match &pirls_result.x_transformed {
-                                DesignMatrix::Dense(x_dense) => x_dense.clone(),
-                                DesignMatrix::Sparse(x_sparse) => {
-                                    let dense = x_sparse.as_ref().to_dense();
-                                    Array2::from_shape_fn(
-                                        (dense.nrows(), dense.ncols()),
-                                        |(i, j)| dense[(i, j)],
-                                    )
-                                }
-                            };
-                            match self.firth_hessian_logit(&x_dense, &pirls_result.solve_mu) {
-                                Ok(h_phi) => {
-                                    let mut h_total = h_eff.to_owned();
-                                    h_total -= &h_phi;
-                                    for i in 0..h_total.nrows() {
-                                        for j in 0..i {
-                                            let v = 0.5 * (h_total[[i, j]] + h_total[[j, i]]);
-                                            h_total[[i, j]] = v;
-                                            h_total[[j, i]] = v;
-                                        }
-                                    }
-                                    factor_imp = Some(self.factorize_faer(&h_total));
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "Firth Hessian computation failed; falling back to H_pen in implicit solve: {:?}",
-                                        err
-                                    );
-                                }
-                            }
-                        }
+                        let factor_imp: Option<FaerFactor> = None;
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
                         // blocks as the Gaussian path. This is the partial derivative
@@ -6243,14 +6160,15 @@ pub mod internal {
                                 let mut solved_slice =
                                     workspace.solved.slice_mut(s![..rows, ..cols]);
                                 solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
+                                let factor_ref = factor_imp.as_ref().unwrap_or(&factor_g);
                                 if let Some(slice) = solved_slice.as_slice_mut() {
                                     let mut solved_view =
                                         faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_g.solve_in_place(solved_view.as_mut());
+                                    factor_ref.solve_in_place(solved_view.as_mut());
                                 } else {
                                     let mut temp =
                                         faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                    factor_g.solve_in_place(temp.as_mut());
+                                    factor_ref.solve_in_place(temp.as_mut());
                                     for j in 0..cols {
                                         for i in 0..rows {
                                             solved_slice[(i, j)] = temp[(i, j)];
@@ -6304,11 +6222,17 @@ pub mod internal {
                                 for i in 0..n {
                                     let mu_i = mu[i];
                                     let w_base = mu_i * (1.0 - mu_i);
-                                    w_prime[i] = self.weights[i] * w_base * (1.0 - 2.0 * mu_i);
+                                    if w_base < Self::MIN_DMU_DETA {
+                                        w_prime[i] = 0.0;
+                                    } else {
+                                        let one_minus2 = 1.0 - 2.0 * mu_i;
+                                        w_prime[i] = pirls_result.solve_weights[i] * one_minus2;
+                                    }
                                 }
 
                                 let mut leverage = Array1::<f64>::zeros(n);
                                 let chunk_cols = 1024usize;
+                                let leverage_factor = factor_imp.as_ref().unwrap_or(&factor_g);
                                 match &pirls_result.x_transformed {
                                     DesignMatrix::Dense(x_dense) => {
                                         let p_dim = x_dense.ncols();
@@ -6324,7 +6248,7 @@ pub mod internal {
                                                     .assign(&x_dense.row(row_idx));
                                             }
                                             let rhs_view = FaerArrayView::new(&rhs);
-                                            let sol = factor_g.solve(rhs_view.as_ref());
+                                            let sol = leverage_factor.solve(rhs_view.as_ref());
                                             for local in 0..width {
                                                 let row_idx = chunk_start + local;
                                                 let mut acc = 0.0;
@@ -6358,8 +6282,8 @@ pub mod internal {
                                                         rhs[(col, local)] = values[idx];
                                                     }
                                                 }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = factor_g.solve(rhs_view.as_ref());
+                                            let rhs_view = FaerArrayView::new(&rhs);
+                                            let sol = leverage_factor.solve(rhs_view.as_ref());
                                                 for (local, row_idx) in
                                                     (chunk_start..chunk_end).enumerate()
                                                 {
@@ -6392,8 +6316,8 @@ pub mod internal {
                                                         .column_mut(local)
                                                         .assign(&x_dense.row(row_idx));
                                                 }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = factor_g.solve(rhs_view.as_ref());
+                                            let rhs_view = FaerArrayView::new(&rhs);
+                                            let sol = leverage_factor.solve(rhs_view.as_ref());
                                                 for (local, row_idx) in
                                                     (chunk_start..chunk_end).enumerate()
                                                 {
@@ -6421,6 +6345,8 @@ pub mod internal {
 
                         let mut grad_beta = residual_grad.clone();
                         if let Some(logh_grad) = logh_beta_grad {
+                            // dV/dβ always contributes 0.5 * ∂log|H|/∂β because the Firth
+                            // penalty lives inside penalised_ll (via log|X'WX|), not in log|H|.
                             grad_beta += &(0.5 * logh_grad);
                         }
 
@@ -6480,6 +6406,7 @@ pub mod internal {
                         workspace
                             .cost_gradient_view(len)
                             .assign(&Array1::from_vec(laml_grad));
+                        }
                     }
                 }
             }
@@ -6509,7 +6436,9 @@ pub mod internal {
             // No final negation is needed.
 
             // One-direction secant test (cheap FD validation)
-            if let Some(gradient_snapshot) = gradient_snapshot {
+            if let Some(gradient_snapshot) = gradient_snapshot
+                && !self.layout.penalty_map.is_empty()
+            {
                 let h = 1e-4;
                 let mut direction = Array1::zeros(p.len());
                 if let Some(dir0) = direction.get_mut(0) {

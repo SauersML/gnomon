@@ -567,15 +567,15 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     matrix.view(),
                     self.x_original_dense,
                     weights.view(),
-                    &self.s_transformed,
                     &mut self.workspace,
                 )?,
-                (DesignMatrix::Sparse(_), Some(csr)) => compute_firth_hat_and_half_logdet_sparse(
-                    csr,
-                    self.x_original_dense,
-                    weights.view(),
-                    &self.s_transformed,
-                )?,
+                (DesignMatrix::Sparse(_), Some(csr)) => {
+                    compute_firth_hat_and_half_logdet_sparse(
+                        csr,
+                        self.x_original_dense,
+                        weights.view(),
+                    )?
+                }
                 (DesignMatrix::Sparse(_), None) => {
                     return Err(EstimationError::InvalidInput(
                         "missing CSR cache for Firth computation".to_string(),
@@ -863,23 +863,21 @@ fn compute_firth_hat_and_half_logdet_sparse(
     x_transformed: &SparseRowMat<usize, f64>,
     x_original: ArrayView2<f64>,
     weights: ArrayView1<f64>,
-    s_transformed: &Array2<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     let n = x_transformed.nrows();
     let p = x_transformed.ncols();
 
     let xtwx_transformed = compute_hessian_sparse(x_transformed, &weights.to_owned())?;
-    let mut penalized_hessian = xtwx_transformed + s_transformed;
+    let mut stabilized = xtwx_transformed;
     for i in 0..p {
         for j in 0..i {
-            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-            penalized_hessian[[i, j]] = v;
-            penalized_hessian[[j, i]] = v;
+            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
+            stabilized[[i, j]] = v;
+            stabilized[[j, i]] = v;
         }
     }
-
-    let mut stabilized = penalized_hessian.clone();
-    ensure_positive_definite(&mut stabilized)?;
+    // Firth correction uses the unpenalized Fisher information X' W X.
+    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     let mut fisher = Array2::<f64>::zeros((p, p));
     for i in 0..n {
@@ -1722,6 +1720,25 @@ pub fn fit_model_for_fixed_rho<'a>(
     }
 
     let mut status = working_summary.status.clone();
+    if matches!(status, PirlsStatus::MaxIterationsReached) {
+        let dev_scale = working_summary.state.deviance.abs().max(1.0);
+        let dev_tol = options.convergence_tolerance * dev_scale;
+        let step_floor = options.min_step_size * 2.0;
+        if working_summary.last_deviance_change.abs() <= dev_tol
+            || working_summary.last_step_size <= step_floor
+        {
+            // Treat as a stalled but usable minimum when progress has effectively stopped.
+            status = PirlsStatus::StalledAtValidMinimum;
+            working_summary.status = status.clone();
+        }
+    }
+    if matches!(status, PirlsStatus::MaxIterationsReached) && firth_active {
+        if working_summary.state.deviance.is_finite() && working_summary.max_abs_eta < 30.0 {
+            // Firth keeps logits bounded; accept stable finite solutions even if gradients stall.
+            status = PirlsStatus::StalledAtValidMinimum;
+            working_summary.status = status.clone();
+        }
+    }
     let has_penalty = e_transformed.nrows() > 0;
     let firth_active = options.firth_bias_reduction;
     if detect_logit_instability(
@@ -5028,7 +5045,6 @@ fn compute_firth_hat_and_half_logdet(
     x_transformed: ArrayView2<f64>,
     x_original: ArrayView2<f64>,
     weights: ArrayView1<f64>,
-    s_transformed: &Array2<f64>,
     workspace: &mut PirlsWorkspace,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     let n = x_transformed.nrows();
@@ -5045,17 +5061,18 @@ fn compute_firth_hat_and_half_logdet(
     workspace.wx *= &sqrt_w_col;
 
     let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
-    let mut penalized_hessian = xtwx_transformed.clone() + s_transformed;
+    let mut stabilized = xtwx_transformed.clone();
     for i in 0..p {
         for j in 0..i {
-            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-            penalized_hessian[[i, j]] = v;
-            penalized_hessian[[j, i]] = v;
+            let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
+            stabilized[[i, j]] = v;
+            stabilized[[j, i]] = v;
         }
     }
-
-    let mut stabilized = penalized_hessian.clone();
-    ensure_positive_definite(&mut stabilized)?;
+    // Firth correction uses the unpenalized Fisher information X' W X.
+    // Using the penalized Hessian here would make the Firth score inconsistent
+    // with the log|X' W X| term in the objective and its derivatives.
+    ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     let mut fisher = Array2::<f64>::zeros((p, p));
     for i in 0..n {
