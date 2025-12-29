@@ -8065,6 +8065,98 @@ pub mod internal {
             (state, rho0)
         }
 
+        fn build_logit_small_lambda_state_firth(
+            n: usize,
+            seed: u64,
+        ) -> (internal::RemlState<'static>, Array1<f64>) {
+            use crate::calibrate::construction::build_design_and_penalty_matrices;
+            use crate::calibrate::data::TrainingData;
+            use crate::calibrate::model::{
+                BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+                PrincipalComponentConfig,
+            };
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let p = Array1::from_shape_fn(n, |_| rng.gen_range(-2.0..2.0));
+            let pc1 = Array1::from_shape_fn(n, |_| rng.gen_range(-1.5..1.5));
+            let mut pcs = Array2::zeros((n, 1));
+            pcs.column_mut(0).assign(&pc1);
+            let logits = p.mapv(|v: f64| (0.7_f64 * v).max(-6.0_f64).min(6.0_f64));
+            let y = super::test_helpers::generate_y_from_logit(&logits, &mut rng);
+            let data = TrainingData {
+                y,
+                p: p.clone(),
+                sex: Array1::from_iter((0..n).map(|i| (i % 2) as f64)),
+                pcs,
+                weights: Array1::<f64>::ones(n),
+            };
+
+            let config = ModelConfig {
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
+                penalty_order: 2,
+                convergence_tolerance: 1e-6,
+                max_iterations: 100,
+                reml_convergence_tolerance: 1e-3,
+                reml_max_iterations: 20,
+                firth_bias_reduction: true,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
+                pgs_basis_config: BasisConfig {
+                    num_knots: 4,
+                    degree: 3,
+                },
+                pc_configs: vec![PrincipalComponentConfig {
+                    name: "PC1".to_string(),
+                    basis_config: BasisConfig {
+                        num_knots: 3,
+                        degree: 3,
+                    },
+                    range: (-1.5, 1.5),
+                }],
+                pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Anisotropic,
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
+
+                mcmc_enabled: false,
+                calibrator_enabled: false,
+                survival: None,
+            };
+
+            let (x, s_list, layout, ..) =
+                build_design_and_penalty_matrices(&data, &config).expect("matrix build");
+
+            let TrainingData {
+                y,
+                p: _,
+                sex: _,
+                pcs: _,
+                weights,
+            } = data;
+            let y_static: &'static mut Array1<f64> = Box::leak(Box::new(y));
+            let w_static: &'static mut Array1<f64> = Box::leak(Box::new(weights));
+            let x_static: &'static mut Array2<f64> = Box::leak(Box::new(x));
+
+            let state = internal::RemlState::new(
+                y_static.view(),
+                x_static.view(),
+                w_static.view(),
+                s_list,
+                Box::leak(Box::new(layout)),
+                Box::leak(Box::new(config)),
+                None,
+            )
+            .expect("RemlState");
+
+            let k = state.layout.num_penalties;
+            let rho0 = Array1::from_elem(k, -1.0);
+
+            (state, rho0)
+        }
+
         // Central-difference helper for the cost gradient
         fn fd_cost_grad(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             let mut g = Array1::zeros(rho.len());
@@ -8134,6 +8226,123 @@ pub mod internal {
         fn fmt_vec(v: &Array1<f64>) -> String {
             let parts: Vec<String> = v.iter().map(|x| format!("{:>+9.3e}", x)).collect();
             format!("[{}]", parts.join(", "))
+        }
+
+        fn log_det_h_total_for_beta(
+            state: &internal::RemlState<'_>,
+            pr: &PirlsResult,
+            beta: &Array1<f64>,
+        ) -> f64 {
+            let x = match &pr.x_transformed {
+                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
+                DesignMatrix::Sparse(x_sparse) => {
+                    let dense = x_sparse.as_ref().to_dense();
+                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+                }
+            };
+            let mut eta = x.dot(beta);
+            eta += &state.offset().to_owned();
+            let mut mu = Array1::<f64>::zeros(eta.len());
+            let mut weights = Array1::<f64>::zeros(eta.len());
+            let mut z = Array1::<f64>::zeros(eta.len());
+            crate::calibrate::pirls::update_glm_vectors(
+                state.y(),
+                &eta,
+                LinkFunction::Logit,
+                state.weights(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+            );
+            let mut xtwx = Array2::<f64>::zeros((x.ncols(), x.ncols()));
+            for i in 0..x.nrows() {
+                let wi = weights[i];
+                let xi = x.row(i);
+                for j in 0..x.ncols() {
+                    for k in 0..x.ncols() {
+                        xtwx[[j, k]] += wi * xi[j] * xi[k];
+                    }
+                }
+            }
+            let mut h_total = xtwx + &pr.reparam_result.s_transformed;
+            let h_phi = state
+                .firth_hessian_logit(&pr.x_transformed, &mu, &weights)
+                .expect("h_phi");
+            h_total -= &h_phi;
+            let chol = h_total
+                .cholesky(Side::Lower)
+                .expect("H_total should be PD");
+            2.0 * chol.diag().mapv(f64::ln).sum()
+        }
+
+        #[test]
+        #[ignore]
+        fn test_firth_logh_total_grad_matches_numeric_beta() {
+            let (state, rho0) = build_logit_small_lambda_state_firth(60, 4242);
+            let pr = state.execute_pirls_if_needed(&rho0).expect("pirls");
+            let beta = pr.beta_transformed.clone();
+            let x = match &pr.x_transformed {
+                DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
+                DesignMatrix::Sparse(x_sparse) => {
+                    let dense = x_sparse.as_ref().to_dense();
+                    Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+                }
+            };
+            let mut eta = x.dot(pr.beta_transformed.as_ref());
+            eta += &state.offset().to_owned();
+            let mut mu = Array1::<f64>::zeros(eta.len());
+            let mut weights = Array1::<f64>::zeros(eta.len());
+            let mut z = Array1::<f64>::zeros(eta.len());
+            crate::calibrate::pirls::update_glm_vectors(
+                state.y(),
+                &eta,
+                LinkFunction::Logit,
+                state.weights(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+            );
+            let mut xtwx = Array2::<f64>::zeros((x.ncols(), x.ncols()));
+            for i in 0..x.nrows() {
+                let wi = weights[i];
+                let xi = x.row(i);
+                for j in 0..x.ncols() {
+                    for k in 0..x.ncols() {
+                        xtwx[[j, k]] += wi * xi[j] * xi[k];
+                    }
+                }
+            }
+            let h_phi = state
+                .firth_hessian_logit(&pr.x_transformed, &mu, &weights)
+                .expect("h_phi");
+            let mut h_total = xtwx + &pr.reparam_result.s_transformed;
+            h_total -= &h_phi;
+            let g_beta = state
+                .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total)
+                .expect("g_beta");
+
+            let mut g_num = Array1::<f64>::zeros(beta.len());
+            for j in 0..beta.len() {
+                let h = 1e-5_f64.max(1e-4 * (1.0 + beta[j].abs()));
+                let mut bp = beta.clone();
+                let mut bm = beta.clone();
+                bp[j] += 0.5 * h;
+                bm[j] -= 0.5 * h;
+                let fp = log_det_h_total_for_beta(&state, &pr, &bp);
+                let fm = log_det_h_total_for_beta(&state, &pr, &bm);
+                g_num[j] = (fp - fm) / h;
+            }
+
+            let diff = (&g_beta - &g_num).mapv(|v| v * v).sum().sqrt();
+            let scale = g_num.mapv(|v| v * v).sum().sqrt().max(1e-12);
+            let rel = diff / scale;
+            eprintln!(
+                "[Firth log|H_total| grad] rel L2: {:.3e}\n  analytic={}\n  numeric={}",
+                rel,
+                fmt_vec(&g_beta),
+                fmt_vec(&g_num)
+            );
+            assert!(rel < 1e-2, "Firth log|H_total| grad mismatch: rel L2={:.3e}", rel);
         }
 
         #[test]

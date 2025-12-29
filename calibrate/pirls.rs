@@ -5162,21 +5162,27 @@ fn ensure_positive_definite_with_ridge(
 
     let cond_est = calculate_condition_number(hess).ok();
     let diag_scale = max_abs_diag(hess);
-    let mut ridge = match cond_est {
-        Some(cond) if cond.is_finite() && cond > HESSIAN_CONDITION_TARGET => {
-            diag_scale * 1e-10 * (cond / HESSIAN_CONDITION_TARGET)
-        }
-        Some(cond) if cond.is_finite() => {
-            if diag_scale > 0.0 {
-                diag_scale * 1e-12
-            } else {
-                0.0
-            }
-        }
-        _ => diag_scale * 1e-8,
+    let min_shift = if diag_scale > 0.0 {
+        diag_scale * 1e-10
+    } else {
+        1e-12
     };
-    let mut total_added = 0.0;
 
+    let min_eig = hess
+        .clone()
+        .eigh(Side::Lower)
+        .ok()
+        .and_then(|(evals, _)| evals.iter().cloned().reduce(f64::min));
+
+    let mut ridge = match min_eig {
+        Some(min_val) if min_val.is_finite() => (min_shift - min_val).max(0.0),
+        _ => min_shift,
+    };
+    if !ridge.is_finite() || ridge <= 0.0 {
+        ridge = min_shift;
+    }
+
+    let mut total_added = 0.0;
     for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
         if ridge > total_added {
             let delta = ridge - total_added;
@@ -5205,13 +5211,9 @@ fn ensure_positive_definite_with_ridge(
             break;
         }
 
-        if ridge <= 0.0 {
-            ridge = diag_scale * 1e-10;
-        } else {
-            ridge = (ridge * 10.0).max(diag_scale * 1e-10);
-        }
+        ridge = (ridge * 10.0).max(min_shift);
         if !ridge.is_finite() || ridge <= 0.0 {
-            ridge = diag_scale;
+            ridge = min_shift;
         }
     }
 
