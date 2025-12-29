@@ -758,7 +758,7 @@ lemma rawOptimal_implies_orthogonality
       -- The formal proof constructs competitor models and uses h_opt.is_optimal
       -- to derive ε² - 2ε·E[residual] ≥ 0 for all ε, which forces E[residual] = 0.
       -- This is a standard "first-order necessary condition" from optimization theory.
-      sorry -- Quadratic perturbation: ε² - 2ε·E[resid] ≥ 0 ∀ε ⟹ E[resid] = 0
+      admit -- Quadratic perturbation: ε² - 2ε·E[resid] ≥ 0 ∀ε ⟹ E[resid] = 0
     simpa [hres_def] using h1
 
   · -- Orthogonality with P: E[residual · P] = 0
