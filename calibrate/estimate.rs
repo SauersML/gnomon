@@ -4660,8 +4660,9 @@ pub mod internal {
                 }
                 s[(i, i)] *= 0.5;
             }
-            // sym(Φ(·)) = S + S^T (since S has half diag and lower triangle only).
-            let sym = &s + &s.t().to_owned();
+            // sym(Φ(·)) = 0.5 * (S + S^T) with the outer 1/2 required by the
+            // exact reverse-mode formula for Cholesky.
+            let sym = 0.5 * (&s + &s.t().to_owned());
             // Left solve: Z = L^{-T} sym
             let z = Self::solve_upper_triangular(&l.t().to_owned(), &sym);
             // Right solve: Ā = Z L^{-1} by solving L * Ā^T = Z^T
@@ -5367,6 +5368,7 @@ pub mod internal {
         ) -> Result<Array1<f64>, EstimationError> {
             let x = self.dense_design_matrix(x_transformed);
             let n = x.nrows();
+            let p = x.ncols();
             if n == 0 || p == 0 || mu.len() != n {
                 return Ok(Array1::zeros(p));
             }
@@ -5547,8 +5549,6 @@ pub mod internal {
         }
 
         // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
-        // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
-        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
         // Returns only B for use in the Firth Hessian path.
         fn firth_hat_basis(
             &self,
@@ -5586,7 +5586,6 @@ pub mod internal {
         ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), EstimationError> {
             use crate::calibrate::faer_ndarray::FaerCholesky;
             let n = x.nrows();
-            let p = x.ncols();
             let mut xw = x.to_owned();
             for i in 0..n {
                 let s = weights[i].max(0.0).sqrt();

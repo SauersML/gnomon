@@ -886,14 +886,37 @@ impl Sink for CustomUppercaseCollector {
             return Ok(true); // Not a comment we can parse, skip
         };
 
-        // Find all alphabetic characters
-        let alpha_chars: Vec<char> = comment_text.chars().filter(|c| c.is_alphabetic()).collect();
+        // Find all alphabetic characters and non-whitespace characters for ratio checks.
+        let alpha_count = comment_text.chars().filter(|c| c.is_alphabetic()).count();
+        let non_whitespace_count = comment_text.chars().filter(|c| !c.is_whitespace()).count();
 
-        if !alpha_chars.is_empty() {
-            let uppercase_count = alpha_chars.iter().filter(|c| c.is_uppercase()).count();
-            let uppercase_ratio = uppercase_count as f64 / alpha_chars.len() as f64;
+        if alpha_count > 0 && non_whitespace_count > 0 {
+            // Only count uppercase letters that are part of multi-letter words.
+            let mut uppercase_count = 0usize;
+            let mut run: Vec<char> = Vec::new();
+            let flush_run = |run: &mut Vec<char>, uppercase_count: &mut usize| {
+                if run.len() > 1 {
+                    *uppercase_count += run.iter().filter(|c| c.is_uppercase()).count();
+                }
+                run.clear();
+            };
 
-            if uppercase_ratio > 0.8 {
+            for ch in comment_text.chars() {
+                if ch.is_alphabetic() {
+                    run.push(ch);
+                } else {
+                    flush_run(&mut run, &mut uppercase_count);
+                }
+            }
+            flush_run(&mut run, &mut uppercase_count);
+
+            let uppercase_ratio = uppercase_count as f64 / alpha_count as f64;
+            let alpha_ratio = alpha_count as f64 / non_whitespace_count as f64;
+
+            // Ignore math-heavy or single-letter comments by requiring enough alphabetic content.
+            let has_enough_alpha = alpha_count >= 6 && alpha_ratio >= 0.6;
+
+            if uppercase_ratio > 0.8 && has_enough_alpha {
                 self.violations.push(format!("{line_number}:{line_text}"));
             }
         }
