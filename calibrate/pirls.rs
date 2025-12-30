@@ -22,12 +22,9 @@ use faer::{Accum, Par, Side, get_global_parallelism, Unbind};
 use log;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
-use std::{
-    borrow::Cow,
-    time::{Duration, Instant},
-};
+use std::borrow::Cow;
 use faer::{MatRef, Spec, Auto};
-use faer::linalg::cholesky::llt::factor::{LltParams, LltRegularization};
+use faer::linalg::cholesky::llt::factor::LltParams;
 
 pub struct LltView<'a> {
     pub matrix: MatRef<'a, f64>,
@@ -1017,6 +1014,20 @@ fn compute_firth_hat_and_half_logdet_sparse(
     Ok((hat_diag, half_log_det))
 }
 
+
+
+fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
+    matrix
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0, f64::max)
+        .max(1.0)
+}
+
+
+
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1299,144 +1310,7 @@ fn record_penalized_deviance(value: f64) {
 }
 
 const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-const HESSIAN_CONDITION_TARGET: f64 = 1e10;
-const PLS_NUGGET_SCALE: f64 = 1e-8;
-const PLS_NUGGET_MIN: f64 = 1e-12;
 
-fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0, f64::max)
-        .max(1.0)
-}
-
-/// Enum to hold either LLT or LDLT factorization for PLS solve.
-/// LDLT is preferred as it handles indefinite matrices gracefully.
-pub(crate) enum PlsFactor<'a> {
-    WorkspaceLlt(LltView<'a>),
-}
-
-impl<'a> PlsFactor<'a> {
-    pub fn solve(&self, rhs: faer::MatRef<'_, f64>, stack: &mut MemStack) -> Array2<f64> {
-        match self {
-            PlsFactor::WorkspaceLlt(view) => view.solve(rhs, stack),
-        }
-    }
-}
-
-/// Attempts to factorize a symmetric matrix, preferring LLT with Ridge
-/// using workspace memory to avoid allocations.
-fn attempt_spd_factorization_mem<'a>(
-    matrix: &Array2<f64>,
-    factorization_matrix: &'a mut Array2<f64>,
-    factorization_scratch: &mut MemBuffer,
-) -> (Option<PlsFactor<'a>>, f64, Option<f64>) {
-    let diag_scale = max_abs_diag(matrix);
-    let cond_est = calculate_condition_number(matrix).ok();
-    
-    // Initial ridge logic
-    let mut ridge = 0.0;
-    if let Some(cond) = cond_est {
-        if !cond.is_finite() {
-            ridge = diag_scale * 1e-8;
-        } else if cond > HESSIAN_CONDITION_TARGET {
-            ridge = diag_scale * 1e-10 * (cond / HESSIAN_CONDITION_TARGET);
-        }
-    } else {
-        ridge = diag_scale * 1e-8;
-    }
-    
-    let mut total_added = 0.0;
-
-    // Params for LLT
-    let par = faer::Par::Seq;
-    let params = <LltParams as Auto<f64>>::auto();
-
-    for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
-        // Copy matrix to factorization buffer
-        factorization_matrix.assign(matrix);
-        
-        let current_ridge = if attempt == 0 && total_added == 0.0 { 0.0 } else { ridge };
-        
-        if attempt > 0 {
-             if ridge <= 0.0 {
-                ridge = diag_scale * 1e-10;
-            } else {
-                ridge = (ridge * 10.0).max(diag_scale * 1e-10);
-            }
-            if !ridge.is_finite() || ridge <= 0.0 {
-                ridge = diag_scale;
-            }
-        }
-
-        if current_ridge > 0.0 {
-            total_added = current_ridge;
-            for i in 0..matrix.nrows() {
-                factorization_matrix[[i, i]] += total_added;
-            }
-        }
-        
-        // Factorize in-place
-        {
-            let mut faer_mat = array2_to_mat_mut(factorization_matrix);
-             // Use from_slice_mut compatible with ColMut via as_slice_mut?
-             // Actually, ColMut doesn't have as_slice_mut easily?
-             // try_as_slice_mut exists.
-             // Or use DiagMut::from(reg_diag_mat) if supported.
-             // I'll try from_column_vector_mut with full path if I can.
-             // But simpler: just use empty reg diag if LLT supports it? 
-             // LLT in place DOES take reg_diag.
-             // I will try unsafe from_raw_parts if safe methods fail? No.
-             // `ColMut` derefs to `ColRef`?
-             // `faer::col::ColMut` -> `try_as_slice_mut`.
-             
-            // Safe fallback: slice from Array1 directly/manually if needed, but we have ColMut.
-            // Let's assume DiagMut::from_column_vector_mut exists in recent faer but maybe trait bound?
-            // "function or associated item not found in Diag<Mut<...>>"
-            // Re-check imports?
-            // Try `faer::diag::DiagMut::from_mut` on what?
-            // I'll just use `DiagMut::new_unchecked` if I have to? No.
-            // I will use `DiagMut::from_col(reg_diag_mat)`. Error said "from_col not found".
-            
-            // Try explicit cast to slice?
-            // reg_diag_buf is Array1.
-            // I can create DiagMut from Array1 slice directly!
-            // reg_diag_buf.as_slice_mut().
-            
-
-
-            let stack = MemStack::new(factorization_scratch);
-            
-            // Using default regularization (assumed Zero/Default)
-            match faer::linalg::cholesky::llt::factor::cholesky_in_place(
-                faer_mat.as_mut(),
-                LltRegularization::default(),
-                par,
-                stack,
-                Spec::new(params.clone()),
-            ) {
-                Ok(_) => {
-                    let m = &*factorization_matrix;
-                    let mat_ref = unsafe {
-                         MatRef::from_raw_parts(m.as_ptr(), m.nrows(), m.ncols(), m.strides()[0], m.strides()[1])
-                    };
-                    return (Some(PlsFactor::WorkspaceLlt(LltView { 
-                        matrix: mat_ref 
-                    })), total_added, cond_est);
-                }
-                Err(_) => {
-                    // Factorization failed (not SPD)
-                    // Continue loop to add ridge
-                }
-            }
-        }
-    }
-    
-    (None, total_added, cond_est)
-}
 
 /// The status of the P-IRLS convergence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1999,164 +1873,11 @@ fn sparse_from_dense_view(x: ArrayView2<f64>) -> Option<DesignMatrix> {
         .map(DesignMatrix::Sparse)
 }
 
-/// Port of the `R_cond` function from mgcv, which implements the CMSW
-/// algorithm to estimate the 1-norm condition number of an upper
-/// triangular matrix R.
-///
-/// This is a direct translation of the C code from mgcv:
-/// ```c
-/// void R_cond(double *R, int *r, int *c, double *work, double *Rcondition) {
-///   double kappa, *pm, *pp, *y, *p, ym, yp, pm_norm, pp_norm, y_inf=0.0, R_inf=0.0;
-///   int i,j,k;
-///   pp=work; work+= *c; pm=work; work+= *c;
-///   y=work; work+= *c; p=work;
-///   for (i=0; i<*c; i++) p[i] = 0.0;
-///   for (k=*c-1; k>=0; k--) {
-///     yp = (1-p[k])/R[k + *r *k];
-///     ym = (-1-p[k])/R[k + *r *k];
-///     for (pp_norm=0.0,i=0;i<k;i++) { pp[i] = p[i] + R[i + *r * k] * yp; pp_norm += fabs(pp[i]); }
-///     for (pm_norm=0.0,i=0;i<k;i++) { pm[i] = p[i] + R[i + *r * k] * ym; pm_norm += fabs(pm[i]); }
-///     if (fabs(yp)+pp_norm >= fabs(ym)+pm_norm) {
-///       y[k]=yp;
-///       for (i=0;i<k;i++) p[i] = pp[i];
-///     } else {
-///       y[k]=ym;
-///       for (i=0;i<k;i++) p[i] = pm[i];
-///     }
-///     kappa=fabs(y[k]);
-///     if (kappa>y_inf) y_inf=kappa;
-///   }
-///   for (i=0;i<*c;i++) {
-///     for (kappa=0.0,j=i;j<*c;j++) kappa += fabs(R[i + *r * j]);  
-///     if (kappa>R_inf) R_inf = kappa;
-///   }
-///   kappa=R_inf*y_inf;
-///   *Rcondition=kappa;
-/// }
-/// ```
-fn estimate_r_condition(r_matrix: ArrayView2<f64>) -> f64 {
-    // ndarray::s is already imported at the module level
 
-    let c = r_matrix.ncols();
-    if c == 0 {
-        return 1.0;
-    }
-    // r_rows is used for proper stride calculation when accessing R elements
-    let r_rows = r_matrix.nrows();
-    log::trace!("R matrix rows: {}", r_rows);
 
-    let mut y: Array1<f64> = Array1::zeros(c);
-    let mut p: Array1<f64> = Array1::zeros(c);
-    let mut pp: Array1<f64> = Array1::zeros(c);
-    let mut pm: Array1<f64> = Array1::zeros(c);
 
-    let mut y_inf = 0.0;
 
-    // Compute max_diag once outside the loop (performance improvement)
-    let max_diag = r_matrix
-        .diag()
-        .iter()
-        .fold(0.0f64, |acc, &val| acc.max(val.abs()));
-    let eps = 1e-16f64.max(max_diag * 1e-14);
 
-    for k in (0..c).rev() {
-        let r_kk = r_matrix[[k, k]];
-        if r_kk.abs() <= eps {
-            // Return large finite number instead of infinity to avoid overflow
-            return 1e300;
-        }
-        let yp = (1.0 - p[k]) / r_kk;
-        let ym = (-1.0 - p[k]) / r_kk;
-
-        let mut pp_norm = 0.0;
-        let mut pm_norm = 0.0;
-        for i in 0..k {
-            let r_ik = r_matrix[[i, k]];
-            pp[i] = p[i] + r_ik * yp;
-            pm[i] = p[i] + r_ik * ym;
-            pp_norm += pp[i].abs();
-            pm_norm += pm[i].abs();
-        }
-
-        if yp.abs() + pp_norm >= ym.abs() + pm_norm {
-            y[k] = yp;
-            for i in 0..k {
-                p[i] = pp[i];
-            }
-        } else {
-            y[k] = ym;
-            for i in 0..k {
-                p[i] = pm[i];
-            }
-        }
-
-        let kappa = y[k].abs();
-        if kappa > y_inf {
-            y_inf = kappa;
-        }
-    }
-
-    // Calculate R_inf, which is the max row sum of absolute values
-    // For an upper triangular matrix, we only sum the upper triangle elements (j >= i)
-    let mut r_inf = 0.0;
-    for i in 0..c {
-        let mut kappa = 0.0;
-        for j in i..c {
-            // Only sum upper triangle elements (j >= i)
-            kappa += r_matrix[[i, j]].abs();
-        }
-        if kappa > r_inf {
-            r_inf = kappa;
-        }
-    }
-
-    // The condition number is the product of the two norms
-    
-    r_inf * y_inf
-}
-
-/// Pivots the columns of a matrix according to a pivot vector.
-///
-/// This applies the permutation `A*P` to get a new matrix `B`. It assumes the
-/// `pivot` vector is a **forward** permutation.
-///
-/// For a matrix A and pivot p, the result B is such that `B_j = A_{p[j]}`.
-///
-/// # Parameters
-/// * `matrix`: The matrix whose columns will be permuted.
-/// * `pivot`: The forward permutation vector.
-fn pivot_columns(matrix: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
-    let r = matrix.nrows();
-    let c = matrix.ncols();
-    let mut pivoted_matrix = Array2::zeros((r, c));
-
-    for j in 0..c {
-        let original_col_index = pivot[j];
-        pivoted_matrix
-            .column_mut(j)
-            .assign(&matrix.column(original_col_index));
-    }
-
-    pivoted_matrix
-}
-
-/// Symmetrically unpivot a matrix using the forward permutation `pivot`.
-/// If `(sqrt(W)X) * P = Q * R`, then `XtWX = P * (R^T R) * P^T`.
-/// Given `m_pivoted = R^T R` in pivoted order, this returns `P * m_pivoted * P^T`.
-fn unpivot_sym_by_perm(m_pivoted: ArrayView2<f64>, pivot: &[usize]) -> Array2<f64> {
-    let n = m_pivoted.nrows();
-    assert_eq!(n, m_pivoted.ncols());
-    assert_eq!(pivot.len(), n);
-    let mut out = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..n {
-            let oi = pivot[i];
-            let oj = pivot[j];
-            out[[oi, oj]] = m_pivoted[[i, j]];
-        }
-    }
-    out
-}
 
 /// Insert zero rows into a vector at locations specified by `drop_indices`.
 /// This is a direct translation of `undrop_rows` from mgcv's C code:
@@ -2420,78 +2141,8 @@ pub struct StablePLSResult {
     pub ridge_used: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlsFallbackReason {
-    FactorizationFailed,
-}
 
-impl PlsFallbackReason {
-    fn as_str(&self) -> &'static str {
-        match self {
-            PlsFallbackReason::FactorizationFailed => "factorization_failed",
-        }
-    }
-}
 
-#[derive(Clone, Debug)]
-struct PlsSolverDiagnostics {
-    x_rows: usize,
-    x_cols: usize,
-    eb_rows: usize,
-    eb_cols: usize,
-    e_rows: usize,
-    e_cols: usize,
-    fallback_reason: Option<PlsFallbackReason>,
-}
-
-impl PlsSolverDiagnostics {
-    fn new(
-        x_rows: usize,
-        x_cols: usize,
-        eb_rows: usize,
-        eb_cols: usize,
-        e_rows: usize,
-        e_cols: usize,
-    ) -> Self {
-        Self {
-            x_rows,
-            x_cols,
-            eb_rows,
-            eb_cols,
-            e_rows,
-            e_cols,
-            fallback_reason: None,
-        }
-    }
-
-    fn record_fallback(&mut self, reason: PlsFallbackReason) {
-        if self.fallback_reason.is_none() {
-            self.fallback_reason = Some(reason);
-        }
-    }
-
-    fn emit_qr_summary(&self, edf: f64, scale: f64, rank: usize, p_dim: usize, elapsed: Duration) {
-        let fallback_fragment = match self.fallback_reason {
-            Some(reason) => format!("spd_fallback={}", reason.as_str()),
-            None => "spd_fallback=not_triggered".to_string(),
-        };
-        println!(
-            "[PLS Solver] QR summary: x=({}x{}), eb=({}x{}), e=({}x{}); {}; edf={:.2}, scale={:.4e}, rank={}/{} [{:.2?}]",
-            self.x_rows,
-            self.x_cols,
-            self.eb_rows,
-            self.eb_cols,
-            self.e_rows,
-            self.e_cols,
-            fallback_fragment,
-            edf,
-            scale,
-            rank,
-            p_dim,
-            elapsed
-        );
-    }
-}
 
 pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
@@ -2511,7 +2162,6 @@ pub fn solve_penalized_least_squares(
     
     // Dimensions
     let p_dim = x_transformed.ncols();
-    let rk_rows = e_transformed.nrows();
 
     // 1. Prepare Weighted Design and Response
     // Uses pre-allocated workspace buffers
@@ -2526,7 +2176,7 @@ pub fn solve_penalized_least_squares(
     workspace.wx.assign(&x_transformed);
     workspace.wx *= &sqrt_w_col; // wx = X .* sqrt_w
 
-    workspace.wz.assign(z);
+    workspace.wz.assign(&z);
     workspace.wz -= &offset;
     workspace.wz *= &workspace.sqrt_w; // wz = (z - offset) .* sqrt_w
 
@@ -2608,12 +2258,11 @@ pub fn solve_penalized_least_squares(
         m
     };
 
-    let params = faer::linalg::cholesky::ldlt::factor::LdltParams::default();
     // Use LDLT factorization
-    let ldlt = FaerLdlt::new_with_params(h_reg_view.as_ref(), Side::Lower, params);
+    let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
     
     let beta_vec = if let Ok(factor) = ldlt {
-        let sol_mat = factor.solve(&rhs_mat);
+        let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
         let mut b = Array1::zeros(p_dim);
         for i in 0..p_dim {
             b[i] = sol_mat[(i, 0)];
@@ -4497,55 +4146,7 @@ mod tests {
         );
     }
 
-    /// This test verifies that the permutation logic in `pivoted_qr_faer` is correct
-    /// and mathematically sound.
-    ///
-    /// It works by checking the fundamental mathematical identity of a pivoted QR decomposition: A*P = Q*R.
-    /// If the permutation P is correct, the identity will hold, and the reconstruction error
-    /// || A*P - Q*R || will be small (close to machine precision).
-    #[test]
-    fn test_pivoted_qr_permutation_is_reliable() {
-        use ndarray::arr2;
 
-        // Stage: Set up a matrix that is tricky to pivot
-        // It's nearly rank-deficient, with highly correlated columns, forcing a non-trivial pivot.
-        // This is representative of the design matrices created in the model tests.
-        let a = arr2(&[
-            [1.0, 2.0, 3.0, 1.0000001],
-            [4.0, 5.0, 9.0, 4.0000002],
-            [6.0, 7.0, 13.0, 6.0000003],
-            [8.0, 9.0, 17.0, 8.0000004],
-        ]);
-
-        // Stage: Execute the function under test
-        let (q, r, pivot) = pivoted_qr_faer(&a).expect("QR decomposition itself should not fail");
-
-        // Stage: Verify that the fundamental QR identity holds
-        // First, apply the permutation to the original matrix 'a'.
-        let a_pivoted = pivot_columns(a.view(), &pivot);
-
-        // Then, compute Q*R using the results from the function.
-        let qr_product = q.dot(&r);
-
-        // Calculate the reconstruction error. If the pivot is correct, this should be near zero.
-        let reconstruction_error_matrix = &a_pivoted - &qr_product;
-        let reconstruction_error_norm = reconstruction_error_matrix.mapv(|x| x.abs()).sum();
-
-        println!("Matrix A:\n{:?}", a);
-        println!("Permutation P: {:?}", pivot);
-        println!("Reconstructed A*P (from pivot):\n{:?}", a_pivoted);
-        println!("Q*R Product:\n{:?}", qr_product);
-        println!("Reconstruction Error Norm: {}", reconstruction_error_norm);
-
-        // Stage: Assert that the reconstruction error is small, proving the pivot is correct
-        // A correct implementation should have an error norm close to machine epsilon (~1e-15).
-        // An error norm greater than 1e-6 would be a definitive failure.
-        assert!(
-            reconstruction_error_norm < 1e-6,
-            "The reconstruction error is too large ({:e}), which indicates the permutation vector is incorrect. The contract A*P = Q*R is violated.",
-            reconstruction_error_norm
-        );
-    }
 }
 
 /// Ensure positive definiteness by adding a small constant ridge to the diagonal if needed.

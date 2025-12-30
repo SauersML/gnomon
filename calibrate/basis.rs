@@ -1759,10 +1759,11 @@ pub fn create_bspline_basis_sparse_derivative(
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
     let knot_view = knot_vector.view();
 
-    let (sparse, knot_vec) = create_bspline_basis_sparse_with_knots_derivative(
+    let (sparse, knot_vec) = create_basis::<Sparse>(
         data.view(),
-        knot_view,
+        KnotSource::Provided(knot_view),
         degree,
+        BasisOptions::first_derivative(),
     )?;
 
     Ok((sparse, knot_vec))
@@ -1793,10 +1794,11 @@ pub fn create_bspline_basis_sparse_second_derivative(
     let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
     let knot_view = knot_vector.view();
 
-    let (sparse, knot_vec) = create_bspline_basis_sparse_with_knots_second_derivative(
+    let (sparse, knot_vec) = create_basis::<Sparse>(
         data.view(),
-        knot_view,
+        KnotSource::Provided(knot_view),
         degree,
+        BasisOptions::second_derivative(),
     )?;
 
     Ok((sparse, knot_vec))
@@ -2563,7 +2565,16 @@ mod tests {
     #[test]
     fn test_bspline_basis_sums_to_one() {
         let data = Array::linspace(0.1, 9.9, 100);
-        let (basis, _) = create_bspline_basis(data.view(), (0.0, 10.0), 10, 3).unwrap();
+        let (basis, _) = create_basis::<Dense>(
+            data.view(),
+            KnotSource::Generate {
+                data_range: (0.0, 10.0),
+                num_internal_knots: 10,
+            },
+            3,
+            BasisOptions::value(),
+        )
+        .unwrap();
 
         let sums = basis.sum_axis(Axis(1));
 
@@ -2594,7 +2605,16 @@ mod tests {
         }
 
         // Even when providing training data, this should fall back to uniform knots
-        let (basis, knots) = create_bspline_basis(data.view(), (0.0, 10.0), 10, 3).unwrap();
+        let (basis, knots) = create_basis::<Dense>(
+            data.view(),
+            KnotSource::Generate {
+                data_range: (0.0, 10.0),
+                num_internal_knots: 10,
+            },
+            3,
+            BasisOptions::value(),
+        )
+        .unwrap();
 
         // Verify that knots are uniformly distributed (not following data distribution)
         // Since quantile knots are disabled, these should be uniform
@@ -2638,8 +2658,13 @@ mod tests {
         let eval_points = Array::linspace(0.1, 9.9, 100);
 
         // Create basis using the previously generated knots
-        let (eval_basis, _) =
-            create_bspline_basis_with_knots(eval_points.view(), knots.view(), 3).unwrap();
+        let (eval_basis, _) = create_basis::<Dense>(
+            eval_points.view(),
+            KnotSource::Provided(knots.view()),
+            3,
+            BasisOptions::value(),
+        )
+        .unwrap();
 
         // Verify sums for the evaluation points
         let eval_sums = eval_basis.sum_axis(Axis(1));
@@ -2658,11 +2683,24 @@ mod tests {
         clear_basis_cache();
 
         let data = Array::linspace(0.0, 1.0, 25);
-        let (fresh_basis, knots) =
-            create_bspline_basis(data.view(), (0.0, 1.0), 5, 3).expect("fresh basis");
+        let (fresh_basis, knots) = create_basis::<Dense>(
+            data.view(),
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            3,
+            BasisOptions::value(),
+        )
+        .expect("fresh basis");
 
-        let (cached_basis, _) =
-            create_bspline_basis_with_knots(data.view(), knots.view(), 3).expect("cached basis");
+        let (cached_basis, _) = create_basis::<Dense>(
+            data.view(),
+            KnotSource::Provided(knots.view()),
+            3,
+            BasisOptions::value(),
+        )
+        .expect("cached basis");
 
         assert_abs_diff_eq!(
             fresh_basis.as_slice().unwrap(),
@@ -2948,11 +2986,16 @@ mod tests {
 
         // --- Setup: Same as the original test ---
         let data = Array::linspace(0.0, 1.0, 11);
-        let degree = 3;
-        let num_internal_knots = 5;
-
-        let (basis_unc, _) =
-            create_bspline_basis(data.view(), (0.0, 1.0), num_internal_knots, degree).unwrap();
+        let (basis_unc, _) = create_basis::<Dense>(
+            data.view(),
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            3,
+            BasisOptions::value(),
+        )
+        .unwrap();
 
         let main_basis_unc = basis_unc.slice(s![.., 1..]);
         let (main_basis_con, z_transform) =
@@ -2971,11 +3014,14 @@ mod tests {
         let on_grid_idx = 6;
 
         // Calculate the prediction for this single point from scratch.
-        let (raw_basis_at_point, _) = create_bspline_basis(
+        let (raw_basis_at_point, _) = create_basis::<Dense>(
             array![test_point_on_grid_x].view(),
-            (0.0, 1.0),
-            num_internal_knots,
-            degree,
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            3,
+            BasisOptions::value(),
         )
         .unwrap();
         let main_basis_unc_at_point = raw_basis_at_point.slice(s![0, 1..]);
@@ -2995,11 +3041,14 @@ mod tests {
         let test_point_off_grid_x = 0.65;
 
         // Calculate the prediction for this single off-grid point.
-        let (raw_basis_off_grid, _) = create_bspline_basis(
+        let (raw_basis_off_grid, _) = create_basis::<Dense>(
             array![test_point_off_grid_x].view(),
-            (0.0, 1.0),
-            num_internal_knots,
-            degree,
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            3,
+            BasisOptions::value(),
         )
         .unwrap();
         let main_basis_unc_off_grid = raw_basis_off_grid.slice(s![0, 1..]);
@@ -3032,12 +3081,32 @@ mod tests {
 
     #[test]
     fn test_error_conditions() {
-        match create_bspline_basis(array![].view(), (0.0, 10.0), 5, 0).unwrap_err() {
+        match create_basis::<Dense>(
+            array![].view(),
+            KnotSource::Generate {
+                data_range: (0.0, 10.0),
+                num_internal_knots: 5,
+            },
+            0,
+            BasisOptions::value(),
+        )
+        .unwrap_err()
+        {
             BasisError::InvalidDegree(deg) => assert_eq!(deg, 0),
             _ => panic!("Expected InvalidDegree error"),
         }
 
-        match create_bspline_basis(array![].view(), (10.0, 0.0), 5, 1).unwrap_err() {
+        match create_basis::<Dense>(
+            array![].view(),
+            KnotSource::Generate {
+                data_range: (10.0, 0.0),
+                num_internal_knots: 5,
+            },
+            1,
+            BasisOptions::value(),
+        )
+        .unwrap_err()
+        {
             BasisError::InvalidRange(start, end) => {
                 assert_eq!(start, 10.0);
                 assert_eq!(end, 0.0);
@@ -3046,7 +3115,17 @@ mod tests {
         }
 
         // Test degenerate range detection
-        match create_bspline_basis(array![].view(), (5.0, 5.0), 3, 1).unwrap_err() {
+        match create_basis::<Dense>(
+            array![].view(),
+            KnotSource::Generate {
+                data_range: (5.0, 5.0),
+                num_internal_knots: 3,
+            },
+            1,
+            BasisOptions::value(),
+        )
+        .unwrap_err()
+        {
             BasisError::DegenerateRange(num_knots) => {
                 assert_eq!(num_knots, 3);
             }
@@ -3055,18 +3134,29 @@ mod tests {
 
         // Special case: Zero-width range is allowed when num_internal_knots = 0
         // This creates a valid but trivial basis
-        let result = create_bspline_basis(array![].view(), (5.0, 5.0), 0, 1);
+        let result = create_basis::<Dense>(
+            array![].view(),
+            KnotSource::Generate {
+                data_range: (5.0, 5.0),
+                num_internal_knots: 0,
+            },
+            1,
+            BasisOptions::value(),
+        );
         assert!(
             result.is_ok(),
             "Zero-width range with no internal knots should be valid"
         );
 
         // Test uniform fallback (quantile knots are disabled for P-splines)
-        let (_, knots_uniform) = create_bspline_basis(
+        let (_, knots_uniform) = create_basis::<Dense>(
             array![].view(), // empty evaluation set is fine
-            (0.0, 10.0),
-            3, // num_internal_knots
+            KnotSource::Generate {
+                data_range: (0.0, 10.0),
+                num_internal_knots: 3,
+            },
             1, // degree
+            BasisOptions::value(),
         )
         .unwrap();
 
@@ -3092,7 +3182,12 @@ mod tests {
         // Decreasing knot vector should be rejected
         let knots_bad_order = array![0.0, 0.0, 2.0, 1.0, 3.0, 3.0];
         let data = array![0.5, 1.0, 1.5];
-        match create_bspline_basis_with_knots(data.view(), knots_bad_order.view(), 1) {
+        match create_basis::<Dense>(
+            data.view(),
+            KnotSource::Provided(knots_bad_order.view()),
+            1,
+            BasisOptions::value(),
+        ) {
             Err(BasisError::InvalidKnotVector(msg)) => {
                 assert!(msg.contains("non-decreasing"));
             }
@@ -3102,7 +3197,12 @@ mod tests {
         // Non-finite knot vector should be rejected
         let mut knots_non_finite = array![0.0, 0.0, 1.0, 2.0, 2.0];
         knots_non_finite[2] = f64::NAN;
-        match create_bspline_basis_with_knots(data.view(), knots_non_finite.view(), 1) {
+        match create_basis::<Dense>(
+            data.view(),
+            KnotSource::Provided(knots_non_finite.view()),
+            1,
+            BasisOptions::value(),
+        ) {
             Err(BasisError::InvalidKnotVector(msg)) => {
                 assert!(msg.contains("non-finite"));
             }

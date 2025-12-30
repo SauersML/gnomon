@@ -9,6 +9,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
+    #[error("Factorization failed")]
+    FactorizationFailed,
     #[error("SVD failed to converge")]
     SvdNoConvergence,
     #[error("Self-adjoint eigendecomposition failed: {0:?}")]
