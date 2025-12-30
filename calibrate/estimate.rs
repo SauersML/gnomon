@@ -7081,7 +7081,7 @@ pub mod internal {
                         };
 
                         let mut grad_beta = if self.config.firth_bias_reduction {
-                            // FULL, EXACT chain-rule term for Firth-LAML:
+                            // Chain-rule term for Firth-LAML:
                             //
                             //   ∂V/∂β = -∂l_p^*/∂β + 0.5 * ∂log|H_total|/∂β
                             //
