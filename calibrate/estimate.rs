@@ -6673,7 +6673,7 @@ pub mod internal {
                             .assign(&Array1::from_vec(laml_grad));
                         // Continue to prior-gradient adjustment below.
                     } else {
-                    let use_numeric_firth = self.config.firth_bias_reduction;
+                    let use_numeric_firth = false; // Analytic gradient is now correct (cost/gradient both use h_eff)
                     let clamp_nonsmooth = self.config.firth_bias_reduction
                         && pirls_result
                             .solve_mu
