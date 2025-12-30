@@ -1,4 +1,4 @@
-use crate::calibrate::basis::{self};
+use crate::calibrate::basis::{self, create_basis, BasisOptions, Dense, KnotSource};
 use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::hull::PeeledHull;
@@ -665,10 +665,11 @@ impl TrainedModel {
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
 
-        let (basis, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (basis, _) = crate::calibrate::basis::create_basis::<Dense>(
             z.view(),
-            joint.knot_vector.view(),
+            KnotSource::Provided(joint.knot_vector.view()),
             joint.degree,
+            BasisOptions::value(),
         ).ok()?;
         let raw = basis.as_ref();
         if joint.link_transform.nrows() != raw.ncols()
@@ -2216,10 +2217,11 @@ mod internal {
             .get("pgs")
             .ok_or(ModelError::InternalStackingError)?;
 
-        let (pgs_basis_unc, _) = basis::create_bspline_basis_with_knots(
+        let (pgs_basis_unc, _) = create_basis::<Dense>(
             p_new,
-            saved_knots.view(),
+            KnotSource::Provided(saved_knots.view()),
             config.pgs_basis_config.degree,
+            BasisOptions::value(),
         )?;
 
         // Build PGS main basis to MATCH TRAINING exactly.
@@ -2279,10 +2281,11 @@ mod internal {
                 .get(pc_name)
                 .ok_or(ModelError::InternalStackingError)?;
 
-            let (pc_basis_unc, _) = basis::create_bspline_basis_with_knots(
+            let (pc_basis_unc, _) = create_basis::<Dense>(
                 pc_col,
-                saved_knots.view(),
+                KnotSource::Provided(saved_knots.view()),
                 config.pc_configs[i].basis_config.degree,
+                BasisOptions::value(),
             )?;
 
             // Slice the basis to remove the intercept term, just like in the training code
@@ -2668,10 +2671,11 @@ mod tests {
         // However, the test below will derive this transformation programmatically.
 
         // Create a dummy unconstrained basis to derive the constraint matrix Z
-        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+        let (unconstrained_basis_for_constraint, _) = create_basis::<Dense>(
             array![0.25, 0.75].view(), // two arbitrary points
-            knot_vector.view(),
+            KnotSource::Provided(knot_vector.view()),
             degree,
+            BasisOptions::value(),
         )
         .unwrap();
         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
@@ -2743,7 +2747,12 @@ mod tests {
         // The manual calculation was flawed. Here's the correct way to derive the ground truth:
         // Stage: Generate the raw, unconstrained basis at the test points
         let (full_basis_unc, _) =
-            basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
+            create_basis::<Dense>(
+                test_points.view(),
+                KnotSource::Provided(knot_vector.view()),
+                degree,
+                BasisOptions::value(),
+            )
                 .unwrap();
 
         // Stage: Isolate the main effect part of the basis (all columns except the intercept)
@@ -2778,10 +2787,11 @@ mod tests {
     fn predict_detailed_uses_mcmc_mean_for_logit() {
         let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
         let degree = 1;
-        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+        let (unconstrained_basis_for_constraint, _) = create_basis::<Dense>(
             array![0.25, 0.75].view(),
-            knot_vector.view(),
+            KnotSource::Provided(knot_vector.view()),
             degree,
+            BasisOptions::value(),
         )
         .unwrap();
         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
@@ -2891,10 +2901,11 @@ mod tests {
     fn identity_prediction_ignores_mcmc_samples() {
         let knot_vector = array![0.0, 0.0, 0.5, 1.0, 1.0];
         let degree = 1;
-        let (unconstrained_basis_for_constraint, _) = basis::create_bspline_basis_with_knots(
+        let (unconstrained_basis_for_constraint, _) = create_basis::<Dense>(
             array![0.25, 0.75].view(),
-            knot_vector.view(),
+            KnotSource::Provided(knot_vector.view()),
             degree,
+            BasisOptions::value(),
         )
         .unwrap();
         let unconstrained_main_basis = unconstrained_basis_for_constraint.slice(s![.., 1..]);
@@ -2964,7 +2975,12 @@ mod tests {
             .unwrap();
 
         let (full_basis_unc, _) =
-            basis::create_bspline_basis_with_knots(test_points.view(), knot_vector.view(), degree)
+            create_basis::<Dense>(
+                test_points.view(),
+                KnotSource::Provided(knot_vector.view()),
+                degree,
+                BasisOptions::value(),
+            )
                 .unwrap();
         let pgs_main_basis_unc = full_basis_unc.slice(s![.., 1..]);
         let pgs_main_basis_con = pgs_main_basis_unc.dot(&z_transform);

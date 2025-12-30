@@ -1,5 +1,6 @@
 use crate::calibrate::basis::{
-    BasisError, apply_weighted_orthogonality_constraint, create_difference_penalty_matrix,
+    apply_weighted_orthogonality_constraint, create_basis, create_difference_penalty_matrix,
+    BasisError, BasisOptions, Dense, KnotSource,
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::FaerArrayView;
@@ -1351,17 +1352,17 @@ pub fn build_calibrator_design(
         usize::MAX,
     );
 
-    let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+    let (b_pred_raw, _) = create_basis::<Dense>(
         pred_std.view(),
-        knots_pred.view(),
+        KnotSource::Provided(knots_pred.view()),
         spec.pred_basis.degree,
-    )?;
-    let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        BasisOptions::value(),
+    )?;    let (b_se_raw, _) = create_basis::<Dense>(
         se_std.view(),
-        knots_se.view(),
+        KnotSource::Provided(knots_se.view()),
         spec.se_basis.degree,
-    )?;
-    let pred_raw_cols = b_pred_raw.ncols();
+        BasisOptions::value(),
+    )?;    let pred_raw_cols = b_pred_raw.ncols();
     let se_raw_cols = b_se_raw.ncols();
 
     let offset = features.pred_identity.clone();
@@ -1618,12 +1619,12 @@ pub fn build_calibrator_design(
         (b, stz, knots, s0, 0)
     } else {
         // Create the spline basis for distance
-        let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (b_dist_raw, _) = create_basis::<Dense>(
             dist_std.view(),
-            knots_dist_generated.view(),
+            KnotSource::Provided(knots_dist_generated.view()),
             spec.dist_basis.degree,
-        )?;
-        let dist_raw_cols = b_dist_raw.ncols();
+            BasisOptions::value(),
+        )?;        let dist_raw_cols = b_dist_raw.ncols();
 
         // Always enforce identifiability constraints so the optimizer sees the true nullspace
         // Replace STZ with full polynomial nullspace removal to match penalty nullspace
@@ -1999,11 +2000,13 @@ pub fn predict_calibrator(
     let b_pred = if n_pred_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (b_pred_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
             pred_std.view(),
-            model.knots_pred.view(),
+            crate::calibrate::basis::KnotSource::Provided(model.knots_pred.view()),
             model.spec.pred_basis.degree,
+            crate::calibrate::basis::BasisOptions::value(),
         )?;
+        let b_pred_raw = (*b_pred_raw_arc).clone();
         b_pred_raw.dot(&model.pred_constraint_transform)
     };
 
@@ -2021,22 +2024,26 @@ pub fn predict_calibrator(
     let b_se = if n_se_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_se_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (b_se_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
             se_std.view(),
-            model.knots_se.view(),
+            crate::calibrate::basis::KnotSource::Provided(model.knots_se.view()),
             model.spec.se_basis.degree,
+            crate::calibrate::basis::BasisOptions::value(),
         )?;
+        let b_se_raw = (*b_se_raw_arc).clone();
         b_se_raw.dot(&model.stz_se)
     };
 
     let b_dist = if n_dist_cols == 0 {
         Array2::<f64>::zeros((n, 0))
     } else {
-        let (b_dist_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (b_dist_raw_arc, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
             dist_std.view(),
-            model.knots_dist.view(),
+            crate::calibrate::basis::KnotSource::Provided(model.knots_dist.view()),
             model.spec.dist_basis.degree,
+            crate::calibrate::basis::BasisOptions::value(),
         )?;
+        let b_dist_raw = (*b_dist_raw_arc).clone();
         b_dist_raw.dot(&model.stz_dist)
     };
 
@@ -3962,10 +3969,11 @@ mod tests {
         }
 
         let pred_std = Array1::zeros(n);
-        let (b_pred_raw, _) = crate::calibrate::basis::create_bspline_basis_with_knots(
+        let (b_pred_raw, _) = crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
             pred_std.view(),
-            schema.knots_pred.view(),
+            crate::calibrate::basis::KnotSource::Provided(schema.knots_pred.view()),
             spec.pred_basis.degree,
+            crate::calibrate::basis::BasisOptions::value(),
         )
         .unwrap();
 

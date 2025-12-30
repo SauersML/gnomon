@@ -1360,6 +1360,7 @@ fn generate_basis_nd_sparse(
 /// On success, returns a `Result` containing a tuple `(Arc<Array2<f64>>, Array1<f64>)`:
 /// - The **basis matrix**, with shape `[data.len(), num_basis_functions]`.
 /// - A copy of the **knot vector** used.
+#[deprecated(since = "0.1.3", note = "Use `create_basis` with `KnotSource::Provided` instead")]
 pub fn create_bspline_basis_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1415,6 +1416,10 @@ pub fn create_bspline_basis_with_knots(
 }
 
 /// Creates the first-derivative B-spline basis matrix using a pre-computed knot vector.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Provided` and `BasisOptions::first_derivative()` instead"
+)]
 pub fn create_bspline_basis_with_knots_derivative(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1470,6 +1475,10 @@ pub fn create_bspline_basis_with_knots_derivative(
 }
 
 /// Creates the second-derivative B-spline basis matrix using a pre-computed knot vector.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Provided` and `BasisOptions::second_derivative()` instead"
+)]
 pub fn create_bspline_basis_with_knots_second_derivative(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1537,6 +1546,10 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
 }
 
 /// Creates a sparse B-spline basis matrix using a pre-computed knot vector.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Provided` instead"
+)]
 pub fn create_bspline_basis_sparse_with_knots(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1558,6 +1571,10 @@ pub fn create_bspline_basis_sparse_with_knots(
 }
 
 /// Creates the first-derivative sparse B-spline basis matrix using a pre-computed knot vector.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Provided` and `BasisOptions::first_derivative()` instead"
+)]
 pub fn create_bspline_basis_sparse_with_knots_derivative(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1579,6 +1596,10 @@ pub fn create_bspline_basis_sparse_with_knots_derivative(
 }
 
 /// Creates the second-derivative sparse B-spline basis matrix using a pre-computed knot vector.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Provided` and `BasisOptions::second_derivative()` instead"
+)]
 pub fn create_bspline_basis_sparse_with_knots_second_derivative(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -1629,6 +1650,7 @@ pub fn create_bspline_basis_sparse_with_knots_second_derivative(
 /// The resulting basis matrix has the partition of unity property: each row sums to 1.
 /// Uniform knot spacing ensures that the discrete difference penalty D^T D has the
 /// correct mathematical interpretation as a discrete approximation to derivatives.
+#[deprecated(since = "0.1.3", note = "Use `create_basis` with `KnotSource::Generate` instead")]
 pub fn create_bspline_basis(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1647,6 +1669,10 @@ pub fn create_bspline_basis(
 }
 
 /// Creates the first-derivative B-spline basis expansion matrix with uniformly spaced knots.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Generate` and `BasisOptions::first_derivative()` instead"
+)]
 pub fn create_bspline_basis_derivative(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1665,6 +1691,10 @@ pub fn create_bspline_basis_derivative(
 }
 
 /// Creates the second-derivative B-spline basis expansion matrix with uniformly spaced knots.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis` with `KnotSource::Generate` and `BasisOptions::second_derivative()` instead"
+)]
 pub fn create_bspline_basis_second_derivative(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1683,6 +1713,10 @@ pub fn create_bspline_basis_second_derivative(
 }
 
 /// Creates a sparse B-spline basis expansion matrix with uniformly spaced knots.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Generate` instead"
+)]
 pub fn create_bspline_basis_sparse(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1701,6 +1735,10 @@ pub fn create_bspline_basis_sparse(
 }
 
 /// Creates the first-derivative sparse B-spline basis expansion matrix with uniformly spaced knots.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Generate` and `BasisOptions::first_derivative()` instead"
+)]
 pub fn create_bspline_basis_sparse_derivative(
     data: ArrayView1<f64>,
     data_range: (f64, f64),
@@ -1731,6 +1769,10 @@ pub fn create_bspline_basis_sparse_derivative(
 }
 
 /// Creates the second-derivative sparse B-spline basis expansion matrix with uniformly spaced knots.
+#[deprecated(
+    since = "0.1.3",
+    note = "Use `create_basis::<Sparse>` with `KnotSource::Generate` and `BasisOptions::second_derivative()` instead"
+)]
 pub fn create_bspline_basis_sparse_second_derivative(
     data: ArrayView1<f64>,
     data_range: (f64, f64),

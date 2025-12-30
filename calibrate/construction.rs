@@ -1,4 +1,4 @@
-use crate::calibrate::basis::{self, create_bspline_basis, create_bspline_basis_nd_with_knots};
+use crate::calibrate::basis::{self, create_basis, create_bspline_basis_nd_with_knots, BasisOptions, Dense, KnotSource};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
@@ -1147,11 +1147,14 @@ pub fn build_design_and_penalty_matrices(
     interaction_orth_alpha.reserve(n_pcs + 1);
 
     // Stage: Generate the PGS basis and apply the sum-to-zero constraint
-    let (pgs_basis_unc, pgs_knots) = create_bspline_basis(
+    let (pgs_basis_unc, pgs_knots) = create_basis::<Dense>(
         data.p.view(),
-        config.pgs_range,
-        config.pgs_basis_config.num_knots,
+        KnotSource::Generate {
+            data_range: config.pgs_range,
+            num_internal_knots: config.pgs_basis_config.num_knots,
+        },
         config.pgs_basis_config.degree,
+        BasisOptions::value(),
     )?;
 
     // Save PGS knot vector
@@ -1198,11 +1201,14 @@ pub fn build_design_and_penalty_matrices(
         let pc_col = data.pcs.column(i);
         let pc_config = &config.pc_configs[i];
         let pc_name = &pc_config.name;
-        let (pc_basis_unc, pc_knots) = create_bspline_basis(
+        let (pc_basis_unc, pc_knots) = create_basis::<Dense>(
             pc_col.view(),
-            pc_config.range,
-            pc_config.basis_config.num_knots,
+            KnotSource::Generate {
+                data_range: pc_config.range,
+                num_internal_knots: pc_config.basis_config.num_knots,
+            },
             pc_config.basis_config.degree,
+            BasisOptions::value(),
         )?;
 
         // Save PC knot vector
@@ -3013,21 +3019,27 @@ mod tests {
         let s_pc_null = &s_list[pc_null_block.penalty_indices[0]];
 
         // Build expected anisotropic penalties for comparison
-        let (pgs_basis_unc, _) = create_bspline_basis(
+        let (pgs_basis_unc, _) = create_basis::<Dense>(
             data.p.view(),
-            config.pgs_range,
-            config.pgs_basis_config.num_knots,
+            KnotSource::Generate {
+                data_range: config.pgs_range,
+                num_internal_knots: config.pgs_basis_config.num_knots,
+            },
             config.pgs_basis_config.degree,
+            BasisOptions::value(),
         )
         .expect("PGS basis construction");
         let pgs_cols = pgs_basis_unc.ncols() - 1; // drop intercept column
 
         let pc_config = &config.pc_configs[0];
-        let (pc_basis_unc, _) = create_bspline_basis(
+        let (pc_basis_unc, _) = create_basis::<Dense>(
             data.pcs.column(0).view(),
-            pc_config.range,
-            pc_config.basis_config.num_knots,
+            KnotSource::Generate {
+                data_range: pc_config.range,
+                num_internal_knots: pc_config.basis_config.num_knots,
+            },
             pc_config.basis_config.degree,
+            BasisOptions::value(),
         )
         .expect("PC basis construction");
         let pc_cols = pc_basis_unc.ncols() - 1; // drop intercept column
@@ -3090,11 +3102,14 @@ mod tests {
         }
 
         // Validate sex×PGS penalty structure (wiggle only)
-        let (pgs_basis_unc, _) = create_bspline_basis(
+        let (pgs_basis_unc, _) = create_basis::<Dense>(
             data.p.view(),
-            config.pgs_range,
-            config.pgs_basis_config.num_knots,
+            KnotSource::Generate {
+                data_range: config.pgs_range,
+                num_internal_knots: config.pgs_basis_config.num_knots,
+            },
             config.pgs_basis_config.degree,
+            BasisOptions::value(),
         )
         .expect("PGS basis construction");
         let pgs_main_basis_unc = pgs_basis_unc.slice(s![.., 1..]);

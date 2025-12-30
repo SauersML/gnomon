@@ -1,7 +1,6 @@
 use crate::calibrate::basis::{
-    BasisError, SplineScratch, baseline_lambda_seed, create_bspline_basis_with_knots,
-    create_bspline_basis_with_knots_derivative, create_difference_penalty_matrix,
-    evaluate_bspline_basis_scalar, null_range_whiten,
+    BasisError, SplineScratch, baseline_lambda_seed, create_difference_penalty_matrix,
+    evaluate_bspline_basis_scalar, null_range_whiten, create_basis, BasisOptions, Dense, KnotSource,
 };
 use crate::calibrate::calibrator::CalibratorModel;
 use crate::calibrate::estimate::EstimationError;
@@ -528,7 +527,12 @@ fn make_reference_constraint(
     reference_u: f64,
 ) -> Result<ReferenceConstraint, SurvivalError> {
     let data = array![reference_u];
-    let (basis_arc, _) = create_bspline_basis_with_knots(data.view(), knot_vector, degree)?;
+    let (basis_arc, _) = create_basis::<Dense>(
+        data.view(),
+        KnotSource::Provided(knot_vector),
+        degree,
+        BasisOptions::value(),
+    )?;
     let basis = (*basis_arc).clone();
     let row = basis.row(0).to_owned();
     let transform = nullspace_transform(&row)?;
@@ -555,16 +559,18 @@ fn evaluate_basis_and_derivative(
     log_ages: ArrayView1<f64>,
     descriptor: &BasisDescriptor,
 ) -> Result<(Array2<f64>, Array2<f64>), SurvivalError> {
-    let (basis_arc, _) = create_bspline_basis_with_knots(
+    let (basis_arc, _) = create_basis::<Dense>(
         log_ages,
-        descriptor.knot_vector.view(),
+        KnotSource::Provided(descriptor.knot_vector.view()),
         descriptor.degree,
+        BasisOptions::value(),
     )?;
     let basis = (*basis_arc).clone();
-    let (derivative_arc, _) = create_bspline_basis_with_knots_derivative(
+    let (derivative_arc, _) = create_basis::<Dense>(
         log_ages,
-        descriptor.knot_vector.view(),
+        KnotSource::Provided(descriptor.knot_vector.view()),
         descriptor.degree,
+        BasisOptions::first_derivative(),
     )?;
     let derivative = (*derivative_arc).clone();
 
@@ -800,11 +806,13 @@ pub fn build_survival_layout(
             config.lambda_null
         };
 
-        let (pgs_basis_full, _) = create_bspline_basis_with_knots(
+        let (pgs_basis_full_arc, _) = create_basis::<Dense>(
             data.pgs.view(),
-            config.pgs_basis.knot_vector.view(),
+            KnotSource::Provided(config.pgs_basis.knot_vector.view()),
             config.pgs_basis.degree,
+            BasisOptions::value(),
         )?;
+        let pgs_basis_full = (*pgs_basis_full_arc).clone();
         if pgs_basis_full.ncols() <= 1 {
             warn!("PGS basis returned no range columns; skipping time-varying interaction");
         } else {
@@ -812,7 +820,7 @@ pub fn build_survival_layout(
             let offsets = compute_weighted_column_means(&pgs_basis, &data.sample_weight);
             if offsets.len() == pgs_basis.ncols() {
                 for (mut column, &offset) in pgs_basis.axis_iter_mut(Axis(1)).zip(offsets.iter()) {
-                    column.mapv_inplace(|value| value - offset);
+                    column.mapv_inplace(|value: f64| value - offset);
                 }
             }
 
@@ -4195,12 +4203,14 @@ mod tests {
             .expect("centering metadata for tensor product")
             .offsets
             .clone();
-        let (pgs_basis_full, _) = create_bspline_basis_with_knots(
+        let (pgs_basis_full_arc, _) = create_basis::<Dense>(
             data.pgs.view(),
-            pgs_basis.knot_vector.view(),
+            KnotSource::Provided(pgs_basis.knot_vector.view()),
             pgs_basis.degree,
+            BasisOptions::value(),
         )
         .unwrap();
+        let pgs_basis_full = (*pgs_basis_full_arc).clone();
         let mut pgs_basis_matrix = pgs_basis_full.slice(s![.., 1..]).to_owned();
         let raw_means = compute_weighted_column_means(&pgs_basis_matrix, &data.sample_weight);
         assert_eq!(raw_means.len(), offsets.len());
@@ -4208,7 +4218,7 @@ mod tests {
             assert_abs_diff_eq!(raw, offset, epsilon = 1e-10);
         }
         for (mut column, &offset) in pgs_basis_matrix.axis_iter_mut(Axis(1)).zip(offsets.iter()) {
-            column.mapv_inplace(|value| value - offset);
+            column.mapv_inplace(|value: f64| value - offset);
         }
         let centered_means = compute_weighted_column_means(&pgs_basis_matrix, &data.sample_weight);
         for mean in centered_means.iter() {

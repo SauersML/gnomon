@@ -24,7 +24,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
 use std::{
     borrow::Cow,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use faer::{MatRef, Spec, Auto};
 use faer::linalg::cholesky::llt::factor::{LltParams, LltRegularization};
@@ -2185,7 +2185,6 @@ fn unpivot_sym_by_perm(m_pivoted: ArrayView2<f64>, pivot: &[usize]) -> Array2<f6
 /// * `src`: Source vector without the dropped rows (length = total - n_drop)
 /// * `dropped_rows`: Indices of rows to be inserted as zeros (MUST be in ascending order)
 /// * `dst`: Destination vector where zeros will be inserted (length = total)
-/// Currently unused but kept for future implementation
 pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f64>) {
     let n_drop = dropped_rows.len();
 
@@ -2229,7 +2228,6 @@ pub fn undrop_rows(src: &Array1<f64>, dropped_rows: &[usize], dst: &mut Array1<f
 
 /// Performs the complement operation to undrop_rows - it removes specified rows from a vector
 /// This simulates the behavior of drop_cols in the C code but for a 1D vector
-/// Currently unused but kept for future implementation
 pub fn drop_rows(src: &Array1<f64>, drop_indices: &[usize], dst: &mut Array1<f64>) {
     let n_drop = drop_indices.len();
 
@@ -2496,694 +2494,145 @@ impl PlsSolverDiagnostics {
     }
 }
 
-/// Robust penalized least squares solver following mgcv's pls_fit1 architecture
-/// This function implements the logic for a SINGLE P-IRLS step in the TRANSFORMED basis
-///
-/// The solver now accepts TWO penalty matrices to separate rank detection from penalty application:
-/// - `eb`: Lambda-INDEPENDENT balanced penalty root used ONLY for numerical rank detection
-/// - `e_transformed`: Lambda-DEPENDENT penalty root used ONLY for applying the actual penalty
 pub fn solve_penalized_least_squares(
     x_transformed: ArrayView2<f64>, // The TRANSFORMED design matrix
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     offset: ArrayView1<f64>,
-    eb: &Array2<f64>, // Balanced penalty root for rank detection (lambda-independent)
-    e_transformed: &Array2<f64>, // Lambda-dependent penalty root for penalty application
-    s_transformed: &Array2<f64>, // Precomputed S = EᵀE (per rho)
-    workspace: &mut PirlsWorkspace, // Preallocated buffers (Suggestion #6)
-    y: ArrayView1<f64>, // Original response (not the working response z)
-    link_function: LinkFunction, // Link function to determine appropriate scale calculation
+    _eb: &Array2<f64>, // DELETE THIS IF IT IS UNUSED
+    e_transformed: &Array2<f64>,
+    s_transformed: &Array2<f64>, // Precomputed S = EᵀE
+    workspace: &mut PirlsWorkspace,
+    y: ArrayView1<f64>,
+    link_function: LinkFunction,
 ) -> Result<(StablePLSResult, usize), EstimationError> {
-    // The penalized least squares solver implements a 5-stage algorithm (QR path) or
-    // a fast symmetric solve (SPD path) when H is SPD.
-
-    // FAST PATH: Pure unpenalized WLS case (no penalty rows)
-    if eb.nrows() == 0 && e_transformed.nrows() == 0 {
-        println!("[PLS Solver] Using fast path for unpenalized WLS");
-
-        // Weighted design and RHS
-        let sqrt_w = weights.mapv(|w| w.max(0.0).sqrt());
-        let wx = &x_transformed * &sqrt_w.view().insert_axis(Axis(1));
-        let z_eff = &z - &offset;
-        let wz = &sqrt_w * &z_eff;
-
-        // Stage: Use pivoted QR only to determine rank and column ordering
-        let (_, r_factor, pivot) = pivoted_qr_faer(&wx)?;
-        let diag = r_factor.diag();
-        let max_diag = diag.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        let tol = max_diag * 1e-12;
-        let rank = diag.iter().filter(|&&v| v.abs() > tol).count();
-
-        // Stage: Build the submatrix from the first `rank` pivoted columns (in original index space)
-        let kept_cols = &pivot[..rank];
-        let mut wx_kept = Array2::<f64>::zeros((wx.nrows(), rank));
-        for (j_new, &j_orig) in kept_cols.iter().enumerate() {
-            wx_kept.column_mut(j_new).assign(&wx.column(j_orig));
-        }
-
-        // Stage: Solve least squares on the kept submatrix via SVD (β_kept = V Σ⁺ Uᵀ wz)
-        use crate::calibrate::faer_ndarray::FaerSvd;
-        let (u_opt, s, vt_opt) = wx_kept
-            .svd(true, true)
-            .map_err(EstimationError::LinearSystemSolveFailed)?;
-        let (u, vt) = match (u_opt, vt_opt) {
-            (Some(u), Some(vt)) => (u, vt),
-            _ => {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-        };
-
-        let smax = s.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
-        let tol_svd = smax * 1e-12;
-
-        // Compute Σ⁺ Uᵀ wz without building dense Σ⁺
-        let utb = u.t().dot(&wz);
-        let mut s_inv_utb = Array1::<f64>::zeros(s.len());
-        for i in 0..s.len() {
-            if s[i] > tol_svd {
-                s_inv_utb[i] = utb[i] / s[i];
-            }
-        }
-        let beta_kept = vt.t().dot(&s_inv_utb); // length = rank
-
-        // Stage: Construct the full beta vector with dropped columns set to zero
-        let mut beta_transformed = Array1::<f64>::zeros(x_transformed.ncols());
-        for (j_new, &j_orig) in kept_cols.iter().enumerate() {
-            beta_transformed[j_orig] = beta_kept[j_new];
-        }
-
-        // Stage: Build the Hessian H = Xᵀ W X (since S=0) using the preallocated buffer
-        use ndarray::linalg::{general_mat_mul, general_mat_vec_mul};
-        let p_wx = wx.ncols();
-        if workspace.xtwx_buf.dim() != (p_wx, p_wx) {
-            // resize if needed (shouldn't happen in steady state)
-            workspace.xtwx_buf = Array2::zeros((p_wx, p_wx));
-        }
-        workspace.xtwx_buf.fill(0.0);
-        general_mat_mul(1.0, &wx.t(), &wx, 0.0, &mut workspace.xtwx_buf);
-        // Compute wx.t() * wz into a preallocated buffer via GEMV
-        if workspace.vec_buf_p.len() != p_wx {
-            workspace.vec_buf_p = Array1::zeros(p_wx);
-        }
-        workspace.vec_buf_p.fill(0.0);
-        general_mat_vec_mul(1.0, &wx.t(), &wz, 0.0, &mut workspace.vec_buf_p);
-        let grad = workspace.xtwx_buf.view().dot(&beta_transformed) - &workspace.vec_buf_p;
-        let inf_norm = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-        if inf_norm > 1e-10 {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-
-        return Ok((
-            StablePLSResult {
-                beta: Coefficients::new(beta_transformed),
-                penalized_hessian: workspace.xtwx_buf.clone(),
-                edf: rank as f64, // EDF = rank in unpenalized LS
-                scale: 1.0,
-                ridge_used: 0.0,
-            },
-            rank,
-        ));
-    }
-
-    let mut diagnostics = PlsSolverDiagnostics::new(
-        x_transformed.nrows(),
-        x_transformed.ncols(),
-        eb.nrows(),
-        eb.ncols(),
-        e_transformed.nrows(),
-        e_transformed.ncols(),
-    );
-
-    // FAST PATH (penalized case): Use symmetric solve on H = Xᵀ W X + S_λ
-    if e_transformed.nrows() > 0 {
-        // Weighted design and RHS via broadcasting
-        workspace
-            .sqrt_w
-            .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
-        let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
-        if workspace.wx.dim() != x_transformed.dim() {
-            workspace.wx = Array2::zeros(x_transformed.dim());
-        }
-        workspace.wx.assign(&x_transformed);
-        workspace.wx *= &sqrt_w_col; // wx = X .* sqrt_w
-        workspace.wz.assign(&z);
-        workspace.wz -= &offset;
-        workspace.wz *= &workspace.sqrt_w; // wz = z .* sqrt_w
-
-        let p_dim = x_transformed.ncols();
-        if workspace.xtwx_buf.dim() != (p_dim, p_dim) {
-            workspace.xtwx_buf = Array2::zeros((p_dim, p_dim));
-        }
-        let wx_view = FaerArrayView::new(&workspace.wx);
-        let mut xtwx_view = array2_to_mat_mut(&mut workspace.xtwx_buf);
-        matmul(
-            xtwx_view.as_mut(),
-            Accum::Replace,
-            wx_view.as_ref().transpose(),
-            wx_view.as_ref(),
-            1.0,
-            get_global_parallelism(),
-        );
-
-        if workspace.vec_buf_p.len() != p_dim {
-            workspace.vec_buf_p = Array1::zeros(p_dim);
-        }
-        let wz_view = FaerColView::new(&workspace.wz);
-        let mut xtwz_view = array1_to_col_mat_mut(&mut workspace.vec_buf_p);
-        matmul(
-            xtwz_view.as_mut(),
-            Accum::Replace,
-            wx_view.as_ref().transpose(),
-            wz_view.as_ref(),
-            1.0,
-            get_global_parallelism(),
-        );
-
-        // H = XtWX + S_lambda (symmetrize to avoid false SPD failures)
-        let mut penalized_hessian = workspace.xtwx_buf.clone();
-        for i in 0..p_dim {
-            for j in 0..p_dim {
-                penalized_hessian[(i, j)] += s_transformed[(i, j)];
-            }
-        }
-        for i in 0..p_dim {
-            for j in 0..i {
-                let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
-                penalized_hessian[[i, j]] = v;
-                penalized_hessian[[j, i]] = v;
-            }
-        }
-
-        let diag_scale = max_abs_diag(&penalized_hessian);
-        let nugget = (diag_scale * PLS_NUGGET_SCALE).max(PLS_NUGGET_MIN);
-        if nugget > 0.0 {
-            for i in 0..p_dim {
-                penalized_hessian[[i, i]] += nugget;
-            }
-        }
-
-        let solve_with_factor = |penalized: &Array2<f64>,
-                                 factor: &PlsFactor,
-                                 ridge_used: f64,
-                                 cond_est: Option<f64>,
-                                 stack: &mut MemStack| // Added stack argument
-         -> Result<Option<(StablePLSResult, usize)>, EstimationError> {
-            if ridge_used > 0.0 {
-                let cond_display = cond_est
-                    .map(|c| format!("{c:.2e}"))
-                    .unwrap_or_else(|| "unavailable".to_string());
-                log::warn!(
-                    "Added ridge {:.3e} before SPD solve (cond ≈ {})",
-                    ridge_used,
-                    cond_display
-                );
-            }
-
-            let cond_bad = match calculate_condition_number(penalized) {
-                Ok(cond) => !cond.is_finite() || cond > 1e8,
-                Err(_) => false,
-            };
-            if cond_bad {
-                log::warn!(
-                    "Penalized Hessian condition is poor after ridge; proceeding with SPD solve."
-                );
-            }
-
-            let rk_rows = e_transformed.nrows();
-            let nrhs = 1 + rk_rows;
-            let mut rhs = Array2::<f64>::zeros((p_dim, nrhs));
-            for i in 0..p_dim {
-                rhs[(i, 0)] = workspace.vec_buf_p[i];
-            }
-            for j in 0..rk_rows {
-                for i in 0..p_dim {
-                    rhs[(i, 1 + j)] = e_transformed[(j, i)];
-                }
-            }
-            let rhs_view = FaerArrayView::new(&rhs);
-            let sol = factor.solve(rhs_view.as_ref(), stack);
-
-            let mut beta_transformed = Array1::zeros(p_dim);
-            for i in 0..p_dim {
-                beta_transformed[i] = sol[(i, 0)];
-            }
-            if !beta_transformed.iter().all(|v| v.is_finite()) {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-
-            let mut frob = 0.0f64;
-            let mut comp = 0.0f64;
-            for j in 0..rk_rows {
-                for i in 0..p_dim {
-                    let prod = sol[(i, 1 + j)] * e_transformed[(j, i)];
-                    let y_k = prod - comp;
-                    let t = frob + y_k;
-                    comp = (t - frob) - y_k;
-                    frob = t;
-                }
-            }
-            let mp = (p_dim as f64 - rk_rows as f64).max(0.0);
-            let edf = (p_dim as f64 - frob).clamp(mp, p_dim as f64);
-            if !edf.is_finite() {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-
-            let scale = calculate_scale(
-                &beta_transformed,
-                x_transformed,
-                y,
-                weights,
-                edf,
-                link_function,
-            );
-            if !scale.is_finite() {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
-
-            println!(
-                "[PLS Solver] (SPD/LDLT or LLᵀ) Completed with edf={:.2}, scale={:.4e}",
-                edf, scale
-            );
-
-            Ok(Some((
-                StablePLSResult {
-                    beta: Coefficients::new(beta_transformed),
-                    penalized_hessian: penalized.clone(),
-                    edf,
-                    scale,
-                    ridge_used,
-                },
-                p_dim,
-            )))
-        };
-
-        let (factor_opt, ridge_used, cond_est) = attempt_spd_factorization_mem(
-            &penalized_hessian,
-            &mut workspace.factorization_matrix,
-            &mut workspace.factorization_scratch,
-        );
-        let total_ridge = ridge_used + nugget;
-        match factor_opt {
-            Some(factor) => {
-                if let Some(result) =
-                    solve_with_factor(
-                        &penalized_hessian,
-                        &factor,
-                        total_ridge,
-                        cond_est,
-                        &mut MemStack::new(&mut workspace.factorization_scratch)
-                    )?
-                {
-                    return Ok(result);
-                }
-            }
-            None => {
-                diagnostics.record_fallback(PlsFallbackReason::FactorizationFailed);
-            }
-        }
-        // If LLᵀ fails, continue into the robust QR path below.
-    }
-
-    let function_timer = Instant::now();
-
-    use ndarray::s;
-
-    // Define rank tolerance, matching mgcv's default
-    const RANK_TOL: f64 = 1e-7;
-
-    // let n = x_transformed.nrows();
+    // Standardize nugget usage across the codebase.
+    // LAML_RIDGE (1e-8) is a good baseline for ensuring positive definiteness
+    // without distorting valid curvature.
+    let nugget_fraction = 1e-8;
+    
+    // Dimensions
     let p_dim = x_transformed.ncols();
+    let rk_rows = e_transformed.nrows();
 
-    // --- Negative Weight Handling ---
-    // The reference mgcv implementation includes extensive logic for handling negative weights,
-    // which can arise during a full Newton-Raphson P-IRLS step with non-canonical link
-    // functions.
-    //
-    // Our current implementation for the Logit link uses Fisher Scoring, where weights
-    // w = mu(1-mu) are always non-negative. For the Identity link, weights are always 1.0.
-    // Therefore, negative weights are currently impossible.
-    //
-    // If full Newton-Raphson is implemented in the future, a full SVD-based correction,
-    // as seen in the mgcv C function `pls_fit1`, would be required here for statistical correctness.
-
-    // Note: Current implementation uses Fisher scoring where weights should be non-negative;
-    // we still clamp tiny negatives to zero before forming sqrt(W) to avoid NaNs.
-
-    // EXACTLY following mgcv's pls_fit1 multi-stage approach:
-
-    // Stage: Initial QR decomposition of the weighted design matrix
-
-    // Form the weighted design matrix (sqrt(W)X) and weighted response (sqrt(W)z)
+    // 1. Prepare Weighted Design and Response
+    // Uses pre-allocated workspace buffers
     workspace
         .sqrt_w
         .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(ndarray::Axis(1));
-    // wx <- X .* sqrt_w (broadcast)
+
     if workspace.wx.dim() != x_transformed.dim() {
         workspace.wx = Array2::zeros(x_transformed.dim());
     }
     workspace.wx.assign(&x_transformed);
-    workspace.wx *= &sqrt_w_col;
-    let wx = &workspace.wx;
-    // wz <- sqrt_w .* z
-    workspace.wz.assign(&z);
-    workspace.wz *= &workspace.sqrt_w;
-    let wz = &workspace.wz;
+    workspace.wx *= &sqrt_w_col; // wx = X .* sqrt_w
 
-    // Perform initial pivoted QR on the weighted design matrix
-    let (q1, r1_full, initial_pivot) = pivoted_qr_faer(wx)?;
+    workspace.wz.assign(z);
+    workspace.wz -= &offset;
+    workspace.wz *= &workspace.sqrt_w; // wz = (z - offset) .* sqrt_w
 
-    // Keep only the leading p rows of r1 (r_rows = min(n, p))
-    let r_rows = r1_full.nrows().min(p_dim);
-    let r1_pivoted = r1_full.slice(s![..r_rows, ..]);
+    // 2. Form X'WX
+    if workspace.xtwx_buf.dim() != (p_dim, p_dim) {
+        workspace.xtwx_buf = Array2::zeros((p_dim, p_dim));
+    }
+    // Efficient computation using Faer
+    let wx_view = FaerArrayView::new(&workspace.wx);
+    let mut xtwx_view = array2_to_mat_mut(&mut workspace.xtwx_buf);
+    matmul(
+        xtwx_view.as_mut(),
+        Accum::Replace,
+        wx_view.as_ref().transpose(),
+        wx_view.as_ref(),
+        1.0,
+        get_global_parallelism(),
+    );
 
-    // DO NOT UN-PIVOT r1_pivoted. Keep it in its stable, pivoted form.
-    // The columns of R1 are currently permuted according to `initial_pivot`.
-    // This permutation is crucial for numerical stability in rank detection.
-    // Transform RHS using Q1' (first transformation of the RHS)
-    let q1_t_wz = fast_atv(&q1, wz);
+    // 3. Form X'Wz
+    if workspace.vec_buf_p.len() != p_dim {
+        workspace.vec_buf_p = Array1::zeros(p_dim);
+    }
+    let wz_view = FaerColView::new(&workspace.wz);
+    let mut xtwz_view = array1_to_col_mat_mut(&mut workspace.vec_buf_p);
+    matmul(
+        xtwz_view.as_mut(),
+        Accum::Replace,
+        wx_view.as_ref().transpose(),
+        wz_view.as_ref(),
+        1.0,
+        get_global_parallelism(),
+    );
 
-    // Stage: Rank determination using the scaled augmented system
+    // 4. Form Penalized Hessian: H = X'WX + S
+    let mut penalized_hessian = workspace.xtwx_buf.clone();
+    // Add S (which is E'E) - usually sparse/structured but here dense S is fine
+    for i in 0..p_dim {
+        for j in 0..p_dim {
+            penalized_hessian[(i, j)] += s_transformed[(i, j)];
+        }
+    }
+    // Symmetrize to be safe
+    for i in 0..p_dim {
+        for j in 0..i {
+            let v = 0.5 * (penalized_hessian[[i, j]] + penalized_hessian[[j, i]]);
+            penalized_hessian[[i, j]] = v;
+            penalized_hessian[[j, i]] = v;
+        }
+    }
 
-    // Instead of un-pivoting r1, apply the SAME pivot to the penalty matrix `eb`
-    // This ensures the columns of both matrices are aligned correctly
-    let eb_pivoted = pivot_columns(eb.view(), &initial_pivot);
+    // 5. Apply Unconditional "Nugget" Regularization
+    // Rationale: We add a fixed fraction of the diagonal scale to ensure
+    // the matrix is numerically non-singular and eigenvalues are bounded away from zero.
+    // This is done UNCONDITIONALLY to prevent discontinuities.
+    let diag_scale = max_abs_diag(&penalized_hessian);
+    let nugget = diag_scale * nugget_fraction;
+    
+    // We treat this nugget as part of the "ridge_used" field for downstream accounting,
+    // although conceptually it's a structural regularizer for the solver.
+    let mut regularized_hessian = penalized_hessian.clone();
+    for i in 0..p_dim {
+        regularized_hessian[[i, i]] += nugget;
+    }
 
-    // Calculate Frobenius norms for scaling
-    let r_norm = frobenius_norm(&r1_pivoted);
-    let eb_norm = if eb_pivoted.nrows() > 0 {
-        frobenius_norm(&eb_pivoted)
-    } else {
-        1.0
+    // 6. Solve using LDLT (Robust for indefinite/near-singular)
+    // Faer's LDLT is pivoted and stable.
+    let h_reg_view = FaerArrayView::new(&regularized_hessian);
+    
+    // Build the RHS for the system H * beta = X'Wz
+    let rhs_vec = &workspace.vec_buf_p; // X'Wz
+    
+    // Convert to Faer structures for solve
+    let rhs_mat = {
+        let mut m = faer::Mat::zeros(p_dim, 1);
+        for i in 0..p_dim {
+            m[(i, 0)] = rhs_vec[i];
+        }
+        m
     };
 
-    // Create the scaled augmented matrix for numerical stability using pivoted matrices
-    // [R1_pivoted/Rnorm; Eb_pivoted/Eb_norm] - this is the lambda-INDEPENDENT system for rank detection
-    let eb_rows = eb_pivoted.nrows();
-    let scaled_rows = r_rows + eb_rows;
-    assert!(workspace.scaled_matrix.nrows() >= scaled_rows);
-    assert!(workspace.scaled_matrix.ncols() >= p_dim);
-    let mut scaled_matrix = workspace
-        .scaled_matrix
-        .slice_mut(s![..scaled_rows, ..p_dim]);
-
-    // Fill in with slice assignments and scale in place
-    use ndarray::s as ns;
-    {
-        let mut top = scaled_matrix.slice_mut(ns![..r_rows, ..]);
-        top.assign(&r1_pivoted);
-        let inv = 1.0 / r_norm;
-        top.mapv_inplace(|v| v * inv);
-    }
-    if eb_rows > 0 {
-        let mut bot = scaled_matrix.slice_mut(ns![r_rows.., ..]);
-        bot.assign(&eb_pivoted);
-        let inv = 1.0 / eb_norm;
-        bot.mapv_inplace(|v| v * inv);
-    }
-
-    // Perform pivoted QR on the scaled matrix for rank determination
-    let scaled_owned = scaled_matrix.to_owned();
-    let (_, r_scaled, rank_pivot_scaled) = pivoted_qr_faer(&scaled_owned)?;
-
-    // Determine rank using condition number on the scaled matrix
-    let mut rank = p_dim.min(scaled_rows);
-    while rank > 0 {
-        let r_sub = r_scaled.slice(s![..rank, ..rank]);
-        let condition = estimate_r_condition(r_sub.view());
-        if !condition.is_finite() {
-            rank -= 1;
-            continue;
+    let params = faer::linalg::cholesky::ldlt::factor::LdltParams::default();
+    // Use LDLT factorization
+    let ldlt = FaerLdlt::new_with_params(h_reg_view.as_ref(), Side::Lower, params);
+    
+    let beta_vec = if let Ok(factor) = ldlt {
+        let sol_mat = factor.solve(&rhs_mat);
+        let mut b = Array1::zeros(p_dim);
+        for i in 0..p_dim {
+            b[i] = sol_mat[(i, 0)];
         }
-        if RANK_TOL * condition > 1.0 {
-            rank -= 1;
-        } else {
-            break;
-        }
-    }
-
-    // Check if the problem is fully rank deficient
-    if rank == 0 {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-
-    // Stage: Create the rank-reduced system using the rank pivot
-
-    // Also need to pivot e_transformed to maintain consistency with all pivoted matrices
-    let e_transformed_pivoted = pivot_columns(e_transformed.view(), &initial_pivot);
-
-    // Apply the rank-determining pivot to the working matrices, then keep the first `rank` columns
-    // This ensures we drop by position in the rank-ordered system (Option A fix)
-    //
-    // NOTE ON TRIANGULARITY: Permuting columns of the upper-triangular r1_pivoted
-    // intentionally destroys its triangular structure. This is NOT a bug.
-    // The resulting dense r1_ranked is used only to SELECT which columns to keep.
-    // A fresh QR decomposition (Stage 4 below) will restore proper triangular
-    // structure for the final back-substitution solve. This multi-stage approach
-    // is standard for rank-revealing decompositions on partially-reduced systems.
-    let r1_ranked = pivot_columns(r1_pivoted.view(), &rank_pivot_scaled);
-    let e_transformed_ranked = pivot_columns(e_transformed_pivoted.view(), &rank_pivot_scaled);
-
-    // Keep the first `rank` columns by position
-    let r1_dropped = r1_ranked.slice(s![.., ..rank]).to_owned();
-
-    let e_transformed_rows = e_transformed_ranked.nrows();
-    let mut e_transformed_dropped = Array2::zeros((e_transformed_rows, rank));
-    if e_transformed_rows > 0 {
-        e_transformed_dropped.assign(&e_transformed_ranked.slice(s![.., ..rank]));
-    }
-
-    // Record kept positions in the initial pivoted order for later reconstruction
-    let kept_positions: Vec<usize> = rank_pivot_scaled[..rank].to_vec();
-
-    // Stage: Final QR decomposition on the unscaled, reduced system
-
-    // Form the final augmented matrix: [R1_dropped; E_transformed_dropped]
-    // This uses the lambda-DEPENDENT penalty for actual penalty application
-    let final_aug_rows = r_rows + e_transformed_rows;
-    assert!(workspace.final_aug_matrix.nrows() >= final_aug_rows);
-    assert!(workspace.final_aug_matrix.ncols() >= rank);
-    let mut final_aug_matrix = workspace
-        .final_aug_matrix
-        .slice_mut(s![..final_aug_rows, ..rank]);
-
-    // Fill via slice assignments (Suggestion #9)
-    final_aug_matrix
-        .slice_mut(ns![..r_rows, ..])
-        .assign(&r1_dropped);
-    if e_transformed_rows > 0 {
-        final_aug_matrix
-            .slice_mut(ns![r_rows.., ..])
-            .assign(&e_transformed_dropped);
-    }
-
-    // Perform final pivoted QR on the unscaled, reduced system
-    let final_aug_owned = final_aug_matrix.to_owned();
-    let (q_final, mut r_final, final_pivot) = pivoted_qr_faer(&final_aug_owned)?;
-
-    // Add tiny ridge jitter to avoid singular/infinite condition number
-    let r_final_sq = r_final.slice(s![..rank, ..rank]);
-    let eps = 1e-10_f64;
-    let diag_floor = eps.max(r_final_sq[[0, 0]].abs() * 1e-10);
-    let m = rank;
-    let mut any_modified = false;
-    for i in 0..m {
-        // ensure strictly positive diagonal to avoid singular/inf cond
-        if r_final[[i, i]].abs() < diag_floor {
-            r_final[[i, i]] = if r_final[[i, i]] >= 0.0 {
-                diag_floor
-            } else {
-                -diag_floor
-            };
-            any_modified = true;
-        }
-    }
-    if any_modified {
-        log::info!(
-            "[PLS Solver] Applied tiny ridge jitter ({:.3e}) to R diagonal for stability",
-            diag_floor
-        );
-    }
-
-    // Stage: Apply the second transformation to the RHS and solve the system
-
-    // Prepare the full RHS for the final system
-    assert!(workspace.rhs_full.len() >= final_aug_rows);
-    let mut rhs_full = workspace.rhs_full.slice_mut(s![..final_aug_rows]);
-    rhs_full.fill(0.0);
-
-    // Use q1_t_wz for the data part (already transformed by Q1')
-    rhs_full
-        .slice_mut(s![..r_rows])
-        .assign(&q1_t_wz.slice(s![..r_rows]));
-
-    // The penalty part is zeros (already initialized)
-
-    // Apply second transformation to the RHS using Q_final'
-    let rhs_final = q_final.t().dot(&rhs_full.to_owned());
-
-    // Extract the square upper-triangular part of R and corresponding RHS
-    let r_square = r_final.slice(s![..rank, ..rank]);
-    let rhs_square = rhs_final.slice(s![..rank]);
-
-    // Back-substitution to solve the triangular system
-    let mut beta_dropped = Array1::zeros(rank);
-
-    // Hoist diagonal tolerance invariants outside inner loop
-    let max_diag = r_square
-        .diag()
-        .iter()
-        .fold(0.0f64, |acc, &val| acc.max(val.abs()));
-    let tol = (max_diag + 1.0) * 1e-14;
-
-    for i in (0..rank).rev() {
-        // Initialize with right-hand side value
-        let mut sum = rhs_square[i];
-
-        // Subtract known values from higher indices
-        for j in (i + 1)..rank {
-            sum -= r_square[[i, j]] * beta_dropped[j];
-        }
-
-        if r_square[[i, i]].abs() < tol {
-            // This should not happen with proper rank detection in Stage 2
-            log::warn!(
-                "Tiny diagonal {} at position {}, but continuing with Stage 2 rank={}",
-                r_square[[i, i]],
-                i,
-                rank
-            );
-            // Set coefficient to zero and continue instead of erroring
-            beta_dropped[i] = 0.0;
-            continue;
-        }
-
-        beta_dropped[i] = sum / r_square[[i, i]];
-    }
-
-    // Stage: Reconstruct the full coefficient vector
-    // Direct composition approach: orig_j = initial_pivot[ kept_positions[ final_pivot[j] ] ]
-    // This maps each solved coefficient directly to its original column index
-
-    let mut beta_transformed = Array1::zeros(p_dim);
-
-    // For each solved coefficient j, find its original column index through the permutation chain
-    for j in 0..rank {
-        let col_in_kept_space = final_pivot[j]; // Which kept column this coeff belongs to
-        let col_in_initial_pivoted_space = kept_positions[col_in_kept_space]; // Map to initial-pivoted space
-        let original_col_index = initial_pivot[col_in_initial_pivoted_space]; // Map to original space
-        beta_transformed[original_col_index] = beta_dropped[j];
-    }
-
-    // VERIFICATION: Check that the normal equations hold for the reconstructed beta
-    // This is critical to ensure correctness - make it unconditional for now
-    {
-        let residual = {
-            let mut eta = offset.to_owned();
-            eta += &x_transformed.dot(&beta_transformed);
-            eta - z
-        };
-        let weighted_residual = &weights * &residual;
-        let grad_dev_part = fast_atv(&x_transformed, &weighted_residual);
-        let grad_pen_part = s_transformed.dot(&beta_transformed);
-        let grad = &grad_dev_part + &grad_pen_part;
-        let grad_norm_inf = grad.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
-
-        let scale = beta_transformed.iter().map(|&v| v.abs()).sum::<f64>() + 1.0;
-
-        // If gradient appears large, log and continue. QR with rank drop already stabilized the solve.
-        if grad_norm_inf > 1e-6 * scale {
-            log::warn!(
-                "PLS triangular solve residual larger than threshold: ||grad||_inf={:.3e}, scale={:.3e}. Continuing.",
-                grad_norm_inf,
-                scale
-            );
-        }
-    }
-
-    // Stage: Construct the penalized Hessian
-    // Build XtWX without re-touching n using Stage 1 QR result.
-    // From (sqrt(W)X) * P = Q * R  =>  Xᵀ W X = P (Rᵀ R) Pᵀ
-    // Compute RᵀR into a preallocated buffer
-    {
-        use ndarray::linalg::general_mat_mul;
-        let mut buf = workspace
-            .xtwx_buf
-            .slice_mut(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
-        buf.fill(0.0);
-        // buf <- Rᵀ R
-        general_mat_mul(1.0, &r1_pivoted.t(), &r1_pivoted, 0.0, &mut buf);
-    }
-    let xtwx_pivoted_view = workspace
-        .xtwx_buf
-        .slice(s![..r1_pivoted.ncols(), ..r1_pivoted.ncols()]);
-    let xtwx = unpivot_sym_by_perm(xtwx_pivoted_view, &initial_pivot);
-
-    // Use precomputed S = EᵀE from caller (original order)
-    let penalized_hessian = &xtwx + s_transformed;
-
-    // Debug-time guards to verify numerical properties
-    #[cfg(debug_assertions)]
-    {
-        use crate::calibrate::faer_ndarray::FaerCholesky;
-
-        // (a) Symmetry check (relative)
-        let mut asym_sum = 0.0f64;
-        let mut abs_sum = 0.0f64;
-        for i in 0..penalized_hessian.nrows() {
-            for j in 0..penalized_hessian.ncols() {
-                let a = penalized_hessian[[i, j]];
-                let b = penalized_hessian[[j, i]];
-                asym_sum += (a - b).abs();
-                abs_sum += a.abs();
-            }
-        }
-        let rel_asym = asym_sum / (1.0 + abs_sum);
-        assert!(
-            rel_asym < 1e-10,
-            "Penalized Hessian not symmetric (rel_asym={})",
-            rel_asym
-        );
-
-        // (b) PD sanity (allow PSD): add tiny ridge then try Cholesky
-        let mut h_check = penalized_hessian.clone();
-        let ridge = 1e-12;
-        for i in 0..h_check.nrows() {
-            h_check[[i, i]] += ridge;
-        }
-        if h_check.cholesky(Side::Lower).is_err() {
-            log::warn!(
-                "Penalized Hessian failed Cholesky even after tiny ridge; matrix may be poorly conditioned."
-            );
-        }
-    }
-
-    // Stage: Calculate the EDF and scale parameter
-
-    // Calculate effective degrees of freedom using H and XtWX directly (stable)
-    let mut edf = calculate_edf(&penalized_hessian, e_transformed)?;
-    if !edf.is_finite() || edf.is_nan() {
-        // robust fallback for rank-deficient/near-singular cases
-        let p = penalized_hessian.ncols() as f64;
-        let rank_s = e_transformed.nrows() as f64;
-        edf = (p - rank_s).max(0.0);
-    }
-
-    // Calculate scale parameter
+        b
+    } else {
+        return Err(EstimationError::LinearSystemSolveFailed(
+            FaerLinalgError::FactorizationFailed,
+        ));
+    };
+    
+    // 7. Calculate EDF and Scale
+    // Re-use `regularized_hessian` for EDF to consistency.
+    let edf = calculate_edf(&regularized_hessian, e_transformed)?;
+    
     let scale = calculate_scale(
-        &beta_transformed,
+        &beta_vec,
         x_transformed,
         y,
         weights,
@@ -3191,131 +2640,17 @@ pub fn solve_penalized_least_squares(
         link_function,
     );
 
-    // At this point, the solver has completed:
-    // - Computing coefficient estimates (beta) for the current iteration
-    // - Forming the penalized Hessian matrix (X'WX + S) for uncertainty quantification
-    // - Calculating effective degrees of freedom (model complexity measure)
-    // - Estimating the scale parameter (variance component for Gaussian models)
-    diagnostics.emit_qr_summary(
-        edf,
-        scale,
-        rank,
-        x_transformed.ncols(),
-        function_timer.elapsed(),
-    );
-
-    // Return the result
     Ok((
         StablePLSResult {
-            beta: Coefficients::new(beta_transformed),
-            penalized_hessian,
+            beta: Coefficients::new(beta_vec),
+            penalized_hessian: penalized_hessian, // Return original H for derivatives
             edf,
             scale,
-            ridge_used: 0.0,
+            ridge_used: nugget, // Report the unconditional nugget
         },
-        rank,
+        p_dim, // Rank is full (p) in this robust solver
     ))
 }
-
-/// Calculate the Frobenius norm of a matrix (sum of squares of all elements)
-fn frobenius_norm<S>(matrix: &ndarray::ArrayBase<S, ndarray::Ix2>) -> f64
-where
-    S: ndarray::Data<Elem = f64>,
-{
-    matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
-}
-
-/// Perform pivoted QR decomposition using faer's robust implementation
-/// This uses faer's high-level ColPivQr solver which guarantees mathematical
-/// consistency between the Q, R, and P factors of the decomposition A*P = Q*R
-fn pivoted_qr_faer(
-    matrix: &Array2<f64>,
-) -> Result<(Array2<f64>, Array2<f64>, Vec<usize>), EstimationError> {
-    use faer::Mat;
-    use faer::linalg::solvers::ColPivQr;
-
-    let m = matrix.nrows();
-    let n = matrix.ncols();
-    let k = m.min(n);
-
-    // Stage: Convert ndarray to a faer matrix
-    let mut a_faer = Mat::zeros(m, n);
-    for i in 0..m {
-        for j in 0..n {
-            a_faer[(i, j)] = matrix[[i, j]];
-        }
-    }
-
-    // Stage: Perform the column-pivoted QR decomposition using the high-level API
-    // This guarantees that Q, R, and P are all from the same consistent decomposition
-    let qr = ColPivQr::new(a_faer.as_ref());
-
-    // Stage: Extract the consistent Q factor (thin version)
-    let q_faer = qr.compute_thin_Q();
-    let mut q = Array2::zeros((m, k));
-    for i in 0..m {
-        for j in 0..k {
-            q[[i, j]] = q_faer[(i, j)];
-        }
-    }
-
-    // Stage: Extract the consistent R factor
-    let r_faer = qr.R();
-    let mut r = Array2::zeros((k, n));
-    for i in 0..k {
-        for j in 0..n {
-            r[[i, j]] = r_faer[(i, j)];
-        }
-    }
-
-    // Stage: Extract the consistent column permutation (pivot)
-    let perm = qr.P();
-    let (p0_slice, p1_slice) = perm.arrays();
-    let p0: Vec<usize> = p0_slice.to_vec();
-    let p1: Vec<usize> = p1_slice.to_vec();
-
-    // The mathematical identity is A*P = Q*R.
-    // Our goal is to find which permutation vector, when used with our `pivot_columns`
-    // function, correctly reconstructs A*P.
-    let qr_product = q.dot(&r);
-
-    // Try candidate p0
-    let a_p0 = pivot_columns(matrix.view(), &p0);
-
-    // Try candidate p1
-    let a_p1 = pivot_columns(matrix.view(), &p1);
-
-    // Use relative error for scale-robust comparison
-    let compute_relative_error = |a_p: &Array2<f64>| -> f64 {
-        let diff_norm = (a_p - &qr_product).mapv(|x| x * x).sum().sqrt();
-        let a_norm = a_p.mapv(|x| x * x).sum().sqrt();
-        let qr_norm = qr_product.mapv(|x| x * x).sum().sqrt();
-        let denom = (a_norm + qr_norm + 1e-16).max(1e-16); // Avoid division by zero
-        diff_norm / denom
-    };
-
-    let err0 = compute_relative_error(&a_p0);
-    let err1 = compute_relative_error(&a_p1);
-
-    let pivot: Vec<usize> = if err0 < 1e-12 {
-        p0
-    } else if err1 < 1e-12 {
-        p1
-    } else {
-        // This case should not be reached with a correct library, but as a fallback,
-        // it indicates a severe numerical or logical issue.
-        // We return an error instead of guessing, which caused the original failures.
-        return Err(EstimationError::LayoutError(format!(
-            "Could not determine correct QR permutation. Reconstruction errors: {:.2e}, {:.2e}",
-            err0, err1
-        )));
-    };
-
-    Ok((q, r, pivot))
-}
-
-/// Calculate effective degrees of freedom using the final unpivoted Hessian
-/// This avoids pivot mismatches by using the correctly aligned final matrices
 fn calculate_edf(
     penalized_hessian: &Array2<f64>,
     e_transformed: &Array2<f64>,

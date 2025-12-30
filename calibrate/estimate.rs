@@ -942,8 +942,11 @@ fn compute_joint_penalized_hessian(
         let (min_u, max_u) = result.knot_range;
         let rw = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / rw).clamp(0.0, 1.0));
-        match crate::calibrate::basis::create_bspline_basis_with_knots(
-            z.view(), result.knot_vector.view(), result.degree
+        match crate::calibrate::basis::create_basis::<crate::calibrate::basis::Dense>(
+            z.view(),
+            crate::calibrate::basis::KnotSource::Provided(result.knot_vector.view()),
+            result.degree,
+            crate::calibrate::basis::BasisOptions::value(),
         ) {
             Ok((basis, _)) => {
                 let raw = basis.as_ref();
@@ -2301,7 +2304,9 @@ pub fn train_survival_model(
     bundle: &crate::calibrate::survival_data::SurvivalTrainingBundle,
     base_config: &ModelConfig,
 ) -> Result<TrainedModel, EstimationError> {
-    use crate::calibrate::basis::{baseline_lambda_seed, create_bspline_basis};
+    use crate::calibrate::basis::{
+        baseline_lambda_seed, create_basis, BasisOptions, Dense, KnotSource,
+    };
     use crate::calibrate::survival;
     use crate::calibrate::survival::{
         AgeTransform, BasisDescriptor, CovariateLayout, HessianFactor, MonotonicityPenalty,
@@ -2451,11 +2456,14 @@ pub fn train_survival_model(
         compute_log_age_extents(&bundle.age_transform, &bundle.data)?;
 
     let knot_vector = {
-        let (basis_arc, knot_vector) = create_bspline_basis(
+        let (basis_arc, knot_vector) = create_basis::<Dense>(
             log_entry.view(),
-            (log_min, log_max),
-            survival_cfg_owned.baseline_basis.num_knots,
+            KnotSource::Generate {
+                data_range: (log_min, log_max),
+                num_internal_knots: survival_cfg_owned.baseline_basis.num_knots,
+            },
             survival_cfg_owned.baseline_basis.degree,
+            BasisOptions::value(),
         )?;
         if basis_arc.ncols() == 0 {
             return Err(EstimationError::InvalidSpecification(
@@ -2508,11 +2516,14 @@ pub fn train_survival_model(
             None
         } else {
             let pgs_knots = {
-                let (pgs_basis_arc, pgs_knots) = create_bspline_basis(
+                let (pgs_basis_arc, pgs_knots) = create_basis::<Dense>(
                     bundle.data.pgs.view(),
-                    (min_pgs, max_pgs),
-                    settings.pgs_basis.num_knots,
+                    KnotSource::Generate {
+                        data_range: (min_pgs, max_pgs),
+                        num_internal_knots: settings.pgs_basis.num_knots,
+                    },
                     settings.pgs_basis.degree,
+                    BasisOptions::value(),
                 )
                 .map_err(|err| map_error(err.into()))?;
                 if pgs_basis_arc.ncols() == 0 {

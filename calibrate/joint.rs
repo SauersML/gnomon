@@ -21,8 +21,8 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::LinkFunction;
 use crate::calibrate::basis::{
-    baseline_lambda_seed, create_bspline_basis, create_bspline_basis_with_knots,
-    create_difference_penalty_matrix,
+    baseline_lambda_seed, create_basis, create_difference_penalty_matrix, BasisOptions, Dense,
+    KnotSource,
 };
 use crate::calibrate::quadrature::QuadratureContext;
 use crate::calibrate::construction::{
@@ -325,10 +325,23 @@ impl<'a> JointModelState<'a> {
         // Build B-spline basis on z ∈ [0, 1]
         let data_range = (0.0, 1.0);
         let basis_result = if let Some(knots) = self.knot_vector.as_ref() {
-            create_bspline_basis_with_knots(z.view(), knots.view(), degree)
-                .map(|(basis, _)| (basis, knots.clone()))
+            create_basis::<Dense>(
+                z.view(),
+                KnotSource::Provided(knots.view()),
+                degree,
+                BasisOptions::value(),
+            )
+            .map(|(basis, _)| (basis, knots.clone()))
         } else {
-            create_bspline_basis(z.view(), data_range, k, degree)
+            create_basis::<Dense>(
+                z.view(),
+                KnotSource::Generate {
+                    data_range,
+                    num_internal_knots: k,
+                },
+                degree,
+                BasisOptions::value(),
+            )
         };
         match basis_result {
             Ok((bspline_basis, knots)) => {
@@ -469,7 +482,12 @@ impl<'a> JointModelState<'a> {
         let z: Array1<f64> = eta_base
             .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
         
-        let b_raw = match create_bspline_basis_with_knots(z.view(), knot_vector.view(), self.degree) {
+        let b_raw = match create_basis::<Dense>(
+            z.view(),
+            KnotSource::Provided(knot_vector.view()),
+            self.degree,
+            BasisOptions::value(),
+        ) {
             Ok((basis, _)) => basis.as_ref().clone(),
             Err(_) => Array2::zeros((n, 0)),
         };
@@ -2232,7 +2250,12 @@ pub fn predict_joint(
     let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
     
     // Build B-spline basis at prediction points using stored parameters
-    let b_wiggle = match create_bspline_basis_with_knots(z.view(), result.knot_vector.view(), result.degree) {
+    let b_wiggle = match create_basis::<Dense>(
+        z.view(),
+        KnotSource::Provided(result.knot_vector.view()),
+        result.degree,
+        BasisOptions::value(),
+    ) {
         Ok((basis, _)) => {
             let raw = basis.as_ref();
             if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
@@ -2345,13 +2368,17 @@ mod tests {
         // Create a simple result with logit link (no wiggle)
         let n_knots = 5;
         let degree = 3;
-        let (basis, knot_vector) = create_bspline_basis(
+        let (basis_arc, knot_vector) = create_basis::<Dense>(
             Array1::from_vec(vec![0.0]).view(),
-            (0.0, 1.0),
-            n_knots,
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: n_knots - degree - 1,
+            },
             degree,
+            BasisOptions::value(),
         )
         .expect("basis");
+        let basis = (*basis_arc).clone();
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
         assert_eq!(basis.ncols(), num_basis);
         let beta_link = Array1::zeros(num_basis);
@@ -2396,13 +2423,17 @@ mod tests {
     fn test_predict_joint_with_se() {
         let n_knots = 5;
         let degree = 3;
-        let (basis, knot_vector) = create_bspline_basis(
+        let (basis_arc, knot_vector) = create_basis::<Dense>(
             Array1::from_vec(vec![0.0]).view(),
-            (0.0, 1.0),
-            n_knots,
+            KnotSource::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: n_knots - degree - 1,
+            },
             degree,
+            BasisOptions::value(),
         )
         .expect("basis");
+        let basis = (*basis_arc).clone();
         let num_basis = knot_vector.len().saturating_sub(degree + 1);
         assert_eq!(basis.ncols(), num_basis);
         let beta_link = Array1::zeros(num_basis);
