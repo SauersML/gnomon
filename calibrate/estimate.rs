@@ -8433,7 +8433,7 @@ pub mod internal {
                 .firth_logh_total_grad(
                     &pr.x_transformed,
                     &pr.solve_mu,
-                    &pr.solve_weights,
+
                     &h_total,
                 )
                 .expect("g_beta_total");

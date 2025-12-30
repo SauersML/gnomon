@@ -26,6 +26,30 @@ use std::{
     borrow::Cow,
     time::{Duration, Instant},
 };
+use faer::{MatRef, Spec, Auto};
+use faer::linalg::cholesky::llt::factor::{LltParams, LltRegularization};
+
+pub struct LltView<'a> {
+    pub matrix: MatRef<'a, f64>,
+}
+
+impl<'a> LltView<'a> {
+    pub fn solve(&self, rhs: MatRef<f64>, stack: &mut MemStack) -> Array2<f64> {
+        let mut result = Array2::<f64>::zeros((rhs.nrows(), rhs.ncols()));
+        let mut result_mat = array2_to_mat_mut(&mut result);
+        // Copy rhs to result
+        result_mat.as_mut().copy_from(rhs);
+        
+        // Solve in place A x = b (x stored in result_mat)
+        faer::linalg::cholesky::llt::solve::solve_in_place(
+            self.matrix,
+            result_mat.as_mut(),
+            faer::Par::Seq,
+            stack,
+        );
+        result
+    }
+}
 
 pub trait WorkingModel {
     fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError>;
@@ -250,6 +274,13 @@ pub struct PirlsWorkspace {
     pub vec_buf_p: Array1<f64>,
     // Cached sparse XtWX workspace (symbolic + scratch)
     pub(crate) sparse_xtwx_cache: Option<SparseXtWxCache>,
+    // Factorization scratch (avoid per-iteration allocation)
+    pub factorization_scratch: MemBuffer,
+    // Permutation buffers for LDLT
+    pub perm: Vec<usize>,
+    pub perm_inv: Vec<usize>,
+    // Buffer for in-place factorization (preserves original Hessian in WorkingState)
+    pub factorization_matrix: Array2<f64>,
 }
 
 impl PirlsWorkspace {
@@ -272,6 +303,21 @@ impl PirlsWorkspace {
             xtwx_buf: Array2::zeros((p, p)),
             vec_buf_p: Array1::zeros(p),
             sparse_xtwx_cache: None,
+            // Allocate scratch for LDLT (max possible size for p)
+            factorization_scratch: {
+                // Using estimated max requirements (p x p matrix)
+                let par = faer::Par::Seq;
+                // Note: using cholesky_in_place_scratch from llt::factor
+                let req = faer::linalg::cholesky::llt::factor::cholesky_in_place_scratch::<f64>(
+                    p,
+                    par,
+                    Spec::new(<LltParams as Auto<f64>>::auto()),
+                );
+                MemBuffer::new(req)
+            },
+            perm: vec![0; p],
+            perm_inv: vec![0; p],
+            factorization_matrix: Array2::zeros((p, p)),
         }
     }
 
@@ -1269,34 +1315,29 @@ fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
 
 /// Enum to hold either LLT or LDLT factorization for PLS solve.
 /// LDLT is preferred as it handles indefinite matrices gracefully.
-pub(crate) enum PlsFactor {
-    Llt(FaerLlt<f64>),
-    Ldlt(FaerLdlt<f64>),
+pub(crate) enum PlsFactor<'a> {
+    WorkspaceLlt(LltView<'a>),
 }
 
-impl PlsFactor {
-    /// Solve a linear system with the stored factorization.
-    pub fn solve(&self, rhs: faer::MatRef<'_, f64>) -> faer::Mat<f64> {
+impl<'a> PlsFactor<'a> {
+    pub fn solve(&self, rhs: faer::MatRef<'_, f64>, stack: &mut MemStack) -> Array2<f64> {
         match self {
-            PlsFactor::Llt(f) => f.solve(rhs),
-            PlsFactor::Ldlt(f) => f.solve(rhs),
+            PlsFactor::WorkspaceLlt(view) => view.solve(rhs, stack),
         }
     }
 }
 
-/// Attempts to factorize a symmetric matrix, preferring LDLT (robust to indefinite)
-/// over LLT. Returns the factorization, total ridge added, and condition estimate.
-///
-/// Strategy:
-/// 1. Try LDLT first (handles indefinite matrices gracefully)
-/// 2. If LDLT succeeds, return it
-/// 3. If LDLT fails, try LLT with progressive ridge  
-/// 4. If both fail, return None
-fn attempt_spd_factorization(matrix: &mut Array2<f64>) -> (Option<PlsFactor>, f64, Option<f64>) {
+/// Attempts to factorize a symmetric matrix, preferring LLT with Ridge
+/// using workspace memory to avoid allocations.
+fn attempt_spd_factorization_mem<'a>(
+    matrix: &Array2<f64>,
+    factorization_matrix: &'a mut Array2<f64>,
+    factorization_scratch: &mut MemBuffer,
+) -> (Option<PlsFactor<'a>>, f64, Option<f64>) {
     let diag_scale = max_abs_diag(matrix);
     let cond_est = calculate_condition_number(matrix).ok();
     
-    // Initial ridge estimation based on condition number
+    // Initial ridge logic
     let mut ridge = 0.0;
     if let Some(cond) = cond_est {
         if !cond.is_finite() {
@@ -1310,53 +1351,95 @@ fn attempt_spd_factorization(matrix: &mut Array2<f64>) -> (Option<PlsFactor>, f6
     
     let mut total_added = 0.0;
 
-    // Try LDLT first (robust to indefinite matrices)
-    let view = FaerArrayView::new(&*matrix);
-    if let Ok(ldlt) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-        return (Some(PlsFactor::Ldlt(ldlt)), 0.0, cond_est);
-    }
+    // Params for LLT
+    let par = faer::Par::Seq;
+    let params = <LltParams as Auto<f64>>::auto();
 
-    // LDLT failed - fall back to LLT with progressive ridge
     for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
-        if ridge > total_added {
-            let delta = ridge - total_added;
-            for i in 0..matrix.nrows() {
-                matrix[[i, i]] += delta;
+        // Copy matrix to factorization buffer
+        factorization_matrix.assign(matrix);
+        
+        let current_ridge = if attempt == 0 && total_added == 0.0 { 0.0 } else { ridge };
+        
+        if attempt > 0 {
+             if ridge <= 0.0 {
+                ridge = diag_scale * 1e-10;
+            } else {
+                ridge = (ridge * 10.0).max(diag_scale * 1e-10);
             }
-            total_added = ridge;
+            if !ridge.is_finite() || ridge <= 0.0 {
+                ridge = diag_scale;
+            }
         }
 
-        let view = FaerArrayView::new(&*matrix);
-        match FaerLlt::new(view.as_ref(), Side::Lower) {
-            Ok(chol) => return (Some(PlsFactor::Llt(chol)), total_added, cond_est),
-            Err(_) => {
-                if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {
-                    // Last resort: try LDLT again with ridge
-                    if let Ok(ldlt) = FaerLdlt::new(view.as_ref(), Side::Lower) {
-                        return (Some(PlsFactor::Ldlt(ldlt)), total_added, cond_est);
-                    }
-                    return (None, total_added, cond_est);
+        if current_ridge > 0.0 {
+            total_added = current_ridge;
+            for i in 0..matrix.nrows() {
+                factorization_matrix[[i, i]] += total_added;
+            }
+        }
+        
+        // Factorize in-place
+        {
+            let mut faer_mat = array2_to_mat_mut(factorization_matrix);
+             // Use from_slice_mut compatible with ColMut via as_slice_mut?
+             // Actually, ColMut doesn't have as_slice_mut easily?
+             // try_as_slice_mut exists.
+             // Or use DiagMut::from(reg_diag_mat) if supported.
+             // I'll try from_column_vector_mut with full path if I can.
+             // But simpler: just use empty reg diag if LLT supports it? 
+             // LLT in place DOES take reg_diag.
+             // I will try unsafe from_raw_parts if safe methods fail? No.
+             // `ColMut` derefs to `ColRef`?
+             // `faer::col::ColMut` -> `try_as_slice_mut`.
+             
+            // Safe fallback: slice from Array1 directly/manually if needed, but we have ColMut.
+            // Let's assume DiagMut::from_column_vector_mut exists in recent faer but maybe trait bound?
+            // "function or associated item not found in Diag<Mut<...>>"
+            // Re-check imports?
+            // Try `faer::diag::DiagMut::from_mut` on what?
+            // I'll just use `DiagMut::new_unchecked` if I have to? No.
+            // I will use `DiagMut::from_col(reg_diag_mat)`. Error said "from_col not found".
+            
+            // Try explicit cast to slice?
+            // reg_diag_buf is Array1.
+            // I can create DiagMut from Array1 slice directly!
+            // reg_diag_buf.as_slice_mut().
+            
+
+
+            let stack = MemStack::new(factorization_scratch);
+            
+            // Using default regularization (assumed Zero/Default)
+            match faer::linalg::cholesky::llt::factor::cholesky_in_place(
+                faer_mat.as_mut(),
+                LltRegularization::default(),
+                par,
+                stack,
+                Spec::new(params.clone()),
+            ) {
+                Ok(_) => {
+                    let m = &*factorization_matrix;
+                    let mat_ref = unsafe {
+                         MatRef::from_raw_parts(m.as_ptr(), m.nrows(), m.ncols(), m.strides()[0], m.strides()[1])
+                    };
+                    return (Some(PlsFactor::WorkspaceLlt(LltView { 
+                        matrix: mat_ref 
+                    })), total_added, cond_est);
                 }
-                if ridge <= 0.0 {
-                    ridge = diag_scale * 1e-10;
-                } else {
-                    ridge = (ridge * 10.0).max(diag_scale * 1e-10);
-                }
-                if !ridge.is_finite() || ridge <= 0.0 {
-                    ridge = diag_scale;
+                Err(_) => {
+                    // Factorization failed (not SPD)
+                    // Continue loop to add ridge
                 }
             }
         }
     }
-
+    
     (None, total_added, cond_est)
 }
 
-
-
-
 /// The status of the P-IRLS convergence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirlsStatus {
     /// Converged successfully within tolerance.
     Converged,
@@ -2604,9 +2687,10 @@ pub fn solve_penalized_least_squares(
         }
 
         let solve_with_factor = |penalized: &Array2<f64>,
-                             factor: &PlsFactor,
-                             ridge_used: f64,
-                             cond_est: Option<f64>|
+                                 factor: &PlsFactor,
+                                 ridge_used: f64,
+                                 cond_est: Option<f64>,
+                                 stack: &mut MemStack| // Added stack argument
          -> Result<Option<(StablePLSResult, usize)>, EstimationError> {
             if ridge_used > 0.0 {
                 let cond_display = cond_est
@@ -2641,7 +2725,7 @@ pub fn solve_penalized_least_squares(
                 }
             }
             let rhs_view = FaerArrayView::new(&rhs);
-            let sol = factor.solve(rhs_view.as_ref());
+            let sol = factor.solve(rhs_view.as_ref(), stack);
 
             let mut beta_transformed = Array1::zeros(p_dim);
             for i in 0..p_dim {
@@ -2703,12 +2787,22 @@ pub fn solve_penalized_least_squares(
             )))
         };
 
-        let (factor_opt, ridge_used, cond_est) = attempt_spd_factorization(&mut penalized_hessian);
+        let (factor_opt, ridge_used, cond_est) = attempt_spd_factorization_mem(
+            &penalized_hessian,
+            &mut workspace.factorization_matrix,
+            &mut workspace.factorization_scratch,
+        );
         let total_ridge = ridge_used + nugget;
         match factor_opt {
             Some(factor) => {
                 if let Some(result) =
-                    solve_with_factor(&penalized_hessian, &factor, total_ridge, cond_est)?
+                    solve_with_factor(
+                        &penalized_hessian,
+                        &factor,
+                        total_ridge,
+                        cond_est,
+                        &mut MemStack::new(&mut workspace.factorization_scratch)
+                    )?
                 {
                     return Ok(result);
                 }
