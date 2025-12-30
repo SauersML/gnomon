@@ -5548,6 +5548,137 @@ pub mod internal {
             Ok(g_beta)
         }
 
+        /// Compute ∂log|H|/∂β for logit GLM (non-Firth path).
+        /// Uses the penalized Hessian factorization for leverage computation.
+        fn logh_beta_grad_logit(
+            &self,
+            x_transformed: &DesignMatrix,
+            mu: &Array1<f64>,
+            weights: &Array1<f64>,
+            factor: &Arc<FaerFactor>,
+        ) -> Option<Array1<f64>> {
+            let n = mu.len();
+            if n == 0 {
+                return None;
+            }
+
+            // Match the GLM weight clamp in update_glm_vectors:
+            // if dmu is clamped, weights are constant and w' = 0.
+            const MIN_WEIGHT: f64 = 1e-12;
+            let mut w_prime = Array1::<f64>::zeros(n);
+            let mut clamped = 0usize;
+            for i in 0..n {
+                let mu_i = mu[i];
+                let w_base = mu_i * (1.0 - mu_i);
+                if w_base < MIN_WEIGHT {
+                    clamped += 1;
+                    w_prime[i] = 0.0;
+                    continue;
+                }
+                let one_minus2 = 1.0 - 2.0 * mu_i;
+                w_prime[i] = weights[i] * one_minus2;
+            }
+
+            let mut leverage = Array1::<f64>::zeros(n);
+            let chunk_cols = 1024usize;
+            match x_transformed {
+                DesignMatrix::Dense(x_dense) => {
+                    let p_dim = x_dense.ncols();
+                    for chunk_start in (0..n).step_by(chunk_cols) {
+                        let chunk_end = (chunk_start + chunk_cols).min(n);
+                        let width = chunk_end - chunk_start;
+                        let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                        for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                            rhs.column_mut(local).assign(&x_dense.row(row_idx));
+                        }
+                        let rhs_view = FaerArrayView::new(&rhs);
+                        let sol = factor.solve(rhs_view.as_ref());
+                        for local in 0..width {
+                            let row_idx = chunk_start + local;
+                            let mut acc = 0.0;
+                            for j in 0..p_dim {
+                                acc += x_dense[[row_idx, j]] * sol[(j, local)];
+                            }
+                            leverage[row_idx] = acc;
+                        }
+                    }
+                }
+                DesignMatrix::Sparse(x_sparse) => {
+                    let p_dim = x_sparse.ncols();
+                    let csr_opt = x_sparse.as_ref().to_row_major().ok();
+                    if let Some(x_csr) = csr_opt {
+                        let symbolic = x_csr.symbolic();
+                        let values = x_csr.val();
+                        let row_ptr = symbolic.row_ptr();
+                        let col_idx = symbolic.col_idx();
+                        for chunk_start in (0..n).step_by(chunk_cols) {
+                            let chunk_end = (chunk_start + chunk_cols).min(n);
+                            let width = chunk_end - chunk_start;
+                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let start = row_ptr[row_idx];
+                                let end = row_ptr[row_idx + 1];
+                                for idx in start..end {
+                                    let col = col_idx[idx];
+                                    rhs[(col, local)] = values[idx];
+                                }
+                            }
+                            let rhs_view = FaerArrayView::new(&rhs);
+                            let sol = factor.solve(rhs_view.as_ref());
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let mut acc = 0.0;
+                                let start = row_ptr[row_idx];
+                                let end = row_ptr[row_idx + 1];
+                                for idx in start..end {
+                                    let col = col_idx[idx];
+                                    acc += values[idx] * sol[(col, local)];
+                                }
+                                leverage[row_idx] = acc;
+                            }
+                        }
+                    } else {
+                        let x_dense = x_sparse.as_ref().to_dense();
+                        let x_dense = Array2::from_shape_fn(
+                            (x_dense.nrows(), x_dense.ncols()),
+                            |(i, j)| x_dense[(i, j)],
+                        );
+                        let p_dim = x_dense.ncols();
+                        for chunk_start in (0..n).step_by(chunk_cols) {
+                            let chunk_end = (chunk_start + chunk_cols).min(n);
+                            let width = chunk_end - chunk_start;
+                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                rhs.column_mut(local).assign(&x_dense.row(row_idx));
+                            }
+                            let rhs_view = FaerArrayView::new(&rhs);
+                            let sol = factor.solve(rhs_view.as_ref());
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let mut acc = 0.0;
+                                for j in 0..p_dim {
+                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
+                                }
+                                leverage[row_idx] = acc;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut weight_vec = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                weight_vec[i] = leverage[i] * w_prime[i];
+            }
+            let logh_grad = x_transformed.transpose_vector_multiply(&weight_vec);
+            let logh_norm = logh_grad.iter().map(|v| v.abs()).fold(0.0_f64, |a, b| a.max(b));
+            if clamped > 0 && logh_norm < 1e-8 {
+                eprintln!(
+                    "[GRAD DIAG] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
+                    clamped, n, logh_norm
+                );
+            }
+            Some(logh_grad)
+        }
+
         // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
         // Returns only B for use in the Firth Hessian path.
         fn firth_hat_basis(
@@ -6936,151 +7067,12 @@ pub mod internal {
                             .link_function()
                             .expect("link_function called on survival model")
                         {
-                            let mu = &pirls_result.solve_mu;
-                            let n = mu.len();
-                            if n == 0 {
-                                None
-                            } else {
-                                // Match the GLM weight clamp in update_glm_vectors:
-                                // if dmu is clamped, weights are constant and w' = 0.
-                                const MIN_WEIGHT: f64 = 1e-12;
-                                let mut w_prime = Array1::<f64>::zeros(n);
-                                let mut clamped = 0usize;
-                                for i in 0..n {
-                                    let mu_i = mu[i];
-                                    let w_base = mu_i * (1.0 - mu_i);
-                                    if w_base < MIN_WEIGHT {
-                                        clamped += 1;
-                                        w_prime[i] = 0.0;
-                                        continue;
-                                    }
-                                    let one_minus2 = 1.0 - 2.0 * mu_i;
-                                    w_prime[i] = pirls_result.solve_weights[i] * one_minus2;
-                                }
-
-                                let mut leverage = Array1::<f64>::zeros(n);
-                                let chunk_cols = 1024usize;
-                                let leverage_factor = &factor_g;
-                                match &pirls_result.x_transformed {
-                                    DesignMatrix::Dense(x_dense) => {
-                                        let p_dim = x_dense.ncols();
-                                        for chunk_start in (0..n).step_by(chunk_cols) {
-                                            let chunk_end = (chunk_start + chunk_cols).min(n);
-                                            let width = chunk_end - chunk_start;
-                                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                            for (local, row_idx) in
-                                                (chunk_start..chunk_end).enumerate()
-                                            {
-                                                rhs
-                                                    .column_mut(local)
-                                                    .assign(&x_dense.row(row_idx));
-                                            }
-                                            let rhs_view = FaerArrayView::new(&rhs);
-                                            let sol = leverage_factor.solve(rhs_view.as_ref());
-                                            for local in 0..width {
-                                                let row_idx = chunk_start + local;
-                                                let mut acc = 0.0;
-                                                for j in 0..p_dim {
-                                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                                                }
-                                                leverage[row_idx] = acc;
-                                            }
-                                        }
-                                    }
-                                    DesignMatrix::Sparse(x_sparse) => {
-                                        let p_dim = x_sparse.ncols();
-                                        let csr_opt = x_sparse.as_ref().to_row_major().ok();
-                                        if let Some(x_csr) = csr_opt {
-                                            let symbolic = x_csr.symbolic();
-                                            let values = x_csr.val();
-                                            let row_ptr = symbolic.row_ptr();
-                                            let col_idx = symbolic.col_idx();
-                                            for chunk_start in (0..n).step_by(chunk_cols) {
-                                                let chunk_end =
-                                                    (chunk_start + chunk_cols).min(n);
-                                                let width = chunk_end - chunk_start;
-                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let start = row_ptr[row_idx];
-                                                    let end = row_ptr[row_idx + 1];
-                                                    for idx in start..end {
-                                                        let col = col_idx[idx];
-                                                        rhs[(col, local)] = values[idx];
-                                                    }
-                                                }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = leverage_factor.solve(rhs_view.as_ref());
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let mut acc = 0.0;
-                                                    let start = row_ptr[row_idx];
-                                                    let end = row_ptr[row_idx + 1];
-                                                    for idx in start..end {
-                                                        let col = col_idx[idx];
-                                                        acc += values[idx] * sol[(col, local)];
-                                                    }
-                                                    leverage[row_idx] = acc;
-                                                }
-                                            }
-                                        } else {
-                                            let x_dense = x_sparse.as_ref().to_dense();
-                                            let x_dense = Array2::from_shape_fn(
-                                                (x_dense.nrows(), x_dense.ncols()),
-                                                |(i, j)| x_dense[(i, j)],
-                                            );
-                                            let p_dim = x_dense.ncols();
-                                            for chunk_start in (0..n).step_by(chunk_cols) {
-                                                let chunk_end =
-                                                    (chunk_start + chunk_cols).min(n);
-                                                let width = chunk_end - chunk_start;
-                                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    rhs
-                                                        .column_mut(local)
-                                                        .assign(&x_dense.row(row_idx));
-                                                }
-                                                let rhs_view = FaerArrayView::new(&rhs);
-                                                let sol = leverage_factor.solve(rhs_view.as_ref());
-                                                for (local, row_idx) in
-                                                    (chunk_start..chunk_end).enumerate()
-                                                {
-                                                    let mut acc = 0.0;
-                                                    for j in 0..p_dim {
-                                                        acc +=
-                                                            x_dense[[row_idx, j]] * sol[(j, local)];
-                                                    }
-                                                    leverage[row_idx] = acc;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let mut weight_vec = Array1::<f64>::zeros(n);
-                                for i in 0..n {
-                                    weight_vec[i] = leverage[i] * w_prime[i];
-                                }
-                                let logh_grad =
-                                    pirls_result.x_transformed.transpose_vector_multiply(&weight_vec);
-                                let logh_norm = logh_grad
-                                    .iter()
-                                    .map(|v| v.abs())
-                                    .fold(0.0_f64, |a, b| a.max(b));
-                                if clamped > 0 && logh_norm < 1e-8 {
-                                    eprintln!(
-                                        "[GRAD DIAG] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
-                                        clamped,
-                                        n,
-                                        logh_norm
-                                    );
-                                }
-                                Some(logh_grad)
-                            }
+                            self.logh_beta_grad_logit(
+                                &pirls_result.x_transformed,
+                                &pirls_result.solve_mu,
+                                &pirls_result.solve_weights,
+                                &factor_g,
+                            )
                         } else {
                             None
                         };
