@@ -1744,8 +1744,23 @@ pub fn fit_model_for_fixed_rho<'a>(
     } = final_state;
 
     let penalized_hessian_transformed = working_summary.state.hessian.clone();
+    // CRITICAL: Use the exact ridge from P-IRLS to stabilize the Hessian.
+    // This ensures that beta is the stationary point of the SAME objective
+    // used for LAML derivatives (Envelope Theorem consistency).
+    // Previously, ensure_positive_definite could add a DIFFERENT ridge,
+    // breaking gradient consistency.
     let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-    ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+    let pirls_ridge = working_summary.state.ridge_used;
+    if pirls_ridge > 0.0 {
+        // Add the exact ridge that P-IRLS used
+        for i in 0..stabilized_hessian_transformed.nrows() {
+            stabilized_hessian_transformed[[i, i]] += pirls_ridge;
+        }
+    }
+    // Only if P-IRLS ridge was 0 and matrix is still not PD, add minimal stabilization
+    if pirls_ridge == 0.0 && stabilized_hessian_transformed.cholesky(Side::Lower).is_err() {
+        ensure_positive_definite(&mut stabilized_hessian_transformed)?;
+    }
 
     let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
     if !edf.is_finite() || edf.is_nan() {

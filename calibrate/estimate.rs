@@ -8406,8 +8406,7 @@ pub mod internal {
                 fmt_vec(&g_beta),
                 fmt_vec(&g_num)
             );
-            // Tolerance relaxed: analytic formula intentionally omits ∂H_phi/∂β (third derivatives)
-            assert!(rel < 5e-1, "Firth log|H_total| grad mismatch: rel L2={:.3e}", rel);
+            assert!(rel < 1e-2, "Firth log|H_total| grad mismatch: rel L2={:.3e}", rel);
         }
 
         #[test]
