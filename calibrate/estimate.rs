@@ -4617,59 +4617,6 @@ pub mod internal {
             out
         }
 
-        // Backward solve for U X = RHS with U upper-triangular.
-        // Used for L^{-T} applications by passing U = L^T.
-        fn solve_upper_triangular(u: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-            let dim = u.nrows();
-            let cols = rhs.ncols();
-            let mut out = Array2::<f64>::zeros((dim, cols));
-            for j in 0..cols {
-                for i in (0..dim).rev() {
-                    let mut sum = rhs[(i, j)];
-                    for k in (i + 1)..dim {
-                        sum -= u[(i, k)] * out[(k, j)];
-                    }
-                    let diag = u[(i, i)];
-                    if diag.abs() < 1e-15 {
-                        out[(i, j)] = 0.0;
-                    } else {
-                        out[(i, j)] = sum / diag;
-                    }
-                }
-            }
-            out
-        }
-
-        // Reverse-mode for A = L L^T (Cholesky).
-        // Given L̄ = ∂J/∂L (lower-triangular), return Ā = ∂J/∂A.
-        //
-        // Exact formula (Giles 2008):
-        //   S = L^T L̄
-        //   S = Φ(S)  (keep lower triangle, half diagonal)
-        //   Ā = L^{-T} (S + S^T) L^{-1}
-        //
-        // This enforces symmetry and respects the triangular dof of L.
-        fn chol_reverse(l: &Array2<f64>, grad_l: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-            // S = L^T L̄
-            let mut s = l.t().dot(grad_l);
-            let dim = s.nrows();
-            // Φ: keep lower triangle, halve the diagonal
-            for i in 0..dim {
-                for j in (i + 1)..dim {
-                    s[(i, j)] = 0.0;
-                }
-                s[(i, i)] *= 0.5;
-            }
-            // sym(Φ(·)) = 0.5 * (S + S^T) with the outer 1/2 required by the
-            // exact reverse-mode formula for Cholesky.
-            let sym = 0.5 * (&s + &s.t().to_owned());
-            // Left solve: Z = L^{-T} sym
-            let z = Self::solve_upper_triangular(&l.t().to_owned(), &sym);
-            // Right solve: Ā = Z L^{-1} by solving L * Ā^T = Z^T
-            let a_bar_t = Self::solve_lower_triangular(l, &z.t().to_owned());
-            Ok(a_bar_t.t().to_owned())
-        }
-
         fn log_det_s_with_ridge(
             s_transformed: &Array2<f64>,
             ridge: f64,
@@ -5359,195 +5306,6 @@ pub mod internal {
             }
         }
 
-        fn firth_logh_total_grad(
-            &self,
-            x_transformed: &DesignMatrix,
-            mu: &Array1<f64>,
-            weights: &Array1<f64>,
-            h_total: &Array2<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
-            let x = self.dense_design_matrix(x_transformed);
-            let n = x.nrows();
-            let p = x.ncols();
-            if n == 0 || p == 0 || mu.len() != n {
-                return Ok(Array1::zeros(p));
-            }
-
-            // Match the GLM weight clamp in update_glm_vectors:
-            // dmu is clamped to MIN_WEIGHT before forming weights.
-            const MIN_WEIGHT: f64 = 1e-12;
-
-            let mut w_base = Array1::<f64>::zeros(n);
-            let mut u = Array1::<f64>::zeros(n);
-            let mut v = Array1::<f64>::zeros(n);
-            let mut v_eta = Array1::<f64>::zeros(n);
-            let mut u_eta = Array1::<f64>::zeros(n);
-            let mut w_prime = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mu_i = mu[i];
-                let w_b = mu_i * (1.0 - mu_i);
-                w_base[i] = w_b;
-                // When dmu is clamped, w is constant => all derivatives are zero.
-                if w_b < MIN_WEIGHT {
-                    u[i] = 0.0;
-                    v[i] = 0.0;
-                    v_eta[i] = 0.0;
-                    u_eta[i] = 0.0;
-                    w_prime[i] = 0.0;
-                    continue;
-                }
-                let u_i = 1.0 - 2.0 * mu_i;
-                u[i] = u_i;
-                // v = w''/w = u^2 - 2*dmu for logit.
-                v[i] = u_i * u_i - 2.0 * w_b;
-                // dv/deta = -6 * dmu * u.
-                v_eta[i] = -6.0 * w_b * u_i;
-                // du/deta = -2*dmu.
-                u_eta[i] = -2.0 * w_b;
-                // w' = dw/deta = w * u.
-                w_prime[i] = weights[i] * u_i;
-            }
-
-            // Forward thin factors:
-            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T
-            //   C = X L_t^{-T}           with M_h = X H_total^{-1} X^T = C C^T
-            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
-            let c = self.h_total_factor(x.view(), h_total)?;
-
-            // Diagonal summaries (no n×n):
-            //   h_i = diag(H_hat)_i = ||b_i||^2
-            //   m_i = diag(M_h)_i = ||c_i||^2
-            let h = Self::row_norms_squared(&b);
-            let mdiag = Self::row_norms_squared(&c);
-
-            // g_eta accumulates ∂J/∂eta (per-observation), then g_beta = X^T g_eta.
-            // Start with the "penalized Hessian" contribution:
-            //   g_eta += mdiag ⊙ w'  where w' = d/deta (weights), clamped to 0 when dmu is clamped.
-            let mut g_eta = &mdiag * &w_prime;
-            // v_eta = dv/deta for v = w''/w (logit closed form)
-            for i in 0..n {
-                g_eta[i] += -0.5 * mdiag[i] * h[i] * v_eta[i];
-            }
-
-            // Backprop through the H_phi diagonal term:
-            //   0.5 * sum_i mdiag_i * h_i * v_i
-            // gives ∂/∂b_i = - mdiag_i * v_i * b_i (the factor 0.5 cancels the 2 from ||b_i||^2).
-            //
-            // Backprop through H_phi off-diagonal term:
-            //   H_phi_off = 0.5 * X^T (diag(u) (H_hat∘H_hat) diag(u)) X
-            // We implement the exact reverse pass using Khatri–Rao.
-            let mut grad_b = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
-                // term1 contributes: -0.5 * mdiag_i * v_i * d(||b_i||^2)
-                let scale = mdiag[i] * v[i];
-                if scale != 0.0 {
-                    for j in 0..p {
-                        grad_b[(i, j)] -= scale * b[(i, j)];
-                    }
-                }
-            }
-
-            // V = diag(u) C, so V V^T = diag(u) M_h diag(u)
-            // and T = (B⊙B)^T V gives the Hadamard-square contraction.
-            let mut v = c.clone();
-            for i in 0..n {
-                let scale = u[i];
-                if scale != 1.0 {
-                    v.row_mut(i).mapv_inplace(|vv| vv * scale);
-                }
-            }
-            // T = (B ⊙ B)^T V, which equals vec-wise contraction with H_hat∘H_hat.
-            let t = Self::khatri_rao_transpose_mul(&b, &v);
-
-            // Reverse for Khatri–Rao contraction (exact, no n×n):
-            //   T = (B⊙B)^T V
-            //   S_off = 0.5 ||T||_F^2  =>  T̄ = T
-            //   A = B⊙B, so Ā_i = V_i T^T = u_i (c_i T^T)
-            //   For each row i, reshape g_i = T c_i into G_i (p×p),
-            //   then ∂/∂b_i = u_i (G_i + G_i^T) b_i.
-            let mut g_u = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let c_i = c.row(i).to_owned();
-                let g_i = t.dot(&c_i);
-                let b_i = b.row(i);
-                let mut tmp1 = vec![0.0; p];
-                let mut tmp2 = vec![0.0; p];
-                let mut gu = 0.0;
-                for a in 0..p {
-                    for bcol in 0..p {
-                        let idx = a + bcol * p;
-                        let g_ab = g_i[idx];
-                        let ba = b_i[a];
-                        let bb = b_i[bcol];
-                        gu += g_ab * ba * bb;
-                        tmp1[a] += g_ab * bb;
-                        tmp2[bcol] += g_ab * ba;
-                    }
-                }
-                // g_u captures ∂S_off/∂u_i via V = diag(u) C.
-                g_u[i] = gu;
-                let scale = u[i];
-                if scale != 0.0 {
-                    for j in 0..p {
-                        grad_b[(i, j)] += scale * (tmp1[j] + tmp2[j]);
-                    }
-                }
-            }
-
-            // Chain u_eta (du/deta = -2 dmu) into g_eta, with clamp → 0 when dmu is clamped.
-            for i in 0..n {
-                g_eta[i] += g_u[i] * u_eta[i];
-            }
-
-            // Reverse-mode through B = X_w L_f^{-T}.
-            // Forward: B^T = L_f^{-1} X_w^T
-            // Backward (triangular solve):
-            //   X_w^T̄ += L_f^{-T} B̄^T
-            //   L_f̄   += -tril( (L_f^{-T} B̄^T) B^T )
-            // This is the exact reverse of Y = L^{-1} B.
-            let g_y = grad_b.t().to_owned();
-            let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
-            let d_l = {
-                let temp = d_xw.dot(&b);
-                let mut out = temp.to_owned();
-                for i in 0..p {
-                    for j in (i + 1)..p {
-                        out[(i, j)] = 0.0;
-                    }
-                }
-                out.mapv(|v| -v)
-            };
-
-            // Cholesky reverse-mode: L_f = chol(F), so this yields ∂J/∂F.
-            let g_f = Self::chol_reverse(&l_f, &d_l)?;
-            // F = X_w^T X_w, so ∂J/∂X_w += 2 X_w g_f.
-            let mut g_xw = xw.dot(&g_f);
-            g_xw.mapv_inplace(|v| 2.0 * v);
-            // Also add the direct adjoint from the triangular solve.
-            g_xw += &d_xw.t().to_owned();
-
-            // Backprop through X_w = diag(sqrt(w)) X.
-            // ∂J/∂w_i = (1/(2 sqrt(w_i))) * sum_j x_ij * (∂J/∂X_w)_ij.
-            for i in 0..n {
-                let w_i = weights[i];
-                if w_i <= 0.0 {
-                    continue;
-                }
-                let denom = w_i.sqrt();
-                let mut acc = 0.0;
-                for j in 0..p {
-                    acc += x[(i, j)] * g_xw[(i, j)];
-                }
-                let g_w = 0.5 * acc / denom;
-                // Chain to eta using w' = dw/deta (logit)
-                g_eta[i] += g_w * w_prime[i];
-            }
-
-            // Final chain: g_beta = X^T g_eta.
-            let g_beta = x.t().dot(&g_eta);
-            Ok(g_beta)
-        }
-
         /// Compute ∂log|H|/∂β for logit GLM (non-Firth path).
         /// Uses the penalized Hessian factorization for leverage computation.
         fn logh_beta_grad_logit(
@@ -5707,61 +5465,6 @@ pub mod internal {
             let b = y.t().to_owned();
             Ok(b)
         }
-
-        // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
-        // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
-        fn firth_hat_factor(
-            &self,
-            x: ArrayView2<'_, f64>,
-            weights: ArrayView1<'_, f64>,
-        ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), EstimationError> {
-            use crate::calibrate::faer_ndarray::FaerCholesky;
-            let n = x.nrows();
-            let mut xw = x.to_owned();
-            for i in 0..n {
-                let s = weights[i].max(0.0).sqrt();
-                if s != 1.0 {
-                    xw.row_mut(i).mapv_inplace(|v| v * s);
-                }
-            }
-            let fisher = xw.t().dot(&xw);
-            let chol = fisher.cholesky(Side::Lower).map_err(|_| {
-                EstimationError::HessianNotPositiveDefinite {
-                    min_eigenvalue: f64::NEG_INFINITY,
-                }
-            })?;
-            let l = chol.lower_triangular();
-            // Solve L_f * Y = X_w^T  =>  B = Y^T = X_w L_f^{-T}
-            let y = Self::solve_lower_triangular(&l, &xw.t().to_owned());
-            let b = y.t().to_owned();
-            Ok((b, l, xw))
-        }
-
-        // Build C = X L_t^{-T} for M_h = X H_total^{-1} X^T = C C^T.
-        fn h_total_factor(
-            &self,
-            x: ArrayView2<'_, f64>,
-            h_total: &Array2<f64>,
-        ) -> Result<Array2<f64>, EstimationError> {
-            use crate::calibrate::faer_ndarray::FaerCholesky;
-            let chol = h_total.cholesky(Side::Lower).map_err(|_| {
-                let min_eig = h_total
-                    .clone()
-                    .eigh(Side::Lower)
-                    .ok()
-                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                    .unwrap_or(f64::NAN);
-                EstimationError::HessianNotPositiveDefinite {
-                    min_eigenvalue: min_eig,
-                }
-            })?;
-            let l = chol.lower_triangular();
-            let y = Self::solve_lower_triangular(&l, &x.t().to_owned());
-            let c = y.t().to_owned();
-            Ok(c)
-        }
-
-
 
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
@@ -6935,7 +6638,7 @@ pub mod internal {
                         // Use the stabilized Hessian factorization for the log|H| trace term.
                         let mut factor_g = self.get_faer_factor(p, h_eff);
                         let factor_imp: Option<FaerFactor> = None;
-                        let mut g_beta_total: Option<Array1<f64>> = None;
+                        // For Firth, compute H_total = H_eff - H_phi and re-factorize
                         if self.config.firth_bias_reduction
                             && matches!(
                                 self.config
@@ -6964,12 +6667,6 @@ pub mod internal {
                                 }
                             })?;
                             factor_g = Arc::new(FaerFactor::Llt(chol));
-                            g_beta_total = Some(self.firth_logh_total_grad(
-                                &pirls_result.x_transformed,
-                                &pirls_result.solve_mu,
-                                &pirls_result.solve_weights,
-                                &h_total,
-                            )?);
                         }
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
@@ -7048,25 +6745,19 @@ pub mod internal {
                             }
                         };
 
-                        // Exact LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
+                        // LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
                         //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
-                        // For logit, H = Xᵀ W X + S and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
+                        // For logit, H = Xᵀ W X + S (or H_total for Firth) and ∂H/∂β_j = Xᵀ diag(w'_i x_{ij}) X,
                         // so ∂log|H|/∂β = Xᵀ (k ∘ w') with k_i = x_iᵀ H^{-1} x_i.
-                        // We include 0.5 * Xᵀ (k ∘ w') to make the implicit gradient exact.
-                        let logh_beta_grad = if self.config.firth_bias_reduction
-                            && matches!(
-                                self.config
-                                    .link_function()
-                                    .expect("link_function called on survival model"),
-                                LinkFunction::Logit
-                            )
-                        {
-                            g_beta_total.clone()
-                        } else if let LinkFunction::Logit = self
+                        // For Firth, H_total = XᵀWX + S - H_φ, but we use the approximation that
+                        // ignores the -∂H_φ/∂β term since H_φ is typically small and the term
+                        // is O(p/n) compared to the XᵀWX term.
+                        let logh_beta_grad = if let LinkFunction::Logit = self
                             .config
                             .link_function()
                             .expect("link_function called on survival model")
                         {
+                            // factor_g is the factorization of H_total (for Firth) or H_eff (for non-Firth)
                             self.logh_beta_grad_logit(
                                 &pirls_result.x_transformed,
                                 &pirls_result.solve_mu,
