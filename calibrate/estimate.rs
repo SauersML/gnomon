@@ -4563,6 +4563,7 @@ pub mod internal {
     impl<'a> RemlState<'a> {
         // Row-wise squared norms: diag(M) when M = C C^T.
         // This is the "diag of Gram" trick to avoid n×n matrices.
+        #[cfg(test)] // Only used in Firth diagnostic tests
         fn row_norms_squared(matrix: &Array2<f64>) -> Array1<f64> {
             let mut out = Array1::<f64>::zeros(matrix.nrows());
             for i in 0..matrix.nrows() {
@@ -4579,6 +4580,7 @@ pub mod internal {
         // Compute T = (B ⊙ B)^T V without forming B ⊙ B.
         // Each row i contributes vec(b_i b_i^T) * v_i^T, which is O(p^2) per row.
         // This is exact and avoids n×n intermediates.
+        #[cfg(test)]
         fn khatri_rao_transpose_mul(b: &Array2<f64>, v: &Array2<f64>) -> Array2<f64> {
             let n = b.nrows();
             let p = b.ncols();
@@ -4607,6 +4609,7 @@ pub mod internal {
 
         // Forward solve for L X = RHS with L lower-triangular.
         // Used for L^{-1} and L^{-T} applications without explicit inverses.
+        #[cfg(test)]
         fn solve_lower_triangular(l: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
             let dim = l.nrows();
             let cols = rhs.ncols();
@@ -5232,6 +5235,7 @@ pub mod internal {
 
         const MIN_DMU_DETA: f64 = 1e-6;
 
+        #[cfg(test)]
         fn firth_hessian_logit(
             &self,
             x_transformed: &DesignMatrix,
@@ -5379,6 +5383,7 @@ pub mod internal {
             Ok(grad)
         }
 
+        #[cfg(test)]
         fn dense_design_matrix(&self, x_transformed: &DesignMatrix) -> Array2<f64> {
             match x_transformed {
                 DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
@@ -5522,6 +5527,7 @@ pub mod internal {
 
         // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
         // Returns only B for use in the Firth Hessian path.
+        #[cfg(test)]
         fn firth_hat_basis(
             &self,
             x: ArrayView2<'_, f64>,
@@ -5932,48 +5938,23 @@ pub mod internal {
                     )?;
 
                     // Log-determinant of the penalized Hessian.
-                    // Keep cost/gradient consistent by using the same stabilized H as the gradient.
-                    let log_det_h = if self.config.firth_bias_reduction
-                        && matches!(
-                            self.config
-                                .link_function()
-                                .expect("link_function called on survival model"),
-                            LinkFunction::Logit
-                        )
-                    {
-                        let h_phi = self.firth_hessian_logit(
-                            &pirls_result.x_transformed,
-                            &pirls_result.solve_mu,
-                            &pirls_result.solve_weights,
-                        )?;
-                        let mut h_total = h_eff.clone();
-                        h_total -= &h_phi;
-                        let chol = h_total.clone().cholesky(Side::Lower).map_err(|_| {
-                            let min_eig = h_total
-                                .clone()
-                                .eigh(Side::Lower)
-                                .ok()
-                                .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                                .unwrap_or(f64::NAN);
-                            EstimationError::HessianNotPositiveDefinite {
-                                min_eigenvalue: min_eig,
-                            }
-                        })?;
-                        2.0 * chol.diag().mapv(f64::ln).sum()
-                    } else {
-                        let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
-                            let min_eig = h_eff
-                                .clone()
-                                .eigh(Side::Lower)
-                                .ok()
-                                .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                                .unwrap_or(f64::NAN);
-                            EstimationError::HessianNotPositiveDefinite {
-                                min_eigenvalue: min_eig,
-                            }
-                        })?;
-                        2.0 * chol.diag().mapv(f64::ln).sum()
-                    };
+                    // Use h_eff (penalized Fisher Information: X'WX + S_lambda) for log-det,
+                    // NOT h_total (which subtracts H_phi). This aligns cost with gradient:
+                    // the gradient implementation uses h_eff because computing ∂H_phi/∂β
+                    // requires prohibitive third derivatives of the likelihood.
+                    // This is the standard approach in GAM software like mgcv.
+                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                        let min_eig = h_eff
+                            .clone()
+                            .eigh(Side::Lower)
+                            .ok()
+                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
+                            .unwrap_or(f64::NAN);
+                        EstimationError::HessianNotPositiveDefinite {
+                            min_eigenvalue: min_eig,
+                        }
+                    })?;
+                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
@@ -6719,38 +6700,11 @@ pub mod internal {
                         }
 
                         // Use the stabilized Hessian factorization for the log|H| trace term.
-                        let mut factor_g = self.get_faer_factor(p, h_eff);
+                        // Use h_eff (penalized Fisher Information) for both cost and gradient
+                        // to ensure mathematical consistency. This avoids the need to compute
+                        // ∂H_phi/∂β (prohibitive third derivatives).
+                        let factor_g = self.get_faer_factor(p, h_eff);
                         let factor_imp: Option<FaerFactor> = None;
-                        // For Firth, compute H_total = H_eff - H_phi and re-factorize
-                        if self.config.firth_bias_reduction
-                            && matches!(
-                                self.config
-                                    .link_function()
-                                    .expect("link_function called on survival model"),
-                                LinkFunction::Logit
-                            )
-                        {
-                            let h_phi = self.firth_hessian_logit(
-                                &pirls_result.x_transformed,
-                                &pirls_result.solve_mu,
-                                &pirls_result.solve_weights,
-                            )?;
-                            let mut h_total = h_eff.clone();
-                            h_total -= &h_phi;
-                            let h_view = FaerArrayView::new(&h_total);
-                            let chol = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-                                let min_eig = h_total
-                                    .clone()
-                                    .eigh(Side::Lower)
-                                    .ok()
-                                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                                    .unwrap_or(f64::NAN);
-                                EstimationError::HessianNotPositiveDefinite {
-                                    min_eigenvalue: min_eig,
-                                }
-                            })?;
-                            factor_g = Arc::new(FaerFactor::Llt(chol));
-                        }
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
                         // blocks as the Gaussian path. This is the partial derivative
