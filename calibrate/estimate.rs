@@ -5938,23 +5938,39 @@ pub mod internal {
                     )?;
 
                     // Log-determinant of the penalized Hessian.
-                    // Use h_eff (penalized Fisher Information: X'WX + S_lambda) for log-det,
-                    // NOT h_total (which subtracts H_phi). This aligns cost with gradient:
-                    // the gradient implementation uses h_eff because computing ∂H_phi/∂β
-                    // requires prohibitive third derivatives of the likelihood.
-                    // This is the standard approach in GAM software like mgcv.
-                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
-                        let min_eig = h_eff
-                            .clone()
-                            .eigh(Side::Lower)
-                            .ok()
-                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                            .unwrap_or(f64::NAN);
+                    // CRITICAL: Use spectral truncation with the SAME structural rank as log|S|_+.
+                    // Previously, log|H| used full Cholesky (all eigenvalues including noise ~1e-16),
+                    // while log|S|_+ used only top `structural_rank` eigenvalues. This caused the
+                    // penalty terms to NOT cancel as λ→∞, creating a phantom gradient.
+                    // 
+                    // The fix: compute log|H|_+ using only the top `structural_rank` eigenvalues,
+                    // matching the truncation used in log|S|_+.
+                    let structural_rank = pirls_result.reparam_result.e_transformed.nrows();
+                    // Use .0 to extract eigenvalues, avoiding unused variable warning
+                    let h_eigenvalues = h_eff.clone().eigh(Side::Lower).map_err(|_| {
                         EstimationError::HessianNotPositiveDefinite {
-                            min_eigenvalue: min_eig,
+                            min_eigenvalue: f64::NAN,
                         }
-                    })?;
-                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
+                    })?.0;
+                    
+                    // Sort eigenvalues descending
+                    let mut sorted_eigs: Vec<f64> = h_eigenvalues.iter().cloned().collect();
+                    sorted_eigs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    // CRITICAL: Take ONLY top `structural_rank` eigenvalues.
+                    // This matches the truncation in log|S|_+ (construction.rs) and prevents
+                    // phantom gradients caused by noise in the null space of the penalty.
+                    // We specifically DROP the unpenalized modes from this determinant
+                    // to ensure exact cancellation of the penalty noise term.
+                    let effective_rank = structural_rank;
+                    
+                    let ln_floor = 1e-300_f64;
+                    let log_det_h: f64 = sorted_eigs
+                        .iter()
+                        .take(effective_rank)
+                        .filter(|&&ev| ev > ln_floor)
+                        .map(|&ev| ev.ln())
+                        .sum();
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
