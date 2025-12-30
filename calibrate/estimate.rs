@@ -5296,6 +5296,70 @@ pub mod internal {
             Ok(h_phi)
         }
 
+        #[cfg(test)]
+        fn firth_logh_total_grad(
+            &self,
+            x_transformed: &DesignMatrix,
+            mu: &Array1<f64>,
+            h_total: &Array2<f64>,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let n = mu.len();
+            let x_dense = self.dense_design_matrix(x_transformed);
+            let p = x_dense.ncols();
+
+            // Factorize H_total (robustly) using LDLT
+            let h_total_view = FaerArrayView::new(h_total);
+            let factor = match FaerLdlt::new(h_total_view.as_ref(), Side::Lower) {
+                Ok(l) => FaerFactor::Ldlt(l),
+                Err(_) => {
+                    // Fallback to LLT with ridge if LDLT fails (unlikely for H_total but possible)
+                    // Or just return error. H_total includes penalties so should be well-conditioned usually.
+                    return Err(EstimationError::RemlOptimizationFailed(
+                        "Hessian factorization failed in firth_logh_total_grad".to_string(),
+                    ));
+                }
+            };
+
+            // Compute leverages h_ii = diag(X H^-1 X^T).
+            // Solve H Y = X^T => Y = H^-1 X^T
+            // h_i = row_i(X) . col_i(Y)
+            let xt = x_dense.t();
+            let xt_view = FaerArrayView::new(&xt);
+            let solved = factor.solve(xt_view.as_ref());
+            
+            // Re-map solved back to Array2
+            // solved is FaerMat<f64>, we need to access elements.
+            // FaerMat implements Index.
+            
+            let mut leverages = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mut v = 0.0;
+                for k in 0..p {
+                    v += x_dense[(i, k)] * solved[(k, i)];
+                }
+                leverages[i] = v;
+            }
+
+            // W' = mu(1-mu)(1-2mu)
+            // gradient_j = sum_i h_ii * W'_i * x_ij
+            //            = (X^T * (h * W'))_j
+            let mut combined = Array1::<f64>::zeros(n);
+            const MIN_WEIGHT: f64 = 1e-12;
+            for i in 0..n {
+                let m = mu[i];
+                let dmu = m * (1.0 - m);
+                let w_prime = if dmu < MIN_WEIGHT {
+                    0.0
+                } else {
+                    dmu * (1.0 - 2.0 * m)
+                };
+                combined[i] = leverages[i] * w_prime;
+            }
+
+            let grad = x_dense.t().dot(&combined);
+            Ok(grad)
+        }
+
         fn dense_design_matrix(&self, x_transformed: &DesignMatrix) -> Array2<f64> {
             match x_transformed {
                 DesignMatrix::Dense(x_dense) => x_dense.to_owned(),
@@ -8299,7 +8363,7 @@ pub mod internal {
             let mut h_total = xtwx + &pr.reparam_result.s_transformed;
             h_total -= &h_phi;
             let g_beta = state
-                .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total)
+                .firth_logh_total_grad(&pr.x_transformed, &mu, &h_total)
                 .expect("g_beta");
 
             let mut g_num = Array1::<f64>::zeros(beta.len());

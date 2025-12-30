@@ -1267,9 +1267,36 @@ fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
         .max(1.0)
 }
 
-fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64, Option<f64>) {
+/// Enum to hold either LLT or LDLT factorization for PLS solve.
+/// LDLT is preferred as it handles indefinite matrices gracefully.
+pub(crate) enum PlsFactor {
+    Llt(FaerLlt<f64>),
+    Ldlt(FaerLdlt<f64>),
+}
+
+impl PlsFactor {
+    /// Solve a linear system with the stored factorization.
+    pub fn solve(&self, rhs: faer::MatRef<'_, f64>) -> faer::Mat<f64> {
+        match self {
+            PlsFactor::Llt(f) => f.solve(rhs),
+            PlsFactor::Ldlt(f) => f.solve(rhs),
+        }
+    }
+}
+
+/// Attempts to factorize a symmetric matrix, preferring LDLT (robust to indefinite)
+/// over LLT. Returns the factorization, total ridge added, and condition estimate.
+///
+/// Strategy:
+/// 1. Try LDLT first (handles indefinite matrices gracefully)
+/// 2. If LDLT succeeds, return it
+/// 3. If LDLT fails, try LLT with progressive ridge  
+/// 4. If both fail, return None
+fn attempt_spd_factorization(matrix: &mut Array2<f64>) -> (Option<PlsFactor>, f64, Option<f64>) {
     let diag_scale = max_abs_diag(matrix);
     let cond_est = calculate_condition_number(matrix).ok();
+    
+    // Initial ridge estimation based on condition number
     let mut ridge = 0.0;
     if let Some(cond) = cond_est {
         if !cond.is_finite() {
@@ -1280,8 +1307,16 @@ fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64,
     } else {
         ridge = diag_scale * 1e-8;
     }
+    
     let mut total_added = 0.0;
 
+    // Try LDLT first (robust to indefinite matrices)
+    let view = FaerArrayView::new(&*matrix);
+    if let Ok(ldlt) = FaerLdlt::new(view.as_ref(), Side::Lower) {
+        return (Some(PlsFactor::Ldlt(ldlt)), 0.0, cond_est);
+    }
+
+    // LDLT failed - fall back to LLT with progressive ridge
     for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
         if ridge > total_added {
             let delta = ridge - total_added;
@@ -1293,9 +1328,13 @@ fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64,
 
         let view = FaerArrayView::new(&*matrix);
         match FaerLlt::new(view.as_ref(), Side::Lower) {
-            Ok(chol) => return (Some(chol), total_added, cond_est),
+            Ok(chol) => return (Some(PlsFactor::Llt(chol)), total_added, cond_est),
             Err(_) => {
                 if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {
+                    // Last resort: try LDLT again with ridge
+                    if let Ok(ldlt) = FaerLdlt::new(view.as_ref(), Side::Lower) {
+                        return (Some(PlsFactor::Ldlt(ldlt)), total_added, cond_est);
+                    }
                     return (None, total_added, cond_est);
                 }
                 if ridge <= 0.0 {
@@ -1312,6 +1351,9 @@ fn attempt_spd_cholesky(matrix: &mut Array2<f64>) -> (Option<FaerLlt<f64>>, f64,
 
     (None, total_added, cond_est)
 }
+
+
+
 
 /// The status of the P-IRLS convergence.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2561,8 +2603,8 @@ pub fn solve_penalized_least_squares(
             }
         }
 
-        let solve_spd = |penalized: &Array2<f64>,
-                             chol: &FaerLlt<f64>,
+        let solve_with_factor = |penalized: &Array2<f64>,
+                             factor: &PlsFactor,
                              ridge_used: f64,
                              cond_est: Option<f64>|
          -> Result<Option<(StablePLSResult, usize)>, EstimationError> {
@@ -2599,7 +2641,7 @@ pub fn solve_penalized_least_squares(
                 }
             }
             let rhs_view = FaerArrayView::new(&rhs);
-            let sol = chol.solve(rhs_view.as_ref());
+            let sol = factor.solve(rhs_view.as_ref());
 
             let mut beta_transformed = Array1::zeros(p_dim);
             for i in 0..p_dim {
@@ -2645,7 +2687,7 @@ pub fn solve_penalized_least_squares(
             }
 
             println!(
-                "[PLS Solver] (SPD/LLᵀ) Completed with edf={:.2}, scale={:.4e}",
+                "[PLS Solver] (SPD/LDLT or LLᵀ) Completed with edf={:.2}, scale={:.4e}",
                 edf, scale
             );
 
@@ -2661,12 +2703,12 @@ pub fn solve_penalized_least_squares(
             )))
         };
 
-        let (chol_opt, ridge_used, cond_est) = attempt_spd_cholesky(&mut penalized_hessian);
+        let (factor_opt, ridge_used, cond_est) = attempt_spd_factorization(&mut penalized_hessian);
         let total_ridge = ridge_used + nugget;
-        match chol_opt {
-            Some(chol) => {
+        match factor_opt {
+            Some(factor) => {
                 if let Some(result) =
-                    solve_spd(&penalized_hessian, &chol, total_ridge, cond_est)?
+                    solve_with_factor(&penalized_hessian, &factor, total_ridge, cond_est)?
                 {
                     return Ok(result);
                 }

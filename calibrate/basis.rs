@@ -98,6 +98,194 @@ pub struct BasisCacheStats {
     pub misses: u64,
 }
 
+// ============================================================================
+// Unified Basis Generation API
+// ============================================================================
+
+/// Options for basis generation, controlling derivative order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BasisOptions {
+    /// Derivative order: 0 = value (default), 1 = first derivative, 2 = second derivative
+    pub derivative_order: usize,
+}
+
+impl BasisOptions {
+    /// Create options for evaluating basis functions (no derivative).
+    pub fn value() -> Self {
+        Self { derivative_order: 0 }
+    }
+
+    /// Create options for evaluating first derivatives of basis functions.
+    pub fn first_derivative() -> Self {
+        Self { derivative_order: 1 }
+    }
+
+    /// Create options for evaluating second derivatives of basis functions.
+    pub fn second_derivative() -> Self {
+        Self { derivative_order: 2 }
+    }
+}
+
+/// Specifies the source of knots for basis generation.
+#[derive(Clone, Debug)]
+pub enum KnotSource<'a> {
+    /// Use a pre-computed knot vector.
+    Provided(ArrayView1<'a, f64>),
+    /// Generate uniformly spaced knots based on data range.
+    Generate {
+        /// Data range (min, max) for knot placement.
+        data_range: (f64, f64),
+        /// Number of internal knots to place between boundaries.
+        num_internal_knots: usize,
+    },
+}
+
+/// Marker type for dense basis matrix output.
+pub struct Dense;
+
+/// Marker type for sparse basis matrix output.
+pub struct Sparse;
+
+/// Trait for selecting basis storage format at compile time.
+pub trait BasisOutput {
+    type Output;
+}
+
+impl BasisOutput for Dense {
+    type Output = Arc<Array2<f64>>;
+}
+
+impl BasisOutput for Sparse {
+    type Output = SparseColMat<usize, f64>;
+}
+
+/// Unified B-spline basis generation with configurable storage, knot source, and options.
+///
+/// This function consolidates various basis generation functions into a single entry point.
+/// Use type parameters to select output format:
+/// - `create_basis::<Dense>(...)` for dense `Array2<f64>` output
+/// - `create_basis::<Sparse>(...)` for sparse `SparseColMat` output
+///
+/// # Arguments
+/// * `data` - Data points to evaluate basis at
+/// * `knot_source` - Either pre-computed knots or parameters for uniform generation
+/// * `degree` - B-spline degree (e.g., 3 for cubic)
+/// * `options` - Derivative order and other options
+///
+/// # Returns
+/// Tuple of (basis matrix, knot vector used)
+pub fn create_basis<O: BasisOutputFormat>(
+    data: ArrayView1<f64>,
+    knot_source: KnotSource<'_>,
+    degree: usize,
+    options: BasisOptions,
+) -> Result<(O::Output, Array1<f64>), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+
+    let eval_kind = match options.derivative_order {
+        0 => BasisEvalKind::Basis,
+        1 => BasisEvalKind::FirstDerivative,
+        2 => BasisEvalKind::SecondDerivative,
+        n => return Err(BasisError::InvalidInput(format!(
+            "unsupported derivative order {n}; only 0, 1, 2 are supported"
+        ))),
+    };
+
+    let knot_vec: Array1<f64> = match knot_source {
+        KnotSource::Provided(view) => {
+            validate_knots_for_degree(view, degree)?;
+            view.to_owned()
+        }
+        KnotSource::Generate { data_range, num_internal_knots } => {
+            if data_range.0 > data_range.1 {
+                return Err(BasisError::InvalidRange(data_range.0, data_range.1));
+            }
+            if data_range.0 == data_range.1 && num_internal_knots > 0 {
+                return Err(BasisError::DegenerateRange(num_internal_knots));
+            }
+            internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?
+        }
+    };
+
+    O::build_basis(data, degree, eval_kind, knot_vec)
+}
+
+/// Trait for building basis matrices with different storage formats.
+/// This is an implementation detail for the unified `create_basis` function.
+pub trait BasisOutputFormat {
+    type Output;
+    
+    fn build_basis(
+        data: ArrayView1<f64>,
+        degree: usize,
+        eval_kind: BasisEvalKind,
+        knot_vec: Array1<f64>,
+    ) -> Result<(Self::Output, Array1<f64>), BasisError>;
+}
+
+impl BasisOutputFormat for Dense {
+    type Output = Arc<Array2<f64>>;
+    
+    fn build_basis(
+        data: ArrayView1<f64>,
+        degree: usize,
+        eval_kind: BasisEvalKind,
+        knot_vec: Array1<f64>,
+    ) -> Result<(Self::Output, Array1<f64>), BasisError> {
+        let knot_view = knot_vec.view();
+        let cache_key = if should_use_basis_cache(data.len(), degree) {
+            Some(make_cache_key(knot_view, degree, data, eval_kind.order()))
+        } else {
+            None
+        };
+
+        if let Some(key) = cache_key.as_ref() {
+            if let Some(cached) = global_basis_cache().get(key) {
+                return Ok((cached, knot_vec));
+            }
+        }
+
+        let num_basis_functions = knot_view.len().saturating_sub(degree + 1);
+        let basis_matrix = if should_use_sparse_basis(num_basis_functions, degree, 1) {
+            // Build sparse internally then convert to dense for cache compatibility
+            let sparse = generate_basis_internal::<SparseStorage>(
+                data.view(), knot_view, degree, eval_kind,
+            )?;
+            let dense = sparse.as_ref().to_dense();
+            Array2::from_shape_fn((dense.nrows(), dense.ncols()), |(i, j)| dense[(i, j)])
+        } else {
+            generate_basis_internal::<DenseStorage>(data.view(), knot_view, degree, eval_kind)?
+        };
+
+        let basis_arc = Arc::new(basis_matrix);
+        if let Some(key) = cache_key {
+            global_basis_cache().insert(key, Arc::clone(&basis_arc));
+        }
+
+        Ok((basis_arc, knot_vec))
+    }
+}
+
+impl BasisOutputFormat for Sparse {
+    type Output = SparseColMat<usize, f64>;
+    
+    fn build_basis(
+        data: ArrayView1<f64>,
+        degree: usize,
+        eval_kind: BasisEvalKind,
+        knot_vec: Array1<f64>,
+    ) -> Result<(Self::Output, Array1<f64>), BasisError> {
+        let knot_view = knot_vec.view();
+        let sparse = generate_basis_internal::<SparseStorage>(
+            data.view(), knot_view, degree, eval_kind,
+        )?;
+        Ok((sparse, knot_vec))
+    }
+}
+
+
 /// Compute a heuristic smoothing weight based on knot span, penalty order, and spline degree.
 pub fn baseline_lambda_seed(knot_vector: &Array1<f64>, degree: usize, penalty_order: usize) -> f64 {
     let mut min_knot = f64::INFINITY;
@@ -427,7 +615,7 @@ fn validate_knots_for_degree(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum BasisEvalKind {
+pub enum BasisEvalKind {
     Basis,
     FirstDerivative,
     SecondDerivative,
@@ -1447,51 +1635,15 @@ pub fn create_bspline_basis(
     num_internal_knots: usize,
     degree: usize,
 ) -> Result<(Arc<Array2<f64>>, Array1<f64>), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if data_range.0 > data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-
-    // Check for degenerate range case: when min == max but internal knots > 0
-    // This would create mathematically degenerate coincident knots
-    if data_range.0 == data_range.1 && num_internal_knots > 0 {
-        return Err(BasisError::DegenerateRange(num_internal_knots));
-    }
-
-    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
-    let knot_view = knot_vector.view();
-
-    let cache_key = if should_use_basis_cache(data.len(), degree) {
-        Some(make_cache_key(
-            knot_view,
-            degree,
-            data,
-            BasisEvalKind::Basis.order(),
-        ))
-    } else {
-        None
-    };
-
-    if let Some(key) = cache_key.as_ref()
-        && let Some(cached) = global_basis_cache().get(key)
-    {
-        return Ok((cached, knot_vector));
-    }
-
-    let basis_matrix = generate_basis_internal::<DenseStorage>(
-        data.view(),
-        knot_view,
+    create_basis::<Dense>(
+        data,
+        KnotSource::Generate {
+            data_range,
+            num_internal_knots,
+        },
         degree,
-        BasisEvalKind::Basis,
-    )?;
-    let basis_arc = Arc::new(basis_matrix);
-    if let Some(key) = cache_key {
-        global_basis_cache().insert(key, Arc::clone(&basis_arc));
-    }
-
-    Ok((basis_arc, knot_vector))
+        BasisOptions::value(),
+    )
 }
 
 /// Creates the first-derivative B-spline basis expansion matrix with uniformly spaced knots.
@@ -1501,49 +1653,15 @@ pub fn create_bspline_basis_derivative(
     num_internal_knots: usize,
     degree: usize,
 ) -> Result<(Arc<Array2<f64>>, Array1<f64>), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if data_range.0 > data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-
-    if data_range.0 == data_range.1 && num_internal_knots > 0 {
-        return Err(BasisError::DegenerateRange(num_internal_knots));
-    }
-
-    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
-    let knot_view = knot_vector.view();
-
-    let cache_key = if should_use_basis_cache(data.len(), degree) {
-        Some(make_cache_key(
-            knot_view,
-            degree,
-            data,
-            BasisEvalKind::FirstDerivative.order(),
-        ))
-    } else {
-        None
-    };
-
-    if let Some(key) = cache_key.as_ref()
-        && let Some(cached) = global_basis_cache().get(key)
-    {
-        return Ok((cached, knot_vector));
-    }
-
-    let basis_matrix = generate_basis_internal::<DenseStorage>(
-        data.view(),
-        knot_view,
+    create_basis::<Dense>(
+        data,
+        KnotSource::Generate {
+            data_range,
+            num_internal_knots,
+        },
         degree,
-        BasisEvalKind::FirstDerivative,
-    )?;
-    let basis_arc = Arc::new(basis_matrix);
-    if let Some(key) = cache_key {
-        global_basis_cache().insert(key, Arc::clone(&basis_arc));
-    }
-
-    Ok((basis_arc, knot_vector))
+        BasisOptions::first_derivative(),
+    )
 }
 
 /// Creates the second-derivative B-spline basis expansion matrix with uniformly spaced knots.
@@ -1553,49 +1671,15 @@ pub fn create_bspline_basis_second_derivative(
     num_internal_knots: usize,
     degree: usize,
 ) -> Result<(Arc<Array2<f64>>, Array1<f64>), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if data_range.0 > data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-
-    if data_range.0 == data_range.1 && num_internal_knots > 0 {
-        return Err(BasisError::DegenerateRange(num_internal_knots));
-    }
-
-    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
-    let knot_view = knot_vector.view();
-
-    let cache_key = if should_use_basis_cache(data.len(), degree) {
-        Some(make_cache_key(
-            knot_view,
-            degree,
-            data,
-            BasisEvalKind::SecondDerivative.order(),
-        ))
-    } else {
-        None
-    };
-
-    if let Some(key) = cache_key.as_ref()
-        && let Some(cached) = global_basis_cache().get(key)
-    {
-        return Ok((cached, knot_vector));
-    }
-
-    let basis_matrix = generate_basis_internal::<DenseStorage>(
-        data.view(),
-        knot_view,
+    create_basis::<Dense>(
+        data,
+        KnotSource::Generate {
+            data_range,
+            num_internal_knots,
+        },
         degree,
-        BasisEvalKind::SecondDerivative,
-    )?;
-    let basis_arc = Arc::new(basis_matrix);
-    if let Some(key) = cache_key {
-        global_basis_cache().insert(key, Arc::clone(&basis_arc));
-    }
-
-    Ok((basis_arc, knot_vector))
+        BasisOptions::second_derivative(),
+    )
 }
 
 /// Creates a sparse B-spline basis expansion matrix with uniformly spaced knots.
@@ -1605,24 +1689,15 @@ pub fn create_bspline_basis_sparse(
     num_internal_knots: usize,
     degree: usize,
 ) -> Result<(SparseColMat<usize, f64>, Array1<f64>), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if data_range.0 > data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-
-    if data_range.0 == data_range.1 && num_internal_knots > 0 {
-        return Err(BasisError::DegenerateRange(num_internal_knots));
-    }
-
-    let knot_vector = internal::generate_full_knot_vector(data_range, num_internal_knots, degree)?;
-    let knot_view = knot_vector.view();
-
-    let (sparse, knot_vec) =
-        create_bspline_basis_sparse_with_knots(data.view(), knot_view, degree)?;
-
-    Ok((sparse, knot_vec))
+    create_basis::<Sparse>(
+        data,
+        KnotSource::Generate {
+            data_range,
+            num_internal_knots,
+        },
+        degree,
+        BasisOptions::value(),
+    )
 }
 
 /// Creates the first-derivative sparse B-spline basis expansion matrix with uniformly spaced knots.
