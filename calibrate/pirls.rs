@@ -562,14 +562,40 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let mu = self.last_mu.clone();
         let mut firth_hat_diag: Option<Array1<f64>> = None;
         if self.firth_bias_reduction {
-            let (hat_diag, half_log_det) = match (&self.x_original_sparse, &self.x_original_csr) {
+            // IMPORTANT: Firth bias reduction must be computed in the *same basis*
+            // as the inner objective being optimized by PIRLS.
+            //
+            // The working response (z) and the coefficients β are in the transformed
+            // basis when a reparameterization is used. The Jeffreys term
+            //   0.5 * log|X^T W X|
+            // and its hat-diagonal adjustment must therefore be computed with the
+            // transformed design matrix, otherwise the inner objective and the
+            // outer LAML gradient are inconsistent.
+            //
+            // This mismatch is subtle but severe: it leaves the analytic gradient
+            // differentiating a *different* objective than the one PIRLS actually
+            // solved, and the gradient check fails catastrophically.
+            //
+            // Rule: use X_transformed if available; fall back to X_original only
+            // when PIRLS is operating directly in the original basis.
+            let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
                 (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
+                    let dense = self.x_transformed.as_ref().unwrap().to_dense();
+                    let dense = Array2::from_shape_fn(
+                        (dense.nrows(), dense.ncols()),
+                        |(i, j)| dense[(i, j)],
+                    );
                     compute_firth_hat_and_half_logdet_sparse(
                         csr,
-                        self.x_original_dense,
+                        dense.view(),
                         weights.view(),
                     )?
                 }
+                (Some(DesignMatrix::Dense(x_dense)), _) => compute_firth_hat_and_half_logdet(
+                    x_dense.view(),
+                    weights.view(),
+                    &mut self.workspace,
+                )?,
                 _ => compute_firth_hat_and_half_logdet(
                     self.x_original_dense,
                     weights.view(),
@@ -857,14 +883,17 @@ fn compute_hessian_sparse(
 }
 
 fn compute_firth_hat_and_half_logdet_sparse(
-    x_original_csr: &SparseRowMat<usize, f64>,
-    x_original: ArrayView2<f64>,
+    x_design_csr: &SparseRowMat<usize, f64>,
+    x_design: ArrayView2<f64>,
     weights: ArrayView1<f64>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    let n = x_original_csr.nrows();
-    let p = x_original_csr.ncols();
+    // This routine computes the Firth hat diagonal and 0.5*log|X^T W X|
+    // for a *specific* design matrix. It must be called with the same
+    // design basis used by PIRLS (transformed if reparameterized).
+    let n = x_design_csr.nrows();
+    let p = x_design_csr.ncols();
 
-    let xtwx_transformed = compute_hessian_sparse(x_original_csr, &weights.to_owned())?;
+    let xtwx_transformed = compute_hessian_sparse(x_design_csr, &weights.to_owned())?;
     let mut stabilized = xtwx_transformed;
     for i in 0..p {
         for j in 0..i {
@@ -882,7 +911,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
         if wi == 0.0 {
             continue;
         }
-        let xi = x_original.row(i);
+        let xi = x_design.row(i);
         for j in 0..p {
             let xij = xi[j];
             for k in 0..p {
@@ -913,7 +942,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let h_inv_arr = identity;
 
     let mut hat_diag = Array1::<f64>::zeros(n);
-    let x_view = x_original_csr.as_ref();
+    let x_view = x_design_csr.as_ref();
     for i in 0..n {
         let w = weights[i];
         if w <= 0.0 {
@@ -5059,21 +5088,24 @@ mod tests {
 /// This mirrors the outer objective/gradient stabilization (H_eff = H or H + c I),
 /// avoiding eigenvalue-dependent clamps that can diverge from the outer path.
 fn compute_firth_hat_and_half_logdet(
-    x_original: ArrayView2<f64>,
+    x_design: ArrayView2<f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    let n = x_original.nrows();
-    let p = x_original.ncols();
+    // Dense version of the Firth hat / log-det computation.
+    // This is exact for the given design matrix and must match the
+    // basis used by the inner PIRLS objective.
+    let n = x_design.nrows();
+    let p = x_design.ncols();
 
     workspace
         .sqrt_w
         .assign(&weights.mapv(|w| w.max(0.0).sqrt()));
     let sqrt_w_col = workspace.sqrt_w.view().insert_axis(Axis(1));
-    if workspace.wx.dim() != x_original.dim() {
-        workspace.wx = Array2::zeros(x_original.dim());
+    if workspace.wx.dim() != x_design.dim() {
+        workspace.wx = Array2::zeros(x_design.dim());
     }
-    workspace.wx.assign(&x_original);
+    workspace.wx.assign(&x_design);
     workspace.wx *= &sqrt_w_col;
 
     let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
@@ -5096,7 +5128,7 @@ fn compute_firth_hat_and_half_logdet(
         if wi == 0.0 {
             continue;
         }
-        let xi = x_original.row(i);
+        let xi = x_design.row(i);
         for j in 0..p {
             let xij = xi[j];
             for k in 0..p {

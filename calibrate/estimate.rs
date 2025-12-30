@@ -7081,11 +7081,30 @@ pub mod internal {
                         };
 
                         let mut grad_beta = if self.config.firth_bias_reduction {
+                            // FULL, EXACT chain-rule term for Firth-LAML:
+                            //
+                            //   ∂V/∂β = -∂l_p^*/∂β + 0.5 * ∂log|H_total|/∂β
+                            //
+                            // where l_p^* is the *actual* inner objective optimized by PIRLS
+                            // (log-likelihood + Jeffreys adjustment - 0.5 βᵀ S β - 0.5 ridge ||β||²).
+                            //
+                            // At a perfect optimum, ∂l_p^*/∂β = 0 and the residual term vanishes.
+                            // In practice, PIRLS stops at a tolerance and may add a stabilization ridge,
+                            // so ∂l_p^*/∂β can be non-zero. Dropping it breaks the chain rule and makes
+                            // the implicit correction term collapse (exactly the observed failure mode).
+                            //
+                            // The working response already includes the Jeffreys (Firth) score, so
+                            // residual_grad is the correct score of the *inner* objective. Therefore
+                            // the exact ∂V/∂β is:
+                            //
+                            //   residual_grad + 0.5 * ∂log|H_total|/∂β
+                            //
+                            // which is what we construct here.
+                            let mut g = residual_grad.clone();
                             if let Some(logh_grad) = logh_beta_grad.as_ref() {
-                                0.5 * logh_grad
-                            } else {
-                                Array1::<f64>::zeros(residual_grad.len())
+                                g += &(0.5 * logh_grad);
                             }
+                            g
                         } else {
                             residual_grad.clone()
                         };
