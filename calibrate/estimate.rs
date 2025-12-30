@@ -6941,13 +6941,18 @@ pub mod internal {
                             if n == 0 {
                                 None
                             } else {
+                                // Match the GLM weight clamp in update_glm_vectors:
+                                // if dmu is clamped, weights are constant and w' = 0.
+                                const MIN_WEIGHT: f64 = 1e-12;
                                 let mut w_prime = Array1::<f64>::zeros(n);
                                 let mut clamped = 0usize;
                                 for i in 0..n {
                                     let mu_i = mu[i];
                                     let w_base = mu_i * (1.0 - mu_i);
-                                    if w_base < Self::MIN_DMU_DETA {
+                                    if w_base < MIN_WEIGHT {
                                         clamped += 1;
+                                        w_prime[i] = 0.0;
+                                        continue;
                                     }
                                     let one_minus2 = 1.0 - 2.0 * mu_i;
                                     w_prime[i] = pirls_result.solve_weights[i] * one_minus2;
