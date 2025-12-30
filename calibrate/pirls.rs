@@ -24,7 +24,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
 use std::{
     borrow::Cow,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use faer::{MatRef, Spec, Auto};
 use faer::linalg::cholesky::llt::factor::{LltParams, LltRegularization};
@@ -1708,7 +1708,6 @@ pub fn fit_model_for_fixed_rho<'a>(
             y,
             prior_weights,
             offset.view(),
-            eb,
             &reparam_result.e_transformed,
             &reparam_result.s_transformed,
             &mut workspace,
@@ -2499,7 +2498,6 @@ pub fn solve_penalized_least_squares(
     z: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     offset: ArrayView1<f64>,
-    _eb: &Array2<f64>, // DELETE THIS IF IT IS UNUSED
     e_transformed: &Array2<f64>,
     s_transformed: &Array2<f64>, // Precomputed S = EᵀE
     workspace: &mut PirlsWorkspace,
@@ -3026,8 +3024,7 @@ mod tests {
             z.view(),
             weights.view(),
             offset.view(),
-            &e, // For test: use same matrix for both rank detection and penalty
-            &e, // For test: use same matrix for both rank detection and penalty
+            &e, 
             &s,
             &mut ws,
             z.view(),
@@ -4161,7 +4158,6 @@ mod tests {
             w.view(),
             offset.view(),
             &e,
-            &e,
             &s,
             &mut ws,
             z.view(),
@@ -4223,7 +4219,6 @@ mod tests {
             y.view(),
             w.view(),
             offset.view(),
-            &e,
             &e,
             &s,
             &mut ws,
@@ -4290,7 +4285,6 @@ mod tests {
             z_old.view(),
             w_old.view(),
             offset.view(),
-            &e,
             &e,
             &s,
             &mut ws,
@@ -4371,7 +4365,6 @@ mod tests {
             z.view(),
             w.view(),
             offset.view(),
-            &e,
             &e,
             &s,
             &mut ws,
