@@ -570,10 +570,8 @@ impl<'a> JointModelState<'a> {
             xwx = xwx + penalty * lambda;
         }
         
-        // Add small ridge for numerical stability
-        for i in 0..p {
-            xwx[[i, i]] += 1e-8;
-        }
+        // Conditional regularization for numerical stability
+        ensure_positive_definite_joint(&mut xwx);
         
         // Compute X'Wz via weighted design
         let xwz = fast_atv(&x_weighted, &z_weighted);
@@ -660,10 +658,8 @@ impl<'a> JointModelState<'a> {
             // Build penalized Hessian: H = B'WB + λS
             let btb = b_weighted.t().dot(&b_weighted);
             let mut h_pen = btb + &(penalty * lambda_link);
-            // Regularize for stability
-            for j in 0..p {
-                h_pen[[j, j]] += 1e-8;
-            }
+            // Conditional regularization for stability
+            ensure_positive_definite_joint(&mut h_pen);
             
             // Cholesky decomposition
             use crate::calibrate::faer_ndarray::FaerCholesky;
@@ -847,9 +843,7 @@ impl<'a> JointModelState<'a> {
             // Build penalized Hessian: H = X'W_effX + S
             let xtx = x_weighted.t().dot(&x_weighted);
             let mut h_pen = xtx + &penalty;
-            for j in 0..p {
-                h_pen[[j, j]] += 1e-8; // Regularize
-            }
+            ensure_positive_definite_joint(&mut h_pen);
             
             // Cholesky decomposition
             use crate::calibrate::faer_ndarray::FaerCholesky;
@@ -1599,12 +1593,8 @@ impl<'a> JointRemlState<'a> {
         d_mat.scaled_add(lambda_link, &link_penalty);
     }
     
-    for i in 0..p_base {
-        a_mat[[i, i]] += 1e-8;
-    }
-    for i in 0..p_link {
-        d_mat[[i, i]] += 1e-8;
-    }
+    ensure_positive_definite_joint(&mut a_mat);
+    ensure_positive_definite_joint(&mut d_mat);
     
     let mut h_mat = Array2::<f64>::zeros((p_total, p_total));
     for i in 0..p_base {

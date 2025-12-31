@@ -32,6 +32,22 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Ensure a matrix is positive definite by adding a minimal conditional ridge.
+/// Only adds regularization if Cholesky fails, avoiding bias on well-conditioned matrices.
+fn ensure_positive_definite_hmc(mat: &mut Array2<f64>) {
+    if mat.cholesky(Side::Lower).is_ok() {
+        return; // Already positive definite, no regularization needed
+    }
+    
+    // Matrix needs regularization - use diagonal-scaled nugget
+    let diag_scale = mat.diag().iter().map(|&d| d.abs()).fold(0.0_f64, f64::max).max(1.0);
+    let nugget = 1e-8 * diag_scale;
+    for i in 0..mat.nrows() {
+        mat[[i, i]] += nugget;
+    }
+}
+
+
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
 /// This is the standard split-chain formulation (no rank normalization).
@@ -337,10 +353,8 @@ impl NutsPosterior {
             }
             
             // Compute 0.5 * log|I| via Cholesky
-            // Add small regularization for stability
-            for j in 0..p {
-                fisher[[j, j]] += 1e-8;
-            }
+            // Conditional regularization for stability
+            ensure_positive_definite_hmc(&mut fisher);
             
             match fisher.cholesky(Side::Lower) {
                 Ok(chol_i) => {
