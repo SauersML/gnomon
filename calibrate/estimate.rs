@@ -5586,7 +5586,6 @@ pub mod internal {
             mu: &Array1<f64>,
             weights: &Array1<f64>,
             factor: &Arc<FaerFactor>,
-            _h_eff: &Array2<f64>,
         ) -> Option<Array1<f64>> {
             let n = mu.len();
             if n == 0 {
@@ -7068,7 +7067,6 @@ pub mod internal {
                                             &pirls_result.solve_mu,
                                             &pirls_result.solve_weights,
                                             &factor_g,
-                                            &h_for_factor,
                                         )
                                     }
                                 }
@@ -7079,7 +7077,6 @@ pub mod internal {
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
                                     &factor_g,
-                                    h_eff, // Use the effective Hessian (ridged if needed)
                                 )
                             }
                         } else {
