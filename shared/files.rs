@@ -1946,12 +1946,17 @@ mod tests {
             unreachable!("ADC guard size overflow");
         }
 
-        assert!(tokio::runtime::Handle::try_current().is_err());
+        // Create test-local runtime FIRST and enter its context.
+        // This ensures load_adc_credentials() spawns async tasks into our
+        // controlled runtime rather than the shared static one, preventing
+        // SIGSEGV when background tasks access resources after guards drop.
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| PipelineError::Io(format!("Failed to create test runtime: {e}")))?;
+        let _guard = runtime.enter();
 
         let credentials = load_adc_credentials()?;
 
-        let runtime = get_shared_runtime()?;
-        runtime.block_on(async move {
+        let result = runtime.block_on(async move {
             StorageControl::builder()
                 .with_credentials(credentials.clone())
                 .build()
@@ -1961,8 +1966,14 @@ mod tests {
                         "Failed to create Cloud Storage control client for test: {e}"
                     ))
                 })
-        })?;
+        });
 
+        // Drop enter guard first to leave runtime context, then shut down
+        // runtime to complete all background tasks before adc_file and adc_guard drop.
+        drop(_guard);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+
+        result?;
         Ok(())
     }
 }

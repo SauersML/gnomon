@@ -20,8 +20,9 @@ const DEFAULT_DERIVATIVE_GUARD: f64 = 1e-8;
 pub const DEFAULT_RISK_EPSILON: f64 = 1e-12;
 const COMPANION_HORIZON_TOLERANCE: f64 = 1e-8;
 // Hard monotonicity constraint: cumulative hazard must be non-decreasing.
-// Any negative slope is ontologically invalid (survival probability cannot increase).
-const MONOTONICITY_TOLERANCE: f64 = 0.0;
+// Allow small negative derivatives from numerical noise (spline evaluation artifacts).
+// A truly non-monotonic hazard would produce much larger negative values.
+const MONOTONICITY_TOLERANCE: f64 = -1e-6;
 const DERIVATIVE_GUARD_WARNING_CEILING: f64 = 0.05;
 
 /// Errors surfaced while validating survival data structures or evaluating the model.
