@@ -1952,25 +1952,30 @@ mod tests {
         // SIGSEGV when background tasks access resources after guards drop.
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| PipelineError::Io(format!("Failed to create test runtime: {e}")))?;
-        let _guard = runtime.enter();
 
-        let credentials = load_adc_credentials()?;
+        let result = {
+            let enter_guard = runtime.enter();
+            let credentials = load_adc_credentials()?;
+            let res = runtime.block_on(async move {
+                StorageControl::builder()
+                    .with_credentials(credentials.clone())
+                    .build()
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Io(format!(
+                            "Failed to create Cloud Storage control client for test: {e}"
+                        ))
+                    })
+            });
+            // enter_guard goes out of scope here naturally
+            if std::mem::size_of_val(&enter_guard) == usize::MAX {
+                unreachable!("enter guard size overflow");
+            }
+            res
+        };
 
-        let result = runtime.block_on(async move {
-            StorageControl::builder()
-                .with_credentials(credentials.clone())
-                .build()
-                .await
-                .map_err(|e| {
-                    PipelineError::Io(format!(
-                        "Failed to create Cloud Storage control client for test: {e}"
-                    ))
-                })
-        });
-
-        // Drop enter guard first to leave runtime context, then shut down
-        // runtime to complete all background tasks before adc_file and adc_guard drop.
-        drop(_guard);
+        // Shut down runtime to complete all background tasks before
+        // adc_file and adc_guard drop.
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 
         result?;
