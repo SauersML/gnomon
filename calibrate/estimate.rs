@@ -5521,16 +5521,13 @@ pub mod internal {
             }
 
             // Reverse-mode through B = X_w L_f^{-T}.
-            // Forward: B^T = L_f^{-1} X_w^T
-            // Backward (triangular solve):
-            //   X_w^T̄ += L_f^{-T} B̄^T
-            //   L_f̄   += -tril( (L_f^{-T} B̄^T) B^T )
-            // This is the exact reverse of Y = L^{-1} B.
+            // Adjoint: L̄_f = tril(-(L_f^{-T} B̄^T B)^T) = tril(-B^T B̄ L_f^{-1})
             let g_y = grad_b.t().to_owned();
             let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
             let d_l = {
                 let temp = d_xw.dot(&b);
-                let mut out = temp.to_owned();
+                // Transpose to get (L_f^{-T} B̄^T B)^T = B^T B̄ L_f^{-1}
+                let mut out = temp.t().to_owned();
                 for i in 0..p {
                     for j in (i + 1)..p {
                         out[(i, j)] = 0.0;
