@@ -7622,8 +7622,11 @@ mod tests {
 
             let mut det = xtwx00 * xtwx11 - xtwx01 * xtwx01;
             if det.abs() < 1e-12 {
-                xtwx00 += 1e-8;
-                xtwx11 += 1e-8;
+                // Use diagonal-scaled nugget for consistency with production code
+                let diag_scale = xtwx00.abs().max(xtwx11.abs()).max(1.0);
+                let nugget = 1e-8 * diag_scale;
+                xtwx00 += nugget;
+                xtwx11 += nugget;
                 det = xtwx00 * xtwx11 - xtwx01 * xtwx01;
                 if det.abs() < 1e-16 {
                     break;
