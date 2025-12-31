@@ -2252,15 +2252,15 @@ pub fn solve_penalized_least_squares(
     
     // Check if regularization is needed
     let (needs_nugget, numerical_rank) = {
-        let eig_result = h_view.as_ref().selfadjoint_eigenvalues(Side::Lower);
+        let eig_result = h_view.as_ref().self_adjoint_eigenvalues(Side::Lower);
         match eig_result {
             Ok(eigenvalues) => {
-                let max_eig = eigenvalues.iter().fold(0.0f64, |a, &b| a.max(b));
-                let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                let max_eig: f64 = eigenvalues.iter().fold(0.0f64, |a: f64, &b: &f64| a.max(b));
+                let min_eig: f64 = eigenvalues.iter().fold(f64::INFINITY, |a: f64, &b: &f64| a.min(b));
                 
                 // Use relative tolerance for rank detection
                 let rank_threshold = max_eig * 1e-10;
-                let num_rank = eigenvalues.iter().filter(|&&e| e > rank_threshold).count();
+                let num_rank = eigenvalues.iter().filter(|&&e: &&f64| e > rank_threshold).count();
                 
                 // Need nugget if min eigenvalue is too small or negative
                 let cond = max_eig / min_eig.max(1e-300);
