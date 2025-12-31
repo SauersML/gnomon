@@ -39,6 +39,25 @@ use wolfe_bfgs::BfgsSolution;
 // and g'(u) = 1 (the derivative code explicitly returns 1.0 at boundaries).
 // This is consistent between training and HMC.
 
+/// Ensure a matrix is positive definite by adding a minimal conditional ridge.
+/// Only adds regularization if Cholesky fails, avoiding bias on well-conditioned matrices.
+fn ensure_positive_definite_joint(mat: &mut Array2<f64>) {
+    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+    
+    if mat.cholesky(Side::Lower).is_ok() {
+        return; // Already positive definite, no regularization needed
+    }
+    
+    // Matrix needs regularization - use diagonal-scaled nugget
+    let diag_scale = mat.diag().iter().map(|&d| d.abs()).fold(0.0_f64, f64::max).max(1.0);
+    let nugget = 1e-8 * diag_scale;
+    for i in 0..mat.nrows() {
+        mat[[i, i]] += nugget;
+    }
+}
+
+
 /// State for the joint single-index model optimization.
 pub struct JointModelState<'a> {
     /// Response variable
@@ -1352,9 +1371,7 @@ impl<'a> JointRemlState<'a> {
                 a_mat.scaled_add(lambda_k, s_k);
             }
         }
-        for i in 0..p_base {
-            a_mat[[i, i]] += 1e-8;
-        }
+        ensure_positive_definite_joint(&mut a_mat);
         
         // C = X' diag(W * g') B + X' diag(r) B'
         let mut wb = b_wiggle.clone();
@@ -1387,9 +1404,7 @@ impl<'a> JointRemlState<'a> {
         if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
             d_mat.scaled_add(lambda_link, &link_penalty);
         }
-        for i in 0..p_link {
-            d_mat[[i, i]] += 1e-8;
-        }
+        ensure_positive_definite_joint(&mut d_mat);
         
         // log|H| via Schur complement: log|A| + log|D - C^T A^{-1} C|
         use crate::calibrate::faer_ndarray::FaerCholesky;
