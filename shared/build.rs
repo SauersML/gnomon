@@ -332,7 +332,7 @@ impl ForbiddenCommentCollector {
             error_msg.push_str(&format!("   {violation}\n"));
         }
 
-        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("\n⚠️ Comments containing 'FIXED', 'CRITICAL', 'CORRECTED', 'FIX', 'FIXES', 'NEW', 'CHANGED', 'CHANGES', 'CHANGE', 'MODIFIED', 'MODIFIES', 'MODIFY', 'UPDATED', 'UPDATES', or 'UPDATE' are STRICTLY FORBIDDEN in this project.\n");
         error_msg.push_str("   These comments will cause compilation to fail. Remove them completely rather than commenting them out.\n");
         error_msg.push_str("   The '**' pattern is not allowed in regular comments (but is allowed in doc comments).\n");
         error_msg.push_str(
@@ -831,6 +831,7 @@ impl Sink for ForbiddenCommentCollector {
             && is_doc_comment(line_text)
             && line_text.contains("**")
             && !line_text.contains("FIXED")
+            && !line_text.contains("CRITICAL")
             && !line_text.contains("CORRECTED")
             && !line_text.contains("FIX")
             && !line_text.contains("FIXES")
