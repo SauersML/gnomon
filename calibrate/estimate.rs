@@ -6956,9 +6956,16 @@ pub mod internal {
                         };
 
                         // Use the exact Hessian factorization for the log|H| trace term.
-                        // For Firth: factor H_total = h_eff - H_phi (exact).
-                        // For non-Firth: factor h_eff as before.
-                        let factor_g = self.get_faer_factor(p, &h_for_factor);
+                        // For Firth: factor H_total = h_eff - H_phi (exact) directly without cache,
+                        // since the cache keys by ρ only and would return the wrong h_eff factor.
+                        // For non-Firth: use cached h_eff factor as before.
+                        let factor_g = if self.config.firth_bias_reduction && h_phi_opt.is_some() {
+                            // Bypass cache for Firth - different matrix than h_eff
+                            Arc::new(self.factorize_faer(&h_for_factor))
+                        } else {
+                            // Non-Firth: use cache with h_eff
+                            self.get_faer_factor(p, h_eff)
+                        };
                         let factor_imp: Option<FaerFactor> = None;
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
