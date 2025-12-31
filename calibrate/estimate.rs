@@ -8611,7 +8611,7 @@ pub mod internal {
             let mut h_total = xtwx + &pr.reparam_result.s_transformed;
             h_total -= &h_phi;
             let g_beta = state
-                .firth_logh_total_grad(&pr.x_transformed, &mu, &h_total)
+                .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total)
                 .expect("g_beta");
 
             let mut g_num = Array1::<f64>::zeros(beta.len());
@@ -8684,7 +8684,7 @@ pub mod internal {
                 .firth_logh_total_grad(
                     &pr.x_transformed,
                     &pr.solve_mu,
-
+                    &pr.solve_weights,
                     &h_total,
                 )
                 .expect("g_beta_total");
