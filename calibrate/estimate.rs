@@ -5611,7 +5611,7 @@ pub mod internal {
                 w_prime[i] = weights[i] * one_minus2;
             }
 
-            // CRITICAL: Use spectral truncation if the penalty has a non-trivial null space.
+            // Use spectral truncation if the penalty has a non-trivial null space.
             // The cost function computes log|H| using only the top `structural_rank` eigenvalues
             // to avoid phantom gradients from noise modes. We must do the same here.
             
@@ -5749,8 +5749,6 @@ pub mod internal {
                             (x_dense.nrows(), x_dense.ncols()),
                             |(i, j)| x_dense[(i, j)],
                         );
-                        // ...recurse/copy logic from Dense branch...
-                        // For brevity/DRY, just using the same dense logic block on the dense array
                         let p_dim = x_dense.ncols();
                         for chunk_start in (0..n).step_by(chunk_cols) {
                             let chunk_end = (chunk_start + chunk_cols).min(n);
@@ -6240,7 +6238,7 @@ pub mod internal {
                     )?;
 
                     // Log-determinant of the penalized Hessian.
-                    // CRITICAL: Use spectral truncation with the SAME structural rank as log|S|_+.
+                    // Use spectral truncation with the SAME structural rank as log|S|_+.
                     // Previously, log|H| used full Cholesky (all eigenvalues including noise ~1e-16),
                     // while log|S|_+ used only top `structural_rank` eigenvalues. This caused the
                     // penalty terms to NOT cancel as λ→∞, creating a phantom gradient.
@@ -6259,7 +6257,7 @@ pub mod internal {
                     let mut sorted_eigs: Vec<f64> = h_eigenvalues.iter().cloned().collect();
                     sorted_eigs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                     
-                    // CRITICAL: Take ONLY top `structural_rank` eigenvalues.
+                    // Take ONLY top `structural_rank` eigenvalues.
                     // This matches the truncation in log|S|_+ (construction.rs) and prevents
                     // phantom gradients caused by noise in the null space of the penalty.
                     // We specifically DROP the unpenalized modes from this determinant
@@ -6738,7 +6736,7 @@ pub mod internal {
                 };
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
-            // CRITICAL: Use the same effective Hessian as the cost function for consistency
+            // Use the same effective Hessian as the cost function for consistency
             if ridge_used > 0.0 {
                 log::debug!(
                     "Gradient path added ridge {:.3e} to stabilized Hessian for consistency",
