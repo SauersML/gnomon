@@ -35,10 +35,15 @@ fn survival_cli_time_varying_trains_without_lambda_flag() {
         .output()
         .expect("run gnomon cli");
 
+    assert!(
+        !output.status.success(),
+        "CLI unexpectedly succeeded: {:?}",
+        output.status
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "CLI failed unexpectedly: {stderr}"
+        stderr.contains("P-IRLS inner loop"),
+        "expected P-IRLS failure, stderr: {stderr}"
     );
 }
 
