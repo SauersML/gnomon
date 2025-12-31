@@ -5586,8 +5586,7 @@ pub mod internal {
             mu: &Array1<f64>,
             weights: &Array1<f64>,
             factor: &Arc<FaerFactor>,
-            h_eff: &Array2<f64>,
-            structural_rank: usize,
+            _h_eff: &Array2<f64>,
         ) -> Option<Array1<f64>> {
             let n = mu.len();
             if n == 0 {
@@ -5611,41 +5610,9 @@ pub mod internal {
                 w_prime[i] = weights[i] * one_minus2;
             }
 
-            // Use spectral truncation if the penalty has a non-trivial null space.
-            // The cost function computes log|H| using only the top `structural_rank` eigenvalues
-            // to avoid phantom gradients from noise modes. We must do the same here.
-            
-            let p_dim = h_eff.nrows();
-            let use_truncation = structural_rank < p_dim;
-            
-            // Try to compute the truncated basis if needed
-            let truncated_basis = if use_truncation {
-                 h_eff.clone().eigh(Side::Lower)
-                    .ok()
-                    .map(|(eigs, vecs)| {
-                        // Sort eigenvalues descending
-                        let mut sorted_indices: Vec<usize> = (0..p_dim).collect();
-                        sorted_indices.sort_by(|&i, &j| eigs[j].partial_cmp(&eigs[i]).unwrap_or(std::cmp::Ordering::Equal));
-                        
-                        let rank = structural_rank;
-                        // Use a small floor to avoid division by zero if structural rank implies including nearly zero modes
-                        let floor = 1e-14;
-                        
-                        let mut basis = Array2::<f64>::zeros((rank, p_dim));
-                        for r in 0..rank {
-                            let idx = sorted_indices[r];
-                            let val = eigs[idx].max(floor);
-                            let scale = val.sqrt().recip();
-                            let vec_col = vecs.column(idx);
-                            for j in 0..p_dim {
-                                basis[[r, j]] = vec_col[j] * scale;
-                            }
-                        }
-                        basis // Shape (rank, p_dim) -> representing D_k^{-1/2} V_k^T
-                    })
-            } else {
-                None
-            };
+            // Always use full rank path (Cholesky solve).
+            // This is consistent with compute_cost which now uses full log|H| via Cholesky.
+            // Previously, truncation was used here but it caused gradient mismatch.
 
             let mut leverage = Array1::<f64>::zeros(n);
             let chunk_cols = 1024usize;
@@ -5656,34 +5623,20 @@ pub mod internal {
                         let chunk_end = (chunk_start + chunk_cols).min(n);
                         let width = chunk_end - chunk_start;
                         
-                        if let Some(basis) = &truncated_basis {
-                            // Truncated path: proj = Basis * X_chunk^T (shape rank x width)
-                            // leverage[i] = ||proj_col_i||^2
-                            let mut x_chunk = Array2::<f64>::zeros((p_dim, width));
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                x_chunk.column_mut(local).assign(&x_dense.row(row_idx));
+                        // Full rank path (standard Cholesky solve)
+                        let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                        for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                            rhs.column_mut(local).assign(&x_dense.row(row_idx));
+                        }
+                        let rhs_view = FaerArrayView::new(&rhs);
+                        let sol = factor.solve(rhs_view.as_ref());
+                        for local in 0..width {
+                            let row_idx = chunk_start + local;
+                            let mut acc = 0.0;
+                            for j in 0..p_dim {
+                                acc += x_dense[[row_idx, j]] * sol[(j, local)];
                             }
-                            let proj = basis.dot(&x_chunk);
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                let col = proj.column(local);
-                                leverage[row_idx] = col.dot(&col);
-                            }
-                        } else {
-                            // Full rank path (standard Cholesky solve)
-                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                rhs.column_mut(local).assign(&x_dense.row(row_idx));
-                            }
-                            let rhs_view = FaerArrayView::new(&rhs);
-                            let sol = factor.solve(rhs_view.as_ref());
-                            for local in 0..width {
-                                let row_idx = chunk_start + local;
-                                let mut acc = 0.0;
-                                for j in 0..p_dim {
-                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                                }
-                                leverage[row_idx] = acc;
-                            }
+                            leverage[row_idx] = acc;
                         }
                     }
                 }
@@ -5699,47 +5652,26 @@ pub mod internal {
                             let chunk_end = (chunk_start + chunk_cols).min(n);
                             let width = chunk_end - chunk_start;
                             
-                            if let Some(basis) = &truncated_basis {
-                                // Sparse truncated project
-                                // basis is (rank, p). x_i is (p, 1). proj_i = basis * x_i.
-                                // We can do this column by column for sparse x
-                                for row_idx in chunk_start..chunk_end {
-                                    let start = row_ptr[row_idx];
-                                    let end = row_ptr[row_idx + 1];
-                                    let mut proj_norm_sq = 0.0;
-                                    for r in 0..basis.nrows() {
-                                        let mut dot = 0.0;
-                                        for idx in start..end {
-                                            let col = col_idx[idx];
-                                            let val = values[idx];
-                                            dot += basis[[r, col]] * val;
-                                        }
-                                        proj_norm_sq += dot * dot;
-                                    }
-                                    leverage[row_idx] = proj_norm_sq;
+                            // Full rank sparse path
+                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let start = row_ptr[row_idx];
+                                let end = row_ptr[row_idx + 1];
+                                for idx in start..end {
+                                    rhs[[col_idx[idx], local]] = values[idx];
                                 }
-                            } else {
-                                // Full rank sparse path
-                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    let start = row_ptr[row_idx];
-                                    let end = row_ptr[row_idx + 1];
-                                    for idx in start..end {
-                                        rhs[[col_idx[idx], local]] = values[idx];
-                                    }
+                            }
+                            let rhs_view = FaerArrayView::new(&rhs);
+                            let sol = factor.solve(rhs_view.as_ref());
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let mut acc = 0.0;
+                                let start = row_ptr[row_idx];
+                                let end = row_ptr[row_idx + 1];
+                                for idx in start..end {
+                                    let col = col_idx[idx];
+                                    acc += values[idx] * sol[(col, local)];
                                 }
-                                let rhs_view = FaerArrayView::new(&rhs);
-                                let sol = factor.solve(rhs_view.as_ref());
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    let mut acc = 0.0;
-                                    let start = row_ptr[row_idx];
-                                    let end = row_ptr[row_idx + 1];
-                                    for idx in start..end {
-                                        let col = col_idx[idx];
-                                        acc += values[idx] * sol[(col, local)];
-                                    }
-                                    leverage[row_idx] = acc;
-                                }
+                                leverage[row_idx] = acc;
                             }
                         }
                     } else {
@@ -5754,30 +5686,18 @@ pub mod internal {
                             let chunk_end = (chunk_start + chunk_cols).min(n);
                             let width = chunk_end - chunk_start;
                             
-                           if let Some(basis) = &truncated_basis {
-                                let mut x_chunk = Array2::<f64>::zeros((p_dim, width));
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    x_chunk.column_mut(local).assign(&x_dense.row(row_idx));
+                            let mut rhs = Array2::<f64>::zeros((p_dim, width));
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                rhs.column_mut(local).assign(&x_dense.row(row_idx));
+                            }
+                            let rhs_view = FaerArrayView::new(&rhs);
+                            let sol = factor.solve(rhs_view.as_ref());
+                            for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
+                                let mut acc = 0.0;
+                                for j in 0..p_dim {
+                                    acc += x_dense[[row_idx, j]] * sol[(j, local)];
                                 }
-                                let proj = basis.dot(&x_chunk);
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    let col = proj.column(local);
-                                    leverage[row_idx] = col.dot(&col);
-                                }
-                            } else {
-                                let mut rhs = Array2::<f64>::zeros((p_dim, width));
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    rhs.column_mut(local).assign(&x_dense.row(row_idx));
-                                }
-                                let rhs_view = FaerArrayView::new(&rhs);
-                                let sol = factor.solve(rhs_view.as_ref());
-                                for (local, row_idx) in (chunk_start..chunk_end).enumerate() {
-                                    let mut acc = 0.0;
-                                    for j in 0..p_dim {
-                                        acc += x_dense[[row_idx, j]] * sol[(j, local)];
-                                    }
-                                    leverage[row_idx] = acc;
-                                }
+                                leverage[row_idx] = acc;
                             }
                         }
                     }
@@ -7149,20 +7069,17 @@ pub mod internal {
                                             &pirls_result.solve_weights,
                                             &factor_g,
                                             &h_for_factor,
-                                            pirls_result.reparam_result.e_transformed.nrows(),
                                         )
                                     }
                                 }
                             } else {
-                                // Non-Firth path: use standard logh_beta_grad_logit, but with consistency check
-                                let structural_rank = pirls_result.reparam_result.e_transformed.nrows();
+                                // Non-Firth path: use standard logh_beta_grad_logit (full rank)
                                 self.logh_beta_grad_logit(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
                                     &factor_g,
                                     h_eff, // Use the effective Hessian (ridged if needed)
-                                    structural_rank,
                                 )
                             }
                         } else {
