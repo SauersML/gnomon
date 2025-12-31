@@ -3513,7 +3513,7 @@ fn renormalize_variant_loadings(
     singular_values: &mut [f64],
     mut sample_scores: MatMut<'_, f64>,
 ) -> Vec<f64> {
-    // CRITICAL: We normalize loadings in Euclidean space so that Σ(L²) = 1.
+    // Note: We normalize loadings in Euclidean space so that Σ(L²) = 1.
     // This Euclidean orthonormality ensures that the WLS projection (which minimizes error in weighted space)
     // simplifies to the Standard Projection (s = Σ x·w·L) when q=1, because LHS = Σ L L^T = I.
     // We pass `None` for weights to force Euclidean normalization.

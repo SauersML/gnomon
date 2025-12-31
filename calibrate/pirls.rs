@@ -1360,7 +1360,7 @@ pub struct PirlsResult {
     // Coefficients and Hessian are now in the STABLE, TRANSFORMED basis
     pub beta_transformed: Coefficients,
     pub penalized_hessian_transformed: Array2<f64>,
-    // CRITICAL: Single stabilized Hessian for consistent cost/gradient computation
+    // Single stabilized Hessian for consistent cost/gradient computation
     pub stabilized_hessian_transformed: Array2<f64>,
     // Ridge added to make the stabilized Hessian positive definite. When > 0, this
     // ridge is treated as a literal penalty term (0.5 * ridge * ||beta||^2).
@@ -1744,7 +1744,7 @@ pub fn fit_model_for_fixed_rho<'a>(
     } = final_state;
 
     let penalized_hessian_transformed = working_summary.state.hessian.clone();
-    // CRITICAL: Use the exact ridge from P-IRLS to stabilize the Hessian.
+    // Use the exact ridge from P-IRLS to stabilize the Hessian.
     // This ensures that beta is the stationary point of the SAME objective
     // used for LAML derivatives (Envelope Theorem consistency).
     // Previously, ensure_positive_definite could add a DIFFERENT ridge,
@@ -2731,7 +2731,7 @@ mod tests {
 
         let (solution, detected_rank) = result.unwrap();
 
-        // CRITICAL TEST: solver should have detected that the matrix is rank 2
+        // Test: solver should have detected that the matrix is rank 2
         // This is the core test of the rank detection algorithm
         assert_eq!(
             detected_rank, 2,
@@ -2774,7 +2774,7 @@ mod tests {
             residual_sum_sq
         );
 
-        // CRITICAL TEST: At least one coefficient should be exactly zero due to rank truncation
+        // Test: At least one coefficient should be exactly zero due to rank truncation
         // The solver should have identified a redundant dimension and truncated it
         let near_zero_count = solution.beta.iter().filter(|&&x| x.abs() < 1e-9).count();
 

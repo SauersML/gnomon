@@ -2195,7 +2195,7 @@ mod internal {
         config: &ModelConfig,
         coeffs: &MappedCoefficients,
     ) -> Result<Array2<f64>, ModelError> {
-        // CRITICAL: Validate that prediction data dimensions are consistent
+        // Validate that prediction data dimensions are consistent
         if p_new.len() != pcs_new.nrows() {
             return Err(ModelError::DimensionMismatch(format!(
                 "Sample count mismatch: p_new has {} samples but pcs_new has {} rows",
@@ -2239,7 +2239,7 @@ mod internal {
         // Target width must match trained coefficient count
         let pgs_coef_len = coeffs.main_effects.pgs.len();
 
-        // CRITICAL: For PGS main effect, we use ONLY the sum-to-zero constraint transform.
+        // For PGS main effect, we use ONLY the sum-to-zero constraint transform.
         // The range transform (z_range_pgs) is used ONLY for interaction terms.
 
         // Check shapes: B_unc (N x m), Z (m x c)
@@ -2262,7 +2262,7 @@ mod internal {
         // This matches the training behavior in construction.rs
         let pgs_main_basis = pgs_main_basis_unc.dot(pgs_z);
 
-        // CRITICAL: The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
+        // The interaction basis MUST be constructed from the UNCONSTRAINED PGS basis.
         // The model's coefficient layout (defined in construction.rs -> ModelLayout::new) is derived
         // from the dimensions of the unconstrained bases. Changing this to use a constrained basis
         // without a corresponding change to the layout logic will cause a dimension mismatch and lead

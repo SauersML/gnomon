@@ -6156,20 +6156,35 @@ pub mod internal {
                         pirls_result.reparam_result.log_det,
                     )?;
 
-                    // Log-determinant of the penalized Hessian.
-                    // Use the FULL log-determinant via Cholesky decomposition.
-                    // This is mathematically consistent with the gradient computation,
-                    // which uses tr(H⁻¹ Sₖ) over all p dimensions.
+                    // Log-determinant of the effective Hessian.
+                    // For Firth bias reduction, use H_total = H_eff - H_phi to match gradient.
+                    // For non-Firth, use H_eff = X'WX + S_λ directly.
                     //
-                    // CRITICAL: Previously, this used spectral truncation to `structural_rank`
-                    // eigenvalues, but the gradient used the full Hessian. This caused the
-                    // optimizer to receive gradients that didn't match the cost surface,
-                    // leading to "Cosine similarity ≈ 0" failures.
-                    //
-                    // The Hessian H = X'WX + S_λ is guaranteed positive definite after
-                    // the nugget regularization, so Cholesky is well-defined.
-                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
-                        let min_eig = h_eff
+                    // Note: Both cost and gradient must use the same Hessian for consistency.
+                    // Firth models use H_total = X'WX + S_λ - H_phi (where H_phi is the
+                    // curvature from the Jeffreys prior).
+                    let h_for_det = if self.config.firth_bias_reduction
+                        && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
+                    {
+                        // Compute H_phi (Firth curvature) and subtract from h_eff
+                        match self.firth_hessian_logit(
+                            &pirls_result.x_transformed,
+                            &pirls_result.solve_mu,
+                            &pirls_result.solve_weights,
+                        ) {
+                            Ok(h_phi) => {
+                                let mut h_total = h_eff.clone();
+                                h_total -= &h_phi;
+                                h_total
+                            }
+                            Err(_) => h_eff.clone(), // Fallback to h_eff if H_phi fails
+                        }
+                    } else {
+                        h_eff.clone()
+                    };
+
+                    let chol = h_for_det.clone().cholesky(Side::Lower).map_err(|_| {
+                        let min_eig = h_for_det
                             .clone()
                             .eigh(Side::Lower)
                             .ok()

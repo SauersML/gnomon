@@ -2045,7 +2045,7 @@ pub fn construct_s_lambda(
         return s_lambda;
     }
 
-    // CRITICAL VALIDATION: lambdas length must match number of penalty matrices
+    // Validation: lambdas length must match number of penalty matrices
     if lambdas.len() != s_list.len() {
         panic!(
             "Lambda count mismatch: expected {} lambdas for {} penalty matrices, got {}",

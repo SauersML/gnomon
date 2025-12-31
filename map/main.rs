@@ -249,7 +249,7 @@ fn run_fit(
         variant_keys = Some(Arc::new(outcome.matched_keys));
     }
 
-    // CRITICAL: Ensure the model ALWAYS has variant keys.
+    // Note: Ensure the model ALWAYS has variant keys.
     // If we haven't already extracted keys (via --list or --ld), do it now.
     // This prevents "anonymous" models that can silently project onto wrong variants.
     if variant_keys.is_none() {
