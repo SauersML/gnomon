@@ -5378,7 +5378,47 @@ pub mod internal {
 
 
         /// Compute the exact gradient ∂log|H_total|/∂β for Firth-adjusted LAML.
-        /// Uses reverse-mode autodiff through Cholesky to capture all terms including ∂H_phi/∂β.
+        ///
+        /// # Mathematical Background
+        ///
+        /// The LAML objective includes: J = 0.5 * log|H_total|
+        /// where H_total = H_pen - H_phi, and H_phi is the Firth curvature correction.
+        ///
+        /// ## Firth Correction Structure
+        ///
+        /// H_phi = 0.5 * (T_1 - T_2) where:
+        /// - T_1 = X^T diag(h ⊙ v) X         (diagonal contribution)
+        /// - T_2 = X^T diag(u) (A⊙A) diag(u) X  (off-diagonal contribution)
+        /// - h_i = (H_hat)_ii = ||b_i||²      (hat diagonal from Fisher info)
+        /// - v_i = (w''/w) = u² - 2w          (curvature ratio, logit)
+        /// - u_i = 1 - 2μ_i                   (logit score factor)
+        /// - A = H_hat = B B^T                (hat matrix)
+        /// - B = W^{1/2} X L_F^{-T}           (Fisher info thin factor)
+        ///
+        /// ## Gradient Formula
+        ///
+        /// ∂J/∂β = 0.5 * tr(H_total^{-1} * ∂H_total/∂β)
+        ///       = -0.5 * tr(M * ∂H_phi/∂β)
+        ///       = -0.25 * tr(M * (∂T_1/∂β - ∂T_2/∂β))
+        ///
+        /// where M = H_total^{-1} (p × p).
+        ///
+        /// ## Term 1 Gradient (diagonal part)
+        ///
+        /// Since h_i depends on β through B = W^{1/2} X L_F^{-T}:
+        /// - ∂T_1/∂B contribution: 2 * diag(m ⊙ v) B
+        /// - Coefficient: -0.25 * 2 = -0.5
+        ///
+        /// ## Term 2 Gradient (off-diagonal part)
+        ///
+        /// Using reverse-mode AD through the Khatri-Rao product (A⊙A):
+        /// - ∂T_2/∂B = 4 * (Z ⊙ A) B where Z = Y M Y^T
+        /// - Coefficient: +0.25 * 4 = +1.0
+        /// - Implementation uses M_proj = C^T C for the inverse Hessian projection
+        ///
+        /// ## Chain Rule to β
+        ///
+        /// Final gradient: g_β = X^T g_η where g_η accumulates per-observation gradients.
         
         fn firth_logh_total_grad(
             &self,
@@ -5481,12 +5521,8 @@ pub mod internal {
             // T = (B ⊙ B)^T V, which equals vec-wise contraction with H_hat∘H_hat.
             let t = Self::khatri_rao_transpose_mul(&b, &vc);
 
-            // =========================================================================
-            // REVERSE-MODE AD FOR TERM 2 (OFF-DIAGONAL PART OF H_phi)
-            // =========================================================================
+            // Reverse-mode AD for Term 2 (off-diagonal part of H_phi)
             //
-            // Mathematical background:
-            // -------------------------
             // The objective involves J = 0.5 * log|H_total| where H_total = H_pen - H_phi.
             // The Firth correction H_phi = 0.5 * (T_1 - T_2) where:
             //   T_1 = X^T diag(h ⊙ v) X  (diagonal term, handled above)
