@@ -2834,27 +2834,22 @@ mod tests {
 
         // For this rank-deficient problem, the true least-squares solution is not unique.
         // One standard solution is beta = [0.1, 0.1, 0.0]. Another is [0.0, 0.0, 0.1].
-        // The solver should find a solution that achieves the minimum possible RSS.
-        // For this specific problem, a perfect fit with RSS = 0 is possible.
+        // The SVD/pseudoinverse solver finds the MINIMUM-NORM solution that achieves
+        // the minimum possible RSS. For this specific problem, a perfect fit with RSS = 0 is possible.
 
         // Assert that the residual sum of squares is extremely close to the true minimum (0.0).
-        // This is a much stronger and more correct assertion than simply being "small".
+        // This is the key correctness criterion for the least-squares solution.
         assert!(
             residual_sum_sq < 1e-9,
             "The residual sum of squares should be effectively zero for a correct least-squares solution. Got: {}",
             residual_sum_sq
         );
 
-        // Test: At least one coefficient should be exactly zero due to rank truncation
-        // The solver should have identified a redundant dimension and truncated it
-        let near_zero_count = solution.beta.iter().filter(|&&x| x.abs() < 1e-9).count();
-
-        // With a properly implemented robust solver, we expect at least one coefficient to be
-        // truncated to zero due to the rank detection. The exact number can be implementation-dependent.
-        assert!(
-            near_zero_count > 0,
-            "At least one coefficient should be truncated to zero by rank detection"
-        );
+        // NOTE: We do NOT expect sparse coefficients from the SVD/pseudoinverse path.
+        // The minimum-norm solution distributes the weight across correlated predictors
+        // rather than concentrating it in a single variable. This is mathematically correct
+        // and actually better for prediction stability. For example, if col3 = col1 + col2,
+        // the minimum-norm solution might give [0.033, 0.033, 0.033] instead of [0.1, 0, 0].
 
         // Print some debug info for transparency
         println!("Detected rank: {}", detected_rank);
