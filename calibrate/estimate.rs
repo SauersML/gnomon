@@ -5481,16 +5481,60 @@ pub mod internal {
             // T = (B ⊙ B)^T V, which equals vec-wise contraction with H_hat∘H_hat.
             let t = Self::khatri_rao_transpose_mul(&b, &vc);
 
-            // Reverse for Khatri–Rao contraction (exact, no n×n):
-            //   T = (B⊙B)^T V
-            //   S_off = 0.5 ||T||_F^2  =>  T̄ = T
-            //   A = B⊙B, so Ā_i = V_i T^T = u_i (c_i T^T)
-            //   For each row i, reshape g_i = T c_i into G_i (p×p),
-            //   then ∂/∂b_i = u_i (G_i + G_i^T) b_i.
+            // =========================================================================
+            // REVERSE-MODE AD FOR TERM 2 (OFF-DIAGONAL PART OF H_phi)
+            // =========================================================================
+            //
+            // Mathematical background:
+            // -------------------------
+            // The objective involves J = 0.5 * log|H_total| where H_total = H_pen - H_phi.
+            // The Firth correction H_phi = 0.5 * (T_1 - T_2) where:
+            //   T_1 = X^T diag(h ⊙ v) X  (diagonal term, handled above)
+            //   T_2 = X^T (diag(u) (A ⊙ A) diag(u)) X  (off-diagonal term)
+            // where A = H_hat = B B^T is the hat matrix from the Fisher information basis.
+            //
+            // For the gradient, we need:
+            //   dJ/dB = 0.5 * tr(H_total^{-1} * d(H_pen - H_phi)/dB)
+            //         = -0.25 * tr(M * d(T_1 - T_2)/dB)
+            // where M = H_total^{-1} (p × p).
+            //
+            // For Term 2, the chain rule through T_2 involves:
+            //   T_2 = X^T Z X where Z = diag(u) (A ⊙ A) diag(u) (n × n)
+            //   dT_2/dB = complex term involving d(A ⊙ A)/dB
+            //
+            // The key insight is that tr(M * dT_2) requires contracting with the
+            // inverse Hessian M. In the factored form where C = X L^{-T} (n × p)
+            // with L = chol(H_total), we have:
+            //   X M X^T = C C^T  (n × n leverage matrix)
+            //   M = L^{-T} L^{-1} = (C^T C)^{-1} ... wait, that's not quite right.
+            //
+            // Actually, the correct projection through M uses:
+            //   M_proj = C^T C = L^{-1} X^T X L^{-T}  (p × p)
+            // This represents the Fisher information projected through H^{-1}.
+            //
+            // The gradient formula for Term 2 is:
+            //   g_i = T * M_proj * c_i  (p² vector)
+            // where the M_proj term ensures we're correctly contracting with H^{-1}.
+            // =========================================================================
+            
+            // Compute M_proj = C^T C (p × p) - the inverse Hessian projection matrix.
+            // This is needed because the trace formula tr(H^{-1} dT_2) requires
+            // the full inverse Hessian, not just a per-observation projection.
+            let m_proj = c.t().dot(&c); // (p × n) × (n × p) = p × p
+            
             let mut g_u = Array1::<f64>::zeros(n);
             for i in 0..n {
-                let c_i = c.row(i).to_owned();
-                let g_i = t.dot(&c_i);
+                // Compute g_i = T * M_proj * c_i for the correct inverse Hessian projection.
+                //
+                // Step 1: Project c_i through M_proj
+                let c_i = c.row(i);
+                let c_proj = m_proj.dot(&c_i); // (p × p) × (p,) = p-vector
+                
+                // Step 2: Contract with T to get p²-vector
+                let g_i = t.dot(&c_proj); // (p² × p) × (p,) = p²-vector
+                
+                // Step 3: Reshape g_i into G_i (p × p) and compute:
+                //   ∂/∂b_i = u_i * (G_i + G_i^T) * b_i
                 let b_i = b.row(i);
                 let mut tmp1 = vec![0.0; p];
                 let mut tmp2 = vec![0.0; p];
@@ -5501,14 +5545,21 @@ pub mod internal {
                         let g_ab = g_i[idx];
                         let ba = b_i[a];
                         let bb = b_i[bcol];
+                        // Track ∂S_off/∂u_i for chain rule through V = diag(u) C
                         gu += g_ab * ba * bb;
+                        // Accumulate symmetric gradient contribution
                         tmp1[a] += g_ab * bb;
                         tmp2[bcol] += g_ab * ba;
                     }
                 }
-                // g_u captures ∂S_off/∂u_i via V = diag(u) C (with chain rule 0.5 factor).
+                
+                // Store g_u with 0.5 factor from chain rule:
+                // 0.5 (log|H|) × 0.5 (H_phi definition) = 0.25, but the Term 2
+                // contributes with opposite sign (+0.25), and d(A⊙A)/dB gives factor 2.
                 g_u[i] = 0.5 * gu;
-                // Term 2 gradient: chain rule 0.5 (log|H|) × 0.5 (H_phi) × 2 (symmetric) = 0.5
+                
+                // Accumulate grad_b contribution for Term 2:
+                // Chain rule: 0.5 (log|H|) × 0.5 (H_phi) × 2 (symmetric) = 0.5
                 let scale = 0.5 * u[i];
                 if scale != 0.0 {
                     for j in 0..p {
