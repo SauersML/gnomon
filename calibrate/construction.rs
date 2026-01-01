@@ -2440,8 +2440,27 @@ pub fn stable_reparameterization_with_invariant(
         det1_vec[k] = *lambda * trace;
     }
 
+    // CRITICAL: Rebuild s_transformed from e_transformed to ensure rank consistency.
+    //
+    // The full sum of λ*S_k may contain "noise modes" (eigenvalues ~1e-15 that get
+    // amplified when λ is large). These modes appear in H but are truncated from
+    // log|S|_+, creating a "phantom penalty" that grows with λ but has zero derivative.
+    //
+    // By setting s_transformed = E^T * E, we ensure that both the Hessian and the
+    // prior normalization use exactly the same truncated penalty representation.
+    // Any noise modes are zeroed out in BOTH terms, restoring gradient consistency.
+    let mut s_truncated = Mat::<f64>::zeros(p, p);
+    matmul(
+        s_truncated.as_mut(),
+        Accum::Replace,
+        e_transformed_mat.transpose(),
+        e_transformed_mat.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
     Ok(ReparamResult {
-        s_transformed: mat_to_array(&s_transformed),
+        s_transformed: mat_to_array(&s_truncated),
         log_det,
         det1: Array1::from(det1_vec),
         qs: mat_to_array(&qs),
