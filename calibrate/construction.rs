@@ -2440,7 +2440,25 @@ pub fn stable_reparameterization_with_invariant(
         det1_vec[k] = *lambda * trace;
     }
 
-    // CRITICAL: Rebuild s_transformed from e_transformed to ensure rank consistency.
+    // Rebuild s_transformed from e_transformed to ensure rank consistency.
+    //
+    // ROOT CAUSE FIX (Gradient Match):
+    // The previous implementation computed s_transformed as the full sum of λ*S_k,
+    // which includes numerical noise modes (eigenvalues ~1e-15). When λ is large
+    // (e.g., 10^12), these noise modes become numerically significant in the Hessian H.
+    //
+    // However, the prior term log|S|_+ is computed using a TRUNCATED rank (structural_rank).
+    // This created a mismatch:
+    // - H includes amplified noise modes (increasing cost)
+    // - log|S|_+ excludes them (failing to subtract the cost)
+    //
+    // Result: An artificial positive slope in the LAML objective as λ -> ∞, causing
+    // massive discrepancies between analytic gradient (~0) and finite difference (>0).
+    //
+    // By reconstructing s_transformed = E^T * E, we force the penalty matrix used
+    // in H to have the EXACT same rank structure as the one used for log|S|_+.
+    // Any mode truncated from the prior is now strictly zero in the Hessian 
+    // calculation, restoring mathematical consistency.
     //
     // The full sum of λ*S_k may contain "noise modes" (eigenvalues ~1e-15 that get
     // amplified when λ is large). These modes appear in H but are truncated from
