@@ -23,30 +23,44 @@ pub enum FaerLinalgError {
 
 #[inline]
 pub fn array2_to_mat_mut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
-    if !array.is_standard_layout() {
-        let (nrows, ncols) = array.dim();
-        let mut standard = Array2::<f64>::zeros((nrows, ncols));
-        for i in 0..nrows {
-            for j in 0..ncols {
-                standard[(i, j)] = array[(i, j)];
-            }
-        }
-        *array = standard;
+    let (rows, cols) = array.dim();
+    let strides = array.strides();
+    
+    // Check if we can get a pointer. 
+    // If the array is contiguous (either C or F order), or simply sliced with strides,
+    // faer can handle it as long as we pass the pointer and strides.
+    // However, as_mut_ptr() requires a mutable reference. 
+    // ndarray's as_ptr/as_mut_ptr works for both layouts.
+    
+    let s0 = strides[0];
+    let s1 = strides[1];
+    
+    // SAFETY: We are creating a MatMut from the raw parts of the Array2.
+    // We strictly follow the dimensions and strides provided by ndarray.
+    unsafe {
+        MatMut::from_raw_parts_mut(
+            array.as_mut_ptr(),
+            rows,
+            cols,
+            s0,
+            s1,
+        )
     }
-    let (nrows, ncols) = array.dim();
-    let slice = array
-        .as_slice_memory_order_mut()
-        .expect("standard-layout array must expose a contiguous slice");
-    MatMut::from_row_major_slice_mut(slice, nrows, ncols)
 }
 
 #[inline]
 pub fn array1_to_col_mat_mut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
     let len = array.len();
-    let slice = array
-        .as_slice_memory_order_mut()
-        .expect("vector must expose a contiguous slice");
-    MatMut::from_row_major_slice_mut(slice, len, 1)
+    let stride = array.strides()[0];
+    unsafe {
+        MatMut::from_raw_parts_mut(
+            array.as_mut_ptr(),
+            len,
+            1,
+            stride,
+            0, // col stride irrelevant for 1 column
+        )
+    }
 }
 
 /// Compute A^T * A using faer's SIMD-optimized GEMM.
@@ -585,3 +599,4 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
     }
 }
+

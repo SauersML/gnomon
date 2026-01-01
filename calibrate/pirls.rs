@@ -20,8 +20,8 @@ use faer::sparse::linalg::matmul::{
 use faer::sparse::{SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat};
 use faer::{Accum, Par, Side, get_global_parallelism, Unbind};
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use rayon::prelude::*;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder};
+
 use std::borrow::Cow;
 use faer::{MatRef, Spec, Auto};
 use faer::linalg::cholesky::llt::factor::LltParams;
@@ -278,6 +278,8 @@ pub struct PirlsWorkspace {
     pub perm_inv: Vec<usize>,
     // Buffer for in-place factorization (preserves original Hessian in WorkingState)
     pub factorization_matrix: Array2<f64>,
+    // Buffer for sparse matrix scaling (avoid per-iteration allocation)
+    pub weighted_x_values: Vec<f64>,
 }
 
 impl PirlsWorkspace {
@@ -288,16 +290,16 @@ impl PirlsWorkspace {
 
         PirlsWorkspace {
             sqrt_w: Array1::zeros(n),
-            wx: Array2::zeros((n, p)),
+            wx: Array2::zeros((n, p).f()),
             wz: Array1::zeros(n),
             eta_buf: Array1::zeros(n),
-            scaled_matrix: Array2::zeros((scaled_rows_max, p)),
-            final_aug_matrix: Array2::zeros((final_aug_rows_max, p)),
+            scaled_matrix: Array2::zeros((scaled_rows_max, p).f()),
+            final_aug_matrix: Array2::zeros((final_aug_rows_max, p).f()),
             rhs_full: Array1::zeros(final_aug_rows_max),
             working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
-            xtwx_buf: Array2::zeros((p, p)),
+            xtwx_buf: Array2::zeros((p, p).f()),
             vec_buf_p: Array1::zeros(p),
             sparse_xtwx_cache: None,
             // Allocate scratch for LDLT (max possible size for p)
@@ -315,6 +317,7 @@ impl PirlsWorkspace {
             perm: vec![0; p],
             perm_inv: vec![0; p],
             factorization_matrix: Array2::zeros((p, p)),
+            weighted_x_values: Vec::with_capacity(n * 10), // Initial guess, will grow
         }
     }
 
@@ -336,6 +339,161 @@ impl PirlsWorkspace {
             .as_mut()
             .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
         cache.compute_dense(x, weights)
+    }
+
+    pub fn compute_hessian_sparse_faer(
+        &mut self,
+        x: &SparseRowMat<usize, f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if weights.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "weights length {} does not match design rows {}",
+                weights.len(),
+                n
+            )));
+        }
+
+        // 1. Prepare weighted values in pre-allocated buffer
+        // Note: x is CSR, so we iterate rows efficiently
+        let x_vals = x.val();
+        self.weighted_x_values.clear();
+        self.weighted_x_values.reserve(x_vals.len());
+
+        let row_ptr = x.symbolic().row_ptr();
+        for i in 0..n {
+            let w_sqrt = weights[i].max(0.0).sqrt();
+            let start = row_ptr[i];
+            let end = row_ptr[i + 1];
+            // Unrolling or SIMD here is handled by compiler usually, but
+            // we simply scale the row's values.
+            for j in start..end {
+                self.weighted_x_values.push(x_vals[j] * w_sqrt);
+            }
+        }
+
+        // 2. Construct Weighted Matrix View (Z = X^T * W^1/2)
+        // x is (n, p) CSR. 
+        // We create a view `weighted_x` which is (n, p) CSR with new values.
+        // Then we transpose it to get `z` which is (p, n) CSC.
+        // H = X^T W X = (X^T W^1/2) (W^1/2 X) = Z * Z^T
+        let weighted_x = faer::sparse::SparseRowMatRef::new(
+            x.symbolic(),
+            &self.weighted_x_values,
+        );
+        let z = weighted_x.transpose(); 
+
+        // 3. Compute H = Z * Z^T
+        if self.xtwx_buf.dim() != (p, p) {
+            self.xtwx_buf = Array2::zeros((p, p));
+        }
+
+
+        // faer's matmul doesn't support sparse inputs directly in older versions,
+        // so we use the sparse-sparse pipeline: symbolic -> numeric -> dense.
+        // This is efficient and correct.
+        
+
+        // Note: z is CSC. z.transpose() is CSR (RowMat). 
+        // sparse_sparse_matmul expects ColMat inputs? 
+        // z_t = z.transpose() as ColMat = (Z^T).
+        // z (lhs) is CSC. z.transpose() (rhs) is CSC.
+        // But z.transpose() on SparseColMat returns SparseRowMat. 
+        // We need explicit conversion or use `z` and `z.transpose()` as is if supported?
+        // sparse_sparse_matmul symbolic expects `SymbolicSparseColMatRef`.
+        // So we need Z^T as CSC.
+        // Z is CSC. Z^T can be constructed by treating Z as CSR transpose?
+        // Actually, Z comes from `weighted_x.transpose()`. 
+        // `weighted_x` is `SparseRowMatRef`.
+        // So `z` is `SparseColMatRef`.
+        // We want $H = Z * Z^T$.
+        // LHS = Z (CSC). RHS = Z^T (RowMatRef of Z).
+        // But functions expect CSC.
+        // RHS as CSC? $Z^T$ as CSC is `weighted_x` as CSC?
+        // `weighted_x` is CSR. `weighted_x` as CSC defines `(weighted_x)^T` = `z`.
+        // We want `(weighted_x)^T * (weighted_x)`. 
+        // No we want `X^T W X`. $A = \tilde{X}$. $H = A^T A$.
+        // `weighted_x` is $A$ (CSR).
+        // `z` is $A^T$ (CSC).
+        // `z_t` should be $A$ (CSC).
+        // We can get $A$ as CSC by transposing $A^T$ (Z) to CSC.
+        // This requires structure conversion (CSR->CSC) which is costly?
+        // Or we can say $H = Z * Z^T$.
+        // If we can't do Col * Row, we need Col * Col.
+        // The user says "Replace manual accumulation...".
+        // If I have to do CSC conversion, it might be slow.
+        // But `SparseXtWxCache` builds `x_t` (CSC) from `x` (CSC). 
+        // `x` in Pirls is usually CSC (DesignMatrix::Sparse).
+        // But `compute_hessian_sparse` receives `SparseRowMat` (CSR).
+        // So `x` is CSR. `$A$` is CSR.
+        // We want $A^T A$.
+        // $A^T$ is CSC (view of A).
+        // $A$ is CSR.
+        // Does `sparse_sparse_matmul` support LHS=Col, RHS=Row?
+        // `sparse_sparse_matmul_symbolic` takes `lhs: SymbolicSparseColMatRef`, `rhs: SymbolicSparseColMatRef`.
+        // So both must be CSC.
+        // LHS = $A^T$ (CSC). RHS = $A$ (as CSC).
+        // converting A (CSR) to A (CSC) is necessary.
+        
+        // This allocation is why cache is preferred. 
+        // But we must correct this fallback.
+        
+        // 1. Convert weighted_x (CSR) to CSC.
+        // faer 0.19 requires explicit conversion if we want CSC.
+        // Or use `to_col_major`. 
+        let weighted_x_csc = weighted_x.to_col_major().map_err(|_| EstimationError::InvalidInput("failed to convert to col major".to_string()))?; 
+        
+        // 2. Symbolic
+        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(
+            z.symbolic(), 
+            weighted_x_csc.symbolic()
+        ).map_err(|_| EstimationError::InvalidInput("failed to build symbolic XtWX".to_string()))?;
+
+        // 3. Numeric
+        let mut xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
+        let mut scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
+                xtwx_symbolic.as_ref(),
+                sparse_xtwx_par(p),
+        ));
+        let mut stack = MemStack::new(&mut scratch);
+        
+        let xtwx_mut = SparseColMatMut::new(xtwx_symbolic.as_ref(), &mut xtwx_values);
+        sparse_sparse_matmul_numeric(
+            xtwx_mut,
+            Accum::Replace,
+            z,
+            weighted_x_csc.as_ref(),
+            1.0,
+            &info,
+            sparse_xtwx_par(p),
+            &mut stack,
+        );
+        
+        // 4. To Dense
+        let xtwx_ref = SparseColMatRef::new(xtwx_symbolic.as_ref(), &xtwx_values);
+        let dense = xtwx_ref.to_dense();
+        
+        // Fill buffer
+        if self.xtwx_buf.dim() != (p, p) {
+            self.xtwx_buf = Array2::zeros((p, p).f());
+        }
+        // Fill Array2 from faer Mat (ColMajor). Array2 is F-order now too? 
+        // self.xtwx_buf is initialized with .f(). 
+        // If Array2 is F-order, and Mat is ColMajor, we can copy simpler?
+        // But `dense` owns data.
+        // Let's just use element-wise assignment to be safe and independent of Array2 layout details.
+        // dense[(i, j)] is value at row i, col j.
+        // self.xtwx_buf[[i, j]] should be set to dense[(i, j)].
+        // Since both are ideally column major, efficient traversal order is by column.
+        for j in 0..p {
+            for i in 0..p {
+                self.xtwx_buf[[i, j]] = dense[(i, j)]; 
+            }
+        }
+        
+        Ok(self.xtwx_buf.clone())
     }
 }
 
@@ -528,7 +686,7 @@ impl<'a> GamWorkingModel<'a> {
                         let csr = self.x_csr.as_ref().ok_or_else(|| {
                             EstimationError::InvalidInput("missing CSR cache".to_string())
                         })?;
-                        compute_hessian_sparse(csr, weights)
+                        self.workspace.compute_hessian_sparse_faer(csr, weights)
                     })?;
                     xtwx + &self.s_transformed
                 }
@@ -540,10 +698,10 @@ impl<'a> GamWorkingModel<'a> {
                 let csr = self.x_original_csr.as_ref().ok_or_else(|| {
                     EstimationError::InvalidInput("missing CSR cache".to_string())
                 })?;
-                compute_hessian_sparse(csr, weights)
+                self.workspace.compute_hessian_sparse_faer(csr, weights)
             })?
         } else if let Some(csr) = &self.x_original_csr {
-            compute_hessian_sparse(csr, weights)?
+            self.workspace.compute_hessian_sparse_faer(csr, weights)?
         } else {
             self.workspace
                 .sqrt_w
@@ -623,15 +781,11 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // when PIRLS is operating directly in the original basis.
             let (hat_diag, half_log_det) = match (&self.x_transformed, &self.x_csr) {
                 (Some(DesignMatrix::Sparse(_)), Some(csr)) => {
-                    let dense = self.x_transformed.as_ref().unwrap().to_dense();
-                    let dense = Array2::from_shape_fn(
-                        (dense.nrows(), dense.ncols()),
-                        |(i, j)| dense[(i, j)],
-                    );
+
                     compute_firth_hat_and_half_logdet_sparse(
                         csr,
-                        dense.view(),
                         weights.view(),
+                        &mut self.workspace,
                     )?
                 }
                 (Some(DesignMatrix::Dense(x_dense)), _) => compute_firth_hat_and_half_logdet(
@@ -820,115 +974,11 @@ fn sparse_xtwx_par(ncols: usize) -> Par {
     }
 }
 
-fn compute_hessian_sparse(
-    x: &SparseRowMat<usize, f64>,
-    weights: &Array1<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    let ncols = x.ncols();
-    let nrows = x.nrows();
-    if weights.len() != nrows {
-        return Err(EstimationError::InvalidInput(format!(
-            "weights length {} does not match design rows {}",
-            weights.len(),
-            nrows
-        )));
-    }
-    const PAR_ROW_THRESHOLD: usize = 512;
-
-    let x_view = x.as_ref();
-    let mismatch = std::sync::atomic::AtomicBool::new(false);
-    let hessian_vec = if nrows >= PAR_ROW_THRESHOLD {
-        (0..nrows)
-            .into_par_iter()
-            .fold(
-                || vec![0.0_f64; ncols * ncols],
-                |mut local, row| {
-                    let w = weights[row].max(0.0);
-                    if w == 0.0 {
-                        return local;
-                    }
-                    let vals = x_view.val_of_row(row);
-                    let cols = x_view.col_idx_of_row_raw(row);
-                    if cols.len() != vals.len() {
-                        mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return local;
-                    }
-                    for (idx_a, &col_a) in cols.iter().enumerate() {
-                        let val_a = vals[idx_a];
-                        let col_a = col_a.unbound();
-                        let scaled = w * val_a;
-                        let row_offset_a = col_a * ncols;
-                        for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
-                            let val_b = vals[idx_b];
-                            let col_b = col_b.unbound();
-                            let delta = scaled * val_b;
-                            local[row_offset_a + col_b] += delta;
-                            if col_a != col_b {
-                                local[col_b * ncols + col_a] += delta;
-                            }
-                        }
-                    }
-                    local
-                },
-            )
-            .reduce(
-                || vec![0.0_f64; ncols * ncols],
-                |mut acc, local| {
-                    for (dst, src) in acc.iter_mut().zip(local.into_iter()) {
-                        *dst += src;
-                    }
-                    acc
-                },
-            )
-    } else {
-        let mut local = vec![0.0_f64; ncols * ncols];
-        for row in 0..nrows {
-            let w = weights[row].max(0.0);
-        if w == 0.0 {
-            continue;
-        }
-        let vals = x_view.val_of_row(row);
-        let cols = x_view.col_idx_of_row_raw(row);
-        if cols.len() != vals.len() {
-            mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(EstimationError::InvalidInput(
-                "sparse row value/index length mismatch".to_string(),
-            ));
-        }
-        for (idx_a, &col_a) in cols.iter().enumerate() {
-            let val_a = vals[idx_a];
-            let col_a = col_a.unbound();
-            let scaled = w * val_a;
-            let row_offset_a = col_a * ncols;
-            for (idx_b, &col_b) in cols[..=idx_a].iter().enumerate() {
-                let val_b = vals[idx_b];
-                let col_b = col_b.unbound();
-                let delta = scaled * val_b;
-                local[row_offset_a + col_b] += delta;
-                if col_a != col_b {
-                    local[col_b * ncols + col_a] += delta;
-                    }
-                }
-            }
-        }
-        local
-    };
-
-    if mismatch.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(EstimationError::InvalidInput(
-            "sparse row value/index length mismatch".to_string(),
-        ));
-    }
-
-    Array2::from_shape_vec((ncols, ncols), hessian_vec).map_err(|_| {
-        EstimationError::InvalidInput("failed to build sparse Hessian".to_string())
-    })
-}
 
 fn compute_firth_hat_and_half_logdet_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
-    x_design: ArrayView2<f64>,
     weights: ArrayView1<f64>,
+    workspace: &mut PirlsWorkspace,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // This routine computes the Firth hat diagonal and 0.5*log|X^T W X|
     // for a *specific* design matrix. It must be called with the same
@@ -936,8 +986,10 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let n = x_design_csr.nrows();
     let p = x_design_csr.ncols();
 
-    let xtwx_transformed = compute_hessian_sparse(x_design_csr, &weights.to_owned())?;
-    let mut stabilized = xtwx_transformed;
+    // Use efficient faer sparse multiplication
+    let xtwx_transformed = workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
+    
+    let mut stabilized = xtwx_transformed.clone();
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
@@ -948,20 +1000,20 @@ fn compute_firth_hat_and_half_logdet_sparse(
     // Firth correction uses the unpenalized Fisher information X' W X.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    let mut fisher = Array2::<f64>::zeros((p, p));
-    for i in 0..n {
-        let wi = weights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let xi = x_design.row(i);
-        for j in 0..p {
-            let xij = xi[j];
-            for k in 0..p {
-                fisher[[j, k]] += wi * xij * xi[k];
-            }
+    // We can reuse the computed Hessian for the Fisher information log-det term
+    // instead of recomputing manual interaction loops.
+    // They are mathematically identical (X'WX).
+    let mut fisher = xtwx_transformed;
+    
+    // Symmetrize fisher (redundant if matmul is precise/symmetric but good practice)
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (fisher[[i, j]] + fisher[[j, i]]);
+            fisher[[i, j]] = v;
+            fisher[[j, i]] = v;
         }
     }
+    
     ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
     let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
@@ -969,6 +1021,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
         }
     })?;
     let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+
 
     let h_view = FaerArrayView::new(&stabilized);
     let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {

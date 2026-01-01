@@ -344,17 +344,18 @@ mod internal {
             let n_cols = pc_arrays.len();
             let mut pcs_flat = Vec::with_capacity(n_rows * n_cols);
 
-            // Convert column vectors to row-major format
-            for row_idx in 0..n_rows {
-                for col_idx in 0..n_cols {
-                    pcs_flat.push(pc_arrays[col_idx][row_idx]);
-                }
+            // Convert column vectors to column-major format (F-order)
+            // This aligns with faer's preference for column-major matrices
+            for col_idx in 0..n_cols {
+                pcs_flat.extend(pc_arrays[col_idx].iter().cloned());
             }
             (pcs_flat, n_rows, n_cols)
         };
 
-        let pcs = Array2::from_shape_vec((n_rows, n_cols), pcs_flat)
-            .expect("PC arrays should have consistent dimensions");
+        let pcs_t = Array2::from_shape_vec((n_cols, n_rows), pcs_flat)
+             .expect("PC arrays should have consistent dimensions");
+        // Transpose to get (n_rows, n_cols) in Column-Major layout
+        let pcs = pcs_t.reversed_axes();
 
         // Process weights column
         let weights = if require_weights {
