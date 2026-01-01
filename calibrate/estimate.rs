@@ -5591,14 +5591,15 @@ pub mod internal {
                     }
                 }
                 
-                // Store g_u with 0.5 factor from chain rule:
-                // 0.5 (log|H|) × 0.5 (H_phi definition) = 0.25, but the Term 2
-                // contributes with opposite sign (+0.25), and d(A⊙A)/dB gives factor 2.
-                g_u[i] = 0.5 * gu;
+                // Store g_u with correct factor from chain rule:
+                // 0.5 (log|H|) × (+0.5 for T2 in H_phi) = +0.25
+                // The d(A⊙A)/dB = 2*(A⊙dA) and dA/dB = 2B gives total factor of 4
+                // Combined: 0.25 × 4 = 1.0
+                g_u[i] = 1.0 * gu;
                 
                 // Accumulate grad_b contribution for Term 2:
-                // Chain rule: 0.5 (log|H|) × 0.5 (H_phi) × 2 (symmetric) = 0.5
-                let scale = 0.5 * u[i];
+                // Same chain rule: 0.5 (log|H|) × 0.5 (H_phi) × 4 (symmetric×Hadamard) = 1.0
+                let scale = 1.0 * u[i];
                 if scale != 0.0 {
                     for j in 0..p {
                         grad_b[(i, j)] += scale * (tmp1[j] + tmp2[j]);
