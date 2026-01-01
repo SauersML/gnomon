@@ -5552,24 +5552,25 @@ pub mod internal {
             //
             // The gradient formula for Term 2 is:
             //   g_i = T * M_proj * c_i  (p² vector)
-            // where the M_proj term ensures we're correctly contracting with H^{-1}.
             // =========================================================================
-            
-            // Compute M_proj = C^T C (p × p) - the inverse Hessian projection matrix.
-            // This is needed because the trace formula tr(H^{-1} dT_2) requires
-            // the full inverse Hessian, not just a per-observation projection.
-            let m_proj = c.t().dot(&c); // (p × n) × (n × p) = p × p
+            // Reverse-mode AD for Term 2 (off-diagonal part of H_phi)
+            //
+            // The trace formula tr(H^{-1} dT_2) requires contracting T with c_i directly.
+            // T already encodes the Khatri-Rao product (B⊙B)^T V where V = diag(u) C.
+            // When we compute T * c_i, we get:
+            //   Σ_j (b_j ⊗ b_j) u_j (c_j^T c_i)
+            // which is exactly the leverage-weighted sum needed for the derivative.
+            //
+            // NOTE: We do NOT use C^T C here. The leverage inner product c_j^T c_i
+            // gives (CC^T)_{ij} = M_h[i,j], which is what the math requires.
+            // =========================================================================
             
             let mut g_u = Array1::<f64>::zeros(n);
             for i in 0..n {
-                // Compute g_i = T * M_proj * c_i for the correct inverse Hessian projection.
-                //
-                // Step 1: Project c_i through M_proj
+                // Contract T directly with c_i (NOT through C^T C projection!)
+                // This gives: Σ_j (b_j ⊗ b_j) u_j (c_j^T c_i)
                 let c_i = c.row(i);
-                let c_proj = m_proj.dot(&c_i); // (p × p) × (p,) = p-vector
-                
-                // Step 2: Contract with T to get p²-vector
-                let g_i = t.dot(&c_proj); // (p² × p) × (p,) = p²-vector
+                let g_i = t.dot(&c_i); // (p² × p) × (p,) = p²-vector
                 
                 // Step 3: Reshape g_i into G_i (p × p) and compute:
                 //   ∂/∂b_i = u_i * (G_i + G_i^T) * b_i
