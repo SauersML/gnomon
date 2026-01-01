@@ -5459,8 +5459,9 @@ pub mod internal {
             // We implement the exact reverse pass using Khatri–Rao.
             let mut grad_b = Array2::<f64>::zeros((n, p));
             for i in 0..n {
-                // term1 contributes: -0.5 * mdiag_i * v_i * d(||b_i||^2)
-                let scale = mdiag[i] * v[i];
+                // Term 1 contributes: -0.5 * mdiag_i * v_i * d(||b_i||^2)/db_ij
+                // Chain rule: 0.5 (from log|H|) × 0.5 (from H_phi) × 2 (from d||b||²) = 0.5
+                let scale = 0.5 * mdiag[i] * v[i];
                 if scale != 0.0 {
                     for j in 0..p {
                         grad_b[(i, j)] -= scale * b[(i, j)];
@@ -5505,9 +5506,10 @@ pub mod internal {
                         tmp2[bcol] += g_ab * ba;
                     }
                 }
-                // g_u captures ∂S_off/∂u_i via V = diag(u) C.
-                g_u[i] = gu;
-                let scale = u[i];
+                // g_u captures ∂S_off/∂u_i via V = diag(u) C (with chain rule 0.5 factor).
+                g_u[i] = 0.5 * gu;
+                // Term 2 gradient: chain rule 0.5 (log|H|) × 0.5 (H_phi) × 2 (symmetric) = 0.5
+                let scale = 0.5 * u[i];
                 if scale != 0.0 {
                     for j in 0..p {
                         grad_b[(i, j)] += scale * (tmp1[j] + tmp2[j]);
