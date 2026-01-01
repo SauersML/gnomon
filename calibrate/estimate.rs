@@ -5292,11 +5292,13 @@ pub mod internal {
 
         /// Compute the Firth curvature matrix H_phi = ∇²Φ where Φ = 0.5 log|X^T W X|.
         /// This is needed for the exact Firth-adjusted Hessian: H_total = H_eff - H_phi.
+        /// When ridge > 0, the Fisher information is regularized to match PIRLS.
         fn firth_hessian_logit(
             &self,
             x_transformed: &DesignMatrix,
             mu: &Array1<f64>,
             weights: &Array1<f64>,
+            ridge: f64,  // Stabilization ridge from PIRLS
         ) -> Result<Array2<f64>, EstimationError> {
             let n = mu.len();
             let x_trans_dense = self.dense_design_matrix(x_transformed);
@@ -5332,7 +5334,8 @@ pub mod internal {
             // Build thin factor B for H_hat = B B^T with B = W^{1/2} X L_f^{-T}.
             // This avoids forming the n×n hat matrix.
             // Use firth_hat_factor and take only the first element (B matrix).
-            let (b, _, _) = self.firth_hat_factor(x_trans_dense.view(), weights.view())?;
+            // Pass ridge to regularize the Fisher information consistently.
+            let (b, _, _) = self.firth_hat_factor(x_trans_dense.view(), weights.view(), ridge)?;
             // h_i = diag(H_hat)_i = ||b_i||^2
             let h = Self::row_norms_squared(&b);
 
@@ -5426,6 +5429,7 @@ pub mod internal {
             mu: &Array1<f64>,
             weights: &Array1<f64>,
             h_total: &Array2<f64>,
+            ridge: f64,  // Stabilization ridge from PIRLS
         ) -> Result<Array1<f64>, EstimationError> {
             let x = self.dense_design_matrix(x_transformed);
             let n = x.nrows();
@@ -5472,7 +5476,8 @@ pub mod internal {
             // Forward thin factors:
             //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T
             //   C = X L_t^{-T}           with M_h = X H_total^{-1} X^T = C C^T
-            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
+            // Pass ridge to regularize Fisher information consistently with PIRLS.
+            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view(), ridge)?;
             let c = self.h_total_factor(x.view(), h_total)?;
 
             // Diagonal summaries (no n×n):
@@ -5809,14 +5814,18 @@ pub mod internal {
 
         // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
         // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
+        // When ridge > 0, the Fisher information is regularized: F_eff = X'WX + ridge*I
+        // to match the stabilized Hessian that PIRLS actually used.
         
         fn firth_hat_factor(
             &self,
             x: ArrayView2<'_, f64>,
             weights: ArrayView1<'_, f64>,
+            ridge: f64,  // Stabilization ridge from PIRLS (0 if none)
         ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), EstimationError> {
             use crate::calibrate::faer_ndarray::FaerCholesky;
             let n = x.nrows();
+            let p = x.ncols();
             let mut xw = x.to_owned();
             for i in 0..n {
                 let s = weights[i].max(0.0).sqrt();
@@ -5824,7 +5833,13 @@ pub mod internal {
                     xw.row_mut(i).mapv_inplace(|v| v * s);
                 }
             }
-            let fisher = xw.t().dot(&xw);
+            let mut fisher = xw.t().dot(&xw);
+            // Add stabilization ridge to match PIRLS objective
+            if ridge > 0.0 {
+                for i in 0..p {
+                    fisher[[i, i]] += ridge;
+                }
+            }
             let chol = fisher.cholesky(Side::Lower).map_err(|_| {
                 EstimationError::HessianNotPositiveDefinite {
                     min_eigenvalue: f64::NEG_INFINITY,
@@ -6256,10 +6271,12 @@ pub mod internal {
                         && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
                     {
                         // Compute H_phi (Firth curvature) and subtract from h_eff
+                        // Pass ridge_used for consistent Fisher information regularization
                         match self.firth_hessian_logit(
                             &pirls_result.x_transformed,
                             &pirls_result.solve_mu,
                             &pirls_result.solve_weights,
+                            ridge_used,
                         ) {
                             Ok(h_phi) => {
                                 let mut h_total = h_eff.clone();
@@ -7031,12 +7048,14 @@ pub mod internal {
                         // For Firth bias reduction, compute the exact Hessian:
                         // H_total = h_eff - H_phi where H_phi is the Firth curvature matrix.
                         // For non-Firth, H_total = h_eff.
+                        // Pass ridge_used for consistent Fisher information regularization.
                         let (h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
                             if let LinkFunction::Logit = self.config.link_function().expect("link fn") {
                                 match self.firth_hessian_logit(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
+                                    ridge_used,
                                 ) {
                                     Ok(h_phi) => {
                                         let mut h_total = h_eff.clone();
@@ -7157,11 +7176,13 @@ pub mod internal {
                         {
                             if self.config.firth_bias_reduction && h_phi_opt.is_some() {
                                 // Use exact firth_logh_total_grad with full reverse-mode autodiff
+                                // Pass ridge_used for consistent Fisher information regularization
                                 match self.firth_logh_total_grad(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
                                     &h_for_factor,
+                                    ridge_used,
                                 ) {
                                     Ok(grad) => Some(grad),
                                     Err(_) => {
@@ -8658,8 +8679,9 @@ pub mod internal {
                 }
             }
             let mut h_total = xtwx + &pr.reparam_result.s_transformed;
+            // Pass ridge=0.0 for test (no PIRLS regularization in test scenario)
             let h_phi = state
-                .firth_hessian_logit(&pr.x_transformed, &mu, &weights)
+                .firth_hessian_logit(&pr.x_transformed, &mu, &weights, 0.0)
                 .expect("h_phi");
             h_total -= &h_phi;
             let chol = h_total
@@ -8712,13 +8734,15 @@ pub mod internal {
                     }
                 }
             }
+            // Pass ridge=0.0 for test (no PIRLS regularization in test scenario)
             let h_phi = state
-                .firth_hessian_logit(&pr.x_transformed, &mu, &weights)
+                .firth_hessian_logit(&pr.x_transformed, &mu, &weights, 0.0)
                 .expect("h_phi");
             let mut h_total = xtwx + &pr.reparam_result.s_transformed;
             h_total -= &h_phi;
+            // Pass ridge=0.0 for test
             let g_beta = state
-                .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total)
+                .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total, 0.0)
                 .expect("g_beta");
 
             let mut g_num = Array1::<f64>::zeros(beta.len());
@@ -8780,19 +8804,22 @@ pub mod internal {
             // Break down the analytic log|H_total| derivative for inspection.
             let pr = state.execute_pirls_if_needed(&rho0).expect("pirls");
             let (h_eff, _) = state.effective_hessian(&pr).expect("h_eff");
+            // Pass ridge=0.0 for test
             let h_phi = state
-                .firth_hessian_logit(&pr.x_transformed, &pr.solve_mu, &pr.solve_weights)
+                .firth_hessian_logit(&pr.x_transformed, &pr.solve_mu, &pr.solve_weights, 0.0)
                 .expect("h_phi");
             let mut h_total = h_eff.clone();
             h_total -= &h_phi;
             let factor_g = state.factorize_faer(&h_total);
 
+            // Pass ridge=0.0 for test
             let g_beta_total = state
                 .firth_logh_total_grad(
                     &pr.x_transformed,
                     &pr.solve_mu,
                     &pr.solve_weights,
                     &h_total,
+                    0.0,
                 )
                 .expect("g_beta_total");
             let g_beta_half = 0.5 * &g_beta_total;

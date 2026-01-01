@@ -2272,7 +2272,16 @@ pub fn solve_penalized_least_squares(
         }
     };
     
-    let nugget = if needs_nugget { diag_scale * nugget_fraction } else { 0.0 };
+    // For truly rank-deficient problems with NO penalty, use SVD pseudoinverse
+    // to get the exact minimum-norm least squares solution. This preserves the
+    // mathematical projection property: X β projects z onto Col(X) exactly.
+    // When penalty is present (e_transformed has rows), regularization is fine.
+    let use_svd_path = needs_nugget && e_transformed.nrows() == 0;
+    let nugget = if needs_nugget && !use_svd_path { 
+        diag_scale * nugget_fraction 
+    } else { 
+        0.0 
+    };
     
     let mut regularized_hessian = penalized_hessian.clone();
     if nugget > 0.0 {
@@ -2281,36 +2290,98 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    // 6. Solve using LDLT (Robust for indefinite/near-singular)
-    // Faer's LDLT is pivoted and stable.
-    let h_reg_view = FaerArrayView::new(&regularized_hessian);
-    
     // Build the RHS for the system H * beta = X'Wz
     let rhs_vec = &workspace.vec_buf_p; // X'Wz
-    
-    // Convert to Faer structures for solve
-    let rhs_mat = {
-        let mut m = faer::Mat::zeros(p_dim, 1);
-        for i in 0..p_dim {
-            m[(i, 0)] = rhs_vec[i];
-        }
-        m
-    };
 
-    // Use LDLT factorization
-    let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
-    
-    let beta_vec = if let Ok(factor) = ldlt {
-        let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
-        let mut b = Array1::zeros(p_dim);
-        for i in 0..p_dim {
-            b[i] = sol_mat[(i, 0)];
+    let beta_vec = if use_svd_path {
+        // SVD-based pseudoinverse for exact least squares on rank-deficient problems.
+        // Solve H β = b where H = X'WX is rank-deficient using H⁺ = V Σ⁺ U'.
+        // This gives the minimum-norm solution with exact projection property.
+        
+        // Use eigendecomposition since H is symmetric: H = Q Λ Q'
+        // Then H⁺ = Q Λ⁺ Q' where Λ⁺ inverts non-zero eigenvalues
+        // Use the FaerEigh trait which returns (eigenvalues: Array1, eigenvectors: Array2)
+        match penalized_hessian.eigh(Side::Lower) {
+            Ok((eigenvalues, eigenvectors)) => {
+                // Find maximum eigenvalue for tolerance calculation
+                let max_eig: f64 = eigenvalues.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+                let tol = 1e-12 * max_eig;
+                let mut result = Array1::<f64>::zeros(p_dim);
+                
+                // Compute Q Λ⁺ Q' b = Σᵢ (qᵢ' b) / λᵢ * qᵢ for λᵢ > tol
+                for j in 0..p_dim {
+                    let lambda_j = eigenvalues[j];
+                    if lambda_j.abs() > tol {
+                        // Compute qⱼ' b
+                        let mut qt_b = 0.0;
+                        for i in 0..p_dim {
+                            qt_b += eigenvectors[(i, j)] * rhs_vec[i];
+                        }
+                        // Add (qⱼ' b) / λⱼ * qⱼ to result
+                        let scale = qt_b / lambda_j;
+                        for i in 0..p_dim {
+                            result[i] += scale * eigenvectors[(i, j)];
+                        }
+                    }
+                }
+                result
+            }
+            Err(_) => {
+                // Fallback to LDLT with nugget if eigendecomposition fails
+                let mut reg_h = penalized_hessian.clone();
+                let fallback_nugget = diag_scale * nugget_fraction;
+                for i in 0..p_dim {
+                    reg_h[[i, i]] += fallback_nugget;
+                }
+                let h_reg_view = FaerArrayView::new(&reg_h);
+                let rhs_mat = {
+                    let mut m = faer::Mat::zeros(p_dim, 1);
+                    for i in 0..p_dim {
+                        m[(i, 0)] = rhs_vec[i];
+                    }
+                    m
+                };
+                let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower)
+                    .map_err(|_| EstimationError::LinearSystemSolveFailed(
+                        FaerLinalgError::FactorizationFailed,
+                    ))?;
+                let sol_mat: faer::Mat<f64> = ldlt.solve(&rhs_mat);
+                let mut b = Array1::zeros(p_dim);
+                for i in 0..p_dim {
+                    b[i] = sol_mat[(i, 0)];
+                }
+                b
+            }
         }
-        b
     } else {
-        return Err(EstimationError::LinearSystemSolveFailed(
-            FaerLinalgError::FactorizationFailed,
-        ));
+        // 6. Solve using LDLT (Robust for indefinite/near-singular)
+        // Faer's LDLT is pivoted and stable.
+        let h_reg_view = FaerArrayView::new(&regularized_hessian);
+        
+        // Convert to Faer structures for solve
+        let rhs_mat = {
+            let mut m = faer::Mat::zeros(p_dim, 1);
+            for i in 0..p_dim {
+                m[(i, 0)] = rhs_vec[i];
+            }
+            m
+        };
+
+        // Use LDLT factorization
+        let ldlt = FaerLdlt::new(h_reg_view.as_ref(), Side::Lower);
+        
+        if let Ok(factor) = ldlt {
+            let sol_mat: faer::Mat<f64> = factor.solve(&rhs_mat);
+            let mut b = Array1::zeros(p_dim);
+            for i in 0..p_dim {
+                b[i] = sol_mat[(i, 0)];
+            }
+            b
+        } else {
+            return Err(EstimationError::LinearSystemSolveFailed(
+                FaerLinalgError::FactorizationFailed,
+            ));
+        }
     };
     
     // 7. Calculate EDF and Scale
