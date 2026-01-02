@@ -5549,7 +5549,36 @@ pub mod internal {
             // Final result: grad_b_t2 = (Z ⊙ A) B with coefficient 1.0
             //   (Z ⊙ A)_{ij} = Z_{ij} * A_{ij} = [u_i * u_j * (c_i · c_j)] * [(b_i · b_j)]
             //   ((Z ⊙ A) B)_{ik} = Σ_j (Z ⊙ A)_{ij} * B_{jk}
+            //
+            // Efficient O(NP³) factorization (avoids O(N²P) loop):
+            //   grad_b_t2[i,m] = u_i Σ_j u_j (Σ_k c_{ik} c_{jk}) (Σ_l b_{il} b_{jl}) b_{jm}
+            //                 = u_i Σ_{k,l} c_{ik} b_{il} [Σ_j u_j c_{jk} b_{jl} b_{jm}]
+            //                 = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
+            //   where T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} is precomputed in O(NP³).
+            //
+            //   g_u[i] = 0.5 Σ_j u_j cc_{ij} bb_{ij}²
+            //          = 0.5 Σ_j u_j (Σ_k c_{ik} c_{jk}) (Σ_{l,m} b_{il} b_{jl} b_{im} b_{jm})
+            //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} [Σ_j u_j c_{jk} b_{jl} b_{jm}]
+            //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
 
+            // Precompute tensor T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} in O(NP³)
+            let mut tensor_t = vec![0.0_f64; p * p * p];
+            for j in 0..n {
+                let c_j = c.row(j);
+                let b_j = b.row(j);
+                let u_j = u[j];
+                for k in 0..p {
+                    let u_c_jk = u_j * c_j[k];
+                    for l in 0..p {
+                        let u_c_b_jkl = u_c_jk * b_j[l];
+                        for m in 0..p {
+                            tensor_t[k * p * p + l * p + m] += u_c_b_jkl * b_j[m];
+                        }
+                    }
+                }
+            }
+
+            // Compute grad_b_t2 and g_u using precomputed tensor in O(NP³) total
             let mut grad_b_t2 = Array2::<f64>::zeros((n, p));
             let mut g_u = Array1::<f64>::zeros(n);
 
@@ -5558,36 +5587,27 @@ pub mod internal {
                 let b_i = b.row(i);
                 let u_i = u[i];
 
-                for j in 0..n {
-                    let c_j = c.row(j);
-                    let b_j = b.row(j);
-                    let u_j = u[j];
-
-                    // (Z ⊙ A)_{ij} = u_i * u_j * (c_i · c_j) * (b_i · b_j)
-                    let cc_ij = c_i.dot(&c_j);
-                    let bb_ij = b_i.dot(&b_j);
-                    let z_odot_a_ij = u_i * u_j * cc_ij * bb_ij;
-
-                    // Accumulate ((Z ⊙ A) B)_{i,:} = Σ_j (Z ⊙ A)_{ij} * b_j
-                    for k in 0..p {
-                        grad_b_t2[(i, k)] += z_odot_a_ij * b[(j, k)];
+                // grad_b_t2[i,m] = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
+                for k in 0..p {
+                    let c_ik = c_i[k];
+                    for l in 0..p {
+                        let c_b_ikl = c_ik * b_i[l];
+                        for m in 0..p {
+                            grad_b_t2[(i, m)] += u_i * c_b_ikl * tensor_t[k * p * p + l * p + m];
+                        }
                     }
                 }
 
-                // Gradient w.r.t. u_i (for chain rule back to β):
-                //   Z = diag(u) (C C^T) diag(u)  ⟹  Z_{jk} = u_j * (c_j · c_k) * u_k
-                //   ∂Z_{jk}/∂u_i = δ_{ij} * (c_j · c_k) * u_k + u_j * (c_j · c_k) * δ_{ik}
-                //   Only row i and column i of Z depend on u_i. By symmetry:
-                //   ∂(tr(Z ⊙ (A⊙A)))/∂u_i = 2 * Σ_j cc_{ij} * u_j * bb_{ij}²
-                //   With chain rule factor 0.25 (from step 2):
-                //   g_u[i] = 0.25 * 2 * Σ_j u_j * cc_{ij} * bb_{ij}² = 0.5 * Σ_j u_j * cc_{ij} * bb_{ij}²
+                // g_u[i] = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
                 let mut gu_i = 0.0;
-                for j in 0..n {
-                    let c_j = c.row(j);
-                    let b_j = b.row(j);
-                    let cc_ij = c_i.dot(&c_j);
-                    let bb_ij = b_i.dot(&b_j);
-                    gu_i += u[j] * cc_ij * bb_ij * bb_ij;
+                for k in 0..p {
+                    let c_ik = c_i[k];
+                    for l in 0..p {
+                        let c_b_ikl = c_ik * b_i[l];
+                        for m in 0..p {
+                            gu_i += c_b_ikl * b_i[m] * tensor_t[k * p * p + l * p + m];
+                        }
+                    }
                 }
                 g_u[i] = 0.5 * gu_i;
             }
