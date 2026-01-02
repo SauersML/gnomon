@@ -7203,24 +7203,36 @@ pub mod internal {
                         }
 
 
-                        // In the reparameterized basis, S_k has zeros in null-space rows/columns:
+                        // Derivation: why no null-space correction is needed for tr(H⁻¹ S_k).
                         //
-                        //     S_k = [Λ_k  0]     where Λ_k contains the penalty eigenvalues
-                        //           [0    0]
+                        // After stable reparameterization, penalty S_k is zero in null-space:
                         //
-                        // When computing tr(H⁻¹ S_k), matrix multiplication gives:
+                        //     S_k = [Λ_k  0]     (Λ_k = diag of positive penalty eigenvalues)
+                        //           [0    0]     (bottom-right is p-r × p-r zeros, r = rank)
                         //
-                        //     H⁻¹ S_k = [(H⁻¹)₁₁ Λ_k    0]
-                        //               [(H⁻¹)₂₁ Λ_k    0]
+                        // The Hessian H = X'WX + Σλ_j S_j is dense due to data coupling:
                         //
-                        // The trace is tr((H⁻¹)₁₁ Λ_k) — the zeros automatically mask out
-                        // null-space contributions. No manual correction is needed.
+                        //     H = [H₁₁  H₁₂]    where H₁₂ = (X'WX)₁₂ ≠ 0 in general
+                        //         [H₂₁  H₂₂]
                         //
-                        // Note: (H⁻¹)₁₁ ≠ (H₁₁)⁻¹ due to data coupling (X'WX creates off-diagonal
-                        // blocks in the Hessian). The full inverse correctly captures how changing
-                        // λ affects both penalized and unpenalized coefficients via Schur complement.
+                        // The inverse is also dense (Schur complement formula):
                         //
-                        // Reference: Wood (2011) "Fast stable restricted maximum likelihood"
+                        //     H⁻¹ = [(H⁻¹)₁₁  (H⁻¹)₁₂]
+                        //           [(H⁻¹)₂₁  (H⁻¹)₂₂]
+                        //
+                        // Multiplying H⁻¹ by S_k:
+                        //
+                        //     H⁻¹ S_k = [(H⁻¹)₁₁  (H⁻¹)₁₂] [Λ_k  0]   [(H⁻¹)₁₁ Λ_k    0]
+                        //               [(H⁻¹)₂₁  (H⁻¹)₂₂] [0    0] = [(H⁻¹)₂₁ Λ_k    0]
+                        //
+                        // The trace sums the diagonal:
+                        //
+                        //     tr(H⁻¹ S_k) = tr((H⁻¹)₁₁ Λ_k) + tr(0) = tr((H⁻¹)₁₁ Λ_k)
+                        //
+                        // The zeros in S_k automatically eliminate any null-space contribution.
+                        // The coupling between range and null spaces (captured by off-diagonal
+                        // blocks of H⁻¹) is correctly handled because (H⁻¹)₁₁ includes the
+                        // Schur complement effect: (H⁻¹)₁₁ = (H₁₁ - H₁₂ H₂₂⁻¹ H₂₁)⁻¹
 
                         let residual_grad = {
                             let eta = pirls_result
