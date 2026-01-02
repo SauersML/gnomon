@@ -7506,54 +7506,154 @@ pub mod internal {
             // which is exactly what the optimizer needs.
             // No final negation is needed.
 
-            // One-direction secant test (cheap FD validation)
+            // Comprehensive gradient diagnostics (all four strategies)
             if let Some(gradient_snapshot) = gradient_snapshot
                 && !self.layout.penalty_map.is_empty()
             {
-                let h = 1e-4;
-                let mut direction = Array1::zeros(p.len());
-                if let Some(dir0) = direction.get_mut(0) {
-                    *dir0 = 1.0; // pick k=0 or max|grad|
-                }
-                let gdot = gradient_snapshot.dot(&direction);
-
-                let mut rho_plus = p.clone();
-                for i in 0..rho_plus.len() {
-                    rho_plus[i] += h * direction[i];
-                }
-                let fp = self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY);
-
-                let mut rho_minus = p.clone();
-                for i in 0..rho_minus.len() {
-                    rho_minus[i] -= h * direction[i];
-                }
-                let fm = self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY);
-
-                let secant = (fp - fm) / (2.0 * h);
-                let denom = gdot.abs().max(secant.abs()).max(1e-8);
-                eprintln!(
-                    "[DD] dir-k={} g·d={:+.3e}  FD={:+.3e}  rel={:.2e}",
-                    0,
-                    gdot,
-                    secant,
-                    ((gdot - secant).abs() / denom)
-                );
-
-                // Check for exploding gradients
-                let big = gradient_snapshot
-                    .iter()
-                    .map(|x| x.abs())
-                    .fold(f64::NAN, f64::max);
-                if !big.is_finite() || big > 1e6 {
-                    eprintln!(
-                        "[WARN] gradient exploded: max|g|={:.3e} (ρ={:?})",
-                        big,
-                        p.to_vec()
-                    );
-                }
+                // Run all diagnostics and emit a single summary if issues found
+                self.run_gradient_diagnostics(p, bundle, &gradient_snapshot);
             }
 
             Ok(gradient_result)
+        }
+
+        /// Run comprehensive gradient diagnostics implementing four strategies:
+        /// 1. KKT/Envelope Theorem Audit
+        /// 2. Component-wise Finite Difference
+        /// 3. Spectral Bleed Trace
+        /// 4. Dual-Ridge Consistency
+        ///
+        /// Only prints a summary when issues are detected.
+        fn run_gradient_diagnostics(
+            &self,
+            rho: &Array1<f64>,
+            bundle: &EvalShared,
+            analytic_grad: &Array1<f64>,
+        ) {
+            use crate::calibrate::gradient_diagnostics::{
+                GradientDiagnosticReport, compute_envelope_audit, compute_dual_ridge_check,
+                compute_spectral_bleed, DiagnosticConfig,
+            };
+
+            let config = DiagnosticConfig::default();
+            let mut report = GradientDiagnosticReport::new();
+
+            let pirls_result = bundle.pirls_result.as_ref();
+            let ridge_used = bundle.ridge_used;
+            let beta = pirls_result.beta_transformed.as_ref();
+            let lambdas: Array1<f64> = rho.mapv(f64::exp);
+
+            // === Strategy 4: Dual-Ridge Consistency Check ===
+            // The ridge used by PIRLS must match what gradient/cost assume
+            let dual_ridge = compute_dual_ridge_check(
+                pirls_result.ridge_used,  // Ridge from PIRLS
+                ridge_used,               // Ridge passed to cost
+                ridge_used,               // Ridge passed to gradient (same bundle)
+                beta,
+            );
+            report.dual_ridge = Some(dual_ridge);
+
+            // === Strategy 1: KKT/Envelope Theorem Audit ===
+            // Check if the inner solver actually reached stationarity
+            // Compute score gradient (X'W(y-μ) for GLM) and penalty gradient (S_λ β)
+            let reparam = &pirls_result.reparam_result;
+            let penalty_grad = reparam.s_transformed.dot(beta);
+
+            // Approximate score gradient using working residuals from PIRLS
+            let eta = pirls_result.solve_mu.mapv(|m| {
+                if m <= 1e-10 { (-700.0_f64).max((m / (1.0 - m + 1e-10)).ln()) }
+                else if m >= 1.0 - 1e-10 { (700.0_f64).min((m / (1.0 - m)).ln()) }
+                else { (m / (1.0 - m)).ln() }
+            });
+            let working_residual = &eta - &pirls_result.solve_working_response;
+            let weighted_residual = &pirls_result.solve_weights * &working_residual;
+            let score_grad = pirls_result.x_transformed.transpose_vector_multiply(&weighted_residual);
+
+            let envelope_audit = compute_envelope_audit(
+                &score_grad,
+                &penalty_grad,
+                pirls_result.ridge_used,
+                ridge_used,  // What gradient assumes
+                beta,
+                config.kkt_tolerance,
+            );
+            report.envelope_audit = Some(envelope_audit);
+
+            // === Strategy 3: Spectral Bleed Trace ===
+            // Check if truncated eigenspace corrections are adequate
+            let u_truncated = &reparam.u_truncated;
+            let truncated_count = u_truncated.ncols();
+
+            if truncated_count > 0 {
+                let h_eff = bundle.h_eff.as_ref();
+
+                // Solve H⁻¹ U_⊥ for spectral bleed calculation
+                let h_view = FaerArrayView::new(h_eff);
+                if let Ok(chol) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                    let mut h_inv_u = u_truncated.clone();
+                    let mut rhs_view = array2_to_mat_mut(&mut h_inv_u);
+                    chol.solve_in_place(rhs_view.as_mut());
+
+                    for (k, r_k) in reparam.rs_transformed.iter().enumerate() {
+                        // Approximate the applied correction (would need to track from gradient calc)
+                        // For now, pass 0.0 and check if there's significant truncated energy
+                        let bleed = compute_spectral_bleed(
+                            k,
+                            r_k.view(),
+                            u_truncated.view(),
+                            h_inv_u.view(),
+                            lambdas[k],
+                            0.0, // We'd need to capture the actual correction from the gradient calc
+                            config.rel_error_threshold,
+                        );
+                        if bleed.has_bleed || bleed.truncated_energy.abs() > 1e-4 {
+                            report.spectral_bleed.push(bleed);
+                        }
+                    }
+                }
+            }
+
+            // === Strategy 2: Component-wise FD (only if we detected other issues) ===
+            // This is expensive, so only do it when other diagnostics flag problems
+            if report.has_issues() {
+                let h = config.fd_step_size;
+                let mut numeric_grad = Array1::<f64>::zeros(rho.len());
+
+                for k in 0..rho.len() {
+                    let mut rho_plus = rho.clone();
+                    rho_plus[k] += h;
+                    let mut rho_minus = rho.clone();
+                    rho_minus[k] -= h;
+
+                    let fp = self.compute_cost(&rho_plus).unwrap_or(f64::INFINITY);
+                    let fm = self.compute_cost(&rho_minus).unwrap_or(f64::INFINITY);
+                    numeric_grad[k] = (fp - fm) / (2.0 * h);
+                }
+
+                report.analytic_gradient = Some(analytic_grad.clone());
+                report.numeric_gradient = Some(numeric_grad.clone());
+
+                // Compute per-component relative errors
+                let mut rel_errors = Array1::<f64>::zeros(rho.len());
+                for k in 0..rho.len() {
+                    let denom = analytic_grad[k].abs().max(numeric_grad[k].abs()).max(1e-8);
+                    rel_errors[k] = (analytic_grad[k] - numeric_grad[k]).abs() / denom;
+                }
+                report.component_rel_errors = Some(rel_errors);
+            }
+
+            // === Output Summary (single print, not in a loop) ===
+            if report.has_issues() {
+                println!("\n[GRADIENT DIAGNOSTICS] Issues detected:");
+                println!("{}", report.summary());
+
+                // Also log total gradient comparison
+                if let (Some(analytic), Some(numeric)) = (&report.analytic_gradient, &report.numeric_gradient) {
+                    let diff = analytic - numeric;
+                    let rel_l2 = diff.dot(&diff).sqrt() / numeric.dot(numeric).sqrt().max(1e-8);
+                    println!("[GRADIENT DIAGNOSTICS] Total gradient rel. L2 error: {:.2e}", rel_l2);
+                }
+            }
         }
     }
 
