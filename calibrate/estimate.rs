@@ -5513,61 +5513,30 @@ pub mod internal {
 
             // Reverse-mode AD for Term 2 (off-diagonal Firth correction)
             //
-            // Objective: J = 0.5 * log|H_total| where H_total = H_pen - H_phi
-            //   H_phi = 0.5 * (T_1 - T_2)
-            //   T_2 = X^T diag(u) (A ⊙ A) diag(u) X  where A = B B^T (hat matrix)
+            // Goal: Compute grad_b_t2 = (Z ⊙ A) B and g_u for chain rule back to β.
             //
-            // We derive ∂J/∂B using the adjoint (reverse-mode AD) method.
+            // Where:
+            //   Z = diag(u) (C C^T) diag(u)  -  leverage matrix scaled by weight factors
+            //   A = B B^T                    -  hat matrix from Fisher information
+            //   B = W^{1/2} X L_f^{-T}       -  thin factor of hat matrix (n × p)
+            //   C = X L_t^{-T}               -  thin factor of H_total inverse (n × p)
             //
-            // Step 1 - Sensitivity to H_total:
-            //   ∂J/∂H_total = 0.5 * H_total^{-1} = 0.5 * M
+            // Naive O(N²P) approach (TOO SLOW for N=33000):
+            //   grad_b_t2[i,m] = Σ_j (Z ⊙ A)_{ij} * b_{jm}
             //
-            // Step 2 - Sensitivity to T_2:
-            //   H_total = H_pen - 0.5*(T_1 - T_2) = H_pen - 0.5*T_1 + 0.5*T_2
-            //   ⟹ ∂J/∂T_2 = 0.5 * (∂J/∂H_total) = 0.25 * M
+            // Efficient O(NP³) tensor factorization:
+            //   grad_b_t2[i,m] = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
+            //   where T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} is precomputed.
             //
-            // Step 3 - Sensitivity to (A ⊙ A):
-            //   T_2 = Y^T (A ⊙ A) Y  where Y = diag(u) X
-            //   Using tr(bar_T_2 * dT_2) = tr(Y * bar_T_2 * Y^T * d(A⊙A)):
-            //   ⟹ ∂J/∂(A⊙A) = Y * (0.25 M) * Y^T = 0.25 * Z  where Z = Y M Y^T
-            //
-            //   Factorization: Z = diag(u) (X M X^T) diag(u) = diag(u) (C C^T) diag(u)
-            //   where C = X L^{-T} and L = chol(H_total), so X M X^T = C C^T.
-            //
-            // Step 4 - Sensitivity to A (through Hadamard square):
-            //   For K = A ⊙ A, we have dK = 2 * A ⊙ dA.
-            //   The adjoint relationship: bar_A = 2 * A ⊙ bar_K
-            //   ⟹ ∂J/∂A = 2 * A ⊙ (0.25 Z) = 0.5 * (A ⊙ Z)
-            //
-            // Step 5 - Sensitivity to B (through A = B B^T):
-            //   dA = dB B^T + B dB^T
-            //   tr(bar_A * dA) = tr(bar_A * dB * B^T) + tr(bar_A * B * dB^T)
-            //                  = 2 * tr(bar_A * B * dB^T)  (since bar_A is symmetric)
-            //                  = 2 * tr(B^T bar_A * dB)
-            //   ⟹ ∂J/∂B = 2 * bar_A * B = 2 * (0.5 * (A ⊙ Z)) * B = (A ⊙ Z) B
-            //
-            // Final result: grad_b_t2 = (Z ⊙ A) B with coefficient 1.0
-            //   (Z ⊙ A)_{ij} = Z_{ij} * A_{ij} = [u_i * u_j * (c_i · c_j)] * [(b_i · b_j)]
-            //   ((Z ⊙ A) B)_{ik} = Σ_j (Z ⊙ A)_{ij} * B_{jk}
-            //
-            // Efficient O(NP³) factorization (avoids O(N²P) loop):
-            //   grad_b_t2[i,m] = u_i Σ_j u_j (Σ_k c_{ik} c_{jk}) (Σ_l b_{il} b_{jl}) b_{jm}
-            //                 = u_i Σ_{k,l} c_{ik} b_{il} [Σ_j u_j c_{jk} b_{jl} b_{jm}]
-            //                 = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
-            //   where T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} is precomputed in O(NP³).
-            //
-            //   g_u[i] = 0.5 Σ_j u_j cc_{ij} bb_{ij}²
-            //          = 0.5 Σ_j u_j (Σ_k c_{ik} c_{jk}) (Σ_{l,m} b_{il} b_{jl} b_{im} b_{jm})
-            //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} [Σ_j u_j c_{jk} b_{jl} b_{jm}]
-            //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
+            // Adjoint derivation (coefficient = 1.0):
+            //   Step 1: ∂J/∂H_total = 0.5 M
+            //   Step 2: ∂J/∂T_2 = 0.25 M  (T_2 enters with +0.5 coefficient)
+            //   Step 3: ∂J/∂(A⊙A) = 0.25 Z
+            //   Step 4: ∂J/∂A = 0.5 (A ⊙ Z)  (factor of 2 from Hadamard square)
+            //   Step 5: ∂J/∂B = (A ⊙ Z) B   (factor of 2 from symmetry of A = BB^T)
 
-            // Precompute tensor T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} using faer matmul.
-            // For each slice m: T[:,:,m] = (diag(u) C)^T (diag(b[:,m]) B)
-            //                           = V^T D^(m) B  where V = diag(u) C
-            // This leverages SIMD-optimized BLAS-3 kernels for O(NP²) per slice, O(NP³) total.
+            // Phase 1: Build weighted leverage matrix V = diag(u) C  [O(NP)]
             let mut tensor_t = vec![0.0_f64; p * p * p];
-
-            // Build V = diag(u) C  (n × p)
             let mut v_mat = faer::Mat::<f64>::zeros(n, p);
             for i in 0..n {
                 let u_i = u[i];
@@ -5576,9 +5545,11 @@ pub mod internal {
                 }
             }
 
-            // For each output column m, compute T[:,:,m] = V^T (diag(b[:,m]) B)
+            // Phase 2: Compute tensor slices via BLAS-3 matmul  [O(NP³) total]
+            // For each m: T[:,:,m] = V^T (diag(b[:,m]) B)
+            // This is equivalent to T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm}
             for m in 0..p {
-                // Build scaled matrix: rows of B scaled by b[:,m]
+                // Scale each row j of B by b[j,m]
                 let mut scaled_b = faer::Mat::<f64>::zeros(n, p);
                 for j in 0..n {
                     let b_jm = b[(j, m)];
@@ -5587,7 +5558,7 @@ pub mod internal {
                     }
                 }
 
-                // T_slice = V^T * scaled_B  (p × p matrix)
+                // T[:,:,m] = V^T * scaled_B  via SIMD-optimized matmul
                 let mut t_slice = faer::Mat::<f64>::zeros(p, p);
                 faer::linalg::matmul::matmul(
                     t_slice.as_mut(),
@@ -5598,7 +5569,7 @@ pub mod internal {
                     faer::Par::Seq,
                 );
 
-                // Copy slice into tensor
+                // Store in flattened tensor (layout: [k][l][m] for cache-friendly m-loop)
                 for k in 0..p {
                     for l in 0..p {
                         tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
@@ -5606,7 +5577,7 @@ pub mod internal {
                 }
             }
 
-            // Compute grad_b_t2 and g_u using precomputed tensor in O(NP³) total
+            // Phase 3: Contract tensor with per-row factors  [O(NP³) total]
             let mut grad_b_t2 = Array2::<f64>::zeros((n, p));
             let mut g_u = Array1::<f64>::zeros(n);
 
@@ -5616,24 +5587,28 @@ pub mod internal {
                 let u_i = u[i];
 
                 // grad_b_t2[i,m] = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
+                // Inner loop over m is contiguous in tensor memory
                 for k in 0..p {
                     let c_ik = c_i[k];
                     for l in 0..p {
                         let c_b_ikl = c_ik * b_i[l];
+                        let base_idx = k * p * p + l * p;
                         for m in 0..p {
-                            grad_b_t2[(i, m)] += u_i * c_b_ikl * tensor_t[k * p * p + l * p + m];
+                            grad_b_t2[(i, m)] += u_i * c_b_ikl * tensor_t[base_idx + m];
                         }
                     }
                 }
 
                 // g_u[i] = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
+                // Chain rule coefficient: 0.25 (from ∂J/∂T_2) × 2 (from Z symmetry) = 0.5
                 let mut gu_i = 0.0;
                 for k in 0..p {
                     let c_ik = c_i[k];
                     for l in 0..p {
                         let c_b_ikl = c_ik * b_i[l];
+                        let base_idx = k * p * p + l * p;
                         for m in 0..p {
-                            gu_i += c_b_ikl * b_i[m] * tensor_t[k * p * p + l * p + m];
+                            gu_i += c_b_ikl * b_i[m] * tensor_t[base_idx + m];
                         }
                     }
                 }
