@@ -7202,86 +7202,25 @@ pub mod internal {
                             workspace.solved_rows = 0;
                         }
 
-                        // Gradient correction for spectral truncation consistency.
-                        // The cost uses S_eff (truncated to structural_rank eigenvalues), but
-                        // the trace tr(H⁻¹ S_k) includes components in the truncated subspace.
-                        // We subtract the error: 0.5 * λ_k * tr(H⁻¹ P_⊥ S_k P_⊥)
-                        // where P_⊥ = U_⊥ U_⊥^T projects onto the truncated (null) subspace.
+
+                        // In the reparameterized basis, S_k has zeros in null-space rows/columns:
                         //
-                        // Using cyclic trace property:
-                        //   Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥))
-                        // where M_⊥ = U_⊥^T H⁻¹ U_⊥ is precomputed once.
+                        //     S_k = [Λ_k  0]     where Λ_k contains the penalty eigenvalues
+                        //           [0    0]
                         //
-                        // For efficiency: U_⊥^T S_k U_⊥ = (R_k U_⊥)^T (R_k U_⊥) = W_k^T W_k
-                        let u_truncated = &reparam_result.u_truncated;
-                        let truncated_count = u_truncated.ncols();
-                        
-                        let gradient_corrections: Vec<f64> = if truncated_count > 0 && workspace.solved_rows > 0 {
-                            // Solve H⁻¹ U_⊥ using the factorization
-                            let rows = h_for_factor.nrows();
-                            let mut h_inv_u_perp = faer::Mat::<f64>::zeros(rows, truncated_count);
-                            
-                            // Copy U_⊥ into working matrix
-                            for i in 0..rows.min(u_truncated.nrows()) {
-                                for j in 0..truncated_count {
-                                    h_inv_u_perp[(i, j)] = u_truncated[(i, j)];
-                                }
-                            }
-                            
-                            // Solve: H * X = U_⊥, result in h_inv_u_perp
-                            factor_g.solve_in_place(h_inv_u_perp.as_mut());
-                            
-                            // Compute M_⊥ = U_⊥^T (H⁻¹ U_⊥)  (truncated_count × truncated_count)
-                            let mut m_perp = faer::Mat::<f64>::zeros(truncated_count, truncated_count);
-                            for i in 0..truncated_count {
-                                for j in 0..truncated_count {
-                                    let mut sum = 0.0;
-                                    for r in 0..rows.min(u_truncated.nrows()) {
-                                        sum += u_truncated[(r, i)] * h_inv_u_perp[(r, j)];
-                                    }
-                                    m_perp[(i, j)] = sum;
-                                }
-                            }
-                            
-                            // Compute correction for each penalty k
-                            let mut corrections = vec![0.0; k_count];
-                            for k in 0..k_count {
-                                let r_k = &rs_transformed[k];
-                                let rank_k = r_k.nrows();
-                                
-                                // W_k = R_k U_⊥  (rank_k × truncated_count)
-                                let mut w_k = faer::Mat::<f64>::zeros(rank_k, truncated_count);
-                                for i in 0..rank_k {
-                                    for j in 0..truncated_count {
-                                        let mut sum = 0.0;
-                                        for l in 0..r_k.ncols().min(u_truncated.nrows()) {
-                                            sum += r_k[(i, l)] * u_truncated[(l, j)];
-                                        }
-                                        w_k[(i, j)] = sum;
-                                    }
-                                }
-                                
-                                // S_k^⊥ = W_k^T W_k  (truncated_count × truncated_count)
-                                // Error = tr(M_⊥ * S_k^⊥) = Frobenius(M_⊥, W_k^T W_k)
-                                // For efficiency: tr(M_⊥ W_k^T W_k) = sum_ij M_⊥[i,j] * (W_k^T W_k)[i,j]
-                                //                                  = sum_ij M_⊥[i,j] * sum_l W_k[l,i]*W_k[l,j]
-                                let mut trace_error = 0.0;
-                                for i in 0..truncated_count {
-                                    for j in 0..truncated_count {
-                                        let mut wtw_ij = 0.0;
-                                        for l in 0..rank_k {
-                                            wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-                                        }
-                                        trace_error += m_perp[(i, j)] * wtw_ij;
-                                    }
-                                }
-                                
-                                corrections[k] = 0.5 * lambdas[k] * trace_error;
-                            }
-                            corrections
-                        } else {
-                            vec![0.0; k_count]
-                        };
+                        // When computing tr(H⁻¹ S_k), matrix multiplication gives:
+                        //
+                        //     H⁻¹ S_k = [(H⁻¹)₁₁ Λ_k    0]
+                        //               [(H⁻¹)₂₁ Λ_k    0]
+                        //
+                        // The trace is tr((H⁻¹)₁₁ Λ_k) — the zeros automatically mask out
+                        // null-space contributions. No manual correction is needed.
+                        //
+                        // Note: (H⁻¹)₁₁ ≠ (H₁₁)⁻¹ due to data coupling (X'WX creates off-diagonal
+                        // blocks in the Hessian). The full inverse correctly captures how changing
+                        // λ affects both penalized and unpenalized coefficients via Schur complement.
+                        //
+                        // Reference: Wood (2011) "Fast stable restricted maximum likelihood"
 
                         let residual_grad = {
                             let eta = pirls_result
@@ -7453,10 +7392,15 @@ pub mod internal {
                                 0.0
                             };
                             let log_det_s_grad_term = 0.5 * det1_values[k];
-                            // Subtract truncation correction to match truncated cost function
-                            let corrected_log_det_h_grad = log_det_h_grad_term - gradient_corrections[k];
+                            
+                            // REML gradient formula (Wood 2017, Section 6.5):
+                            //   ∂V/∂ρ_k = 0.5 * λ_k * β'S_k β   (penalty on coefficients)
+                            //           + 0.5 * λ_k * tr(H⁻¹ S_k)  (Hessian log-det derivative)  
+                            //           - 0.5 * det1[k]            (penalty log-det derivative)
+                            //
+                            // Note: log_det_h_grad_term already contains the 0.5 factor and λ_k
                             let mut gradient_value =
-                                0.5 * beta_terms[k] + corrected_log_det_h_grad - log_det_s_grad_term;
+                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
                             if let Some(delta_ref) = delta_opt.as_ref() {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
