@@ -265,8 +265,6 @@ pub struct PirlsWorkspace {
     pub weighted_residual: Array1<f64>,
     // Step-halving direction (XΔβ)
     pub delta_eta: Array1<f64>,
-    // Preallocated buffers for GEMM (e.g., XtWX)
-    pub xtwx_buf: Array2<f64>,
     // Preallocated buffer for GEMV results (length p)
     pub vec_buf_p: Array1<f64>,
     // Cached sparse XtWX workspace (symbolic + scratch)
@@ -299,7 +297,6 @@ impl PirlsWorkspace {
             working_residual: Array1::zeros(n),
             weighted_residual: Array1::zeros(n),
             delta_eta: Array1::zeros(n),
-            xtwx_buf: Array2::zeros((p, p).f()),
             vec_buf_p: Array1::zeros(p),
             sparse_xtwx_cache: None,
             // Allocate scratch for LDLT (max possible size for p)
@@ -341,159 +338,41 @@ impl PirlsWorkspace {
         cache.compute_dense(x, weights)
     }
 
+    
     pub fn compute_hessian_sparse_faer(
         &mut self,
         x: &SparseRowMat<usize, f64>,
         weights: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        let n = x.nrows();
-        let p = x.ncols();
-        if weights.len() != n {
+        let csr_rows = x.nrows();
+        if weights.len() != csr_rows {
             return Err(EstimationError::InvalidInput(format!(
                 "weights length {} does not match design rows {}",
                 weights.len(),
-                n
+                csr_rows
             )));
         }
 
-        // 1. Prepare weighted values in pre-allocated buffer
-        // Note: x is CSR, so we iterate rows efficiently
-        let x_vals = x.val();
-        self.weighted_x_values.clear();
-        self.weighted_x_values.reserve(x_vals.len());
+        // Treat the CSR matrix as a transposed CSC view for sparse matmul.
+        let x_t = x.as_ref().transpose();
+        let csc_view = x_t
+            .transpose()
+            .to_col_major()
+            .map_err(|_| EstimationError::InvalidInput("failed to view CSR as CSC".to_string()))?;
 
-        let row_ptr = x.symbolic().row_ptr();
-        for i in 0..n {
-            let w_sqrt = weights[i].max(0.0).sqrt();
-            let start = row_ptr[i];
-            let end = row_ptr[i + 1];
-            // Unrolling or SIMD here is handled by compiler usually, but
-            // we simply scale the row's values.
-            for j in start..end {
-                self.weighted_x_values.push(x_vals[j] * w_sqrt);
-            }
+        let rebuild = match self.sparse_xtwx_cache.as_ref() {
+            Some(cache) => !cache.matches(&csc_view),
+            None => true,
+        };
+        if rebuild {
+            self.sparse_xtwx_cache = Some(SparseXtWxCache::new(&csc_view)?);
         }
 
-        // 2. Construct Weighted Matrix View (Z = X^T * W^1/2)
-        // x is (n, p) CSR. 
-        // We create a view `weighted_x` which is (n, p) CSR with new values.
-        // Then we transpose it to get `z` which is (p, n) CSC.
-        // H = X^T W X = (X^T W^1/2) (W^1/2 X) = Z * Z^T
-        let weighted_x = faer::sparse::SparseRowMatRef::new(
-            x.symbolic(),
-            &self.weighted_x_values,
-        );
-        let z = weighted_x.transpose(); 
-
-        // 3. Compute H = Z * Z^T
-        if self.xtwx_buf.dim() != (p, p) {
-            self.xtwx_buf = Array2::zeros((p, p));
-        }
-
-
-        // faer's matmul doesn't support sparse inputs directly in older versions,
-        // so we use the sparse-sparse pipeline: symbolic -> numeric -> dense.
-        // This is efficient and correct.
-        
-
-        // Note: z is CSC. z.transpose() is CSR (RowMat). 
-        // sparse_sparse_matmul expects ColMat inputs? 
-        // z_t = z.transpose() as ColMat = (Z^T).
-        // z (lhs) is CSC. z.transpose() (rhs) is CSC.
-        // But z.transpose() on SparseColMat returns SparseRowMat. 
-        // We need explicit conversion or use `z` and `z.transpose()` as is if supported?
-        // sparse_sparse_matmul symbolic expects `SymbolicSparseColMatRef`.
-        // So we need Z^T as CSC.
-        // Z is CSC. Z^T can be constructed by treating Z as CSR transpose?
-        // Actually, Z comes from `weighted_x.transpose()`. 
-        // `weighted_x` is `SparseRowMatRef`.
-        // So `z` is `SparseColMatRef`.
-        // We want $H = Z * Z^T$.
-        // LHS = Z (CSC). RHS = Z^T (RowMatRef of Z).
-        // But functions expect CSC.
-        // RHS as CSC? $Z^T$ as CSC is `weighted_x` as CSC?
-        // `weighted_x` is CSR. `weighted_x` as CSC defines `(weighted_x)^T` = `z`.
-        // We want `(weighted_x)^T * (weighted_x)`. 
-        // No we want `X^T W X`. $A = \tilde{X}$. $H = A^T A$.
-        // `weighted_x` is $A$ (CSR).
-        // `z` is $A^T$ (CSC).
-        // `z_t` should be $A$ (CSC).
-        // We can get $A$ as CSC by transposing $A^T$ (Z) to CSC.
-        // This requires structure conversion (CSR->CSC) which is costly?
-        // Or we can say $H = Z * Z^T$.
-        // If we can't do Col * Row, we need Col * Col.
-        // The user says "Replace manual accumulation...".
-        // If I have to do CSC conversion, it might be slow.
-        // But `SparseXtWxCache` builds `x_t` (CSC) from `x` (CSC). 
-        // `x` in Pirls is usually CSC (DesignMatrix::Sparse).
-        // But `compute_hessian_sparse` receives `SparseRowMat` (CSR).
-        // So `x` is CSR. `$A$` is CSR.
-        // We want $A^T A$.
-        // $A^T$ is CSC (view of A).
-        // $A$ is CSR.
-        // Does `sparse_sparse_matmul` support LHS=Col, RHS=Row?
-        // `sparse_sparse_matmul_symbolic` takes `lhs: SymbolicSparseColMatRef`, `rhs: SymbolicSparseColMatRef`.
-        // So both must be CSC.
-        // LHS = $A^T$ (CSC). RHS = $A$ (as CSC).
-        // converting A (CSR) to A (CSC) is necessary.
-        
-        // This allocation is why cache is preferred. 
-        // But we must correct this fallback.
-        
-        // 1. Convert weighted_x (CSR) to CSC.
-        // faer 0.19 requires explicit conversion if we want CSC.
-        // Or use `to_col_major`. 
-        let weighted_x_csc = weighted_x.to_col_major().map_err(|_| EstimationError::InvalidInput("failed to convert to col major".to_string()))?; 
-        
-        // 2. Symbolic
-        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(
-            z.symbolic(), 
-            weighted_x_csc.symbolic()
-        ).map_err(|_| EstimationError::InvalidInput("failed to build symbolic XtWX".to_string()))?;
-
-        // 3. Numeric
-        let mut xtwx_values = vec![0.0; xtwx_symbolic.row_idx().len()];
-        let mut scratch = MemBuffer::new(sparse_sparse_matmul_numeric_scratch::<usize, f64>(
-                xtwx_symbolic.as_ref(),
-                sparse_xtwx_par(p),
-        ));
-        let mut stack = MemStack::new(&mut scratch);
-        
-        let xtwx_mut = SparseColMatMut::new(xtwx_symbolic.as_ref(), &mut xtwx_values);
-        sparse_sparse_matmul_numeric(
-            xtwx_mut,
-            Accum::Replace,
-            z,
-            weighted_x_csc.as_ref(),
-            1.0,
-            &info,
-            sparse_xtwx_par(p),
-            &mut stack,
-        );
-        
-        // 4. To Dense
-        let xtwx_ref = SparseColMatRef::new(xtwx_symbolic.as_ref(), &xtwx_values);
-        let dense = xtwx_ref.to_dense();
-        
-        // Fill buffer
-        if self.xtwx_buf.dim() != (p, p) {
-            self.xtwx_buf = Array2::zeros((p, p).f());
-        }
-        // Fill Array2 from faer Mat (ColMajor). Array2 is F-order now too? 
-        // self.xtwx_buf is initialized with .f(). 
-        // If Array2 is F-order, and Mat is ColMajor, we can copy simpler?
-        // But `dense` owns data.
-        // Let's just use element-wise assignment to be safe and independent of Array2 layout details.
-        // dense[(i, j)] is value at row i, col j.
-        // self.xtwx_buf[[i, j]] should be set to dense[(i, j)].
-        // Since both are ideally column major, efficient traversal order is by column.
-        for j in 0..p {
-            for i in 0..p {
-                self.xtwx_buf[[i, j]] = dense[(i, j)]; 
-            }
-        }
-        
-        Ok(self.xtwx_buf.clone())
+        let cache = self
+            .sparse_xtwx_cache
+            .as_mut()
+            .ok_or_else(|| EstimationError::InvalidInput("missing sparse cache".to_string()))?;
+        cache.compute_dense(&csc_view, weights)
     }
 }
 
@@ -673,12 +552,17 @@ impl<'a> GamWorkingModel<'a> {
                     }
                     self.workspace.wx.assign(matrix);
                     self.workspace.wx *= &sqrt_w_col;
-                    if self.workspace.xtwx_buf.dim() != (matrix.ncols(), matrix.ncols()) {
-                        self.workspace.xtwx_buf = Array2::zeros((matrix.ncols(), matrix.ncols()));
-                    }
-                    fast_ata_into(&self.workspace.wx, &mut self.workspace.xtwx_buf);
-                    let mut xtwx = self.workspace.xtwx_buf.clone();
-                    xtwx += &self.s_transformed;
+                    let mut xtwx = self.s_transformed.clone();
+                    let wx_view = FaerArrayView::new(&self.workspace.wx);
+                    let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
+                    matmul(
+                        xtwx_view.as_mut(),
+                        Accum::Add,
+                        wx_view.as_ref().transpose(),
+                        wx_view.as_ref(),
+                        1.0,
+                        get_global_parallelism(),
+                    );
                     xtwx
                 }
                 DesignMatrix::Sparse(matrix) => {
@@ -712,12 +596,18 @@ impl<'a> GamWorkingModel<'a> {
             }
             self.workspace.wx.assign(&self.x_original_dense);
             self.workspace.wx *= &sqrt_w_col;
-            if self.workspace.xtwx_buf.dim() != (self.x_original_dense.ncols(), self.x_original_dense.ncols()) {
-                self.workspace.xtwx_buf =
-                    Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
-            }
-            fast_ata_into(&self.workspace.wx, &mut self.workspace.xtwx_buf);
-            self.workspace.xtwx_buf.clone()
+            let wx_view = FaerArrayView::new(&self.workspace.wx);
+            let mut xtwx = Array2::zeros((self.x_original_dense.ncols(), self.x_original_dense.ncols()));
+            let mut xtwx_view = array2_to_mat_mut(&mut xtwx);
+            matmul(
+                xtwx_view.as_mut(),
+                Accum::Add,
+                wx_view.as_ref().transpose(),
+                wx_view.as_ref(),
+                1.0,
+                get_global_parallelism(),
+            );
+            xtwx
         };
 
         let qs = self.qs.as_ref().expect("qs required for implicit design");
@@ -868,7 +758,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 }
 
 pub(crate) struct SparseXtWxCache {
-    x_t: SparseColMat<usize, f64>,
     xtwx_symbolic: SymbolicSparseColMat<usize>,
     xtwx_values: Vec<f64>,
     wx_values: Vec<f64>,
@@ -882,12 +771,10 @@ pub(crate) struct SparseXtWxCache {
 
 impl SparseXtWxCache {
     fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
-        let x_t = x
-            .as_ref()
-            .transpose()
-            .to_col_major()
-            .map_err(|_| EstimationError::InvalidInput("failed to build X^T cache".to_string()))?;
-        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(x_t.symbolic(), x.symbolic())
+        let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(
+            x.as_ref().transpose(),
+            x.symbolic(),
+        )
             .map_err(|_| {
                 EstimationError::InvalidInput("failed to build symbolic XtWX cache".to_string())
             })?;
@@ -900,7 +787,6 @@ impl SparseXtWxCache {
                 par,
             ));
         Ok(Self {
-            x_t,
             xtwx_symbolic,
             xtwx_values,
             wx_values,
@@ -943,13 +829,14 @@ impl SparseXtWxCache {
         }
 
         let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
+        let x_t = x.as_ref().transpose();
         let mut stack = MemStack::new(&mut self.scratch);
         let xtwx_symbolic = self.xtwx_symbolic.as_ref();
         let xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
         sparse_sparse_matmul_numeric(
             xtwx_mut,
             Accum::Replace,
-            self.x_t.as_ref(),
+            x_t,
             wx_ref,
             1.0,
             &self.info,
@@ -2249,20 +2136,19 @@ pub fn solve_penalized_least_squares(
     workspace.wz *= &workspace.sqrt_w; // wz = (z - offset) .* sqrt_w
 
     // 2. Form X'WX
-    if workspace.xtwx_buf.dim() != (p_dim, p_dim) {
-        workspace.xtwx_buf = Array2::zeros((p_dim, p_dim));
-    }
-    // Efficient computation using Faer
     let wx_view = FaerArrayView::new(&workspace.wx);
-    let mut xtwx_view = array2_to_mat_mut(&mut workspace.xtwx_buf);
-    matmul(
-        xtwx_view.as_mut(),
-        Accum::Replace,
-        wx_view.as_ref().transpose(),
-        wx_view.as_ref(),
-        1.0,
-        get_global_parallelism(),
-    );
+    let mut penalized_hessian = s_transformed.clone();
+    {
+        let mut xtwx_view = array2_to_mat_mut(&mut penalized_hessian);
+        matmul(
+            xtwx_view.as_mut(),
+            Accum::Add,
+            wx_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            get_global_parallelism(),
+        );
+    }
 
     // 3. Form X'Wz
     if workspace.vec_buf_p.len() != p_dim {
@@ -2280,13 +2166,6 @@ pub fn solve_penalized_least_squares(
     );
 
     // 4. Form Penalized Hessian: H = X'WX + S
-    let mut penalized_hessian = workspace.xtwx_buf.clone();
-    // Add S (which is E'E) - usually sparse/structured but here dense S is fine
-    for i in 0..p_dim {
-        for j in 0..p_dim {
-            penalized_hessian[(i, j)] += s_transformed[(i, j)];
-        }
-    }
     // Symmetrize to be safe
     for i in 0..p_dim {
         for j in 0..i {
