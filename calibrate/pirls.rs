@@ -767,12 +767,18 @@ pub(crate) struct SparseXtWxCache {
     nrows: usize,
     ncols: usize,
     nnz: usize,
+    x_t_csc: SparseColMat<usize, f64>,  // CSC format of X transpose for matmul
 }
 
 impl SparseXtWxCache {
     fn new(x: &SparseColMat<usize, f64>) -> Result<Self, EstimationError> {
+        // For X^T X where X is CSC: X^T is a SparseRowMat, which we need to convert
+        // to CSC format for the matmul API. Use the symbolic method properly.
+        let x_t_csc = x.as_ref().transpose().to_col_major().map_err(|_| {
+            EstimationError::InvalidInput("failed to transpose to CSC".to_string())
+        })?;
         let (xtwx_symbolic, info) = sparse_sparse_matmul_symbolic(
-            x.as_ref().transpose(),
+            x_t_csc.symbolic(),
             x.symbolic(),
         )
             .map_err(|_| {
@@ -796,6 +802,7 @@ impl SparseXtWxCache {
             nrows: x.nrows(),
             ncols: x.ncols(),
             nnz: x.val().len(),
+            x_t_csc,
         })
     }
 
@@ -829,14 +836,13 @@ impl SparseXtWxCache {
         }
 
         let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wx_values);
-        let x_t = x.as_ref().transpose();
         let mut stack = MemStack::new(&mut self.scratch);
         let xtwx_symbolic = self.xtwx_symbolic.as_ref();
         let xtwx_mut = SparseColMatMut::new(xtwx_symbolic, &mut self.xtwx_values);
         sparse_sparse_matmul_numeric(
             xtwx_mut,
             Accum::Replace,
-            x_t,
+            self.x_t_csc.as_ref(),
             wx_ref,
             1.0,
             &self.info,
