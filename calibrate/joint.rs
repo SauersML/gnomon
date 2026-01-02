@@ -1461,6 +1461,7 @@ impl<'a> JointRemlState<'a> {
             rs_transformed: vec![],
             rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p_base)),
+            u_truncated: Array2::zeros((p_base, p_base)),  // All modes truncated in fallback
         });
         let base_log_det_s = base_reparam.log_det;
         let base_rank = base_reparam.e_transformed.nrows() as f64;
