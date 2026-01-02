@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-FN_RE = re.compile(r"\bfn\s+[A-Za-z0-9_]+")
+ITEM_RE = re.compile(r"\b(fn|struct|enum|trait|type|impl|const|static)\b")
 
 
 class ScanState:
@@ -245,10 +245,10 @@ def iter_crate_archives():
         yield name, version, path
 
 
-def find_crate_archives(dep_name: str, include_prefix: bool) -> list[Path]:
+def find_crate_archive(dep_name: str) -> Path:
     selected = {}
     for name, version, path in iter_crate_archives():
-        if name != dep_name and not (include_prefix and name.startswith(f"{dep_name}-")):
+        if name != dep_name:
             continue
         key = version_key_from_str(version)
         current = selected.get(name)
@@ -259,7 +259,28 @@ def find_crate_archives(dep_name: str, include_prefix: bool) -> list[Path]:
         cache_root = Path.home() / ".cargo/registry/cache"
         raise FileNotFoundError(f"No crate archive found for {dep_name} in {cache_root}")
 
-    return [path for _, path in sorted(selected.items())]
+    return list(selected.values())[0][1]
+
+
+def load_dependency_prefixes(crate_root: Path, dep_name: str) -> list[str]:
+    cargo_path = crate_root / "Cargo.toml"
+    if not cargo_path.exists():
+        return []
+    try:
+        import tomllib
+    except ImportError:
+        return []
+    data = tomllib.loads(cargo_path.read_text(errors="replace"))
+    deps = data.get("dependencies", {})
+    prefixes = []
+    for name, info in deps.items():
+        package = None
+        if isinstance(info, dict):
+            package = info.get("package")
+        dep_id = package or name
+        if dep_id.startswith(f"{dep_name}-"):
+            prefixes.append(dep_id)
+    return sorted(set(prefixes))
 
 
 def extract_crate(crate_path: Path, dest_dir: Path) -> Path:
@@ -271,19 +292,19 @@ def extract_crate(crate_path: Path, dest_dir: Path) -> Path:
     return roots[0]
 
 
-def collect_function_signature(lines, start_idx):
-    fn_lines = []
+def collect_item_signature(lines, start_idx):
+    item_lines = []
     sig_state = ScanState()
     i = start_idx
     while i < len(lines):
         line = lines[i]
         idx, ch, sig_state = find_sig_terminator(line, sig_state)
         if idx is not None:
-            fn_lines.append(line[: idx + 1])
-            return fn_lines, i + 1
-        fn_lines.append(line)
+            item_lines.append(line[: idx + 1])
+            return item_lines, i + 1
+        item_lines.append(line)
         i += 1
-    return fn_lines, i
+    return item_lines, i
 
 
 def extract_lines_in_order(path: Path):
@@ -296,9 +317,9 @@ def extract_lines_in_order(path: Path):
         line = lines[i]
         comments, code, state = scan_line_for_comments_and_code(line, state)
 
-        if FN_RE.search(code):
-            fn_lines, next_idx = collect_function_signature(lines, i)
-            out_lines.extend(fn_lines)
+        if ITEM_RE.search(code):
+            item_lines, next_idx = collect_item_signature(lines, i)
+            out_lines.extend(item_lines)
             i = next_idx
             continue
 
@@ -312,13 +333,10 @@ def extract_lines_in_order(path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract comments and function definitions from a crate.")
-    parser.add_argument("dep_name", help="Cargo dependency name, e.g. faer")
-    parser.add_argument(
-        "--include-prefix",
-        action="store_true",
-        help="Also scan crates whose names start with <dep_name>- (e.g. burn-core, burn-tensor).",
+    parser = argparse.ArgumentParser(
+        description="Extract comments and item signatures from a crate and related subcrates."
     )
+    parser.add_argument("dep_name", help="Cargo dependency name, e.g. faer")
     parser.add_argument(
         "--out",
         help="Output path (default: <dep_name>_comments.txt)",
@@ -326,17 +344,30 @@ def main():
     )
     args = parser.parse_args()
 
-    crate_paths = find_crate_archives(args.dep_name, args.include_prefix)
+    crate_path = find_crate_archive(args.dep_name)
     out_path = Path(args.out or f"{args.dep_name}_comments.txt")
 
     with tempfile.TemporaryDirectory(prefix=f"{args.dep_name}-src-") as tmpdir:
         out_lines = []
-        for crate_path in crate_paths:
-            extract_root = Path(tmpdir) / crate_path.stem
+        root = extract_crate(crate_path, Path(tmpdir))
+        rs_files = sorted(root.rglob("*.rs"))
+        for rs in rs_files:
+            lines = extract_lines_in_order(rs)
+            if not lines:
+                continue
+            out_lines.extend(lines)
+
+        dep_names = load_dependency_prefixes(root, args.dep_name)
+        for dep in dep_names:
+            try:
+                dep_crate_path = find_crate_archive(dep)
+            except FileNotFoundError:
+                continue
+            extract_root = Path(tmpdir) / dep_crate_path.stem
             extract_root.mkdir(parents=True, exist_ok=True)
-            root = extract_crate(crate_path, extract_root)
-            rs_files = sorted(root.rglob("*.rs"))
-            for rs in rs_files:
+            dep_root = extract_crate(dep_crate_path, extract_root)
+            dep_rs_files = sorted(dep_root.rglob("*.rs"))
+            for rs in dep_rs_files:
                 lines = extract_lines_in_order(rs)
                 if not lines:
                     continue
