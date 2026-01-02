@@ -7565,7 +7565,7 @@ pub mod internal {
                 else if m >= 1.0 - 1e-10 { (700.0_f64).min((m / (1.0 - m)).ln()) }
                 else { (m / (1.0 - m)).ln() }
             });
-            let working_residual = &eta - &pirls_result.solve_working_response;
+            let working_residual = &pirls_result.solve_working_response - &eta;
             let weighted_residual = &pirls_result.solve_weights * &working_residual;
             let score_grad = pirls_result.x_transformed.transpose_vector_multiply(&weighted_residual);
 
