@@ -7353,7 +7353,18 @@ pub mod internal {
                             }
                         }
 
-                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
+
+                        // Compute KKT residual norm to check if envelope theorem applies.
+                        // The Implicit Function Theorem (used for delta_opt) assumes that β moves
+                        // to maintain ∇V = 0 as ρ changes. If P-IRLS hasn't converged (large residual),
+                        // β is effectively "stuck" on a ledge and doesn't move as predicted by IFT.
+                        // In that case, we MUST skip the implicit correction to match reality.
+                        let kkt_norm = residual_grad.iter().fold(0.0_f64, |acc, &v| acc + v * v).sqrt();
+                        
+                        // Strict tolerance for stationarity assumption (1e-3 allows for some noise but catches failures)
+                        let envelope_tolerance = 1e-3; 
+
+                        let delta_opt = if kkt_norm < envelope_tolerance && grad_beta.iter().all(|v| v.is_finite()) {
                             let rhs_view = FaerColView::new(&grad_beta);
                             let solved = match &factor_imp {
                                 Some(factor) => factor.solve(rhs_view.as_ref()),
@@ -7376,6 +7387,12 @@ pub mod internal {
                             }
                             Some(delta)
                         } else {
+                            if kkt_norm >= envelope_tolerance {
+                                log::warn!(
+                                    "Skipping IFT correction: KKT residual {:.2e} > {:.1e} implies non-stationarity.",
+                                    kkt_norm, envelope_tolerance
+                                );
+                            }
                             None
                         };
 
