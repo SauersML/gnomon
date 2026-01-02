@@ -2349,6 +2349,24 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
 
+    // Project rs_transformed onto the retained eigenspace to ensure gradient consistency.
+    // The cost function uses S_eff (truncated to top penalized_rank eigenvalues), so the
+    // gradient must also use the projected penalty: P_r S_k P_r instead of full S_k.
+    //
+    // In the transformed basis (after multiplying by qs), columns [0, penalized_rank) span
+    // the retained subspace and columns [penalized_rank, p) span the truncated subspace.
+    // Zeroing the truncated columns ensures tr(H⁻¹ rs^T rs) computes tr(H⁻¹ P_r S_k P_r).
+    if penalized_rank > 0 && penalized_rank < p {
+        for rs in rs_transformed.iter_mut() {
+            let rows = rs.nrows();
+            for i in 0..rows {
+                for j in penalized_rank..rs.ncols() {
+                    rs[(i, j)] = 0.0;
+                }
+            }
+        }
+    }
+
     let mut s_transformed = Mat::<f64>::zeros(p, p);
     let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
     for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
