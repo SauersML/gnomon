@@ -6918,6 +6918,68 @@ pub mod internal {
                         workspace.solved_rows = 0;
                     }
 
+                    // Gradient correction for spectral truncation (same as Logit path).
+                    // Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥)) where M_⊥ = U_⊥^T H⁻¹ U_⊥.
+                    let u_truncated_gauss = &reparam_result.u_truncated;
+                    let truncated_count_gauss = u_truncated_gauss.ncols();
+                    
+                    let gaussian_corrections: Vec<f64> = if truncated_count_gauss > 0 && workspace.solved_rows > 0 {
+                        let rows = h_eff.nrows();
+                        let mut h_inv_u_perp = faer::Mat::<f64>::zeros(rows, truncated_count_gauss);
+                        
+                        for i in 0..rows.min(u_truncated_gauss.nrows()) {
+                            for j in 0..truncated_count_gauss {
+                                h_inv_u_perp[(i, j)] = u_truncated_gauss[(i, j)];
+                            }
+                        }
+                        
+                        factor_g.solve_in_place(h_inv_u_perp.as_mut());
+                        
+                        let mut m_perp = faer::Mat::<f64>::zeros(truncated_count_gauss, truncated_count_gauss);
+                        for i in 0..truncated_count_gauss {
+                            for j in 0..truncated_count_gauss {
+                                let mut sum = 0.0;
+                                for r in 0..rows.min(u_truncated_gauss.nrows()) {
+                                    sum += u_truncated_gauss[(r, i)] * h_inv_u_perp[(r, j)];
+                                }
+                                m_perp[(i, j)] = sum;
+                            }
+                        }
+                        
+                        let mut corrections = vec![0.0; lambdas.len()];
+                        for k_idx in 0..lambdas.len() {
+                            let r_k = &rs_transformed[k_idx];
+                            let rank_k = r_k.nrows();
+                            
+                            let mut w_k = faer::Mat::<f64>::zeros(rank_k, truncated_count_gauss);
+                            for i in 0..rank_k {
+                                for j in 0..truncated_count_gauss {
+                                    let mut sum = 0.0;
+                                    for l in 0..r_k.ncols().min(u_truncated_gauss.nrows()) {
+                                        sum += r_k[(i, l)] * u_truncated_gauss[(l, j)];
+                                    }
+                                    w_k[(i, j)] = sum;
+                                }
+                            }
+                            
+                            let mut trace_error = 0.0;
+                            for i in 0..truncated_count_gauss {
+                                for j in 0..truncated_count_gauss {
+                                    let mut wtw_ij = 0.0;
+                                    for l in 0..rank_k {
+                                        wtw_ij += w_k[(l, i)] * w_k[(l, j)];
+                                    }
+                                    trace_error += m_perp[(i, j)] * wtw_ij;
+                                }
+                            }
+                            
+                            corrections[k_idx] = 0.5 * lambdas[k_idx] * trace_error;
+                        }
+                        corrections
+                    } else {
+                        vec![0.0; lambdas.len()]
+                    };
+
                     let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
                     let det1_values = &det1_values;
                     let beta_ref = beta_transformed;
@@ -6925,6 +6987,7 @@ pub mod internal {
                     let block_ranges_ref = &workspace.block_ranges;
                     let solved_ref = &workspace.solved;
                     let concat_ref = &workspace.concat;
+                    let gaussian_corrections_ref = &gaussian_corrections;
                     let compute_gaussian_grad = |k: usize| -> f64 {
                         let r_k = &rs_transformed[k];
                         // Avoid forming S_k: compute S_k β = Rᵀ (R β)
@@ -6958,11 +7021,14 @@ pub mod internal {
                         } else {
                             0.0
                         };
+                        
+                        // Apply truncation correction to match truncated cost function
+                        let corrected_log_det_h = log_det_h_grad_term - gaussian_corrections_ref[k];
 
                         // Component 3: derivative of the penalty pseudo-determinant.
                         let log_det_s_grad_term = 0.5 * det1_values[k];
 
-                        deviance_grad_term + log_det_h_grad_term - log_det_s_grad_term
+                        deviance_grad_term + corrected_log_det_h - log_det_s_grad_term
                     };
 
                     let mut gaussian_grad = Vec::with_capacity(lambdas.len());
@@ -7136,6 +7202,87 @@ pub mod internal {
                             workspace.solved_rows = 0;
                         }
 
+                        // Gradient correction for spectral truncation consistency.
+                        // The cost uses S_eff (truncated to structural_rank eigenvalues), but
+                        // the trace tr(H⁻¹ S_k) includes components in the truncated subspace.
+                        // We subtract the error: 0.5 * λ_k * tr(H⁻¹ P_⊥ S_k P_⊥)
+                        // where P_⊥ = U_⊥ U_⊥^T projects onto the truncated (null) subspace.
+                        //
+                        // Using cyclic trace property:
+                        //   Error_k = 0.5 * λ_k * tr(M_⊥ * (U_⊥^T S_k U_⊥))
+                        // where M_⊥ = U_⊥^T H⁻¹ U_⊥ is precomputed once.
+                        //
+                        // For efficiency: U_⊥^T S_k U_⊥ = (R_k U_⊥)^T (R_k U_⊥) = W_k^T W_k
+                        let u_truncated = &reparam_result.u_truncated;
+                        let truncated_count = u_truncated.ncols();
+                        
+                        let gradient_corrections: Vec<f64> = if truncated_count > 0 && workspace.solved_rows > 0 {
+                            // Solve H⁻¹ U_⊥ using the factorization
+                            let rows = h_for_factor.nrows();
+                            let mut h_inv_u_perp = faer::Mat::<f64>::zeros(rows, truncated_count);
+                            
+                            // Copy U_⊥ into working matrix
+                            for i in 0..rows.min(u_truncated.nrows()) {
+                                for j in 0..truncated_count {
+                                    h_inv_u_perp[(i, j)] = u_truncated[(i, j)];
+                                }
+                            }
+                            
+                            // Solve: H * X = U_⊥, result in h_inv_u_perp
+                            factor_g.solve_in_place(h_inv_u_perp.as_mut());
+                            
+                            // Compute M_⊥ = U_⊥^T (H⁻¹ U_⊥)  (truncated_count × truncated_count)
+                            let mut m_perp = faer::Mat::<f64>::zeros(truncated_count, truncated_count);
+                            for i in 0..truncated_count {
+                                for j in 0..truncated_count {
+                                    let mut sum = 0.0;
+                                    for r in 0..rows.min(u_truncated.nrows()) {
+                                        sum += u_truncated[(r, i)] * h_inv_u_perp[(r, j)];
+                                    }
+                                    m_perp[(i, j)] = sum;
+                                }
+                            }
+                            
+                            // Compute correction for each penalty k
+                            let mut corrections = vec![0.0; k_count];
+                            for k in 0..k_count {
+                                let r_k = &rs_transformed[k];
+                                let rank_k = r_k.nrows();
+                                
+                                // W_k = R_k U_⊥  (rank_k × truncated_count)
+                                let mut w_k = faer::Mat::<f64>::zeros(rank_k, truncated_count);
+                                for i in 0..rank_k {
+                                    for j in 0..truncated_count {
+                                        let mut sum = 0.0;
+                                        for l in 0..r_k.ncols().min(u_truncated.nrows()) {
+                                            sum += r_k[(i, l)] * u_truncated[(l, j)];
+                                        }
+                                        w_k[(i, j)] = sum;
+                                    }
+                                }
+                                
+                                // S_k^⊥ = W_k^T W_k  (truncated_count × truncated_count)
+                                // Error = tr(M_⊥ * S_k^⊥) = Frobenius(M_⊥, W_k^T W_k)
+                                // For efficiency: tr(M_⊥ W_k^T W_k) = sum_ij M_⊥[i,j] * (W_k^T W_k)[i,j]
+                                //                                  = sum_ij M_⊥[i,j] * sum_l W_k[l,i]*W_k[l,j]
+                                let mut trace_error = 0.0;
+                                for i in 0..truncated_count {
+                                    for j in 0..truncated_count {
+                                        let mut wtw_ij = 0.0;
+                                        for l in 0..rank_k {
+                                            wtw_ij += w_k[(l, i)] * w_k[(l, j)];
+                                        }
+                                        trace_error += m_perp[(i, j)] * wtw_ij;
+                                    }
+                                }
+                                
+                                corrections[k] = 0.5 * lambdas[k] * trace_error;
+                            }
+                            corrections
+                        } else {
+                            vec![0.0; k_count]
+                        };
+
                         let residual_grad = {
                             let eta = pirls_result
                                 .solve_mu
@@ -7306,8 +7453,10 @@ pub mod internal {
                                 0.0
                             };
                             let log_det_s_grad_term = 0.5 * det1_values[k];
+                            // Subtract truncation correction to match truncated cost function
+                            let corrected_log_det_h_grad = log_det_h_grad_term - gradient_corrections[k];
                             let mut gradient_value =
-                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
+                                0.5 * beta_terms[k] + corrected_log_det_h_grad - log_det_s_grad_term;
                             if let Some(delta_ref) = delta_opt.as_ref() {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);

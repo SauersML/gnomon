@@ -1906,6 +1906,10 @@ pub struct ReparamResult {
     /// Lambda-dependent penalty square root from s_transformed (rank x p matrix)
     /// This is used for applying the actual penalty in the least squares solve
     pub e_transformed: Array2<f64>,
+    /// Truncated eigenvectors (p × m where m = p - structural_rank)
+    /// These span the null space of the effective penalty and are needed for
+    /// gradient correction: subtract tr(H⁻¹ P_⊥ S_k P_⊥) from the full trace.
+    pub u_truncated: Array2<f64>,
 }
 
 /// Creates a lambda-independent balanced penalty root for stable rank detection
@@ -2242,6 +2246,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: vec![],
             rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p)),
+            u_truncated: Array2::zeros((p, p)),  // All modes truncated when no penalties
         });
     }
 
@@ -2254,6 +2259,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: rs_list.to_vec(),
             rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
+            u_truncated: Array2::zeros((p, p)),  // All modes truncated when zero penalty
         });
     }
 
@@ -2349,24 +2355,6 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
 
-    // Project rs_transformed onto the retained eigenspace to ensure gradient consistency.
-    // The cost function uses S_eff (truncated to top penalized_rank eigenvalues), so the
-    // gradient must also use the projected penalty: P_r S_k P_r instead of full S_k.
-    //
-    // In the transformed basis (after multiplying by qs), columns [0, penalized_rank) span
-    // the retained subspace and columns [penalized_rank, p) span the truncated subspace.
-    // Zeroing the truncated columns ensures tr(H⁻¹ rs^T rs) computes tr(H⁻¹ P_r S_k P_r).
-    if penalized_rank > 0 && penalized_rank < p {
-        for rs in rs_transformed.iter_mut() {
-            let rows = rs.nrows();
-            for i in 0..rows {
-                for j in penalized_rank..rs.ncols() {
-                    rs[(i, j)] = 0.0;
-                }
-            }
-        }
-    }
-
     let mut s_transformed = Mat::<f64>::zeros(p, p);
     let mut s_k_transformed_cache: Vec<Mat<f64>> = Vec::with_capacity(m);
     for (lambda, rs_k) in lambdas.iter().zip(rs_transformed.iter()) {
@@ -2406,7 +2394,23 @@ pub fn stable_reparameterization_with_invariant(
     
     // Take exactly the top `penalized_rank` eigenvalues (structural rank from invariant)
     let structural_rank = penalized_rank.min(sorted_eigs.len());
-    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.into_iter().take(structural_rank).collect();
+    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(structural_rank).cloned().collect();
+    
+    // Extract truncated eigenvector indices (those NOT in selected_eigs)
+    // These span the null space and are needed for gradient correction
+    let truncated_indices: Vec<usize> = sorted_eigs.iter()
+        .skip(structural_rank)
+        .map(|&(idx, _)| idx)
+        .collect();
+    let truncated_count = truncated_indices.len();
+    
+    // Build u_truncated matrix (p × truncated_count)
+    let mut u_truncated_mat = Mat::<f64>::zeros(p, truncated_count);
+    for (col_out, &col_in) in truncated_indices.iter().enumerate() {
+        for row in 0..p {
+            u_truncated_mat[(row, col_out)] = s_eigenvectors[(row, col_in)];
+        }
+    }
     
     // Tiny absolute floor to prevent ln(0) - we never filter structural modes
     let ln_floor = 1e-300_f64;
@@ -2489,6 +2493,7 @@ pub fn stable_reparameterization_with_invariant(
             .map(|mat| Array2::from_shape_fn((mat.ncols(), mat.nrows()), |(i, j)| mat[(j, i)]))
             .collect(),
         e_transformed: mat_to_array(&e_transformed_mat),
+        u_truncated: mat_to_array(&u_truncated_mat),
     })
 }
 
