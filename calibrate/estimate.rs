@@ -5511,102 +5511,89 @@ pub mod internal {
                 }
             }
 
-            // V = diag(u) C, so V V^T = diag(u) M_h diag(u)
-            // and T = (B⊙B)^T V gives the Hadamard-square contraction.
-            let mut vc = c.clone();
-            for i in 0..n {
-                let scale = u[i];
-                if scale != 1.0 {
-                    vc.row_mut(i).mapv_inplace(|vv| vv * scale);
-                }
-            }
-            // T = (B ⊙ B)^T V, which equals vec-wise contraction with H_hat∘H_hat.
-            let t = Self::khatri_rao_transpose_mul(&b, &vc);
+            // Reverse-mode AD for Term 2 (off-diagonal Firth correction)
+            //
+            // Objective: J = 0.5 * log|H_total| where H_total = H_pen - H_phi
+            //   H_phi = 0.5 * (T_1 - T_2)
+            //   T_2 = X^T diag(u) (A ⊙ A) diag(u) X  where A = B B^T (hat matrix)
+            //
+            // We derive ∂J/∂B using the adjoint (reverse-mode AD) method.
+            //
+            // Step 1 - Sensitivity to H_total:
+            //   ∂J/∂H_total = 0.5 * H_total^{-1} = 0.5 * M
+            //
+            // Step 2 - Sensitivity to T_2:
+            //   H_total = H_pen - 0.5*(T_1 - T_2) = H_pen - 0.5*T_1 + 0.5*T_2
+            //   ⟹ ∂J/∂T_2 = 0.5 * (∂J/∂H_total) = 0.25 * M
+            //
+            // Step 3 - Sensitivity to (A ⊙ A):
+            //   T_2 = Y^T (A ⊙ A) Y  where Y = diag(u) X
+            //   Using tr(bar_T_2 * dT_2) = tr(Y * bar_T_2 * Y^T * d(A⊙A)):
+            //   ⟹ ∂J/∂(A⊙A) = Y * (0.25 M) * Y^T = 0.25 * Z  where Z = Y M Y^T
+            //
+            //   Factorization: Z = diag(u) (X M X^T) diag(u) = diag(u) (C C^T) diag(u)
+            //   where C = X L^{-T} and L = chol(H_total), so X M X^T = C C^T.
+            //
+            // Step 4 - Sensitivity to A (through Hadamard square):
+            //   For K = A ⊙ A, we have dK = 2 * A ⊙ dA.
+            //   The adjoint relationship: bar_A = 2 * A ⊙ bar_K
+            //   ⟹ ∂J/∂A = 2 * A ⊙ (0.25 Z) = 0.5 * (A ⊙ Z)
+            //
+            // Step 5 - Sensitivity to B (through A = B B^T):
+            //   dA = dB B^T + B dB^T
+            //   tr(bar_A * dA) = tr(bar_A * dB * B^T) + tr(bar_A * B * dB^T)
+            //                  = 2 * tr(bar_A * B * dB^T)  (since bar_A is symmetric)
+            //                  = 2 * tr(B^T bar_A * dB)
+            //   ⟹ ∂J/∂B = 2 * bar_A * B = 2 * (0.5 * (A ⊙ Z)) * B = (A ⊙ Z) B
+            //
+            // Final result: grad_b_t2 = (Z ⊙ A) B with coefficient 1.0
+            //   (Z ⊙ A)_{ij} = Z_{ij} * A_{ij} = [u_i * u_j * (c_i · c_j)] * [(b_i · b_j)]
+            //   ((Z ⊙ A) B)_{ik} = Σ_j (Z ⊙ A)_{ij} * B_{jk}
 
-            // Reverse-mode AD for Term 2 (off-diagonal part of H_phi)
-            //
-            // The objective involves J = 0.5 * log|H_total| where H_total = H_pen - H_phi.
-            // The Firth correction H_phi = 0.5 * (T_1 - T_2) where:
-            //   T_1 = X^T diag(h ⊙ v) X  (diagonal term, handled above)
-            //   T_2 = X^T (diag(u) (A ⊙ A) diag(u)) X  (off-diagonal term)
-            // where A = H_hat = B B^T is the hat matrix from the Fisher information basis.
-            //
-            // For the gradient, we need:
-            //   dJ/dB = 0.5 * tr(H_total^{-1} * d(H_pen - H_phi)/dB)
-            //         = -0.25 * tr(M * d(T_1 - T_2)/dB)
-            // where M = H_total^{-1} (p × p).
-            //
-            // For Term 2, the chain rule through T_2 involves:
-            //   T_2 = X^T Z X where Z = diag(u) (A ⊙ A) diag(u) (n × n)
-            //   dT_2/dB = complex term involving d(A ⊙ A)/dB
-            //
-            // The key insight is that tr(M * dT_2) requires contracting with the
-            // inverse Hessian M. In the factored form where C = X L^{-T} (n × p)
-            // with L = chol(H_total), we have:
-            //   X M X^T = C C^T  (n × n leverage matrix)
-            //   M = L^{-T} L^{-1} = (C^T C)^{-1} ... wait, that's not quite right.
-            //
-            // Actually, the correct projection through M uses:
-            //   M_proj = C^T C = L^{-1} X^T X L^{-T}  (p × p)
-            // This represents the Fisher information projected through H^{-1}.
-            //
-            // The gradient formula for Term 2 is:
-            //   g_i = T * M_proj * c_i  (p² vector)
-            // =========================================================================
-            // Reverse-mode AD for Term 2 (off-diagonal part of H_phi)
-            //
-            // The trace formula tr(H^{-1} dT_2) requires contracting T with c_i directly.
-            // T already encodes the Khatri-Rao product (B⊙B)^T V where V = diag(u) C.
-            // When we compute T * c_i, we get:
-            //   Σ_j (b_j ⊗ b_j) u_j (c_j^T c_i)
-            // which is exactly the leverage-weighted sum needed for the derivative.
-            //
-            // NOTE: We do NOT use C^T C here. The leverage inner product c_j^T c_i
-            // gives (CC^T)_{ij} = M_h[i,j], which is what the math requires.
-            // =========================================================================
-            
+            let mut grad_b_t2 = Array2::<f64>::zeros((n, p));
             let mut g_u = Array1::<f64>::zeros(n);
+
             for i in 0..n {
-                // Contract T directly with c_i (NOT through C^T C projection!)
-                // This gives: Σ_j (b_j ⊗ b_j) u_j (c_j^T c_i)
                 let c_i = c.row(i);
-                let g_i = t.dot(&c_i); // (p² × p) × (p,) = p²-vector
-                
-                // Step 3: Reshape g_i into G_i (p × p) and compute:
-                //   ∂/∂b_i = u_i * (G_i + G_i^T) * b_i
                 let b_i = b.row(i);
-                let mut tmp1 = vec![0.0; p];
-                let mut tmp2 = vec![0.0; p];
-                let mut gu = 0.0;
-                for a in 0..p {
-                    for bcol in 0..p {
-                        let idx = a + bcol * p;
-                        let g_ab = g_i[idx];
-                        let ba = b_i[a];
-                        let bb = b_i[bcol];
-                        // Track ∂S_off/∂u_i for chain rule through V = diag(u) C
-                        gu += g_ab * ba * bb;
-                        // Accumulate symmetric gradient contribution
-                        tmp1[a] += g_ab * bb;
-                        tmp2[bcol] += g_ab * ba;
+                let u_i = u[i];
+
+                for j in 0..n {
+                    let c_j = c.row(j);
+                    let b_j = b.row(j);
+                    let u_j = u[j];
+
+                    // (Z ⊙ A)_{ij} = u_i * u_j * (c_i · c_j) * (b_i · b_j)
+                    let cc_ij = c_i.dot(&c_j);
+                    let bb_ij = b_i.dot(&b_j);
+                    let z_odot_a_ij = u_i * u_j * cc_ij * bb_ij;
+
+                    // Accumulate ((Z ⊙ A) B)_{i,:} = Σ_j (Z ⊙ A)_{ij} * b_j
+                    for k in 0..p {
+                        grad_b_t2[(i, k)] += z_odot_a_ij * b[(j, k)];
                     }
                 }
-                
-                // Store g_u with correct factor from chain rule:
-                // 0.5 (log|H|) × (+0.5 for T2 in H_phi) = +0.25
-                // The d(A⊙A)/dB = 2*(A⊙dA) and dA/dB = 2B gives total factor of 4
-                // Combined: 0.25 × 4 = 1.0
-                g_u[i] = 1.0 * gu;
-                
-                // Accumulate grad_b contribution for Term 2:
-                // Same chain rule: 0.5 (log|H|) × 0.5 (H_phi) × 4 (symmetric×Hadamard) = 1.0
-                let scale = 1.0 * u[i];
-                if scale != 0.0 {
-                    for j in 0..p {
-                        grad_b[(i, j)] += scale * (tmp1[j] + tmp2[j]);
-                    }
+
+                // Gradient w.r.t. u_i (for chain rule back to β):
+                //   Z = diag(u) (C C^T) diag(u)  ⟹  Z_{jk} = u_j * (c_j · c_k) * u_k
+                //   ∂Z_{jk}/∂u_i = δ_{ij} * (c_j · c_k) * u_k + u_j * (c_j · c_k) * δ_{ik}
+                //   Only row i and column i of Z depend on u_i. By symmetry:
+                //   ∂(tr(Z ⊙ (A⊙A)))/∂u_i = 2 * Σ_j cc_{ij} * u_j * bb_{ij}²
+                //   With chain rule factor 0.25 (from step 2):
+                //   g_u[i] = 0.25 * 2 * Σ_j u_j * cc_{ij} * bb_{ij}² = 0.5 * Σ_j u_j * cc_{ij} * bb_{ij}²
+                let mut gu_i = 0.0;
+                for j in 0..n {
+                    let c_j = c.row(j);
+                    let b_j = b.row(j);
+                    let cc_ij = c_i.dot(&c_j);
+                    let bb_ij = b_i.dot(&b_j);
+                    gu_i += u[j] * cc_ij * bb_ij * bb_ij;
                 }
+                g_u[i] = 0.5 * gu_i;
             }
+
+            // Add Term 2 contribution to grad_b (coefficient 1.0 from derivation above)
+            grad_b += &grad_b_t2;
 
             // Chain u_eta (du/deta = -2 dmu) into g_eta, with clamp → 0 when dmu is clamped.
             for i in 0..n {
@@ -6158,7 +6145,6 @@ pub mod internal {
                     // STRATEGIC DESIGN DECISION: Use unweighted sample count for mgcv compatibility
                     // In standard WLS theory, one might use sum(weights) as effective sample size.
                     // However, mgcv deliberately uses the unweighted count 'n.true' in gam.fit3.
-                    // We maintain this behavior for strict mgcv compatibility.
                     let n = self.y.len() as f64;
                     // Number of coefficients (transformed basis)
 
