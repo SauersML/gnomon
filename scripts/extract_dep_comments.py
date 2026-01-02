@@ -220,33 +220,46 @@ def count_braces_in_code(line: str, state: ScanState):
     return brace_delta, code_state
 
 
-def find_crate_archive(dep_name: str) -> Path:
-    cache_root = Path.home() / ".cargo/registry/cache"
-    raw_candidates = sorted(cache_root.rglob(f"{dep_name}-*.crate"))
-    candidates = []
-    for path in raw_candidates:
-        stem = path.stem
-        if not stem.startswith(f"{dep_name}-"):
-            continue
-        version_part = stem[len(dep_name) + 1 :]
-        if version_part and version_part[0].isdigit():
-            candidates.append(path)
-    if not candidates:
-        raise FileNotFoundError(f"No crate archive found for {dep_name} in {cache_root}")
-    # Prefer highest semver-ish version; fall back to lexical sort.
-    def version_key(path: Path):
-        name = path.stem  # dep-1.2.3
-        version = name[len(dep_name) + 1 :]
-        parts = re.split(r"[.-]", version)
-        key = []
-        for part in parts:
-            if part.isdigit():
-                key.append((0, int(part)))
-            else:
-                key.append((1, part))
-        return key
+CRATE_STEM_RE = re.compile(r"^(.+)-([0-9].+)$")
 
-    return sorted(candidates, key=version_key)[-1]
+
+def version_key_from_str(version: str):
+    parts = re.split(r"[.-]", version)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return key
+
+
+def iter_crate_archives():
+    cache_root = Path.home() / ".cargo/registry/cache"
+    for path in cache_root.rglob("*.crate"):
+        stem = path.stem
+        match = CRATE_STEM_RE.match(stem)
+        if not match:
+            continue
+        name, version = match.groups()
+        yield name, version, path
+
+
+def find_crate_archives(dep_name: str, include_prefix: bool) -> list[Path]:
+    selected = {}
+    for name, version, path in iter_crate_archives():
+        if name != dep_name and not (include_prefix and name.startswith(f"{dep_name}-")):
+            continue
+        key = version_key_from_str(version)
+        current = selected.get(name)
+        if current is None or key > current[0]:
+            selected[name] = (key, path)
+
+    if not selected:
+        cache_root = Path.home() / ".cargo/registry/cache"
+        raise FileNotFoundError(f"No crate archive found for {dep_name} in {cache_root}")
+
+    return [path for _, path in sorted(selected.items())]
 
 
 def extract_crate(crate_path: Path, dest_dir: Path) -> Path:
@@ -302,25 +315,32 @@ def main():
     parser = argparse.ArgumentParser(description="Extract comments and function definitions from a crate.")
     parser.add_argument("dep_name", help="Cargo dependency name, e.g. faer")
     parser.add_argument(
+        "--include-prefix",
+        action="store_true",
+        help="Also scan crates whose names start with <dep_name>- (e.g. burn-core, burn-tensor).",
+    )
+    parser.add_argument(
         "--out",
         help="Output path (default: <dep_name>_comments.txt)",
         default=None,
     )
     args = parser.parse_args()
 
-    crate_path = find_crate_archive(args.dep_name)
+    crate_paths = find_crate_archives(args.dep_name, args.include_prefix)
     out_path = Path(args.out or f"{args.dep_name}_comments.txt")
 
     with tempfile.TemporaryDirectory(prefix=f"{args.dep_name}-src-") as tmpdir:
-        root = extract_crate(crate_path, Path(tmpdir))
-        rs_files = sorted(root.rglob("*.rs"))
-
         out_lines = []
-        for rs in rs_files:
-            lines = extract_lines_in_order(rs)
-            if not lines:
-                continue
-            out_lines.extend(lines)
+        for crate_path in crate_paths:
+            extract_root = Path(tmpdir) / crate_path.stem
+            extract_root.mkdir(parents=True, exist_ok=True)
+            root = extract_crate(crate_path, extract_root)
+            rs_files = sorted(root.rglob("*.rs"))
+            for rs in rs_files:
+                lines = extract_lines_in_order(rs)
+                if not lines:
+                    continue
+                out_lines.extend(lines)
 
         out_text = "\n".join(out_lines).rstrip() + "\n"
         out_path.write_text(out_text)

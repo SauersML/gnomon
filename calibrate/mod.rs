@@ -21,7 +21,7 @@ pub mod hmc;
 pub mod seeding;
 pub mod visualizer;
 pub mod types;
-pub mod gradient_diagnostics;
+pub mod diagnostics;
 
 #[cfg(test)]
 pub mod test_fixtures;

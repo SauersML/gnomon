@@ -7530,7 +7530,7 @@ pub mod internal {
             bundle: &EvalShared,
             analytic_grad: &Array1<f64>,
         ) {
-            use crate::calibrate::gradient_diagnostics::{
+            use crate::calibrate::diagnostics::{
                 GradientDiagnosticReport, compute_envelope_audit, compute_dual_ridge_check,
                 compute_spectral_bleed, DiagnosticConfig,
             };
