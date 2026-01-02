@@ -205,11 +205,11 @@ impl<'a> GamLogitWorkingModel<'a> {
         //
         //   l_p(β; ρ) = l(β) - 0.5 * βᵀ S_λ β - 0.5 * ridge * ||β||²
         //
-        // This makes the PIRLS optimum consistent with the stabilized log|H|
-        // term used by the LAML objective and its gradient. Without this, the
-        // cost would be evaluated on H + ridge*I while β still satisfies the
-        // *unridged* stationarity condition, breaking the envelope-theorem
-        // assumptions and yielding FD/analytic gradient mismatches.
+        // Then the stationarity condition is:
+        //   ∇β l_p = 0  =>  ∇β l(β) + (S_λ + ridge I) β = 0.
+        //
+        // This keeps the inner optimum and the LAML Taylor expansion on the
+        // same surface, so the envelope-theorem simplifications stay valid.
         let ridge_used =
             ensure_positive_definite_with_ridge(&mut hessian, "PIRLS penalized Hessian")?;
 
@@ -1076,132 +1076,158 @@ where
         value
     };
 
+    let mut lambda = 1e-6; // Initial damping (Levenberg-Marquardt parameter)
+    let lambda_factor = 10.0;
+    
     'pirls_loop: for iter in 1..=options.max_iterations {
         iterations = iter;
         let state = model.update(&beta)?;
         let current_penalized = penalized_objective(&state);
         #[cfg(test)]
         record_penalized_deviance(current_penalized);
-        let mut direction = solve_newton_direction_dense(&state.hessian, &state.gradient)?;
-        let mut descent = state.gradient.dot(&direction);
-        if !(descent.is_nan() || descent < 0.0) {
-            let dim = state.hessian.nrows();
-            let mut ridge = 1e-8;
-            loop {
-                let mut regularized = state.hessian.clone();
-                for i in 0..dim {
-                    regularized[[i, i]] += ridge;
-                }
-                direction = solve_newton_direction_dense(&regularized, &state.gradient)?;
-                descent = state.gradient.dot(&direction);
-                if descent.is_nan() || descent < 0.0 || ridge >= 1.0 {
-                    break;
-                }
-                ridge *= 10.0;
-            }
-            if !(descent.is_nan() || descent < 0.0) {
-                direction = state.gradient.mapv(|g| -g);
-            }
-        }
-        let mut step = 1.0;
-        let mut step_halving = 0usize;
-        let mut last_error: Option<EstimationError> = None;
 
-        let (candidate_beta, candidate_state, candidate_penalized) = loop {
-            let candidate_beta = Coefficients::new(&*beta + &(direction.mapv(|v| step * v)));
+        // --- Levenberg-Marquardt Step ---
+
+        
+        // Loop to adjust lambda until we accept a step or fail
+        // In standard LM, we solve (H + λI)δ = -g
+        let mut loop_lambda = lambda;
+        let mut attempts = 0;
+        
+        loop {
+            attempts += 1;
+            
+            // 1. Solve (H + λI)δ = -g
+            // We clone the Hessian effectively implementing H_damped = H + λI
+            let mut regularized = state.hessian.clone();
+            let dim = regularized.nrows();
+            for i in 0..dim {
+                regularized[[i, i]] += loop_lambda;
+            }
+            
+            let direction = match solve_newton_direction_dense(&regularized, &state.gradient) {
+                Ok(d) => d,
+                Err(_) => {
+                    // Singular even with ridge (unlikely unless huge). Increase lambda.
+                   if loop_lambda < 1e12 {
+                       loop_lambda *= lambda_factor;
+                       continue;
+                   } else {
+                       // Fallback to gradient descent
+                       state.gradient.mapv(|g| -g) 
+                   }
+                }
+            };
+            
+            // 2. Compute Predicted Reduction
+            // Pred = -g'δ - 0.5 * δ'(H)δ
+            // Actually, we should check against the model: m(0) - m(δ)
+            // m(δ) = L_old + g'δ + 0.5 δ'Hδ.
+            // Reduction = -(g'δ + 0.5 δ'Hδ)
+            let q_term = state.hessian.dot(&direction);
+            let quad = 0.5 * direction.dot(&q_term);
+            let lin = state.gradient.dot(&direction);
+            let predicted_reduction = -(lin + quad);
+            
+            // 3. Compute Actual Reduction
+            let candidate_beta = Coefficients::new(&*beta + &direction);
             match model.update(&candidate_beta) {
                 Ok(candidate_state) => {
                     let candidate_penalized = penalized_objective(&candidate_state);
-                    let accept_step = candidate_penalized.is_finite()
-                        && (candidate_penalized <= current_penalized * (1.0 + 1e-12)
-                            || (current_penalized - candidate_penalized).abs() < 1e-12);
-                    if accept_step {
-                        break (candidate_beta, candidate_state, candidate_penalized);
+                    let actual_reduction = current_penalized - candidate_penalized;
+                    
+                    // 4. Gain Ratio
+                    let rho = if predicted_reduction > 1e-15 {
+                        actual_reduction / predicted_reduction
+                    } else {
+                        // If predicted reduction is tiny/negative, model is weird.
+                        if actual_reduction > 0.0 { 1.0 } else { -1.0 }
+                    };
+
+                    if rho > 0.0 && candidate_penalized.is_finite() {
+                        // Accept Step
+
+                        // Update Trust Region (Lambda)
+                        // Heuristic: if good step, decrease lambda (more Newton-like)
+                        // if barely acceptable, keep or increase?
+                        // Marquardt: if rho is high, decrease lambda.
+                        if rho > 0.25 {
+                            lambda = (loop_lambda / lambda_factor).max(1e-9);
+                        } else {
+                            lambda = loop_lambda; 
+                        }
+                        
+                        // Updates for next iteration
+                        beta = candidate_beta;
+                        
+                         // Update Iteration Info
+                        let candidate_grad_norm = candidate_state.gradient.dot(&candidate_state.gradient).sqrt();
+                        let deviance_change = actual_reduction;
+                         
+                        iteration_callback(&WorkingModelIterationInfo {
+                            iteration: iter,
+                            deviance: candidate_state.deviance,
+                            gradient_norm: candidate_grad_norm,
+                            step_size: 1.0, 
+                            step_halving: attempts, // repurpose as attempt count
+                        });
+                        
+                        last_gradient_norm = candidate_grad_norm;
+                        last_deviance_change = deviance_change;
+                        last_step_size = 1.0;
+                        last_step_halving = attempts;
+                        max_abs_eta = candidate_state
+                            .eta
+                            .iter()
+                            .copied()
+                            .map(f64::abs)
+                            .fold(0.0, f64::max);
+                        
+                        // Set the ridge used in the state for consistency
+                        let mut final_state_with_ridge = candidate_state.clone();
+                        final_state_with_ridge.ridge_used = loop_lambda;
+                        
+                        final_state = Some(final_state_with_ridge.clone());
+                        
+                        // Check Convergence
+                        let deviance_scale = current_penalized.abs().max(candidate_penalized.abs()).max(1.0);
+                        let grad_tol = options.convergence_tolerance; // Absolute norm check
+                        let dev_tol = options.convergence_tolerance * deviance_scale;
+                        
+                        if candidate_grad_norm < grad_tol {
+                             status = PirlsStatus::Converged;
+                             break 'pirls_loop;
+                        }
+                        if deviance_change.abs() < dev_tol && deviance_change >= 0.0 {
+                             status = PirlsStatus::Converged;
+                             break 'pirls_loop;
+                        }
+                        
+                        break; // Break inner lambda loop, continue outer pirls loop
+                    } else {
+                        // Reject Step
+                         if loop_lambda > 1e12 {
+                             // Exhausted attempts
+                             if attempts > 30 {
+                                 status = PirlsStatus::StalledAtValidMinimum;
+                                 let mut stalled_state = state.clone();
+                                 stalled_state.ridge_used = loop_lambda;
+                                 final_state = Some(stalled_state);
+                                 break 'pirls_loop;
+                             }
+                         }
+                         loop_lambda *= lambda_factor;
                     }
                 }
-                Err(err) => {
-                    last_error = Some(err);
+                Err(_) => {
+                     // Evaluation failed (NaN?)
+                     loop_lambda *= lambda_factor;
                 }
             }
-
-            if step_halving >= options.max_step_halving || step * 0.5 < options.min_step_size {
-                if let Some(err) = last_error {
-                    return Err(err);
-                }
-                log::warn!(
-                    "P-IRLS step halving exhausted at iter {}; returning current state.",
-                    iter
-                );
-                status = PirlsStatus::StalledAtValidMinimum;
-                final_state = Some(state);
-                break 'pirls_loop;
-            }
-
-            step *= 0.5;
-            step_halving += 1;
-        };
-        let candidate_grad_norm = candidate_state
-            .gradient
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        let deviance_change = current_penalized - candidate_penalized;
-        let deviance_scale = current_penalized
-            .abs()
-            .max(candidate_penalized.abs())
-            .max(1.0);
-        let deviance_tolerance = options.convergence_tolerance * deviance_scale;
-        #[cfg(test)]
-        record_penalized_deviance(candidate_penalized);
-
-        iteration_callback(&WorkingModelIterationInfo {
-            iteration: iter,
-            deviance: candidate_state.deviance,
-            gradient_norm: candidate_grad_norm,
-            step_size: step,
-            step_halving,
-        });
-
-        beta = candidate_beta;
-        last_gradient_norm = candidate_grad_norm;
-        last_deviance_change = deviance_change;
-        last_step_size = step;
-        last_step_halving = step_halving;
-        max_abs_eta = candidate_state
-            .eta
-            .iter()
-            .copied()
-            .map(f64::abs)
-            .fold(0.0, f64::max);
-
-        if !candidate_state.deviance.is_finite()
-            || !candidate_penalized.is_finite()
-            || !candidate_grad_norm.is_finite()
-        {
-            status = PirlsStatus::Unstable;
-            final_state = Some(candidate_state);
-            break;
-        }
-
-        if candidate_grad_norm < options.convergence_tolerance {
-            status = if deviance_change.abs() < deviance_tolerance {
-                PirlsStatus::Converged
-            } else {
-                PirlsStatus::StalledAtValidMinimum
-            };
-            final_state = Some(candidate_state);
-            break;
-        }
-
-        if deviance_change.abs() < deviance_tolerance {
-            status = PirlsStatus::Converged;
-            final_state = Some(candidate_state);
-            break;
-        }
-
-        final_state = Some(candidate_state);
+        } // end loop (lambda search)
     }
+
+
 
     let state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,
@@ -1318,8 +1344,10 @@ pub struct PirlsResult {
     // Effective degrees of freedom at the solution
     pub edf: f64,
 
-    // The penalty term, calculated stably within P-IRLS
-    // This is beta_transformed' * S_transformed * beta_transformed
+    // The penalty term, calculated stably within P-IRLS.
+    // This is beta_transformed' * S_transformed * beta_transformed, plus
+    // ridge_used * ||beta||^2 when stabilization is active so that the
+    // penalized deviance matches the stabilized Hessian.
     pub stable_penalty_term: f64,
 
     /// Optional Jeffreys prior log-determinant contribution (½ log |H|) when
@@ -1690,23 +1718,10 @@ pub fn fit_model_for_fixed_rho<'a>(
     } = final_state;
 
     let penalized_hessian_transformed = working_summary.state.hessian.clone();
-    // Use the exact ridge from P-IRLS to stabilize the Hessian.
-    // This ensures that beta is the stationary point of the SAME objective
-    // used for LAML derivatives (Envelope Theorem consistency).
-    // Previously, ensure_positive_definite could add a DIFFERENT ridge,
-    // breaking gradient consistency.
-    let mut stabilized_hessian_transformed = penalized_hessian_transformed.clone();
-    let pirls_ridge = working_summary.state.ridge_used;
-    if pirls_ridge > 0.0 {
-        // Add the exact ridge that P-IRLS used
-        for i in 0..stabilized_hessian_transformed.nrows() {
-            stabilized_hessian_transformed[[i, i]] += pirls_ridge;
-        }
-    }
-    // Only if P-IRLS ridge was 0 and matrix is still not PD, add minimal stabilization
-    if pirls_ridge == 0.0 && stabilized_hessian_transformed.cholesky(Side::Lower).is_err() {
-        ensure_positive_definite(&mut stabilized_hessian_transformed)?;
-    }
+    // P-IRLS already folded any stabilization ridge directly into the Hessian.
+    // Keep that exact matrix so outer LAML derivatives stay consistent:
+    // H_eff = X'WX + S_λ + ridge I (if ridge_used > 0).
+    let stabilized_hessian_transformed = penalized_hessian_transformed.clone();
 
     let mut edf = calculate_edf(&penalized_hessian_transformed, &e_transformed)?;
     if !edf.is_finite() || edf.is_nan() {

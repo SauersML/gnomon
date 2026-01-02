@@ -46,6 +46,7 @@ use crate::calibrate::types::{
 };
 use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
 use crate::calibrate::visualizer;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
@@ -63,6 +64,33 @@ use faer::linalg::solvers::{
 fn logit_from_prob(p: f64) -> f64 {
     let p = p.clamp(1e-8, 1.0 - 1e-8);
     (p / (1.0 - p)).ln()
+}
+
+const MIN_EIG_DIAG_EVERY: usize = 200;
+const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
+static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
+static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
+    if !min_eig.is_finite() || min_eig <= 0.0 {
+        return true;
+    }
+    if min_eig >= MIN_EIG_DIAG_THRESHOLD {
+        return false;
+    }
+    let bucket = if min_eig.is_finite() && min_eig > 0.0 {
+        min_eig.log10().floor() as i32
+    } else {
+        i32::MIN
+    };
+    let last = H_MIN_EIG_LOG_BUCKET.load(Ordering::Relaxed);
+    let count = H_MIN_EIG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if bucket != last || count % MIN_EIG_DIAG_EVERY == 0 {
+        H_MIN_EIG_LOG_BUCKET.store(bucket, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -4802,10 +4830,12 @@ pub mod internal {
         /// Returns the effective Hessian and the ridge value used (if any).
         /// This ensures we use the same Hessian matrix in both cost and gradient calculations.
         ///
-        /// PIRLS now folds any stabilization ridge directly into the penalized objective,
-        /// so the stabilized Hessian should already be PD. We do not add a second ridge
-        /// here; if the stabilized Hessian is still indefinite, we abort so that the
-        /// objective/gradient remain exact rather than silently drifting.
+        /// PIRLS folds any stabilization ridge directly into the penalized objective:
+        ///   l_p(β; ρ) = l(β) - 0.5 * βᵀ (S_λ + ridge I) β.
+        /// Therefore the curvature used in LAML must be
+        ///   H_eff = X'WX + S_λ + ridge I,
+        /// and we must not add another ridge here or the Laplace expansion
+        /// would be centered on a different surface.
         fn effective_hessian(
             &self,
             pr: &PirlsResult,
@@ -6113,7 +6143,13 @@ pub mod internal {
             if ridge_used > 0.0
                 && let Ok((eigs, _)) = pirls_result.penalized_hessian_transformed.eigh(Side::Lower)
                     && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
-                        eprintln!("[Diag] H min_eig={:.3e}", min_eig);
+                        if should_emit_h_min_eig_diag(min_eig) {
+                            eprintln!(
+                                "[Diag] H min_eig={:.3e} (ridge={:.3e})",
+                                min_eig,
+                                ridge_used
+                            );
+                        }
 
                         if min_eig <= 0.0 {
                             log::warn!(
@@ -6175,7 +6211,8 @@ pub mod internal {
                     let rss = pirls_result.deviance; // Unpenalized ||y - μ||²
                     // Use stable penalty term calculated in P-IRLS
                     let penalty = pirls_result.stable_penalty_term;
-                    let dp = rss + penalty; // Correct penalized deviance
+
+                    let dp = rss + penalty;
 
                     // Calculate EDF = p - tr((X'X + S_λ)⁻¹S_λ)
                     // Work directly in the transformed basis for efficiency and numerical stability
@@ -6189,7 +6226,7 @@ pub mod internal {
 
                     // Use the edf_from_h_and_rk helper for diagnostics only; φ no longer depends on EDF.
                     let edf = self.edf_from_h_and_rk(pirls_result, lambdas.view(), h_eff)?;
-                    eprintln!("[Diag] EDF total={:.3}", edf);
+                    log::debug!("[Diag] EDF total={:.3}", edf);
 
                     if n - edf < 1.0 {
                         log::warn!("Effective DoF exceeds samples; model may be overfit.");
@@ -6205,8 +6242,11 @@ pub mod internal {
                     }
                     let phi = dp_c / denom;
 
-                    // log |H| = log |X'X + S_λ| using the single effective Hessian shared with the gradient
-                    let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                    // log |H| = log |X'X + S_λ + ridge I| using the single effective
+                    // Hessian shared with the gradient. Ridge is already baked into h_eff.
+                    let h_for_det = h_eff.clone();
+
+                    let chol = h_for_det.cholesky(Side::Lower).map_err(|_| {
                         let min_eig = h_eff
                             .clone()
                             .eigh(Side::Lower)
@@ -6219,7 +6259,9 @@ pub mod internal {
                     })?;
                     let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
 
-                    // log |S_λ|_+ (pseudo-determinant) - use stable value from P-IRLS
+                    // log |S_λ + ridge I|_+ (pseudo-determinant) to match the
+                    // stabilized penalty used by PIRLS.
+                    let ridge_used = pirls_result.ridge_used;
                     let log_det_s_plus = Self::log_det_s_with_ridge(
                         &pirls_result.reparam_result.s_transformed,
                         ridge_used,
@@ -6245,6 +6287,8 @@ pub mod internal {
                     // Use stable penalty term calculated in P-IRLS
                     let mut penalised_ll =
                         -0.5 * pirls_result.deviance - 0.5 * pirls_result.stable_penalty_term;
+                    
+                    let ridge_used = pirls_result.ridge_used;
                     // Include Firth log-det term in LAML for consistency with inner PIRLS
                     if self.config.firth_bias_reduction
                         && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
@@ -6766,10 +6810,10 @@ pub mod internal {
                 };
 
             // --- Use Single Stabilized Hessian from P-IRLS ---
-            // Use the same effective Hessian as the cost function for consistency
+            // Use the same effective Hessian as the cost function for consistency.
             if ridge_used > 0.0 {
                 log::debug!(
-                    "Gradient path added ridge {:.3e} to stabilized Hessian for consistency",
+                    "Gradient path using PIRLS-stabilized Hessian (ridge {:.3e})",
                     ridge_used
                 );
             }
@@ -7114,8 +7158,8 @@ pub mod internal {
                         // For Firth bias reduction, compute the exact Hessian:
                         // H_total = h_eff - H_phi where H_phi is the Firth curvature matrix.
                         // For non-Firth, H_total = h_eff.
-                        // NOTE: Firth uses pure Fisher info (no ridge) per mathematical definition.
-                        let (h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
+                        // NOTE: h_eff already includes any stabilization ridge from PIRLS.
+                        let (mut h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
                             if let LinkFunction::Logit = self.config.link_function().expect("link fn") {
                                 match self.firth_hessian_logit(
                                     &pirls_result.x_transformed,
@@ -7138,6 +7182,8 @@ pub mod internal {
                         } else {
                             (h_eff.clone(), None)
                         };
+
+                        // P-IRLS already folded any stabilization ridge into h_eff.
 
                         // Use the exact Hessian factorization for the log|H| trace term.
                         // For Firth: factor H_total = h_eff - H_phi (exact) directly without cache,
