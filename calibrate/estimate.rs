@@ -5561,19 +5561,47 @@ pub mod internal {
             //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} [Σ_j u_j c_{jk} b_{jl} b_{jm}]
             //          = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
 
-            // Precompute tensor T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} in O(NP³)
+            // Precompute tensor T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} using faer matmul.
+            // For each slice m: T[:,:,m] = (diag(u) C)^T (diag(b[:,m]) B)
+            //                           = V^T D^(m) B  where V = diag(u) C
+            // This leverages SIMD-optimized BLAS-3 kernels for O(NP²) per slice, O(NP³) total.
             let mut tensor_t = vec![0.0_f64; p * p * p];
-            for j in 0..n {
-                let c_j = c.row(j);
-                let b_j = b.row(j);
-                let u_j = u[j];
+
+            // Build V = diag(u) C  (n × p)
+            let mut v_mat = faer::Mat::<f64>::zeros(n, p);
+            for i in 0..n {
+                let u_i = u[i];
                 for k in 0..p {
-                    let u_c_jk = u_j * c_j[k];
+                    v_mat[(i, k)] = u_i * c[(i, k)];
+                }
+            }
+
+            // For each output column m, compute T[:,:,m] = V^T (diag(b[:,m]) B)
+            for m in 0..p {
+                // Build scaled matrix: rows of B scaled by b[:,m]
+                let mut scaled_b = faer::Mat::<f64>::zeros(n, p);
+                for j in 0..n {
+                    let b_jm = b[(j, m)];
                     for l in 0..p {
-                        let u_c_b_jkl = u_c_jk * b_j[l];
-                        for m in 0..p {
-                            tensor_t[k * p * p + l * p + m] += u_c_b_jkl * b_j[m];
-                        }
+                        scaled_b[(j, l)] = b_jm * b[(j, l)];
+                    }
+                }
+
+                // T_slice = V^T * scaled_B  (p × p matrix)
+                let mut t_slice = faer::Mat::<f64>::zeros(p, p);
+                faer::linalg::matmul::matmul(
+                    t_slice.as_mut(),
+                    faer::Accum::Replace,
+                    v_mat.transpose(),
+                    scaled_b.as_ref(),
+                    1.0,
+                    faer::Par::Seq,
+                );
+
+                // Copy slice into tensor
+                for k in 0..p {
+                    for l in 0..p {
+                        tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
                     }
                 }
             }
