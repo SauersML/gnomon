@@ -7159,7 +7159,7 @@ pub mod internal {
                         // H_total = h_eff - H_phi where H_phi is the Firth curvature matrix.
                         // For non-Firth, H_total = h_eff.
                         // NOTE: h_eff already includes any stabilization ridge from PIRLS.
-                        let (mut h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
+                        let (h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
                             if let LinkFunction::Logit = self.config.link_function().expect("link fn") {
                                 match self.firth_hessian_logit(
                                     &pirls_result.x_transformed,
