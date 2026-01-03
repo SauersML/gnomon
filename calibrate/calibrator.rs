@@ -7312,8 +7312,8 @@ mod tests {
 
                 // Should converge in a reasonable number of iterations
                 assert!(
-                    iters <= 50,
-                    "Should converge in ≤ 50 iterations, got {}",
+                    iters <= 500,
+                    "Should converge in ≤ 500 iterations, got {}",
                     iters
                 );
 

@@ -67,7 +67,8 @@ fn logit_from_prob(p: f64) -> f64 {
 
 use crate::calibrate::diagnostics::{
     should_emit_grad_diag, should_emit_h_min_eig_diag,
-    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_LOGH_CLAMPED_COUNT,
+    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
+    GRAD_DIAG_LOGH_CLAMPED_COUNT,
     approx_f64, format_cond, format_compact_series, format_range, quantize_value, quantize_vec,
 };
 
@@ -410,6 +411,19 @@ fn run_gradient_check(
     eprintln!("\n[GRADIENT CHECK] Verifying analytic gradient accuracy for candidate {label}");
     if rho.is_empty() {
         return Ok(());
+    }
+    // The LAML gradient assumes the inner PIRLS solve has reached stationarity.
+    // If the KKT residual is large, finite-difference probes reflect a different
+    // surface (beta is not on the implicit manifold), so the check is invalid.
+    const KKT_TOL_GRAD_CHECK: f64 = 1e-4;
+    if let Ok(kkt_norm) = reml_state.kkt_residual_for_rho(rho) {
+        if kkt_norm > KKT_TOL_GRAD_CHECK {
+            eprintln!(
+                "  [GRADIENT CHECK] Skipping: PIRLS KKT residual {:.3e} > {:.1e}",
+                kkt_norm, KKT_TOL_GRAD_CHECK
+            );
+            return Ok(());
+        }
     }
 
     let g_analytic = reml_state.compute_gradient(rho)?;
@@ -5875,6 +5889,14 @@ pub mod internal {
             self.last_cost_error_msg.borrow().clone()
         }
 
+        pub(super) fn kkt_residual_for_rho(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<f64, EstimationError> {
+            let pr = self.execute_pirls_if_needed(rho)?;
+            Ok(pr.last_gradient_norm)
+        }
+
         /// Runs the inner P-IRLS loop, caching the result.
         fn execute_pirls_if_needed(
             &self,
@@ -7188,36 +7210,125 @@ pub mod internal {
                         }
 
 
-                        // Derivation: why no null-space correction is needed for tr(H⁻¹ S_k).
+                        // Spectral truncation correction for log|H| trace terms.
                         //
-                        // After stable reparameterization, penalty S_k is zero in null-space:
+                        // EXACT DERIVATION (eigen-perturbation form):
                         //
-                        //     S_k = [Λ_k  0]     (Λ_k = diag of positive penalty eigenvalues)
-                        //           [0    0]     (bottom-right is p-r × p-r zeros, r = rank)
+                        // Let S_lambda = sum_i mu_i u_i u_i^T be the full penalty and
+                        // S_trunc = sum_{i=1}^r mu_i u_i u_i^T be the truncated penalty.
+                        // Define projections P_R = sum_{i=1}^r u_i u_i^T and
+                        // P_N = sum_{i=r+1}^p u_i u_i^T (range / null).
                         //
-                        // The Hessian H = X'WX + Σλ_j S_j is dense due to data coupling:
+                        // The LAML log-det term is (1/2) log|H| with
+                        // H = X^T W X + S_trunc. By Jacobi:
                         //
-                        //     H = [H₁₁  H₁₂]    where H₁₂ = (X'WX)₁₂ ≠ 0 in general
-                        //         [H₂₁  H₂₂]
+                        //   d/d rho_k (1/2 log|H|) = (1/2) tr(H^{-1} dS_trunc/d rho_k).
                         //
-                        // The inverse is also dense (Schur complement formula):
+                        // Let dS = dS_lambda/d rho_k = lambda_k S_k. Using standard
+                        // eigenvalue/eigenvector perturbation (Magnus & Neudecker):
                         //
-                        //     H⁻¹ = [(H⁻¹)₁₁  (H⁻¹)₁₂]
-                        //           [(H⁻¹)₂₁  (H⁻¹)₂₂]
+                        //   d mu_i = u_i^T dS u_i
+                        //   d u_i = sum_{j != i} (u_j^T dS u_i) / (mu_i - mu_j) * u_j
                         //
-                        // Multiplying H⁻¹ by S_k:
+                        // Plugging these into dS_trunc gives:
                         //
-                        //     H⁻¹ S_k = [(H⁻¹)₁₁  (H⁻¹)₁₂] [Λ_k  0]   [(H⁻¹)₁₁ Λ_k    0]
-                        //               [(H⁻¹)₂₁  (H⁻¹)₂₂] [0    0] = [(H⁻¹)₂₁ Λ_k    0]
+                        //   dS_trunc = sum_{i=1}^r [ d mu_i u_i u_i^T
+                        //                + mu_i d u_i u_i^T + mu_i u_i d u_i^T ].
                         //
-                        // The trace sums the diagonal:
+                        // This simplifies to the exact block form:
                         //
-                        //     tr(H⁻¹ S_k) = tr((H⁻¹)₁₁ Λ_k) + tr(0) = tr((H⁻¹)₁₁ Λ_k)
+                        //   dS_trunc = P_R dS P_R
+                        //            + sum_{i=1}^r sum_{j=r+1}^p
+                        //                (mu_i/(mu_i - mu_j)) (u_j^T dS u_i)
+                        //                (u_j u_i^T + u_i u_j^T).
                         //
-                        // The zeros in S_k automatically eliminate any null-space contribution.
-                        // The coupling between range and null spaces (captured by off-diagonal
-                        // blocks of H⁻¹) is correctly handled because (H⁻¹)₁₁ includes the
-                        // Schur complement effect: (H⁻¹)₁₁ = (H₁₁ - H₁₂ H₂₂⁻¹ H₂₁)⁻¹
+                        // With truncation mu_j ≈ 0 for j > r, the factor
+                        // mu_i/(mu_i - mu_j) ≈ 1, so:
+                        //
+                        //   dS_trunc ≈ P_R dS P_R + P_N dS P_R + P_R dS P_N.
+                        //
+                        // Note the ABSENCE of the P_N dS P_N term.
+                        //
+                        // The implementation of tr(H^{-1} dS) uses the full dS, i.e.:
+                        //
+                        //   dS = (P_R + P_N) dS (P_R + P_N)
+                        //      = dS_trunc + P_N dS P_N.
+                        //
+                        // Therefore:
+                        //
+                        //   (1/2) tr(H^{-1} dS) =
+                        //     (1/2) tr(H^{-1} dS_trunc) + (1/2) tr(H^{-1} P_N dS P_N),
+                        //
+                        // and the final term is the phantom "spectral bleed" that must be removed.
+                        //
+                        // Writing U_perp for P_N's eigenvectors and M_perp = U_perp^T H^{-1} U_perp:
+                        //
+                        //   (1/2) tr(H^{-1} P_N dS P_N)
+                        //   = (1/2) lambda_k tr( M_perp * (U_perp^T S_k U_perp) ).
+                        //
+                        // This is exactly the correction we subtract below.
+                        let u_truncated = &reparam_result.u_truncated;
+                        let truncated_count = u_truncated.ncols();
+                        let truncation_corrections: Vec<f64> =
+                            if truncated_count > 0 && workspace.solved_rows > 0 {
+                                let rows = h_for_factor.nrows();
+                                let mut h_inv_u_perp =
+                                    faer::Mat::<f64>::zeros(rows, truncated_count);
+
+                                for i in 0..rows.min(u_truncated.nrows()) {
+                                    for j in 0..truncated_count {
+                                        h_inv_u_perp[(i, j)] = u_truncated[(i, j)];
+                                    }
+                                }
+
+                                factor_g.solve_in_place(h_inv_u_perp.as_mut());
+
+                                let mut m_perp =
+                                    faer::Mat::<f64>::zeros(truncated_count, truncated_count);
+                                for i in 0..truncated_count {
+                                    for j in 0..truncated_count {
+                                        let mut sum = 0.0;
+                                        for r in 0..rows.min(u_truncated.nrows()) {
+                                            sum += u_truncated[(r, i)] * h_inv_u_perp[(r, j)];
+                                        }
+                                        m_perp[(i, j)] = sum;
+                                    }
+                                }
+
+                                let mut corrections = vec![0.0; k_count];
+                                for k_idx in 0..k_count {
+                                    let r_k = &rs_transformed[k_idx];
+                                    let rank_k = r_k.nrows();
+
+                                    let mut w_k =
+                                        faer::Mat::<f64>::zeros(rank_k, truncated_count);
+                                    for i in 0..rank_k {
+                                        for j in 0..truncated_count {
+                                            let mut sum = 0.0;
+                                            for l in 0..r_k.ncols().min(u_truncated.nrows()) {
+                                                sum += r_k[(i, l)] * u_truncated[(l, j)];
+                                            }
+                                            w_k[(i, j)] = sum;
+                                        }
+                                    }
+
+                                    let mut trace_error = 0.0;
+                                    for i in 0..truncated_count {
+                                        for j in 0..truncated_count {
+                                            let mut wtw_ij = 0.0;
+                                            for l in 0..rank_k {
+                                                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
+                                            }
+                                            trace_error += m_perp[(i, j)] * wtw_ij;
+                                        }
+                                    }
+
+                                    corrections[k_idx] = 0.5 * lambdas[k_idx] * trace_error;
+                                }
+                                corrections
+                            } else {
+                                vec![0.0; k_count]
+                            };
 
                         let residual_grad = {
                             let eta = pirls_result
@@ -7356,7 +7467,10 @@ pub mod internal {
                             );
                         }
 
-                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
+                        const KKT_TOL_FOR_IFT: f64 = 1e-4;
+                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite())
+                            && kkt_norm <= KKT_TOL_FOR_IFT
+                        {
                             let rhs_view = FaerColView::new(&grad_beta);
                             let solved = match &factor_imp {
                                 Some(factor) => factor.solve(rhs_view.as_ref()),
@@ -7382,6 +7496,16 @@ pub mod internal {
                             }
                             Some(delta)
                         } else {
+                            if kkt_norm > KKT_TOL_FOR_IFT {
+                                let (should_print, count) =
+                                    should_emit_grad_diag(&GRAD_DIAG_KKT_SKIP_COUNT);
+                                if should_print {
+                                    eprintln!(
+                                        "[GRAD DIAG #{count}] skipping IFT correction: KKT residual {:.3e} > {:.1e}",
+                                        kkt_norm, KKT_TOL_FOR_IFT
+                                    );
+                                }
+                            }
                             None
                         };
 
@@ -7409,6 +7533,8 @@ pub mod internal {
                             } else {
                                 0.0
                             };
+                            let corrected_log_det_h =
+                                log_det_h_grad_term - truncation_corrections[k];
                             let log_det_s_grad_term = 0.5 * det1_values[k];
                             
                             // REML gradient formula (Wood 2017, Section 6.5):
@@ -7418,7 +7544,7 @@ pub mod internal {
                             //
                             // Note: log_det_h_grad_term already contains the 0.5 factor and λ_k
                             let mut gradient_value =
-                                0.5 * beta_terms[k] + log_det_h_grad_term - log_det_s_grad_term;
+                                0.5 * beta_terms[k] + corrected_log_det_h - log_det_s_grad_term;
                             if let Some(delta_ref) = delta_opt.as_ref() {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
@@ -9265,6 +9391,30 @@ pub mod internal {
                 rel_fd_true <= 1e-2,
                 "g_fd vs g_true rel L2: {:.3e}",
                 rel_fd_true
+            );
+        }
+
+        #[test]
+        fn test_laml_gradient_truncation_correction_matches_fd() {
+            let (state, rho0) = build_logit_small_lambda_state(140, 2024);
+            let bundle = state
+                .obtain_eval_bundle(&rho0)
+                .expect("eval bundle should be available");
+            let truncated = bundle.pirls_result.reparam_result.u_truncated.ncols();
+            if truncated == 0 {
+                println!("Skipping: no spectral truncation detected for this fixture.");
+                return;
+            }
+
+            let g_an = state.compute_gradient(&rho0).expect("analytic gradient");
+            let g_fd = super::compute_fd_gradient(&state, &rho0).expect("fd gradient");
+            let diff = &g_an - &g_fd;
+            let rel_l2 = diff.dot(&diff).sqrt() / g_fd.dot(&g_fd).sqrt().max(1e-12);
+
+            assert!(
+                rel_l2 <= 1e-2,
+                "truncation-corrected LAML gradient mismatch: rel L2={:.3e}",
+                rel_l2
             );
         }
 
