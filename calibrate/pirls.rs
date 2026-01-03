@@ -408,8 +408,11 @@ pub struct WorkingModelPirlsResult {
 }
 
 // Fixed stabilization ridge for PIRLS/PLS. This is treated as an explicit penalty
-// term (0.5 * ridge * ||beta||^2) and is constant w.r.t. rho, keeping the
-// outer objective smooth and the gradient consistent.
+// term (0.5 * ridge * ||beta||^2) and is constant w.r.t. rho.
+//
+// Math note: letting ridge depend on rho makes the LAML/REML objective non-smooth
+// (ridge flips when the Hessian spectrum crosses a threshold). A fixed ridge keeps
+// the objective differentiable in rho and preserves the envelope-theorem gradient.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-6;
 
 struct GamWorkingModel<'a> {
@@ -2185,8 +2188,9 @@ pub fn solve_penalized_least_squares(
     }
 
     // 5. Fixed Ridge Regularization (rho-independent)
-    // Apply a constant ridge whenever penalties are present so the objective
-    // is smooth in rho and cost/gradient share the exact same matrix.
+    // Apply a constant ridge whenever penalties are present:
+    //   H = X'WX + S_λ + ridge * I
+    // This makes the objective smooth in rho and keeps cost/gradient consistent.
     let has_penalty = e_transformed.nrows() > 0;
     let use_svd_path = !has_penalty;
     let nugget = if has_penalty {
@@ -4266,6 +4270,7 @@ fn ensure_positive_definite_with_ridge(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<f64, EstimationError> {
+    // Always apply the same ridge to avoid rho-dependent kinks in the objective.
     let ridge = if FIXED_STABILIZATION_RIDGE > 0.0 {
         FIXED_STABILIZATION_RIDGE
     } else {

@@ -6702,9 +6702,9 @@ pub mod internal {
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
                 // When we treat a stabilization ridge as a true penalty term, the
-                // penalty matrix becomes S_λ + ridge * I.  For exactness, both the
+                // penalty matrix becomes S_λ + ridge * I. For exactness, both the
                 // log|S| term in the cost and the derivative d/dρ_k log|S| must be
-                // computed using this ridged matrix.  The derivative is:
+                // computed using this ridged matrix. The derivative is:
                 //
                 //   det1[k] = d/dρ_k log|S_λ + ridge I|
                 //           = λ_k * tr((S_λ + ridge I)^{-1} S_k)
@@ -8843,6 +8843,8 @@ pub mod internal {
             if ridge_used <= 0.0 {
                 return Array1::from(pr.reparam_result.det1.to_vec());
             }
+            // With a fixed ridge, the penalty term is log|S_λ + ridge I|_+.
+            // The exact derivative is λ_k * tr((S_λ + ridge I)^{-1} S_k).
             let p_dim = pr.reparam_result.s_transformed.nrows();
             let mut s_ridge = pr.reparam_result.s_transformed.clone();
             for i in 0..p_dim {
