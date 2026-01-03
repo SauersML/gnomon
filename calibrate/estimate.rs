@@ -9109,8 +9109,63 @@ pub mod internal {
                 .expect("pirls")
                 .ridge_used;
 
-            // Reference (true) gradient assembled purely from numeric pieces consistent with the cost
-            let g_true = &g_pll + &g_half_logh_full - &(0.5 * &g_log_s);
+            let pr = state.execute_pirls_if_needed(&rho0).expect("pirls");
+            let beta_ref = pr.beta_transformed.as_ref();
+            let lambdas = rho0.mapv(f64::exp);
+            let mut beta_terms = Array1::<f64>::zeros(lambdas.len());
+            for k in 0..lambdas.len() {
+                let r_k = &pr.reparam_result.rs_transformed[k];
+                let r_beta = r_k.dot(beta_ref);
+                let s_k_beta = r_k.t().dot(&r_beta);
+                beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
+            }
+            // Reference (true) gradient assembled from exact partials plus the
+            // implicit correction when the PIRLS solution is not perfectly stationary.
+            let mut g_true = 0.5 * &beta_terms + &g_half_logh_s - &(0.5 * &g_log_s);
+            let residual_grad = {
+                let eta = pr.solve_mu.mapv(|m| logit_from_prob(m));
+                let working_residual = &eta - &pr.solve_working_response;
+                let weighted_residual = &pr.solve_weights * &working_residual;
+                let gradient_data = pr.x_transformed.transpose_vector_multiply(&weighted_residual);
+                let s_beta = pr.reparam_result.s_transformed.dot(beta_ref);
+                if ridge_used > 0.0 {
+                    gradient_data + s_beta + beta_ref.mapv(|v| ridge_used * v)
+                } else {
+                    gradient_data + s_beta
+                }
+            };
+            let h_eff = state
+                .effective_hessian(&pr)
+                .expect("effective Hessian")
+                .0;
+            let factor_g = state.get_faer_factor(&rho0, &h_eff);
+            let logh_beta_grad = state.logh_beta_grad_logit(
+                &pr.x_transformed,
+                &pr.solve_mu,
+                &pr.solve_weights,
+                &factor_g,
+            );
+            let mut grad_beta = residual_grad.clone();
+            if let Some(logh_grad) = logh_beta_grad {
+                grad_beta += &(0.5 * logh_grad);
+            }
+            if grad_beta.iter().all(|v| v.is_finite()) {
+                let rhs_view = FaerColView::new(&grad_beta);
+                let solved = factor_g.solve(rhs_view.as_ref());
+                let mut delta = Array1::zeros(grad_beta.len());
+                for i in 0..delta.len() {
+                    delta[i] = solved[(i, 0)];
+                }
+                let mut correction = Array1::<f64>::zeros(lambdas.len());
+                for k in 0..lambdas.len() {
+                    let r_k = &pr.reparam_result.rs_transformed[k];
+                    let r_beta = r_k.dot(beta_ref);
+                    let s_k_beta = r_k.t().dot(&r_beta);
+                    let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                    correction[k] = -delta.dot(&u_k);
+                }
+                g_true += &correction;
+            }
 
             // Diagnostics (printed on failure)
             eprintln!(
@@ -9126,14 +9181,26 @@ pub mod internal {
             eprintln!("  ½logH(full) = {}", fmt_vec(&g_half_logh_full));
             eprintln!("  -½logS      = {}", fmt_vec(&(-0.5 * &g_log_s)));
 
-            // Gate: code gradient should match FD(cost). The component-wise numeric
-            // assembly is diagnostic only and can be noisy in stiff regimes.
+            // Gate: code gradient should match both FD(cost) and the assembled reference.
             let n_fd = g_fd.mapv(|x| x * x).sum().sqrt().max(1e-12);
             let rel_an_fd = (&g_an - &g_fd).mapv(|x| x * x).sum().sqrt() / n_fd;
             assert!(
                 rel_an_fd <= 1e-2,
                 "g_an vs g_fd rel L2: {:.3e}",
                 rel_an_fd
+            );
+            let n_true = g_true.mapv(|x| x * x).sum().sqrt().max(1e-12);
+            let rel_an_true = (&g_an - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
+            let rel_fd_true = (&g_fd - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
+            assert!(
+                rel_an_true <= 1e-2,
+                "g_an vs g_true rel L2: {:.3e}",
+                rel_an_true
+            );
+            assert!(
+                rel_fd_true <= 1e-2,
+                "g_fd vs g_true rel L2: {:.3e}",
+                rel_fd_true
             );
         }
 
