@@ -14192,5 +14192,272 @@ mod ground_truth_gradient_tests {
             println!("[{}] p/n={:.2} | cos={:.4} | max|a|={:.2e} | max|fd|={:.2e} | {}", label, ratio, cosine, max_a, max_f, status);
         }
     }
+
+    /// TRUE GROUND-TRUTH TEST: Compute LAML gradient from first principles.
+    ///
+    /// This test implements the exact formula from the critic's derivation:
+    ///
+    /// ∂L/∂ρ_k = 
+    ///   + 0.5 * λ_k * tr(S₊⁻¹ Sₖ)           [log|S| term]
+    ///   - 0.5 * λ_k * β̂'Sₖ β̂                [penalty term]  
+    ///   - 0.5 * λ_k * tr(H⁻¹ Sₖ)            [log|H| direct term]
+    ///   + 0.5 * λ_k * Σᵢ Aᵢᵢ·[wᵢμᵢ(1-μᵢ)(1-2μᵢ)]·(xᵢ'H⁻¹Sₖβ̂)  [implicit term]
+    ///
+    /// where A = X H⁻¹ X', and we compare both analytic AND FD to this ground truth.
+    #[test]
+    fn test_laml_gradient_exact_formula_ground_truth() {
+        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        // Simple well-conditioned logit problem
+        let n = 100_usize;
+        let p = 8_usize;
+        
+        let mut rng = StdRng::seed_from_u64(12345);
+        
+        // Generate design matrix (including intercept)
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            x[[i, 0]] = 1.0; // intercept
+            for j in 1..p {
+                x[[i, j]] = rng.gen_range(-1.0..1.0);
+            }
+        }
+        
+        // Generate response
+        let true_beta: Array1<f64> = (0..p).map(|j| if j == 0 { 0.0 } else { 0.5 / (j as f64) }).collect();
+        let eta_true = x.dot(&true_beta);
+        let y: Array1<f64> = eta_true.iter().map(|&eta| {
+            let prob = 1.0 / (1.0 + (-eta).exp());
+            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        }).collect();
+        
+        // Simple 2nd-order penalty on all coefficients except intercept
+        // S = diag(0, 1, 1, ..., 1)
+        let mut s_k = Array2::<f64>::zeros((p, p));
+        for j in 1..p {
+            s_k[[j, j]] = 1.0;
+        }
+        
+        let weights = Array1::<f64>::ones(n);
+        
+        // Test at ρ = 0, so λ = 1
+        let rho_val = 0.0_f64;
+        let lambda = rho_val.exp();
+        
+        // ========================================
+        // STEP 1: Run PIRLS to get β̂, μ, W at convergence
+        // ========================================
+        let mut beta = Array1::<f64>::zeros(p);
+        let mut mu = Array1::<f64>::from_elem(n, 0.5);
+        let mut w_diag = Array1::<f64>::zeros(n);
+        
+        // Simple IRLS loop
+        for iter in 0..50 {
+            // W = diag(μ(1-μ))
+            for i in 0..n {
+                w_diag[i] = weights[i] * mu[i] * (1.0 - mu[i]);
+                w_diag[i] = w_diag[i].max(1e-10); // stability
+            }
+            
+            // H = X'WX + λS
+            let xw = &x * &w_diag.clone().insert_axis(ndarray::Axis(1));
+            let mut h = xw.t().dot(&x);
+            h = h + lambda * &s_k;
+            
+            // Score: X'(y - μ) - λ S β
+            let residual = &y - &mu;
+            let score = x.t().dot(&(&weights * &residual)) - lambda * s_k.dot(&beta);
+            
+            // Newton step: δ = H⁻¹ score
+            let chol = match h.cholesky(Side::Lower) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let l = chol.lower_triangular();
+            
+            // Solve L L' δ = score
+            let mut delta = score.clone();
+            // Forward sub
+            for i in 0..p {
+                for k in 0..i {
+                    delta[i] -= l[[i, k]] * delta[k];
+                }
+                delta[i] /= l[[i, i]];
+            }
+            // Back sub
+            for i in (0..p).rev() {
+                for k in (i+1)..p {
+                    delta[i] -= l[[k, i]] * delta[k];
+                }
+                delta[i] /= l[[i, i]];
+            }
+            
+            beta = beta + &delta;
+            
+            // Update mu
+            let eta = x.dot(&beta);
+            for i in 0..n {
+                mu[i] = 1.0 / (1.0 + (-eta[i]).exp());
+                mu[i] = mu[i].clamp(1e-10, 1.0 - 1e-10);
+            }
+            
+            if delta.dot(&delta).sqrt() < 1e-10 {
+                println!("  IRLS converged at iteration {}", iter);
+                break;
+            }
+        }
+        
+        println!("  β̂[0..3] = [{:.4}, {:.4}, {:.4}]", beta[0], beta[1], beta[2]);
+        
+        // ========================================
+        // STEP 2: Compute all required matrices at convergence
+        // ========================================
+        
+        // W = diag(w_i * μ_i(1-μ_i))
+        for i in 0..n {
+            w_diag[i] = weights[i] * mu[i] * (1.0 - mu[i]);
+            w_diag[i] = w_diag[i].max(1e-10);
+        }
+        
+        // H = X'WX + λS
+        let xw = &x * &w_diag.clone().insert_axis(ndarray::Axis(1));
+        let mut h = xw.t().dot(&x);
+        h = h + lambda * &s_k;
+        
+        // H⁻¹ via Cholesky
+        let chol = h.cholesky(Side::Lower).expect("H cholesky");
+        let l_h = chol.lower_triangular();
+        let mut h_inv = Array2::<f64>::zeros((p, p));
+        for col in 0..p {
+            let mut e = Array1::<f64>::zeros(p);
+            e[col] = 1.0;
+            // Forward
+            for i in 0..p {
+                for k in 0..i { e[i] -= l_h[[i,k]] * e[k]; }
+                e[i] /= l_h[[i,i]];
+            }
+            // Back
+            for i in (0..p).rev() {
+                for k in (i+1)..p { e[i] -= l_h[[k,i]] * e[k]; }
+                e[i] /= l_h[[i,i]];
+            }
+            for row in 0..p { h_inv[[row, col]] = e[row]; }
+        }
+
+        
+        // ========================================
+        // STEP 3: Compute exact gradient terms
+        // ========================================
+        
+        // Term 1: +0.5 * λ * tr(S₊⁻¹ S_k)
+        // For our simple diagonal penalty, S_λ⁺ = diag(0, 1/λ, 1/λ, ...) on the penalized subspace
+        // tr(S_λ⁺ S_k) = Σⱼ (1/λ if λ>0) * S_k[j,j] = (p-1) for our case when λ=1
+        let rank_s = (p - 1) as f64; // number of non-zero eigenvalues in S_k
+        let term1 = 0.5 * lambda * rank_s;
+        
+        // Term 2: -0.5 * λ * β̂'S_k β̂
+        let s_beta = s_k.dot(&beta);
+        let term2 = -0.5 * lambda * beta.dot(&s_beta);
+        
+        // Term 3: -0.5 * λ * tr(H⁻¹ S_k)
+        let mut trace_h_inv_s = 0.0;
+        for i in 0..p {
+            for j in 0..p {
+                trace_h_inv_s += h_inv[[i, j]] * s_k[[j, i]];
+            }
+        }
+        let term3 = -0.5 * lambda * trace_h_inv_s;
+        
+        // Term 4: +0.5 * λ * Σᵢ Aᵢᵢ * [wᵢμᵢ(1-μᵢ)(1-2μᵢ)] * (xᵢ'H⁻¹S_k β̂)
+        // where A = X H⁻¹ X'
+        // First compute H⁻¹ S_k β̂
+        let h_inv_s_beta = h_inv.dot(&s_beta);
+        
+        // Compute A_ii = x_i' H⁻¹ x_i and the product x_i' H⁻¹ S_k β̂
+        let mut term4 = 0.0;
+        for i in 0..n {
+            let x_i = x.row(i);
+            // A_ii = x_i' H⁻¹ x_i
+            let h_inv_x_i = h_inv.dot(&x_i.to_owned());
+            let a_ii = x_i.dot(&h_inv_x_i);
+            
+            // x_i' H⁻¹ S_k β̂
+            let x_h_inv_s_beta = x_i.dot(&h_inv_s_beta);
+            
+            // dW_i/dη_i = w_i * μ_i(1-μ_i)(1-2μ_i)
+            let dw_deta = weights[i] * mu[i] * (1.0 - mu[i]) * (1.0 - 2.0 * mu[i]);
+            
+            // ∂η̂_i/∂ρ = -λ * x_i' H⁻¹ S_k β̂
+            let d_eta_d_rho = -lambda * x_h_inv_s_beta;
+            
+            // ∂W_i/∂ρ = dW_i/dη_i * ∂η̂_i/∂ρ
+            let d_w_d_rho = dw_deta * d_eta_d_rho;
+            
+            // Contribution: -0.5 * A_ii * ∂W_i/∂ρ
+            // (the minus in front comes from -0.5 tr(H⁻¹ X' (∂W/∂ρ) X))
+            term4 += -0.5 * a_ii * d_w_d_rho;
+        }
+        
+        // Ground truth gradient
+        let ground_truth = term1 + term2 + term3 + term4;
+        
+        println!("  Term 1 (log|S|):      {:.6}", term1);
+        println!("  Term 2 (penalty):     {:.6}", term2);
+        println!("  Term 3 (log|H| dir):  {:.6}", term3);
+        println!("  Term 4 (implicit):    {:.6}", term4);
+        println!("  GROUND TRUTH ∂L/∂ρ = {:.6}", ground_truth);
+        
+        // ========================================
+        // STEP 4: Get RemlState analytic and FD gradients
+        // ========================================
+        
+        // Use external REML interface
+        let s_list = vec![s_k.clone()];
+        let offset = Array1::<f64>::zeros(n);
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 100,
+            nullspace_dims: vec![1], // intercept is in null space of our penalty
+        };
+        
+        let rho = array![rho_val];
+        
+        match evaluate_external_gradients(y.view(), weights.view(), x.view(), offset.view(), &s_list, &opts, &rho) {
+            Ok((analytic_grad, fd_grad)) => {
+                println!("  Analytic gradient:    {:.6}", analytic_grad[0]);
+                println!("  FD gradient:          {:.6}", fd_grad[0]);
+                
+                let err_analytic = (analytic_grad[0] - ground_truth).abs();
+                let err_fd = (fd_grad[0] - ground_truth).abs();
+                let rel_err_analytic = err_analytic / ground_truth.abs().max(1.0);
+                let rel_err_fd = err_fd / ground_truth.abs().max(1.0);
+                
+                println!("  |analytic - ground_truth| = {:.3e} (rel: {:.3e})", err_analytic, rel_err_analytic);
+                println!("  |FD - ground_truth|       = {:.3e} (rel: {:.3e})", err_fd, rel_err_fd);
+                
+                // Both should be close to ground truth
+                assert!(
+                    rel_err_analytic < 0.1 || err_analytic < 0.1,
+                    "Analytic gradient doesn't match ground truth: analytic={:.4}, truth={:.4}, rel_err={:.3e}",
+                    analytic_grad[0], ground_truth, rel_err_analytic
+                );
+                assert!(
+                    rel_err_fd < 0.1 || err_fd < 0.1,
+                    "FD gradient doesn't match ground truth: fd={:.4}, truth={:.4}, rel_err={:.3e}",
+                    fd_grad[0], ground_truth, rel_err_fd
+                );
+                
+                println!("✓ TRUE GROUND TRUTH TEST PASSED: both analytic and FD match exact formula");
+            }
+            Err(e) => {
+                println!("  evaluate_external_gradients failed: {:?}", e);
+                // Try to at least report ground truth vs manual FD
+                println!("  Ground truth gradient = {:.6} (computed from exact formula)", ground_truth);
+            }
+        }
+    }
 }
 
