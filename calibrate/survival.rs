@@ -1564,7 +1564,7 @@ impl WorkingModelSurvival {
         }
 
         let d_vec = self.event_target.mapv(f64::from);
-        let w_event = &self.sample_weight * &d_vec;
+        let w_event = self.sample_weight.as_ref() * &d_vec;
         let w_event_scaled = &w_event * &derivative_scale;
         let w_event_hess = w_event.mapv(f64::sqrt) * &derivative_scale;
 
@@ -1572,8 +1572,8 @@ impl WorkingModelSurvival {
         let term2 = &h_exit - &h_entry;
         let log_likelihood = self.sample_weight.dot(&(term1 - term2));
 
-        let w_h_e = &self.sample_weight * &h_exit;
-        let w_h_s = &self.sample_weight * &h_entry;
+        let w_h_e = self.sample_weight.as_ref() * &h_exit;
+        let w_h_s = self.sample_weight.as_ref() * &h_entry;
         let mut gradient = -self.layout.combined_exit.t().dot(&w_h_e);
         gradient += &self.layout.combined_entry.t().dot(&w_h_s);
         gradient += &self.layout.combined_exit.t().dot(&w_event);
