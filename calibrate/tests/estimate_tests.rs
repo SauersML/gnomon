@@ -1,4 +1,3 @@
-
 // --- Unit Tests ---
 #[cfg(test)]
 mod tests {
@@ -7057,4 +7056,5 @@ fn test_laml_gradient_firth_exact_formula_ground_truth() {
             panic!("evaluate_external_gradients failed: {:?}\nGround truth = {:.6}", e, ground_truth);
         }
     }
+
 }

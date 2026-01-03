@@ -7464,12 +7464,12 @@ pub mod internal {
                                 Some(factor) => factor.solve(rhs_view.as_ref()),
                                 None => factor_g.solve(rhs_view.as_ref()),
                             };
-                            let mut delta = Array1::zeros(grad_beta.len());
+                            let mut delta: Array1<f64> = Array1::zeros(grad_beta.len());
                             for i in 0..delta.len() {
                                 delta[i] = solved[(i, 0)];
                             }
                             let delta_inf =
-                                delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                                delta.iter().fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
                             if delta_inf < 1e-8 {
                                 let (should_print, count) = should_emit_grad_diag(&GRAD_DIAG_DELTA_ZERO_COUNT);
                                 if should_print {
@@ -7527,7 +7527,7 @@ pub mod internal {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
                                 let s_k_beta = r_k.t().dot(&r_beta);
-                                let u_k = s_k_beta.mapv(|v| v * lambdas[k]);
+                                let u_k: Array1<f64> = s_k_beta.mapv(|v| v * lambdas[k]);
                                 // Indirect term from chain rule:
                                 // dV/dρ_k = ∂V/∂ρ_k + (∇β V)ᵀ dβ/dρ_k.
                                 // Differentiate stationarity g = score - Sβ (+ Firth): ∂g/∂β = -H,
@@ -7838,10 +7838,10 @@ pub mod internal {
     #[cfg(test)]
     mod remlstate_tests {
         use super::*;
-        use ndarray::{Array1, Array2};
         use crate::calibrate::model::{
             BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
         };
+        use ndarray::{Array1, Array2};
 
         #[test]
         fn test_remlstate_helpers_basic() {
