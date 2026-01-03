@@ -1,4 +1,4 @@
-use crate::calibrate::construction::{ModelLayout, ReparamResult, calculate_condition_number};
+use crate::calibrate::construction::{ModelLayout, ReparamResult};
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError, array1_to_col_mat_mut,
@@ -406,6 +406,11 @@ pub struct WorkingModelPirlsResult {
     pub last_step_halving: usize,
     pub max_abs_eta: f64,
 }
+
+// Fixed stabilization ridge for PIRLS/PLS. This is treated as an explicit penalty
+// term (0.5 * ridge * ||beta||^2) and is constant w.r.t. rho, keeping the
+// outer objective smooth and the gradient consistent.
+const FIXED_STABILIZATION_RIDGE: f64 = 1e-6;
 
 struct GamWorkingModel<'a> {
     x_transformed: Option<DesignMatrix>,
@@ -962,18 +967,6 @@ fn compute_firth_hat_and_half_logdet_sparse(
 
 
 
-fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0, f64::max)
-        .max(1.0)
-}
-
-
-
 fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -1281,9 +1274,6 @@ fn record_penalized_deviance(value: f64) {
     });
 }
 
-const PLS_MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-
-
 /// The status of the P-IRLS convergence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PirlsStatus {
@@ -1584,9 +1574,12 @@ pub fn fit_model_for_fixed_rho<'a>(
         let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
         let deviance = calculate_deviance(y, &final_mu, link_function, prior_weights);
         let mut stabilized_hessian = penalized_hessian.clone();
-        let extra_ridge =
-            ensure_positive_definite_with_ridge(&mut stabilized_hessian, "PIRLS penalized Hessian")?;
-        let ridge_used = base_ridge + extra_ridge;
+        let ridge_used = base_ridge;
+        if ridge_used > 0.0 {
+            for i in 0..stabilized_hessian.nrows() {
+                stabilized_hessian[[i, i]] += ridge_used;
+            }
+        }
         if ridge_used > 0.0 {
             let ridge_penalty = ridge_used * beta_transformed.as_ref().dot(beta_transformed.as_ref());
             penalty_term += ridge_penalty;
@@ -2131,11 +2124,6 @@ pub fn solve_penalized_least_squares(
     y: ArrayView1<f64>,
     link_function: LinkFunction,
 ) -> Result<(StablePLSResult, usize), EstimationError> {
-    // Standardize nugget usage across the codebase.
-    // LAML_RIDGE (1e-8) is a good baseline for ensuring positive definiteness
-    // without distorting valid curvature.
-    let nugget_fraction = 1e-8;
-    
     // Dimensions
     let p_dim = x_transformed.ncols();
 
@@ -2196,46 +2184,17 @@ pub fn solve_penalized_least_squares(
         }
     }
 
-    // 5. Conditional Nugget Regularization
-    // Only apply nugget when the matrix is ill-conditioned, to avoid biasing
-    // well-conditioned problems. This allows normal equations tests with strict
-    // tolerances (1e-10) to pass on well-posed problems.
-    let diag_scale = max_abs_diag(&penalized_hessian);
-    let h_view = FaerArrayView::new(&penalized_hessian);
-    
-    // Check if regularization is needed
-    let (needs_nugget, numerical_rank) = {
-        let eig_result = h_view.as_ref().self_adjoint_eigenvalues(Side::Lower);
-        match eig_result {
-            Ok(eigenvalues) => {
-                let max_eig: f64 = eigenvalues.iter().fold(0.0f64, |a: f64, &b: &f64| a.max(b));
-                let min_eig: f64 = eigenvalues.iter().fold(f64::INFINITY, |a: f64, &b: &f64| a.min(b));
-                
-                // Use relative tolerance for rank detection
-                let rank_threshold = max_eig * 1e-10;
-                let num_rank = eigenvalues.iter().filter(|&&e: &&f64| e > rank_threshold).count();
-                
-                // Need nugget if min eigenvalue is too small or negative
-                let cond = max_eig / min_eig.max(1e-300);
-                let ill_conditioned = min_eig <= 0.0 || cond > 1e12;
-                
-                (ill_conditioned, num_rank)
-            }
-            Err(_) => (true, p_dim),  // Fall back to nugget if eigendecomp fails
-        }
+    // 5. Fixed Ridge Regularization (rho-independent)
+    // Apply a constant ridge whenever penalties are present so the objective
+    // is smooth in rho and cost/gradient share the exact same matrix.
+    let has_penalty = e_transformed.nrows() > 0;
+    let use_svd_path = !has_penalty;
+    let nugget = if has_penalty {
+        FIXED_STABILIZATION_RIDGE
+    } else {
+        0.0
     };
-    
-    // For truly rank-deficient problems with NO penalty, use SVD pseudoinverse
-    // to get the exact minimum-norm least squares solution. This preserves the
-    // mathematical projection property: X β projects z onto Col(X) exactly.
-    // When penalty is present (e_transformed has rows), regularization is fine.
-    let use_svd_path = needs_nugget && e_transformed.nrows() == 0;
-    let nugget = if needs_nugget && !use_svd_path { 
-        diag_scale * nugget_fraction 
-    } else { 
-        0.0 
-    };
-    
+
     let mut regularized_hessian = penalized_hessian.clone();
     if nugget > 0.0 {
         for i in 0..p_dim {
@@ -2280,11 +2239,12 @@ pub fn solve_penalized_least_squares(
                 result
             }
             Err(_) => {
-                // Fallback to LDLT with nugget if eigendecomposition fails
+                // Fallback to LDLT with fixed ridge if eigendecomposition fails
                 let mut reg_h = penalized_hessian.clone();
-                let fallback_nugget = diag_scale * nugget_fraction;
-                for i in 0..p_dim {
-                    reg_h[[i, i]] += fallback_nugget;
+                if FIXED_STABILIZATION_RIDGE > 0.0 {
+                    for i in 0..p_dim {
+                        reg_h[[i, i]] += FIXED_STABILIZATION_RIDGE;
+                    }
                 }
                 let h_reg_view = FaerArrayView::new(&reg_h);
                 let rhs_mat = {
@@ -2356,9 +2316,9 @@ pub fn solve_penalized_least_squares(
             penalized_hessian: penalized_hessian, // Return original H for derivatives
             edf,
             scale,
-            ridge_used: nugget, // Report the actual nugget used (may be 0)
+            ridge_used: nugget, // Report the fixed ridge (may be 0 without penalties)
         },
-        numerical_rank, // Return the detected numerical rank
+        p_dim, // Numerical rank is unused with fixed ridge; return full dim
     ))
 }
 fn calculate_edf(
@@ -4306,69 +4266,28 @@ fn ensure_positive_definite_with_ridge(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<f64, EstimationError> {
-    // If already PD, do nothing
-    if hess.cholesky(Side::Lower).is_ok() {
-        return Ok(0.0);
-    }
-
-    let cond_est = calculate_condition_number(hess).ok();
-    let diag_scale = max_abs_diag(hess);
-    let min_shift = if diag_scale > 0.0 {
-        diag_scale * 1e-10
+    let ridge = if FIXED_STABILIZATION_RIDGE > 0.0 {
+        FIXED_STABILIZATION_RIDGE
     } else {
-        1e-12
+        0.0
     };
-
-    let min_eig = hess
-        .clone()
-        .eigh(Side::Lower)
-        .ok()
-        .and_then(|(evals, _)| evals.iter().cloned().reduce(f64::min));
-
-    let mut ridge = match min_eig {
-        Some(min_val) if min_val.is_finite() => (min_shift - min_val).max(0.0),
-        _ => min_shift,
-    };
-    if !ridge.is_finite() || ridge <= 0.0 {
-        ridge = min_shift;
-    }
-
-    let mut total_added = 0.0;
-    for attempt in 0..=PLS_MAX_FACTORIZATION_ATTEMPTS {
-        if ridge > total_added {
-            let delta = ridge - total_added;
-            for i in 0..hess.nrows() {
-                hess[[i, i]] += delta;
-            }
-            total_added = ridge;
-        }
-
-        if hess.cholesky(Side::Lower).is_ok() {
-            if total_added > 0.0 {
-                let cond_display = cond_est
-                    .map(|c| format!("{c:.2e}"))
-                    .unwrap_or_else(|| "unavailable".to_string());
-                log::warn!(
-                    "{} not PD; added ridge {:.1e} (cond ≈ {}) to ensure stability.",
-                    label,
-                    total_added,
-                    cond_display
-                );
-            }
-            return Ok(total_added);
-        }
-
-        if attempt == PLS_MAX_FACTORIZATION_ATTEMPTS {
-            break;
-        }
-
-        ridge = (ridge * 10.0).max(min_shift);
-        if !ridge.is_finite() || ridge <= 0.0 {
-            ridge = min_shift;
+    if ridge > 0.0 {
+        for i in 0..hess.nrows() {
+            hess[[i, i]] += ridge;
         }
     }
 
-    // As a last resort, report indefiniteness with min eigenvalue for diagnostics
+    if hess.cholesky(Side::Lower).is_ok() {
+        if ridge > 0.0 {
+            log::debug!(
+                "{} stabilized with fixed ridge {:.1e}.",
+                label,
+                ridge
+            );
+        }
+        return Ok(ridge);
+    }
+
     if let Ok((evals, _)) = hess.eigh(Side::Lower) {
         let min_eig = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         return Err(EstimationError::HessianNotPositiveDefinite {
