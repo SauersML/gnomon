@@ -6693,7 +6693,7 @@ pub mod internal {
             let rs_transposed = &reparam_result.rs_transposed;
 
             let mut includes_prior = false;
-            let (gradient_result, gradient_snapshot) = {
+            let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
                 let mut workspace_ref = self.workspace.lock().unwrap();
                 let workspace = &mut *workspace_ref;
                 let len = p.len();
@@ -6701,6 +6701,7 @@ pub mod internal {
                 workspace.set_lambda_values(p);
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
+                let mut applied_truncation_corrections: Option<Vec<f64>> = None;
                 // When we treat a stabilization ridge as a true penalty term, the
                 // penalty matrix becomes S_λ + ridge * I. For exactness, both the
                 // log|S| term in the cost and the derivative d/dρ_k log|S| must be
@@ -6962,6 +6963,7 @@ pub mod internal {
                     } else {
                         vec![0.0; lambdas.len()]
                     };
+                    applied_truncation_corrections = Some(gaussian_corrections.clone());
 
                     let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
                     let det1_values = &det1_values;
@@ -7307,6 +7309,7 @@ pub mod internal {
                             } else {
                                 vec![0.0; k_count]
                             };
+                        applied_truncation_corrections = Some(truncation_corrections.clone());
 
                         let residual_grad = {
                             let eta = pirls_result
@@ -7564,7 +7567,7 @@ pub mod internal {
                     Some(gradient_result.clone())
                 };
 
-                (gradient_result, gradient_snapshot)
+                (gradient_result, gradient_snapshot, applied_truncation_corrections)
             };
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
@@ -7577,7 +7580,12 @@ pub mod internal {
                 && !self.layout.penalty_map.is_empty()
             {
                 // Run all diagnostics and emit a single summary if issues found
-                self.run_gradient_diagnostics(p, bundle, &gradient_snapshot);
+                self.run_gradient_diagnostics(
+                    p,
+                    bundle,
+                    &gradient_snapshot,
+                    applied_truncation_corrections.as_deref(),
+                );
             }
 
             Ok(gradient_result)
@@ -7595,6 +7603,7 @@ pub mod internal {
             rho: &Array1<f64>,
             bundle: &EvalShared,
             analytic_grad: &Array1<f64>,
+            applied_truncation_corrections: Option<&[f64]>,
         ) {
             use crate::calibrate::diagnostics::{
                 GradientDiagnosticReport, compute_envelope_audit, compute_dual_ridge_check,
@@ -7661,15 +7670,16 @@ pub mod internal {
                     chol.solve_in_place(rhs_view.as_mut());
 
                     for (k, r_k) in reparam.rs_transformed.iter().enumerate() {
-                        // Approximate the applied correction (would need to track from gradient calc)
-                        // For now, pass 0.0 and check if there's significant truncated energy
+                        let applied_correction = applied_truncation_corrections
+                            .and_then(|values| values.get(k).copied())
+                            .unwrap_or(0.0);
                         let bleed = compute_spectral_bleed(
                             k,
                             r_k.view(),
                             u_truncated.view(),
                             h_inv_u.view(),
                             lambdas[k],
-                            0.0, // We'd need to capture the actual correction from the gradient calc
+                            applied_correction,
                             config.rel_error_threshold,
                         );
                         if bleed.has_bleed || bleed.truncated_energy.abs() > 1e-4 {

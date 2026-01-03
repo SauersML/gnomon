@@ -641,9 +641,8 @@ impl<'a> JointModelState<'a> {
         // When Firth is enabled for logit, compute Firth correction using hat diagonal
         // Firth modifies the working response: z_firth = z + h_ii * (0.5 - μ) / w_i
         let z_firth = if self.firth_bias_reduction && matches!(self.link, LinkFunction::Logit) && b_wiggle.ncols() > 0 {
-            // Compute hat diagonal: h = diag(B(B'WB + λS)^{-1}B'W)
+            // Compute hat diagonal from the unpenalized Fisher information (B'WB).
             // For efficiency, use: h_ii = w_i * ||solve(H, b_i)||^2 where b_i is ith row of B√w
-            let penalty = self.build_link_penalty();
             let p = b_wiggle.ncols();
             
             // Build weighted design: B_w = sqrt(W) * B
@@ -655,15 +654,15 @@ impl<'a> JointModelState<'a> {
                 }
             }
             
-            // Build penalized Hessian: H = B'WB + λS
+            // Build Fisher information: H = B'WB (no smoothing penalty for Firth adjustment)
             let btb = b_weighted.t().dot(&b_weighted);
-            let mut h_pen = btb + &(penalty * lambda_link);
-            // Conditional regularization for stability
-            ensure_positive_definite_joint(&mut h_pen);
+            let mut h_fisher = btb;
+            // Conditional regularization for stability without changing the objective form
+            ensure_positive_definite_joint(&mut h_fisher);
             
             // Cholesky decomposition
             use crate::calibrate::faer_ndarray::FaerCholesky;
-            let chol = match h_pen.cholesky(faer::Side::Lower) {
+            let chol = match h_fisher.cholesky(faer::Side::Lower) {
                 Ok(c) => c,
                 Err(_) => {
                     // Fall back to standard IRLS if Firth fails
@@ -840,14 +839,14 @@ impl<'a> JointModelState<'a> {
                 }
             }
             
-            // Build penalized Hessian: H = X'W_effX + S
+            // Build Fisher information: H = X'W_effX (no smoothing penalty for Firth adjustment)
             let xtx = x_weighted.t().dot(&x_weighted);
-            let mut h_pen = xtx + &penalty;
-            ensure_positive_definite_joint(&mut h_pen);
+            let mut h_fisher = xtx;
+            ensure_positive_definite_joint(&mut h_fisher);
             
             // Cholesky decomposition
             use crate::calibrate::faer_ndarray::FaerCholesky;
-            if let Ok(chol) = h_pen.cholesky(faer::Side::Lower) {
+            if let Ok(chol) = h_fisher.cholesky(faer::Side::Lower) {
                 // Compute hat diagonal and apply Firth adjustment to z_eff
                 for i in 0..n {
                     let mi = mu[i].clamp(1e-8, 1.0 - 1e-8);

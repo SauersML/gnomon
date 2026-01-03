@@ -1058,7 +1058,7 @@ mod survival_hmc {
             // Test at multiple random points
             let n_test_points = 3;
             let eps = 1e-5;
-            let mut all_passed = true;
+            let mut failures: Vec<String> = Vec::new();
 
             for test_idx in 0..n_test_points {
                 // Random point in whitened space
@@ -1099,18 +1099,18 @@ mod survival_hmc {
                 );
 
                 if cos_sim < 0.999 || !cos_sim.is_finite() {
-                    println!("[Survival Gradient] WARNING: Low cosine similarity at point {}", test_idx);
-                    all_passed = false;
+                    failures.push(format!(
+                        "Point {}: cos_sim={:.6}, rel_error={:.4e}",
+                        test_idx, cos_sim, rel_error
+                    ));
                 }
             }
 
-            if all_passed {
-                println!("[Survival Gradient] PASSED: Analytical gradients match finite differences");
-            } else {
-                // Note: This test may fail due to complex survival model internals
-                // For now, we warn rather than fail hard
-                println!("[Survival Gradient] Note: Some gradient checks had low similarity");
-            }
+            assert!(
+                failures.is_empty(),
+                "[Survival Gradient] Gradient mismatches found:\n{}",
+                failures.join("\n")
+            );
         }
     }
 }

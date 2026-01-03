@@ -1476,9 +1476,7 @@ impl WorkingModelSurvival {
 
         let n = eta_exit.len();
         let p = beta.len();
-        let mut gradient = Array1::<f64>::zeros(p);
         let mut hessian = Array2::<f64>::zeros((p, p));
-        let mut log_likelihood = 0.0;
         let guard_threshold = self.spec.derivative_guard.max(f64::EPSILON);
         if self.monotonicity.derivative_design.nrows() > 0 {
             if self.monotonicity.derivative_design.ncols() != p
@@ -1565,49 +1563,21 @@ impl WorkingModelSurvival {
             w_entry[i] = (weight * h_s).sqrt();
         }
 
-        // Compute log-likelihood and gradient (still per-sample for now due to conditionals)
-        for i in 0..n {
-            let weight = self.sample_weight[i];
-            if weight == 0.0 {
-                continue;
-            }
-            let d = f64::from(self.event_target[i]);
-            let eta_e = eta_exit[i];
-            let h_e = h_exit[i];
-            let h_s = h_entry[i];
-            if !eta_e.is_finite() {
-                return Err(SurvivalError::NonFiniteLinearPredictor);
-            }
-            let scale = derivative_scale[i];
-            let log_guard = log_derivative[i];
-            let delta = h_e - h_s;
-            log_likelihood += weight * (d * (eta_e + log_guard) - delta);
+        let d_vec = self.event_target.mapv(f64::from);
+        let w_event = &self.sample_weight * &d_vec;
+        let w_event_scaled = &w_event * &derivative_scale;
+        let w_event_hess = w_event.mapv(f64::sqrt) * &derivative_scale;
 
-            let x_exit = self.layout.combined_exit.row(i);
-            let x_entry = self.layout.combined_entry.row(i);
-            let d_exit = self.layout.combined_derivative_exit.row(i);
-            accumulate_weighted_vector(&mut gradient, -weight * h_e, &x_exit);
-            accumulate_weighted_vector(&mut gradient, weight * h_s, &x_entry);
+        let term1 = &d_vec * (&eta_exit + &log_derivative);
+        let term2 = &h_exit - &h_entry;
+        let log_likelihood = self.sample_weight.dot(&(term1 - term2));
 
-            let mut x_tilde = x_exit.to_owned();
-            Zip::from(&mut x_tilde)
-                .and(&d_exit)
-                .for_each(|value, &deriv| *value += deriv * scale);
-
-            if d > 0.0 {
-                accumulate_weighted_vector(&mut gradient, weight * d, &x_tilde);
-            }
-
-            // Event-specific Hessian term (cannot be batched due to conditional)
-            let event_scale = weight * d;
-            if event_scale != 0.0 && scale != 0.0 {
-                accumulate_symmetric_outer(
-                    &mut hessian,
-                    -event_scale * scale * scale,
-                    &self.layout.combined_derivative_exit.row(i),
-                );
-            }
-        }
+        let w_h_e = &self.sample_weight * &h_exit;
+        let w_h_s = &self.sample_weight * &h_entry;
+        let mut gradient = -self.layout.combined_exit.t().dot(&w_h_e);
+        gradient += &self.layout.combined_entry.t().dot(&w_h_s);
+        gradient += &self.layout.combined_exit.t().dot(&w_event);
+        gradient += &self.layout.combined_derivative_exit.t().dot(&w_event_scaled);
 
         // Vectorized Hessian: H += -sqrt(w*h_e)*X_exit)^T * (sqrt(w*h_e)*X_exit)
         // Using BLAS GEMM (via ndarray general_mat_mul) for efficiency
@@ -1641,6 +1611,16 @@ impl WorkingModelSurvival {
             }
             // H += wx_entry^T * wx_entry via BLAS GEMM
             general_mat_mul(1.0, &wx_entry.t(), &wx_entry, 1.0, &mut hessian);
+
+            // Event-specific Hessian term: H -= (sqrt(w*d)*scale*D_exit)^T * (sqrt(w*d)*scale*D_exit)
+            let mut wx_event = Array2::<f64>::zeros((n_rows, n_cols));
+            for i in 0..n_rows {
+                let sqrt_w = w_event_hess[i];
+                for j in 0..n_cols {
+                    wx_event[[i, j]] = sqrt_w * self.layout.combined_derivative_exit[[i, j]];
+                }
+            }
+            general_mat_mul(-1.0, &wx_event.t(), &wx_event, 1.0, &mut hessian);
         }
 
         gradient.mapv_inplace(|value| value * -2.0);
