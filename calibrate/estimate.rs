@@ -14345,44 +14345,38 @@ mod ground_truth_gradient_tests {
             for row in 0..p { h_inv[[row, col]] = e[row]; }
         }
 
-        
         // ========================================
-        // STEP 3: Compute exact gradient terms
+        // STEP 3: Compute exact COST gradient terms (Cost = -LAML)
+        // The code minimizes Cost, so compute_gradient returns ∇Cost = -∇LAML
         // ========================================
         
-        // Term 1: +0.5 * λ * tr(S₊⁻¹ S_k)
-        // For our simple diagonal penalty, S_λ⁺ = diag(0, 1/λ, 1/λ, ...) on the penalized subspace
-        // tr(S_λ⁺ S_k) = Σⱼ (1/λ if λ>0) * S_k[j,j] = (p-1) for our case when λ=1
+        // Term 1: Cost has -0.5*log|S|, so ∂Cost/∂ρ has -0.5*rank(S)
+        // (∂/∂ρ log|S_λ| = rank(S) when S_λ = λ*S and we differentiate w.r.t. ρ = log(λ))
         let rank_s = (p - 1) as f64; // number of non-zero eigenvalues in S_k
-        let term1 = 0.5 * lambda * rank_s;
+        let term1 = -0.5 * rank_s;
         
-        // Term 2: -0.5 * λ * β̂'S_k β̂
+        // Term 2: Cost has +0.5*β'Sβ, so ∂Cost/∂ρ has +0.5*λ*β'S_kβ
         let s_beta = s_k.dot(&beta);
-        let term2 = -0.5 * lambda * beta.dot(&s_beta);
+        let term2 = 0.5 * lambda * beta.dot(&s_beta);
         
-        // Term 3: -0.5 * λ * tr(H⁻¹ S_k)
+        // Term 3: Cost has +0.5*log|H|, so ∂Cost/∂ρ has +0.5*λ*tr(H⁻¹S_k)
         let mut trace_h_inv_s = 0.0;
         for i in 0..p {
             for j in 0..p {
                 trace_h_inv_s += h_inv[[i, j]] * s_k[[j, i]];
             }
         }
-        let term3 = -0.5 * lambda * trace_h_inv_s;
+        let term3 = 0.5 * lambda * trace_h_inv_s;
         
-        // Term 4: +0.5 * λ * Σᵢ Aᵢᵢ * [wᵢμᵢ(1-μᵢ)(1-2μᵢ)] * (xᵢ'H⁻¹S_k β̂)
-        // where A = X H⁻¹ X'
-        // First compute H⁻¹ S_k β̂
+        // Term 4: Implicit term from ∂H/∂ρ through ∂β̂/∂ρ
+        // For Cost = -LAML, this also gets negated
         let h_inv_s_beta = h_inv.dot(&s_beta);
         
-        // Compute A_ii = x_i' H⁻¹ x_i and the product x_i' H⁻¹ S_k β̂
         let mut term4 = 0.0;
         for i in 0..n {
             let x_i = x.row(i);
-            // A_ii = x_i' H⁻¹ x_i
             let h_inv_x_i = h_inv.dot(&x_i.to_owned());
             let a_ii = x_i.dot(&h_inv_x_i);
-            
-            // x_i' H⁻¹ S_k β̂
             let x_h_inv_s_beta = x_i.dot(&h_inv_s_beta);
             
             // dW_i/dη_i = w_i * μ_i(1-μ_i)(1-2μ_i)
@@ -14394,19 +14388,19 @@ mod ground_truth_gradient_tests {
             // ∂W_i/∂ρ = dW_i/dη_i * ∂η̂_i/∂ρ
             let d_w_d_rho = dw_deta * d_eta_d_rho;
             
-            // Contribution: -0.5 * A_ii * ∂W_i/∂ρ
-            // (the minus in front comes from -0.5 tr(H⁻¹ X' (∂W/∂ρ) X))
-            term4 += -0.5 * a_ii * d_w_d_rho;
+            // For Cost (+0.5 log|H|), contribution is +0.5 * A_ii * ∂W_i/∂ρ
+            term4 += 0.5 * a_ii * d_w_d_rho;
         }
         
-        // Ground truth gradient
+        // Ground truth COST gradient (what compute_gradient should return)
         let ground_truth = term1 + term2 + term3 + term4;
         
-        println!("  Term 1 (log|S|):      {:.6}", term1);
-        println!("  Term 2 (penalty):     {:.6}", term2);
-        println!("  Term 3 (log|H| dir):  {:.6}", term3);
+        println!("  Term 1 (-log|S|):     {:.6}", term1);
+        println!("  Term 2 (+penalty):    {:.6}", term2);
+        println!("  Term 3 (+log|H| dir): {:.6}", term3);
         println!("  Term 4 (implicit):    {:.6}", term4);
-        println!("  GROUND TRUTH ∂L/∂ρ = {:.6}", ground_truth);
+        println!("  GROUND TRUTH ∂Cost/∂ρ = {:.6}", ground_truth);
+        
         
         // ========================================
         // STEP 4: Get RemlState analytic and FD gradients
