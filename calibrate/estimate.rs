@@ -8812,14 +8812,78 @@ pub mod internal {
         fn fd_half_logh(state: &internal::RemlState<'_>, rho: &Array1<f64>) -> Array1<f64> {
             let mut g = Array1::zeros(rho.len());
             for k in 0..rho.len() {
-                let h = (1e-4 * (1.0 + rho[k].abs())).max(1e-5);
-                let mut rp = rho.clone();
-                rp[k] += 0.5 * h;
-                let mut rm = rho.clone();
-                rm[k] -= 0.5 * h;
-                let hp = half_logh(state, &rp);
-                let hm = half_logh(state, &rm);
-                g[k] = (hp - hm) / h;
+                let h_rel = 1e-4_f64 * (1.0 + rho[k].abs());
+                let h_abs = 1e-5_f64;
+                let mut base_h = h_rel.max(h_abs);
+
+                let mut d_small = 0.0;
+                let mut d_big = 0.0;
+                let mut derivative: Option<f64> = None;
+                let mut best_rel_gap = f64::INFINITY;
+                let mut best_derivative: Option<f64> = None;
+                let mut last_rel_gap = f64::INFINITY;
+
+                for _ in 0..=FD_MAX_REFINEMENTS {
+                    let mut rp = rho.clone();
+                    rp[k] += 0.5 * base_h;
+                    let mut rm = rho.clone();
+                    rm[k] -= 0.5 * base_h;
+                    let hp = half_logh(state, &rp);
+                    let hm = half_logh(state, &rm);
+                    d_small = (hp - hm) / base_h;
+
+                    let h2 = 2.0 * base_h;
+                    let mut rp2 = rho.clone();
+                    rp2[k] += 0.5 * h2;
+                    let mut rm2 = rho.clone();
+                    rm2[k] -= 0.5 * h2;
+                    let hp2 = half_logh(state, &rp2);
+                    let hm2 = half_logh(state, &rm2);
+                    d_big = (hp2 - hm2) / h2;
+
+                    let denom = d_small.abs().max(d_big.abs()).max(1e-12);
+                    let rel_gap = (d_small - d_big).abs() / denom;
+                    let same_sign = super::fd_same_sign(d_small, d_big);
+
+                    if same_sign {
+                        if rel_gap <= best_rel_gap {
+                            best_rel_gap = rel_gap;
+                            best_derivative = Some(super::select_fd_derivative(
+                                d_small,
+                                d_big,
+                                same_sign,
+                            ));
+                        }
+                        if rel_gap > last_rel_gap {
+                            derivative = best_derivative;
+                            break;
+                        }
+                        last_rel_gap = rel_gap;
+                    }
+
+                    let refining = same_sign
+                        && rel_gap > FD_REL_GAP_THRESHOLD
+                        && base_h * 0.5 >= FD_MIN_BASE_STEP;
+                    if !refining {
+                        derivative =
+                            Some(super::select_fd_derivative(d_small, d_big, same_sign));
+                        break;
+                    }
+                    base_h *= 0.5;
+                }
+
+                if derivative.is_none() {
+                    let same_sign = super::fd_same_sign(d_small, d_big);
+                    if same_sign {
+                        derivative = best_derivative.or_else(|| {
+                            Some(super::select_fd_derivative(d_small, d_big, same_sign))
+                        });
+                    } else {
+                        derivative = Some(super::select_fd_derivative(d_small, d_big, same_sign));
+                    }
+                }
+
+                g[k] = derivative.unwrap_or(f64::NAN);
             }
             g
         }
@@ -9119,8 +9183,8 @@ pub mod internal {
                 let s_k_beta = r_k.t().dot(&r_beta);
                 beta_terms[k] = lambdas[k] * beta_ref.dot(&s_k_beta);
             }
-            // Reference (true) gradient assembled from exact partials plus the
-            // implicit correction when the PIRLS solution is not perfectly stationary.
+            // Reference gradient assembled from exact partials plus the implicit correction
+            // implied by the KKT residual (IFT term).
             let mut g_true = 0.5 * &beta_terms + &g_half_logh_s - &(0.5 * &g_log_s);
             let residual_grad = {
                 let eta = pr.solve_mu.mapv(|m| logit_from_prob(m));
@@ -9181,7 +9245,7 @@ pub mod internal {
             eprintln!("  ½logH(full) = {}", fmt_vec(&g_half_logh_full));
             eprintln!("  -½logS      = {}", fmt_vec(&(-0.5 * &g_log_s)));
 
-            // Gate: code gradient should match both FD(cost) and the assembled reference.
+            // Gates: code gradient should match both FD(cost) and the numeric assembly (g_true)
             let n_fd = g_fd.mapv(|x| x * x).sum().sqrt().max(1e-12);
             let rel_an_fd = (&g_an - &g_fd).mapv(|x| x * x).sum().sqrt() / n_fd;
             assert!(
