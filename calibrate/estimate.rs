@@ -67,7 +67,7 @@ fn logit_from_prob(p: f64) -> f64 {
 
 use crate::calibrate::diagnostics::{
     should_emit_grad_diag, should_emit_h_min_eig_diag,
-    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_KKT_SKIP_COUNT,
+    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT,
     GRAD_DIAG_LOGH_CLAMPED_COUNT,
     approx_f64, format_cond, format_compact_series, format_range, quantize_value, quantize_vec,
 };
@@ -412,20 +412,6 @@ fn run_gradient_check(
     if rho.is_empty() {
         return Ok(());
     }
-    // The LAML gradient assumes the inner PIRLS solve has reached stationarity.
-    // If the KKT residual is large, finite-difference probes reflect a different
-    // surface (beta is not on the implicit manifold), so the check is invalid.
-    const KKT_TOL_GRAD_CHECK: f64 = 1e-4;
-    if let Ok(kkt_norm) = reml_state.kkt_residual_for_rho(rho) {
-        if kkt_norm > KKT_TOL_GRAD_CHECK {
-            eprintln!(
-                "  [GRADIENT CHECK] Skipping: PIRLS KKT residual {:.3e} > {:.1e}",
-                kkt_norm, KKT_TOL_GRAD_CHECK
-            );
-            return Ok(());
-        }
-    }
-
     let g_analytic = reml_state.compute_gradient(rho)?;
     let g_fd = compute_fd_gradient(reml_state, rho)?;
 
@@ -5889,14 +5875,6 @@ pub mod internal {
             self.last_cost_error_msg.borrow().clone()
         }
 
-        pub(super) fn kkt_residual_for_rho(
-            &self,
-            rho: &Array1<f64>,
-        ) -> Result<f64, EstimationError> {
-            let pr = self.execute_pirls_if_needed(rho)?;
-            Ok(pr.last_gradient_norm)
-        }
-
         /// Runs the inner P-IRLS loop, caching the result.
         fn execute_pirls_if_needed(
             &self,
@@ -7467,10 +7445,7 @@ pub mod internal {
                             );
                         }
 
-                        const KKT_TOL_FOR_IFT: f64 = 1e-4;
-                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite())
-                            && kkt_norm <= KKT_TOL_FOR_IFT
-                        {
+                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
                             let rhs_view = FaerColView::new(&grad_beta);
                             let solved = match &factor_imp {
                                 Some(factor) => factor.solve(rhs_view.as_ref()),
@@ -7496,16 +7471,6 @@ pub mod internal {
                             }
                             Some(delta)
                         } else {
-                            if kkt_norm > KKT_TOL_FOR_IFT {
-                                let (should_print, count) =
-                                    should_emit_grad_diag(&GRAD_DIAG_KKT_SKIP_COUNT);
-                                if should_print {
-                                    eprintln!(
-                                        "[GRAD DIAG #{count}] skipping IFT correction: KKT residual {:.3e} > {:.1e}",
-                                        kkt_norm, KKT_TOL_FOR_IFT
-                                    );
-                                }
-                            }
                             None
                         };
 

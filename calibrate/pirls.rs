@@ -1197,7 +1197,10 @@ where
                              status = PirlsStatus::Converged;
                              break 'pirls_loop;
                         }
-                        if deviance_change.abs() < dev_tol && deviance_change >= 0.0 {
+                        if deviance_change.abs() < dev_tol
+                            && deviance_change >= 0.0
+                            && candidate_grad_norm < grad_tol
+                        {
                              status = PirlsStatus::Converged;
                              break 'pirls_loop;
                         }
