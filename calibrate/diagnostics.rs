@@ -371,7 +371,8 @@ pub fn compute_envelope_audit(
     ridge_used: f64,
     ridge_assumed: f64,
     beta: &Array1<f64>,
-    tolerance: f64,
+    abs_tolerance: f64,
+    rel_tolerance: f64,
 ) -> EnvelopeAudit {
     // KKT residual: ∇_β L = score - S_λ β - ridge * β (if ridge is present)
     let mut kkt_residual = score_gradient - penalty_gradient;
@@ -380,30 +381,36 @@ pub fn compute_envelope_audit(
     }
     
     let kkt_norm = kkt_residual.dot(&kkt_residual).sqrt();
+    let score_norm = score_gradient.dot(score_gradient).sqrt();
+    let penalty_norm = penalty_gradient.dot(penalty_gradient).sqrt();
+    let beta_norm = beta.dot(beta).sqrt();
+    let scale = score_norm + penalty_norm + ridge_used.abs() * beta_norm;
+    let rel_kkt = if scale > 0.0 { kkt_norm / scale } else { 0.0 };
     let ridge_mismatch = (ridge_used - ridge_assumed).abs() > 1e-12;
-    let is_violated = kkt_norm > tolerance || ridge_mismatch;
+    let kkt_violation = kkt_norm > abs_tolerance && rel_kkt > rel_tolerance;
+    let is_violated = kkt_violation || ridge_mismatch;
     
-    let message = if ridge_mismatch && kkt_norm > tolerance {
+    let message = if ridge_mismatch && kkt_violation {
         format!(
             "Envelope Violation: Inner solver ridge = {:.2e}, Outer gradient assumes ridge = {:.2e}. \
-             KKT residual norm = {:.2e} (tolerance = {:.2e}). Unaccounted gradient energy: {:.2e}",
-            ridge_used, ridge_assumed, kkt_norm, tolerance, kkt_norm
+             KKT residual norm = {:.2e} (abs tol = {:.2e}, rel tol = {:.2e}). Unaccounted gradient energy: {:.2e}",
+            ridge_used, ridge_assumed, kkt_norm, abs_tolerance, rel_tolerance, kkt_norm
         )
     } else if ridge_mismatch {
         format!(
             "Ridge Mismatch: PIRLS optimized for H + {:.2e}*I, but Gradient calculated for H + {:.2e}*I",
             ridge_used, ridge_assumed
         )
-    } else if kkt_norm > tolerance {
+    } else if kkt_violation {
         format!(
-            "Envelope Violation: KKT residual ||∇_β L|| = {:.2e} exceeds tolerance {:.2e}. \
+            "Envelope Violation: KKT residual ||∇_β L|| = {:.2e} (rel {:.2e}) exceeds tolerances (abs {:.2e}, rel {:.2e}). \
              Inner solver may not have converged to true stationary point.",
-            kkt_norm, tolerance
+            kkt_norm, rel_kkt, abs_tolerance, rel_tolerance
         )
     } else {
         format!(
-            "Envelope OK: KKT residual = {:.2e}, ridge match = {:.2e}",
-            kkt_norm, ridge_used
+            "Envelope OK: KKT residual = {:.2e} (rel {:.2e}), ridge match = {:.2e}",
+            kkt_norm, rel_kkt, ridge_used
         )
     };
     
@@ -726,7 +733,7 @@ mod tests {
         let penalty = arr1(&[1.0, 2.0, 3.0]);
         let beta = arr1(&[0.1, 0.2, 0.3]);
         
-        let result = compute_envelope_audit(&score, &penalty, 0.0, 0.0, &beta, 1e-4);
+        let result = compute_envelope_audit(&score, &penalty, 0.0, 0.0, &beta, 1e-4, 1e-2);
         assert!(!result.is_violated);
         assert!(result.kkt_residual_norm < 1e-10);
     }
@@ -738,7 +745,7 @@ mod tests {
         let beta = arr1(&[1.0, 1.0, 1.0]);
         
         // PIRLS used ridge 0.1, but gradient assumes 0.0
-        let result = compute_envelope_audit(&score, &penalty, 0.1, 0.0, &beta, 1e-4);
+        let result = compute_envelope_audit(&score, &penalty, 0.1, 0.0, &beta, 1e-4, 1e-2);
         assert!(result.is_violated);
         assert!(result.message.contains("Ridge Mismatch") || result.message.contains("Envelope Violation"));
     }

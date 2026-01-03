@@ -188,6 +188,49 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     Array2::from_shape_fn((p, q), |(i, j)| result[(i, j)])
 }
 
+/// Compute A * B using faer's SIMD-optimized GEMM.
+/// For A of shape (n, p) and B of shape (p, q), this computes the (n, q) result.
+/// Uses zero-copy views when possible.
+#[inline]
+pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+) -> Array2<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Mat};
+
+    let (n, p) = a.dim();
+    let (p_b, q) = b.dim();
+    debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
+
+    if n < 64 {
+        return a.dot(b);
+    }
+
+    let mut result = Mat::<f64>::zeros(n, q);
+
+    let a_view = FaerArrayView::new(a);
+    let b_view = FaerArrayView::new(b);
+    let a_ref = a_view.as_ref();
+    let b_ref = b_view.as_ref();
+
+    let par = if n < 128 || p < 128 || q < 128 {
+        Par::Seq
+    } else {
+        get_global_parallelism()
+    };
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_ref,
+        b_ref,
+        1.0,
+        par,
+    );
+
+    Array2::from_shape_fn((n, q), |(i, j)| result[(i, j)])
+}
+
 /// Compute A^T * v into a pre-allocated output buffer.
 /// `out` must be length p where A is (n, p) and v is length n.
 #[inline]
@@ -599,4 +642,3 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
         Ok((mat_to_array(q.as_ref()), mat_to_array(r)))
     }
 }
-

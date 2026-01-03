@@ -4258,7 +4258,7 @@ fn compute_firth_hat_and_half_logdet(
     Ok((hat_diag, half_log_det))
 }
 
-fn ensure_positive_definite_with_label(
+pub(crate) fn ensure_positive_definite_with_label(
     hess: &mut Array2<f64>,
     label: &str,
 ) -> Result<(), EstimationError> {

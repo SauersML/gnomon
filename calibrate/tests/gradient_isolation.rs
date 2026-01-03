@@ -21,12 +21,20 @@ use gnomon::calibrate::basis::{
     apply_sum_to_zero_constraint, create_basis, create_difference_penalty_matrix, BasisOptions,
     Dense, KnotSource,
 };
-use gnomon::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+use gnomon::calibrate::construction::{
+    build_design_and_penalty_matrices, compute_penalty_square_roots, stable_reparameterization,
+    ModelLayout,
+};
+use gnomon::calibrate::data::TrainingData;
 use gnomon::calibrate::estimate::{evaluate_external_gradients, ExternalOptimOptions};
 use gnomon::calibrate::faer_ndarray::FaerCholesky;
-use gnomon::calibrate::model::{LinkFunction, ModelConfig};
+use gnomon::calibrate::model::{
+    default_reml_parallel_threshold, BasisConfig, InteractionPenaltyKind, LinkFunction,
+    ModelConfig, ModelFamily, PrincipalComponentConfig,
+};
 use gnomon::calibrate::pirls::{calculate_deviance, fit_model_for_fixed_rho, update_glm_vectors};
 use gnomon::calibrate::types::LogSmoothingParamsView;
+use std::collections::HashMap;
 
 /// Helper to create a simple diagonal penalty matrix.
 fn diagonal_penalty(p: usize, start: usize, end: usize) -> Array2<f64> {
@@ -115,6 +123,127 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
     
     let weights = Array1::<f64>::ones(n);
     (y, x, weights)
+}
+
+fn create_logistic_training_data(n_samples: usize, num_pcs: usize, seed: u64) -> TrainingData {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut p = Array1::zeros(n_samples);
+    for val in p.iter_mut() {
+        *val = rng.gen_range(-2.5..2.5);
+    }
+
+    let mut pcs = Array2::zeros((n_samples, num_pcs));
+    for i in 0..n_samples {
+        for j in 0..num_pcs {
+            pcs[[i, j]] = rng.gen_range(-2.0..2.0);
+        }
+    }
+
+    let mut eta = Array1::zeros(n_samples);
+    for i in 0..n_samples {
+        let mut val = 0.6 * p[i] + rng.gen_range(-0.3..0.3);
+        for j in 0..num_pcs {
+            let weight = 0.2 + 0.1 * (j as f64);
+            val += weight * pcs[[i, j]];
+        }
+        eta[i] = val;
+    }
+
+    let mut y = Array1::zeros(n_samples);
+    for i in 0..n_samples {
+        let prob = 1.0 / (1.0 + (-eta[i]).exp());
+        y[i] = if rng.gen_range(0.0..1.0) < prob { 1.0 } else { 0.0 };
+    }
+
+    let sex = Array1::from_iter((0..n_samples).map(|_| {
+        if rng.gen_range(0.0..1.0) < 0.5 {
+            1.0
+        } else {
+            0.0
+        }
+    }));
+    let weights = Array1::ones(n_samples);
+
+    TrainingData {
+        y,
+        p,
+        sex,
+        pcs,
+        weights,
+    }
+}
+
+fn range_from_column(col: &Array1<f64>) -> (f64, f64) {
+    (
+        col.iter().fold(f64::INFINITY, |acc, &v| acc.min(v)),
+        col.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v)),
+    )
+}
+
+fn logistic_model_config(
+    include_pc_mains: bool,
+    include_interactions: bool,
+    data: &TrainingData,
+) -> ModelConfig {
+    let (pgs_knots, pc_knots) = if include_interactions {
+        (1, 1)
+    } else if include_pc_mains {
+        (1, 0)
+    } else {
+        (1, 0)
+    };
+
+    let pgs_basis_config = BasisConfig {
+        num_knots: pgs_knots,
+        degree: 3,
+    };
+    let pc_basis_template = BasisConfig {
+        num_knots: pc_knots.max(1),
+        degree: 3,
+    };
+
+    let pc_configs: Vec<PrincipalComponentConfig> = if include_pc_mains {
+        (0..data.pcs.ncols())
+            .map(|idx| {
+                let col = data.pcs.column(idx).to_owned();
+                PrincipalComponentConfig {
+                    name: format!("PC{}", idx + 1),
+                    basis_config: pc_basis_template.clone(),
+                    range: range_from_column(&col),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    ModelConfig {
+        model_family: ModelFamily::Gam(LinkFunction::Logit),
+        penalty_order: 2,
+        convergence_tolerance: 1e-6,
+        max_iterations: 15,
+        reml_convergence_tolerance: 1e-6,
+        reml_max_iterations: 0,
+        firth_bias_reduction: true,
+        reml_parallel_threshold: default_reml_parallel_threshold(),
+        pgs_basis_config,
+        pc_configs,
+        pgs_range: range_from_column(&data.p),
+        interaction_penalty: if include_pc_mains && include_interactions {
+            InteractionPenaltyKind::Anisotropic
+        } else {
+            InteractionPenaltyKind::Isotropic
+        },
+        sum_to_zero_constraints: HashMap::new(),
+        knot_vectors: HashMap::new(),
+        range_transforms: HashMap::new(),
+        pc_null_transforms: HashMap::new(),
+        interaction_centering_means: HashMap::new(),
+        interaction_orth_alpha: HashMap::new(),
+        mcmc_enabled: false,
+        calibrator_enabled: false,
+        survival: None,
+    }
 }
 
 fn kron_with_identity(s: &Array2<f64>, n: usize) -> Array2<f64> {
@@ -829,6 +958,45 @@ fn isolation_multiple_overlapping_dense_penalties_with_firth() {
 
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Multi dense + Firth", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_reparam_pgs_pc_mains_firth() {
+    println!("\n=== ISOLATION: Reparam PGS+PC mains, Logit, Firth ===");
+    let train = create_logistic_training_data(100, 3, 31);
+    let mut config = logistic_model_config(true, false, &train);
+    config.firth_bias_reduction = true;
+    let (x, s_list, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    let nullspace_dims = vec![0; s_list.len()];
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims,
+    };
+    let (analytic, fd) = match evaluate_external_gradients(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Reparam PGS+PC mains", cos_fd, rel_fd, max_a, max_fd);
+    assert!(cos_fd > 0.999, "cosine too low: {cos_fd}");
+    assert!(rel_fd < 5e-2, "rel_l2 too high: {rel_fd}");
 }
 
 // ============================================================================

@@ -4931,9 +4931,19 @@ pub mod internal {
             // Because of that design, a given ρ vector corresponds to exactly one Hessian type in
             // practice, and the cache cannot hand back a factorization of an unintended matrix.
 
-            // Factor the effective Hessian once
+            // Prefer an un-ridged factorization when the stabilized Hessian is already PD.
+            // Only fall back to the RidgePlanner path if direct factorization fails.
             let rho_like = lambdas.mapv(|lam| lam.ln());
-            let factor = self.get_faer_factor(&rho_like, h_eff);
+            let factor = {
+                let h_view = FaerArrayView::new(h_eff);
+                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                    Arc::new(FaerFactor::Llt(f))
+                } else if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                    Arc::new(FaerFactor::Ldlt(f))
+                } else {
+                    self.get_faer_factor(&rho_like, h_eff)
+                }
+            };
 
             // Use the single λ-weighted penalty root E for S_λ = Eᵀ E to compute
             // trace(H⁻¹ S_λ) = ⟨H⁻¹ Eᵀ, Eᵀ⟩_F directly (numerically robust)
@@ -5233,7 +5243,7 @@ pub mod internal {
 
         /// Compute the Firth curvature matrix H_phi = ∇²Φ where Φ = 0.5 log|X^T W X|.
         /// This is needed for the exact Firth-adjusted Hessian: H_total = H_eff - H_phi.
-        /// NOTE: Uses pure Fisher info X'WX (no stabilization ridge) per Firth definition.
+        /// NOTE: Uses stabilized Fisher info (matching cost path) for gradient consistency.
         fn firth_hessian_logit(
             &self,
             x_transformed: &DesignMatrix,
@@ -5427,7 +5437,7 @@ pub mod internal {
             // Forward thin factors:
             //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T
             //   C = X L_t^{-T}           with M_h = X H_total^{-1} X^T = C C^T
-            // NOTE: Use pure Fisher info (no ridge) per Firth prior definition.
+            // NOTE: firth_hat_factor applies the same stabilization ridge as compute_firth_hat_and_half_logdet.
             let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
             let c = self.h_total_factor(x.view(), h_total)?;
 
@@ -5784,9 +5794,9 @@ pub mod internal {
 
         // Build B = W^{1/2} X L_f^{-T} for H_hat = B B^T.
         // We return (B, L_f, X_w) because reverse-mode needs L_f and X_w.
-        // NOTE: The Firth prior is defined as |I|^{1/2} where I = X'WX is the
-        // PURE Fisher information. We do NOT add stabilization ridge here,
-        // because that would change the mathematical definition of the prior.
+        // NOTE: We apply the same stabilization ridge as compute_firth_hat_and_half_logdet
+        // to ensure the gradient is computed on the same regularized surface as the cost.
+        // This is essential for gradient consistency (finite-diff checks will fail otherwise).
         
         fn firth_hat_factor(
             &self,
@@ -5802,7 +5812,13 @@ pub mod internal {
                     xw.row_mut(i).mapv_inplace(|v| v * s);
                 }
             }
-            let fisher = xw.t().dot(&xw);
+            let mut fisher = xw.t().dot(&xw);
+            // Apply the same stabilization ridge as compute_firth_hat_and_half_logdet
+            // to ensure gradient is computed on the same regularized surface as the cost.
+            crate::calibrate::pirls::ensure_positive_definite_with_label(
+                &mut fisher,
+                "Firth Fisher information (gradient)",
+            )?;
             let chol = fisher.cholesky(Side::Lower).map_err(|_| {
                 EstimationError::HessianNotPositiveDefinite {
                     min_eigenvalue: f64::NEG_INFINITY,
@@ -7350,7 +7366,7 @@ pub mod internal {
                         {
                             if self.config.firth_bias_reduction && h_phi_opt.is_some() {
                                 // Use exact firth_logh_total_grad with full reverse-mode autodiff
-                                // NOTE: Uses pure Fisher info (no ridge) per Firth definition
+                                // NOTE: Uses stabilized Fisher info (matching cost path) for consistency
                                 match self.firth_logh_total_grad(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
@@ -7651,6 +7667,7 @@ pub mod internal {
                 ridge_used,  // What gradient assumes
                 beta,
                 config.kkt_tolerance,
+                config.rel_error_threshold,
             );
             report.envelope_audit = Some(envelope_audit);
 
