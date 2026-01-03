@@ -17,6 +17,137 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 use std::fmt;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+// =============================================================================
+// Rate-Limited Diagnostic Output
+// =============================================================================
+// These helpers prevent diagnostic spam while ensuring important messages are seen.
+// Pattern: show first occurrence, then every Nth occurrence, with count indicator.
+
+/// Print interval for rate-limited diagnostics
+pub const DIAG_PRINT_INTERVAL: usize = 50;
+
+/// Rate-limited diagnostic counters for gradient calculations
+pub static GRAD_DIAG_BETA_COLLAPSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static GRAD_DIAG_DELTA_ZERO_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static GRAD_DIAG_LOGH_CLAMPED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Rate-limited diagnostic for Hessian minimum eigenvalue warnings
+pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
+pub static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub const MIN_EIG_DIAG_EVERY: usize = 200;
+pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
+
+/// Returns (should_print, count) - prints on first occurrence, then every DIAG_PRINT_INTERVAL
+pub fn should_emit_grad_diag(counter: &AtomicUsize) -> (bool, usize) {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_print = count == 1 || count % DIAG_PRINT_INTERVAL == 0;
+    (should_print, count)
+}
+
+/// Rate-limited check for Hessian minimum eigenvalue diagnostics.
+/// Returns true if this eigenvalue warrants a diagnostic message.
+pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
+    if !min_eig.is_finite() || min_eig <= 0.0 {
+        return true;
+    }
+    if min_eig >= MIN_EIG_DIAG_THRESHOLD {
+        return false;
+    }
+    let bucket = if min_eig.is_finite() && min_eig > 0.0 {
+        min_eig.log10().floor() as i32
+    } else {
+        i32::MIN
+    };
+    let last = H_MIN_EIG_LOG_BUCKET.load(Ordering::Relaxed);
+    let count = H_MIN_EIG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if bucket != last || count % MIN_EIG_DIAG_EVERY == 0 {
+        H_MIN_EIG_LOG_BUCKET.store(bucket, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+// =============================================================================
+// Formatting Utilities for Diagnostic Output  
+// =============================================================================
+
+/// Approximate floating-point equality check for diagnostic deduplication.
+pub fn approx_f64(a: f64, b: f64, rel: f64, abs: f64) -> bool {
+    (a - b).abs() <= abs + rel * a.abs().max(b.abs())
+}
+
+/// Format a condition number for display.
+pub fn format_cond(cond: f64) -> String {
+    if cond.is_finite() {
+        format!("{:.2e}", cond)
+    } else {
+        "N/A".to_string()
+    }
+}
+
+/// Quantize a value for deduplication (bucketing similar values together).
+pub fn quantize_value(value: f64, rel: f64, abs: f64) -> f64 {
+    if value == 0.0 {
+        return 0.0;
+    }
+    let scale = abs.max(rel * value.abs());
+    let quantized = (value / scale).round() * scale;
+    if quantized == 0.0 {
+        0.0
+    } else {
+        quantized
+    }
+}
+
+/// Quantize a vector of values for deduplication.
+pub fn quantize_vec(values: &[f64], rel: f64, abs: f64) -> Vec<f64> {
+    values
+        .iter()
+        .map(|&value| quantize_value(value, rel, abs))
+        .collect()
+}
+
+/// Format a range of values, collapsing to single value if min ≈ max.
+pub fn format_range<F>(min: f64, max: f64, fmt: F) -> String
+where
+    F: Fn(f64) -> String,
+{
+    if approx_f64(min, max, 1e-6, 1e-9) {
+        fmt(min)
+    } else {
+        format!("[{}, {}]", fmt(min), fmt(max))
+    }
+}
+
+/// Format a series of values compactly, detecting uniform steps.
+pub fn format_compact_series<F>(values: &[f64], fmt: F) -> String
+where
+    F: Fn(f64) -> String,
+{
+    if values.is_empty() {
+        return "[]".to_string();
+    }
+    if values.len() == 1 {
+        return format!("[{}]", fmt(values[0]));
+    }
+    let first = values[0];
+    let last = values[values.len() - 1];
+    let step = values[1] - values[0];
+    let uniform_step = values
+        .windows(2)
+        .all(|pair| approx_f64(pair[1] - pair[0], step, 1e-6, 1e-9));
+    if uniform_step {
+        return format!("[{}..{} step {}]", fmt(first), fmt(last), fmt(step));
+    }
+    let (min, max) = values.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(min, max), &v| (min.min(v), max.max(v)),
+    );
+    format!("[{}..{}] n={}", fmt(min), fmt(max), values.len())
+}
 
 /// Configuration for gradient diagnostics
 #[derive(Clone, Debug)]

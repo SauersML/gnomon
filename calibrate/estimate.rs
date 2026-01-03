@@ -68,6 +68,7 @@ fn logit_from_prob(p: f64) -> f64 {
 use crate::calibrate::diagnostics::{
     should_emit_grad_diag, should_emit_h_min_eig_diag,
     GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_LOGH_CLAMPED_COUNT,
+    approx_f64, format_cond, format_compact_series, format_range, quantize_value, quantize_vec,
 };
 
 #[cfg(test)]
@@ -4496,74 +4497,7 @@ pub mod internal {
         }
     }
 
-    fn approx_f64(a: f64, b: f64, rel: f64, abs: f64) -> bool {
-        (a - b).abs() <= abs + rel * a.abs().max(b.abs())
-    }
-
-    fn format_cond(cond: f64) -> String {
-        if cond.is_finite() {
-            format!("{:.2e}", cond)
-        } else {
-            "N/A".to_string()
-        }
-    }
-
-    fn quantize_value(value: f64, rel: f64, abs: f64) -> f64 {
-        if value == 0.0 {
-            return 0.0;
-        }
-        let scale = abs.max(rel * value.abs());
-        let quantized = (value / scale).round() * scale;
-        if quantized == 0.0 {
-            0.0
-        } else {
-            quantized
-        }
-    }
-
-    fn quantize_vec(values: &[f64], rel: f64, abs: f64) -> Vec<f64> {
-        values
-            .iter()
-            .map(|&value| quantize_value(value, rel, abs))
-            .collect()
-    }
-
-    fn format_range<F>(min: f64, max: f64, fmt: F) -> String
-    where
-        F: Fn(f64) -> String,
-    {
-        if approx_f64(min, max, 1e-6, 1e-9) {
-            fmt(min)
-        } else {
-            format!("[{}, {}]", fmt(min), fmt(max))
-        }
-    }
-
-    fn format_compact_series<F>(values: &[f64], fmt: F) -> String
-    where
-        F: Fn(f64) -> String,
-    {
-        if values.is_empty() {
-            return "[]".to_string();
-        }
-        if values.len() == 1 {
-            return format!("[{}]", fmt(values[0]));
-        }
-        let first = values[0];
-        let last = values[values.len() - 1];
-        let step = values[1] - values[0];
-        let uniform_step = values
-            .windows(2)
-            .all(|pair| approx_f64(pair[1] - pair[0], step, 1e-6, 1e-9));
-        if uniform_step {
-            return format!("[{}..{} step {}]", fmt(first), fmt(last), fmt(step));
-        }
-        let (min, max) = values.iter().fold(
-            (f64::INFINITY, f64::NEG_INFINITY),
-            |(min, max), &v| (min.min(v), max.max(v)),
-        );
-        format!("[{}..{}] n={}", fmt(min), fmt(max), values.len())
-    }
+    // Formatting utilities moved to crate::calibrate::diagnostics
 
     impl<'a> RemlState<'a> {
         // Row-wise squared norms: diag(M) when M = C C^T.
