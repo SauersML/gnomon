@@ -14447,9 +14447,7 @@ mod ground_truth_gradient_tests {
                 println!("✓ TRUE GROUND TRUTH TEST PASSED: both analytic and FD match exact formula");
             }
             Err(e) => {
-                println!("  evaluate_external_gradients failed: {:?}", e);
-                // Try to at least report ground truth vs manual FD
-                println!("  Ground truth gradient = {:.6} (computed from exact formula)", ground_truth);
+                panic!("evaluate_external_gradients failed: {:?}\nGround truth gradient = {:.6}", e, ground_truth);
             }
         }
     }
@@ -14760,20 +14758,19 @@ mod ground_truth_gradient_tests {
                 
                 println!("  |analytic - ground_truth| = {:.3e} (rel: {:.3e})", err_analytic, rel_err_analytic);
                 
-                // For Firth, we expect some discrepancy due to H_phi simplification
-                // But the main terms should be close
-                if rel_err_analytic < 0.2 || err_analytic < 0.5 {
-                    println!("✓ FIRTH GROUND TRUTH TEST PASSED");
-                } else {
-                    println!("⚠ FIRTH GROUND TRUTH TEST: significant discrepancy (may be due to H_phi derivatives)");
-                    println!("  This indicates either:");
-                    println!("  1. Missing ∂H_phi/∂β term in ground truth (expected)");
-                    println!("  2. Bug in analytic Firth gradient");
-                }
+                // Assert that analytic gradient matches ground truth
+                assert!(
+                    rel_err_analytic < 0.2 || err_analytic < 0.5,
+                    "FIRTH GROUND TRUTH TEST FAILED: analytic gradient doesn't match ground truth.\n\
+                     analytic={:.4e}, truth={:.4e}, rel_err={:.3e}\n\
+                     This indicates a bug in the Firth analytic gradient calculation.",
+                    analytic_grad[0], ground_truth, rel_err_analytic
+                );
+                
+                println!("✓ FIRTH GROUND TRUTH TEST PASSED");
             }
             Err(e) => {
-                println!("  evaluate_external_gradients failed: {:?}", e);
-                println!("  Ground truth (Firth) = {:.6}", ground_truth);
+                panic!("evaluate_external_gradients failed: {:?}\nGround truth (Firth) = {:.6}", e, ground_truth);
             }
         }
     }
