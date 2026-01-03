@@ -14452,16 +14452,12 @@ mod ground_truth_gradient_tests {
         }
     }
 
-    /// TRUE GROUND-TRUTH TEST FOR FIRTH: Compute LAML gradient from first principles.
+    /// TRUE GROUND-TRUTH TEST FOR FIRTH: EXACT formula with all tensor derivatives.
     ///
-    /// For Firth, the total Hessian is: H_total = X'WX + S - H_phi
-    /// where H_phi = ∇²(0.5 * log|I(β)|) is the Firth correction Hessian.
-    ///
-    /// The gradient formula is:
-    ///   Term1 = -0.5 * rank(S_k)
-    ///   Term2 = +0.5 * λ * β'S_kβ  
-    ///   Term3 = +0.5 * λ * tr(H_total⁻¹ S_k)
-    ///   Term4 = δ' * (-λ * H_total⁻¹ S_k β)  [implicit term]
+    /// This implements the FULL exact Firth gradient formula:
+    /// - H_phi = 0.5 * (T1 - T2) with full hat matrix
+    /// - ∂H_phi/∂β tensor (3rd-order derivatives)
+    /// - KKT residual included
     #[test]
     fn test_laml_gradient_firth_exact_formula_ground_truth() {
         use crate::calibrate::faer_ndarray::FaerCholesky;
@@ -14497,76 +14493,59 @@ mod ground_truth_gradient_tests {
         }
         
         let weights = Array1::<f64>::ones(n);
-        
-        // Test at ρ = 0, so λ = 1
-        let rho_val = 0.0_f64;
-        let lambda = rho_val.exp();
+        let lambda = 1.0_f64; // ρ = 0
         
         // ========================================
         // STEP 1: Run Firth-adjusted IRLS to convergence
         // ========================================
         let mut beta = Array1::<f64>::zeros(p);
         let mut mu = Array1::<f64>::from_elem(n, 0.5);
-        let mut w_diag = Array1::<f64>::zeros(n);
         
         for iter in 0..50 {
-            // W = diag(μ(1-μ))
-            for i in 0..n {
-                w_diag[i] = weights[i] * mu[i] * (1.0 - mu[i]);
-                w_diag[i] = w_diag[i].max(1e-10);
-            }
+            // Compute w, Fisher, Fisher inverse, hat values
+            let w: Array1<f64> = (0..n).map(|i| (weights[i] * mu[i] * (1.0 - mu[i])).max(1e-12)).collect();
             
-            // Fisher info I = X'WX
-            let xw = &x * &w_diag.clone().insert_axis(ndarray::Axis(1));
+            let xw = &x * &w.clone().insert_axis(ndarray::Axis(1));
             let fisher = xw.t().dot(&x);
             
-            // Compute hat values h_i = x_i' (X'WX)^{-1} x_i * w_i
             let fisher_chol = match fisher.cholesky(Side::Lower) {
                 Ok(c) => c,
                 Err(_) => break,
             };
-            let l_fisher = fisher_chol.lower_triangular();
+            let l = fisher_chol.lower_triangular();
             
-            // Fisher inverse via Cholesky
+            // Fisher inverse
             let mut fisher_inv = Array2::<f64>::zeros((p, p));
             for col in 0..p {
                 let mut e = Array1::<f64>::zeros(p);
                 e[col] = 1.0;
                 for i in 0..p {
-                    for k in 0..i { e[i] -= l_fisher[[i,k]] * e[k]; }
-                    e[i] /= l_fisher[[i,i]];
+                    for k in 0..i { e[i] -= l[[i,k]] * e[k]; }
+                    e[i] /= l[[i,i]];
                 }
                 for i in (0..p).rev() {
-                    for k in (i+1)..p { e[i] -= l_fisher[[k,i]] * e[k]; }
-                    e[i] /= l_fisher[[i,i]];
+                    for k in (i+1)..p { e[i] -= l[[k,i]] * e[k]; }
+                    e[i] /= l[[i,i]];
                 }
                 for row in 0..p { fisher_inv[[row, col]] = e[row]; }
             }
             
             // Hat values: h_i = w_i * x_i' Fisher^{-1} x_i
-            let mut h_diag = Array1::<f64>::zeros(n);
-            for i in 0..n {
+            let h_diag: Array1<f64> = (0..n).map(|i| {
                 let x_i = x.row(i);
-                let fisher_inv_x = fisher_inv.dot(&x_i.to_owned());
-                h_diag[i] = w_diag[i] * x_i.dot(&fisher_inv_x);
-            }
+                let fi_x = fisher_inv.dot(&x_i.to_owned());
+                w[i] * x_i.dot(&fi_x)
+            }).collect();
             
-            // Firth-adjusted working response
-            // z_i = (y_i - μ_i) + h_i * (0.5 - μ_i)
-            let mut z = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                z[i] = (y[i] - mu[i]) + h_diag[i] * (0.5 - mu[i]);
-            }
-            
-            // H_total = X'WX + S (simplified - compute H_phi separately for gradient)
-            let mut h_total = fisher.clone();
-            h_total = h_total + lambda * &s_k;
-            
-            // Score with Firth adjustment
+            // Firth score: X'(y - μ + h⊙(0.5 - μ)) - S_λ β
+            let z: Array1<f64> = (0..n).map(|i| {
+                (y[i] - mu[i]) + h_diag[i] * (0.5 - mu[i])
+            }).collect();
             let score = x.t().dot(&(&weights * &z)) - lambda * s_k.dot(&beta);
             
-            // Newton step
-            let h_chol = match h_total.cholesky(Side::Lower) {
+            // H_simple = Fisher + S (for Newton step in IRLS)
+            let mut h_simple = fisher.clone() + lambda * &s_k;
+            let h_chol = match h_simple.cholesky(Side::Lower) {
                 Ok(c) => c,
                 Err(_) => break,
             };
@@ -14583,12 +14562,9 @@ mod ground_truth_gradient_tests {
             }
             
             beta = beta + &delta;
-            
-            // Update mu
             let eta = x.dot(&beta);
             for i in 0..n {
-                mu[i] = 1.0 / (1.0 + (-eta[i]).exp());
-                mu[i] = mu[i].clamp(1e-10, 1.0 - 1e-10);
+                mu[i] = (1.0 / (1.0 + (-eta[i]).exp())).clamp(1e-10, 1.0 - 1e-10);
             }
             
             if delta.dot(&delta).sqrt() < 1e-10 {
@@ -14596,67 +14572,75 @@ mod ground_truth_gradient_tests {
                 break;
             }
         }
-        
         println!("  β̂[0..3] = [{:.4}, {:.4}, {:.4}]", beta[0], beta[1], beta[2]);
         
         // ========================================
-        // STEP 2: Compute matrices at convergence
+        // STEP 2: Compute all derivatives at convergence
         // ========================================
         
-        for i in 0..n {
-            w_diag[i] = weights[i] * mu[i] * (1.0 - mu[i]);
-            w_diag[i] = w_diag[i].max(1e-10);
-        }
+        // Scalar derivatives per observation
+        let w: Array1<f64> = (0..n).map(|i| (weights[i] * mu[i] * (1.0 - mu[i])).max(1e-12)).collect();
+        let sqrt_w: Array1<f64> = w.mapv(f64::sqrt);
+        let u: Array1<f64> = (0..n).map(|i| 1.0 - 2.0 * mu[i]).collect();
+        let w_prime: Array1<f64> = (0..n).map(|i| w[i] * u[i]).collect(); // w' = μ(1-μ)(1-2μ)
+        let u_prime: Array1<f64> = w.mapv(|wi| -2.0 * wi); // u' = -2w
+        let v: Array1<f64> = (0..n).map(|i| u[i] * u[i] - 2.0 * w[i]).collect();
+        let v_prime: Array1<f64> = (0..n).map(|i| -4.0 * u[i] * w[i] - 2.0 * w_prime[i]).collect();
         
-        let xw = &x * &w_diag.clone().insert_axis(ndarray::Axis(1));
+        // Fisher I = X'WX and its inverse
+        let xw = &x * &w.clone().insert_axis(ndarray::Axis(1));
         let fisher = xw.t().dot(&x);
-        
-        // Fisher inverse
         let fisher_chol = fisher.cholesky(Side::Lower).expect("Fisher chol");
-        let l_fisher = fisher_chol.lower_triangular();
+        let l = fisher_chol.lower_triangular();
         let mut fisher_inv = Array2::<f64>::zeros((p, p));
         for col in 0..p {
             let mut e = Array1::<f64>::zeros(p);
             e[col] = 1.0;
             for i in 0..p {
-                for k in 0..i { e[i] -= l_fisher[[i,k]] * e[k]; }
-                e[i] /= l_fisher[[i,i]];
+                for k in 0..i { e[i] -= l[[i,k]] * e[k]; }
+                e[i] /= l[[i,i]];
             }
             for i in (0..p).rev() {
-                for k in (i+1)..p { e[i] -= l_fisher[[k,i]] * e[k]; }
-                e[i] /= l_fisher[[i,i]];
+                for k in (i+1)..p { e[i] -= l[[k,i]] * e[k]; }
+                e[i] /= l[[i,i]];
             }
             for row in 0..p { fisher_inv[[row, col]] = e[row]; }
         }
         
-        // Hat values
-        let mut h_diag = Array1::<f64>::zeros(n);
+        // Full Hat matrix A = W^{1/2} X I^{-1} X' W^{1/2}  (n×n)
+        let x_fisher_inv = x.dot(&fisher_inv); // n×p
+        let mut a_mat = Array2::<f64>::zeros((n, n));
         for i in 0..n {
-            let x_i = x.row(i);
-            let fisher_inv_x = fisher_inv.dot(&x_i.to_owned());
-            h_diag[i] = w_diag[i] * x_i.dot(&fisher_inv_x);
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..p {
+                    sum += x_fisher_inv[[i, k]] * x[[j, k]];
+                }
+                a_mat[[i, j]] = sqrt_w[i] * sum * sqrt_w[j];
+            }
         }
+        let h_diag: Array1<f64> = (0..n).map(|i| a_mat[[i, i]]).collect();
         
-        // Compute H_phi (Firth correction Hessian)
-        // H_phi = 0.5 * X' diag(h * w'') X - 0.5 * X' diag(u) (A∘A) diag(u) X
-        // where u = 1-2μ, w'' = w*(1-6μ(1-μ))
-        // Simplified: H_phi ≈ 0.5 * X' diag(h * v) X where v = (1-2μ)² - 2w
-        let mut v = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let u_i = 1.0 - 2.0 * mu[i];
-            v[i] = u_i * u_i - 2.0 * w_diag[i];
-        }
+        // ========================================
+        // EXACT H_phi = 0.5 * (T1 - T2)
+        // ========================================
         
-        // H_phi term 1: 0.5 * X' diag(h * v) X
+        // T1 = X' diag(h ⊙ v) X
         let hv = &h_diag * &v;
         let x_hv = &x * &hv.clone().insert_axis(ndarray::Axis(1));
-        let h_phi_term1 = 0.5 * x_hv.t().dot(&x);
+        let t1 = x_hv.t().dot(&x);
         
-        // For simplicity, use just term1 of H_phi (the dominant term)
-        let h_phi = h_phi_term1;
+        // T2 = X' diag(u) (A ⊙ A) diag(u) X
+        // = (X' diag(u)) (A ⊙ A) (diag(u) X)
+        let xu = &x * &u.clone().insert_axis(ndarray::Axis(1)); // n×p, rows scaled by u
+        let a_sq = &a_mat * &a_mat; // Hadamard square
+        let xu_a_sq = xu.t().dot(&a_sq); // p×n
+        let t2 = xu_a_sq.dot(&xu); // p×p
+        
+        let h_phi = 0.5 * (&t1 - &t2);
         
         // H_total = Fisher + S - H_phi
-        let mut h_total = fisher.clone() + lambda * &s_k - &h_phi;
+        let h_total = &fisher + &(lambda * &s_k) - &h_phi;
         
         // H_total inverse
         let h_total_chol = h_total.cholesky(Side::Lower).expect("H_total chol");
@@ -14677,18 +14661,164 @@ mod ground_truth_gradient_tests {
         }
         
         // ========================================
-        // STEP 3: Compute exact COST gradient terms
+        // STEP 3: Compute ∂I/∂β and ∂I^{-1}/∂β tensors
         // ========================================
         
-        // Term 1: -0.5 * rank(S_k)
+        // ∂I/∂β_k = X' diag(w' ⊙ X_{·k}) X for each k
+        let mut d_fisher: Vec<Array2<f64>> = Vec::with_capacity(p);
+        for k in 0..p {
+            let diag_k: Array1<f64> = (0..n).map(|i| w_prime[i] * x[[i, k]]).collect();
+            let x_diag = &x * &diag_k.clone().insert_axis(ndarray::Axis(1));
+            d_fisher.push(x_diag.t().dot(&x));
+        }
+        
+        // ∂I^{-1}/∂β_k = -I^{-1} (∂I/∂β_k) I^{-1}
+        let mut d_fisher_inv: Vec<Array2<f64>> = Vec::with_capacity(p);
+        for k in 0..p {
+            let tmp = fisher_inv.dot(&d_fisher[k]);
+            d_fisher_inv.push(-tmp.dot(&fisher_inv));
+        }
+        
+        // ========================================
+        // STEP 4: Compute ∂h/∂β (hat diagonal derivatives)
+        // ========================================
+        
+        // ∂A_ii/∂β_k has 3 components per the critic's formula
+        // We only need the diagonal elements for ∂h/∂β_k
+        let mut d_h_diag: Vec<Array1<f64>> = Vec::with_capacity(p);
+        for k in 0..p {
+            let mut dh_k = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let x_i = x.row(i);
+                
+                // Component 1: derivative of left sqrt(w_i)
+                // 0.5 * sqrt(w_i) * u_i * X_ik * (X I^{-1} X')_ii * sqrt(w_i)
+                let xi_fisher_inv_xi = x_i.dot(&fisher_inv.dot(&x_i.to_owned()));
+                let comp1 = 0.5 * sqrt_w[i] * u[i] * x[[i, k]] * xi_fisher_inv_xi * sqrt_w[i];
+                
+                // Component 2: derivative of right sqrt(w_i) (same as comp1 for diagonal)
+                let comp2 = comp1;
+                
+                // Component 3: derivative through I^{-1}
+                let xi_d_fisher_inv_xi = x_i.dot(&d_fisher_inv[k].dot(&x_i.to_owned()));
+                let comp3 = sqrt_w[i] * xi_d_fisher_inv_xi * sqrt_w[i];
+                
+                dh_k[i] = comp1 + comp2 + comp3;
+            }
+            d_h_diag.push(dh_k);
+        }
+        
+        // ========================================
+        // STEP 5: Compute ∂H_phi/∂β tensor
+        // ========================================
+        
+        // This is complex. For T1 = X' diag(h⊙v) X:
+        // ∂T1/∂β_k = X' diag(∂h/∂β_k ⊙ v + h ⊙ ∂v/∂β_k) X
+        
+        // For T2 = X' diag(u) (A⊙A) diag(u) X:
+        // We need ∂(A⊙A)/∂β and ∂diag(u)/∂β
+        // Simplified: compute full tensor for small p
+        
+        let mut d_h_phi: Vec<Array2<f64>> = Vec::with_capacity(p);
+        for k in 0..p {
+            // ∂v/∂β_k = v'_i * X_ik
+            let dv_k: Array1<f64> = (0..n).map(|i| v_prime[i] * x[[i, k]]).collect();
+            
+            // ∂(h⊙v)/∂β_k = ∂h/∂β_k ⊙ v + h ⊙ ∂v/∂β_k
+            let d_hv_k = &d_h_diag[k] * &v + &h_diag * &dv_k;
+            let x_d_hv = &x * &d_hv_k.clone().insert_axis(ndarray::Axis(1));
+            let dt1_k = x_d_hv.t().dot(&x);
+            
+            // For T2, we need ∂[diag(u) (A⊙A) diag(u)]/∂β_k
+            // ∂u/∂β_k = u'_i * X_ik = -2w_i * X_ik
+            let du_k: Array1<f64> = (0..n).map(|i| u_prime[i] * x[[i, k]]).collect();
+            
+            // Full ∂A/∂β_k matrix (n×n) - expensive but exact
+            let mut d_a_k = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in 0..n {
+                    let x_i = x.row(i);
+                    let x_j = x.row(j);
+                    
+                    // Derivative of sqrt(w_i)
+                    let d_sqrt_w_i = 0.5 * sqrt_w[i] * u[i] * x[[i, k]];
+                    // Derivative of sqrt(w_j)  
+                    let d_sqrt_w_j = 0.5 * sqrt_w[j] * u[j] * x[[j, k]];
+                    
+                    let xi_fi_xj = x_i.dot(&fisher_inv.dot(&x_j.to_owned()));
+                    let xi_dfi_xj = x_i.dot(&d_fisher_inv[k].dot(&x_j.to_owned()));
+                    
+                    d_a_k[[i, j]] = d_sqrt_w_i * xi_fi_xj * sqrt_w[j]
+                                 + sqrt_w[i] * xi_fi_xj * d_sqrt_w_j
+                                 + sqrt_w[i] * xi_dfi_xj * sqrt_w[j];
+                }
+            }
+            
+            // ∂(A⊙A)/∂β_k = 2 * A ⊙ ∂A/∂β_k
+            let d_a_sq_k = 2.0 * &a_mat * &d_a_k;
+            
+            // Now compute ∂T2/∂β_k = X' [∂(diag(u)(A⊙A)diag(u))/∂β_k] X
+            // Product rule: 3 terms
+            // 1. ∂diag(u)/∂β_k * (A⊙A) * diag(u)
+            // 2. diag(u) * ∂(A⊙A)/∂β_k * diag(u)
+            // 3. diag(u) * (A⊙A) * ∂diag(u)/∂β_k
+            
+            // M = diag(u) (A⊙A) diag(u)
+            // ∂M/∂β_k = diag(∂u) (A⊙A) diag(u) + diag(u) ∂(A⊙A) diag(u) + diag(u) (A⊙A) diag(∂u)
+            
+            let mut d_m_k = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in 0..n {
+                    let a_sq_ij = a_sq[[i, j]];
+                    d_m_k[[i, j]] = du_k[i] * a_sq_ij * u[j]
+                                 + u[i] * d_a_sq_k[[i, j]] * u[j]
+                                 + u[i] * a_sq_ij * du_k[j];
+                }
+            }
+            
+            let dt2_k = x.t().dot(&d_m_k).dot(&x);
+            
+            d_h_phi.push(0.5 * (&dt1_k - &dt2_k));
+        }
+        
+        // ========================================
+        // STEP 6: Compute δ = -KKT + 0.5 * tr(H^{-1} ∂H/∂β)
+        // ========================================
+        
+        // KKT residual: gradient of Firth inner objective at β̂
+        // = -X'(y - μ + h⊙(0.5-μ)) + Sβ
+        let z_firth: Array1<f64> = (0..n).map(|i| {
+            (y[i] - mu[i]) + h_diag[i] * (0.5 - mu[i])
+        }).collect();
+        let kkt = -x.t().dot(&(&weights * &z_firth)) + lambda * s_k.dot(&beta);
+        
+        // ∂H_total/∂β_k = ∂I/∂β_k - ∂H_phi/∂β_k
+        // δ_k = -kkt_k + 0.5 * tr(H_total^{-1} ∂H_total/∂β_k)
+        let mut delta = Array1::<f64>::zeros(p);
+        for k in 0..p {
+            let d_h_total_k = &d_fisher[k] - &d_h_phi[k];
+            let mut trace_k = 0.0;
+            for i in 0..p {
+                for j in 0..p {
+                    trace_k += h_total_inv[[i, j]] * d_h_total_k[[j, i]];
+                }
+            }
+            delta[k] = -kkt[k] + 0.5 * trace_k;
+        }
+        
+        // ========================================
+        // STEP 7: Compute ground truth gradient
+        // ========================================
+        
+        // Term 1: -0.5 * rank(S)
         let rank_s = (p - 1) as f64;
         let term1 = -0.5 * rank_s;
         
-        // Term 2: +0.5 * λ * β'S_kβ
+        // Term 2: +0.5 * λ * β'Sβ
         let s_beta = s_k.dot(&beta);
         let term2 = 0.5 * lambda * beta.dot(&s_beta);
         
-        // Term 3: +0.5 * λ * tr(H_total⁻¹ S_k)
+        // Term 3: +0.5 * λ * tr(H_total^{-1} S)
         let mut trace_h_inv_s = 0.0;
         for i in 0..p {
             for j in 0..p {
@@ -14697,43 +14827,22 @@ mod ground_truth_gradient_tests {
         }
         let term3 = 0.5 * lambda * trace_h_inv_s;
         
-        // Term 4: Implicit via ∂β/∂ρ
-        // ∂β/∂ρ = -H_total⁻¹ * λ * S_k * β
+        // Term 4: δ' * (-λ H^{-1} S β)
         let h_inv_s_beta = h_total_inv.dot(&s_beta);
-        
-        // δ = ∇_β V = KKT_residual + 0.5 * ∇_β log|H_total|
-        // Assuming convergence, KKT residual ≈ 0
-        // ∇_β log|H_total| ≈ tr(H_total⁻¹ ∂(X'WX)/∂β) = Σ_i A_ii * w'_i * x_i
-        // where A = X H_total⁻¹ X'
-        let mut delta = Array1::<f64>::zeros(p);
-        for i in 0..n {
-            let x_i = x.row(i);
-            let h_inv_x = h_total_inv.dot(&x_i.to_owned());
-            let a_ii = x_i.dot(&h_inv_x);
-            
-            // w' = μ(1-μ)(1-2μ)
-            let w_prime_i = weights[i] * mu[i] * (1.0 - mu[i]) * (1.0 - 2.0 * mu[i]);
-            
-            for j in 0..p {
-                delta[j] += 0.5 * a_ii * w_prime_i * x[[i, j]];
-            }
-        }
-        
-        // Term 4 = δ' * (-λ * H_total⁻¹ S_k β)
         let d_beta_d_rho = -lambda * &h_inv_s_beta;
         let term4 = delta.dot(&d_beta_d_rho);
         
-        // Ground truth COST gradient
         let ground_truth = term1 + term2 + term3 + term4;
         
         println!("  Term 1 (-log|S|):     {:.6}", term1);
         println!("  Term 2 (+penalty):    {:.6}", term2);
         println!("  Term 3 (+log|H| dir): {:.6}", term3);
         println!("  Term 4 (implicit):    {:.6}", term4);
-        println!("  GROUND TRUTH ∂Cost/∂ρ (Firth) = {:.6}", ground_truth);
+        println!("  KKT residual norm:    {:.6e}", kkt.dot(&kkt).sqrt());
+        println!("  GROUND TRUTH ∂Cost/∂ρ (Firth, EXACT) = {:.6}", ground_truth);
         
         // ========================================
-        // STEP 4: Get analytic gradient via external API
+        // STEP 8: Compare to analytic gradient
         // ========================================
         
         let s_list = vec![s_k.clone()];
@@ -14746,7 +14855,7 @@ mod ground_truth_gradient_tests {
             nullspace_dims: vec![1],
         };
         
-        let rho = array![rho_val];
+        let rho = array![0.0_f64];
         
         match evaluate_external_gradients(y.view(), weights.view(), x.view(), offset.view(), &s_list, &opts, &rho) {
             Ok((analytic_grad, fd_grad)) => {
@@ -14758,19 +14867,17 @@ mod ground_truth_gradient_tests {
                 
                 println!("  |analytic - ground_truth| = {:.3e} (rel: {:.3e})", err_analytic, rel_err_analytic);
                 
-                // Assert that analytic gradient matches ground truth
+                // With exact formula, we expect close match
                 assert!(
-                    rel_err_analytic < 0.2 || err_analytic < 0.5,
-                    "FIRTH GROUND TRUTH TEST FAILED: analytic gradient doesn't match ground truth.\n\
-                     analytic={:.4e}, truth={:.4e}, rel_err={:.3e}\n\
-                     This indicates a bug in the Firth analytic gradient calculation.",
+                    rel_err_analytic < 0.1 || err_analytic < 0.1,
+                    "FIRTH GROUND TRUTH TEST FAILED: analytic={:.4e}, truth={:.4e}, rel_err={:.3e}",
                     analytic_grad[0], ground_truth, rel_err_analytic
                 );
                 
-                println!("✓ FIRTH GROUND TRUTH TEST PASSED");
+                println!("✓ FIRTH EXACT GROUND TRUTH TEST PASSED");
             }
             Err(e) => {
-                panic!("evaluate_external_gradients failed: {:?}\nGround truth (Firth) = {:.6}", e, ground_truth);
+                panic!("evaluate_external_gradients failed: {:?}\nGround truth = {:.6}", e, ground_truth);
             }
         }
     }

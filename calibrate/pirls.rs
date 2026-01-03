@@ -1182,11 +1182,10 @@ where
                             .map(f64::abs)
                             .fold(0.0, f64::max);
                         
-                        // Set the ridge used in the state for consistency
-                        let mut final_state_with_ridge = candidate_state.clone();
-                        final_state_with_ridge.ridge_used = loop_lambda;
-                        
-                        final_state = Some(final_state_with_ridge.clone());
+                        // Preserve the structural ridge computed by the model.
+                        // LM damping is a transient solver detail and must not
+                        // redefine the objective's stabilization ridge.
+                        final_state = Some(candidate_state.clone());
                         
                         // Check Convergence
                         let deviance_scale = current_penalized.abs().max(candidate_penalized.abs()).max(1.0);
@@ -1212,9 +1211,8 @@ where
                              // Exhausted attempts
                              if attempts > 30 {
                                  status = PirlsStatus::StalledAtValidMinimum;
-                                 let mut stalled_state = state.clone();
-                                 stalled_state.ridge_used = loop_lambda;
-                                 final_state = Some(stalled_state);
+                                 // Preserve the structural ridge from the model state.
+                                 final_state = Some(state.clone());
                                  break 'pirls_loop;
                              }
                          }
