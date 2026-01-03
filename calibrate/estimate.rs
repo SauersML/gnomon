@@ -5248,6 +5248,12 @@ pub mod internal {
                 return Ok(Array2::zeros((p, p)));
             }
 
+            // Match the GLM probability clamp in update_glm_vectors.
+            // When mu is clamped, the forward objective is locally constant in eta,
+            // so derivatives w.r.t. eta must be zero to avoid a gradient/cost mismatch.
+            // Note: this creates a kink at the clamp boundary (piecewise objective),
+            // which can slow quasi-Newton methods, but keeps math consistent.
+            const PROB_EPS: f64 = 1e-8;
             // Match the GLM weight clamp in update_glm_vectors:
             // dmu is clamped to MIN_WEIGHT before forming weights.
             const MIN_WEIGHT: f64 = 1e-12;
@@ -5260,8 +5266,9 @@ pub mod internal {
                 let dmu = mu_i * (1.0 - mu_i);
                 w_base[i] = dmu;
                 // u = w'/w, v = w''/w for logit with clamped W.
-                // If dmu is clamped, w is constant => derivatives are zero.
-                if dmu < MIN_WEIGHT {
+                // If mu is clamped, w is constant => derivatives are zero.
+                // This avoids phantom gradients in saturated regions.
+                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || dmu < MIN_WEIGHT {
                     u[i] = 0.0;
                     v[i] = 0.0;
                     continue;
@@ -5376,6 +5383,12 @@ pub mod internal {
                 return Ok(Array1::zeros(p));
             }
 
+            // Match the GLM probability clamp in update_glm_vectors.
+            // If mu is clamped, the objective is flat in eta, so all eta-derivatives
+            // (u, v, u_eta, v_eta, w_prime) must be zero for consistency.
+            // This is piecewise-smooth (kink at clamp), which is acceptable but
+            // theoretically less friendly to BFGS/L-BFGS.
+            const PROB_EPS: f64 = 1e-8;
             // Match the GLM weight clamp in update_glm_vectors:
             // dmu is clamped to MIN_WEIGHT before forming weights.
             const MIN_WEIGHT: f64 = 1e-12;
@@ -5390,8 +5403,8 @@ pub mod internal {
                 let mu_i = mu[i];
                 let w_b = mu_i * (1.0 - mu_i);
                 w_base[i] = w_b;
-                // When dmu is clamped, w is constant => all derivatives are zero.
-                if w_b < MIN_WEIGHT {
+                // When mu is clamped, w is constant => all derivatives are zero.
+                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_b < MIN_WEIGHT {
                     u[i] = 0.0;
                     v[i] = 0.0;
                     v_eta[i] = 0.0;
@@ -5636,6 +5649,10 @@ pub mod internal {
                 return None;
             }
 
+            // Match the GLM probability clamp in update_glm_vectors.
+            // The clamp makes w(eta) constant in saturated regions, so dw/deta = 0.
+            // Using the unclamped derivative there would create a phantom gradient.
+            const PROB_EPS: f64 = 1e-8;
             // Match the GLM weight clamp in update_glm_vectors:
             // if dmu is clamped, weights are constant and w' = 0.
             const MIN_WEIGHT: f64 = 1e-12;
@@ -5644,7 +5661,7 @@ pub mod internal {
             for i in 0..n {
                 let mu_i = mu[i];
                 let w_base = mu_i * (1.0 - mu_i);
-                if w_base < MIN_WEIGHT {
+                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_base < MIN_WEIGHT {
                     clamped += 1;
                     w_prime[i] = 0.0;
                     continue;
