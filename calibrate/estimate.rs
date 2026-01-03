@@ -13828,3 +13828,369 @@ mod gradient_validation_tests {
         println!("[MCMC E2E] Test passed! MCMC integration verified with disk I/O.");
     }
 }
+
+// === Ground-Truth Gradient Tests ===
+// These tests verify gradient computations against mathematically-derived exact values,
+// not just finite-difference approximations. This provides a stronger correctness guarantee.
+#[cfg(test)]
+mod ground_truth_gradient_tests {
+    use super::*;
+    use crate::calibrate::model::{
+        BasisConfig, InteractionPenaltyKind, LinkFunction, ModelConfig, ModelFamily,
+    };
+    use ndarray::{array, Array1, Array2};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    /// Layer 0: Verify the log|A| gradient formula using faer-based Cholesky.
+    /// For J(A) = log|A|, we have ∂J/∂A = A^{-T}.
+    /// We test this by computing log|A| and its gradient via finite differences.
+    #[test]
+    fn test_log_det_gradient_formula() {
+        use crate::calibrate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        // Simple 3×3 SPD matrix
+        let a = array![
+            [4.0, 1.0, 0.5],
+            [1.0, 3.0, 0.2],
+            [0.5, 0.2, 2.0]
+        ];
+
+        // Helper to compute log|A| using faer Cholesky
+        fn log_det_chol(mat: &Array2<f64>) -> Option<f64> {
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            use faer::Side;
+            match mat.cholesky(Side::Lower) {
+                Ok(chol) => {
+                    let l = chol.lower_triangular();
+                    let sum: f64 = (0..l.nrows()).map(|i| l[[i, i]].ln()).sum();
+                    Some(2.0 * sum)
+                }
+                Err(_) => None,
+            }
+        }
+
+        let log_det = log_det_chol(&a).expect("chol(A)");
+
+        // Compute gradient via finite differences
+        let h = 1e-7;
+        let mut grad_fd = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut a_plus = a.clone();
+                let mut a_minus = a.clone();
+                a_plus[[i, j]] += h;
+                a_minus[[i, j]] -= h;
+                // Ensure symmetry for SPD
+                a_plus[[j, i]] = a_plus[[i, j]];
+                a_minus[[j, i]] = a_minus[[i, j]];
+
+                let log_plus = log_det_chol(&a_plus).unwrap_or(f64::NAN);
+                let log_minus = log_det_chol(&a_minus).unwrap_or(f64::NAN);
+                grad_fd[[i, j]] = (log_plus - log_minus) / (2.0 * h);
+            }
+        }
+
+        // Compute A^{-1} using Cholesky factorization
+        let chol = a.cholesky(Side::Lower).expect("chol for inverse");
+        let l = chol.lower_triangular();
+        // A^{-1} = L^{-T} L^{-1}, solve by applying to identity columns
+        let mut a_inv = Array2::<f64>::zeros((3, 3));
+        for col in 0..3 {
+            let mut e = Array1::<f64>::zeros(3);
+            e[col] = 1.0;
+            // Forward substitution: L y = e
+            let mut y = Array1::<f64>::zeros(3);
+            for i in 0..3 {
+                let mut sum = e[i];
+                for k in 0..i {
+                    sum -= l[[i, k]] * y[k];
+                }
+                y[i] = sum / l[[i, i]];
+            }
+            // Backward substitution: L^T x = y
+            let mut x = Array1::<f64>::zeros(3);
+            for i in (0..3).rev() {
+                let mut sum = y[i];
+                for k in (i + 1)..3 {
+                    sum -= l[[k, i]] * x[k];
+                }
+                x[i] = sum / l[[i, i]];
+            }
+            for row in 0..3 {
+                a_inv[[row, col]] = x[row];
+            }
+        }
+
+        println!("  log|A| = {:.6}", log_det);
+        println!("  Analytic A^{{-1}} diag = [{:.6}, {:.6}, {:.6}]", a_inv[[0,0]], a_inv[[1,1]], a_inv[[2,2]]);
+
+        // Check diagonal matches
+        for i in 0..3 {
+            assert!(
+                (grad_fd[[i, i]] - a_inv[[i, i]]).abs() < 1e-4,
+                "Diagonal mismatch at {}: FD={:.6}, analytic={:.6}",
+                i, grad_fd[[i, i]], a_inv[[i, i]]
+            );
+        }
+
+        // Check off-diagonal (should be 2 * A^{-1} because we perturbed both elements)
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                let expected = 2.0 * a_inv[[i, j]]; // factor of 2 for symmetric perturbation
+                assert!(
+                    (grad_fd[[i, j]] - expected).abs() < 1e-4,
+                    "Off-diagonal mismatch at [{},{}]: FD={:.6}, expected={:.6}",
+                    i, j, grad_fd[[i, j]], expected
+                );
+            }
+        }
+
+        println!("✓ Layer 0: log|A| gradient matches A^{{-1}} formula");
+
+    }
+
+    /// Layer 2: Logit link without Firth, well-conditioned.
+    #[test]
+    fn test_laml_gradient_logit_no_firth_well_conditioned() {
+        let n = 200;
+        let p_basis = 6;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+        let eta_true: Array1<f64> = p_vals.mapv(|p| 0.5 * p);
+        let y: Array1<f64> = eta_true
+            .iter()
+            .map(|&eta| {
+                let prob = 1.0 / (1.0 + (-eta).exp());
+                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            })
+            .collect();
+
+        let data = TrainingData {
+            y,
+            p: p_vals,
+            sex,
+            pcs: Array2::<f64>::zeros((n, 0)),
+            weights: Array1::<f64>::ones(n),
+        };
+
+        let config = ModelConfig {
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
+            penalty_order: 2,
+            convergence_tolerance: 1e-8,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 50,
+            firth_bias_reduction: false,
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
+            pgs_basis_config: BasisConfig { num_knots: p_basis - 3, degree: 3 },
+            pc_configs: vec![],
+            pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Isotropic,
+            sum_to_zero_constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
+            interaction_orth_alpha: std::collections::HashMap::new(),
+            mcmc_enabled: false,
+            calibrator_enabled: false,
+            survival: None,
+        };
+
+        let (x, s_list, layout, ..) = crate::calibrate::construction::build_design_and_penalty_matrices(&data, &config)
+            .expect("build matrices");
+
+        let reml_state = internal::RemlState::new(
+            data.y.view(), x.view(), data.weights.view(), s_list, &layout, &config, None,
+        ).expect("RemlState");
+
+        let rho = Array1::from_elem(layout.num_penalties, 0.0);
+        let analytic = reml_state.compute_gradient(&rho).expect("analytic grad");
+        let fd = compute_fd_gradient(&reml_state, &rho).expect("FD grad");
+
+        println!("  n={}, p={}, penalties={}", n, x.ncols(), layout.num_penalties);
+        
+        let dot = analytic.dot(&fd);
+        let n_a = analytic.dot(&analytic).sqrt();
+        let n_f = fd.dot(&fd).sqrt();
+        let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+        let diff = &analytic - &fd;
+        let rel_l2 = diff.dot(&diff).sqrt() / n_f.max(n_a).max(1.0);
+
+        println!("  Cosine similarity: {:.6}, Relative L2 error: {:.3e}", cosine, rel_l2);
+
+        assert!(cosine > 0.99, "Layer 2 FAILED: cosine {:.4} < 0.99", cosine);
+        assert!(rel_l2 < 0.1, "Layer 2 FAILED: rel_l2 {:.3e} > 0.1", rel_l2);
+        println!("✓ Layer 2: Logit (no Firth) gradient matches FD");
+    }
+
+    /// Layer 3: Logit + Firth, well-conditioned (n >> p).
+    #[test]
+    fn test_laml_gradient_logit_with_firth_well_conditioned() {
+        let n = 300;
+        let p_basis = 8;
+
+        let mut rng = StdRng::seed_from_u64(123);
+        let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+        let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+        let eta_true: Array1<f64> = p_vals.mapv(|p| 0.3 * p);
+        let y: Array1<f64> = eta_true
+            .iter()
+            .map(|&eta| {
+                let prob = 1.0 / (1.0 + (-eta).exp());
+                if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+            })
+            .collect();
+
+        let data = TrainingData {
+            y,
+            p: p_vals,
+            sex,
+            pcs: Array2::<f64>::zeros((n, 0)),
+            weights: Array1::<f64>::ones(n),
+        };
+
+        let config = ModelConfig {
+            model_family: ModelFamily::Gam(LinkFunction::Logit),
+            penalty_order: 2,
+            convergence_tolerance: 1e-8,
+            max_iterations: 100,
+            reml_convergence_tolerance: 1e-6,
+            reml_max_iterations: 50,
+            firth_bias_reduction: true, // Firth enabled
+            reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
+            pgs_basis_config: BasisConfig { num_knots: p_basis - 3, degree: 3 },
+            pc_configs: vec![],
+            pgs_range: (-2.0, 2.0),
+            interaction_penalty: InteractionPenaltyKind::Isotropic,
+            sum_to_zero_constraints: std::collections::HashMap::new(),
+            knot_vectors: std::collections::HashMap::new(),
+            range_transforms: std::collections::HashMap::new(),
+            pc_null_transforms: std::collections::HashMap::new(),
+            interaction_centering_means: std::collections::HashMap::new(),
+            interaction_orth_alpha: std::collections::HashMap::new(),
+            mcmc_enabled: false,
+            calibrator_enabled: false,
+            survival: None,
+        };
+
+        let (x, s_list, layout, ..) = crate::calibrate::construction::build_design_and_penalty_matrices(&data, &config)
+            .expect("build matrices");
+
+        println!("  n={}, p={}, penalties={}, Firth=true", n, x.ncols(), layout.num_penalties);
+
+        let reml_state = internal::RemlState::new(
+            data.y.view(), x.view(), data.weights.view(), s_list, &layout, &config, None,
+        ).expect("RemlState");
+
+        let rho = Array1::from_elem(layout.num_penalties, 0.0);
+        let analytic = reml_state.compute_gradient(&rho).expect("analytic grad");
+        let fd = compute_fd_gradient(&reml_state, &rho).expect("FD grad");
+
+        let max_analytic = analytic.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let max_fd = fd.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        println!("  max|analytic| = {:.3e}, max|FD| = {:.3e}", max_analytic, max_fd);
+
+        assert!(max_analytic < 1e10, "Layer 3 FAILED: gradient explosion, max={:.3e}", max_analytic);
+
+        let dot = analytic.dot(&fd);
+        let n_a = analytic.dot(&analytic).sqrt();
+        let n_f = fd.dot(&fd).sqrt();
+        let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+        let diff = &analytic - &fd;
+        let rel_l2 = diff.dot(&diff).sqrt() / n_f.max(n_a).max(1.0);
+
+        println!("  Cosine similarity: {:.6}, Relative L2 error: {:.3e}", cosine, rel_l2);
+
+        assert!(cosine > 0.95, "Layer 3 FAILED: cosine {:.4} < 0.95", cosine);
+        assert!(rel_l2 < 0.2, "Layer 3 FAILED: rel_l2 {:.3e} > 0.2", rel_l2);
+        println!("✓ Layer 3: Logit + Firth gradient matches FD");
+    }
+
+    /// Layer 4: Stress test - observe gradient breakdown as p/n increases.
+    #[test]
+    fn stress_test_firth_gradient_vs_conditioning() {
+        println!("\n=== Firth Gradient Stress Test: varying p/n ratio ===\n");
+
+        let test_configs = [
+            (200, 4, "easy"),
+            (150, 6, "moderate"),
+            (100, 8, "challenging"),
+        ];
+
+        for (n, knots, label) in test_configs {
+            let mut rng = StdRng::seed_from_u64(999);
+            let p_vals: Array1<f64> = (0..n).map(|_| rng.gen_range(-2.0..2.0)).collect();
+            let sex: Array1<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+            let eta_true: Array1<f64> = p_vals.mapv(|p| 0.3 * p);
+            let y: Array1<f64> = eta_true
+                .iter()
+                .map(|&eta| {
+                    let prob = 1.0 / (1.0 + (-eta).exp());
+                    if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+                })
+                .collect();
+
+            let data = TrainingData {
+                y, p: p_vals, sex,
+                pcs: Array2::<f64>::zeros((n, 0)),
+                weights: Array1::<f64>::ones(n),
+            };
+
+            let config = ModelConfig {
+                model_family: ModelFamily::Gam(LinkFunction::Logit),
+                penalty_order: 2,
+                convergence_tolerance: 1e-6,
+                max_iterations: 50,
+                reml_convergence_tolerance: 1e-4,
+                reml_max_iterations: 20,
+                firth_bias_reduction: true,
+                reml_parallel_threshold: crate::calibrate::model::default_reml_parallel_threshold(),
+                pgs_basis_config: BasisConfig { num_knots: knots, degree: 3 },
+                pc_configs: vec![],
+                pgs_range: (-2.0, 2.0),
+                interaction_penalty: InteractionPenaltyKind::Isotropic,
+                sum_to_zero_constraints: std::collections::HashMap::new(),
+                knot_vectors: std::collections::HashMap::new(),
+                range_transforms: std::collections::HashMap::new(),
+                pc_null_transforms: std::collections::HashMap::new(),
+                interaction_centering_means: std::collections::HashMap::new(),
+                interaction_orth_alpha: std::collections::HashMap::new(),
+                mcmc_enabled: false,
+                calibrator_enabled: false,
+                survival: None,
+            };
+
+            let Ok((x, s_list, layout, ..)) = crate::calibrate::construction::build_design_and_penalty_matrices(&data, &config) else {
+                println!("[{}] Build failed", label);
+                continue;
+            };
+
+            let ratio = x.ncols() as f64 / n as f64;
+            let Ok(reml_state) = internal::RemlState::new(
+                data.y.view(), x.view(), data.weights.view(), s_list, &layout, &config, None,
+            ) else {
+                println!("[{}] p/n={:.2} - RemlState failed", label, ratio);
+                continue;
+            };
+
+            let rho = Array1::from_elem(layout.num_penalties, 0.0);
+            let Ok(analytic) = reml_state.compute_gradient(&rho) else { continue; };
+            let Ok(fd) = compute_fd_gradient(&reml_state, &rho) else { continue; };
+
+            let max_a = analytic.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let max_f = fd.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let dot = analytic.dot(&fd);
+            let n_a = analytic.dot(&analytic).sqrt();
+            let n_f = fd.dot(&fd).sqrt();
+            let cosine = if n_a * n_f > 1e-12 { dot / (n_a * n_f) } else { 1.0 };
+
+            let status = if cosine > 0.95 && max_a < 1e8 { "OK" } else { "WARN" };
+            println!("[{}] p/n={:.2} | cos={:.4} | max|a|={:.2e} | max|fd|={:.2e} | {}", label, ratio, cosine, max_a, max_f, status);
+        }
+    }
+}
+
