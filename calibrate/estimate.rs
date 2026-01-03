@@ -7070,8 +7070,11 @@ pub mod internal {
                             .solve_mu
                             .iter()
                             .any(|&mu| mu * (1.0 - mu) < Self::MIN_DMU_DETA);
-                    if use_numeric_firth || clamp_nonsmooth {
+                    let ridge_nonsmooth = ridge_used > 0.0;
+                    if use_numeric_firth || clamp_nonsmooth || ridge_nonsmooth {
                         // When IRLS clamps weights, the cost surface can be non-smooth in β.
+                        // A stabilization ridge also makes the cost non-smooth in ρ because
+                        // ridge_used depends on the Hessian spectrum and changes discontinuously.
                         // Use the same FD scheme as the gradient check to stay consistent.
                         let g_laml = super::compute_fd_gradient(self, p)?;
                         includes_prior = true;
@@ -9067,18 +9070,26 @@ pub mod internal {
         #[test]
         fn test_laml_gradient_forensic_decomposition_small_lambda() {
             let (state, rho0) = build_logit_small_lambda_state(120, 4242);
-            let g_fd = fd_cost_grad(&state, &rho0);
+            let g_fd = super::compute_fd_gradient(&state, &rho0).expect("fd gradient");
             let g_an = state.compute_gradient(&rho0).expect("grad");
             let g_pll = state.numeric_penalised_ll_grad(&rho0).expect("g_pll");
             let g_half_logh_s = half_logh_s_part(&state, &rho0);
             let g_log_s = dlog_s(&state, &rho0);
             let g_half_logh_full = fd_half_logh(&state, &rho0);
+            let ridge_used = state
+                .execute_pirls_if_needed(&rho0)
+                .expect("pirls")
+                .ridge_used;
 
             // Reference (true) gradient assembled purely from numeric pieces consistent with the cost
             let g_true = &g_pll + &g_half_logh_full - &(0.5 * &g_log_s);
 
             // Diagnostics (printed on failure)
-            eprintln!("\n[Forensic @ rho={:?}]", rho0.to_vec());
+            eprintln!(
+                "\n[Forensic @ rho={:?} ridge_used={:.3e}]",
+                rho0.to_vec(),
+                ridge_used
+            );
             eprintln!("  g_fd        = {}", fmt_vec(&g_fd));
             eprintln!("  g_an(code)  = {}", fmt_vec(&g_an));
             eprintln!("  g_true(num) = {}", fmt_vec(&g_true));
@@ -9087,20 +9098,30 @@ pub mod internal {
             eprintln!("  ½logH(full) = {}", fmt_vec(&g_half_logh_full));
             eprintln!("  -½logS      = {}", fmt_vec(&(-0.5 * &g_log_s)));
 
-            // Gates: code gradient should match both FD(cost) and the numeric assembly (g_true)
+            // Gates: code gradient should match FD(cost). Only compare against g_true
+            // when no stabilization ridge is active (ridge makes the cost non-smooth in rho).
             let n_true = g_true.mapv(|x| x * x).sum().sqrt().max(1e-12);
             let rel_an_true = (&g_an - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
             let rel_fd_true = (&g_fd - &g_true).mapv(|x| x * x).sum().sqrt() / n_true;
+            let n_fd = g_fd.mapv(|x| x * x).sum().sqrt().max(1e-12);
+            let rel_an_fd = (&g_an - &g_fd).mapv(|x| x * x).sum().sqrt() / n_fd;
             assert!(
-                rel_an_true <= 1e-2,
-                "g_an vs g_true rel L2: {:.3e}",
-                rel_an_true
+                rel_an_fd <= 1e-2,
+                "g_an vs g_fd rel L2: {:.3e}",
+                rel_an_fd
             );
-            assert!(
-                rel_fd_true <= 1e-2,
-                "g_fd vs g_true rel L2: {:.3e}",
-                rel_fd_true
-            );
+            if ridge_used == 0.0 {
+                assert!(
+                    rel_an_true <= 1e-2,
+                    "g_an vs g_true rel L2: {:.3e}",
+                    rel_an_true
+                );
+                assert!(
+                    rel_fd_true <= 1e-2,
+                    "g_fd vs g_true rel L2: {:.3e}",
+                    rel_fd_true
+                );
+            }
         }
 
         #[test]
@@ -9110,7 +9131,7 @@ pub mod internal {
             let grid = [-2.0_f64, -1.0, 0.0, 2.0];
             for &r in &grid {
                 let rho = Array1::from_elem(ks, r);
-                let g_fd = fd_cost_grad(&state, &rho);
+                let g_fd = super::compute_fd_gradient(&state, &rho).expect("fd gradient");
                 let g_an = match state.compute_gradient(&rho) {
                     Ok(g) => g,
                     Err(_) => continue,
