@@ -410,9 +410,12 @@ pub struct WorkingModelPirlsResult {
 // Fixed stabilization ridge for PIRLS/PLS. This is treated as an explicit penalty
 // term (0.5 * ridge * ||beta||^2) and is constant w.r.t. rho.
 //
-// Math note: letting ridge depend on rho makes the LAML/REML objective non-smooth
-// (ridge flips when the Hessian spectrum crosses a threshold). A fixed ridge keeps
-// the objective differentiable in rho and preserves the envelope-theorem gradient.
+// Math note:
+//   Objective: V(ρ) includes log|H(ρ)| with H(ρ) = X' W X + S_λ(ρ) + δ I.
+//   If δ = δ(ρ) is adaptive, V(ρ) is only piecewise-smooth and ∂V/∂ρ ignores
+//   ∂δ/∂ρ, causing analytic/FD mismatch. Using a fixed δ makes V(ρ) smooth and
+//   the standard envelope-theorem gradient valid:
+//     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-6;
 
 struct GamWorkingModel<'a> {

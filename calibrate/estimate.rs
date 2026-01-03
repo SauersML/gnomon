@@ -6704,7 +6704,11 @@ pub mod internal {
                 // When we treat a stabilization ridge as a true penalty term, the
                 // penalty matrix becomes S_λ + ridge * I. For exactness, both the
                 // log|S| term in the cost and the derivative d/dρ_k log|S| must be
-                // computed using this ridged matrix. The derivative is:
+                // computed using this ridged matrix. The derivative follows from
+                // Jacobi's formula:
+                //   d/dρ_k log|S_λ + δI|
+                //     = tr((S_λ + δI)^{-1} dS_λ/dρ_k)
+                //     = λ_k tr((S_λ + δI)^{-1} S_k).
                 //
                 //   det1[k] = d/dρ_k log|S_λ + ridge I|
                 //           = λ_k * tr((S_λ + ridge I)^{-1} S_k)
