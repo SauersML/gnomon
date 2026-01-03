@@ -14544,7 +14544,7 @@ mod ground_truth_gradient_tests {
             let score = x.t().dot(&(&weights * &z)) - lambda * s_k.dot(&beta);
             
             // H_simple = Fisher + S (for Newton step in IRLS)
-            let mut h_simple = fisher.clone() + lambda * &s_k;
+            let h_simple = fisher.clone() + lambda * &s_k;
             let h_chol = match h_simple.cholesky(Side::Lower) {
                 Ok(c) => c,
                 Err(_) => break,
@@ -14882,4 +14882,3 @@ mod ground_truth_gradient_tests {
         }
     }
 }
-
