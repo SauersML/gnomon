@@ -17,7 +17,10 @@ use rand::{Rng, SeedableRng};
 
 use faer::Side;
 use gnomon::calibrate::calibrator::FirthSpec;
-use gnomon::calibrate::basis::create_difference_penalty_matrix;
+use gnomon::calibrate::basis::{
+    apply_sum_to_zero_constraint, create_basis, create_difference_penalty_matrix, BasisOptions,
+    Dense, KnotSource,
+};
 use gnomon::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
 use gnomon::calibrate::estimate::{evaluate_external_gradients, ExternalOptimOptions};
 use gnomon::calibrate::faer_ndarray::FaerCholesky;
@@ -63,6 +66,31 @@ fn generate_logit_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f6
     (y, x, weights)
 }
 
+fn generate_logit_data_no_intercept(
+    n: usize,
+    p: usize,
+    seed: u64,
+) -> (Array1<f64>, Array2<f64>, Array1<f64>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p {
+            x[[i, j]] = rng.gen_range(-1.0..1.0);
+        }
+    }
+    let true_beta: Array1<f64> = (0..p).map(|j| 0.2 / (1.0 + j as f64)).collect();
+    let eta = x.dot(&true_beta);
+    let y: Array1<f64> = eta
+        .iter()
+        .map(|&e| {
+            let prob = 1.0 / (1.0 + (-e).exp());
+            if rng.r#gen::<f64>() < prob { 1.0 } else { 0.0 }
+        })
+        .collect();
+    let weights = Array1::<f64>::ones(n);
+    (y, x, weights)
+}
+
 /// Generate Gaussian data for identity link tests.
 fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -89,28 +117,6 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
     (y, x, weights)
 }
 
-fn random_orthonormal_basis(p: usize, k: usize, seed: u64) -> Array2<f64> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut q = Array2::<f64>::zeros((p, k));
-    for j in 0..k {
-        let mut v = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            v[i] = rng.gen_range(-1.0..1.0);
-        }
-        for jj in 0..j {
-            let col = q.column(jj);
-            let dot = col.dot(&v);
-            v -= &(col.to_owned() * dot);
-        }
-        let norm = v.dot(&v).sqrt();
-        if norm > 0.0 {
-            v /= norm;
-        }
-        q.column_mut(j).assign(&v);
-    }
-    q
-}
-
 fn kron_with_identity(s: &Array2<f64>, n: usize) -> Array2<f64> {
     let p1 = s.nrows();
     let p = p1 * n;
@@ -125,6 +131,42 @@ fn kron_with_identity(s: &Array2<f64>, n: usize) -> Array2<f64> {
                 let row = i1 * n + i2;
                 let col = j1 * n + i2;
                 out[[row, col]] = v;
+            }
+        }
+    }
+    out
+}
+
+fn identity_kron_with(s: &Array2<f64>, n: usize) -> Array2<f64> {
+    let p2 = s.nrows();
+    let p = p2 * n;
+    let mut out = Array2::<f64>::zeros((p, p));
+    for block in 0..n {
+        let row_off = block * p2;
+        let col_off = block * p2;
+        for i in 0..p2 {
+            for j in 0..p2 {
+                out[[row_off + i, col_off + j]] = s[[i, j]];
+            }
+        }
+    }
+    out
+}
+
+fn kron_with_identity_right(z: &Array2<f64>, n: usize) -> Array2<f64> {
+    let r = z.nrows();
+    let c = z.ncols();
+    let rows = r * n;
+    let cols = c * n;
+    let mut out = Array2::<f64>::zeros((rows, cols));
+    for i in 0..r {
+        for j in 0..c {
+            let v = z[[i, j]];
+            if v == 0.0 {
+                continue;
+            }
+            for k in 0..n {
+                out[[i * n + k, j * n + k]] = v;
             }
         }
     }
@@ -613,17 +655,34 @@ fn isolation_concurrent_nullspace_instability() {
 #[test]
 fn isolation_projected_tensor_penalty_logit_no_firth() {
     println!("\n=== ISOLATION: Projected tensor penalty, Logit, No Firth ===");
-    
-    let n = 120;
-    let n1 = 4;
-    let n2 = 4;
-    let p_raw = n1 * n2;
-    let s1 = create_difference_penalty_matrix(n1, 2).expect("difference penalty");
+    let n = 140;
+    let n_obs = 200;
+    let degree = 3;
+    let num_internal_knots = 20;
+    let data: Array1<f64> = (0..n_obs)
+        .map(|i| i as f64 / (n_obs - 1) as f64)
+        .collect();
+    let (basis_arc, _) = create_basis::<Dense>(
+        data.view(),
+        KnotSource::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots,
+        },
+        degree,
+        BasisOptions::value(),
+    )
+    .expect("basis");
+    let basis = basis_arc.as_ref();
+    let (_, z1) = apply_sum_to_zero_constraint(basis.view(), None).expect("constraint");
+    let k1 = z1.nrows();
+    let n2 = 5;
+    let p_raw = k1 * n2;
+    let s1 = create_difference_penalty_matrix(k1, 2).expect("difference penalty");
     let s_raw = kron_with_identity(&s1, n2);
-    let z = random_orthonormal_basis(p_raw, p_raw - 1, 55);
+    let z = kron_with_identity_right(&z1, n2);
     let s = z.t().dot(&s_raw).dot(&z);
     
-    let (y, x, w) = generate_logit_data(n, p_raw - 1, 55);
+    let (y, x, w) = generate_logit_data_no_intercept(n, p_raw - n2, 55);
     let rho = array![0.0];
     
     let (analytic, fd) = match evaluate_external_gradients(
@@ -637,7 +696,7 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
             firth: None,
             tol: 1e-10,
             max_iter: 200,
-            nullspace_dims: vec![2 * n2],
+            nullspace_dims: vec![n2],
         },
         &rho,
     ) {
@@ -650,6 +709,126 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
     
     let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
     print_result("Projected tensor penalty", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_projected_tensor_penalty_with_firth() {
+    println!("\n=== ISOLATION: Projected tensor penalty, Logit, Firth ===");
+    let n = 140;
+    let n_obs = 200;
+    let degree = 3;
+    let num_internal_knots = 20;
+    let data: Array1<f64> = (0..n_obs)
+        .map(|i| i as f64 / (n_obs - 1) as f64)
+        .collect();
+    let (basis_arc, _) = create_basis::<Dense>(
+        data.view(),
+        KnotSource::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots,
+        },
+        degree,
+        BasisOptions::value(),
+    )
+    .expect("basis");
+    let basis = basis_arc.as_ref();
+    let (_, z1) = apply_sum_to_zero_constraint(basis.view(), None).expect("constraint");
+    let k1 = z1.nrows();
+    let n2 = 5;
+    let p_raw = k1 * n2;
+    let s1_base = create_difference_penalty_matrix(k1, 2).expect("difference penalty");
+    let s2_base = create_difference_penalty_matrix(n2, 2).expect("difference penalty");
+    let s1_raw = kron_with_identity(&s1_base, n2);
+    let s2_raw = identity_kron_with(&s2_base, k1);
+    let z = kron_with_identity_right(&z1, n2);
+    let s1 = z.t().dot(&s1_raw).dot(&z);
+    let s2 = z.t().dot(&s2_raw).dot(&z);
+
+    let (y, x, w) = generate_logit_data_no_intercept(n, p_raw - n2, 56);
+    let rho = array![0.0, 0.0];
+
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(n).view(),
+        &[s1, s2],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![n2, 2 * (k1 - 1)],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Projected tensor + Firth", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_multiple_overlapping_dense_penalties_with_firth() {
+    println!("\n=== ISOLATION: Multiple overlapping dense penalties + Firth ===");
+    let n = 120;
+    let n_obs = 180;
+    let degree = 3;
+    let num_internal_knots = 12;
+    let data: Array1<f64> = (0..n_obs)
+        .map(|i| i as f64 / (n_obs - 1) as f64)
+        .collect();
+    let (basis_arc, _) = create_basis::<Dense>(
+        data.view(),
+        KnotSource::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots,
+        },
+        degree,
+        BasisOptions::value(),
+    )
+    .expect("basis");
+    let basis = basis_arc.as_ref();
+    let (_, z) = apply_sum_to_zero_constraint(basis.view(), None).expect("constraint");
+    let k_eff = z.nrows();
+    let s_raw_1 = create_difference_penalty_matrix(k_eff, 1).expect("diff 1");
+    let s_raw_2 = create_difference_penalty_matrix(k_eff, 2).expect("diff 2");
+    let s1 = z.t().dot(&s_raw_1).dot(&z);
+    let s2 = z.t().dot(&s_raw_2).dot(&z);
+
+    let p_eff = s1.nrows();
+    let (y, x, w) = generate_logit_data_no_intercept(n, p_eff, 99);
+    let rho = array![0.9, 0.4];
+
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(n).view(),
+        &[s1, s2],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![1, 2],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Multi dense + Firth", cos_fd, rel_fd, max_a, max_fd);
 }
 
 // ============================================================================
