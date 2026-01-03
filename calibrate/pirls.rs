@@ -416,7 +416,7 @@ pub struct WorkingModelPirlsResult {
 //   ∂δ/∂ρ, causing analytic/FD mismatch. Using a fixed δ makes V(ρ) smooth and
 //   the standard envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
-const FIXED_STABILIZATION_RIDGE: f64 = 1e-6;
+const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
 struct GamWorkingModel<'a> {
     x_transformed: Option<DesignMatrix>,
