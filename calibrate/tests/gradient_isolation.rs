@@ -3,21 +3,27 @@
 //! Each test toggles ONE factor while keeping others constant.
 //! This identifies the root cause of gradient failures in complex models.
 //!
-//! DIAGNOSTIC STRATEGY:
-//! 
+//! Diagnostic strategy:
+//!
 //! 1. Factor Isolation: Toggle single factors (Firth, multi-penalty, anisotropic λ)
-//! 2. Frozen Beta Test: Disable re-optimization to test Envelope Theorem
-//! 3. Component Breakout: Test each LAML term separately
-//! 4. Ridge Scaling: Vary ridge to detect null-space amplification
-//! 5. Identity Link: Control for Firth/logit-specific issues
+//! 2. Identity Link: Control for logit-specific issues
+//! 3. Frozen Beta FD: Hold β and compare gradients
+//! 4. Rank-deficient penalties: difference and near-null cases
+//! 5. Projected tensor penalty: constraint projection
 
 use ndarray::{array, Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use gnomon::calibrate::estimate::{evaluate_external_gradients, ExternalOptimOptions};
-use gnomon::calibrate::model::LinkFunction;
+use faer::Side;
 use gnomon::calibrate::calibrator::FirthSpec;
+use gnomon::calibrate::basis::create_difference_penalty_matrix;
+use gnomon::calibrate::construction::{compute_penalty_square_roots, stable_reparameterization, ModelLayout};
+use gnomon::calibrate::estimate::{evaluate_external_gradients, ExternalOptimOptions};
+use gnomon::calibrate::faer_ndarray::FaerCholesky;
+use gnomon::calibrate::model::{LinkFunction, ModelConfig};
+use gnomon::calibrate::pirls::{calculate_deviance, fit_model_for_fixed_rho, update_glm_vectors};
+use gnomon::calibrate::types::LogSmoothingParamsView;
 
 /// Helper to create a simple diagonal penalty matrix.
 fn diagonal_penalty(p: usize, start: usize, end: usize) -> Array2<f64> {
@@ -83,6 +89,73 @@ fn generate_gaussian_data(n: usize, p: usize, seed: u64) -> (Array1<f64>, Array2
     (y, x, weights)
 }
 
+fn random_orthonormal_basis(p: usize, k: usize, seed: u64) -> Array2<f64> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut q = Array2::<f64>::zeros((p, k));
+    for j in 0..k {
+        let mut v = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            v[i] = rng.gen_range(-1.0..1.0);
+        }
+        for jj in 0..j {
+            let col = q.column(jj);
+            let dot = col.dot(&v);
+            v -= &(col.to_owned() * dot);
+        }
+        let norm = v.dot(&v).sqrt();
+        if norm > 0.0 {
+            v /= norm;
+        }
+        q.column_mut(j).assign(&v);
+    }
+    q
+}
+
+fn kron_with_identity(s: &Array2<f64>, n: usize) -> Array2<f64> {
+    let p1 = s.nrows();
+    let p = p1 * n;
+    let mut out = Array2::<f64>::zeros((p, p));
+    for i1 in 0..p1 {
+        for j1 in 0..p1 {
+            let v = s[[i1, j1]];
+            if v == 0.0 {
+                continue;
+            }
+            for i2 in 0..n {
+                let row = i1 * n + i2;
+                let col = j1 * n + i2;
+                out[[row, col]] = v;
+            }
+        }
+    }
+    out
+}
+
+fn design_with_nullspace_suppression(n: usize, p: usize, seed: u64) -> Array2<f64> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut z = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p {
+            z[[i, j]] = rng.gen_range(-1.0..1.0);
+        }
+    }
+    let mut b = Array2::<f64>::zeros((p, 2));
+    for j in 0..p {
+        b[[j, 0]] = 1.0;
+        b[[j, 1]] = j as f64;
+    }
+    let bt_b = b.t().dot(&b);
+    let det = bt_b[[0, 0]] * bt_b[[1, 1]] - bt_b[[0, 1]] * bt_b[[1, 0]];
+    let inv = array![
+        [bt_b[[1, 1]] / det, -bt_b[[0, 1]] / det],
+        [-bt_b[[1, 0]] / det, bt_b[[0, 0]] / det],
+    ];
+    let proj = b.dot(&inv).dot(&b.t());
+    let mut p_mat = Array2::<f64>::eye(p);
+    p_mat -= &proj;
+    z.dot(&p_mat)
+}
+
 /// Run gradient check and return (cosine, rel_l2, max_analytic, max_fd).
 fn check_gradient(
     y: &Array1<f64>,
@@ -138,8 +211,109 @@ fn print_result(label: &str, cos: f64, rel: f64, max_a: f64, max_f: f64) {
              label, cos, rel, max_a, max_f, status);
 }
 
+fn gradient_metrics(a: &Array1<f64>, b: &Array1<f64>) -> (f64, f64, f64, f64) {
+    let dot: f64 = a.dot(b);
+    let n_a: f64 = a.dot(a).sqrt();
+    let n_b: f64 = b.dot(b).sqrt();
+    let cosine = if n_a * n_b > 1e-12 { dot / (n_a * n_b) } else { 1.0 };
+    
+    let diff = a - b;
+    let rel_l2 = diff.dot(&diff).sqrt() / n_b.max(n_a).max(1e-12);
+    
+    let max_a = a.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let max_b = b.iter().copied().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    
+    (cosine, rel_l2, max_a, max_b)
+}
+
+fn laml_cost_logit_with_beta(
+    y: &Array1<f64>,
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    s_list: &[Array2<f64>],
+    rho: &Array1<f64>,
+    beta: &Array1<f64>,
+) -> Result<f64, String> {
+    let p = x.ncols();
+    let layout = ModelLayout::external(p, s_list.len());
+    let rs_list = compute_penalty_square_roots(s_list).map_err(|e| format!("{:?}", e))?;
+    let lambdas: Vec<f64> = rho.iter().map(|v| v.exp()).collect();
+    let reparam =
+        stable_reparameterization(&rs_list, &lambdas, &layout).map_err(|e| format!("{:?}", e))?;
+    let beta_t = reparam.qs.t().dot(beta);
+    let x_t = x.dot(&reparam.qs);
+    let n = x_t.nrows();
+    let eta = x_t.dot(&beta_t);
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut w_work = Array1::<f64>::zeros(n);
+    let mut z = Array1::<f64>::zeros(n);
+    update_glm_vectors(
+        y.view(),
+        &eta,
+        LinkFunction::Logit,
+        weights.view(),
+        &mut mu,
+        &mut w_work,
+        &mut z,
+    );
+    let deviance = calculate_deviance(y.view(), &mu, LinkFunction::Logit, weights.view());
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let wi = w_work[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p {
+            let xa = x_t[[i, a]];
+            if xa == 0.0 {
+                continue;
+            }
+            for b in 0..p {
+                xtwx[[a, b]] += wi * xa * x_t[[i, b]];
+            }
+        }
+    }
+    let h = &xtwx + &reparam.s_transformed;
+    let chol = h
+        .clone()
+        .cholesky(Side::Lower)
+        .map_err(|_| "Hessian not PD".to_string())?;
+    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
+    let log_det_s = reparam.log_det;
+    let s_beta = reparam.s_transformed.dot(&beta_t);
+    let penalty = beta_t.dot(&s_beta);
+    let penalised_ll = -0.5 * deviance - 0.5 * penalty;
+    let penalty_rank = reparam.e_transformed.nrows();
+    let mp = layout.total_coeffs.saturating_sub(penalty_rank) as f64;
+    let laml = penalised_ll + 0.5 * log_det_s - 0.5 * log_det_h
+        + 0.5 * mp * (2.0 * std::f64::consts::PI).ln();
+    Ok(-laml)
+}
+
+fn frozen_fd_gradient_logit(
+    y: &Array1<f64>,
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    s_list: &[Array2<f64>],
+    rho: &Array1<f64>,
+    beta: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    let mut g = Array1::zeros(rho.len());
+    for k in 0..rho.len() {
+        let h = (1e-4 * (1.0 + rho[k].abs())).max(1e-5);
+        let mut rp = rho.clone();
+        rp[k] += 0.5 * h;
+        let mut rm = rho.clone();
+        rm[k] -= 0.5 * h;
+        let fp = laml_cost_logit_with_beta(y, x, weights, s_list, &rp, beta)?;
+        let fm = laml_cost_logit_with_beta(y, x, weights, s_list, &rm, beta)?;
+        g[k] = (fp - fm) / h;
+    }
+    Ok(g)
+}
+
 // ============================================================================
-// SECTION 1: FACTOR ISOLATION TESTS
+// Section 1: factor isolation tests
 // ============================================================================
 
 /// Test 1: Single penalty, no Firth — baseline.
@@ -254,12 +428,10 @@ fn isolation_multi_penalty_anisotropic_with_firth() {
     }
 }
 
-/// Test 7: Disjoint null spaces (critic's hypothesis).
+/// Test 7: Disjoint null spaces.
 #[test]
 fn isolation_disjoint_null_spaces() {
     println!("\n=== ISOLATION: Disjoint null spaces ===");
-    println!("  S1 penalizes [1,2,3], null=[0,4,5]");
-    println!("  S2 penalizes [4,5], null=[0,1,2,3]");
     
     let (y, x, w) = generate_logit_data(80, 6, 42);
     
@@ -274,16 +446,13 @@ fn isolation_disjoint_null_spaces() {
     match check_gradient(&y, &x, &w, &[s1, s2], &rho, true, vec![1, 0], LinkFunction::Logit) {
         Ok((cos, rel, max_a, max_f)) => {
             print_result("Disjoint null", cos, rel, max_a, max_f);
-            if cos < 0.99 {
-                println!("  → Confirms truncation/det1 hypothesis!");
-            }
         }
         Err(e) => println!("  ERROR: {}", e),
     }
 }
 
 // ============================================================================
-// SECTION 2: IDENTITY LINK CONTROL (Critic's #6)
+// Section 2: identity link control
 // ============================================================================
 
 /// If Identity works but Logit fails → issue is Firth/W-derivative specific.
@@ -291,7 +460,6 @@ fn isolation_disjoint_null_spaces() {
 #[test]
 fn isolation_identity_link_control() {
     println!("\n=== IDENTITY LINK CONTROL ===");
-    println!("  Same penalties as logit test, but with Gaussian data + Identity link");
     
     let (y, x, w) = generate_gaussian_data(100, 12, 42);
     let p = x.ncols();
@@ -305,155 +473,268 @@ fn isolation_identity_link_control() {
     match check_gradient(&y, &x, &w, &s_list, &rho, false, vec![1, 0, 0], LinkFunction::Identity) {
         Ok((cos, rel, max_a, max_f)) => {
             print_result("Identity link", cos, rel, max_a, max_f);
-            if cos > 0.99 {
-                println!("  → Identity PASSES: issue is Firth/logit-specific");
-            } else {
-                println!("  → Identity FAILS: issue is in linear algebra");
-            }
         }
         Err(e) => println!("  ERROR: {}", e),
     }
 }
 
 // ============================================================================
-// SECTION 3: RIDGE SCALING SWEEP (Critic's #2)
+// Section 3: rank-deficient penalties
 // ============================================================================
 
-/// If error ∝ 1/ridge → confirms null-space amplification (Ghost Penalty).
-/// If error is constant → structural logic error (sign, transpose, etc).
-///
-/// NOTE: This test conceptually documents the approach. The actual fixed ridge
-/// is determined by FIXED_STABILIZATION_RIDGE in pirls.rs. To truly test this,
-/// you'd need to modify that constant and rebuild.
 #[test]
-fn isolation_ridge_scaling_conceptual() {
-    println!("\n=== RIDGE SCALING SWEEP (conceptual) ===");
-    println!("  Varying ridge to detect null-space amplification");
-    println!("  If error ∝ 1/ridge → Ghost Penalty confirmed");
-    println!("  If error constant → structural logic error");
-    println!();
-    println!("  To test: modify FIXED_STABILIZATION_RIDGE in pirls.rs to:");
-    println!("    1e-8, 1e-6, 1e-4");
-    println!("  and compare gradient errors.");
-    println!();
+fn isolation_difference_penalty_logit_no_firth() {
+    println!("\n=== ISOLATION: Difference penalty, Logit, No Firth ===");
     
-    // Run with current ridge as baseline measurement
-    let (y, x, w) = generate_logit_data(100, 12, 42);
+    let (y, x, w) = generate_logit_data(120, 10, 42);
+    let p = x.ncols();
+    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let rho = array![0.0];
+    
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(x.nrows()).view(),
+        &[s],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![2],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Difference penalty", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_dirty_nullspace_logit_no_firth() {
+    println!("\n=== ISOLATION: Near-null penalty, Logit, No Firth ===");
+    
+    let (y, x, w) = generate_logit_data(120, 10, 43);
+    let p = x.ncols();
+    let mut s = diagonal_penalty(p, 1, p - 2);
+    let eps = 1e-12;
+    for j in (p - 2)..p {
+        s[[j, j]] += eps;
+    }
+    let rho = array![0.0];
+    
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(x.nrows()).view(),
+        &[s],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![2],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Near-null penalty", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_concurrent_nullspace_instability() {
+    println!("\n=== ISOLATION: Concurrent nullspace, Logit, No Firth ===");
+    
+    let n = 160;
+    let p = 12;
+    let x = design_with_nullspace_suppression(n, p, 44);
+    let mut rng = StdRng::seed_from_u64(44);
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        y[i] = if rng.r#gen::<f64>() < 0.5 { 0.0 } else { 1.0 };
+    }
+    let w = Array1::<f64>::ones(n);
+    
+    let mut s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let eps = 1e-12;
+    let mut b1 = Array1::<f64>::zeros(p);
+    let mut b2 = Array1::<f64>::zeros(p);
+    for j in 0..p {
+        b1[j] = 1.0;
+        b2[j] = j as f64;
+    }
+    let b1_outer = b1.view().insert_axis(ndarray::Axis(1)).dot(&b1.view().insert_axis(ndarray::Axis(0)));
+    let b2_outer = b2.view().insert_axis(ndarray::Axis(1)).dot(&b2.view().insert_axis(ndarray::Axis(0)));
+    s.scaled_add(eps, &b1_outer);
+    s.scaled_add(eps, &b2_outer);
+    let rho = array![5.0];
+    
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(n).view(),
+        &[s],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![2],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Concurrent nullspace", cos_fd, rel_fd, max_a, max_fd);
+}
+
+#[test]
+fn isolation_projected_tensor_penalty_logit_no_firth() {
+    println!("\n=== ISOLATION: Projected tensor penalty, Logit, No Firth ===");
+    
+    let n = 120;
+    let n1 = 4;
+    let n2 = 4;
+    let p_raw = n1 * n2;
+    let s1 = create_difference_penalty_matrix(n1, 2).expect("difference penalty");
+    let s_raw = kron_with_identity(&s1, n2);
+    let z = random_orthonormal_basis(p_raw, p_raw - 1, 55);
+    let s = z.t().dot(&s_raw).dot(&z);
+    
+    let (y, x, w) = generate_logit_data(n, p_raw - 1, 55);
+    let rho = array![0.0];
+    
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::<f64>::zeros(n).view(),
+        &[s],
+        &ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![2 * n2],
+        },
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    print_result("Projected tensor penalty", cos_fd, rel_fd, max_a, max_fd);
+}
+
+// ============================================================================
+// Section 4: frozen beta FD
+// ============================================================================
+
+#[test]
+fn isolation_frozen_beta_fd() {
+    println!("\n=== ISOLATION: Frozen beta FD ===");
+    
+    let (y, x, w) = generate_logit_data(120, 10, 42);
     let p = x.ncols();
     let s_list = vec![
-        diagonal_penalty(p, 1, 5),
-        diagonal_penalty(p, 4, 9),
-        diagonal_penalty(p, 8, 12),
+        diagonal_penalty(p, 1, 6),
+        diagonal_penalty(p, 5, 10),
     ];
-    let rho = array![0.0, 4.6, -4.6];
+    let rho = array![0.0, 3.2];
+    let n = x.nrows();
+    let offset = Array1::<f64>::zeros(n);
     
-    match check_gradient(&y, &x, &w, &s_list, &rho, true, vec![1, 0, 0], LinkFunction::Logit) {
-        Ok((cos, rel, max_a, max_f)) => {
-            print_result("Current ridge", cos, rel, max_a, max_f);
-            println!("  Record this. Repeat with different FIXED_STABILIZATION_RIDGE values.");
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: None,
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![1, 0],
+    };
+    
+    let (analytic, fd) = match evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    ) {
+        Ok((a, f)) => (a, f),
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
         }
-        Err(e) => println!("  ERROR: {}", e),
-    }
-}
-
-// ============================================================================
-// SECTION 4: COMPONENT BREAKOUT (Critic's #1)
-// ============================================================================
-
-/// The LAML gradient is: ∂V/∂ρ = ∂D_p/∂ρ + 0.5·∂log|H|/∂ρ - 0.5·∂log|S|+/∂ρ
-/// 
-/// This test conceptually documents what to check:
-/// - If D_p fails → Envelope Theorem violated (PIRLS didn't converge)
-/// - If log|S| fails → truncation logic mismatch (Ghost Penalty)
-/// - If log|H| fails → Firth Hessian mismatch
-///
-/// NOTE: Implementing this requires instrumenting compute_gradient to return
-/// individual terms. This is a TODO for full diagnosis.
-#[test]
-fn isolation_component_breakout_conceptual() {
-    println!("\n=== COMPONENT BREAKOUT (conceptual) ===");
-    println!("  LAML gradient = ∂D_p/∂ρ + 0.5·∂log|H|/∂ρ - 0.5·∂log|S|/∂ρ");
-    println!();
-    println!("  To diagnose: instrument compute_gradient() to return each term.");
-    println!("  Compare analytic vs FD for EACH term separately.");
-    println!();
-    println!("  Interpretation:");
-    println!("    D_p fails    → PIRLS didn't converge (Envelope Theorem)");
-    println!("    log|S| fails → truncation mismatch (Ghost Penalty)");
-    println!("    log|H| fails → Firth Hessian wrong");
-}
-
-// ============================================================================
-// SECTION 5: FROZEN BETA TEST (Critic's #3) - THE KILLER TEST
-// ============================================================================
-
-/// Frozen Beta Test: Perturb ρ but do NOT re-optimize β.
-/// 
-/// Standard FD: f(ρ+h) - f(ρ-h) where β is re-optimized at each ρ.
-/// Frozen FD:   f(ρ+h, β_fixed) - f(ρ-h, β_fixed) with the SAME β.
-///
-/// If Analytic ≈ Frozen_FD → direct derivatives are correct, but we're 
-///                           missing the implicit dβ/dρ term.
-/// If Analytic ≠ Frozen_FD → the ∂/∂ρ formulas themselves are wrong.
-///
-/// NOTE: This requires modifying evaluate_external_gradients to accept a
-/// frozen_beta parameter. This is a TODO for full diagnosis.
-#[test]
-fn isolation_frozen_beta_conceptual() {
-    println!("\n=== FROZEN BETA TEST (conceptual) ===");
-    println!("  Standard FD: re-optimize β at ρ±h");
-    println!("  Frozen FD:   use SAME β at ρ±h");
-    println!();
-    println!("  If Analytic ≈ Frozen_FD:");
-    println!("    → Direct derivatives correct, missing implicit dβ/dρ");
-    println!("  If Analytic ≠ Frozen_FD:");
-    println!("    → The ∂/∂ρ formulas are wrong");
-    println!();
-    println!("  To implement: modify evaluate_external_gradients to accept");
-    println!("  an optional frozen_beta parameter for FD computation.");
-}
-
-// ============================================================================
-// SECTION 6: CLEAN MATRIX INJECTION (Critic's #5)
-// ============================================================================
-
-/// Clean Matrix Injection: Project S_k onto the active subspace before
-/// computing trace(H^{-1} S_k).
-///
-/// If S_clean fixes the mismatch → spectral bleed is the cause.
-/// The cost function ignores null-space energy, but the trace captures it.
-///
-/// NOTE: This requires modifying the gradient code to accept projected
-/// penalty matrices. This is a TODO for full diagnosis.
-#[test]
-fn isolation_clean_matrix_conceptual() {
-    println!("\n=== CLEAN MATRIX INJECTION (conceptual) ===");
-    println!("  Project S_k onto active subspace before computing trace");
-    println!("  S_clean = P_range · S_k · P_range");
-    println!();
-    println!("  If S_clean fixes mismatch:");
-    println!("    → Spectral bleed is cause (null-space energy captured by trace)");
-    println!();
-    println!("  To implement: modify gradient to project S_k before trace.");
-}
-
-// ============================================================================
-// SUMMARY TEST: Run all isolation tests and print diagnosis
-// ============================================================================
-
-#[test]
-fn isolation_summary() {
-    println!("\n");
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║            GRADIENT ISOLATION DIAGNOSTIC SUMMARY             ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║ Run: cargo test isolation_ -- --nocapture --test-threads=1   ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║ Pattern Analysis:                                            ║");
-    println!("║   • All pass except Firth → Firth derivative bug             ║");
-    println!("║   • All pass except anisotropic → truncation bug             ║");
-    println!("║   • All pass except disjoint null → Ghost Penalty confirmed  ║");
-    println!("║   • Identity passes, Logit fails → Firth/W-derivative bug    ║");
-    println!("║   • Everything fails → fundamental linear algebra bug        ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    };
+    
+    let layout = ModelLayout::external(p, s_list.len());
+    let cfg = ModelConfig::external(LinkFunction::Logit, 1e-10, 200, false);
+    let rs_list = match compute_penalty_square_roots(&s_list) {
+        Ok(list) => list,
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    let (pirls, _) = match fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(rho.view()),
+        x.view(),
+        offset.view(),
+        y.view(),
+        w.view(),
+        &rs_list,
+        None,
+        None,
+        &layout,
+        &cfg,
+        None,
+        None,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            println!("  ERROR: {:?}", e);
+            return;
+        }
+    };
+    let beta_orig = pirls.reparam_result.qs.dot(pirls.beta_transformed.as_ref());
+    
+    let frozen_fd = match frozen_fd_gradient_logit(&y, &x, &w, &s_list, &rho, &beta_orig) {
+        Ok(g) => g,
+        Err(e) => {
+            println!("  ERROR: {}", e);
+            return;
+        }
+    };
+    
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    let (cos_frozen, rel_frozen, max_af, max_frozen) = gradient_metrics(&analytic, &frozen_fd);
+    print_result("Analytic vs FD", cos_fd, rel_fd, max_a, max_fd);
+    print_result("Analytic vs Frozen FD", cos_frozen, rel_frozen, max_af, max_frozen);
 }
