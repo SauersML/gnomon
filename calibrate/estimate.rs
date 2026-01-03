@@ -46,7 +46,6 @@ use crate::calibrate::types::{
 };
 use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrategy};
 use crate::calibrate::visualizer;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
@@ -66,32 +65,10 @@ fn logit_from_prob(p: f64) -> f64 {
     (p / (1.0 - p)).ln()
 }
 
-const MIN_EIG_DIAG_EVERY: usize = 200;
-const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
-static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
-static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
-    if !min_eig.is_finite() || min_eig <= 0.0 {
-        return true;
-    }
-    if min_eig >= MIN_EIG_DIAG_THRESHOLD {
-        return false;
-    }
-    let bucket = if min_eig.is_finite() && min_eig > 0.0 {
-        min_eig.log10().floor() as i32
-    } else {
-        i32::MIN
-    };
-    let last = H_MIN_EIG_LOG_BUCKET.load(Ordering::Relaxed);
-    let count = H_MIN_EIG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if bucket != last || count % MIN_EIG_DIAG_EVERY == 0 {
-        H_MIN_EIG_LOG_BUCKET.store(bucket, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
-}
+use crate::calibrate::diagnostics::{
+    should_emit_grad_diag, should_emit_h_min_eig_diag,
+    GRAD_DIAG_BETA_COLLAPSE_COUNT, GRAD_DIAG_DELTA_ZERO_COUNT, GRAD_DIAG_LOGH_CLAMPED_COUNT,
+};
 
 #[cfg(test)]
 mod mcmc_mean_tests {
@@ -5843,10 +5820,13 @@ pub mod internal {
             let logh_grad = x_transformed.transpose_vector_multiply(&weight_vec);
             let logh_norm = logh_grad.iter().map(|v| v.abs()).fold(0.0_f64, |a, b| a.max(b));
             if clamped > 0 && logh_norm < 1e-8 {
-                eprintln!(
-                    "[GRAD DIAG] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
-                    clamped, n, logh_norm
-                );
+                let (should_print, count) = should_emit_grad_diag(&GRAD_DIAG_LOGH_CLAMPED_COUNT);
+                if should_print {
+                    eprintln!(
+                        "[GRAD DIAG #{count}] logh_beta_grad ~0 with clamped weights: clamped={}/{}, max|logh_beta_grad|={:.3e}",
+                        clamped, n, logh_norm
+                    );
+                }
             }
             Some(logh_grad)
         }
@@ -6488,28 +6468,32 @@ pub mod internal {
                             );
 
                             // --- Correct State Management: Only Update on Actual Improvement ---
+                            // Print summary every 50 steps to avoid spam (graph shows real-time anyway)
+                            const PRINT_INTERVAL: u64 = 50;
+                            let should_print = eval_num == 1 || eval_num % PRINT_INTERVAL == 0;
+                            
                             if eval_num == 1 {
-                                println!("\n[BFGS Initial Point]");
-                                println!("  -> Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}");
-                                // Update on the first step
+                                println!("\n[BFGS] Starting optimization...");
+                                println!("  -> Initial Cost: {cost:.7} | Grad Norm: {grad_norm:.6e}");
                                 *self.last_cost.borrow_mut() = cost;
                                 *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else if cost < *self.last_cost.borrow() {
-                                println!("\n[BFGS Progress Step #{eval_num}]");
-                                println!(
-                                    "  -> Old Cost: {:.7} | New Cost: {:.7} (IMPROVEMENT)",
-                                    *self.last_cost.borrow(),
-                                    cost
-                                );
-                                println!("  -> Grad Norm: {grad_norm:.6e}");
-                                // ONLY update the state if it's a true improvement
+                                let improvement = *self.last_cost.borrow() - cost;
+                                if should_print {
+                                    println!(
+                                        "[BFGS Step {eval_num}] Cost: {cost:.7} (Δ={improvement:.2e}) | Grad: {grad_norm:.6e}"
+                                    );
+                                }
                                 *self.last_cost.borrow_mut() = cost;
                                 *self.last_grad_norm.borrow_mut() = grad_norm;
                             } else {
-                                println!("\n[BFGS Trial Step #{eval_num}]");
-                                println!("  -> Last Good Cost: {:.7}", *self.last_cost.borrow());
-                                println!("  -> Trial Cost:     {cost:.7} (NO IMPROVEMENT)");
-                                // DO NOT update last_cost here - this is the key fix
+                                // Trial step that didn't improve - only log every PRINT_INTERVAL
+                                if should_print {
+                                    println!(
+                                        "[BFGS Step {eval_num}] Trial (no improvement) | Best: {:.7}",
+                                        *self.last_cost.borrow()
+                                    );
+                                }
                             }
 
                             (cost, grad_z)
@@ -7391,10 +7375,13 @@ pub mod internal {
                                 let grad_inf =
                                     grad_beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                                 if logh_inf < 1e-8 || grad_inf < 1e-8 {
-                                    eprintln!(
-                                        "[GRAD DIAG] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
-                                        res_inf, logh_inf, grad_inf
-                                    );
+                                    let (should_print, count) = should_emit_grad_diag(&GRAD_DIAG_BETA_COLLAPSE_COUNT);
+                                    if should_print {
+                                        eprintln!(
+                                            "[GRAD DIAG #{count}] beta-grad collapse: max|residual|={:.3e} max|logh|={:.3e} max|grad_beta|={:.3e}",
+                                            res_inf, logh_inf, grad_inf
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -7407,10 +7394,14 @@ pub mod internal {
                         // In that case, we MUST skip the implicit correction to match reality.
                         let kkt_norm = residual_grad.iter().fold(0.0_f64, |acc, &v| acc + v * v).sqrt();
                         
-                        // Strict tolerance for stationarity assumption (1e-3 allows for some noise but catches failures)
-                        let envelope_tolerance = 1e-3; 
+                        if !grad_beta.iter().all(|v| v.is_finite()) {
+                            log::warn!(
+                                "Skipping IFT correction: non-finite gradient entries (kkt_norm={:.2e}).",
+                                kkt_norm
+                            );
+                        }
 
-                        let delta_opt = if kkt_norm < envelope_tolerance && grad_beta.iter().all(|v| v.is_finite()) {
+                        let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) {
                             let rhs_view = FaerColView::new(&grad_beta);
                             let solved = match &factor_imp {
                                 Some(factor) => factor.solve(rhs_view.as_ref()),
@@ -7423,22 +7414,19 @@ pub mod internal {
                             let delta_inf =
                                 delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                             if delta_inf < 1e-8 {
-                                eprintln!(
-                                    "[GRAD DIAG] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
-                                    delta_inf,
-                                    grad_beta
-                                        .iter()
-                                        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                                );
+                                let (should_print, count) = should_emit_grad_diag(&GRAD_DIAG_DELTA_ZERO_COUNT);
+                                if should_print {
+                                    eprintln!(
+                                        "[GRAD DIAG #{count}] delta ~0: max|delta|={:.3e} max|grad_beta|={:.3e}",
+                                        delta_inf,
+                                        grad_beta
+                                            .iter()
+                                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                                    );
+                                }
                             }
                             Some(delta)
                         } else {
-                            if kkt_norm >= envelope_tolerance {
-                                log::warn!(
-                                    "Skipping IFT correction: KKT residual {:.2e} > {:.1e} implies non-stationarity.",
-                                    kkt_norm, envelope_tolerance
-                                );
-                            }
                             None
                         };
 
