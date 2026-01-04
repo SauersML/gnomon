@@ -22,8 +22,8 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::LinkFunction;
 use crate::calibrate::basis::{
-    baseline_lambda_seed, create_basis, create_difference_penalty_matrix, BasisOptions, Dense,
-    KnotSource,
+    baseline_lambda_seed, compute_geometric_constraint_transform, create_basis,
+    create_difference_penalty_matrix, BasisOptions, Dense, KnotSource,
 };
 use crate::calibrate::quadrature::QuadratureContext;
 use crate::calibrate::construction::{
@@ -79,6 +79,12 @@ pub struct JointModelState<'a> {
     s_link_constrained: Option<Array2<f64>>,
     /// Constraint transform Z (basis → constrained basis) - None until build_link_basis is called
     link_transform: Option<Array2<f64>>,
+    /// Geometric constraint transform computed from Greville abscissae (constant w.r.t. β).
+    /// This is computed once when knots are initialized and reused for all subsequent
+    /// basis evaluations, ensuring dZ/dβ = 0 exactly for correct analytic gradients.
+    geometric_link_transform: Option<Array2<f64>>,
+    /// Pre-computed projected penalty using geometric transform (Z'SZ).
+    geometric_s_link_constrained: Option<Array2<f64>>,
     /// Current log-smoothing parameters (one per base penalty + one for link)
     rho: Array1<f64>,
     /// Link function (Logit or Identity)
@@ -204,6 +210,7 @@ impl<'a> JointModelState<'a> {
         let rho = Array1::zeros(n_penalties);
         
         // link_transform and s_link_constrained are None until build_link_basis is called
+        // geometric_* fields are computed once when knots are initialized
         Self {
             y,
             weights,
@@ -213,6 +220,8 @@ impl<'a> JointModelState<'a> {
             s_base,
             s_link_constrained: None,
             link_transform: None,
+            geometric_link_transform: None,
+            geometric_s_link_constrained: None,
             rho,
             link,
             layout_base,
@@ -275,60 +284,51 @@ impl<'a> JointModelState<'a> {
     pub fn layout(&self) -> &ModelLayout {
         &self.layout_base
     }
-    
+
+    /// Initialize the geometric constraint transform from the knot vector.
+    ///
+    /// This computes Z and S_c using Greville abscissae, which depend only on
+    /// the knot geometry and not on β. This ensures dZ/dβ = 0 exactly, making
+    /// the analytic gradient correct.
+    ///
+    /// Should be called once after knots are determined (first build_link_basis call).
+    fn initialize_geometric_constraint(&mut self) -> Result<(), String> {
+        let knot_vector = self.knot_vector.as_ref().ok_or_else(|| {
+            "Cannot initialize geometric constraint: knot_vector not set".to_string()
+        })?;
+
+        let (z, s_constrained) =
+            compute_geometric_constraint_transform(knot_vector, self.degree, 2).map_err(|e| {
+                format!("Geometric constraint computation failed: {e}")
+            })?;
+
+        let n_constrained = z.ncols();
+
+        self.geometric_link_transform = Some(z);
+        self.geometric_s_link_constrained = Some(s_constrained);
+
+        // Update dimension tracking and resize beta_link if needed
+        if self.n_constrained_basis != n_constrained {
+            self.n_constrained_basis = n_constrained;
+            self.beta_link = Array1::zeros(n_constrained);
+        }
+
+        Ok(())
+    }
+
     /// Build link spline basis at current Xβ values
     /// Returns ONLY the constrained wiggle basis (identity u is treated as offset)
     /// Also updates internal state with transform and projected penalty
-    /// 
-    /// The orthogonality constraint is applied using IRLS working weights
-    /// from the current linear predictor to align with the optimization metric.
-    /// 
-    /// Returns Err if z has degenerate variance (cannot build identifiable constraint).
+    ///
+    /// The orthogonality constraint uses Greville abscissae (geometric constraints)
+    /// computed from the knot vector. This ensures Z is constant w.r.t. β,
+    /// making dZ/dβ = 0 exactly and enabling correct analytic gradients.
+    ///
+    /// Returns Err if geometric constraint computation fails.
     pub fn build_link_basis(&mut self, eta_base: &Array1<f64>) -> Result<Array2<f64>, String> {
-        use crate::calibrate::basis::apply_weighted_orthogonality_constraint;
-        
-        let eta_for_weights = match &self.last_eta {
-            Some(last) if last.len() == eta_base.len() => last,
-            _ => eta_base,
-        };
-
-        // Compute IRLS working weights to align constraint metric with the IRLS quadratic approximation.
-        let mut mu = Array1::<f64>::zeros(eta_base.len());
-        let mut irls_weights = Array1::<f64>::zeros(eta_base.len());
-        let mut z = Array1::<f64>::zeros(eta_base.len());
-        match (&self.link, &self.covariate_se) {
-            (LinkFunction::Logit, Some(se)) => {
-                crate::calibrate::pirls::update_glm_vectors_integrated(
-                    &self.quad_ctx,
-                    self.y,
-                    eta_for_weights,
-                    se.view(),
-                    self.weights,
-                    &mut mu,
-                    &mut irls_weights,
-                    &mut z,
-                );
-            }
-            (LinkFunction::Logit, None) => {
-                crate::calibrate::pirls::update_glm_vectors(
-                    self.y,
-                    eta_for_weights,
-                    LinkFunction::Logit,
-                    self.weights,
-                    &mut mu,
-                    &mut irls_weights,
-                    &mut z,
-                );
-            }
-            (LinkFunction::Identity, _) => {
-                irls_weights.assign(&self.weights);
-            }
-        }
-        
-        let n = eta_base.len();
         let k = self.n_link_knots;
         let degree = self.degree;
-        
+
         // Freeze knot range after first initialization to keep the objective stable.
         let (min_u, max_u) = if let Some(range) = self.knot_range {
             range
@@ -346,12 +346,12 @@ impl<'a> JointModelState<'a> {
             self.knot_range = Some(range);
             range
         };
-        
+
         // Standardize: z = (u - min) / (max - min) to [0, 1]
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base
             .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
-        
+
         // Build B-spline basis on z ∈ [0, 1]
         let data_range = (0.0, 1.0);
         let basis_result = if let Some(knots) = self.knot_vector.as_ref() {
@@ -373,137 +373,47 @@ impl<'a> JointModelState<'a> {
                 BasisOptions::value(),
             )
         };
+
         match basis_result {
             Ok((bspline_basis, knots)) => {
                 let bspline_basis = bspline_basis.as_ref();
-                // Store knot vector if not already stored
-                if self.knot_vector.is_none() {
-                    self.knot_vector = Some(knots);
-                }
-                
-                let n_raw = bspline_basis.ncols();
 
-                // Check if z has sufficient variance for a well-conditioned constraint
-                // If z is nearly constant, the constraint matrix [1,z] is rank-deficient
-                let z_mean: f64 = z.iter().sum::<f64>() / n as f64;
-                let z_var: f64 = z.iter().map(|&v| (v - z_mean).powi(2)).sum::<f64>() / n as f64;
-                let z_has_spread = z_var > 1e-6;
-                
-                // Error on degenerate z - cannot build identifiable constraint
-                if !z_has_spread {
+                // Store knot vector and initialize geometric constraint if first call
+                let first_init = self.knot_vector.is_none();
+                if first_init {
+                    self.knot_vector = Some(knots);
+                    // Initialize geometric constraint transform (computed ONCE from knot geometry)
+                    self.initialize_geometric_constraint()?;
+                }
+
+                // Use pre-computed geometric constraint transform
+                let transform = self.geometric_link_transform.as_ref().ok_or_else(|| {
+                    "Geometric transform not initialized".to_string()
+                })?;
+
+                // Verify dimensions match
+                if transform.nrows() != bspline_basis.ncols() {
                     return Err(format!(
-                        "Base predictor z has near-zero variance (var={z_var:.2e}). \
-                        Cannot build identifiable link constraint."
+                        "Transform dimension mismatch: transform has {} rows but basis has {} cols",
+                        transform.nrows(),
+                        bspline_basis.ncols()
                     ));
                 }
-                
-                // Always rebuild constraint from current z and IRLS weights
-                // (do NOT cache transform - it depends on data that changes each iteration)
-                
-                // Build constraint matrix: [ones, z] to remove intercept and linear from wiggle
-                let mut constraint = Array2::<f64>::zeros((n, 2));
-                for i in 0..n {
-                    constraint[[i, 0]] = 1.0;     // intercept
-                    constraint[[i, 1]] = z[i];    // linear term
+
+                // Apply transform: B_constrained = B_raw * Z
+                let constrained_basis = bspline_basis.dot(transform);
+                let n_constrained = constrained_basis.ncols();
+
+                // Copy geometric transform to the standard fields for compatibility
+                self.link_transform = self.geometric_link_transform.clone();
+                self.s_link_constrained = self.geometric_s_link_constrained.clone();
+                self.n_constrained_basis = n_constrained;
+
+                if self.beta_link.len() != n_constrained {
+                    self.beta_link = Array1::zeros(n_constrained);
                 }
-                
-                // Apply weighted orthogonality constraint: wiggle ⟂ {1, z}.
-                //
-                // We utilize "Fixed-Anchor" backfitting here by strictly using the fixed prior weights
-                // (self.weights) for the orthogonality metric, rather than the dynamic IRLS weights.
-                //
-                // The analytic gradient of the Joint Model assumes that prediction eta = X*beta + B*Z*theta,
-                // where the basis constraint matrix Z is constant with respect to beta.
-                // If we used dynamic weights W(beta), then Z would depend on beta, adding a term:
-                //   d(eta)/d(beta)_extra = B * (dZ/dW * dW/d(beta)) * theta
-                // This term is non-zero for Logit models (where W depends on mu) but zero for Identity.
-                //
-                // By fixing the metric to the prior weights, we ensure dZ/d(beta) = 0
-                match apply_weighted_orthogonality_constraint(
-                    bspline_basis.view(),
-                    constraint.view(),
-                    Some(self.weights.view()),
-                ) {
-                    Ok((constrained_basis, transform)) => {
-                        let n_constrained = constrained_basis.ncols();
-                        
-                        // Build raw difference penalty for original basis
-                        let raw_penalty = match create_difference_penalty_matrix(n_raw, 2) {
-                            Ok(p) => p,
-                            Err(_) => Array2::zeros((n_raw, n_raw)),
-                        };
-                        
-                        // Project penalty into constrained space: S_c = Z' S Z
-                        let projected_penalty = transform.t().dot(&raw_penalty).dot(&transform);
-                        
-                        // Store transform and projected penalty
-                        self.link_transform = Some(transform);
-                        self.s_link_constrained = Some(projected_penalty);
-                        self.n_constrained_basis = n_constrained;
-                        if self.beta_link.len() != n_constrained {
-                            self.beta_link = Array1::zeros(n_constrained);
-                        }
-                        
-                        Ok(constrained_basis)
-                    }
-                    Err(_) => {
-                        // Fallback: construct a nullspace transform via eigendecomposition.
-                        // Use PRIOR weights for consistency
-                        eprintln!("[JOINT] Orthogonality constraint failed, using eigendecomposition fallback");
-                        let mut weighted_constraints = constraint.clone();
-                        for i in 0..n {
-                            let w = self.weights[i];  // Use self.weights
-                            weighted_constraints[[i, 0]] *= w;
-                            weighted_constraints[[i, 1]] *= w;
-                        }
-                        let constraint_cross = bspline_basis.t().dot(&weighted_constraints); // k×2
-                        let cross_prod = constraint_cross.dot(&constraint_cross.t()); // k×k
-                        
-                        use crate::calibrate::faer_ndarray::FaerEigh;
-                        use faer::Side;
-                        let (eigs, evecs): (Array1<f64>, Array2<f64>) = cross_prod
-                            .eigh(Side::Lower)
-                            .unwrap_or_else(|_| (Array1::zeros(n_raw), Array2::eye(n_raw)));
-                        let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-                        let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-                        let null_indices: Vec<usize> = eigs
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, &ev)| if ev <= tol { Some(i) } else { None })
-                            .collect();
-                        
-                        let transform = if null_indices.is_empty() {
-                            // WARN: No null space found means constraint failed - model may confound β and θ
-                            eprintln!("[JOINT WARNING] Orthogonality constraint found no null space - \
-                                      falling back to unconstrained link. Model identifiability may be compromised.");
-                            Array2::eye(n_raw)
-                        } else {
-                            let mut z = Array2::<f64>::zeros((n_raw, null_indices.len()));
-                            for (col, &idx) in null_indices.iter().enumerate() {
-                                let vec = evecs.column(idx);
-                                z.column_mut(col).assign(&vec);
-                            }
-                            z
-                        };
-                        
-                        let n_constrained = transform.ncols();
-                        let constrained_basis = bspline_basis.dot(&transform);
-                        
-                        let raw_penalty = match create_difference_penalty_matrix(n_raw, 2) {
-                            Ok(p) => p,
-                            Err(_) => Array2::zeros((n_raw, n_raw)),
-                        };
-                        let projected_penalty = transform.t().dot(&raw_penalty).dot(&transform);
-                        
-                        self.link_transform = Some(transform);
-                        self.s_link_constrained = Some(projected_penalty);
-                        self.n_constrained_basis = n_constrained;
-                        if self.beta_link.len() != n_constrained {
-                            self.beta_link = Array1::zeros(n_constrained);
-                        }
-                        Ok(constrained_basis)
-                    }
-                }
+
+                Ok(constrained_basis)
             }
             Err(e) => {
                 // B-spline basis construction failed - return error
@@ -513,6 +423,7 @@ impl<'a> JointModelState<'a> {
     }
     
     /// Build constrained link basis using stored knots without mutating state.
+    /// Uses the pre-computed geometric transform (constant w.r.t. β).
     pub fn build_link_basis_from_state(&self, eta_base: &Array1<f64>) -> Array2<f64> {
         let n = eta_base.len();
         let Some(knot_vector) = self.knot_vector.as_ref() else {
@@ -522,7 +433,7 @@ impl<'a> JointModelState<'a> {
         let range_width = (max_u - min_u).max(1e-6);
         let z: Array1<f64> = eta_base
             .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
-        
+
         let b_raw = match create_basis::<Dense>(
             z.view(),
             KnotSource::Provided(knot_vector.view()),
@@ -530,10 +441,16 @@ impl<'a> JointModelState<'a> {
             BasisOptions::value(),
         ) {
             Ok((basis, _)) => basis.as_ref().clone(),
-            Err(_) => Array2::zeros((n, 0)),
+            Err(_) => return Array2::zeros((n, 0)),
         };
-        
-        if let Some(ref transform) = self.link_transform {
+
+        // Use geometric transform (preferred) or fall back to link_transform
+        let transform = self
+            .geometric_link_transform
+            .as_ref()
+            .or(self.link_transform.as_ref());
+
+        if let Some(transform) = transform {
             if transform.ncols() > 0 && transform.nrows() == b_raw.ncols() {
                 return b_raw.dot(transform);
             }
@@ -2079,37 +1996,9 @@ impl<'a> JointRemlState<'a> {
         let b_raw = b_raw_arc.as_ref();
         let b_prime = b_prime_arc.as_ref();
 
-        // Build constraint matrix C (n x 2) and weighted constraints.
-        let mut constraint = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            constraint[[i, 0]] = 1.0;
-            constraint[[i, 1]] = z[i];
-        }
-
-        let mut weighted_constraints = constraint.clone();
-        for i in 0..n {
-            let w = state.weights[i]; // Use fixed prior weights
-            weighted_constraints[[i, 0]] *= w;
-            weighted_constraints[[i, 1]] *= w;
-        }
-        let constraint_cross =
-            crate::calibrate::faer_ndarray::fast_atb(b_raw, &weighted_constraints); // k x 2
-        let m = constraint_cross.t().to_owned(); // 2 x k
-
-        let mmt = m.dot(&m.t()); // 2 x 2
-        let det = mmt[(0, 0)] * mmt[(1, 1)] - mmt[(0, 1)] * mmt[(1, 0)];
-        if det.abs() < 1e-14 {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "constraint matrix nearly singular in analytic gradient".to_string(),
-            ));
-        }
-        let inv_det = 1.0 / det;
-        let mut mmt_inv = Array2::<f64>::zeros((2, 2));
-        mmt_inv[(0, 0)] = mmt[(1, 1)] * inv_det;
-        mmt_inv[(1, 1)] = mmt[(0, 0)] * inv_det;
-        mmt_inv[(0, 1)] = -mmt[(0, 1)] * inv_det;
-        mmt_inv[(1, 0)] = -mmt[(1, 0)] * inv_det;
-        let m_pinv = m.t().dot(&mmt_inv); // k x 2
+        // NOTE: With geometric constraints (Greville abscissae), Z is constant w.r.t. β,
+        // so dZ/dβ = 0 exactly. The constraint matrix M and its pseudoinverse are no longer
+        // needed for the gradient computation.
 
         // Raw penalty for link block and its projection (constant for this rho).
         let s_raw = if p_link > 0 {
@@ -2139,11 +2028,9 @@ impl<'a> JointRemlState<'a> {
         }
         let clamp_z_frac = clamp_z_count as f64 / n.max(1) as f64;
         let clamp_mu_frac = clamp_mu_count as f64 / n.max(1) as f64;
-        let det_abs = det.abs();
         let audit_needed = !converged
             || clamp_z_frac > 0.05
-            || clamp_mu_frac > 0.05
-            || det_abs < 1e-10;
+            || clamp_mu_frac > 0.05;
         // Penalty det derivative for base penalties.
         let base_reparam = if let Some(invariant) = self.base_reparam_invariant.as_ref() {
             stable_reparameterization_with_invariant(
@@ -2186,9 +2073,8 @@ impl<'a> JointRemlState<'a> {
         let mut w_prime = Array1::<f64>::zeros(n);
         let mut w_dot = Array1::<f64>::zeros(n);
         let mut b_dot = Array2::<f64>::zeros((n, n_raw));
-        let mut c_dot = Array2::<f64>::zeros((n, 2));
-        let mut weighted_c_dot = Array2::<f64>::zeros((n, 2));
-        let mut weighted_b_dot = Array2::<f64>::zeros((n, n_raw));
+        // c_dot, weighted_c_dot, weighted_b_dot removed: no longer needed since
+        // Z is now computed from Greville abscissae (geometric constraint) and dZ/dβ = 0
         let mut dot_j_theta = Array2::<f64>::zeros((n, p_link));
         let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
         let mut dot_j = Array2::<f64>::zeros((n, p_total));
@@ -2254,23 +2140,6 @@ impl<'a> JointRemlState<'a> {
                 w_dot[i] = w_prime[i] * dot_eta[i];
             }
 
-            // M_dot = C_dot^T W B + C^T W B_dot.
-            //
-            // Since we use fixed prior weights to define the constraint Z (dZ/d(beta) = 0),
-            // the term involving the derivative of the weights (C^T W_dot B) vanishes from the
-            // constraint sensitivity calculation. We explicitly use the fixed weights here
-            // to match the definition of Z in build_link_basis.
-            c_dot.fill(0.0);
-            for i in 0..n {
-                c_dot[[i, 1]] = dot_z[i];
-            }
-            weighted_c_dot.assign(&c_dot);
-            for i in 0..n {
-                let w = state.weights[i]; // Use fixed prior weights
-                weighted_c_dot[[i, 0]] *= w;
-                weighted_c_dot[[i, 1]] *= w;
-            }
-
             // dB_raw/dρ = (dB_raw/dz) * dz/dρ
             b_dot.fill(0.0);
             for i in 0..n {
@@ -2283,61 +2152,10 @@ impl<'a> JointRemlState<'a> {
                 }
             }
 
-            weighted_b_dot.assign(&b_dot);
-            for i in 0..n {
-                let w = state.weights[i]; // Use fixed prior weights
-                for j in 0..n_raw {
-                    weighted_b_dot[[i, j]] *= w;
-                }
-            }
-            let mut m_dot = Array2::<f64>::zeros((2, n_raw));
-            {
-                use crate::calibrate::faer_ndarray::{FaerArrayView, array2_to_mat_mut};
-                use faer::linalg::matmul::matmul;
-                use faer::{Accum, Par, get_global_parallelism};
-
-                let par = if n < 128 || n_raw < 128 {
-                    Par::Seq
-                } else {
-                    get_global_parallelism()
-                };
-
-                let mut m_dot_view = array2_to_mat_mut(&mut m_dot);
-                
-                // Bind FaerArrayView temporaries to local variables to extend their lifetime
-                let wc_wrapper = FaerArrayView::new(&weighted_c_dot);
-                let wc_view = wc_wrapper.as_ref();
-                let b_wrapper = FaerArrayView::new(b_raw);
-                let b_view = b_wrapper.as_ref();
-                let c_wrapper = FaerArrayView::new(&constraint);
-                let c_view = c_wrapper.as_ref();
-                let wbdot_wrapper = FaerArrayView::new(&weighted_b_dot);
-                let wbdot_view = wbdot_wrapper.as_ref();
-
-                // term 1: C_dot^T W B
-                matmul(
-                    m_dot_view.as_mut(),
-                    Accum::Replace,
-                    wc_view.transpose(),
-                    b_view,
-                    1.0,
-                    par,
-                );
-                // term 2: C^T W B_dot
-                matmul(
-                    m_dot_view.as_mut(),
-                    Accum::Add,
-                    c_view.transpose(),
-                    wbdot_view,
-                    1.0,
-                    par,
-                );
-                // term 3 (C^T W_dot B) is removed because W is fixed for constraint
-            }
-            let z_dot = -m_pinv.dot(&crate::calibrate::faer_ndarray::fast_ab(
-                &m_dot,
-                link_transform,
-            ));
+            // Z is now computed from Greville abscissae (geometric constraint) and is
+            // constant w.r.t. β. Therefore dZ/dβ = 0 exactly, and z_dot = 0.
+            // This eliminates the entire M_dot computation and constraint sensitivity terms.
+            let z_dot = Array2::<f64>::zeros((n_raw, p_link));
 
             dot_j_theta.assign(
                 &crate::calibrate::faer_ndarray::fast_ab(&b_dot, link_transform),
