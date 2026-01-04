@@ -3642,6 +3642,114 @@ fn summary_root_cause_documentation() {
     println!("===============================================================================");
 }
 
+/// Verification: Sweep rho values to find where analytic vs FD agree.
+/// This explores the transition from good agreement to divergence.
+#[test]
+fn verification_rho_sweep_for_penalty_4() {
+    println!("\n=== Verification: Rho Sweep for Penalty [4] ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    // Extract penalty [4] - the one that fails at rho=12
+    let s_4 = s_list_gam[4].clone();
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    println!("  {:>6} {:>12} {:>12} {:>12} {:>8} {:>8}",
+        "rho", "lambda", "analytic", "FD", "cos", "rel");
+
+    for rho_val in [0.0_f64, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0] {
+        let rho = array![rho_val];
+        let lambda_val = rho_val.exp();
+
+        let result = evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho,
+        );
+
+        match result {
+            Ok((analytic, fd)) => {
+                let (cos, rel, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.99 && rel < 0.2 { "ok" } else if cos < 0.0 { "SIGN!" } else { "err" };
+                println!("  {:>6.1} {:>12.2e} {:>+12.3e} {:>+12.3e} {:>8.4} {:>8.2e} {}",
+                    rho_val, lambda_val, analytic[0], fd[0], cos, rel, status);
+            }
+            Err(e) => {
+                println!("  {:>6.1} {:>12.2e} ERROR: {:?}", rho_val, lambda_val, e);
+            }
+        }
+    }
+
+    println!("\n  Legend:");
+    println!("    ok   = cos>0.99 and rel<0.2 (good agreement)");
+    println!("    err  = magnitude disagreement (rel>=0.2)");
+    println!("    SIGN!= direction disagreement (cos<0, opposite signs)");
+}
+
+/// Verification: Full GAM works at moderate rho (all 8 penalties).
+#[test]
+fn verification_full_gam_correct_at_moderate_rho() {
+    println!("\n=== Verification: Full GAM at Moderate rho ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let nullspace_dims = vec![0; s_list_gam.len()];
+    let offset = Array1::<f64>::zeros(train.y.len());
+    // Use rho=6 instead of 12
+    let rho = Array1::from_elem(layout.num_penalties, 6.0);
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims,
+    };
+
+    println!("  Testing full GAM ({} penalties) at rho=6.0", s_list_gam.len());
+
+    let (analytic, fd) = evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+        &s_list_gam, &opts, &rho,
+    ).expect("gradients");
+
+    let (cos, rel, max_a, ..) = gradient_metrics(&analytic, &fd);
+    let pass = cos > 0.99 && rel < 0.05;
+    let status = if pass { "PASS" } else { "FAIL" };
+    println!("    cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
+
+    // Show per-component results
+    println!("\n  Per-component analysis:");
+    for i in 0..analytic.len() {
+        let a = analytic[i];
+        let f = fd[i];
+        let same_sign = (a >= 0.0) == (f >= 0.0);
+        let sign_status = if same_sign { "ok" } else { "SIGN!" };
+        println!("    [{}]: analytic={:+.3e} fd={:+.3e} {}",
+            i, a, f, sign_status);
+    }
+
+    assert!(pass,
+        "Full GAM gradient should match at moderate rho=6: cos={:.4}, rel={:.2e}",
+        cos, rel
+    );
+
+    println!("\n  Full GAM passes at moderate rho, confirming code correctness.");
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
