@@ -5076,6 +5076,18 @@ pub mod internal {
             // w.t() returns a view, so no extra allocation for transpose.
             let h_pseudoinverse = w.dot(&w.t());
 
+            // Pad W with zeros if needed to match p columns
+            let p_dim = h_total.nrows();
+            let spectral_w = if w.nrows() == p_dim && w.ncols() == p_dim {
+                w
+            } else {
+                let mut w_padded = Array2::<f64>::zeros((p_dim, p_dim));
+                w_padded
+                    .slice_mut(s![..w.nrows(), ..w.ncols()])
+                    .assign(&w);
+                w_padded
+            };
+
             // d. Factorize h_total for linear solves (implicit derivative term).
             // This uses the same ridge logic as the rest of the system, capturing
             // the actual curvature surface that PIRLS optimizes over.
@@ -5089,7 +5101,7 @@ pub mod internal {
                 h_total: Arc::new(h_total),
                 h_total_factor,
                 h_pseudoinverse: Arc::new(h_pseudoinverse),
-                spectral_factor_w: Arc::new(w),
+                spectral_factor_w: Arc::new(spectral_w),
                 h_total_log_det,
             })
         }

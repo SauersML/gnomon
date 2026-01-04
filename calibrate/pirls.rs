@@ -3097,7 +3097,7 @@ mod tests {
         // whose null space has dimension two.
         let num_basis_functions = 10;
         let penalty_order = 2;
-        let penalty = create_difference_penalty_matrix(num_basis_functions, penalty_order)
+        let penalty = create_difference_penalty_matrix(num_basis_functions, penalty_order, None)
             .expect("valid difference penalty");
 
         // Compute the analytical rank from the eigen-spectrum.

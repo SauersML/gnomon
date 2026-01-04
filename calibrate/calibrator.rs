@@ -1,6 +1,6 @@
 use crate::calibrate::basis::{
-    apply_weighted_orthogonality_constraint, create_basis, create_difference_penalty_matrix,
-    BasisError, BasisOptions, Dense, KnotSource,
+    apply_weighted_orthogonality_constraint, compute_greville_abscissae, create_basis,
+    create_difference_penalty_matrix, BasisError, BasisOptions, Dense, KnotSource,
 };
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::faer_ndarray::FaerArrayView;
@@ -1652,8 +1652,13 @@ pub fn build_calibrator_design(
             }
             Err(err) => return Err(EstimationError::BasisError(err)),
         };
-        let s_dist_raw0 =
-            create_difference_penalty_matrix(b_dist_raw.ncols(), spec.penalty_order_dist)?;
+        let g_dist = compute_greville_abscissae(&knots_dist_generated, spec.dist_basis.degree)
+            .map_err(EstimationError::BasisError)?;
+        let s_dist_raw0 = create_difference_penalty_matrix(
+            b_dist_raw.ncols(),
+            spec.penalty_order_dist,
+            Some(g_dist.view()),
+        )?;
         (
             b_dist_c,
             stz_dist,
@@ -1722,12 +1727,24 @@ pub fn build_calibrator_design(
     let mut knots_se = knots_se.clone(); // Take ownership
 
     // Build penalties in raw space, then push through STZ
-    let s_pred_raw0 =
-        create_difference_penalty_matrix(b_pred_raw.ncols(), spec.penalty_order_pred)?;
+    let g_pred = compute_greville_abscissae(&knots_pred, spec.pred_basis.degree)
+        .map_err(EstimationError::BasisError)?;
+    let s_pred_raw0 = create_difference_penalty_matrix(
+        b_pred_raw.ncols(),
+        spec.penalty_order_pred,
+        Some(g_pred.view()),
+    )?;
+
     let s_se_raw0 = if se_wiggle_only_drop {
         Array2::<f64>::zeros((b_se_raw.ncols(), b_se_raw.ncols()))
     } else {
-        create_difference_penalty_matrix(b_se_raw.ncols(), spec.penalty_order_se)?
+        let g_se = compute_greville_abscissae(&knots_se, spec.se_basis.degree)
+            .map_err(EstimationError::BasisError)?;
+        create_difference_penalty_matrix(
+            b_se_raw.ncols(),
+            spec.penalty_order_se,
+            Some(g_se.view()),
+        )?
     };
     // s_dist_raw0 is already created in the if-else block above
 

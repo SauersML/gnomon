@@ -1919,15 +1919,23 @@ pub fn create_bspline_basis_nd_sparse_with_knots_derivative(
 /// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
 /// differences of the spline coefficients. This is the core of P-splines.
 ///
+/// This function supports both uniform knots (using ordinary differences) and
+/// non-uniform knots (using divided differences), which is critical for
+/// correctly penalizing curvature when knots are irregularly spaced (e.g. quantiles).
+///
 /// # Arguments
 /// * `num_basis_functions`: The number of basis functions (i.e., columns in the basis matrix).
 /// * `order`: The order of the difference penalty (e.g., 2 for second differences).
+/// * `greville_abscissae`: Optional Greville abscissae for divided differences.
+///   If `None`, assumes uniform knots and uses ordinary integer differences.
+///   If `Some`, uses divided differences scaled by the inverse of the knot spans.
 ///
 /// # Returns
 /// A square `Array2<f64>` of shape `[num_basis, num_basis]` representing the penalty `S`.
 pub fn create_difference_penalty_matrix(
     num_basis_functions: usize,
     order: usize,
+    greville_abscissae: Option<ArrayView1<f64>>,
 ) -> Result<Array2<f64>, BasisError> {
     if order == 0 || order >= num_basis_functions {
         return Err(BasisError::InvalidPenaltyOrder {
@@ -1936,14 +1944,37 @@ pub fn create_difference_penalty_matrix(
         });
     }
 
+    if let Some(g) = greville_abscissae {
+        if g.len() != num_basis_functions {
+            return Err(BasisError::DimensionMismatch(format!(
+                "Greville abscissae length {} does not match num_basis_functions {}",
+                g.len(),
+                num_basis_functions
+            )));
+        }
+    }
+
     // Start with the identity matrix
     let mut d = Array2::<f64>::eye(num_basis_functions);
 
     // Apply the differencing operation `order` times.
     // Each `diff` reduces the number of rows by 1.
-    for _ in 0..order {
-        // This calculates the difference between adjacent rows.
+    for o in 1..=order {
+        // Calculate the difference between adjacent rows: D^{(o)} = Delta * D^{(o-1)}
         d = &d.slice(s![1.., ..]) - &d.slice(s![..-1, ..]);
+
+        // If using non-uniform knots, apply divided difference scaling:
+        // D^{(o)}_i = D^{(o)}_i / (xi_{i+o} - xi_i)
+        if let Some(g) = greville_abscissae {
+            let nrows = d.nrows();
+            for i in 0..nrows {
+                let span = g[i + o] - g[i];
+                if span.abs() > 1e-12 {
+                    let mut row = d.row_mut(i);
+                    row /= span;
+                }
+            }
+        }
     }
 
     // The penalty matrix S = D' * D
@@ -2239,7 +2270,7 @@ pub fn compute_geometric_constraint_transform(
     }
 
     // 7. Build raw penalty and project: S_c = Z' S Z
-    let s_raw = create_difference_penalty_matrix(k, penalty_order)?;
+    let s_raw = create_difference_penalty_matrix(k, penalty_order, Some(g.view()))?;
     let s_constrained = z.t().dot(&s_raw).dot(&z);
 
     Ok((z, s_constrained))
@@ -2704,7 +2735,7 @@ mod tests {
 
     #[test]
     fn test_penalty_matrix_creation() {
-        let s = create_difference_penalty_matrix(5, 2).unwrap();
+        let s = create_difference_penalty_matrix(5, 2, None).unwrap();
         assert_eq!(s.shape(), &[5, 5]);
         // D_2 for n=5 is [[1, -2, 1, 0, 0], [0, 1, -2, 1, 0], [0, 0, 1, -2, 1]]
         // s = d_2' * d_2
@@ -3329,7 +3360,7 @@ mod tests {
             epsilon = 1e-9
         );
 
-        match create_difference_penalty_matrix(5, 5).unwrap_err() {
+        match create_difference_penalty_matrix(5, 5, None).unwrap_err() {
             BasisError::InvalidPenaltyOrder { order, num_basis } => {
                 assert_eq!(order, 5);
                 assert_eq!(num_basis, 5);

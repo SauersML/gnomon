@@ -3087,9 +3087,9 @@ mod tests {
         .expect("PC basis construction");
         let pc_cols = pc_basis_unc.ncols() - 1; // drop intercept column
 
-        let s_pgs = create_difference_penalty_matrix(pgs_cols, config.penalty_order)
+        let s_pgs = create_difference_penalty_matrix(pgs_cols, config.penalty_order, None)
             .expect("valid PGS penalty");
-        let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order)
+        let s_pc = create_difference_penalty_matrix(pc_cols, config.penalty_order, None)
             .expect("valid PC penalty");
         let i_pgs = Array2::<f64>::eye(pgs_cols);
         let i_pc = Array2::<f64>::eye(pc_cols);
@@ -3162,7 +3162,7 @@ mod tests {
         )
         .expect("sum-to-zero transform");
         let s_pgs =
-            create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order)
+            create_difference_penalty_matrix(pgs_main_basis_unc.ncols(), config.penalty_order, None)
                 .expect("PGS penalty");
         let s_sex_pgs_wiggle = z_transform.t().dot(&s_pgs.dot(&z_transform));
         let s_sex_pgs_wiggle_block = &s_list[sex_pgs_block.penalty_indices[0]];

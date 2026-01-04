@@ -663,7 +663,7 @@ fn isolation_difference_penalty_logit_no_firth() {
     
     let (y, x, w) = generate_logit_data(120, 10, 42);
     let p = x.ncols();
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let rho = array![0.0];
     
     let (analytic, fd) = match evaluate_external_gradients(
@@ -745,7 +745,7 @@ fn isolation_concurrent_nullspace_instability() {
     }
     let w = Array1::<f64>::ones(n);
     
-    let mut s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let mut s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let eps = 1e-12;
     let mut b1 = Array1::<f64>::zeros(p);
     let mut b2 = Array1::<f64>::zeros(p);
@@ -810,7 +810,7 @@ fn isolation_projected_tensor_penalty_logit_no_firth() {
     let k1 = z1.nrows();
     let n2 = 5;
     let p_raw = k1 * n2;
-    let s1 = create_difference_penalty_matrix(k1, 2).expect("difference penalty");
+    let s1 = create_difference_penalty_matrix(k1, 2, None).expect("difference penalty");
     let s_raw = kron_with_identity(&s1, n2);
     let z = kron_with_identity_right(&z1, n2);
     let s = z.t().dot(&s_raw).dot(&z);
@@ -869,8 +869,8 @@ fn isolation_projected_tensor_penalty_with_firth() {
     let k1 = z1.nrows();
     let n2 = 5;
     let p_raw = k1 * n2;
-    let s1_base = create_difference_penalty_matrix(k1, 2).expect("difference penalty");
-    let s2_base = create_difference_penalty_matrix(n2, 2).expect("difference penalty");
+    let s1_base = create_difference_penalty_matrix(k1, 2, None).expect("difference penalty");
+    let s2_base = create_difference_penalty_matrix(n2, 2, None).expect("difference penalty");
     let s1_raw = kron_with_identity(&s1_base, n2);
     let s2_raw = identity_kron_with(&s2_base, k1);
     let z = kron_with_identity_right(&z1, n2);
@@ -929,8 +929,8 @@ fn isolation_multiple_overlapping_dense_penalties_with_firth() {
     let basis = basis_arc.as_ref();
     let (_, z) = apply_sum_to_zero_constraint(basis.view(), None).expect("constraint");
     let k_eff = z.nrows();
-    let s_raw_1 = create_difference_penalty_matrix(k_eff, 1).expect("diff 1");
-    let s_raw_2 = create_difference_penalty_matrix(k_eff, 2).expect("diff 2");
+    let s_raw_1 = create_difference_penalty_matrix(k_eff, 1, None).expect("diff 1");
+    let s_raw_2 = create_difference_penalty_matrix(k_eff, 2, None).expect("diff 2");
     let s1 = z.t().dot(&s_raw_1).dot(&z);
     let s2 = z.t().dot(&s_raw_2).dot(&z);
 
@@ -1601,7 +1601,7 @@ fn isolation_missing_term_hypothesis() {
     
     // Get optimal beta using public fit_model_for_fixed_rho
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
-    let balanced = create_difference_penalty_matrix(p, 1).unwrap();
+    let balanced = create_difference_penalty_matrix(p, 1, None).unwrap();
     let layout = ModelLayout::external(p, s_list.len());
     let config = ModelConfig::external(
         opts.link,
@@ -1738,7 +1738,7 @@ fn isolation_truncation_correction_ridge_hypothesis() {
     let (y, x, w) = generate_logit_data(n, p, 42);
     
     // Difference penalty with order 2 has 2-dimensional null space
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2]; // Order-2 difference has 2D null space
     
@@ -1825,7 +1825,7 @@ fn isolation_truncation_correction_no_ridge_baseline() {
     let p = 8;
     let (y, x, w) = generate_logit_data(n, p, 42);
     
-    let s = create_difference_penalty_matrix(p, 1).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 1, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![1];
     
@@ -1898,7 +1898,7 @@ fn hypothesis_firth_alone_single_penalty() {
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
     
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     
@@ -1972,7 +1972,7 @@ fn hypothesis_firth_high_smoothing() {
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
     
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     
@@ -2049,7 +2049,7 @@ fn hypothesis_firth_rank_deficient_penalty() {
     let (y, x, w) = generate_logit_data(n, p, 42);
     
     // Use difference penalty which has a proper null space
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     
@@ -2351,7 +2351,7 @@ fn hypothesis_gradient_magnitude_threshold() {
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
     
-    let s = create_difference_penalty_matrix(p, 2).expect("penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     let offset = Array1::<f64>::zeros(n);
@@ -2453,9 +2453,9 @@ fn hypothesis_spline_penalty_synthetic_data() {
     let (y, x, w) = generate_logit_data(n, p, 42);
     
     // Use multiple difference penalties (order 2) like real splines
-    let s1 = create_difference_penalty_matrix(8, 2).expect("penalty 1");
-    let s2 = create_difference_penalty_matrix(6, 2).expect("penalty 2");  
-    let s3 = create_difference_penalty_matrix(6, 2).expect("penalty 3");
+    let s1 = create_difference_penalty_matrix(8, 2, None).expect("penalty 1");
+    let s2 = create_difference_penalty_matrix(6, 2, None).expect("penalty 2");
+    let s3 = create_difference_penalty_matrix(6, 2, None).expect("penalty 3");
     
     // Embed them in a block-diagonal structure within the full p dimensions
     let mut s1_full = Array2::<f64>::zeros((p, p));
@@ -2530,9 +2530,9 @@ fn hypothesis_overlapping_penalty_structure() {
     let mut s3 = Array2::<f64>::zeros((p, p));
     
     // Fill with difference penalty structure in each block
-    let d1 = create_difference_penalty_matrix(11, 2).expect("d1");
-    let d2 = create_difference_penalty_matrix(11, 2).expect("d2");
-    let d3 = create_difference_penalty_matrix(10, 2).expect("d3");
+    let d1 = create_difference_penalty_matrix(11, 2, None).expect("d1");
+    let d2 = create_difference_penalty_matrix(11, 2, None).expect("d2");
+    let d3 = create_difference_penalty_matrix(10, 2, None).expect("d3");
     
     for i in 0..11 {
         for j in 0..11 {
