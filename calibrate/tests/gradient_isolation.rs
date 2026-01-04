@@ -3861,7 +3861,7 @@ fn hypothesis_analytic_vs_cost_trend_per_component() {
     };
 
     // Get analytic gradient at rho=12
-    let mut rho = Array1::from_elem(layout.num_penalties, 12.0);
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
     let (analytic, fd) = evaluate_external_gradients(
         train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
         &s_list_gam, &opts, &rho,
