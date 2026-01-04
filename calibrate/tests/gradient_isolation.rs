@@ -1085,3 +1085,45 @@ fn isolation_frozen_beta_fd() {
     print_result("Analytic vs FD", cos_fd, rel_fd, max_a, max_fd);
     print_result("Analytic vs Frozen FD", cos_frozen, rel_frozen, max_af, max_frozen);
 }
+
+// ============================================================================
+// Section 5: FD reliability diagnostic
+// ============================================================================
+
+/// Proves FD is unreliable at high smoothing (should FAIL at rho=12).
+#[test]
+fn diagnostic_fd_noise_floor_at_high_smoothing() {
+    let train = create_logistic_training_data(100, 3, 31);
+    let mut config = logistic_model_config(true, false, &train);
+    config.firth_bias_reduction = true;
+    let (x, s_list, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![0; s_list.len()],
+    };
+    
+    // rho=2: should pass
+    let rho_mod = Array1::from_elem(layout.num_penalties, 2.0);
+    let (a_mod, fd_mod) = evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x.view(), offset.view(),
+        &s_list, &opts, &rho_mod,
+    ).unwrap();
+    let (cos_mod, ..) = gradient_metrics(&a_mod, &fd_mod);
+    
+    // rho=12: should FAIL if FD is unreliable
+    let rho_ext = Array1::from_elem(layout.num_penalties, 12.0);
+    let (a_ext, fd_ext) = evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x.view(), offset.view(),
+        &s_list, &opts, &rho_ext,
+    ).unwrap();
+    let (cos_ext, _, max_a, _) = gradient_metrics(&a_ext, &fd_ext);
+    
+    assert!(cos_mod > 0.999, "rho=2 failed: cos={cos_mod}");
+    assert!(cos_ext > 0.999, "rho=12 failed: cos={cos_ext}, |grad|={max_a:.2e}");
+}
