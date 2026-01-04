@@ -4980,95 +4980,169 @@ pub mod internal {
         ) -> Result<EvalShared, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(rho)?;
             let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
-            
-            // Compute h_total: the exact Hessian used for log|H| in the cost function.
-            // For Firth: h_total = h_eff - h_phi (subtract Firth curvature)
-            // For non-Firth: h_total = h_eff
-            let h_total = if self.config.firth_bias_reduction
-                && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit)
-            {
-                match self.firth_hessian_logit(
+
+            // Spectral consistency threshold for eigenvalue truncation.
+            // This threshold determines both the cost function domain and the gradient projection.
+            const EIG_THRESHOLD: f64 = 1e-12;
+
+            let dim = h_eff.nrows();
+
+            // Determine if Firth is active
+            let firth_active = self.config.firth_bias_reduction
+                && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit);
+
+            // Compute spectral quantities using WHITENED SUBTRACTION to avoid catastrophic cancellation.
+            //
+            // PROBLEM: Direct subtraction h_total = h_eff - h_phi causes catastrophic cancellation
+            // when h_eff ≈ h_phi, corrupting eigenvalues with numerical noise.
+            //
+            // SOLUTION (Golub & Van Loan, Matrix Computations, Section 8.7.2):
+            // Use the generalized eigenvalue approach:
+            //   1. Factor h_eff = L L^T (Cholesky)
+            //   2. Whiten h_phi: K = L^{-1} h_phi L^{-T}
+            //   3. Eigendecompose K = U diag(μ) U^T
+            //   4. Then h_total = L(I - K)L^T, so:
+            //      - Eigenvalues of h_total in whitened space: (1 - μ_i)
+            //      - log|h_total| = log|h_eff| + Σ log(1 - μ_i)
+            //      - Spectral factor: W = L^{-T} U diag(1/√(1-μ))
+            //
+            // This transforms the unstable matrix subtraction into stable scalar subtraction (1 - μ).
+
+            let (h_total_log_det, w, h_total) = if firth_active {
+                // Firth case: use whitened subtraction
+                let h_phi = self.firth_hessian_logit(
                     &pirls_result.x_transformed,
                     &pirls_result.solve_mu,
                     &pirls_result.solve_weights,
-                ) {
-                    Ok(h_phi) => {
-                        let mut h_total = h_eff.clone();
-                        h_total -= &h_phi;
-                        h_total
+                )?;
+
+                // Step 1: Cholesky factorization of h_eff
+                let chol = h_eff.clone().cholesky(Side::Lower).map_err(|_| {
+                    EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
                     }
-                    Err(_) => h_eff.clone(), // Fallback to h_eff if h_phi fails
+                })?;
+                let l = chol.lower_triangular();
+
+                // Compute log|h_eff| = 2 * sum(log(diag(L)))
+                let log_det_h_eff: f64 = 2.0 * l.diag().mapv(|x| x.ln()).sum();
+
+                // Step 2: Compute whitened matrix K = L^{-1} h_phi L^{-T}
+                // K = L^{-1} * h_phi * L^{-T}
+                // First: Y = L^{-1} * h_phi (solve L Y = h_phi)
+                let y = Self::solve_lower_triangular(&l, &h_phi);
+                // Then: K = Y * L^{-T} = Y * (L^T)^{-1}
+                // This is: K^T = L^{-1} * Y^T, so K = (L^{-1} Y^T)^T
+                // Or more directly: solve L^T Z = Y^T, then K = Z^T
+                let l_t = l.t().to_owned();
+                let k_t = Self::solve_upper_triangular(&l_t, &y.t().to_owned());
+                let k = k_t.t().to_owned();
+
+                // Step 3: Eigendecompose K (symmetric)
+                let (mu_vals, u_vecs) = k.eigh(Side::Lower).map_err(|e| {
+                    EstimationError::EigendecompositionFailed(e)
+                })?;
+
+                // Step 4: Eigenvalues of h_total (in whitened space) are (1 - μ)
+                // log|h_total| = log|h_eff| + sum(log(1 - μ_i)) for valid (1-μ) > threshold
+                //
+                // Note: For numerical stability, we need (1 - μ) > threshold.
+                // If μ ≈ 1, then h_phi ≈ h_eff in that direction → h_total is near-singular there.
+                let mut log_det_correction: f64 = 0.0;
+                let mut valid_indices: Vec<usize> = Vec::new();
+
+                for (i, &mu) in mu_vals.iter().enumerate() {
+                    let one_minus_mu = 1.0 - mu;
+                    if one_minus_mu > EIG_THRESHOLD {
+                        log_det_correction += one_minus_mu.ln();
+                        valid_indices.push(i);
+                    }
                 }
+
+                let h_total_log_det = log_det_h_eff + log_det_correction;
+
+                if !h_total_log_det.is_finite() {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
+                }
+
+                // Step 5: Compute spectral factor W = L^{-T} U_valid diag(1/√(1-μ_valid))
+                // H_total^{-1} = W W^T in the truncated spectral sense
+                let valid_count = valid_indices.len();
+                let mut w = Array2::<f64>::zeros((dim, valid_count));
+
+                // First compute U_scaled = U_valid * diag(1/√(1-μ))
+                let mut u_scaled = Array2::<f64>::zeros((dim, valid_count));
+                for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                    let one_minus_mu = 1.0 - mu_vals[eig_idx];
+                    let scale = 1.0 / one_minus_mu.sqrt();
+                    let u_col = u_vecs.column(eig_idx);
+
+                    let mut scaled_col = u_scaled.column_mut(w_col_idx);
+                    Zip::from(&mut scaled_col).and(&u_col).for_each(|s, &u| {
+                        *s = u * scale;
+                    });
+                }
+
+                // Then W = L^{-T} * U_scaled = solve L^T W = U_scaled
+                for j in 0..valid_count {
+                    let rhs_col = u_scaled.column(j).to_owned().insert_axis(ndarray::Axis(1));
+                    let w_col_result = Self::solve_upper_triangular(&l_t, &rhs_col);
+                    w.column_mut(j).assign(&w_col_result.column(0));
+                }
+
+                // Reconstruct h_total for storage (though we don't eigendecompose it directly)
+                // h_total = h_eff - h_phi (for storage/debugging, not for spectral computation)
+                let mut h_total = h_eff.clone();
+                h_total -= &h_phi;
+
+                (h_total_log_det, w, h_total)
             } else {
-                h_eff.clone()
-            };
-            
-            // Perform Eigendecomposition to ensure spectral consistency between Cost and Gradient.
-            // Cost = sum(log(lambda)) for lambda > epsilon
-            // Gradient = tr(H_plus_dagger * dH)
-            
-            // We use Faer's self-adjoint eigendecomposition
-            // Optimization: eigh borrows self, so we removed clone().
-            let (eigvals, eigvecs) = match h_total.eigh(Side::Lower) {
-                Ok((vals, vecs)) => (vals, vecs),
-                Err(e) => {
-                    // Fallback if eigendecomposition fails (rare): return error
-                    return Err(EstimationError::EigendecompositionFailed(e));
+                // Non-Firth case: direct eigendecomposition (no subtraction, no cancellation risk)
+                let h_total = h_eff.clone();
+
+                let (eigvals, eigvecs) = h_total.eigh(Side::Lower).map_err(|e| {
+                    EstimationError::EigendecompositionFailed(e)
+                })?;
+
+                // Sum log(lambda) for valid eigenvalues
+                let h_total_log_det: f64 = eigvals.iter()
+                    .filter(|&&v| v > EIG_THRESHOLD)
+                    .map(|&v| v.ln())
+                    .sum();
+
+                if !h_total_log_det.is_finite() {
+                    return Err(EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    });
                 }
+
+                // Filter valid eigenvalues and construct W
+                let valid_indices: Vec<usize> = eigvals
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+                    .collect();
+
+                let valid_count = valid_indices.len();
+                let mut w = Array2::<f64>::zeros((dim, valid_count));
+
+                for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                    let val = eigvals[eig_idx];
+                    let scale = 1.0 / val.sqrt();
+                    let u_col = eigvecs.column(eig_idx);
+
+                    let mut w_col = w.column_mut(w_col_idx);
+                    Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
+                        *w_elem = u_elem * scale;
+                    });
+                }
+
+                (h_total_log_det, w, h_total)
             };
-            
-            // Truncation logic:
-            // Filter eigenvalues: keep only those significantly positive.
-            // This threshold determines both the cost function domain and the gradient projection.
-            // 1e-12 is consistent with the previous fallback logic.
-            const EIG_THRESHOLD: f64 = 1e-12;
-            
-            // 1. Compute Cost (Log Determinant)
-            // Sum log(lambda) only for valid eigenvalues.
-            let h_total_log_det : f64 = eigvals.iter()
-                .filter(|&&v| v > EIG_THRESHOLD)
-                .map(|&v| v.ln())
-                .sum();
-                
-            if !h_total_log_det.is_finite() {
-                 return Err(EstimationError::ModelIsIllConditioned {
-                     condition_number: f64::INFINITY
-                 });
-            }
-            
-            // 2. Compute Pseudoinverse H_plus_dagger
-            // Efficiently using matrix multiplication: H+ = W * W^T
-            // where W = U_valid * diag(1/sqrt(lambda_valid))
-            // This replaces the previous O(N^3) scalar loop with highly optimized BLAS operations.
-            
-            // a. Filter indices of valid eigenvalues
-            let valid_indices: Vec<usize> = eigvals
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
-                .collect();
-                
-            let valid_count = valid_indices.len();
-            let dim = h_total.nrows();
-            
-            // b. Construct W (scaled eigenvectors)
-            let mut w = Array2::<f64>::zeros((dim, valid_count));
-            
-            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
-                let val = eigvals[eig_idx];
-                let scale = 1.0 / val.sqrt();
-                let u_col = eigvecs.column(eig_idx);
-                
-                // Vectorized scale and copy
-                let mut w_col = w.column_mut(w_col_idx);
-                Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
-                    *w_elem = u_elem * scale;
-                });
-            }
-            
-            // c. Compute Pseudoinverse via Matrix Multiplication (H_dagger = W * W^T)
-            // This leverages highly optimized BLAS/GEMM routines implicit in dot().
-            // w.t() returns a view, so no extra allocation for transpose.
+
+            // Compute pseudoinverse: H_dagger = W * W^T
             let h_pseudoinverse = w.dot(&w.t());
 
             Ok(EvalShared {
@@ -7278,25 +7352,17 @@ pub mod internal {
                             .expect("link_function called on survival model")
                         {
                             if self.config.firth_bias_reduction && h_phi_opt.is_some() {
-                                // Use SPECTRAL version with W factor for consistency with truncated cost
+                                // Use SPECTRAL version with W factor for consistency with truncated cost.
+                                // NO FALLBACK: Spectral consistency is required for FD agreement.
+                                // If spectral gradient fails, propagate error - don't switch to Cholesky
+                                // which uses a different mathematical surface.
                                 let spectral_w = bundle.spectral_factor_w.as_ref();
-                                match self.firth_logh_total_grad_spectral(
+                                Some(self.firth_logh_total_grad_spectral(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
                                     spectral_w,
-                                ) {
-                                    Ok(grad) => Some(grad),
-                                    Err(_) => {
-                                    // Fallback to approximate gradient (also spectral)
-                                        self.logh_beta_grad_logit(
-                                            &pirls_result.x_transformed,
-                                            &pirls_result.solve_mu,
-                                            &pirls_result.solve_weights,
-                                            &factor_g,
-                                        )
-                                    }
-                                }
+                                )?)
                             } else {
                                 // Non-Firth path: use standard logh_beta_grad_logit (full rank)
                                 self.logh_beta_grad_logit(

@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
-"""Example workflow that converts direct-to-consumer genotype exports to VCF and runs
-polygenic scores from the PGS catalog with gnomon.
+"""Example workflow that scores direct-to-consumer genotype exports using gnomon.
+
+gnomon natively supports DTC text files (23andMe, AncestryDNA, etc.) and will
+automatically download the required reference genome on first run.
 
 Steps performed:
-    1. Download the GRCh37 reference FASTA from Illumina if it is not present.
-    2. Use the `convert_genome` Rust CLI to convert the text genomes in ``data`` to VCFs.
-    3. Transform each VCF into a PLINK fileset with ``plink2``.
-    4. Download a configurable set of PGS catalog scores and score each converted genome
-       with gnomon's high-performance pipeline.
-    5. Print the final score matrix and assert a few high-level invariants so the script
+    1. Download a configurable set of PGS catalog scores.
+    2. Run gnomon directly on the raw .txt genomes in ``data/``.
+    3. Print the final score matrix and assert a few high-level invariants so the script
        can be dropped into continuous integration.
-
-The script is intentionally verbose and defensive.  It prints each shell command prior to
-execution, validates that required binaries are available, and refuses to silently skip
-steps.  This makes it appropriate for manual runs when experimenting with new scores as
-well as for automated checks that should run whenever the ``score`` crate changes.
 
 Usage (after building gnomon with ``cargo build --release``)::
 
@@ -35,7 +29,6 @@ import re
 import shutil
 import subprocess
 import sys
-import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,10 +43,6 @@ from urllib.request import urlopen
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "convert_score_output"
-DEFAULT_REFERENCE_URL = (
-    "https://webdata.illumina.com/downloads/productfiles/"
-    "microarray-analytics-array/GRCh37_genome.zip"
-)
 DEFAULT_PGS_IDS = (
     "PGS000007",
     "PGS000317",
@@ -71,11 +60,6 @@ GENOME_SOURCES: Tuple[Tuple[str, str], ...] = (
 # Dataclasses and small utilities
 # --------------------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class ToolPaths:
-    convert_genome: Path
-    gnomon: Path
-
 
 @dataclass
 class ScoreResult:
@@ -86,7 +70,6 @@ class ScoreResult:
 
 def debug(msg: str) -> None:
     """Small helper to print progress messages with a common prefix."""
-
     print(f"[convert_score] {msg}", flush=True)
 
 
@@ -96,7 +79,6 @@ class CommandError(RuntimeError):
 
 def run_command(argv: Sequence[os.PathLike[str] | str], cwd: Path | None = None) -> None:
     """Execute ``argv`` and raise :class:`CommandError` on failure."""
-
     printable = " ".join(map(str, argv))
     if cwd is not None:
         printable = f"(cd {cwd} && {printable})"
@@ -110,7 +92,6 @@ def run_command(argv: Sequence[os.PathLike[str] | str], cwd: Path | None = None)
 
 def ensure_binary(name: str, explicit: str | None = None) -> Path:
     """Return the resolved path to ``name`` or raise a clear error."""
-
     candidate = Path(explicit) if explicit else shutil.which(name)
     if not candidate:
         raise FileNotFoundError(
@@ -126,67 +107,22 @@ def ensure_binary(name: str, explicit: str | None = None) -> Path:
 # Download helpers
 # --------------------------------------------------------------------------------------
 
+
 def stream_download(url: str, destination: Path) -> None:
     """Download ``url`` to ``destination`` using urllib with streaming."""
-
     debug(f"Downloading {url} -> {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         with urlopen(url) as response, open(destination, "wb") as handle:
             shutil.copyfileobj(response, handle)
-    except (HTTPError, URLError) as exc:  # pragma: no cover - network failure
+    except (HTTPError, URLError) as exc:
         raise RuntimeError(f"Failed to download {url}: {exc}") from exc
-
-
-def ensure_reference_fasta(reference_url: str, work_dir: Path) -> Path:
-    """Download and extract the FASTA file used by ``convert_genome``."""
-
-    archive_name = Path(reference_url.split("/")[-1])
-    archive_path = work_dir / archive_name
-    candidate_fastas: List[Path] = []
-
-    for suffix in (".fa", ".fasta", ".fa.gz", ".fasta.gz"):
-        candidate_fastas.extend(work_dir.glob(f"*{suffix}"))
-    if candidate_fastas:
-        debug(f"Using existing reference FASTA: {candidate_fastas[0]}")
-        return candidate_fastas[0]
-
-    if not archive_path.exists():
-        stream_download(reference_url, archive_path)
-
-    debug(f"Extracting reference from {archive_path}")
-    extracted_fasta: Path | None = None
-    with zipfile.ZipFile(archive_path) as zf:
-        for name in zf.namelist():
-            lower = name.lower()
-            if lower.endswith((".fa", ".fasta", ".fa.gz", ".fasta.gz")):
-                target = work_dir / Path(name).name
-                if not target.exists():
-                    with zf.open(name) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                extracted_fasta = target
-                break
-    if extracted_fasta is None:
-        raise RuntimeError(
-            "Reference archive did not contain a .fa or .fasta file; convert_genome cannot run."
-        )
-
-    if extracted_fasta.suffixes[-1] == ".gz":
-        debug(f"Decompressing {extracted_fasta}")
-        decompressed = extracted_fasta.with_suffix("")
-        with gzip.open(extracted_fasta, "rb") as src, open(decompressed, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        extracted_fasta = decompressed
-
-    debug(f"Reference FASTA ready: {extracted_fasta}")
-    return extracted_fasta
 
 
 def download_pgs_score(
     pgs_id: str, cache_dir: Path, assembly: str = "GRCh37"
 ) -> Path:
     """Download the harmonized PGS scoring file for ``assembly``."""
-
     valid_assemblies = {"GRCh37", "GRCh38"}
     if assembly not in valid_assemblies:
         raise ValueError(
@@ -225,66 +161,43 @@ def download_pgs_score(
 
 
 # --------------------------------------------------------------------------------------
-# Conversion steps
+# Scoring
 # --------------------------------------------------------------------------------------
-
-
-def convert_genome_to_plink(
-    tool: Path,
-    genome_path: Path,
-    sample_id: str,
-    reference_fasta: Path,
-    output_dir: Path,
-    assembly: str,
-) -> Path:
-    """Convert genome directly to PLINK format using convert_genome --format plink."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plink_prefix = output_dir / genome_path.stem
-    bed_path = plink_prefix.with_suffix(".bed")
-
-    if bed_path.exists():
-        debug(f"Skipping conversion; PLINK files already exist: {plink_prefix}")
-        return plink_prefix
-
-    run_command(
-        (
-            tool,
-            "--input",
-            genome_path,
-            "--reference",
-            reference_fasta,
-            "--output",
-            plink_prefix,
-            "--format",
-            "plink",
-            "--sample",
-            sample_id,
-            "--assembly",
-            assembly,
-        )
-    )
-    if not bed_path.exists():
-        raise RuntimeError(f"convert_genome reported success but {bed_path} was not created.")
-    return plink_prefix
-
-
 
 
 def run_gnomon_score(
     tool: Path,
     score_path: Path,
-    plink_prefix: Path,
+    genome_path: Path,
+    assembly: str,
 ) -> Path:
-    """Execute ``gnomon score`` and return the path to the generated ``.sscore`` file."""
+    """Execute ``gnomon score`` directly on a DTC text file.
 
-    run_command((tool, "score", score_path, plink_prefix))
+    gnomon will automatically download the reference genome if needed.
+    """
+    # gnomon score <SCORE_PATH> <GENOTYPE_PATH> [--build <BUILD>]
+    cmd = [tool, "score", score_path, genome_path]
+    if assembly == "GRCh37":
+        cmd.extend(["--build", "37"])
 
-    # New naming convention: plink_prefix + "_" + score_stem + ".sscore"
+    run_command(cmd)
+
+    # Output naming: genome_stem + "_" + score_stem + ".sscore"
+    # But gnomon creates a cache dir, so output is in genome_path.parent / cache / ...
+    # Actually, gnomon outputs relative to the converted PLINK prefix
+    # The cache is at genome_path.parent / genome_stem.gnomon_cache / genotypes
+    cache_dir = genome_path.parent / f"{genome_path.stem}.gnomon_cache"
     score_stem = score_path.stem
-    sscore_path = plink_prefix.parent / f"{plink_prefix.name}_{score_stem}.sscore"
+    sscore_path = cache_dir / f"genotypes_{score_stem}.sscore"
+
     if not sscore_path.exists():
-        raise RuntimeError(f"gnomon score did not create {sscore_path}")
+        # Try alternate location (if gnomon changes output location)
+        alt_path = genome_path.parent / f"{genome_path.stem}_{score_stem}.sscore"
+        if alt_path.exists():
+            sscore_path = alt_path
+        else:
+            raise RuntimeError(f"gnomon score did not create {sscore_path} or {alt_path}")
+
     return sscore_path
 
 
@@ -292,9 +205,9 @@ def run_gnomon_score(
 # Parsing helpers
 # --------------------------------------------------------------------------------------
 
+
 def parse_sscore(path: Path) -> Tuple[List[str], List[ScoreResult]]:
     """Parse a gnomon ``.sscore`` file into a row-wise structure."""
-
     with path.open("r", encoding="utf-8") as handle:
         header: List[str] | None = None
         rows: List[ScoreResult] = []
@@ -305,7 +218,6 @@ def parse_sscore(path: Path) -> Tuple[List[str], List[ScoreResult]]:
                 header = [col.lstrip("#") for col in raw.rstrip().split("\t")]
                 continue
             values = raw.rstrip().split("\t")
-            iid = values[0]
             idx = 1
             while idx < len(values):
                 score_name = header[idx]
@@ -329,7 +241,6 @@ def parse_sscore(path: Path) -> Tuple[List[str], List[ScoreResult]]:
 
 def derive_sample_id(filename: str, override: str | None = None) -> str:
     """Generate a stable sample ID for the provided genome filename."""
-
     if override:
         return override
     name = Path(filename).stem
@@ -342,17 +253,15 @@ def derive_sample_id(filename: str, override: str | None = None) -> str:
 # Main orchestration
 # --------------------------------------------------------------------------------------
 
+
 def orchestrate(args: argparse.Namespace) -> None:
-    tools = ToolPaths(
-        convert_genome=ensure_binary("convert_genome", args.convert_genome_bin),
-        gnomon=ensure_binary("gnomon", args.gnomon_bin or str(REPO_ROOT / "target" / "release" / "gnomon")),
+    gnomon = ensure_binary(
+        "gnomon",
+        args.gnomon_bin or str(REPO_ROOT / "target" / "release" / "gnomon"),
     )
 
     output_dir = Path(args.output_dir).resolve()
-    plink_dir = output_dir / "plink"
     score_cache = output_dir / "scores"
-
-    reference_fasta = ensure_reference_fasta(args.reference_url, output_dir / "reference")
 
     genome_inputs: List[Tuple[Path, str]] = []
     for filename, override in GENOME_SOURCES:
@@ -371,18 +280,10 @@ def orchestrate(args: argparse.Namespace) -> None:
 
     for genome_path, sample_id in genome_inputs:
         debug(f"Processing genome {genome_path.name} (sample {sample_id})")
-        plink_prefix = convert_genome_to_plink(
-            tools.convert_genome,
-            genome_path,
-            sample_id,
-            reference_fasta,
-            plink_dir,
-            args.assembly,
-        )
 
         for pgs_id in args.scores:
             score_path = download_pgs_score(pgs_id, score_cache, assembly=args.assembly)
-            sscore_path = run_gnomon_score(tools.gnomon, score_path, plink_prefix)
+            sscore_path = run_gnomon_score(gnomon, score_path, genome_path, args.assembly)
             print()
             print(
                 f"==== Contents of {sscore_path.name} for sample {sample_id} / {pgs_id} ===="
@@ -393,9 +294,9 @@ def orchestrate(args: argparse.Namespace) -> None:
                 print()
             print("==== End of", sscore_path.name, "====\n")
             header, scores = parse_sscore(sscore_path)
-            assert scores, f"No score rows parsed from {sscore_path}"  # noqa: S101
+            assert scores, f"No score rows parsed from {sscore_path}"
             for score in scores:
-                assert 0.0 <= score.missing_pct <= 100.0  # noqa: S101
+                assert 0.0 <= score.missing_pct <= 100.0
                 all_results[sample_id][score.pgs_id] = score
 
     print("\nFinal score summary:\n======================")
@@ -413,12 +314,13 @@ def orchestrate(args: argparse.Namespace) -> None:
             expected_scores <= set(sample_scores)
         ), f"Sample {sample} missing expected scores"
 
-    debug("All assertions passed. Conversion and scoring succeeded.")
+    debug("All assertions passed. Scoring succeeded.")
 
 
 # --------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -432,25 +334,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--assembly",
         default="GRCh37",
         choices=("GRCh37", "GRCh38"),
-        help=(
-            "Genome assembly to use for convert_genome and PGS downloads "
-            "(default: %(default)s)"
-        ),
-    )
-    parser.add_argument(
-        "--reference-url",
-        default=DEFAULT_REFERENCE_URL,
-        help="URL to a ZIP archive containing a GRCh37 FASTA (default: %(default)s)",
+        help="Genome assembly for PGS downloads (default: %(default)s)",
     )
     parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help="Working directory for downloads and intermediate files",
-    )
-    parser.add_argument(
-        "--convert-genome-bin",
-        default=None,
-        help="Path to the convert_genome executable (defaults to PATH lookup)",
     )
     parser.add_argument(
         "--gnomon-bin",
@@ -469,9 +358,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:  # pragma: no cover - convenience
+    except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         sys.exit(130)
-    except Exception as exc:  # pragma: no cover - convenience
+    except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

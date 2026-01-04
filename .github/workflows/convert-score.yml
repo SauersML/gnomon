@@ -30,9 +30,6 @@ jobs:
       - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install convert_genome
-        run: cargo +nightly install convert_genome
-
       - name: Build gnomon in release mode
         run: cargo +nightly build --release
 
