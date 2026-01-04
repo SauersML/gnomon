@@ -77,6 +77,11 @@ pub enum BasisError {
     ConstraintNullspaceNotFound,
 
     #[error(
+        "Knot vector is degenerate: all Greville abscissae are equal, so linear constraint cannot be applied."
+    )]
+    DegenerateKnots,
+
+    #[error(
         "The provided knot vector is invalid: {0}. It must be non-decreasing and contain only finite values."
     )]
     InvalidKnotVector(String),
@@ -2084,6 +2089,162 @@ pub fn apply_weighted_orthogonality_constraint(
     Ok((constrained_basis, transform))
 }
 
+/// Compute Greville abscissae for a B-spline basis.
+///
+/// The Greville abscissa for basis function j is defined as:
+///   G_j = (1/d) × Σ_{k=1}^{d} t_{j+k}
+///
+/// These provide the "center" of support for each basis function and are used
+/// for geometric constraints that don't depend on observed data. A key property
+/// is that a linear function f(x) = a + bx has B-spline coefficients c_j = a + b·G_j,
+/// so constraining coefficients to be orthogonal to [1, G] removes linear functions
+/// from the representable space.
+///
+/// # Arguments
+/// * `knot_vector` - Full knot vector including boundary repetitions
+/// * `degree` - B-spline degree (typically 3 for cubic)
+///
+/// # Returns
+/// Array of Greville abscissae, one per basis function (length = n_knots - degree - 1)
+///
+/// # Errors
+/// Returns error if knot vector is too short or Greville abscissae are degenerate.
+pub fn compute_greville_abscissae(
+    knot_vector: &Array1<f64>,
+    degree: usize,
+) -> Result<Array1<f64>, BasisError> {
+    let n_knots = knot_vector.len();
+    if degree == 0 {
+        // For degree 0, Greville abscissae are knot midpoints
+        let n_basis = n_knots.saturating_sub(1);
+        if n_basis == 0 {
+            return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
+        }
+        let mut g = Array1::<f64>::zeros(n_basis);
+        for j in 0..n_basis {
+            g[j] = 0.5 * (knot_vector[j] + knot_vector[j + 1]);
+        }
+        return Ok(g);
+    }
+
+    // Number of basis functions: k = n_knots - degree - 1
+    if n_knots <= degree + 1 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: n_knots.saturating_sub(degree + 1),
+        });
+    }
+    let n_basis = n_knots - degree - 1;
+
+    let mut g = Array1::<f64>::zeros(n_basis);
+    let d_inv = 1.0 / (degree as f64);
+
+    for j in 0..n_basis {
+        // G_j = (1/d) × Σ_{k=1}^{d} t_{j+k}
+        let mut sum = 0.0;
+        for k in 1..=degree {
+            sum += knot_vector[j + k];
+        }
+        g[j] = sum * d_inv;
+    }
+
+    // Check for degeneracy (all Greville abscissae equal)
+    let g_min = g.iter().cloned().fold(f64::INFINITY, f64::min);
+    let g_max = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if (g_max - g_min) < 1e-10 {
+        return Err(BasisError::DegenerateKnots);
+    }
+
+    Ok(g)
+}
+
+/// Compute the constraint transform Z using Greville abscissae (geometric constraints).
+///
+/// This creates a transform that removes constant and linear trends from spline
+/// coefficients based purely on knot geometry, without reference to observed data.
+/// This makes Z constant w.r.t. model parameters β, ensuring dZ/dβ = 0 exactly,
+/// which enables exact analytic gradients.
+///
+/// # Mathematical Background
+/// For B-splines, a linear function f(x) = a + bx has coefficients c_j = a + b·G_j
+/// where G_j are the Greville abscissae. Therefore, constraining the coefficient
+/// vector θ to satisfy:
+///   - Σ θ_j = 0  (orthogonal to constants)
+///   - Σ θ_j·G_j = 0  (orthogonal to linear in Greville coordinates)
+/// removes the ability to represent any linear function.
+///
+/// # Arguments
+/// * `knot_vector` - Full knot vector
+/// * `degree` - B-spline degree
+/// * `penalty_order` - Order of difference penalty (typically 2)
+///
+/// # Returns
+/// Tuple of (transform Z, projected_penalty Z'SZ) where:
+/// - Z: k × (k-2) matrix mapping raw coefficients to constrained space
+/// - S_constrained: (k-2) × (k-2) projected second-difference penalty
+pub fn compute_geometric_constraint_transform(
+    knot_vector: &Array1<f64>,
+    degree: usize,
+    penalty_order: usize,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    // 1. Compute Greville abscissae
+    let g = compute_greville_abscissae(knot_vector, degree)?;
+    let k = g.len();
+
+    if k < 3 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+    }
+
+    // 2. Build constraint matrix C_geom (2 × k)
+    // Row 0: all ones (intercept constraint)
+    // Row 1: Greville abscissae (linear constraint)
+    let mut c_geom = Array2::<f64>::zeros((2, k));
+    for j in 0..k {
+        c_geom[[0, j]] = 1.0;
+        c_geom[[1, j]] = g[j];
+    }
+
+    // 3. Standardize linear row for numerical conditioning
+    let g_mean = g.mean().unwrap_or(0.0);
+    let g_var = g.iter().map(|&x| (x - g_mean).powi(2)).sum::<f64>() / (k as f64);
+    let g_std = g_var.sqrt().max(1e-10);
+    for j in 0..k {
+        c_geom[[1, j]] = (c_geom[[1, j]] - g_mean) / g_std;
+    }
+
+    // 4. SVD to find nullspace of C_geom
+    // C_geom is 2×k, so we want right singular vectors corresponding to zero singular values
+    use crate::calibrate::faer_ndarray::FaerSvd;
+    let (_, singular_values, vt_opt) = c_geom.svd(false, true).map_err(BasisError::LinalgError)?;
+    let vt = match vt_opt {
+        Some(vt) => vt,
+        None => return Err(BasisError::ConstraintNullspaceNotFound),
+    };
+
+    // 5. Identify nullspace columns (singular values ≈ 0)
+    let max_sigma = singular_values.iter().fold(0.0_f64, |a, &b| a.max(b));
+    let tol = (k as f64) * 1e-12 * max_sigma.max(1.0);
+    let rank = singular_values.iter().filter(|&&s| s > tol).count();
+
+    if rank >= k {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    // 6. Z = columns of V corresponding to near-zero singular values
+    // V = Vt^T, and we want columns rank..k
+    let v = vt.t();
+    let z = v.slice(s![.., rank..]).to_owned();
+
+    if z.ncols() == 0 {
+        return Err(BasisError::ConstraintNullspaceNotFound);
+    }
+
+    // 7. Build raw penalty and project: S_c = Z' S Z
+    let s_raw = create_difference_penalty_matrix(k, penalty_order)?;
+    let s_constrained = z.t().dot(&s_raw).dot(&z);
+
+    Ok((z, s_constrained))
+}
+
 /// Decomposes a penalty matrix S into its null-space and whitened range-space components.
 /// This is used for functional ANOVA decomposition in GAMs to separate unpenalized
 /// and penalized subspaces of a basis.
@@ -3242,6 +3403,103 @@ mod tests {
                 d2[i],
                 fd
             );
+        }
+    }
+
+    #[test]
+    fn test_greville_abscissae_cubic() {
+        // Uniform cubic spline on [0, 1] with 1 internal knot at 0.5
+        // Knot vector: [0, 0, 0, 0, 0.5, 1, 1, 1, 1] (9 knots)
+        // Number of basis functions: 9 - 3 - 1 = 5
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3;
+
+        let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville abscissae");
+
+        // For degree 3: G_j = (t_{j+1} + t_{j+2} + t_{j+3}) / 3
+        // G_0 = (0 + 0 + 0) / 3 = 0
+        // G_1 = (0 + 0 + 0.5) / 3 = 0.1667
+        // G_2 = (0 + 0.5 + 1.0) / 3 = 0.5
+        // G_3 = (0.5 + 1.0 + 1.0) / 3 = 0.8333
+        // G_4 = (1.0 + 1.0 + 1.0) / 3 = 1.0
+        assert_eq!(g.len(), 5);
+        assert_abs_diff_eq!(g[0], 0.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(g[1], 0.5 / 3.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(g[2], 0.5, epsilon = 1e-10);
+        assert_abs_diff_eq!(g[3], 2.5 / 3.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(g[4], 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_geometric_constraint_transform_orthogonality() {
+        // Test that the geometric constraint transform makes coefficients orthogonal
+        // to constant and linear (Greville) vectors.
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
+        let degree = 3;
+
+        let (z, s_constrained) =
+            compute_geometric_constraint_transform(&knots, degree, 2).expect("should compute transform");
+        // Verify s_constrained has expected dimensions
+        assert!(s_constrained.nrows() > 0, "s_constrained should not be empty");
+
+        let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville");
+        let k = g.len();
+        let ones = Array1::<f64>::ones(k);
+
+        // Z^T * 1 should be approximately zero (orthogonal to constants)
+        let z_t_ones = z.t().dot(&ones);
+        for i in 0..z_t_ones.len() {
+            assert!(
+                z_t_ones[i].abs() < 1e-10,
+                "Z not orthogonal to constants: Z'*1[{}] = {}",
+                i,
+                z_t_ones[i]
+            );
+        }
+
+        // Z^T * G should be approximately zero (orthogonal to linear in Greville coords)
+        let z_t_g = z.t().dot(&g);
+        for i in 0..z_t_g.len() {
+            assert!(
+                z_t_g[i].abs() < 1e-10,
+                "Z not orthogonal to Greville: Z'*G[{}] = {}",
+                i,
+                z_t_g[i]
+            );
+        }
+
+        // Transform should reduce dimension by 2 (removing constant and linear)
+        assert_eq!(z.ncols(), k - 2, "Z should have k-2 columns");
+        assert_eq!(z.nrows(), k, "Z should have k rows");
+    }
+
+    #[test]
+    fn test_geometric_constraint_transform_dimensions() {
+        // Test various knot configurations
+        for n_internal in [3, 5, 10, 20] {
+            let degree = 3;
+            let n_knots = n_internal + 2 * (degree + 1);
+            let mut knots = Array1::<f64>::zeros(n_knots);
+
+            // Build clamped uniform knot vector
+            for i in 0..=degree {
+                knots[i] = 0.0;
+                knots[n_knots - 1 - i] = 1.0;
+            }
+            for i in 0..n_internal {
+                knots[degree + 1 + i] = (i + 1) as f64 / (n_internal + 1) as f64;
+            }
+
+            let (z, s_c) = compute_geometric_constraint_transform(&knots, degree, 2)
+                .expect("should compute transform");
+
+            let n_basis = n_knots - degree - 1;
+            let n_constrained = n_basis - 2;
+
+            assert_eq!(z.nrows(), n_basis, "Z rows should equal n_basis");
+            assert_eq!(z.ncols(), n_constrained, "Z cols should equal n_basis - 2");
+            assert_eq!(s_c.nrows(), n_constrained, "S_c should be n_constrained x n_constrained");
+            assert_eq!(s_c.ncols(), n_constrained);
         }
     }
 }

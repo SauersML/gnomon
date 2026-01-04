@@ -40,24 +40,23 @@ use wolfe_bfgs::BfgsSolution;
 // and g'(u) = 1 (the derivative code explicitly returns 1.0 at boundaries).
 // This is consistent between training and HMC.
 
-/// Ensure a matrix is positive definite by adding a minimal conditional ridge.
-/// Only adds regularization if Cholesky fails, avoiding bias on well-conditioned matrices.
-/// Returns the ridge value added (0.0 if matrix was already positive definite).
+/// Fixed stabilization ridge for positive definiteness.
+/// Using a CONSTANT ridge makes V(ρ) smooth and the envelope-theorem gradient valid.
+/// A ρ-dependent ridge (e.g., scaled by diagonal) creates implicit derivative terms
+/// that the analytic gradient misses, causing FD/analytic mismatch.
+const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
+
+/// Ensure a matrix is positive definite by always adding a fixed ridge.
+/// This approach (matching pirls.rs) ensures:
+/// 1. V(ρ) is smooth everywhere (no discontinuity at PD boundary)
+/// 2. The standard envelope-theorem gradient is valid
+/// 3. FD and analytic gradients agree
 fn ensure_positive_definite_joint(mat: &mut Array2<f64>) -> f64 {
-    use crate::calibrate::faer_ndarray::FaerCholesky;
-    use faer::Side;
-
-    if mat.cholesky(Side::Lower).is_ok() {
-        return 0.0; // Already positive definite, no regularization needed
-    }
-
-    // Matrix needs regularization - use diagonal-scaled nugget
-    let diag_scale = mat.diag().iter().map(|&d| d.abs()).fold(0.0_f64, f64::max).max(1.0);
-    let nugget = 1e-8 * diag_scale;
+    // Always add fixed ridge for smoothness and gradient consistency
     for i in 0..mat.nrows() {
-        mat[[i, i]] += nugget;
+        mat[[i, i]] += FIXED_STABILIZATION_RIDGE;
     }
-    nugget
+    FIXED_STABILIZATION_RIDGE
 }
 
 
@@ -2053,7 +2052,8 @@ impl<'a> JointRemlState<'a> {
             u_truncated: Array2::zeros((p_base, p_base)),
         });
 
-        let link_det1 = if p_link > 0 && link_penalty.nrows() == p_link {
+        // Eigenvalues of link penalty for det_term computation
+        let link_eigs: Vec<f64> = if p_link > 0 && link_penalty.nrows() == p_link {
             use crate::calibrate::faer_ndarray::FaerEigh;
             let (eigs, _) = link_penalty
                 .clone()
@@ -2061,10 +2061,37 @@ impl<'a> JointRemlState<'a> {
                 .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
             let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-            let rank = eigs.iter().filter(|&&ev| ev > tol).count() as f64;
-            rank
+            eigs.iter().cloned().filter(|&ev| ev > tol).collect()
         } else {
-            0.0
+            vec![]
+        };
+        let link_det1_no_ridge = link_eigs.len() as f64;
+
+        // Eigendecomposition of combined base penalty for ridge-aware det_term
+        let (base_eigs, base_eigvecs): (Vec<f64>, Array2<f64>) = if state.ridge_used > 0.0 && base_reparam.s_transformed.nrows() > 0 {
+            use crate::calibrate::faer_ndarray::FaerEigh;
+            let (eigs, vecs) = base_reparam.s_transformed
+                .clone()
+                .eigh(Side::Lower)
+                .unwrap_or_else(|_| (Array1::zeros(p_base), Array2::eye(p_base)));
+            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+            let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
+            // Filter eigenvectors to match positive eigenvalues
+            let n_pos = positive.len();
+            let pos_indices: Vec<usize> = eigs.iter().enumerate()
+                .filter(|&(_, ev)| *ev > tol)
+                .map(|(i, _)| i)
+                .collect();
+            let mut pos_vecs = Array2::zeros((p_base, n_pos));
+            for (j, &idx) in pos_indices.iter().enumerate() {
+                for i in 0..p_base {
+                    pos_vecs[[i, j]] = vecs[[i, idx]];
+                }
+            }
+            (positive, pos_vecs)
+        } else {
+            (vec![], Array2::zeros((0, 0)))
         };
 
         let mut dot_u = Array1::<f64>::zeros(n);
@@ -2357,10 +2384,47 @@ impl<'a> JointRemlState<'a> {
                 0.0
             };
 
+            // Ridge-aware det_term: when δ > 0, d/dλ_k[log|S_λ + δI|] = tr((S_λ + δI)^{-1} S_k)
+            // Without ridge: d/dλ_k[log|S_λ|_+] = rank(S_k)
             let det_term = if is_link {
-                0.5 * link_det1
+                if state.ridge_used > 0.0 && !link_eigs.is_empty() {
+                    // Link: eigenvalues of S_link are link_eigs, so eigenvalues of λ*S_link + δI are λ*σ + δ
+                    // d/dλ[log|λ*S + δI|] = Σ σ_i/(λ*σ_i + δ)
+                    let sum: f64 = link_eigs.iter()
+                        .map(|&sigma| sigma / (lambda_link * sigma + state.ridge_used))
+                        .sum();
+                    0.5 * lambda_k * sum
+                } else {
+                    0.5 * link_det1_no_ridge
+                }
             } else if k < base_reparam.det1.len() {
-                0.5 * base_reparam.det1[k]
+                if state.ridge_used > 0.0 && !base_eigs.is_empty() && base_eigvecs.ncols() > 0 {
+                    // Base: need tr((S_λ + δI)^{-1} S_k) = Σ (u_i^T S_k u_i) / (σ_i + δ)
+                    // where σ_i are eigenvalues of S_λ and u_i are eigenvectors
+                    if let Some(s_k) = state.s_base.get(k) {
+                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
+                            let mut sum = 0.0;
+                            for (j, &sigma) in base_eigs.iter().enumerate() {
+                                // u_j is the j-th column of base_eigvecs
+                                let mut u_j = Array1::zeros(p_base);
+                                for i in 0..p_base {
+                                    u_j[i] = base_eigvecs[[i, j]];
+                                }
+                                // Compute u_j^T S_k u_j
+                                let s_k_u = s_k.dot(&u_j);
+                                let quadratic = u_j.dot(&s_k_u);
+                                sum += quadratic / (sigma + state.ridge_used);
+                            }
+                            0.5 * lambda_k * sum
+                        } else {
+                            0.5 * base_reparam.det1[k]
+                        }
+                    } else {
+                        0.5 * base_reparam.det1[k]
+                    }
+                } else {
+                    0.5 * base_reparam.det1[k]
+                }
             } else {
                 0.0
             };
@@ -3280,6 +3344,8 @@ mod tests {
                     state.knot_vector = None;
                     state.link_transform = None;
                     state.s_link_constrained = None;
+                    state.geometric_link_transform = None;
+                    state.geometric_s_link_constrained = None;
                     let u = state.base_linear_predictor();
                     if state.build_link_basis(&u).is_err() {
                         last_err = Some("link basis failed".to_string());
