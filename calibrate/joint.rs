@@ -2470,7 +2470,7 @@ impl<'a> JointRemlState<'a> {
             };
 
             let grad_laml = penalty_term - det_term + 0.5 * trace;
-            grad[k] = -grad_laml;
+            grad[k] = grad_laml;
         }
 
         println!("Analytic Grad: {:?}", grad);

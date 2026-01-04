@@ -2575,7 +2575,7 @@ mod internal {
         // No fallback - only modern approach is supported now
 
         // Stack all column views into the final design matrix
-        let col_views: Vec<_> = owned_cols.iter().map(Array1::view).collect();
+        let col_views: Vec<_> = owned_cols.iter().map(|col| col.view()).collect();
         ndarray::stack(Axis(1), &col_views).map_err(|_| ModelError::InternalStackingError)
     }
 

@@ -84,7 +84,7 @@ debug = 1
 strip = false
 
 [dependencies.mini-mcmc]
-git = "https://github.com/SauersML/mini-mcmc"
+git = "https://github.com/SauersML/general-mcmc"
 branch = "main"
 default-features = false
 

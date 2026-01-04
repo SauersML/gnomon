@@ -2,6 +2,9 @@ use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagMut, DiagRef};
 use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
 use faer::linalg::solvers::{self, Solve};
+pub use faer::linalg::solvers::{
+    Lblt as FaerLblt, Ldlt as FaerLdlt, Llt as FaerLlt, Solve as FaerSolve,
+};
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::{Auto, Mat, MatMut, MatRef, Par, Side, Spec, get_global_parallelism};
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};

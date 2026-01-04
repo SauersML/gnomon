@@ -230,8 +230,14 @@ mod internal {
                 });
             }
 
-            // Now convert to ndarray
-            let arr = phenotype_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            // Now convert to ndarray without relying on polars' ndarray feature
+            let arr = Array1::from_vec(
+                phenotype_casted
+                    .rechunk()
+                    .f64()?
+                    .into_no_null_iter()
+                    .collect(),
+            );
             validate_is_finite(&arr, "phenotype")?;
             Some(arr)
         } else {
@@ -266,8 +272,14 @@ mod internal {
             });
         }
 
-        // Now convert to ndarray
-        let pgs = score_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+        // Now convert to ndarray without relying on polars' ndarray feature
+        let pgs = Array1::from_vec(
+            score_casted
+                .rechunk()
+                .f64()?
+                .into_no_null_iter()
+                .collect(),
+        );
         validate_is_finite(&pgs, "score")?;
 
         // Process sex column
@@ -295,7 +307,13 @@ mod internal {
             });
         }
 
-        let sex = sex_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+        let sex = Array1::from_vec(
+            sex_casted
+                .rechunk()
+                .f64()?
+                .into_no_null_iter()
+                .collect(),
+        );
         validate_is_finite(&sex, "sex")?;
 
         // Process PC columns efficiently
@@ -327,8 +345,14 @@ mod internal {
                 });
             }
 
-            // Now convert to ndarray
-            let arr = pc_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            // Now convert to ndarray without relying on polars' ndarray feature
+            let arr = Array1::from_vec(
+                pc_casted
+                    .rechunk()
+                    .f64()?
+                    .into_no_null_iter()
+                    .collect(),
+            );
             validate_is_finite(&arr, pc_name)?;
             pc_arrays.push(arr);
         }
@@ -389,8 +413,14 @@ mod internal {
                 });
             }
 
-            // Convert to ndarray
-            let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+            // Convert to ndarray without relying on polars' ndarray feature
+            let weights_array = Array1::from_vec(
+                weights_casted
+                    .rechunk()
+                    .f64()?
+                    .into_no_null_iter()
+                    .collect(),
+            );
             validate_is_finite(&weights_array, "weights")?;
 
             // Validate that all weights are non-negative
@@ -432,7 +462,13 @@ mod internal {
                     });
                 }
 
-                let weights_array = weights_casted.rechunk().f64()?.to_ndarray()?.to_owned();
+                let weights_array = Array1::from_vec(
+                    weights_casted
+                        .rechunk()
+                        .f64()?
+                        .into_no_null_iter()
+                        .collect(),
+                );
                 validate_is_finite(&weights_array, "weights")?;
                 weights_array
             } else {

@@ -16,6 +16,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use faer::Side;
+use faer::linalg::solvers::Solve;
 use gnomon::calibrate::calibrator::FirthSpec;
 use gnomon::calibrate::basis::{
     apply_sum_to_zero_constraint, create_basis, create_difference_penalty_matrix, BasisOptions,
@@ -1602,12 +1603,12 @@ fn isolation_missing_term_hypothesis() {
     let rs_list = compute_penalty_square_roots(&s_list).unwrap();
     let balanced = create_difference_penalty_matrix(p, 1).unwrap();
     let layout = ModelLayout::external(p, s_list.len());
-    let config = ModelConfig::default(); 
-    // Note: ModelConfig default has firth=true? No, default is usually false.
-    // But fit_model_for_fixed_rho takes `ModelConfig` and checks `firth_bias_reduction`.
-    // We must enable it.
-    let mut config = config;
-    config.firth_bias_reduction = true;
+    let config = ModelConfig::external(
+        opts.link,
+        opts.tol,
+        opts.max_iter,
+        true,
+    );
 
     use gnomon::calibrate::types::LogSmoothingParamsView;
     let rho_view = LogSmoothingParamsView::new(rho.view());
@@ -1619,7 +1620,7 @@ fn isolation_missing_term_hypothesis() {
         y.view(),
         w.view(),
         &rs_list,
-        Some(balanced),
+        Some(&balanced),
         None,
         &layout,
         &config,
@@ -1627,7 +1628,7 @@ fn isolation_missing_term_hypothesis() {
         None
     ).expect("Fit failed");
     
-    let beta = fit.beta;
+    let beta = fit.beta_transformed.clone();
     let mu = fit.solve_mu; 
     
     // 3. Compute H_phi(rho)
@@ -1707,4 +1708,3 @@ fn isolation_missing_term_hypothesis() {
         println!("✓ Hypothesis Verified: Missing term explains the discrepancy.");
     }
 }
-
