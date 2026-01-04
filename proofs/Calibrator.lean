@@ -497,6 +497,56 @@ lemma orthogonal_features
 
 /-! ### L² Orthogonality Characterization (Classical Derivation) -/
 
+/-- If a quadratic `a*ε + b*ε²` is non-negative for all `ε`, then `a = 0`.
+    This is a key lemma for proving gradient conditions at optima.
+
+    The proof considers two cases:
+    - If b = 0: a linear function a*ε can't be ≥ 0 for all ε unless a = 0
+    - If b ≠ 0: the quadratic either opens upward (b > 0) with negative minimum,
+      or opens downward (b < 0) and becomes negative for large |ε| -/
+lemma linear_coeff_zero_of_quadratic_nonneg (a b : ℝ)
+    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
+  by_contra ha_ne
+  by_cases hb : b = 0
+  · -- Case b = 0: then a*ε ≥ 0 for all ε, impossible if a ≠ 0
+    by_cases ha_pos : 0 < a
+    · have h_neg1 := h (-1)
+      simp only [hb, zero_mul, add_zero, mul_neg, mul_one] at h_neg1
+      linarith
+    · push_neg at ha_pos
+      have ha_neg : a < 0 := lt_of_le_of_ne ha_pos ha_ne
+      have h_1 := h 1
+      simp only [hb, zero_mul, add_zero, mul_one] at h_1
+      linarith
+  · -- Case b ≠ 0: consider the vertex of the parabola
+    by_cases hb_pos : 0 < b
+    · -- b > 0: minimum at ε = -a/(2b) gives value -a²/(4b) < 0
+      let ε := -a / (2 * b)
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = -a^2 / (4 * b) := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : -a^2 / (4 * b) < 0 := by
+        apply div_neg_of_neg_of_pos
+        · linarith
+        · linarith
+      linarith
+    · -- b < 0: quadratic opens downward, eventually negative
+      push_neg at hb_pos
+      have hb_neg : b < 0 := lt_of_le_of_ne hb_pos hb
+      let ε := -2 * a / b
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = 2 * a^2 / b := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : 2 * a^2 / b < 0 := by
+        apply div_neg_of_pos_of_neg
+        · linarith
+        · exact hb_neg
+      linarith
+
 /-- **Standalone Lemma**: Optimal coefficients for Raw Model on Additive DGP.
     Given Y = P + β*C, independence, and standardized moments:
     The raw model (projecting onto span{1, P}) has coefficients a=0, b=1.
@@ -757,22 +807,31 @@ lemma rawOptimal_implies_orthogonality
     -- Therefore E[residual] = 0
     have h1 : ∫ pc, residual pc ∂μ = 0 := by
       -- The formal proof constructs competitor models and uses h_opt.is_optimal
-      -- to derive ε² - 2ε·E[residual] ≥ 0 for all ε, which forces E[residual] = 0.
-      -- This is a standard "first-order necessary condition" from optimization theory.
-      admit -- Quadratic perturbation: ε² - 2ε·E[resid] ≥ 0 ∀ε ⟹ E[resid] = 0
+      -- to derive -2ε·E[residual] + ε² ≥ 0 for all ε, which forces E[residual] = 0.
+      -- Step 1: Establish the quadratic inequality from optimality
+      -- (Constructing competitor model with intercept a + ε and using h_opt.is_optimal)
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 ≥ 0 := by
+        sorry -- Model construction: perturb intercept, expand E[(resid - ε)²]
+      -- Step 2: Apply the quadratic perturbation lemma
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
+      linarith
     simpa [hres_def] using h1
 
   · -- Orthogonality with P: E[residual · P] = 0
     -- **Quadratic Perturbation Proof**:
     -- L(ε) = E[(residual - εP)²] = E[residual²] - 2ε·E[residual·P] + ε²·E[P²]
-    -- Optimality: 0 ≤ -2ε·E[residual·P] + ε²·E[P²] = ε(-2·E[residual·P] + ε·E[P²])
-    -- For small |ε|, the sign is determined by -2·E[residual·P]
-    -- Testing ε > 0: -2·E[residual·P] ≥ 0 → E[residual·P] ≤ 0
-    -- Testing ε < 0: -2·E[residual·P] ≤ 0 → E[residual·P] ≥ 0
-    -- Therefore E[residual·P] = 0
+    -- Optimality: 0 ≤ -2ε·E[residual·P] + ε²·E[P²]
     have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
-      -- Same construction with slope perturbation b → b + ε
-      sorry -- Quadratic perturbation: ε(-2E[resid·P] + εE[P²]) ≥ 0 ∀ε ⟹ E[resid·P] = 0
+      -- Step 1: Establish the quadratic inequality from optimality
+      -- (Constructing competitor model with slope b + ε and using h_opt.is_optimal)
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε +
+          (∫ pc, pc.1^2 ∂μ) * ε^2 ≥ 0 := by
+        sorry -- Model construction: perturb slope, expand E[(resid - ε·P)²]
+      -- Step 2: Apply the quadratic perturbation lemma
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
+      linarith
     simpa [hres_def] using h2
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
@@ -3155,56 +3214,6 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   rw [one_div_lt_one_div hx_pos hy_pos]
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
-
-/-- If a quadratic `a*ε + b*ε²` is non-negative for all `ε`, then `a = 0`.
-    This is a key lemma for proving gradient conditions at optima.
-
-    The proof considers two cases:
-    - If b = 0: a linear function a*ε can't be ≥ 0 for all ε unless a = 0
-    - If b ≠ 0: the quadratic either opens upward (b > 0) with negative minimum,
-      or opens downward (b < 0) and becomes negative for large |ε| -/
-lemma linear_coeff_zero_of_quadratic_nonneg (a b : ℝ)
-    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
-  by_contra ha_ne
-  by_cases hb : b = 0
-  · -- Case b = 0: then a*ε ≥ 0 for all ε, impossible if a ≠ 0
-    by_cases ha_pos : 0 < a
-    · have h_neg1 := h (-1)
-      simp only [hb, zero_mul, add_zero, mul_neg, mul_one] at h_neg1
-      linarith
-    · push_neg at ha_pos
-      have ha_neg : a < 0 := lt_of_le_of_ne ha_pos ha_ne
-      have h_1 := h 1
-      simp only [hb, zero_mul, add_zero, mul_one] at h_1
-      linarith
-  · -- Case b ≠ 0: consider the vertex of the parabola
-    by_cases hb_pos : 0 < b
-    · -- b > 0: minimum at ε = -a/(2b) gives value -a²/(4b) < 0
-      let ε := -a / (2 * b)
-      have hε := h ε
-      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
-      have eval : a * ε + b * ε^2 = -a^2 / (4 * b) := by
-        simp only [ε]; field_simp; ring
-      rw [eval] at hε
-      have : -a^2 / (4 * b) < 0 := by
-        apply div_neg_of_neg_of_pos
-        · linarith
-        · linarith
-      linarith
-    · -- b < 0: quadratic opens downward, eventually negative
-      push_neg at hb_pos
-      have hb_neg : b < 0 := lt_of_le_of_ne hb_pos hb
-      let ε := -2 * a / b
-      have hε := h ε
-      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
-      have eval : a * ε + b * ε^2 = 2 * a^2 / b := by
-        simp only [ε]; field_simp; ring
-      rw [eval] at hε
-      have : 2 * a^2 / b < 0 := by
-        apply div_neg_of_pos_of_neg
-        · linarith
-        · exact hb_neg
-      linarith
 
 /-- **Jensen's Gap for Logistic Regression**
 
