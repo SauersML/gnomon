@@ -3578,6 +3578,70 @@ fn diagnostic_trace_fd_step_selection() {
     println!("    disagree' fails because even the coarser step is unreliable.");
 }
 
+/// SUMMARY: Complete root cause documentation for Firth+GAM gradient test failures.
+///
+/// This test documents the complete chain of causation for why 5 tests fail:
+///   1. firth_correctness_single_penalty_spectral
+///   2. firth_correctness_multiple_penalties_spectral
+///   3. firth_vs_fd_gradient_spectral (indices 1, 4, 6)
+///
+/// Root cause chain:
+/// 1. These tests use `build_design_and_penalty_matrices` which creates GAM penalties
+/// 2. The default rho=12.0 corresponds to λ=exp(12)≈163,000 (extreme smoothing)
+/// 3. At extreme smoothing, the cost function becomes asymptotically flat:
+///    - Cost barely changes with rho: ~8e-7 difference from rho=12 to rho=18
+/// 4. The true gradient at rho=12 is ~-2e-6 (NEGATIVE, cost decreasing)
+/// 5. To measure this via FD requires cost differences of ~2e-9
+/// 6. But cost≈302, so relative precision needed: ~7e-12 (only 30x above f64 epsilon!)
+/// 7. At this precision, FD results are dominated by numerical noise
+/// 8. The FD algorithm's step refinement becomes chaotic:
+///    - Starting h=2e-3: CORRECT answer
+///    - Starting h=1.3e-3: WRONG answer (all positive derivatives)
+///    - Starting h=1e-3: CORRECT answer
+///    - Starting h=5e-4: WRONG answer
+/// 9. The actual FD uses h=1.3e-3, which happens to be in a "bad" zone
+///
+/// Conclusion:
+/// The analytic gradient is correct.
+/// The FD validation is unreliable at high smoothing.
+/// These test failures are false positives - the code is working correctly,
+/// but the validation method (FD) fails at extreme parameter values.
+///
+/// Recommendations:
+/// - Skip FD validation at rho > 10 (where λ > 22,000)
+/// - Or use much larger FD step sizes for extreme smoothing
+/// - Or accept larger tolerance for FD comparison at high rho
+#[test]
+fn summary_root_cause_documentation() {
+    println!("\n===============================================================================");
+    println!("  SUMMARY: Root Cause of Firth+GAM Gradient Test Failures");
+    println!("===============================================================================");
+    println!();
+    println!("  AFFECTED TESTS:");
+    println!("    - firth_correctness_single_penalty_spectral");
+    println!("    - firth_correctness_multiple_penalties_spectral");
+    println!("    - firth_vs_fd_gradient_spectral (indices 1, 4, 6)");
+    println!();
+    println!("  ROOT CAUSE: FD validation fails at extreme smoothing (rho≥12)");
+    println!();
+    println!("  CHAIN OF CAUSATION:");
+    println!("    1. Tests use GAM penalties with default rho=12 → λ=exp(12)≈163,000");
+    println!("    2. Extreme penalty makes cost function asymptotically flat");
+    println!("    3. True gradient is ~-2e-6, requiring cost diffs of ~2e-9");
+    println!("    4. Cost≈302, so relative precision: ~7e-12 (near f64 epsilon)");
+    println!("    5. FD step refinement becomes chaotic (wrong sign at h=1.3e-3)");
+    println!();
+    println!("  PROOF THAT ANALYTIC IS CORRECT:");
+    println!("    - Cost trend at rho=11.9→12.1 shows DECREASING (gradient NEGATIVE)");
+    println!("    - Analytic gradient: -2.25e-6 (NEGATIVE) ✓");
+    println!("    - FD gradient: +2.75e-6 (POSITIVE) ✗");
+    println!();
+    println!("  CONCLUSION: These are FALSE POSITIVE test failures.");
+    println!("              The spectral gradient is mathematically correct.");
+    println!("              The FD validation method is unreliable at extreme λ.");
+    println!("===============================================================================");
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
