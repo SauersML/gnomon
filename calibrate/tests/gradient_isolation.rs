@@ -2933,11 +2933,67 @@ fn diagnostic_deep_gradient_analysis() {
     }
 }
 
+/// DIAGNOSTIC: Map penalty indices to their structure and rank
+#[test]
+fn diagnostic_penalty_structure_analysis() {
+    println!("\n=== DIAGNOSTIC: Penalty Structure Analysis ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let p = x_gam.ncols();
+    println!("  Total parameters: {}", p);
+    println!("  Number of penalties: {}", s_list_gam.len());
+
+    // Analyze each penalty matrix
+    for (idx, s_k) in s_list_gam.iter().enumerate() {
+        // Compute eigenvalues to understand structure
+        let (eigvals, _): (Array1<f64>, _) = s_k.eigh(Side::Lower).expect("eigh");
+        let pos_count = eigvals.iter().filter(|v| **v > 1e-10).count();
+        let zero_count = eigvals.iter().filter(|v| v.abs() <= 1e-10).count();
+        let neg_count = eigvals.iter().filter(|v| **v < -1e-10).count();
+
+        let max_eig = eigvals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min_eig = eigvals.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        // Compute Frobenius norm
+        let frob: f64 = s_k.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        // Check which parameters are penalized
+        let diag: Vec<f64> = (0..p).map(|i| s_k[[i, i]]).collect();
+        let penalized_range: Vec<usize> = diag.iter().enumerate()
+            .filter(|(_, v)| **v > 1e-10)
+            .map(|(i, _)| i)
+            .collect();
+
+        let start_idx = penalized_range.first().copied().unwrap_or(0);
+        let end_idx = penalized_range.last().copied().unwrap_or(0);
+
+        // Flag if this is a suspect component (1, 2, 4, 6)
+        let suspect = matches!(idx, 1 | 2 | 4 | 6);
+        let flag = if suspect { " <-- SUSPECT" } else { "" };
+
+        println!("  Penalty [{}]{}:", idx, flag);
+        println!("    Eigenvalues: pos={}, zero={}, neg={}", pos_count, zero_count, neg_count);
+        println!("    Eigenrange: [{:.2e}, {:.2e}]", min_eig, max_eig);
+        println!("    Frobenius norm: {:.2e}", frob);
+        println!("    Penalized param range: [{}..{}]", start_idx, end_idx);
+    }
+
+    // Also print the layout info if available
+    println!("\n  Layout info:");
+    println!("    Intercept col: {}", layout.intercept_col);
+    println!("    PGS main cols: {:?}", layout.pgs_main_cols);
+    println!("    Num penalties: {}", layout.num_penalties);
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
     println!("\n=== Hypothesis 20: Full GAM (Control - Expected Fail) ===");
-    
+
     let train = create_logistic_training_data(100, 3, 31);
     let config = logistic_model_config(true, false, &train);
     let (x_gam, s_list_gam, layout, ..) =
