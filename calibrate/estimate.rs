@@ -51,7 +51,7 @@ use crate::calibrate::visualizer;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
-    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
+    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError,
 };
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
@@ -4243,11 +4243,10 @@ pub mod internal {
         /// The exact H_total matrix used for LAML cost computation.
         /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
         h_total: Arc<Array2<f64>>,
-        /// The Cholesky factorization of h_total. Gradient MUST use this
-        /// exact factor to ensure mathematical consistency with cost.
-        h_total_factor: Arc<FaerFactor>,
-        /// Precomputed log|h_total| for the cost function.
-        /// Stored because faer factors don't expose the L matrix directly.
+        /// The pseudoinverse of H_total, constructed explicitly from valid eigenvalues only.
+        /// This ensures the gradient sees the exact same spectral truncation as the cost function.
+        h_pseudoinverse: Arc<Array2<f64>>,
+        /// The log determinant, computed by summing log(lambda) for lambda > epsilon.
         h_total_log_det: f64,
     }
 
@@ -4971,33 +4970,63 @@ pub mod internal {
                 h_eff.clone()
             };
             
-            // Compute log|h_total| using ndarray Cholesky BEFORE creating faer factor.
-            // This gives us the log-determinant in a portable way.
-            use crate::calibrate::faer_ndarray::FaerCholesky;
-            let h_total_log_det = match h_total.clone().cholesky(Side::Lower) {
-                Ok(chol) => 2.0 * chol.diag().mapv(f64::ln).sum(),
-                Err(_) => {
-                    // Fallback: use eigenvalue approach for potentially indefinite matrix
-                    let eigs = h_total.clone().eigh(Side::Lower)
-                        .ok()
-                        .map(|(vals, _)| vals.iter().filter(|&&v| v > 1e-12).map(|v| v.ln()).sum())
-                        .unwrap_or(f64::NEG_INFINITY);
-                    eigs
+            // Perform Eigendecomposition to ensure spectral consistency between Cost and Gradient.
+            // Cost = sum(log(lambda)) for lambda > epsilon
+            // Gradient = tr(H_plus_dagger * dH)
+            
+            // We use Faer's self-adjoint eigendecomposition
+            let (eigvals, eigvecs) = match h_total.clone().eigh(Side::Lower) {
+                Ok((vals, vecs)) => (vals, vecs),
+                Err(e) => {
+                    // Fallback if eigendecomposition fails (rare): return error
+                    return Err(EstimationError::EigendecompositionFailed(e));
                 }
             };
             
-            // Factorize h_total ONCE. This is the "Hessian Passport" that gradient MUST use.
-            let h_total_factor = {
-                let h_view = FaerArrayView::new(&h_total);
-                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                    Arc::new(FaerFactor::Llt(f))
-                } else if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                    Arc::new(FaerFactor::Ldlt(f))
-                } else {
-                    // Last resort: use the RidgePlanner
-                    self.get_faer_factor(rho, &h_total)
+            // Truncation logic:
+            // Filter eigenvalues: keep only those significantly positive.
+            // This threshold determines both the cost function domain and the gradient projection.
+            // 1e-12 is consistent with the previous fallback logic.
+            const EIG_THRESHOLD: f64 = 1e-12;
+            
+            // 1. Compute Cost (Log Determinant)
+            // Sum log(lambda) only for valid eigenvalues.
+            let h_total_log_det : f64 = eigvals.iter()
+                .filter(|&&v| v > EIG_THRESHOLD)
+                .map(|v| v.ln())
+                .sum();
+                
+            if !h_total_log_det.is_finite() {
+                 return Err(EstimationError::ModelIsIllConditioned {
+                     condition_number: f64::INFINITY
+                 });
+            }
+            
+            // 2. Compute Pseudoinverse H_plus_dagger
+            // H+ = U * diag(1/lambda_valid ... 0) * U^T
+            // Calculation: sum_{k in valid} (1/lambda_k) * v_k * v_k^T
+            let dim = h_total.nrows();
+            let mut h_pseudoinverse = Array2::<f64>::zeros((dim, dim));
+            
+            for (k, &val) in eigvals.iter().enumerate() {
+                if val > EIG_THRESHOLD {
+                    let inv_lambda = 1.0 / val;
+                    let vec_k = eigvecs.column(k);
+                    // Add (1/lambda) * vec * vec^T to accumulator
+                    // We can use outer product + scaled addition
+                    // ndarray doesn't have a direct "add_outer", so we do it manually or via gemm if available.
+                    // For typical dimensions, manual loop or slight inefficiency is acceptable compared to linear solve.
+                    // Optimization: h_pseudoinverse += (inv_lambda) * vec_k * vec_k.t()
+                    
+                    for i in 0..dim {
+                        let vi = vec_k[i];
+                        for j in 0..dim {
+                             let vj = vec_k[j];
+                             h_pseudoinverse[[i, j]] += vi * vj * inv_lambda;
+                        }
+                    }
                 }
-            };
+            }
             
             Ok(EvalShared {
                 key,
@@ -5005,7 +5034,7 @@ pub mod internal {
                 h_eff: Arc::new(h_eff),
                 ridge_used,
                 h_total: Arc::new(h_total),
-                h_total_factor,
+                h_pseudoinverse: Arc::new(h_pseudoinverse),
                 h_total_log_det,
             })
         }
@@ -6849,7 +6878,7 @@ pub mod internal {
             let rs_transposed = &reparam_result.rs_transposed;
 
             let mut includes_prior = false;
-            let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
+            let (gradient_result, gradient_snapshot, _) = {
                 let mut workspace_ref = self.workspace.lock().unwrap();
                 let workspace = &mut *workspace_ref;
                 let len = p.len();
@@ -6857,7 +6886,7 @@ pub mod internal {
                 workspace.set_lambda_values(p);
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
-                let mut applied_truncation_corrections: Option<Vec<f64>> = None;
+
                 // When we treat a stabilization ridge as a true penalty term, the
                 // penalty matrix becomes S_λ + ridge * I. For exactness, both the
                 // log|S| term in the cost and the derivative d/dρ_k log|S| must be
@@ -7119,8 +7148,7 @@ pub mod internal {
                     } else {
                         vec![0.0; lambdas.len()]
                     };
-                    applied_truncation_corrections = Some(gaussian_corrections.clone());
-
+    
                     let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
                     let det1_values = &det1_values;
                     let beta_ref = beta_transformed;
@@ -7270,182 +7298,77 @@ pub mod internal {
 
                         // P-IRLS already folded any stabilization ridge into h_eff.
 
-                        // Use the cached factorization from the bundle - DO NOT refactorize.
-                        // This is the "Hessian Passport" that guarantees consistency.
-                        let factor_g = Arc::clone(&bundle.h_total_factor);
-                        let factor_imp: Option<FaerFactor> = None;
+                        // Create local factor_g for legacy/fallback paths.
+                        // Ideally these paths should also be updated to use pseudoinverse,
+                        // but for now we maintain them for non-Firth/fallback cases.
+                        let factor_g = {
+                            let h_total = bundle.h_total.as_ref();
+                             let h_view = FaerArrayView::new(h_total);
+                             if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                                 Arc::new(FaerFactor::Llt(f))
+                             } else {
+                                 // Fallback to LDLT
+                                 match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                                     Ok(f) => Arc::new(FaerFactor::Ldlt(f)),
+                                     Err(_) => {
+                                         // Last resort: use the RidgePlanner
+                                         // But we don't have easy access to self.get_faer_factor here without rho.
+                                         // We'll panic or return error if this fails, which is rare for h_total.
+                                         // Or better, use get_faer_factor since we have rho.
+                                         self.get_faer_factor(p, h_total)
+                                     }
+                                 }
+                             }
+                        };
 
-                        // Compute trace(H^{-1} S_k) using the same reparameterized penalty
-                        // blocks as the Gaussian path. This is the partial derivative
-                        // ∂/∂ρ_k (0.5 log|H|) with β held fixed; the β-dependence is handled
-                        // separately via the implicit correction term to avoid double counting.
-                        workspace.reset_block_ranges();
-                        let mut total_rank = 0;
-                        for rt in rs_transposed {
-                            let cols = rt.ncols();
-                            workspace.block_ranges.push((total_rank, total_rank + cols));
-                            total_rank += cols;
-                        }
-                        if total_rank > 0 {
-                            workspace.concat.fill(0.0);
-                            let rows = h_for_factor.nrows();
-                            for ((start, end), rt) in
-                                workspace.block_ranges.iter().zip(rs_transposed.iter())
-                            {
-                                if *end > *start {
-                                    workspace
-                                        .concat
-                                        .slice_mut(s![..rows, *start..*end])
-                                        .assign(rt);
+
+                        // TRACE TERM COMPUTATION: tr(H_+^\dagger S_k)
+                        // We use the precomputed pseudoinverse from the eval bundle.
+                        // This guarantees spectral consistency with the cost function.
+                        let h_dagger = bundle.h_pseudoinverse.as_ref();
+                        
+                        let mut trace_terms = vec![0.0; k_count];
+                        for k_idx in 0..k_count {
+                            let rt = &rs_transformed[k_idx];
+                            if rt.ncols() == 0 {
+                                continue;
+                            }
+                            // Compute H_dagger * rt^T
+                            // H_dagger is (p x p), rt is (rank x p).
+                            // We want H_dagger * rt^T -> (p x rank).
+                            let h_dag_rt_t = h_dagger.dot(&rt.t());
+                            
+                            // Trace term: tr(H_dagger * S_k) = tr(H_dagger * rt^T * rt)
+                            // = tr(rt * H_dagger * rt^T)
+                            // = sum_{i, j} rt_{ij} * (H_dagger * rt^T)_{ji}
+                            // Let M = H_dagger * rt^T (p x rank).
+                            // We want sum_{i=0..rank, j=0..p} rt[i, j] * M[j, i].
+                            //
+                            // Note: M[j, i] corresponds to the (j, i) element.
+                            // rt[i, j] corresponds to the (i, j) element.
+                            //
+                            // Since M columns correspond to rows of rt.
+                            
+                            let mut trace_val = 0.0;
+                            for i in 0..rt.nrows() {
+                                for j in 0..rt.ncols() {
+                                    trace_val += rt[(i, j)] * h_dag_rt_t[(j, i)];
                                 }
                             }
-                            let rows = h_for_factor.nrows();
-                            let cols = total_rank;
-                            {
-                                let mut solved_slice =
-                                    workspace.solved.slice_mut(s![..rows, ..cols]);
-                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                                if let Some(slice) = solved_slice.as_slice_mut() {
-                                    let mut solved_view =
-                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_g.solve_in_place(solved_view.as_mut());
-                                } else {
-                                    let mut temp =
-                                        faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                    factor_g.solve_in_place(temp.as_mut());
-                                    for j in 0..cols {
-                                        for i in 0..rows {
-                                            solved_slice[(i, j)] = temp[(i, j)];
-                                        }
-                                    }
-                                }
-                            }
-                            workspace.solved_rows = h_eff.nrows();
-                        } else {
-                            workspace.solved_rows = 0;
+                            
+                            trace_terms[k_idx] = trace_val;
                         }
+                        
+                        // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
+                        workspace.solved_rows = 0;
 
 
-                        // Spectral truncation correction for log|H| trace terms.
-                        //
-                        // EXACT DERIVATION (eigen-perturbation form):
-                        //
-                        // Let S_lambda = sum_i mu_i u_i u_i^T be the full penalty and
-                        // S_trunc = sum_{i=1}^r mu_i u_i u_i^T be the truncated penalty.
-                        // Define projections P_R = sum_{i=1}^r u_i u_i^T and
-                        // P_N = sum_{i=r+1}^p u_i u_i^T (range / null).
-                        //
-                        // The LAML log-det term is (1/2) log|H| with
-                        // H = X^T W X + S_trunc. By Jacobi:
-                        //
-                        //   d/d rho_k (1/2 log|H|) = (1/2) tr(H^{-1} dS_trunc/d rho_k).
-                        //
-                        // Let dS = dS_lambda/d rho_k = lambda_k S_k. Using standard
-                        // eigenvalue/eigenvector perturbation (Magnus & Neudecker):
-                        //
-                        //   d mu_i = u_i^T dS u_i
-                        //   d u_i = sum_{j != i} (u_j^T dS u_i) / (mu_i - mu_j) * u_j
-                        //
-                        // Plugging these into dS_trunc gives:
-                        //
-                        //   dS_trunc = sum_{i=1}^r [ d mu_i u_i u_i^T
-                        //                + mu_i d u_i u_i^T + mu_i u_i d u_i^T ].
-                        //
-                        // This simplifies to the exact block form:
-                        //
-                        //   dS_trunc = P_R dS P_R
-                        //            + sum_{i=1}^r sum_{j=r+1}^p
-                        //                (mu_i/(mu_i - mu_j)) (u_j^T dS u_i)
-                        //                (u_j u_i^T + u_i u_j^T).
-                        //
-                        // With truncation mu_j ≈ 0 for j > r, the factor
-                        // mu_i/(mu_i - mu_j) ≈ 1, so:
-                        //
-                        //   dS_trunc ≈ P_R dS P_R + P_N dS P_R + P_R dS P_N.
-                        //
-                        // Note the ABSENCE of the P_N dS P_N term.
-                        //
-                        // The implementation of tr(H^{-1} dS) uses the full dS, i.e.:
-                        //
-                        //   dS = (P_R + P_N) dS (P_R + P_N)
-                        //      = dS_trunc + P_N dS P_N.
-                        //
-                        // Therefore:
-                        //
-                        //   (1/2) tr(H^{-1} dS) =
-                        //     (1/2) tr(H^{-1} dS_trunc) + (1/2) tr(H^{-1} P_N dS P_N),
-                        //
-                        // and the final term is the phantom "spectral bleed" that must be removed.
-                        //
-                        // Writing U_perp for P_N's eigenvectors and M_perp = U_perp^T H^{-1} U_perp:
-                        //
-                        //   (1/2) tr(H^{-1} P_N dS P_N)
-                        //   = (1/2) lambda_k tr( M_perp * (U_perp^T S_k U_perp) ).
-                        //
-                        // This is exactly the correction we subtract below.
-                        let u_truncated = &reparam_result.u_truncated;
-                        let truncated_count = u_truncated.ncols();
-                        let truncation_corrections: Vec<f64> =
-                            if truncated_count > 0 && workspace.solved_rows > 0 {
-                                let rows = h_for_factor.nrows();
-                                let mut h_inv_u_perp =
-                                    faer::Mat::<f64>::zeros(rows, truncated_count);
-
-                                for i in 0..rows.min(u_truncated.nrows()) {
-                                    for j in 0..truncated_count {
-                                        h_inv_u_perp[(i, j)] = u_truncated[(i, j)];
-                                    }
-                                }
-
-                                factor_g.solve_in_place(h_inv_u_perp.as_mut());
-
-                                let mut m_perp =
-                                    faer::Mat::<f64>::zeros(truncated_count, truncated_count);
-                                for i in 0..truncated_count {
-                                    for j in 0..truncated_count {
-                                        let mut sum = 0.0;
-                                        for r in 0..rows.min(u_truncated.nrows()) {
-                                            sum += u_truncated[(r, i)] * h_inv_u_perp[(r, j)];
-                                        }
-                                        m_perp[(i, j)] = sum;
-                                    }
-                                }
-
-                                let mut corrections = vec![0.0; k_count];
-                                for k_idx in 0..k_count {
-                                    let r_k = &rs_transformed[k_idx];
-                                    let rank_k = r_k.nrows();
-
-                                    let mut w_k =
-                                        faer::Mat::<f64>::zeros(rank_k, truncated_count);
-                                    for i in 0..rank_k {
-                                        for j in 0..truncated_count {
-                                            let mut sum = 0.0;
-                                            for l in 0..r_k.ncols().min(u_truncated.nrows()) {
-                                                sum += r_k[(i, l)] * u_truncated[(l, j)];
-                                            }
-                                            w_k[(i, j)] = sum;
-                                        }
-                                    }
-
-                                    let mut trace_error = 0.0;
-                                    for i in 0..truncated_count {
-                                        for j in 0..truncated_count {
-                                            let mut wtw_ij = 0.0;
-                                            for l in 0..rank_k {
-                                                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-                                            }
-                                            trace_error += m_perp[(i, j)] * wtw_ij;
-                                        }
-                                    }
-
-                                    corrections[k_idx] = 0.5 * lambdas[k_idx] * trace_error;
-                                }
-                                corrections
-                            } else {
-                                vec![0.0; k_count]
-                            };
-                        applied_truncation_corrections = Some(truncation_corrections.clone());
+                        // Implicit Truncation Correction:
+                        // By using H_+^\dagger essentially constructed from U_R D_R^{-1} U_R^T,
+                        // we automatically project dS onto the valid subspace P_R.
+                        // The phantom spectral bleed term (tr(H^-1 P_N dS P_N)) is identically zero
+                        // because P_N H_+^\dagger = 0.
+                        let truncation_corrections = vec![0.0; k_count];
 
                         let residual_grad = {
                             let eta = pirls_result
@@ -7606,15 +7529,13 @@ pub mod internal {
                         }
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
-                            let rhs_view = FaerColView::new(&grad_beta);
-                            let solved = match &factor_imp {
-                                Some(factor) => factor.solve(rhs_view.as_ref()),
-                                None => factor_g.solve(rhs_view.as_ref()),
-                            };
-                            let mut delta: Array1<f64> = Array1::zeros(grad_beta.len());
-                            for i in 0..delta.len() {
-                                delta[i] = solved[(i, 0)];
-                            }
+                            // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
+                            // We need delta = H^-1 * grad_beta (where grad_beta comes from stationarity or envelope).
+                            // Replace linear solve with pseudoinverse multiplication for spectral consistency.
+                            // H^-1 -> H_+^\dagger
+                            let h_dagger = bundle.h_pseudoinverse.as_ref();
+                            let delta = h_dagger.dot(&grad_beta);
+                            
                             let delta_inf =
                                 delta.iter().fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
                             if delta_inf < 1e-8 {
@@ -7719,7 +7640,7 @@ pub mod internal {
                     Some(gradient_result.clone())
                 };
 
-                (gradient_result, gradient_snapshot, applied_truncation_corrections)
+                (gradient_result, gradient_snapshot, None::<Vec<f64>>)
             };
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
@@ -7736,7 +7657,7 @@ pub mod internal {
                     p,
                     bundle,
                     &gradient_snapshot,
-                    applied_truncation_corrections.as_deref(),
+                    None,
                 );
             }
 
