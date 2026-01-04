@@ -48,7 +48,7 @@ use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrateg
 use crate::calibrate::visualizer;
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
     array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError,
@@ -4975,7 +4975,8 @@ pub mod internal {
             // Gradient = tr(H_plus_dagger * dH)
             
             // We use Faer's self-adjoint eigendecomposition
-            let (eigvals, eigvecs) = match h_total.clone().eigh(Side::Lower) {
+            // Optimization: eigh borrows self, so we removed clone().
+            let (eigvals, eigvecs) = match h_total.eigh(Side::Lower) {
                 Ok((vals, vecs)) => (vals, vecs),
                 Err(e) => {
                     // Fallback if eigendecomposition fails (rare): return error
@@ -4993,7 +4994,7 @@ pub mod internal {
             // Sum log(lambda) only for valid eigenvalues.
             let h_total_log_det : f64 = eigvals.iter()
                 .filter(|&&v| v > EIG_THRESHOLD)
-                .map(|v| v.ln())
+                .map(|&v| v.ln())
                 .sum();
                 
             if !h_total_log_det.is_finite() {
@@ -5003,30 +5004,39 @@ pub mod internal {
             }
             
             // 2. Compute Pseudoinverse H_plus_dagger
-            // H+ = U * diag(1/lambda_valid ... 0) * U^T
-            // Calculation: sum_{k in valid} (1/lambda_k) * v_k * v_k^T
-            let dim = h_total.nrows();
-            let mut h_pseudoinverse = Array2::<f64>::zeros((dim, dim));
+            // Efficiently using matrix multiplication: H+ = W * W^T
+            // where W = U_valid * diag(1/sqrt(lambda_valid))
+            // This replaces the previous O(N^3) scalar loop with highly optimized BLAS operations.
             
-            for (k, &val) in eigvals.iter().enumerate() {
-                if val > EIG_THRESHOLD {
-                    let inv_lambda = 1.0 / val;
-                    let vec_k = eigvecs.column(k);
-                    // Add (1/lambda) * vec * vec^T to accumulator
-                    // We can use outer product + scaled addition
-                    // ndarray doesn't have a direct "add_outer", so we do it manually or via gemm if available.
-                    // For typical dimensions, manual loop or slight inefficiency is acceptable compared to linear solve.
-                    // Optimization: h_pseudoinverse += (inv_lambda) * vec_k * vec_k.t()
-                    
-                    for i in 0..dim {
-                        let vi = vec_k[i];
-                        for j in 0..dim {
-                             let vj = vec_k[j];
-                             h_pseudoinverse[[i, j]] += vi * vj * inv_lambda;
-                        }
-                    }
-                }
+            // a. Filter indices of valid eigenvalues
+            let valid_indices: Vec<usize> = eigvals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+                .collect();
+                
+            let valid_count = valid_indices.len();
+            let dim = h_total.nrows();
+            
+            // b. Construct W (scaled eigenvectors)
+            let mut w = Array2::<f64>::zeros((dim, valid_count));
+            
+            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                let val = eigvals[eig_idx];
+                let scale = 1.0 / val.sqrt();
+                let u_col = eigvecs.column(eig_idx);
+                
+                // Vectorized scale and copy
+                let mut w_col = w.column_mut(w_col_idx);
+                Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
+                    *w_elem = u_elem * scale;
+                });
             }
+            
+            // c. Compute Pseudoinverse via Matrix Multiplication (H_dagger = W * W^T)
+            // This leverages highly optimized BLAS/GEMM routines implicit in dot().
+            // w.t() returns a view, so no extra allocation for transpose.
+            let h_pseudoinverse = w.dot(&w.t());
             
             Ok(EvalShared {
                 key,
