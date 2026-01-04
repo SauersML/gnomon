@@ -1688,7 +1688,7 @@ impl<'a> JointRemlState<'a> {
                 "Non-finite gradient from finite-difference LAML.".to_string(),
             ));
         }
-        
+        println!("FD Grad: {:?}", grad);
         Ok(grad)
     }
 
@@ -2457,6 +2457,7 @@ impl<'a> JointRemlState<'a> {
             grad[k] = -grad_laml;
         }
 
+        println!("Analytic Grad: {:?}", grad);
         Ok((grad, audit_needed))
     }
 
