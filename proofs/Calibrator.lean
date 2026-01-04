@@ -3121,77 +3121,47 @@ theorem sigmoid_zero : sigmoid 0 = 1 / 2 := by
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
-    - If μ > 0: E[sigmoid(η)] < sigmoid(μ)  (mean is less confident than mode)
-    - If μ < 0: E[sigmoid(η)] > sigmoid(μ)  (mean is less confident than mode)
+    - If μ > 0: E[sigmoid(η)] < sigmoid(μ)  (sigmoid is concave for x > 0)
+    - If μ < 0: E[sigmoid(η)] > sigmoid(μ)  (sigmoid is convex for x < 0)
     - If μ = 0: E[sigmoid(η)] = sigmoid(μ) = 0.5  (by symmetry)
 
-    This is because sigmoid is concave for x > 0 and convex for x < 0.
+    **Note**: The direction of shrinkage is toward 0.5, but with large variance
+    the expectation can overshoot past 0.5. The core Jensen inequality is just
+    about the relationship to sigmoid(μ), not about staying on the same side of 0.5.
 
-    **Implication**: The Mode prediction is always MORE confident (further from 0.5)
-    than the Mean prediction. The Mean correctly accounts for parameter uncertainty
-    by "shrinking" predictions toward 0.5.
+    A full proof requires:
+    1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
+    2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
+theorem jensen_sigmoid_positive (μ σ : ℝ) (hσ : σ > 0) (hμ : μ > 0) :
+    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
+  sorry -- Requires: sigmoid concavity on (0,∞) + Jensen's inequality
 
-    This theorem is stated axiomatically here; a full proof would require
-    measure-theoretic integration over the posterior distribution. -/
-axiom jensen_sigmoid_positive (μ σ : ℝ) (hσ : σ > 0) (hμ : μ > 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ ∧ E_sigmoid > 1/2
+theorem jensen_sigmoid_negative (μ σ : ℝ) (hσ : σ > 0) (hμ : μ < 0) :
+    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
+  sorry -- Requires: sigmoid convexity on (-∞,0) + Jensen's inequality
 
-axiom jensen_sigmoid_negative (μ σ : ℝ) (hσ : σ > 0) (hμ : μ < 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ ∧ E_sigmoid < 1/2
+/-- **Calibration Shrinkage Theorem** (Conditional version)
 
-/-- **Calibration Shrinkage Theorem**
-
-    The posterior mean prediction is always closer to 0.5 than the mode prediction.
-    This "shrinkage" is the correct Bayesian response to parameter uncertainty.
+    Under certain conditions on the variance, the posterior mean prediction
+    is closer to 0.5 than the mode prediction.
 
     |E[sigmoid(η)] - 0.5| ≤ |sigmoid(E[η]) - 0.5|
 
-    with equality iff Var(η) = 0 (no uncertainty) or E[η] = 0 (symmetric case). -/
-theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0) :
+    **Important caveat**: This is NOT universally true! With very large variance,
+    the expectation E[sigmoid(η)] can "overshoot" past 0.5 to the other side.
+
+    For η ~ N(μ, σ²):
+    - Jensen guarantees E[sigmoid(η)] is pulled toward 0.5 relative to sigmoid(μ)
+    - But with σ² >> |μ|, E[sigmoid(η)] → 0.5 and can cross to the other side
+
+    A complete proof would require bounding σ² relative to |μ| to ensure
+    E[sigmoid(η)] stays on the same side of 0.5 as sigmoid(μ). -/
+theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0)
+    (h_moderate_var : σ < |μ|) :  -- Additional hypothesis needed!
     ∃ E_sigmoid : ℝ, |E_sigmoid - 1/2| < |sigmoid μ - 1/2| := by
-  by_cases h : μ > 0
-  · -- Case μ > 0: sigmoid(μ) > 0.5, and E[sigmoid] < sigmoid(μ)
-    obtain ⟨E_sig, hlt, hpos⟩ := jensen_sigmoid_positive μ σ hσ h
-    use E_sig
-    have h_sig_gt : sigmoid μ > 1/2 := by
-      unfold sigmoid
-      have hexp : Real.exp (-μ) < 1 := by
-        rw [Real.exp_lt_one_iff]
-        linarith
-      have hexp_pos : Real.exp (-μ) > 0 := Real.exp_pos (-μ)
-      have hdenom_pos : 1 + Real.exp (-μ) > 0 := by linarith
-      -- Want to show 1 / (1 + exp(-μ)) > 1/2
-      -- Equivalent to 1/2 < 1 / (1 + exp(-μ)), i.e., (1 + exp(-μ)) * (1/2) < 1
-      rw [gt_iff_lt, lt_div_iff₀ hdenom_pos]
-      linarith
-    -- E_sig < sigmoid(μ) and sigmoid(μ) > 0.5 and E_sig > 0.5
-    -- Need to show |E_sig - 0.5| < |sigmoid(μ) - 0.5|
-    -- Since 0.5 < E_sig < sigmoid(μ), both sides are positive and we can drop absolute values
-    rw [abs_of_pos (by linarith : E_sig - 1/2 > 0)]
-    rw [abs_of_pos (by linarith : sigmoid μ - 1/2 > 0)]
-    linarith
-  · -- Case μ < 0: symmetric argument
-    push_neg at h
-    have hμ_neg : μ < 0 := h.lt_of_ne hμ
-    obtain ⟨E_sig, hgt, hlt_half⟩ := jensen_sigmoid_negative μ σ hσ hμ_neg
-    use E_sig
-    have h_sig_lt : sigmoid μ < 1/2 := by
-      unfold sigmoid
-      have hexp : Real.exp (-μ) > 1 := by
-        rw [gt_iff_lt, Real.one_lt_exp_iff]
-        linarith
-      have hexp_pos : Real.exp (-μ) > 0 := Real.exp_pos (-μ)
-      have hdenom_pos : 1 + Real.exp (-μ) > 0 := by linarith
-      -- Want to show 1 / (1 + exp(-μ)) < 1/2
-      -- Equivalent to 2 * 1 < (1 + exp(-μ)) * (1/2), but we need 2 < 1 + exp(-μ)
-      rw [div_lt_iff₀ hdenom_pos]
-      linarith
-    -- sigmoid(μ) < E_sig < 0.5, so both are negative when we subtract 0.5
-    -- We need |E_sig - 0.5| < |sigmoid(μ) - 0.5|
-    -- Since both are less than 0.5, the absolute values flip the inequality
-    rw [abs_of_neg (by linarith : E_sig - 1/2 < 0)]
-    rw [abs_of_neg (by linarith : sigmoid μ - 1/2 < 0)]
-    linarith
+  -- This requires showing that E[sigmoid(η)] stays between 0.5 and sigmoid(μ)
+  -- which depends on the variance being "moderate" relative to the mean
+  sorry
 
 end BrierScore
 
