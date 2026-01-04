@@ -1993,7 +1993,7 @@ pub fn train_model(
         }
 
         if success {
-            eprintln!("[Boundary] Using corrected Hessian for inference.");
+            log::info!("[Boundary] Using corrected Hessian for inference.");
             qs.dot(&h_trans_corrected).dot(&qs.t())
         } else {
             log::warn!("[Boundary] Failed to invert corrected covariance. Falling back to conditional Hessian.");
@@ -7734,7 +7734,6 @@ pub mod internal {
             // 1. Identify boundary parameters and perturb
             let mut current_rho = initial_rho.clone();
             let mut perturbed = false;
-            let base_cost = self.compute_cost(&current_rho)?;
 
             // Target cost increase: 0.01 log-likelihood units (statistically insignificant)
             let target_diff = 0.01;
@@ -7743,6 +7742,9 @@ pub mod internal {
                 // Check if at upper boundary (high smoothing -> linear)
                 // RHO_BOUND is 30.0.
                 if current_rho[k] > RHO_BOUND - 1.0 {
+                    // Compute base_cost fresh for each parameter to handle multiple boundary cases
+                    let base_cost = self.compute_cost(&current_rho)?;
+
                     log::info!(
                         "[Boundary] rho[{}] = {:.2} is at boundary. Perturbing...",
                         k, current_rho[k]
