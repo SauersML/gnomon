@@ -3336,6 +3336,7 @@ mod tests {
 
         let mut grad_analytic = None;
         let mut grad_fd = None;
+        let mut last_err: Option<String> = None;
         for attempt in 0..3 {
             let mut rng = StdRng::seed_from_u64(123 + attempt);
             let mut x = Array2::<f64>::zeros((n, p));
@@ -3371,9 +3372,13 @@ mod tests {
                 let mut state = reml_state.state.borrow_mut();
                 state.beta_base = beta_true.clone();
                 *reml_state.cached_beta_base.borrow_mut() = beta_true.clone();
+                let u = state.base_linear_predictor();
+                if state.build_link_basis(&u).is_err() {
+                    continue;
+                }
             }
 
-            let rho = Array1::zeros(2);
+            let rho = Array1::from_vec(vec![0.0, 2.0]);
             match reml_state.compute_gradient_analytic_for_test(&rho) {
                 Ok(ga) => {
                     let gf = reml_state
@@ -3383,11 +3388,17 @@ mod tests {
                     grad_fd = Some(gf);
                     break;
                 }
-                Err(_) => continue,
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                    continue;
+                }
             }
         }
 
-        let grad_analytic = grad_analytic.expect("analytic gradient");
+        let grad_analytic = match grad_analytic {
+            Some(g) => g,
+            None => panic!("analytic gradient: {}", last_err.unwrap_or_else(|| "unknown".to_string())),
+        };
         let grad_fd = grad_fd.expect("fd gradient");
 
         let mut diff_norm = 0.0;

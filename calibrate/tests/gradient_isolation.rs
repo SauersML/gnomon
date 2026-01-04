@@ -1090,7 +1090,6 @@ fn isolation_frozen_beta_fd() {
 // Section 5: FD reliability diagnostic
 // ============================================================================
 
-/// Proves FD is unreliable at high smoothing (should FAIL at rho=12).
 #[test]
 fn diagnostic_fd_noise_floor_at_high_smoothing() {
     let train = create_logistic_training_data(100, 3, 31);
@@ -1108,7 +1107,6 @@ fn diagnostic_fd_noise_floor_at_high_smoothing() {
         nullspace_dims: vec![0; s_list.len()],
     };
     
-    // rho=2: should pass
     let rho_mod = Array1::from_elem(layout.num_penalties, 2.0);
     let (a_mod, fd_mod) = evaluate_external_gradients(
         train.y.view(), train.weights.view(), x.view(), offset.view(),
@@ -1116,7 +1114,6 @@ fn diagnostic_fd_noise_floor_at_high_smoothing() {
     ).unwrap();
     let (cos_mod, ..) = gradient_metrics(&a_mod, &fd_mod);
     
-    // rho=12: should FAIL if FD is unreliable
     let rho_ext = Array1::from_elem(layout.num_penalties, 12.0);
     let (a_ext, fd_ext) = evaluate_external_gradients(
         train.y.view(), train.weights.view(), x.view(), offset.view(),
