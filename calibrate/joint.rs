@@ -401,7 +401,7 @@ impl<'a> JointModelState<'a> {
                 match apply_weighted_orthogonality_constraint(
                     bspline_basis.view(),
                     constraint.view(),
-                    Some(irls_weights.view()),  // Use IRLS weights for constraint metric
+                    Some(self.weights.view()),
                 ) {
                     Ok((constrained_basis, transform)) => {
                         let n_constrained = constrained_basis.ncols();
@@ -427,11 +427,11 @@ impl<'a> JointModelState<'a> {
                     }
                     Err(_) => {
                         // Fallback: construct a nullspace transform via eigendecomposition.
-                        // Use IRLS weights (not data weights) for consistency with primary path
+                        // Use PRIOR weights for consistency
                         eprintln!("[JOINT] Orthogonality constraint failed, using eigendecomposition fallback");
                         let mut weighted_constraints = constraint.clone();
                         for i in 0..n {
-                            let w = irls_weights[i];  // Use IRLS weights, not self.weights
+                            let w = self.weights[i];  // Use self.weights
                             weighted_constraints[[i, 0]] *= w;
                             weighted_constraints[[i, 1]] *= w;
                         }
@@ -2011,7 +2011,7 @@ impl<'a> JointRemlState<'a> {
 
         let mut weighted_constraints = constraint.clone();
         for i in 0..n {
-            let w = weights[i];
+            let w = state.weights[i]; // Use fixed prior weights
             weighted_constraints[[i, 0]] *= w;
             weighted_constraints[[i, 1]] *= w;
         }
@@ -2111,7 +2111,6 @@ impl<'a> JointRemlState<'a> {
         let mut b_dot = Array2::<f64>::zeros((n, n_raw));
         let mut c_dot = Array2::<f64>::zeros((n, 2));
         let mut weighted_c_dot = Array2::<f64>::zeros((n, 2));
-        let mut weighted_b = Array2::<f64>::zeros((n, n_raw));
         let mut weighted_b_dot = Array2::<f64>::zeros((n, n_raw));
         let mut dot_j_theta = Array2::<f64>::zeros((n, p_link));
         let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
@@ -2178,38 +2177,21 @@ impl<'a> JointRemlState<'a> {
                 w_dot[i] = w_prime[i] * dot_eta[i];
             }
 
-            // B_dot = B' * diag(dot_z)
-            b_dot.assign(b_prime);
-            for i in 0..n {
-                let scale = dot_z[i];
-                if scale != 1.0 {
-                    for j in 0..n_raw {
-                        b_dot[[i, j]] *= scale;
-                    }
-                }
-            }
-
-            // M_dot = C_dot^T W B + C^T W_dot B + C^T W B_dot
+            // M_dot = C_dot^T W B + C^T W B_dot (W_dot is zero for fixed constraint metric)
             c_dot.fill(0.0);
             for i in 0..n {
                 c_dot[[i, 1]] = dot_z[i];
             }
             weighted_c_dot.assign(&c_dot);
             for i in 0..n {
-                let w = weights[i];
+                let w = state.weights[i]; // Use fixed prior weights
                 weighted_c_dot[[i, 0]] *= w;
                 weighted_c_dot[[i, 1]] *= w;
             }
-            weighted_b.assign(b_raw);
-            for i in 0..n {
-                let w = w_dot[i];
-                for j in 0..n_raw {
-                    weighted_b[[i, j]] *= w;
-                }
-            }
+
             weighted_b_dot.assign(&b_dot);
             for i in 0..n {
-                let w = weights[i];
+                let w = state.weights[i]; // Use fixed prior weights
                 for j in 0..n_raw {
                     weighted_b_dot[[i, j]] *= w;
                 }
@@ -2235,11 +2217,10 @@ impl<'a> JointRemlState<'a> {
                 let b_view = b_wrapper.as_ref();
                 let c_wrapper = FaerArrayView::new(&constraint);
                 let c_view = c_wrapper.as_ref();
-                let wb_wrapper = FaerArrayView::new(&weighted_b);
-                let wb_view = wb_wrapper.as_ref();
                 let wbdot_wrapper = FaerArrayView::new(&weighted_b_dot);
                 let wbdot_view = wbdot_wrapper.as_ref();
 
+                // term 1: C_dot^T W B
                 matmul(
                     m_dot_view.as_mut(),
                     Accum::Replace,
@@ -2248,14 +2229,7 @@ impl<'a> JointRemlState<'a> {
                     1.0,
                     par,
                 );
-                matmul(
-                    m_dot_view.as_mut(),
-                    Accum::Add,
-                    c_view.transpose(),
-                    wb_view,
-                    1.0,
-                    par,
-                );
+                // term 2: C^T W B_dot
                 matmul(
                     m_dot_view.as_mut(),
                     Accum::Add,
@@ -2264,6 +2238,7 @@ impl<'a> JointRemlState<'a> {
                     1.0,
                     par,
                 );
+                // term 3 (C^T W_dot B) is removed because W is fixed for constraint
             }
             let z_dot = -m_pinv.dot(&crate::calibrate::faer_ndarray::fast_ab(
                 &m_dot,

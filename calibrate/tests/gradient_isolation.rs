@@ -26,7 +26,10 @@ use gnomon::calibrate::construction::{
     ModelLayout,
 };
 use gnomon::calibrate::data::TrainingData;
-use gnomon::calibrate::estimate::{evaluate_external_gradients, ExternalOptimOptions};
+use gnomon::calibrate::estimate::{
+    evaluate_external_cost_and_ridge, evaluate_external_gradients, optimize_external_design,
+    ExternalOptimOptions,
+};
 use gnomon::calibrate::faer_ndarray::FaerCholesky;
 use gnomon::calibrate::model::{
     default_reml_parallel_threshold, BasisConfig, InteractionPenaltyKind, LinkFunction,
@@ -968,7 +971,7 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     config.firth_bias_reduction = true;
     let (x, s_list, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    let rho: Array1<f64> = Array1::from_elem(layout.num_penalties, 12.0);
     let nullspace_dims = vec![0; s_list.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
     let opts = ExternalOptimOptions {
@@ -997,6 +1000,80 @@ fn isolation_reparam_pgs_pc_mains_firth() {
     print_result("Reparam PGS+PC mains", cos_fd, rel_fd, max_a, max_fd);
     assert!(cos_fd > 0.999, "cosine too low: {cos_fd}");
     assert!(rel_fd < 5e-2, "rel_l2 too high: {rel_fd}");
+}
+
+#[test]
+fn isolation_reparam_pgs_pc_mains_firth_frozen_beta_fd() {
+    println!("\n=== ISOLATION: Reparam PGS+PC mains, Firth, Frozen beta FD ===");
+    let train = create_logistic_training_data(100, 3, 31);
+    let mut config = logistic_model_config(true, false, &train);
+    config.firth_bias_reduction = true;
+    let (x, s_list, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    let rho: Array1<f64> = Array1::from_elem(layout.num_penalties, 12.0);
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![0; s_list.len()],
+    };
+
+    let (analytic, fd) = evaluate_external_gradients(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .unwrap();
+
+    let rs_list = compute_penalty_square_roots(&s_list).unwrap();
+    let cfg = ModelConfig::external(LinkFunction::Logit, 1e-10, 200, true);
+    let (pirls, _) = fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(rho.view()),
+        x.view(),
+        offset.view(),
+        train.y.view(),
+        train.weights.view(),
+        &rs_list,
+        None,
+        None,
+        &layout,
+        &cfg,
+        None,
+        None,
+    )
+    .unwrap();
+    let beta_orig = pirls.reparam_result.qs.dot(pirls.beta_transformed.as_ref());
+
+    let frozen_fd = frozen_fd_gradient_logit(
+        &train.y,
+        &x,
+        &train.weights,
+        &s_list,
+        &rho,
+        &beta_orig,
+    )
+    .unwrap();
+
+    let (cos_fd, rel_fd, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+    let (cos_frozen, rel_frozen, max_af, max_frozen) = gradient_metrics(&analytic, &frozen_fd);
+    print_result("Analytic vs FD", cos_fd, rel_fd, max_a, max_fd);
+    print_result(
+        "Analytic vs Frozen FD",
+        cos_frozen,
+        rel_frozen,
+        max_af,
+        max_frozen,
+    );
+    assert!(
+        cos_frozen > cos_fd + 0.02 || rel_frozen < 0.5 * rel_fd,
+        "frozen beta did not improve FD agreement: cos {cos_fd:.4}->{cos_frozen:.4}, rel {rel_fd:.3e}->{rel_frozen:.3e}"
+    );
 }
 
 // ============================================================================
@@ -1123,4 +1200,248 @@ fn isolation_diagnostic_fd_noise_floor_at_high_smoothing() {
     
     assert!(cos_mod > 0.999, "rho=2 failed: cos={cos_mod}");
     assert!(cos_ext > 0.999, "rho=12 failed: cos={cos_ext}, |grad|={max_a:.2e}");
+}
+
+// ============================================================================
+// Section 6: targeted noise floor diagnostics
+// ============================================================================
+
+#[test]
+fn isolation_stationarity_limit_at_optimum() {
+    println!("\n=== ISOLATION: Stationarity limit at optimized rho ===");
+    let (y, x, w) = generate_logit_data_no_intercept(180, 6, 7);
+    let p = x.ncols();
+    let s_list = vec![diagonal_penalty(p, 0, 4)];
+    let offset = Array1::<f64>::zeros(y.len());
+    let nullspace_dims = vec![2];
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: None,
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: nullspace_dims.clone(),
+    };
+
+    let rho_baseline = Array1::<f64>::zeros(s_list.len());
+    let (a_baseline, _) = evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_baseline,
+    )
+    .unwrap();
+    let n_baseline = a_baseline.dot(&a_baseline).sqrt();
+
+    let opt = optimize_external_design(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+    )
+    .unwrap();
+    let rho_opt = opt.lambdas.mapv(|v| v.ln());
+    let (a_opt, fd_opt) = evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_opt,
+    )
+    .unwrap();
+    let n_opt = a_opt.dot(&a_opt).sqrt();
+    let (cos_opt, rel_opt, max_a, max_fd) = gradient_metrics(&a_opt, &fd_opt);
+    print_result("Optimized rho", cos_opt, rel_opt, max_a, max_fd);
+
+    assert!(
+        n_opt < 1e-3 || n_opt < 1e-2 * n_baseline,
+        "optimized gradient too large: n_opt={n_opt:.3e} n_baseline={n_baseline:.3e}"
+    );
+}
+
+#[test]
+fn isolation_high_penalty_nullspace_gradient_decay() {
+    println!("\n=== ISOLATION: High-penalty nullspace gradient decay ===");
+    let (y, x, w) = generate_logit_data_no_intercept(200, 4, 11);
+    let p = x.ncols();
+    let s_list = vec![diagonal_penalty(p, 0, 2)];
+    let offset = Array1::<f64>::zeros(y.len());
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![2],
+    };
+
+    let rho_mid = array![2.0];
+    let (a_mid, fd_mid) = evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_mid,
+    )
+    .unwrap();
+    let (cos_mid, rel_mid, max_a_mid, max_fd_mid) = gradient_metrics(&a_mid, &fd_mid);
+    print_result("Nullspace rho=2", cos_mid, rel_mid, max_a_mid, max_fd_mid);
+    assert!(cos_mid > 0.99, "rho=2 cosine too low: {cos_mid}");
+
+    let rho_high = array![15.0];
+    let (a_high, fd_high) = evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_high,
+    )
+    .unwrap();
+    let (cos_high, rel_high, max_a_high, max_fd_high) = gradient_metrics(&a_high, &fd_high);
+    print_result("Nullspace rho=15", cos_high, rel_high, max_a_high, max_fd_high);
+
+    let n_mid = a_mid.dot(&a_mid).sqrt();
+    let n_high = a_high.dot(&a_high).sqrt();
+    assert!(
+        n_high < 0.2 * n_mid,
+        "high-penalty gradient did not decay: n_high={n_high:.3e} n_mid={n_mid:.3e}"
+    );
+}
+
+// ============================================================================
+// Section 7: diagnostic strategies from critic
+// ============================================================================
+
+#[test]
+fn diagnostic_super_convergence_tight_tol_improves_fd() {
+    println!("\n=== DIAGNOSTIC: Super-convergence tight tol improves FD ===");
+    let train = create_logistic_training_data(100, 3, 31);
+    let mut config = logistic_model_config(true, false, &train);
+    config.firth_bias_reduction = true;
+    let (x, s_list, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts_base = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![0; s_list.len()],
+    };
+    let (a_base, fd_base) = evaluate_external_gradients(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts_base,
+        &rho,
+    )
+    .unwrap();
+    let (cos_base, rel_base, max_a_base, max_fd_base) =
+        gradient_metrics(&a_base, &fd_base);
+    print_result("Base tol", cos_base, rel_base, max_a_base, max_fd_base);
+
+    let grad_norm = a_base.dot(&a_base).sqrt();
+    let tight_tol = (grad_norm * 1e-3).max(1e-14);
+    let opts_tight = ExternalOptimOptions {
+        tol: tight_tol,
+        max_iter: 500,
+        ..opts_base.clone()
+    };
+    let (a_tight, fd_tight) = evaluate_external_gradients(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts_tight,
+        &rho,
+    )
+    .unwrap();
+    let (cos_tight, rel_tight, max_a_tight, max_fd_tight) =
+        gradient_metrics(&a_tight, &fd_tight);
+    print_result("Tight tol", cos_tight, rel_tight, max_a_tight, max_fd_tight);
+
+    assert!(
+        cos_tight > cos_base + 0.02 || rel_tight < 0.5 * rel_base,
+        "tight tol did not improve FD agreement: cos {cos_base:.4}->{cos_tight:.4}, rel {rel_base:.3e}->{rel_tight:.3e}"
+    );
+}
+
+#[test]
+fn diagnostic_fd_ridge_jitter_at_high_smoothing() {
+    println!("\n=== DIAGNOSTIC: Ridge jitter across FD probes ===");
+    let train = create_logistic_training_data(100, 3, 31);
+    let mut config = logistic_model_config(true, false, &train);
+    config.firth_bias_reduction = true;
+    let (x, s_list, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims: vec![0; s_list.len()],
+    };
+
+    let mut rho_p = rho.clone();
+    let mut rho_m = rho.clone();
+    let h = 1e-4_f64 * (1.0_f64 + f64::abs(rho[0]));
+    rho_p[0] += 0.5 * h;
+    rho_m[0] -= 0.5 * h;
+
+    let (_, ridge_0) = evaluate_external_cost_and_ridge(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho,
+    )
+    .unwrap();
+    let (_, ridge_p) = evaluate_external_cost_and_ridge(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_p,
+    )
+    .unwrap();
+    let (_, ridge_m) = evaluate_external_cost_and_ridge(
+        train.y.view(),
+        train.weights.view(),
+        x.view(),
+        offset.view(),
+        &s_list,
+        &opts,
+        &rho_m,
+    )
+    .unwrap();
+
+    println!(
+        "  ridge: center={:.3e} plus={:.3e} minus={:.3e}",
+        ridge_0, ridge_p, ridge_m
+    );
+    let jitter = (ridge_p - ridge_0).abs().max((ridge_m - ridge_0).abs());
+    assert!(
+        jitter > 1e-12,
+        "ridge did not change across FD probes (jitter={jitter:.3e})"
+    );
 }

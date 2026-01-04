@@ -4088,6 +4088,71 @@ pub fn evaluate_external_gradients(
     Ok((analytic_grad, fd_grad))
 }
 
+/// Evaluate the external cost and report the stabilization ridge used.
+/// This is a diagnostic helper for tests that need to detect ridge jitter.
+pub fn evaluate_external_cost_and_ridge(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: ArrayView2<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    s_list: &[Array2<f64>],
+    opts: &ExternalOptimOptions,
+    rho: &Array1<f64>,
+) -> Result<(f64, f64), EstimationError> {
+    if !(y.len() == w.len() && y.len() == x.nrows() && y.len() == offset.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Row mismatch: y={}, w={}, X.rows={}, offset={}",
+            y.len(),
+            w.len(),
+            x.nrows(),
+            offset.len()
+        )));
+    }
+
+    let p = x.ncols();
+    for (k, s) in s_list.iter().enumerate() {
+        if s.nrows() != p || s.ncols() != p {
+            return Err(EstimationError::InvalidInput(format!(
+                "Penalty matrix {} must be {}×{}, got {}×{}",
+                k,
+                p,
+                p,
+                s.nrows(),
+                s.ncols()
+            )));
+        }
+    }
+
+    use crate::calibrate::model::ModelConfig;
+
+    let layout = ModelLayout::external(p, s_list.len());
+    let firth_active = opts.firth.as_ref().is_some_and(|spec| {
+        spec.enabled && matches!(opts.link, LinkFunction::Logit)
+    });
+    let cfg = ModelConfig::external(opts.link, opts.tol, opts.max_iter, firth_active);
+
+    let s_vec: Vec<Array2<f64>> = s_list.to_vec();
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let x_o = x.to_owned();
+    let offset_o = offset.to_owned();
+
+    let reml_state = internal::RemlState::new_with_offset(
+        y_o.view(),
+        x_o.view(),
+        w_o.view(),
+        offset_o.view(),
+        s_vec,
+        &layout,
+        &cfg,
+        Some(opts.nullspace_dims.clone()),
+    )?;
+
+    let cost = reml_state.compute_cost(rho)?;
+    let ridge = reml_state.last_ridge_used().unwrap_or(0.0);
+    Ok((cost, ridge))
+}
+
 /// Helper to log the final model structure.
 fn log_layout_info(layout: &ModelLayout) {
     log::info!(
