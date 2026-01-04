@@ -28,7 +28,9 @@ from urllib.request import urlopen
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 OUTPUT_DIR = Path(__file__).resolve().parent / "convert_score_output"
-GNOMON_BIN = REPO_ROOT / "target" / "release" / "gnomon"
+
+# Try installed gnomon first, fall back to local build
+GNOMON_BIN = shutil.which("gnomon") or REPO_ROOT / "target" / "release" / "gnomon"
 
 PGS_IDS = ("PGS000007", "PGS000317", "PGS004869", "PGS000507")
 PGS_BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores"
@@ -125,8 +127,9 @@ def parse_sscore(path: Path) -> list[ScoreResult]:
 
 
 def main() -> None:
-    if not GNOMON_BIN.exists():
-        raise RuntimeError(f"gnomon not found at {GNOMON_BIN}. Run: cargo build --release")
+    gnomon = Path(GNOMON_BIN) if isinstance(GNOMON_BIN, str) else GNOMON_BIN
+    if not gnomon.exists():
+        raise RuntimeError(f"gnomon not found. Install with: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash")
 
     score_cache = OUTPUT_DIR / "scores"
     all_results: dict[str, dict[str, ScoreResult]] = defaultdict(dict)
@@ -143,7 +146,7 @@ def main() -> None:
             score_file = get_pgs_score(pgs_id, score_cache)
 
             # Run gnomon directly on .txt file
-            run([GNOMON_BIN, "score", score_file, genome_path, "--build", "37"])
+            run([gnomon, "score", score_file, genome_path, "--build", "37"])
 
             # Find output
             cache_dir = genome_path.parent / f"{genome_path.stem}.gnomon_cache"

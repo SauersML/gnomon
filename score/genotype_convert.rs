@@ -10,9 +10,10 @@
 
 use convert_genome::input::InputFormat as ConvertInputFormat;
 use convert_genome::{ConversionConfig, OutputFormat, convert_dtc_file};
+use flate2::read::GzDecoder;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Reference genome download URLs with fallbacks (tried in order)
@@ -110,7 +111,7 @@ fn get_gnomon_cache_dir() -> PathBuf {
 /// Ensures a reference genome is available, downloading if necessary.
 ///
 /// Tries multiple mirror URLs with fallback if one fails.
-/// Returns the path to the reference FASTA file.
+/// Returns the path to the uncompressed reference FASTA file.
 fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let cache_dir = get_gnomon_cache_dir().join("refs");
     fs::create_dir_all(&cache_dir)?;
@@ -121,17 +122,12 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
         (GRCH38_URLS, "GRCh38_reference.fa")
     };
 
-    // Check for any existing cached reference (could have different extensions)
-    let ref_path_gz = cache_dir.join(format!("{}.gz", canonical_filename));
-    let ref_path_plain = cache_dir.join(canonical_filename);
+    let ref_path = cache_dir.join(canonical_filename);
 
-    if ref_path_gz.exists() {
-        eprintln!("> Using cached reference genome: {}", ref_path_gz.display());
-        return Ok(ref_path_gz);
-    }
-    if ref_path_plain.exists() {
-        eprintln!("> Using cached reference genome: {}", ref_path_plain.display());
-        return Ok(ref_path_plain);
+    // Check for existing cached reference (uncompressed)
+    if ref_path.exists() {
+        eprintln!("> Using cached reference genome: {}", ref_path.display());
+        return Ok(ref_path);
     }
 
     eprintln!("> Reference genome not found locally.");
@@ -142,19 +138,40 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
     for (i, url) in urls.iter().enumerate() {
         eprintln!("> Trying mirror {}/{}: {}", i + 1, urls.len(), url);
 
-        // Determine output path based on URL (preserve .gz if compressed)
-        let dest_path = if url.ends_with(".gz") {
-            &ref_path_gz
+        // Download to temp file first
+        let temp_path = if url.ends_with(".gz") {
+            cache_dir.join(format!("{}.gz.tmp", canonical_filename))
         } else {
-            &ref_path_plain
+            cache_dir.join(format!("{}.tmp", canonical_filename))
         };
 
-        match download_with_progress(url, dest_path) {
+        match download_with_progress(url, &temp_path) {
             Ok(()) => {
-                eprintln!("> Reference genome cached at: {}", dest_path.display());
-                return Ok(dest_path.clone());
+                // Decompress if needed
+                if url.ends_with(".gz") {
+                    eprintln!("> Decompressing reference genome...");
+                    match decompress_gz(&temp_path, &ref_path) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(&temp_path);
+                            eprintln!("> Reference genome cached at: {}", ref_path.display());
+                            return Ok(ref_path);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&temp_path);
+                            last_error = format!("Decompression failed: {}", e);
+                            eprintln!("> {}. Trying next mirror...", last_error);
+                            continue;
+                        }
+                    }
+                } else {
+                    // Just rename the temp file
+                    fs::rename(&temp_path, &ref_path)?;
+                    eprintln!("> Reference genome cached at: {}", ref_path.display());
+                    return Ok(ref_path);
+                }
             }
             Err(e) => {
+                let _ = fs::remove_file(&temp_path);
                 last_error = e.to_string();
                 eprintln!("> Mirror failed: {}. Trying next...", last_error);
             }
@@ -166,6 +183,27 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
         urls.len(),
         last_error
     ).into())
+}
+
+/// Decompress a gzipped file
+fn decompress_gz(src: &Path, dest: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let input = File::open(src)?;
+    let decoder = GzDecoder::new(BufReader::new(input));
+    let mut reader = BufReader::new(decoder);
+
+    let output = File::create(dest)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut buffer = [0u8; 65536];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..bytes_read])?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 /// Downloads a file with progress indication
