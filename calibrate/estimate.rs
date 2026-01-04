@@ -7350,23 +7350,8 @@ pub mod internal {
                             
                             // Trace term: tr(H_dagger * S_k) = tr(H_dagger * rt^T * rt)
                             // = tr(rt * H_dagger * rt^T)
-                            // = sum_{i, j} rt_{ij} * (H_dagger * rt^T)_{ji}
-                            // Let M = H_dagger * rt^T (p x rank).
-                            // We want sum_{i=0..rank, j=0..p} rt[i, j] * M[j, i].
-                            //
-                            // Note: M[j, i] corresponds to the (j, i) element.
-                            // rt[i, j] corresponds to the (i, j) element.
-                            //
-                            // Since M columns correspond to rows of rt.
-                            
-                            let mut trace_val = 0.0;
-                            for i in 0..rt.nrows() {
-                                for j in 0..rt.ncols() {
-                                    trace_val += rt[(i, j)] * h_dag_rt_t[(j, i)];
-                                }
-                            }
-                            
-                            trace_terms[k_idx] = trace_val;
+                            // Computed idiomatically via matrix product + diagonal sum.
+                            trace_terms[k_idx] = rt.dot(&h_dag_rt_t).diag().sum();
                         }
                         
                         // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
