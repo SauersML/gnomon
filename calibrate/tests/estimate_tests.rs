@@ -6,7 +6,7 @@ mod tests {
     use crate::calibrate::model::{
         BasisConfig, InteractionPenaltyKind, ModelFamily, PrincipalComponentConfig,
     };
-    use ndarray::{Array, Array1, Array2};
+    use ndarray::{Array, Array1, Array2, Zip};
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, Normal};
@@ -1306,8 +1306,34 @@ mod tests {
             .expect("h_phi");
         let mut h_total = xtwx + &pr.reparam_result.s_transformed;
         h_total -= &h_phi;
+
+        // Compute spectral factor W for the spectral version of the gradient
+        // This matches the production code in estimate.rs
+        use crate::calibrate::faer_ndarray::FaerEigh;
+        let (eigvals_arr, eigvecs_arr) = h_total.eigh(Side::Lower).expect("eigh");
+
+        const EIG_THRESHOLD: f64 = 1e-12;
+        let valid_indices: Vec<usize> = eigvals_arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+            .collect();
+        let valid_count = valid_indices.len();
+        let dim = h_total.nrows();
+
+        let mut spectral_w = Array2::<f64>::zeros((dim, valid_count));
+        for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+            let val = eigvals_arr[eig_idx];
+            let scale = 1.0 / val.sqrt();
+            let u_col = eigvecs_arr.column(eig_idx);
+            let mut w_col = spectral_w.column_mut(w_col_idx);
+            Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
+                *w_elem = u_elem * scale;
+            });
+        }
+
         let g_beta = state
-            .firth_logh_total_grad(&pr.x_transformed, &mu, &weights, &h_total)
+            .firth_logh_total_grad_spectral(&pr.x_transformed, &mu, &weights, &spectral_w)
             .expect("g_beta");
 
         let mut g_num = Array1::<f64>::zeros(beta.len());
@@ -1377,12 +1403,34 @@ mod tests {
         h_total -= &h_phi;
         let factor_g = state.factorize_faer(&h_total);
 
+        // Compute spectral factor W for the spectral version of the gradient
+        use crate::calibrate::faer_ndarray::FaerEigh;
+        let (eigvals_arr, eigvecs_arr) = h_total.eigh(Side::Lower).expect("eigh");
+        const EIG_THRESHOLD: f64 = 1e-12;
+        let valid_indices: Vec<usize> = eigvals_arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+            .collect();
+        let valid_count = valid_indices.len();
+        let dim = h_total.nrows();
+        let mut spectral_w = Array2::<f64>::zeros((dim, valid_count));
+        for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+            let val = eigvals_arr[eig_idx];
+            let scale = 1.0 / val.sqrt();
+            let u_col = eigvecs_arr.column(eig_idx);
+            let mut w_col = spectral_w.column_mut(w_col_idx);
+            Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
+                *w_elem = u_elem * scale;
+            });
+        }
+
         let g_beta_total = state
-            .firth_logh_total_grad(
+            .firth_logh_total_grad_spectral(
                 &pr.x_transformed,
                 &pr.solve_mu,
                 &pr.solve_weights,
-                &h_total,
+                &spectral_w,
             )
             .expect("g_beta_total");
         let g_beta_half = 0.5 * &g_beta_total;
