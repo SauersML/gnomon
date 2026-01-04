@@ -2734,3 +2734,129 @@ fn hypothesis_near_zero_components() {
     }
 }
 
+
+/// Hypothesis 18: Use GAM S matrices but with random X.
+/// This tests if the problem is S-related or X-related.
+#[test]
+fn hypothesis_gam_s_random_x() {
+    println!("\n=== Hypothesis 18: GAM S Matrices + Random X ===");
+    
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    
+    let p = x_gam.ncols();
+    let n = x_gam.nrows();
+    
+    // Create random X with same dimensions
+    let (y_rand, x_rand, w_rand) = generate_logit_data(n, p, 42);
+    
+    let nullspace_dims = vec![0; s_list_gam.len()];
+    let offset = Array1::<f64>::zeros(n);
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims,
+    };
+    
+    // Test: Use GAM penalties with random X and random y
+    let (analytic, fd) = evaluate_external_gradients(
+        y_rand.view(), w_rand.view(), x_rand.view(), offset.view(),
+        &s_list_gam, &opts, &rho,
+    ).expect("gradients");
+    
+    let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
+    let status = if cos > 0.99 && rel < 0.05 { "✓ PASS" } else { "✗ FAIL" };
+    println!("  GAM S + Random X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
+    
+    if cos > 0.99 {
+        println!("  => S matrices alone do NOT trigger failure");
+    } else {
+        println!("  => S matrices DO trigger failure (even with random X)");
+    }
+}
+
+/// Hypothesis 19: Use random S matrices but with GAM X and y.
+#[test]
+fn hypothesis_random_s_gam_xy() {
+    println!("\n=== Hypothesis 19: Random S + GAM X and Y ===");
+    
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    
+    let p = x_gam.ncols();
+    
+    // Create simple diagonal penalties matching the number of GAM penalties
+    let mut s_list_diag = Vec::new();
+    for k in 0..s_list_gam.len() {
+        s_list_diag.push(diagonal_penalty(p, k * (p / s_list_gam.len()), (k+1) * (p / s_list_gam.len())));
+    }
+    
+    let nullspace_dims = vec![0; s_list_gam.len()];
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims,
+    };
+    
+    // Test: Use diagonal penalties with GAM X and y
+    let (analytic, fd) = evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+        &s_list_diag, &opts, &rho,
+    ).expect("gradients");
+    
+    let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
+    let status = if cos > 0.99 && rel < 0.05 { "✓ PASS" } else { "✗ FAIL" };
+    println!("  Random S + GAM X: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
+    
+    if cos > 0.99 {
+        println!("  => GAM X/y alone do NOT trigger failure");
+    } else {
+        println!("  => GAM X/y DO trigger failure (even with diagonal S)");
+    }
+}
+
+/// Hypothesis 20: Full GAM combination (control - expected to fail).
+#[test]
+fn hypothesis_full_gam_control() {
+    println!("\n=== Hypothesis 20: Full GAM (Control - Expected Fail) ===");
+    
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+    
+    let nullspace_dims = vec![0; s_list_gam.len()];
+    let offset = Array1::<f64>::zeros(train.y.len());
+    let rho = Array1::from_elem(layout.num_penalties, 12.0);
+    
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 200,
+        nullspace_dims,
+    };
+    
+    // Test: Full GAM configuration
+    let (analytic, fd) = evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+        &s_list_gam, &opts, &rho,
+    ).expect("gradients");
+    
+    let (cos, rel, max_a, _) = gradient_metrics(&analytic, &fd);
+    let status = if cos > 0.99 && rel < 0.05 { "✓ PASS" } else { "✗ FAIL" };
+    println!("  Full GAM: cos={:.4}, rel={:.2e}, |grad|={:.2e} {}", cos, rel, max_a, status);
+}
