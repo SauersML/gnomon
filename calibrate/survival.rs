@@ -768,7 +768,8 @@ pub fn build_survival_layout(
     let static_covariate_names = assemble_static_covariate_names(data);
 
     let baseline_cols = constrained_exit.ncols();
-    let penalty_matrix = create_difference_penalty_matrix(baseline_cols, baseline_penalty_order)?;
+    let penalty_matrix =
+        create_difference_penalty_matrix(baseline_cols, baseline_penalty_order, None)?;
     let baseline_lambda =
         baseline_lambda_seed(&age_basis.knot_vector, age_basis.degree, baseline_penalty_order);
     let mut penalty_blocks = vec![PenaltyBlock {
@@ -835,7 +836,7 @@ pub fn build_survival_layout(
             if time_cols > 0 {
                 let age_penalty_1d = penalty_matrix.clone();
                 let pgs_penalty_1d =
-                    create_difference_penalty_matrix(pgs_cols, config.pgs_penalty_order)?;
+                    create_difference_penalty_matrix(pgs_cols, config.pgs_penalty_order, None)?;
 
                 let identity_age = Array2::<f64>::eye(baseline_cols);
                 let identity_pgs = Array2::<f64>::eye(pgs_cols);
@@ -3265,7 +3266,7 @@ mod tests {
     ) -> PenaltyDescriptor {
         let baseline_cols = layout.baseline_exit.ncols();
         let matrix =
-            create_difference_penalty_matrix(baseline_cols, order).expect("baseline penalty");
+            create_difference_penalty_matrix(baseline_cols, order, None).expect("baseline penalty");
         PenaltyDescriptor {
             order,
             lambda,

@@ -2031,7 +2031,7 @@ impl<'a> JointRemlState<'a> {
 
         // Raw penalty for link block and its projection (constant for this rho).
         let s_raw = if p_link > 0 {
-            create_difference_penalty_matrix(n_raw, 2)
+            create_difference_penalty_matrix(n_raw, 2, None)
                 .unwrap_or_else(|_| Array2::zeros((n_raw, n_raw)))
         } else {
             Array2::zeros((0, 0))
