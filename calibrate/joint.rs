@@ -1712,6 +1712,7 @@ impl<'a> JointRemlState<'a> {
                 "analytic joint gradient not implemented for integrated logit weights".to_string(),
             ));
         }
+        let firth_active = state.firth_bias_reduction && matches!(state.link, LinkFunction::Logit);
 
         // Set ρ and warm-start from cached coefficients
         state.set_rho(rho.clone());
@@ -1915,6 +1916,48 @@ impl<'a> JointRemlState<'a> {
             }
         }
 
+        // Firth adjoint matrix Q = H^{-1} V H^{-1}.
+        //
+        // Proof-style derivation (fixed-point, logit Firth):
+        //   Let I = J^T W J be the Fisher information and define the Firth term:
+        //     Phi = 0.5 * log|I|.
+        //   The Firth-adjusted objective adds Phi to the log-likelihood, so the
+        //   REML/LAML gradient gains an extra contribution from d/d rho_k Phi.
+        //
+        //   Using Jacobi's identity:
+        //     d Phi = 0.5 * tr(I^{-1} dI).
+        //   The implicit dependence of I on the parameters introduces the adjoint
+        //   (a "sandwich") term in the trace of dH/d rho_k. We encode this by
+        //   augmenting H^{-1} with Q so that:
+        //     tr(H^{-1} dotH_std)  ->  tr((H^{-1} + Q) dotH_std),
+        //   where:
+        //     Q = H^{-1} V H^{-1}.
+        //
+        //   For logit Jeffreys prior, V is the sensitivity of the Firth penalty
+        //   to hat values and reduces to:
+        //     V = J^T diag(0.5 - mu) J.
+        //
+        //   This choice yields:
+        //     tr(Q * dotH_std) = tr(H^{-1} V H^{-1} dotH_std),
+        //   which is the exact adjoint correction for the Firth term, matching
+        //   the fixed-point objective defined by the Gauss-Newton Hessian H.
+        let mut q_firth = Array2::<f64>::zeros((p_total, p_total));
+        if firth_active {
+            let mut j_weighted = j_mat.clone();
+            for i in 0..n {
+                let nu = 0.5 - mu[i];
+                for j in 0..p_total {
+                    j_weighted[[i, j]] *= nu;
+                }
+            }
+            // V = J^T diag(0.5 - mu) J (implemented as J^T * (diag(nu) J)).
+            let v_mat = crate::calibrate::faer_ndarray::fast_atb(&j_mat, &j_weighted);
+            let y = h_chol.solve_mat(&v_mat);
+            let y_t = y.t().to_owned();
+            let q_t = h_chol.solve_mat(&y_t);
+            q_firth = q_t.t().to_owned();
+        }
+
         // Prepare basis derivatives for constraint sensitivity.
         let Some(knot_vector) = state.knot_vector.as_ref() else {
             return Err(EstimationError::RemlOptimizationFailed(
@@ -2060,6 +2103,20 @@ impl<'a> JointRemlState<'a> {
             0.0
         };
 
+        let mut dot_u = Array1::<f64>::zeros(n);
+        let mut dot_z = Array1::<f64>::zeros(n);
+        let mut dot_eta = Array1::<f64>::zeros(n);
+        let mut w_prime = Array1::<f64>::zeros(n);
+        let mut w_dot = Array1::<f64>::zeros(n);
+        let mut b_dot = Array2::<f64>::zeros((n, n_raw));
+        let mut c_dot = Array2::<f64>::zeros((n, 2));
+        let mut weighted_c_dot = Array2::<f64>::zeros((n, 2));
+        let mut weighted_b = Array2::<f64>::zeros((n, n_raw));
+        let mut weighted_b_dot = Array2::<f64>::zeros((n, n_raw));
+        let mut dot_j_theta = Array2::<f64>::zeros((n, p_link));
+        let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
+        let mut dot_j = Array2::<f64>::zeros((n, p_total));
+
         for k in 0..rho.len() {
             let is_link = k == n_base;
             let lambda_k = if is_link { lambda_link } else { lambda_base[k] };
@@ -2085,22 +2142,22 @@ impl<'a> JointRemlState<'a> {
             let delta_beta = delta.slice(s![..p_base]).to_owned();
             let delta_theta = delta.slice(s![p_base..]).to_owned();
 
-            let dot_u = state.x_base.dot(&delta_beta);
+            dot_u.assign(&state.x_base.dot(&delta_beta));
 
             // dot_z with clamp mask
-            let mut dot_z = Array1::<f64>::zeros(n);
             let inv_rw = 1.0 / range_width;
             for i in 0..n {
                 let zi = z[i];
                 if zi > 0.0 && zi < 1.0 {
                     dot_z[i] = dot_u[i] * inv_rw;
+                } else {
+                    dot_z[i] = 0.0;
                 }
             }
 
-            let dot_eta = j_mat.dot(&delta);
+            dot_eta.assign(&j_mat.dot(&delta));
 
             // w' for logit (clamped)
-            let mut w_prime = Array1::<f64>::zeros(n);
             if matches!(state.link, LinkFunction::Logit) {
                 const PROB_EPS: f64 = 1e-8;
                 const MIN_WEIGHT: f64 = 1e-12;
@@ -2113,15 +2170,16 @@ impl<'a> JointRemlState<'a> {
                         w_prime[i] = state.weights[i] * w_base * (1.0 - 2.0 * mu_i);
                     }
                 }
+            } else {
+                w_prime.fill(0.0);
             }
 
-            let mut w_dot = Array1::<f64>::zeros(n);
             for i in 0..n {
                 w_dot[i] = w_prime[i] * dot_eta[i];
             }
 
             // B_dot = B' * diag(dot_z)
-            let mut b_dot = b_prime.to_owned();
+            b_dot.assign(b_prime);
             for i in 0..n {
                 let scale = dot_z[i];
                 if scale != 1.0 {
@@ -2132,44 +2190,89 @@ impl<'a> JointRemlState<'a> {
             }
 
             // M_dot = C_dot^T W B + C^T W_dot B + C^T W B_dot
-            let mut c_dot = Array2::<f64>::zeros((n, 2));
+            c_dot.fill(0.0);
             for i in 0..n {
                 c_dot[[i, 1]] = dot_z[i];
             }
-            let mut weighted_c_dot = c_dot.clone();
+            weighted_c_dot.assign(&c_dot);
             for i in 0..n {
                 let w = weights[i];
                 weighted_c_dot[[i, 0]] *= w;
                 weighted_c_dot[[i, 1]] *= w;
             }
-            let t1 = crate::calibrate::faer_ndarray::fast_atb(&weighted_c_dot, b_raw);
-
-            let mut weighted_b = b_raw.to_owned();
+            weighted_b.assign(b_raw);
             for i in 0..n {
                 let w = w_dot[i];
                 for j in 0..n_raw {
                     weighted_b[[i, j]] *= w;
                 }
             }
-            let t2 = crate::calibrate::faer_ndarray::fast_atb(&constraint, &weighted_b);
-
-            let mut weighted_b_dot = b_dot.clone();
+            weighted_b_dot.assign(&b_dot);
             for i in 0..n {
                 let w = weights[i];
                 for j in 0..n_raw {
                     weighted_b_dot[[i, j]] *= w;
                 }
             }
-            let t3 = crate::calibrate::faer_ndarray::fast_atb(&constraint, &weighted_b_dot);
+            let mut m_dot = Array2::<f64>::zeros((2, n_raw));
+            {
+                use crate::calibrate::faer_ndarray::{FaerArrayView, array2_to_mat_mut};
+                use faer::linalg::matmul::matmul;
+                use faer::{Accum, Par, get_global_parallelism};
 
-            let m_dot = t1 + t2 + t3;
+                let par = if n < 128 || n_raw < 128 {
+                    Par::Seq
+                } else {
+                    get_global_parallelism()
+                };
+
+                let mut m_dot_view = array2_to_mat_mut(&mut m_dot);
+                
+                // Bind FaerArrayView temporaries to local variables to extend their lifetime
+                let wc_wrapper = FaerArrayView::new(&weighted_c_dot);
+                let wc_view = wc_wrapper.as_ref();
+                let b_wrapper = FaerArrayView::new(b_raw);
+                let b_view = b_wrapper.as_ref();
+                let c_wrapper = FaerArrayView::new(&constraint);
+                let c_view = c_wrapper.as_ref();
+                let wb_wrapper = FaerArrayView::new(&weighted_b);
+                let wb_view = wb_wrapper.as_ref();
+                let wbdot_wrapper = FaerArrayView::new(&weighted_b_dot);
+                let wbdot_view = wbdot_wrapper.as_ref();
+
+                matmul(
+                    m_dot_view.as_mut(),
+                    Accum::Replace,
+                    wc_view.transpose(),
+                    b_view,
+                    1.0,
+                    par,
+                );
+                matmul(
+                    m_dot_view.as_mut(),
+                    Accum::Add,
+                    c_view.transpose(),
+                    wb_view,
+                    1.0,
+                    par,
+                );
+                matmul(
+                    m_dot_view.as_mut(),
+                    Accum::Add,
+                    c_view.transpose(),
+                    wbdot_view,
+                    1.0,
+                    par,
+                );
+            }
             let z_dot = -m_pinv.dot(&crate::calibrate::faer_ndarray::fast_ab(
                 &m_dot,
                 link_transform,
             ));
 
-            let mut dot_j_theta =
-                crate::calibrate::faer_ndarray::fast_ab(&b_dot, link_transform);
+            dot_j_theta.assign(
+                &crate::calibrate::faer_ndarray::fast_ab(&b_dot, link_transform),
+            );
             dot_j_theta += &crate::calibrate::faer_ndarray::fast_ab(b_raw, &z_dot);
 
             // dot_g_prime
@@ -2190,7 +2293,7 @@ impl<'a> JointRemlState<'a> {
             }
 
             // dot_J_beta = diag(dot_g_prime) X
-            let mut dot_j_beta = Array2::<f64>::zeros((n, p_base));
+            dot_j_beta.fill(0.0);
             for i in 0..n {
                 let scale = dot_g_prime[i];
                 for j in 0..p_base {
@@ -2199,7 +2302,7 @@ impl<'a> JointRemlState<'a> {
             }
 
             // dot_J = [dot_J_beta | dot_J_theta]
-            let mut dot_j = Array2::<f64>::zeros((n, p_total));
+            dot_j.fill(0.0);
             dot_j.slice_mut(s![.., ..p_base]).assign(&dot_j_beta);
             dot_j.slice_mut(s![.., p_base..]).assign(&dot_j_theta);
             // Trace for likelihood curvature: 2 tr(K_w * dot_J) + tr(diag(J H^{-1} J^T) * W_dot)
@@ -2247,6 +2350,105 @@ impl<'a> JointRemlState<'a> {
                     }
                 }
                 trace += lambda_link * trace_penalty;
+            }
+
+            // Firth adjoint correction: add tr(Q * dotH_std) for logit Firth.
+            //
+            // dotH_std is the directional derivative of the standard Hessian:
+            //   dotH_std = dotJ^T W J + J^T W dotJ + J^T W_dot J + dotS_lambda
+            // where dotS_lambda includes the penalty manifold sensitivity of the link block.
+            if firth_active {
+                // dotH_std = dotJ^T W J + J^T W dotJ + J^T W_dot J, with penalty sensitivity added to theta block.
+                let mut dot_h_std = Array2::<f64>::zeros((p_total, p_total));
+                {
+                    use crate::calibrate::faer_ndarray::{FaerArrayView, array2_to_mat_mut};
+                    use faer::linalg::matmul::matmul;
+                    use faer::{Accum, Par, get_global_parallelism};
+
+                    let par = if n < 128 || p_total < 128 {
+                        Par::Seq
+                    } else {
+                        get_global_parallelism()
+                    };
+                    let mut dot_h_view = array2_to_mat_mut(&mut dot_h_std);
+
+                    let mut wj = j_mat.clone();
+                    for i in 0..n {
+                        let w = weights[i];
+                        for j in 0..p_total {
+                            wj[[i, j]] *= w;
+                        }
+                    }
+                    let mut wdotj = j_mat.clone();
+                    for i in 0..n {
+                        let w = w_dot[i];
+                        for j in 0..p_total {
+                            wdotj[[i, j]] *= w;
+                        }
+                    }
+                    let mut wdotj2 = dot_j.clone();
+                    for i in 0..n {
+                        let w = weights[i];
+                        for j in 0..p_total {
+                            wdotj2[[i, j]] *= w;
+                        }
+                    }
+
+                    // Bind FaerArrayView temporaries to local variables to extend their lifetime
+                    let dj_wrapper = FaerArrayView::new(&dot_j);
+                    let dj_view = dj_wrapper.as_ref();
+                    let wj_wrapper = FaerArrayView::new(&wj);
+                    let wj_view = wj_wrapper.as_ref();
+                    let j_wrapper = FaerArrayView::new(&j_mat);
+                    let j_view = j_wrapper.as_ref();
+                    let wdotj_wrapper = FaerArrayView::new(&wdotj);
+                    let wdotj_view = wdotj_wrapper.as_ref();
+                    let wdotj2_wrapper = FaerArrayView::new(&wdotj2);
+                    let wdotj2_view = wdotj2_wrapper.as_ref();
+
+                    matmul(
+                        dot_h_view.as_mut(),
+                        Accum::Replace,
+                        dj_view.transpose(),
+                        wj_view,
+                        1.0,
+                        par,
+                    );
+                    matmul(
+                        dot_h_view.as_mut(),
+                        Accum::Add,
+                        j_view.transpose(),
+                        wdotj2_view,
+                        1.0,
+                        par,
+                    );
+                    matmul(
+                        dot_h_view.as_mut(),
+                        Accum::Add,
+                        j_view.transpose(),
+                        wdotj_view,
+                        1.0,
+                        par,
+                    );
+                }
+
+                // Add penalty manifold sensitivity into dotH_std theta block.
+                if p_link > 0 && v_pen.nrows() == n_raw {
+                    let left = crate::calibrate::faer_ndarray::fast_atb(&z_dot, &v_pen);
+                    let right = crate::calibrate::faer_ndarray::fast_atb(&v_pen, &z_dot);
+                    let dot_s_link = left + right;
+                    let mut link_block = dot_h_std.slice_mut(s![p_base.., p_base..]);
+                    link_block += &dot_s_link.mapv(|v| v * lambda_link);
+                }
+
+                // Accumulate tr(Q * dotH_std) = sum_ij Q_ij * dotH_std_ji.
+                let mut trace_q = 0.0;
+                for i in 0..p_total {
+                    for j in 0..p_total {
+                        trace_q += q_firth[[i, j]] * dot_h_std[[j, i]];
+                    }
+                }
+                trace += trace_q;
             }
 
 
@@ -2300,10 +2502,10 @@ impl<'a> JointRemlState<'a> {
                             }
                             let rel = diff_norm.sqrt() / (fd_norm.sqrt() + 1.0);
                             if rel > GRAD_FD_REL_TOL {
-                                eprintln!(
-                                    "[JOINT][REML] Analytic/FD gradient mismatch (rel {:.3e}); keeping analytic.",
+                                return Err(EstimationError::RemlOptimizationFailed(format!(
+                                    "Analytic/FD gradient mismatch (rel {:.3e}) in joint REML.",
                                     rel
-                                );
+                                )));
                             }
                         }
                         Err(err) => {
@@ -2318,6 +2520,22 @@ impl<'a> JointRemlState<'a> {
                 self.compute_gradient_fd(rho)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn compute_gradient_analytic_for_test(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        self.compute_gradient_analytic(rho).map(|(grad, _)| grad)
+    }
+
+    #[cfg(test)]
+    pub fn compute_gradient_fd_for_test(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        self.compute_gradient_fd(rho)
     }
 
     /// Combined cost and gradient for BFGS
@@ -2969,6 +3187,8 @@ pub fn predict_joint_from_base_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     
     #[test]
     fn test_joint_model_state_creation() {
@@ -3102,5 +3322,69 @@ mod tests {
         for i in 0..3 {
             assert!((eff_se[i] - se_base[i]).abs() < 0.1);
         }
+    }
+
+    #[test]
+    fn test_joint_analytic_gradient_matches_fd() {
+        let n = 120;
+        let p = 6;
+        let mut rng = StdRng::seed_from_u64(123);
+
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[[i, j]] = rng.gen_range(-1.0..1.0);
+            }
+        }
+
+        let mut beta_true = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            beta_true[j] = rng.gen_range(-0.5..0.5);
+        }
+        let eta = x.dot(&beta_true);
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mu = 1.0 / (1.0 + (-eta[i]).exp());
+            y[i] = if rng.gen::<f64>() < mu { 1.0 } else { 0.0 };
+        }
+
+        let weights = Array1::ones(n);
+        let s = vec![Array2::eye(p)];
+        let layout = ModelLayout::external(p, 1);
+        let config = JointModelConfig::default();
+        let quad_ctx = QuadratureContext::new();
+
+        let reml_state = JointRemlState::new(
+            y.view(),
+            weights.view(),
+            x.view(),
+            s,
+            layout,
+            LinkFunction::Logit,
+            &config,
+            None,
+            quad_ctx,
+        );
+
+        let rho = Array1::<f64>::zeros(2);
+        let grad_analytic = reml_state
+            .compute_gradient_analytic_for_test(&rho)
+            .expect("analytic gradient");
+        let grad_fd = reml_state
+            .compute_gradient_fd_for_test(&rho)
+            .expect("fd gradient");
+
+        let mut diff_norm = 0.0;
+        let mut fd_norm = 0.0;
+        for i in 0..grad_fd.len() {
+            let d = grad_analytic[i] - grad_fd[i];
+            diff_norm += d * d;
+            fd_norm += grad_fd[i] * grad_fd[i];
+        }
+        let rel = diff_norm.sqrt() / (fd_norm.sqrt().max(1.0));
+        assert!(
+            rel < 1e-2,
+            "analytic/FD gradient mismatch: rel={rel:.3e}"
+        );
     }
 }

@@ -4175,6 +4175,15 @@ pub mod internal {
         pirls_result: Arc<PirlsResult>,
         h_eff: Arc<Array2<f64>>,
         ridge_used: f64,
+        /// The exact H_total matrix used for LAML cost computation.
+        /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
+        h_total: Arc<Array2<f64>>,
+        /// The Cholesky factorization of h_total. Gradient MUST use this
+        /// exact factor to ensure mathematical consistency with cost.
+        h_total_factor: Arc<FaerFactor>,
+        /// Precomputed log|h_total| for the cost function.
+        /// Stored because faer factors don't expose the L matrix directly.
+        h_total_log_det: f64,
     }
 
     impl EvalShared {
@@ -4874,11 +4883,65 @@ pub mod internal {
         ) -> Result<EvalShared, EstimationError> {
             let pirls_result = self.execute_pirls_if_needed(rho)?;
             let (h_eff, ridge_used) = self.effective_hessian(pirls_result.as_ref())?;
+            
+            // Compute h_total: the exact Hessian used for log|H| in the cost function.
+            // For Firth: h_total = h_eff - h_phi (subtract Firth curvature)
+            // For non-Firth: h_total = h_eff
+            let h_total = if self.config.firth_bias_reduction
+                && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit)
+            {
+                match self.firth_hessian_logit(
+                    &pirls_result.x_transformed,
+                    &pirls_result.solve_mu,
+                    &pirls_result.solve_weights,
+                ) {
+                    Ok(h_phi) => {
+                        let mut h_total = h_eff.clone();
+                        h_total -= &h_phi;
+                        h_total
+                    }
+                    Err(_) => h_eff.clone(), // Fallback to h_eff if h_phi fails
+                }
+            } else {
+                h_eff.clone()
+            };
+            
+            // Compute log|h_total| using ndarray Cholesky BEFORE creating faer factor.
+            // This gives us the log-determinant in a portable way.
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let h_total_log_det = match h_total.clone().cholesky(Side::Lower) {
+                Ok(chol) => 2.0 * chol.diag().mapv(f64::ln).sum(),
+                Err(_) => {
+                    // Fallback: use eigenvalue approach for potentially indefinite matrix
+                    let eigs = h_total.clone().eigh(Side::Lower)
+                        .ok()
+                        .map(|(vals, _)| vals.iter().filter(|&&v| v > 1e-12).map(|v| v.ln()).sum())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    eigs
+                }
+            };
+            
+            // Factorize h_total ONCE. This is the "Hessian Passport" that gradient MUST use.
+            let h_total_factor = {
+                let h_view = FaerArrayView::new(&h_total);
+                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                    Arc::new(FaerFactor::Llt(f))
+                } else if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                    Arc::new(FaerFactor::Ldlt(f))
+                } else {
+                    // Last resort: use the RidgePlanner
+                    self.get_faer_factor(rho, &h_total)
+                }
+            };
+            
             Ok(EvalShared {
                 key,
                 pirls_result,
                 h_eff: Arc::new(h_eff),
                 ridge_used,
+                h_total: Arc::new(h_total),
+                h_total_factor,
+                h_total_log_det,
             })
         }
 
@@ -6253,45 +6316,11 @@ pub mod internal {
                     )?;
 
                     // Log-determinant of the effective Hessian.
-                    // For Firth bias reduction, use H_total = H_eff - H_phi to match gradient.
-                    // For non-Firth, use H_eff = X'WX + S_λ directly.
-                    //
-                    // Note: Both cost and gradient must use the same Hessian for consistency.
-                    // Firth models use H_total = X'WX + S_λ - H_phi (where H_phi is the
-                    // curvature from the Jeffreys prior).
-                    let h_for_det = if self.config.firth_bias_reduction
-                        && matches!(self.config.link_function().expect("link_function called on survival model"), LinkFunction::Logit)
-                    {
-                        // Compute H_phi (Firth curvature) and subtract from h_eff
-                        // NOTE: Uses pure Fisher info (no ridge) per Firth definition
-                        match self.firth_hessian_logit(
-                            &pirls_result.x_transformed,
-                            &pirls_result.solve_mu,
-                            &pirls_result.solve_weights,
-                        ) {
-                            Ok(h_phi) => {
-                                let mut h_total = h_eff.clone();
-                                h_total -= &h_phi;
-                                h_total
-                            }
-                            Err(_) => h_eff.clone(), // Fallback to h_eff if H_phi fails
-                        }
-                    } else {
-                        h_eff.clone()
-                    };
-
-                    let chol = h_for_det.clone().cholesky(Side::Lower).map_err(|_| {
-                        let min_eig = h_for_det
-                            .clone()
-                            .eigh(Side::Lower)
-                            .ok()
-                            .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                            .unwrap_or(f64::NAN);
-                        EstimationError::HessianNotPositiveDefinite {
-                            min_eigenvalue: min_eig,
-                        }
-                    })?;
-                    let log_det_h = 2.0 * chol.diag().mapv(f64::ln).sum();
+                    // HESSIAN PASSPORT: Use the pre-computed h_total and its factorization
+                    // from the bundle to ensure exact consistency with gradient computation.
+                    // For Firth: h_total = h_eff - h_phi (computed in prepare_eval_bundle)
+                    // For non-Firth: h_total = h_eff
+                    let log_det_h = bundle.h_total_log_det;
 
                     // The LAML score is Lp + 0.5*log|S| - 0.5*log|H| + Mp/2*log(2πφ)
                     // Mp is null space dimension (number of unpenalized coefficients)
@@ -7115,44 +7144,24 @@ pub mod internal {
                         // For Firth bias reduction, compute the exact Hessian:
                         // H_total = h_eff - H_phi where H_phi is the Firth curvature matrix.
                         // For non-Firth, H_total = h_eff.
-                        // NOTE: h_eff already includes any stabilization ridge from PIRLS.
-                        let (h_for_factor, h_phi_opt) = if self.config.firth_bias_reduction {
-                            if let LinkFunction::Logit = self.config.link_function().expect("link fn") {
-                                match self.firth_hessian_logit(
-                                    &pirls_result.x_transformed,
-                                    &pirls_result.solve_mu,
-                                    &pirls_result.solve_weights,
-                                ) {
-                                    Ok(h_phi) => {
-                                        let mut h_total = h_eff.clone();
-                                        h_total -= &h_phi;
-                                        (h_total, Some(h_phi))
-                                    }
-                                    Err(_) => {
-                                        // Fallback to approximate if H_phi computation fails
-                                        (h_eff.clone(), None)
-                                    }
-                                }
-                            } else {
-                                (h_eff.clone(), None)
-                            }
+                        //
+                        // HESSIAN PASSPORT: Use the EXACT same h_total and factorization
+                        // that was used in the cost function computation. This ensures
+                        // mathematical consistency between cost and gradient.
+                        let h_for_factor = bundle.h_total.as_ref();
+                        let h_phi_opt: Option<()> = if self.config.firth_bias_reduction
+                            && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit)
+                        {
+                            Some(()) // Signal that Firth is active (h_phi already subtracted in bundle)
                         } else {
-                            (h_eff.clone(), None)
+                            None
                         };
 
                         // P-IRLS already folded any stabilization ridge into h_eff.
 
-                        // Use the exact Hessian factorization for the log|H| trace term.
-                        // For Firth: factor H_total = h_eff - H_phi (exact) directly without cache,
-                        // since the cache keys by ρ only and would return the wrong h_eff factor.
-                        // For non-Firth: use cached h_eff factor as before.
-                        let factor_g = if self.config.firth_bias_reduction && h_phi_opt.is_some() {
-                            // Bypass cache for Firth - different matrix than h_eff
-                            Arc::new(self.factorize_faer(&h_for_factor))
-                        } else {
-                            // Non-Firth: use cache with h_eff
-                            self.get_faer_factor(p, h_eff)
-                        };
+                        // Use the cached factorization from the bundle - DO NOT refactorize.
+                        // This is the "Hessian Passport" that guarantees consistency.
+                        let factor_g = Arc::clone(&bundle.h_total_factor);
                         let factor_imp: Option<FaerFactor> = None;
 
                         // Compute trace(H^{-1} S_k) using the same reparameterized penalty
