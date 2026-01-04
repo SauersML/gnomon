@@ -1545,7 +1545,7 @@ fn compute_firth_h_phi(
     // M_mid_ij = u_i * (h_hat_ij^2) * u_j
     
     // T2 = X^T M_mid X
-    let mut t2 = Array2::zeros((p, p));
+    let mut t2 = Array2::<f64>::zeros((p, p));
     for i in 0..n {
         for j in 0..n {
             let m_val = u[i] * (h_hat[[i, j]] * h_hat[[i, j]]) * u[j];
