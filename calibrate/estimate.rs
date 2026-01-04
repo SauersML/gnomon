@@ -7191,9 +7191,9 @@ pub mod internal {
 
                         // P-IRLS already folded any stabilization ridge into h_eff.
 
-                        // Create local factor_g for legacy/fallback paths.
-                        // Ideally these paths should also be updated to use pseudoinverse,
-                        // but for now we maintain them for non-Firth/fallback cases.
+                        // Create local factor_g for the non-Firth path and Firth fallback.
+                        // The non-Firth path intentionally uses full-rank Cholesky (not pseudoinverse)
+                        // because truncation caused gradient mismatch (see logh_beta_grad_logit).
                         let factor_g = {
                             let h_total = bundle.h_total.as_ref();
                              let h_view = FaerArrayView::new(h_total);
