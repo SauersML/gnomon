@@ -13,6 +13,7 @@ import Mathlib.LinearAlgebra.Matrix.PosDef
 import Mathlib.LinearAlgebra.Matrix.ToLin
 import Mathlib.LinearAlgebra.Dimension.OrzechProperty
 import Mathlib.Data.Matrix.Basic
+import Mathlib.Data.Matrix.Mul
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
 import Mathlib.MeasureTheory.Constructions.Pi
@@ -1228,7 +1229,53 @@ lemma transpose_mul_self_posDef {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintyp
   -- Show: dotProduct' (XᵀX).mulVec v v = ‖Xv‖² > 0
   -- The key is: (XᵀX).mulVec v = Xᵀ(Xv), so vᵀ(XᵀX)v = (Xv)ᵀ(Xv) = ‖Xv‖²
   -- Since Xv ≠ 0, we have ‖Xv‖² > 0
-  sorry -- dotProduct' vᵀ(XᵀX)v = ‖Xv‖² > 0 by Hilbert space norm property
+
+  -- Step 1: Expand (Xᵀ * X).mulVec v to Xᵀ.mulVec (X.mulVec v)
+  have h_expand : (Matrix.transpose X * X).mulVec v =
+                  (Matrix.transpose X).mulVec (X.mulVec v) := by
+    simp only [Matrix.mulVec_mulVec]
+
+  -- Step 2: Use the transpose-dot identity to simplify the quadratic form
+  -- dotProduct' (Xᵀ.mulVec w) v = dotProduct' w (X.mulVec v)
+  -- This is our sum_mulVec_mul_eq_sum_mul_transpose_mulVec but need rectangular version
+
+  -- For rectangular matrices, we use the Mathlib identity directly:
+  -- v ⬝ᵥ (A.mulVec w) = (v ᵥ* A) ⬝ᵥ w = (Aᵀ.mulVec v) ⬝ᵥ w
+  unfold dotProduct'
+  rw [h_expand]
+  -- Goal: 0 < ∑ j, (Xᵀ.mulVec (X.mulVec v)) j * v j
+  -- We'll show this equals ∑ i, (X.mulVec v) i * (X.mulVec v) i > 0
+
+  -- First, swap multiplication to get dotProduct form
+  have h_swap : (Finset.univ.sum fun j => (Matrix.transpose X).mulVec (X.mulVec v) j * v j) =
+                (Finset.univ.sum fun j => v j * (Matrix.transpose X).mulVec (X.mulVec v) j) := by
+    congr 1; ext j; ring
+  rw [h_swap]
+
+  -- This sum is v ⬝ᵥ (Xᵀ.mulVec (X.mulVec v))
+  -- Using dotProduct_mulVec: v ⬝ᵥ (A *ᵥ w) = (v ᵥ* A) ⬝ᵥ w
+  -- And vecMul_transpose: v ᵥ* Aᵀ = A *ᵥ v
+  have h_dotProduct_eq : (Finset.univ.sum fun j => v j * (Matrix.transpose X).mulVec (X.mulVec v) j) =
+                         dotProduct v ((Matrix.transpose X).mulVec (X.mulVec v)) := rfl
+  rw [h_dotProduct_eq, Matrix.dotProduct_mulVec, Matrix.vecMul_transpose]
+
+  -- Now we have: (X.mulVec v) ⬝ᵥ (X.mulVec v) = ∑ i, (X.mulVec v)_i²
+  -- This is a sum of squares, positive when nonzero
+  rw [dotProduct]
+  apply Finset.sum_pos'
+  · intro i _
+    exact mul_self_nonneg _
+  · -- There exists some i where (X.mulVec v) i ≠ 0
+    by_contra h_all_zero
+    push_neg at h_all_zero
+    apply h_Xv_ne
+    ext i
+    -- h_all_zero : ∀ i ∈ Finset.univ, (X.mulVec v) i * (X.mulVec v) i ≤ 0
+    have hi := h_all_zero i (Finset.mem_univ i)
+    -- From a * a ≤ 0 and 0 ≤ a * a, we get a * a = 0, hence a = 0
+    have h_ge : 0 ≤ (X.mulVec v) i * (X.mulVec v) i := mul_self_nonneg _
+    have h_zero : (X.mulVec v) i * (X.mulVec v) i = 0 := le_antisymm hi h_ge
+    exact mul_self_eq_zero.mp h_zero
 
 /-- The penalized Gaussian loss as a quadratic function of parameters. -/
 noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
