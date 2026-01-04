@@ -397,7 +397,18 @@ impl<'a> JointModelState<'a> {
                     constraint[[i, 1]] = z[i];    // linear term
                 }
                 
-                // Apply orthogonality constraint: wiggle ⟂ {1, z}
+                // Apply weighted orthogonality constraint: wiggle ⟂ {1, z}.
+                //
+                // We utilize "Fixed-Anchor" backfitting here by strictly using the fixed prior weights
+                // (self.weights) for the orthogonality metric, rather than the dynamic IRLS weights.
+                //
+                // The analytic gradient of the Joint Model assumes that prediction eta = X*beta + B*Z*theta,
+                // where the basis constraint matrix Z is constant with respect to beta.
+                // If we used dynamic weights W(beta), then Z would depend on beta, adding a term:
+                //   d(eta)/d(beta)_extra = B * (dZ/dW * dW/d(beta)) * theta
+                // This term is non-zero for Logit models (where W depends on mu) but zero for Identity.
+                //
+                // By fixing the metric to the prior weights, we ensure dZ/d(beta) = 0
                 match apply_weighted_orthogonality_constraint(
                     bspline_basis.view(),
                     constraint.view(),
@@ -2177,7 +2188,12 @@ impl<'a> JointRemlState<'a> {
                 w_dot[i] = w_prime[i] * dot_eta[i];
             }
 
-            // M_dot = C_dot^T W B + C^T W B_dot (W_dot is zero for fixed constraint metric)
+            // M_dot = C_dot^T W B + C^T W B_dot.
+            //
+            // Since we use fixed prior weights to define the constraint Z (dZ/d(beta) = 0),
+            // the term involving the derivative of the weights (C^T W_dot B) vanishes from the
+            // constraint sensitivity calculation. We explicitly use the fixed weights here
+            // to match the definition of Z in build_link_basis.
             c_dot.fill(0.0);
             for i in 0..n {
                 c_dot[[i, 1]] = dot_z[i];
