@@ -2363,15 +2363,15 @@ impl VcfLikeVariantBlockSource {
             Some(VariantFormat::Vcf) => {
                 let info = self.vcf_record.info();
 
-                // Try R2 first (minimac, Michigan Imputation Server)
-                if let Some(quality) = Self::get_info_float(&info, header, "R2") {
+                // Try DR2 first (BEAGLE style)
+                if let Some(quality) = Self::get_info_float(&info, header, "DR2") {
                     if quality.is_finite() {
                         return quality.clamp(0.0, 1.0);
                     }
                     return 0.0; // Conservative fallback for NaN/Inf
                 }
-                // Try DR2 (BEAGLE style)
-                if let Some(quality) = Self::get_info_float(&info, header, "DR2") {
+                // Try R2 (minimac, Michigan Imputation Server)
+                if let Some(quality) = Self::get_info_float(&info, header, "R2") {
                     if quality.is_finite() {
                         return quality.clamp(0.0, 1.0);
                     }
@@ -2395,8 +2395,35 @@ impl VcfLikeVariantBlockSource {
                 1.0
             }
             Some(VariantFormat::Bcf) => {
-                // BCF INFO parsing would follow similar pattern
-                // For now, return 1.0 (hard call)
+                let info = self.bcf_record.info();
+
+                // Try DR2 first (BEAGLE style)
+                if let Some(quality) = Self::get_info_float(&info, header, "DR2") {
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0;
+                }
+                // Try R2 (minimac, Michigan Imputation Server)
+                if let Some(quality) = Self::get_info_float(&info, header, "R2") {
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0;
+                }
+                // Try INFO (some pipelines use this key)
+                if let Some(quality) = Self::get_info_float(&info, header, "INFO") {
+                    if quality.is_finite() {
+                        return quality.clamp(0.0, 1.0);
+                    }
+                    return 0.0;
+                }
+                // Check if 'IMP' flag is present (indicating Imputed data)
+                if info.get(header, "IMP").is_some() {
+                    return 0.0;
+                }
+
+                // No IMP flag -> Assume Genotyped (hard call)
                 1.0
             }
             None => 1.0,

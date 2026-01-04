@@ -21,8 +21,8 @@ import requests
 import re
 
 JULES_API_URL = "https://jules.googleapis.com"
-MAX_RETRIES = 3  # Number of retries for Jules API failures
-RETRY_DELAY = 30  # Seconds between retries
+MAX_RETRIES = 2  # Number of retries for Jules API failures
+RETRY_DELAY = 60  # Seconds between retries
 
 
 def strip_ansi(text):
@@ -177,7 +177,7 @@ def call_jules(prompt, attempt=1):
     session_name = session["name"]
     print(f"Session created: {session_name}")
 
-    max_polls = 60  # 10 minutes of polling
+    max_polls = 180  # 30 minutes of polling
     seen_ids = set()
 
     for i in range(max_polls):
@@ -236,9 +236,16 @@ def call_jules(prompt, attempt=1):
                     if "pullRequest" in art:
                         pr = art["pullRequest"]
                         print(f"Pull Request: {pr.get('title')} - {pr.get('url')}")
+                        # If Jules created a PR directly, we're done
+                        return "PR_CREATED"
 
             if "sessionCompleted" in act:
                 print("Session Completed.")
+                # Session completed - return whatever we have (or None if no changeset)
+                if latest_changeset:
+                    return latest_changeset
+                print("Session completed but no ChangeSet was produced.")
+                return None
 
         if latest_changeset:
             return latest_changeset
@@ -295,6 +302,11 @@ def main():
 
     if not changeset:
         print("\nJules failed to produce a changeset after all retries.")
+        sys.exit(0)
+
+    # If Jules created a PR directly, we're done
+    if changeset == "PR_CREATED":
+        print("\nJules created a PR directly. Nothing more to do.")
         sys.exit(0)
 
     patch = changeset.get("gitPatch", {}).get("unidiffPatch")

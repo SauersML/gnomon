@@ -43,8 +43,9 @@ impl OutputMode {
             return Self::Ci;
         }
 
-        // Check for Jupyter/notebook environments - treat as CI for now
-        // (periodic log lines work well in notebook output cells)
+        // Jupyter/notebook environments: use periodic log lines (same as CI).
+        // This is intentional - notebooks render log output in cells much better
+        // than animated progress bars, which would produce visual noise.
         if env::var("JPY_PARENT_PID").is_ok() || env::var("JUPYTER_RUNTIME_DIR").is_ok() {
             return Self::Ci;
         }
@@ -689,6 +690,50 @@ impl FitProgressObserver for CiFitProgress {
     }
 }
 
+/// Minimal progress observer for quiet/piped output.
+///
+/// Only logs stage start and completion - no intermediate progress updates.
+/// Suitable for piped/redirected output where minimal noise is desired.
+pub struct QuietFitProgress;
+
+impl QuietFitProgress {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for QuietFitProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FitProgressObserver for QuietFitProgress {
+    fn on_stage_start(&self, stage: FitProgressStage, total_variants: usize) {
+        let stage_name = match stage {
+            FitProgressStage::AlleleStatistics => "Estimating allele statistics",
+            FitProgressStage::LdWeights => "Computing LD weights",
+            FitProgressStage::GramMatrix => "Accumulating Gram matrix",
+            FitProgressStage::Loadings => "Computing variant loadings",
+        };
+        if total_variants > 0 {
+            println!("[PCA] {}... ({} variants)", stage_name, total_variants);
+        } else {
+            println!("[PCA] {}...", stage_name);
+        }
+    }
+
+    fn on_stage_finish(&self, stage: FitProgressStage) {
+        let stage_name = match stage {
+            FitProgressStage::AlleleStatistics => "allele statistics",
+            FitProgressStage::LdWeights => "LD weights",
+            FitProgressStage::GramMatrix => "Gram matrix",
+            FitProgressStage::Loadings => "loadings",
+        };
+        println!("[PCA] Completed {}.", stage_name);
+    }
+}
+
 enum ProjectionStageBar {
     Determinate {
         total: u64,
@@ -924,6 +969,7 @@ impl Drop for ConsoleProjectionProgress {
 pub enum AdaptiveFitProgress {
     Terminal(ConsoleFitProgress),
     Ci(CiFitProgress),
+    Quiet(QuietFitProgress),
 }
 
 impl FitProgressObserver for AdaptiveFitProgress {
@@ -931,6 +977,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_start(stage, total_variants),
             Self::Ci(p) => p.on_stage_start(stage, total_variants),
+            Self::Quiet(p) => p.on_stage_start(stage, total_variants),
         }
     }
 
@@ -938,6 +985,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_estimate(stage, estimated_total),
             Self::Ci(p) => p.on_stage_estimate(stage, estimated_total),
+            Self::Quiet(p) => p.on_stage_estimate(stage, estimated_total),
         }
     }
 
@@ -945,6 +993,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_advance(stage, processed_variants),
             Self::Ci(p) => p.on_stage_advance(stage, processed_variants),
+            Self::Quiet(p) => p.on_stage_advance(stage, processed_variants),
         }
     }
 
@@ -952,6 +1001,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_total(stage, total_variants),
             Self::Ci(p) => p.on_stage_total(stage, total_variants),
+            Self::Quiet(p) => p.on_stage_total(stage, total_variants),
         }
     }
 
@@ -959,6 +1009,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_finish(stage),
             Self::Ci(p) => p.on_stage_finish(stage),
+            Self::Quiet(p) => p.on_stage_finish(stage),
         }
     }
 
@@ -971,6 +1022,7 @@ impl FitProgressObserver for AdaptiveFitProgress {
         match self {
             Self::Terminal(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
             Self::Ci(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
+            Self::Quiet(p) => p.on_stage_bytes(stage, processed_bytes, total_bytes),
         }
     }
 }
@@ -979,12 +1031,12 @@ impl FitProgressObserver for AdaptiveFitProgress {
 ///
 /// - In terminals: Returns animated progress bars via `indicatif`
 /// - In CI/GHA: Returns periodic log lines (throttled to ~20 per stage)
-/// - In quiet mode: Returns minimal periodic output
+/// - In quiet mode: Returns start/finish messages only (no intermediate progress)
 pub fn fit_progress() -> Arc<AdaptiveFitProgress> {
     match OutputMode::detect() {
         OutputMode::Terminal => Arc::new(AdaptiveFitProgress::Terminal(ConsoleFitProgress::new())),
         OutputMode::Ci => Arc::new(AdaptiveFitProgress::Ci(CiFitProgress::new())),
-        OutputMode::Quiet => Arc::new(AdaptiveFitProgress::Ci(CiFitProgress::new())), // Same as CI for now
+        OutputMode::Quiet => Arc::new(AdaptiveFitProgress::Quiet(QuietFitProgress::new())),
     }
 }
 

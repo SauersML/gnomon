@@ -48,7 +48,7 @@ use crate::calibrate::seeding::{generate_rho_candidates, SeedConfig, SeedStrateg
 use crate::calibrate::visualizer;
 
 // Ndarray and faer linear algebra helpers
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
     array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
@@ -4243,11 +4243,48 @@ pub mod internal {
         /// The exact H_total matrix used for LAML cost computation.
         /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
         h_total: Arc<Array2<f64>>,
-        /// The Cholesky factorization of h_total. Gradient MUST use this
-        /// exact factor to ensure mathematical consistency with cost.
+
+        // ══════════════════════════════════════════════════════════════════════
+        // WHY TWO INVERSES? (Hybrid Approach for Indefinite Hessians)
+        // ══════════════════════════════════════════════════════════════════════
+        //
+        // The LAML gradient has two terms requiring DIFFERENT matrix inverses:
+        //
+        // 1. TRACE TERM (∂/∂ρ log|H|): Uses PSEUDOINVERSE H₊†
+        //    - Cost defines log|H| = Σᵢ log(λᵢ) for λᵢ > ε only (truncated)
+        //    - Derivative: ∂J/∂ρ = ½ tr(H₊† ∂H/∂ρ)
+        //    - H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ for positive λᵢ only
+        //    - Negative eigenvalues contribute 0 to cost, so derivative must be 0
+        //
+        // 2. IMPLICIT TERM (dβ/dρ): Uses RIDGED FACTOR (H + δI)⁻¹
+        //    - PIRLS stabilizes indefinite H by adding ridge: solves (H + δI)β = ...
+        //    - Stationarity condition: G(β,ρ) = ∇L + δβ = 0
+        //    - By Implicit Function Theorem: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
+        //    - Must use ridged inverse because β moves on the RIDGED surface
+        //
+        // EXAMPLE: H = -5 (indefinite), ridge δ = 10
+        //   Trace term: Pseudoinverse → 0 (correct: truncated eigenvalue)
+        //               Ridged inverse → 0.2 (WRONG: gradient of non-existent curve)
+        //   Implicit term: Ridged inverse → 1/5 (correct: solver sees stiffness +5)
+        //                  Pseudoinverse → 0 or ∞ (WRONG: ignores ridge physics)
+        //
+        // ══════════════════════════════════════════════════════════════════════
+
+        /// Factorization of h_total (with ridge if needed) for solving linear systems.
+        /// Used for IMPLICIT derivative: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
+        /// This captures the actual curvature surface that PIRLS optimizes over.
         h_total_factor: Arc<FaerFactor>,
-        /// Precomputed log|h_total| for the cost function.
-        /// Stored because faer factors don't expose the L matrix directly.
+
+        /// Pseudoinverse of H_total from positive eigenvalues only: H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ
+        /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
+        h_pseudoinverse: Arc<Array2<f64>>,
+
+        /// Spectral factor W where H₊† = W Wᵀ and W = U_valid * diag(1/√λ_valid).
+        /// Shape: (p × rank) where rank = number of positive eigenvalues.
+        /// Used for computing ∇_β log|H₊| via M = X W Wᵀ Xᵀ = (XW)(XW)ᵀ
+        spectral_factor_w: Arc<Array2<f64>>,
+
+        /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
     }
 
@@ -4971,34 +5008,79 @@ pub mod internal {
                 h_eff.clone()
             };
             
-            // Compute log|h_total| using ndarray Cholesky BEFORE creating faer factor.
-            // This gives us the log-determinant in a portable way.
-            use crate::calibrate::faer_ndarray::FaerCholesky;
-            let h_total_log_det = match h_total.clone().cholesky(Side::Lower) {
-                Ok(chol) => 2.0 * chol.diag().mapv(f64::ln).sum(),
-                Err(_) => {
-                    // Fallback: use eigenvalue approach for potentially indefinite matrix
-                    let eigs = h_total.clone().eigh(Side::Lower)
-                        .ok()
-                        .map(|(vals, _)| vals.iter().filter(|&&v| v > 1e-12).map(|v| v.ln()).sum())
-                        .unwrap_or(f64::NEG_INFINITY);
-                    eigs
+            // Perform Eigendecomposition to ensure spectral consistency between Cost and Gradient.
+            // Cost = sum(log(lambda)) for lambda > epsilon
+            // Gradient = tr(H_plus_dagger * dH)
+            
+            // We use Faer's self-adjoint eigendecomposition
+            // Optimization: eigh borrows self, so we removed clone().
+            let (eigvals, eigvecs) = match h_total.eigh(Side::Lower) {
+                Ok((vals, vecs)) => (vals, vecs),
+                Err(e) => {
+                    // Fallback if eigendecomposition fails (rare): return error
+                    return Err(EstimationError::EigendecompositionFailed(e));
                 }
             };
             
-            // Factorize h_total ONCE. This is the "Hessian Passport" that gradient MUST use.
-            let h_total_factor = {
-                let h_view = FaerArrayView::new(&h_total);
-                if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
-                    Arc::new(FaerFactor::Llt(f))
-                } else if let Ok(f) = FaerLdlt::new(h_view.as_ref(), Side::Lower) {
-                    Arc::new(FaerFactor::Ldlt(f))
-                } else {
-                    // Last resort: use the RidgePlanner
-                    self.get_faer_factor(rho, &h_total)
-                }
-            };
+            // Truncation logic:
+            // Filter eigenvalues: keep only those significantly positive.
+            // This threshold determines both the cost function domain and the gradient projection.
+            // 1e-12 is consistent with the previous fallback logic.
+            const EIG_THRESHOLD: f64 = 1e-12;
             
+            // 1. Compute Cost (Log Determinant)
+            // Sum log(lambda) only for valid eigenvalues.
+            let h_total_log_det : f64 = eigvals.iter()
+                .filter(|&&v| v > EIG_THRESHOLD)
+                .map(|&v| v.ln())
+                .sum();
+                
+            if !h_total_log_det.is_finite() {
+                 return Err(EstimationError::ModelIsIllConditioned {
+                     condition_number: f64::INFINITY
+                 });
+            }
+            
+            // 2. Compute Pseudoinverse H_plus_dagger
+            // Efficiently using matrix multiplication: H+ = W * W^T
+            // where W = U_valid * diag(1/sqrt(lambda_valid))
+            // This replaces the previous O(N^3) scalar loop with highly optimized BLAS operations.
+            
+            // a. Filter indices of valid eigenvalues
+            let valid_indices: Vec<usize> = eigvals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > EIG_THRESHOLD { Some(i) } else { None })
+                .collect();
+                
+            let valid_count = valid_indices.len();
+            let dim = h_total.nrows();
+            
+            // b. Construct W (scaled eigenvectors)
+            let mut w = Array2::<f64>::zeros((dim, valid_count));
+            
+            for (w_col_idx, &eig_idx) in valid_indices.iter().enumerate() {
+                let val = eigvals[eig_idx];
+                let scale = 1.0 / val.sqrt();
+                let u_col = eigvecs.column(eig_idx);
+                
+                // Vectorized scale and copy
+                let mut w_col = w.column_mut(w_col_idx);
+                Zip::from(&mut w_col).and(&u_col).for_each(|w_elem, &u_elem| {
+                    *w_elem = u_elem * scale;
+                });
+            }
+            
+            // c. Compute Pseudoinverse via Matrix Multiplication (H_dagger = W * W^T)
+            // This leverages highly optimized BLAS/GEMM routines implicit in dot().
+            // w.t() returns a view, so no extra allocation for transpose.
+            let h_pseudoinverse = w.dot(&w.t());
+
+            // d. Factorize h_total for linear solves (implicit derivative term).
+            // This uses the same ridge logic as the rest of the system, capturing
+            // the actual curvature surface that PIRLS optimizes over.
+            let h_total_factor = self.get_faer_factor(rho, &h_total);
+
             Ok(EvalShared {
                 key,
                 pirls_result,
@@ -5006,6 +5088,8 @@ pub mod internal {
                 ridge_used,
                 h_total: Arc::new(h_total),
                 h_total_factor,
+                h_pseudoinverse: Arc::new(h_pseudoinverse),
+                spectral_factor_w: Arc::new(w),
                 h_total_log_det,
             })
         }
@@ -5463,72 +5547,19 @@ pub mod internal {
             Ok(h_phi)
         }
 
-
-        /// Compute the exact gradient ∂log|H_total|/∂β for Firth-adjusted LAML.
+        /// Spectral version of firth log-det gradient for consistency with truncated log-det.
         ///
-        /// # Mathematical Background
+        /// Instead of using Cholesky-based C = X L_t^{-T}, this uses C = X W where
+        /// W is the spectral factor satisfying H₊† = W Wᵀ.
         ///
-        /// The LAML objective includes: J = 0.5 * log|H_total|
-        /// where H_total = H_pen - H_phi, and H_phi is the Firth curvature correction.
-        ///
-        /// ## Firth Correction Structure
-        ///
-        /// H_phi = 0.5 * (T_1 - T_2) where:
-        /// - T_1 = X^T diag(h ⊙ v) X         (diagonal contribution)
-        /// - T_2 = X^T diag(u) (A⊙A) diag(u) X  (off-diagonal contribution)
-        /// - h_i = (H_hat)_ii = ||b_i||²      (hat diagonal from Fisher info)
-        /// - v_i = (w''/w) = u² - 2w          (curvature ratio, logit)
-        /// - u_i = 1 - 2μ_i                   (logit score factor)
-        /// - A = H_hat = B B^T                (hat matrix)
-        /// - B = W^{1/2} X L_F^{-T}           (Fisher info thin factor)
-        ///
-        /// ## Gradient Formula
-        ///
-        /// ∂J/∂β = 0.5 * tr(H_total^{-1} * ∂H_total/∂β)
-        ///       = -0.5 * tr(M * ∂H_phi/∂β)
-        ///       = -0.25 * tr(M * (∂T_1/∂β - ∂T_2/∂β))
-        ///
-        /// where M = H_total^{-1} (p × p).
-        ///
-        /// ## Term 1 Gradient (diagonal part)
-        ///
-        /// Since h_i depends on β through B = W^{1/2} X L_F^{-T}:
-        /// - ∂T_1/∂B contribution: 2 * diag(m ⊙ v) B
-        /// - Coefficient: -0.25 * 2 = -0.5
-        ///
-        /// ## Term 2 Gradient (off-diagonal part)
-        ///
-        /// Using reverse-mode AD through the Khatri-Rao product (A⊙A):
-        /// - ∂T_2/∂B = 4 * (Z ⊙ A) B where Z = Y M Y^T
-        /// - Coefficient: +0.25 * 4 = +1.0
-        /// - Implementation uses M_proj = C^T C for the inverse Hessian projection
-        ///
-        /// ## Chain Rule to β
-        ///
-        /// Final gradient: g_β = X^T g_η where g_η accumulates per-observation gradients.
-        ///
-        /// ## Mathematical Derivation using Adjoint Method
-        ///
-        /// We seek $\nabla_\beta \log |H_{total}|$ where $H_{total} = X^\top W X + S_\lambda - H_\phi$.
-        /// Here $H_\phi$ is the Firth curvature matrix (Hessian of the Firth penalty).
-        ///
-        /// The derivative involves forward differentiation of the components of $H_\phi$ and reverse-mode
-        /// accumulation (adjoint method) to compute the gradient efficiently without forming 3rd order tensors.
-        ///
-        /// 1. **Main Hessian Term:** $\text{tr}(H_{total}^{-1} X^\top \frac{\partial W}{\partial \beta_j} X)$
-        ///    - Implemented by `g_eta += mdiag * w_prime`
-        ///
-        /// 2. **Firth Curvature Term:** $-\text{tr}(H_{total}^{-1} \frac{\partial^3 \Phi}{\partial \beta \partial \beta^\top \partial \beta_j})$
-        ///    - Backpropagated through Cholesky of hat matrix components.
-        ///    - Includes sensitivities for $v = w''/w$, $u = w'/w$, and $b$ (hat factor).
-        ///
-        
-        fn firth_logh_total_grad(
+        /// This ensures ∇_β log|H₊| = tr(H₊† ∂H/∂β) uses the same spectral truncation
+        /// as the cost function log|H₊| = Σᵢ log(λᵢ) for λᵢ > ε.
+        fn firth_logh_total_grad_spectral(
             &self,
             x_transformed: &DesignMatrix,
             mu: &Array1<f64>,
             weights: &Array1<f64>,
-            h_total: &Array2<f64>,
+            spectral_w: &Array2<f64>,
         ) -> Result<Array1<f64>, EstimationError> {
             let x = self.dense_design_matrix(x_transformed);
             let n = x.nrows();
@@ -5537,14 +5568,7 @@ pub mod internal {
                 return Ok(Array1::zeros(p));
             }
 
-            // Match the GLM probability clamp in update_glm_vectors.
-            // If mu is clamped, the objective is flat in eta, so all eta-derivatives
-            // (u, v, u_eta, v_eta, w_prime) must be zero for consistency.
-            // This is piecewise-smooth (kink at clamp), which is acceptable but
-            // theoretically less friendly to BFGS/L-BFGS.
             const PROB_EPS: f64 = 1e-8;
-            // Match the GLM weight clamp in update_glm_vectors:
-            // dmu is clamped to MIN_WEIGHT before forming weights.
             const MIN_WEIGHT: f64 = 1e-12;
 
             let mut w_base = Array1::<f64>::zeros(n);
@@ -5557,7 +5581,6 @@ pub mod internal {
                 let mu_i = mu[i];
                 let w_b = mu_i * (1.0 - mu_i);
                 w_base[i] = w_b;
-                // When mu is clamped, w is constant => all derivatives are zero.
                 if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_b < MIN_WEIGHT {
                     u[i] = 0.0;
                     v[i] = 0.0;
@@ -5568,49 +5591,33 @@ pub mod internal {
                 }
                 let u_i = 1.0 - 2.0 * mu_i;
                 u[i] = u_i;
-                // v = w''/w = u^2 - 2*dmu for logit.
                 v[i] = u_i * u_i - 2.0 * w_b;
-                // dv/deta = -6 * dmu * u.
                 v_eta[i] = -6.0 * w_b * u_i;
-                // du/deta = -2*dmu.
                 u_eta[i] = -2.0 * w_b;
-                // w' = dw/deta = w * u.
                 w_prime[i] = weights[i] * u_i;
             }
 
             // Forward thin factors:
-            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T
-            //   C = X L_t^{-T}           with M_h = X H_total^{-1} X^T = C C^T
-            // NOTE: firth_hat_factor applies the same stabilization ridge as compute_firth_hat_and_half_logdet.
+            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T (unchanged - Fisher info)
+            //   C = X * spectral_W      with M_h = X H₊† X^T = C C^T (SPECTRAL VERSION)
             let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
-            let c = self.h_total_factor(x.view(), h_total)?;
+
+            // SPECTRAL: C = X * W instead of Cholesky-based X L_t^{-T}
+            let c = x.dot(spectral_w);
 
             // Diagonal summaries (no n×n):
-            //   h_i = diag(H_hat)_i = ||b_i||^2
-            //   m_i = diag(M_h)_i = ||c_i||^2
             let h = Self::row_norms_squared(&b);
             let mdiag = Self::row_norms_squared(&c);
 
-            // g_eta accumulates ∂J/∂eta (per-observation), then g_beta = X^T g_eta.
-            // Start with the "penalized Hessian" contribution:
-            //   g_eta += mdiag ⊙ w'  where w' = d/deta (weights), clamped to 0 when dmu is clamped.
+            // g_eta accumulates ∂J/∂eta
             let mut g_eta = &mdiag * &w_prime;
-            // v_eta = dv/deta for v = w''/w (logit closed form)
             for i in 0..n {
                 g_eta[i] += -0.5 * mdiag[i] * h[i] * v_eta[i];
             }
 
-            // Backprop through the H_phi diagonal term:
-            //   0.5 * sum_i mdiag_i * h_i * v_i
-            // gives ∂/∂b_i = - mdiag_i * v_i * b_i (the factor 0.5 cancels the 2 from ||b_i||^2).
-            //
-            // Backprop through H_phi off-diagonal term:
-            //   H_phi_off = 0.5 * X^T (diag(u) (H_hat∘H_hat) diag(u)) X
-            // We implement the exact reverse pass using Khatri–Rao.
+            // Backprop through H_phi diagonal term
             let mut grad_b = Array2::<f64>::zeros((n, p));
             for i in 0..n {
-                // Term 1 contributes: -0.5 * mdiag_i * v_i * d(||b_i||^2)/db_ij
-                // Chain rule: 0.5 (from log|H|) × 0.5 (from H_phi) × 2 (from d||b||²) = 0.5
                 let scale = 0.5 * mdiag[i] * v[i];
                 if scale != 0.0 {
                     for j in 0..p {
@@ -5619,31 +5626,7 @@ pub mod internal {
                 }
             }
 
-            // Reverse-mode AD for Term 2 (off-diagonal Firth correction)
-            //
-            // Goal: Compute grad_b_t2 = (Z ⊙ A) B and g_u for chain rule back to β.
-            //
-            // Where:
-            //   Z = diag(u) (C C^T) diag(u)  -  leverage matrix scaled by weight factors
-            //   A = B B^T                    -  hat matrix from Fisher information
-            //   B = W^{1/2} X L_f^{-T}       -  thin factor of hat matrix (n × p)
-            //   C = X L_t^{-T}               -  thin factor of H_total inverse (n × p)
-            //
-            // Naive O(N²P) approach (TOO SLOW for N=33000):
-            //   grad_b_t2[i,m] = Σ_j (Z ⊙ A)_{ij} * b_{jm}
-            //
-            // Efficient O(NP³) tensor factorization:
-            //   grad_b_t2[i,m] = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
-            //   where T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm} is precomputed.
-            //
-            // Adjoint derivation (coefficient = 1.0):
-            //   Step 1: ∂J/∂H_total = 0.5 M
-            //   Step 2: ∂J/∂T_2 = 0.25 M  (T_2 enters with +0.5 coefficient)
-            //   Step 3: ∂J/∂(A⊙A) = 0.25 Z
-            //   Step 4: ∂J/∂A = 0.5 (A ⊙ Z)  (factor of 2 from Hadamard square)
-            //   Step 5: ∂J/∂B = (A ⊙ Z) B   (factor of 2 from symmetry of A = BB^T)
-
-            // Phase 1: Build weighted leverage matrix V = diag(u) C  [O(NP)]
+            // Reverse-mode AD for off-diagonal Firth correction (using spectral C)
             let mut tensor_t = vec![0.0_f64; p * p * p];
             let mut v_mat = faer::Mat::<f64>::zeros(n, p);
             for i in 0..n {
@@ -5653,11 +5636,8 @@ pub mod internal {
                 }
             }
 
-            // Phase 2: Compute tensor slices via BLAS-3 matmul  [O(NP³) total]
-            // For each m: T[:,:,m] = V^T (diag(b[:,m]) B)
-            // This is equivalent to T_{klm} = Σ_j u_j c_{jk} b_{jl} b_{jm}
+            // Phase 2: Compute tensor slices via BLAS-3 matmul
             for m in 0..p {
-                // Scale each row j of B by b[j,m]
                 let mut scaled_b = faer::Mat::<f64>::zeros(n, p);
                 for j in 0..n {
                     let b_jm = b[(j, m)];
@@ -5665,19 +5645,15 @@ pub mod internal {
                         scaled_b[(j, l)] = b_jm * b[(j, l)];
                     }
                 }
-
-                // T[:,:,m] = V^T * scaled_B  via SIMD-optimized matmul
                 let mut t_slice = faer::Mat::<f64>::zeros(p, p);
                 faer::linalg::matmul::matmul(
                     t_slice.as_mut(),
                     faer::Accum::Replace,
-                    v_mat.transpose(),
+                    v_mat.as_ref().transpose(),
                     scaled_b.as_ref(),
                     1.0,
-                    faer::Par::Seq,
+                    Par::Seq,
                 );
-
-                // Store in flattened tensor (layout: [k][l][m] for cache-friendly m-loop)
                 for k in 0..p {
                     for l in 0..p {
                         tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
@@ -5685,59 +5661,36 @@ pub mod internal {
                 }
             }
 
-            // Phase 3: Contract tensor with per-row factors  [O(NP³) total]
-            let mut grad_b_t2 = Array2::<f64>::zeros((n, p));
-            let mut g_u = Array1::<f64>::zeros(n);
-
+            // Phase 3: Contract tensor with observation vectors
             for i in 0..n {
-                let c_i = c.row(i);
-                let b_i = b.row(i);
                 let u_i = u[i];
-
-                // grad_b_t2[i,m] = u_i Σ_{k,l} c_{ik} b_{il} T_{klm}
-                // Inner loop over m is contiguous in tensor memory
-                for k in 0..p {
-                    let c_ik = c_i[k];
-                    for l in 0..p {
-                        let c_b_ikl = c_ik * b_i[l];
-                        let base_idx = k * p * p + l * p;
-                        for m in 0..p {
-                            grad_b_t2[(i, m)] += u_i * c_b_ikl * tensor_t[base_idx + m];
+                if u_i == 0.0 {
+                    continue;
+                }
+                for m in 0..p {
+                    let mut acc = 0.0;
+                    for k in 0..p {
+                        let c_ik = c[(i, k)];
+                        if c_ik == 0.0 {
+                            continue;
+                        }
+                        for l in 0..p {
+                            let b_il = b[(i, l)];
+                            if b_il == 0.0 {
+                                continue;
+                            }
+                            acc += c_ik * b_il * tensor_t[k * p * p + l * p + m];
                         }
                     }
+                    grad_b[(i, m)] += u_i * acc;
                 }
-
-                // g_u[i] = 0.5 Σ_{k,l,m} c_{ik} b_{il} b_{im} T_{klm}
-                // Chain rule coefficient: 0.25 (from ∂J/∂T_2) × 2 (from Z symmetry) = 0.5
-                let mut gu_i = 0.0;
-                for k in 0..p {
-                    let c_ik = c_i[k];
-                    for l in 0..p {
-                        let c_b_ikl = c_ik * b_i[l];
-                        let base_idx = k * p * p + l * p;
-                        for m in 0..p {
-                            gu_i += c_b_ikl * b_i[m] * tensor_t[base_idx + m];
-                        }
-                    }
-                }
-                g_u[i] = 0.5 * gu_i;
             }
 
-            // Add Term 2 contribution to grad_b (coefficient 1.0 from derivation above)
-            grad_b += &grad_b_t2;
-
-            // Chain u_eta (du/deta = -2 dmu) into g_eta, with clamp → 0 when dmu is clamped.
-            for i in 0..n {
-                g_eta[i] += g_u[i] * u_eta[i];
-            }
-
-            // Reverse-mode through B = X_w L_f^{-T}.
-            // Adjoint: L̄_f = tril(-(L_f^{-T} B̄^T B)^T) = tril(-B^T B̄ L_f^{-1})
+            // Backprop through Cholesky of Fisher info (unchanged)
             let g_y = grad_b.t().to_owned();
             let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
             let d_l = {
                 let temp = d_xw.dot(&b);
-                // Transpose to get (L_f^{-T} B̄^T B)^T = B^T B̄ L_f^{-1}
                 let mut out = temp.t().to_owned();
                 for i in 0..p {
                     for j in (i + 1)..p {
@@ -5746,17 +5699,12 @@ pub mod internal {
                 }
                 out.mapv(|vv| -vv)
             };
-
-            // Cholesky reverse-mode: L_f = chol(F), so this yields ∂J/∂F.
             let g_f = Self::chol_reverse(&l_f, &d_l)?;
-            // F = X_w^T X_w, so ∂J/∂X_w += 2 X_w g_f.
             let mut g_xw = xw.dot(&g_f);
             g_xw.mapv_inplace(|vv| 2.0 * vv);
-            // Also add the direct adjoint from the triangular solve.
             g_xw += &d_xw.t().to_owned();
 
-            // Backprop through X_w = diag(sqrt(w)) X.
-            // ∂J/∂w_i = (1/(2 sqrt(w_i))) * sum_j x_ij * (∂J/∂X_w)_ij.
+            // Backprop through X_w = diag(sqrt(w)) X
             for i in 0..n {
                 let w_i = weights[i];
                 if w_i <= 0.0 {
@@ -5768,11 +5716,10 @@ pub mod internal {
                     acc += x[(i, j)] * g_xw[(i, j)];
                 }
                 let g_w = 0.5 * acc / denom;
-                // Chain to eta using w' = dw/deta (logit)
                 g_eta[i] += g_w * w_prime[i];
             }
 
-            // Final chain: g_beta = X^T g_eta.
+            // Final chain: g_beta = X^T g_eta
             let g_beta = x.t().dot(&g_eta);
             Ok(g_beta)
         }
@@ -5974,32 +5921,6 @@ pub mod internal {
             let b = y.t().to_owned();
             Ok((b, l, xw))
         }
-
-        // Build C = X L_t^{-T} for M_h = X H_total^{-1} X^T = C C^T.
-        
-        fn h_total_factor(
-            &self,
-            x: ArrayView2<'_, f64>,
-            h_total: &Array2<f64>,
-        ) -> Result<Array2<f64>, EstimationError> {
-            use crate::calibrate::faer_ndarray::FaerCholesky;
-            let chol = h_total.cholesky(Side::Lower).map_err(|_| {
-                let min_eig = h_total
-                    .clone()
-                    .eigh(Side::Lower)
-                    .ok()
-                    .and_then(|(eigs, _)| eigs.iter().cloned().reduce(f64::min))
-                    .unwrap_or(f64::NAN);
-                EstimationError::HessianNotPositiveDefinite {
-                    min_eigenvalue: min_eig,
-                }
-            })?;
-            let l = chol.lower_triangular();
-            let y = Self::solve_lower_triangular(&l, &x.t().to_owned());
-            let c = y.t().to_owned();
-            Ok(c)
-        }
-
 
         // Accessor methods for private fields
         pub(super) fn x(&self) -> ArrayView2<'a, f64> {
@@ -6849,7 +6770,7 @@ pub mod internal {
             let rs_transposed = &reparam_result.rs_transposed;
 
             let mut includes_prior = false;
-            let (gradient_result, gradient_snapshot, applied_truncation_corrections) = {
+            let (gradient_result, gradient_snapshot, _) = {
                 let mut workspace_ref = self.workspace.lock().unwrap();
                 let workspace = &mut *workspace_ref;
                 let len = p.len();
@@ -6857,7 +6778,7 @@ pub mod internal {
                 workspace.set_lambda_values(p);
                 workspace.zero_cost_gradient(len);
                 let lambdas = workspace.lambda_view(len).to_owned();
-                let mut applied_truncation_corrections: Option<Vec<f64>> = None;
+
                 // When we treat a stabilization ridge as a true penalty term, the
                 // penalty matrix becomes S_λ + ridge * I. For exactness, both the
                 // log|S| term in the cost and the derivative d/dρ_k log|S| must be
@@ -7119,8 +7040,7 @@ pub mod internal {
                     } else {
                         vec![0.0; lambdas.len()]
                     };
-                    applied_truncation_corrections = Some(gaussian_corrections.clone());
-
+    
                     let numeric_logh_grad_ref = numeric_logh_grad.as_ref();
                     let det1_values = &det1_values;
                     let beta_ref = beta_transformed;
@@ -7259,7 +7179,8 @@ pub mod internal {
                         // HESSIAN PASSPORT: Use the EXACT same h_total and factorization
                         // that was used in the cost function computation. This ensures
                         // mathematical consistency between cost and gradient.
-                        let h_for_factor = bundle.h_total.as_ref();
+                        // h_total kept for reference but no longer used directly in gradient
+                        // (spectral factor W is used instead for consistency)
                         let h_phi_opt: Option<()> = if self.config.firth_bias_reduction
                             && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit)
                         {
@@ -7270,182 +7191,62 @@ pub mod internal {
 
                         // P-IRLS already folded any stabilization ridge into h_eff.
 
-                        // Use the cached factorization from the bundle - DO NOT refactorize.
-                        // This is the "Hessian Passport" that guarantees consistency.
-                        let factor_g = Arc::clone(&bundle.h_total_factor);
-                        let factor_imp: Option<FaerFactor> = None;
+                        // Create local factor_g for the non-Firth path and Firth fallback.
+                        // The non-Firth path intentionally uses full-rank Cholesky (not pseudoinverse)
+                        // because truncation caused gradient mismatch (see logh_beta_grad_logit).
+                        let factor_g = {
+                            let h_total = bundle.h_total.as_ref();
+                             let h_view = FaerArrayView::new(h_total);
+                             if let Ok(f) = FaerLlt::new(h_view.as_ref(), Side::Lower) {
+                                 Arc::new(FaerFactor::Llt(f))
+                             } else {
+                                 // Fallback to LDLT
+                                 match FaerLdlt::new(h_view.as_ref(), Side::Lower) {
+                                     Ok(f) => Arc::new(FaerFactor::Ldlt(f)),
+                                     Err(_) => {
+                                         // Last resort: use the RidgePlanner
+                                         // But we don't have easy access to self.get_faer_factor here without rho.
+                                         // We'll panic or return error if this fails, which is rare for h_total.
+                                         // Or better, use get_faer_factor since we have rho.
+                                         self.get_faer_factor(p, h_total)
+                                     }
+                                 }
+                             }
+                        };
 
-                        // Compute trace(H^{-1} S_k) using the same reparameterized penalty
-                        // blocks as the Gaussian path. This is the partial derivative
-                        // ∂/∂ρ_k (0.5 log|H|) with β held fixed; the β-dependence is handled
-                        // separately via the implicit correction term to avoid double counting.
-                        workspace.reset_block_ranges();
-                        let mut total_rank = 0;
-                        for rt in rs_transposed {
-                            let cols = rt.ncols();
-                            workspace.block_ranges.push((total_rank, total_rank + cols));
-                            total_rank += cols;
-                        }
-                        if total_rank > 0 {
-                            workspace.concat.fill(0.0);
-                            let rows = h_for_factor.nrows();
-                            for ((start, end), rt) in
-                                workspace.block_ranges.iter().zip(rs_transposed.iter())
-                            {
-                                if *end > *start {
-                                    workspace
-                                        .concat
-                                        .slice_mut(s![..rows, *start..*end])
-                                        .assign(rt);
-                                }
+
+                        // TRACE TERM COMPUTATION: tr(H_+^\dagger S_k)
+                        // We use the precomputed pseudoinverse from the eval bundle.
+                        // This guarantees spectral consistency with the cost function.
+                        let h_dagger = bundle.h_pseudoinverse.as_ref();
+                        
+                        let mut trace_terms = vec![0.0; k_count];
+                        for k_idx in 0..k_count {
+                            let rt = &rs_transformed[k_idx];
+                            if rt.ncols() == 0 {
+                                continue;
                             }
-                            let rows = h_for_factor.nrows();
-                            let cols = total_rank;
-                            {
-                                let mut solved_slice =
-                                    workspace.solved.slice_mut(s![..rows, ..cols]);
-                                solved_slice.assign(&workspace.concat.slice(s![..rows, ..cols]));
-                                if let Some(slice) = solved_slice.as_slice_mut() {
-                                    let mut solved_view =
-                                        faer::MatMut::from_row_major_slice_mut(slice, rows, cols);
-                                    factor_g.solve_in_place(solved_view.as_mut());
-                                } else {
-                                    let mut temp =
-                                        faer::Mat::from_fn(rows, cols, |i, j| solved_slice[(i, j)]);
-                                    factor_g.solve_in_place(temp.as_mut());
-                                    for j in 0..cols {
-                                        for i in 0..rows {
-                                            solved_slice[(i, j)] = temp[(i, j)];
-                                        }
-                                    }
-                                }
-                            }
-                            workspace.solved_rows = h_eff.nrows();
-                        } else {
-                            workspace.solved_rows = 0;
+                            // Compute H_dagger * rt^T
+                            // H_dagger is (p x p), rt is (rank x p).
+                            // We want H_dagger * rt^T -> (p x rank).
+                            let h_dag_rt_t = h_dagger.dot(&rt.t());
+                            
+                            // Trace term: tr(H_dagger * S_k) = tr(H_dagger * rt^T * rt)
+                            // = tr(rt * H_dagger * rt^T)
+                            // Computed idiomatically via matrix product + diagonal sum.
+                            trace_terms[k_idx] = rt.dot(&h_dag_rt_t).diag().iter().sum();
                         }
+                        
+                        // We do NOT need to set workspace.solved_rows as we aren't using the workspace solver.
+                        workspace.solved_rows = 0;
 
 
-                        // Spectral truncation correction for log|H| trace terms.
-                        //
-                        // EXACT DERIVATION (eigen-perturbation form):
-                        //
-                        // Let S_lambda = sum_i mu_i u_i u_i^T be the full penalty and
-                        // S_trunc = sum_{i=1}^r mu_i u_i u_i^T be the truncated penalty.
-                        // Define projections P_R = sum_{i=1}^r u_i u_i^T and
-                        // P_N = sum_{i=r+1}^p u_i u_i^T (range / null).
-                        //
-                        // The LAML log-det term is (1/2) log|H| with
-                        // H = X^T W X + S_trunc. By Jacobi:
-                        //
-                        //   d/d rho_k (1/2 log|H|) = (1/2) tr(H^{-1} dS_trunc/d rho_k).
-                        //
-                        // Let dS = dS_lambda/d rho_k = lambda_k S_k. Using standard
-                        // eigenvalue/eigenvector perturbation (Magnus & Neudecker):
-                        //
-                        //   d mu_i = u_i^T dS u_i
-                        //   d u_i = sum_{j != i} (u_j^T dS u_i) / (mu_i - mu_j) * u_j
-                        //
-                        // Plugging these into dS_trunc gives:
-                        //
-                        //   dS_trunc = sum_{i=1}^r [ d mu_i u_i u_i^T
-                        //                + mu_i d u_i u_i^T + mu_i u_i d u_i^T ].
-                        //
-                        // This simplifies to the exact block form:
-                        //
-                        //   dS_trunc = P_R dS P_R
-                        //            + sum_{i=1}^r sum_{j=r+1}^p
-                        //                (mu_i/(mu_i - mu_j)) (u_j^T dS u_i)
-                        //                (u_j u_i^T + u_i u_j^T).
-                        //
-                        // With truncation mu_j ≈ 0 for j > r, the factor
-                        // mu_i/(mu_i - mu_j) ≈ 1, so:
-                        //
-                        //   dS_trunc ≈ P_R dS P_R + P_N dS P_R + P_R dS P_N.
-                        //
-                        // Note the ABSENCE of the P_N dS P_N term.
-                        //
-                        // The implementation of tr(H^{-1} dS) uses the full dS, i.e.:
-                        //
-                        //   dS = (P_R + P_N) dS (P_R + P_N)
-                        //      = dS_trunc + P_N dS P_N.
-                        //
-                        // Therefore:
-                        //
-                        //   (1/2) tr(H^{-1} dS) =
-                        //     (1/2) tr(H^{-1} dS_trunc) + (1/2) tr(H^{-1} P_N dS P_N),
-                        //
-                        // and the final term is the phantom "spectral bleed" that must be removed.
-                        //
-                        // Writing U_perp for P_N's eigenvectors and M_perp = U_perp^T H^{-1} U_perp:
-                        //
-                        //   (1/2) tr(H^{-1} P_N dS P_N)
-                        //   = (1/2) lambda_k tr( M_perp * (U_perp^T S_k U_perp) ).
-                        //
-                        // This is exactly the correction we subtract below.
-                        let u_truncated = &reparam_result.u_truncated;
-                        let truncated_count = u_truncated.ncols();
-                        let truncation_corrections: Vec<f64> =
-                            if truncated_count > 0 && workspace.solved_rows > 0 {
-                                let rows = h_for_factor.nrows();
-                                let mut h_inv_u_perp =
-                                    faer::Mat::<f64>::zeros(rows, truncated_count);
-
-                                for i in 0..rows.min(u_truncated.nrows()) {
-                                    for j in 0..truncated_count {
-                                        h_inv_u_perp[(i, j)] = u_truncated[(i, j)];
-                                    }
-                                }
-
-                                factor_g.solve_in_place(h_inv_u_perp.as_mut());
-
-                                let mut m_perp =
-                                    faer::Mat::<f64>::zeros(truncated_count, truncated_count);
-                                for i in 0..truncated_count {
-                                    for j in 0..truncated_count {
-                                        let mut sum = 0.0;
-                                        for r in 0..rows.min(u_truncated.nrows()) {
-                                            sum += u_truncated[(r, i)] * h_inv_u_perp[(r, j)];
-                                        }
-                                        m_perp[(i, j)] = sum;
-                                    }
-                                }
-
-                                let mut corrections = vec![0.0; k_count];
-                                for k_idx in 0..k_count {
-                                    let r_k = &rs_transformed[k_idx];
-                                    let rank_k = r_k.nrows();
-
-                                    let mut w_k =
-                                        faer::Mat::<f64>::zeros(rank_k, truncated_count);
-                                    for i in 0..rank_k {
-                                        for j in 0..truncated_count {
-                                            let mut sum = 0.0;
-                                            for l in 0..r_k.ncols().min(u_truncated.nrows()) {
-                                                sum += r_k[(i, l)] * u_truncated[(l, j)];
-                                            }
-                                            w_k[(i, j)] = sum;
-                                        }
-                                    }
-
-                                    let mut trace_error = 0.0;
-                                    for i in 0..truncated_count {
-                                        for j in 0..truncated_count {
-                                            let mut wtw_ij = 0.0;
-                                            for l in 0..rank_k {
-                                                wtw_ij += w_k[(l, i)] * w_k[(l, j)];
-                                            }
-                                            trace_error += m_perp[(i, j)] * wtw_ij;
-                                        }
-                                    }
-
-                                    corrections[k_idx] = 0.5 * lambdas[k_idx] * trace_error;
-                                }
-                                corrections
-                            } else {
-                                vec![0.0; k_count]
-                            };
-                        applied_truncation_corrections = Some(truncation_corrections.clone());
+                        // Implicit Truncation Correction:
+                        // By using H_+^\dagger essentially constructed from U_R D_R^{-1} U_R^T,
+                        // we automatically project dS onto the valid subspace P_R.
+                        // The phantom spectral bleed term (tr(H^-1 P_N dS P_N)) is identically zero
+                        // because P_N H_+^\dagger = 0.
+                        let truncation_corrections = vec![0.0; k_count];
 
                         let residual_grad = {
                             let eta = pirls_result
@@ -7474,28 +7275,31 @@ pub mod internal {
                         };
 
 
-                        // LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
-                        //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
+                        // LAML adds 0.5 * ∂log|H₊|/∂β. By Jacobi's formula:
+                        //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
                         // For logit, H = Xᵀ W X + S (non-Firth) or H_total = Xᵀ W X + S - H_φ (Firth).
-                        // For Firth, we use the exact gradient via reverse-mode autodiff which
-                        // includes the ∂H_φ/∂β term through the Cholesky factorization backprop.
+                        //
+                        // SPECTRAL CONSISTENCY: We use the spectral factor W (where H₊† = WWᵀ)
+                        // to ensure ∇_β log|H₊| uses the same truncation as the cost function.
+                        // This is critical for the implicit correction term to point in the
+                        // correct direction on the truncated cost surface.
                         let logh_beta_grad: Option<Array1<f64>> = if let LinkFunction::Logit = self
                             .config
                             .link_function()
                             .expect("link_function called on survival model")
                         {
                             if self.config.firth_bias_reduction && h_phi_opt.is_some() {
-                                // Use exact firth_logh_total_grad with full reverse-mode autodiff
-                                // NOTE: Uses stabilized Fisher info (matching cost path) for consistency
-                                match self.firth_logh_total_grad(
+                                // Use SPECTRAL version with W factor for consistency with truncated cost
+                                let spectral_w = bundle.spectral_factor_w.as_ref();
+                                match self.firth_logh_total_grad_spectral(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
-                                    &h_for_factor,
+                                    spectral_w,
                                 ) {
                                     Ok(grad) => Some(grad),
                                     Err(_) => {
-                                    // Fallback to approximate gradient
+                                    // Fallback to approximate gradient (also spectral)
                                         self.logh_beta_grad_logit(
                                             &pirls_result.x_transformed,
                                             &pirls_result.solve_mu,
@@ -7606,15 +7410,18 @@ pub mod internal {
                         }
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
+                            // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
+                            // We need delta = H^-1 * grad_beta (where grad_beta comes from stationarity or envelope).
+                            // Use the FACTOR (ridged inverse) here, NOT the pseudoinverse.
+                            // The implicit term describes how β moves on the ridged surface that PIRLS
+                            // actually optimizes, so we need (H + δI)^-1 not H_+†.
                             let rhs_view = FaerColView::new(&grad_beta);
-                            let solved = match &factor_imp {
-                                Some(factor) => factor.solve(rhs_view.as_ref()),
-                                None => factor_g.solve(rhs_view.as_ref()),
-                            };
+                            let solved = bundle.h_total_factor.solve(rhs_view.as_ref());
                             let mut delta: Array1<f64> = Array1::zeros(grad_beta.len());
                             for i in 0..delta.len() {
                                 delta[i] = solved[(i, 0)];
                             }
+
                             let delta_inf =
                                 delta.iter().fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
                             if delta_inf < 1e-8 {
@@ -7635,29 +7442,7 @@ pub mod internal {
                         };
 
                         for k in 0..k_count {
-                            let log_det_h_grad_term = if workspace.solved_rows > 0 {
-                                let (start, end) = workspace.block_ranges[k];
-                                if end > start {
-                                    let solved_block = workspace
-                                        .solved
-                                        .slice(s![..workspace.solved_rows, start..end]);
-                                    let rt_block = workspace
-                                        .concat
-                                        .slice(s![..workspace.solved_rows, start..end]);
-                                    let trace_h_inv_s_k = kahan_sum(
-                                        solved_block
-                                            .iter()
-                                            .zip(rt_block.iter())
-                                            .map(|(&x, &y)| x * y),
-                                    );
-                                    let tra1 = lambdas[k] * trace_h_inv_s_k;
-                                    tra1 / 2.0
-                                } else {
-                                    0.0
-                                }
-                            } else {
-                                0.0
-                            };
+                            let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];
                             let corrected_log_det_h =
                                 log_det_h_grad_term - truncation_corrections[k];
                             let log_det_s_grad_term = 0.5 * det1_values[k];
@@ -7719,7 +7504,7 @@ pub mod internal {
                     Some(gradient_result.clone())
                 };
 
-                (gradient_result, gradient_snapshot, applied_truncation_corrections)
+                (gradient_result, gradient_snapshot, None::<Vec<f64>>)
             };
 
             // The optimizer MINIMIZES a cost function. The score is MAXIMIZED.
@@ -7736,7 +7521,7 @@ pub mod internal {
                     p,
                     bundle,
                     &gradient_snapshot,
-                    applied_truncation_corrections.as_deref(),
+                    None,
                 );
             }
 

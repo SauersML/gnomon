@@ -623,10 +623,9 @@ impl<'a> JointModelState<'a> {
         let mut weights = Array1::<f64>::zeros(n);
         let mut z_glm = Array1::<f64>::zeros(n);
         
-        // Compute working response and weights
-        // Note: Firth bias reduction in joint model would require using GamWorkingModel pattern
-        // from pirls.rs which maintains Hessian state. For now, we use standard GLM vectors
-        // but the flag triggers Firth in the outer LAML cost (via config passthrough).
+        // Compute working response and weights.
+        // Standard GLM vectors are computed first, then Firth correction is applied below
+        // (see z_firth computation) using hat diagonal from the unpenalized Fisher information.
         if let (LinkFunction::Logit, Some(se)) = (&self.link, &self.covariate_se) {
                 crate::calibrate::pirls::update_glm_vectors_integrated(
                     &self.quad_ctx,
