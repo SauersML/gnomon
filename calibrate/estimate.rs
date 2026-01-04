@@ -1909,7 +1909,23 @@ pub fn train_model(
     // --- Finalize the Model (same as before) ---
     // Map final unconstrained point to bounded rho, then clamp for safety
     let final_rho = to_rho_from_z(&final_z);
-    let final_rho_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
+    let final_rho_initial_clamped = final_rho.mapv(|v| v.clamp(-RHO_BOUND, RHO_BOUND));
+
+    // Attempt boundary perturbation to recover uncertainty for infinite smoothing parameters
+    // This implements Wood (2016) / Greven & Scheipl (2010) boundary correction.
+    let (final_rho_clamped, corrected_hessian_inv_trans) = match reml_state
+        .perform_boundary_perturbation_correction(&final_rho_initial_clamped)
+    {
+        Ok(res) => res,
+        Err(e) => {
+            log::warn!(
+                "Boundary perturbation failed: {}. Using uncorrected estimates.",
+                e
+            );
+            (final_rho_initial_clamped, None)
+        }
+    };
+
     let final_lambda = final_rho_clamped.mapv(f64::exp);
     log::info!(
         "Final estimated smoothing parameters (lambda): {:?}",
@@ -1949,9 +1965,43 @@ pub fn train_model(
         final_fit.reparam_result.qs.dot(final_fit.beta_transformed.as_ref());
     // Recover penalized Hessian in the ORIGINAL basis: H = Qs * H_trans * Qs^T
     let qs = &final_fit.reparam_result.qs;
-    let penalized_hessian_orig = qs
-        .dot(&final_fit.penalized_hessian_transformed)
-        .dot(&qs.t());
+
+    // If boundary correction provided a total covariance matrix (V_total), invert it to get H_total.
+    // Otherwise use the conditional Hessian from the fit.
+    let penalized_hessian_orig = if let Some(v_total_trans) = corrected_hessian_inv_trans {
+        use crate::calibrate::faer_ndarray::{array2_to_mat_mut, FaerArrayView};
+        use faer::Side;
+
+        let mut h_trans_corrected =
+            Array2::<f64>::zeros((v_total_trans.nrows(), v_total_trans.ncols()));
+        let h_view = FaerArrayView::new(&v_total_trans);
+        let mut success = false;
+
+        // Invert V_total to get H_total (precision matrix)
+        if let Ok(chol) = faer::linalg::solvers::Llt::new(h_view.as_ref(), Side::Lower) {
+            let mut eye = Array2::<f64>::eye(v_total_trans.nrows());
+            let mut eye_view = array2_to_mat_mut(&mut eye);
+            chol.solve_in_place(eye_view.as_mut());
+            h_trans_corrected.assign(&eye);
+            success = true;
+        } else if let Ok(ldlt) = faer::linalg::solvers::Ldlt::new(h_view.as_ref(), Side::Lower) {
+            let mut eye = Array2::<f64>::eye(v_total_trans.nrows());
+            let mut eye_view = array2_to_mat_mut(&mut eye);
+            ldlt.solve_in_place(eye_view.as_mut());
+            h_trans_corrected.assign(&eye);
+            success = true;
+        }
+
+        if success {
+            log::info!("[Boundary] Using corrected Hessian for inference.");
+            qs.dot(&h_trans_corrected).dot(&qs.t())
+        } else {
+            log::warn!("[Boundary] Failed to invert corrected covariance. Falling back to conditional Hessian.");
+            qs.dot(&final_fit.penalized_hessian_transformed).dot(&qs.t())
+        }
+    } else {
+        qs.dot(&final_fit.penalized_hessian_transformed).dot(&qs.t())
+    };
     // Compute scale for Identity; 1.0 for Logit
     let scale_val = match config.link_function().expect("link_function called on survival model") {
         LinkFunction::Logit => 1.0,
@@ -7720,6 +7770,223 @@ pub mod internal {
                     println!("[GRADIENT DIAGNOSTICS] Total gradient rel. L2 error: {:.2e}", rel_l2);
                 }
             }
+        }
+
+    /// Implements the stable re-parameterization algorithm from Wood (2011) Appendix B
+    /// This replaces naive summation S_λ = Σ λᵢSᵢ with similarity transforms
+    /// to avoid "dominant machine zero leakage" between penalty components
+    ///
+        // Helper for boundary perturbation
+        // Returns (perturbed_rho, optional_corrected_covariance_in_transformed_basis)
+        // The covariance is V'_beta_trans
+        pub(super) fn perform_boundary_perturbation_correction(
+            &self,
+            initial_rho: &Array1<f64>,
+        ) -> Result<(Array1<f64>, Option<Array2<f64>>), EstimationError> {
+            // 1. Identify boundary parameters and perturb
+            let mut current_rho = initial_rho.clone();
+            let mut perturbed = false;
+
+            // Target cost increase: 0.01 log-likelihood units (statistically insignificant)
+            let target_diff = 0.01;
+
+            for k in 0..current_rho.len() {
+                // Check if at upper boundary (high smoothing -> linear)
+                // RHO_BOUND is 30.0.
+                if current_rho[k] > RHO_BOUND - 1.0 {
+                    // Compute base_cost fresh for each parameter to handle multiple boundary cases
+                    let base_cost = self.compute_cost(&current_rho)?;
+
+                    log::info!(
+                        "[Boundary] rho[{}] = {:.2} is at boundary. Perturbing...",
+                        k, current_rho[k]
+                    );
+
+                    // Search inwards (decreasing rho)
+                    // We want delta > 0 such that Cost(rho - delta) approx Base + 0.01
+                    let mut lower = 0.0;
+                    let mut upper = 15.0;
+                    let mut best_delta = 0.0;
+
+                    // Initial check: if upper is not enough, just take upper
+                    let mut rho_test = current_rho.clone();
+                    rho_test[k] -= upper;
+                    if let Ok(c) = self.compute_cost(&rho_test) {
+                        if (c - base_cost).abs() < target_diff {
+                            // Even big change doesn't change cost much?
+                            // This implies extremely flat surface. Just move away from boundary significantly.
+                            best_delta = upper;
+                        }
+                    }
+
+                    if best_delta == 0.0 {
+                        // Bisection
+                        for _ in 0..15 {
+                            let mid = (lower + upper) * 0.5;
+                            rho_test[k] = current_rho[k] - mid;
+                            if let Ok(c) = self.compute_cost(&rho_test) {
+                                let diff = c - base_cost;
+                                if diff < target_diff {
+                                    // Need more change -> larger delta
+                                    lower = mid;
+                                } else {
+                                    // Too much change -> smaller delta
+                                    upper = mid;
+                                }
+                            } else {
+                                // Error computing cost, assume strictly worse (too far?)
+                                upper = mid;
+                            }
+                        }
+                        best_delta = (lower + upper) * 0.5;
+                    }
+
+                    current_rho[k] -= best_delta;
+                    perturbed = true;
+                    log::info!(
+                        "[Boundary] rho[{}] moved to {:.2} (delta={:.3})",
+                        k, current_rho[k], best_delta
+                    );
+                }
+            }
+
+            if !perturbed {
+                return Ok((current_rho, None));
+            }
+
+            // 2. Compute LAML Hessian at perturbed rho
+            // Finite difference on gradient
+            let h_step = 1e-4;
+            let n_rho = current_rho.len();
+            let mut laml_hessian = Array2::<f64>::zeros((n_rho, n_rho));
+
+            // We need the gradient at the perturbed point
+            let grad_center = self.compute_gradient(&current_rho)?;
+
+            for j in 0..n_rho {
+                let mut rho_plus = current_rho.clone();
+                rho_plus[j] += h_step;
+                let grad_plus = self.compute_gradient(&rho_plus)?;
+
+                // Use forward difference for Hessian columns: H_j approx (g(rho+h) - g(rho)) / h
+                let col_diff = (&grad_plus - &grad_center) / h_step;
+                for i in 0..n_rho {
+                    laml_hessian[[i, j]] = col_diff[i];
+                }
+            }
+
+            // Symmetrize
+            for i in 0..n_rho {
+                for j in 0..i {
+                    let avg = 0.5 * (laml_hessian[[i, j]] + laml_hessian[[j, i]]);
+                    laml_hessian[[i, j]] = avg;
+                    laml_hessian[[j, i]] = avg;
+                }
+            }
+
+            // Invert LAML Hessian to get V_rho
+            // Use faer for robust inversion
+            let mut v_rho = Array2::<f64>::zeros((n_rho, n_rho));
+            {
+                use crate::calibrate::faer_ndarray::{array2_to_mat_mut, FaerArrayView};
+                use faer::Side;
+
+                // Ensure PD
+                crate::calibrate::pirls::ensure_positive_definite_with_label(
+                    &mut laml_hessian,
+                    "LAML Hessian",
+                )?;
+
+                let h_view = FaerArrayView::new(&laml_hessian);
+                if let Ok(chol) = faer::linalg::solvers::Llt::new(h_view.as_ref(), Side::Lower) {
+                    let mut eye = Array2::<f64>::eye(n_rho);
+                    let mut eye_view = array2_to_mat_mut(&mut eye);
+                    chol.solve_in_place(eye_view.as_mut());
+                    v_rho.assign(&eye);
+                } else {
+                    // Fallback: SVD or pseudoinverse? Or just fail correction.
+                    log::warn!(
+                        "LAML Hessian not invertible even after stabilization. Skipping correction."
+                    );
+                    return Ok((current_rho, None));
+                }
+            }
+
+            // 3. Compute Correction: J * V_rho * J^T
+            // J = d beta / d rho = - H_p^-1 * [S_1 beta lambda_1, ..., S_k beta lambda_k]
+
+            // We need H_p and beta at the perturbed rho.
+            let pirls_res = self.execute_pirls_if_needed(&current_rho)?;
+
+            let beta = pirls_res.beta_transformed.as_ref();
+            let h_p = &pirls_res.penalized_hessian_transformed;
+            let lambdas = current_rho.mapv(f64::exp);
+            let rs = &pirls_res.reparam_result.rs_transformed;
+
+            let p_dim = beta.len();
+
+            // Invert H_p to get V_beta_cond (conditional covariance)
+            let mut v_beta_cond = Array2::<f64>::zeros((p_dim, p_dim));
+            {
+                use crate::calibrate::faer_ndarray::{array2_to_mat_mut, FaerArrayView};
+                use faer::Side;
+                let h_view = FaerArrayView::new(h_p);
+                // H_p should be PD at convergence
+                if let Ok(chol) = faer::linalg::solvers::Llt::new(h_view.as_ref(), Side::Lower) {
+                    let mut eye = Array2::<f64>::eye(p_dim);
+                    let mut eye_view = array2_to_mat_mut(&mut eye);
+                    chol.solve_in_place(eye_view.as_mut());
+                    v_beta_cond.assign(&eye);
+                } else {
+                    // Use LDLT if LLT fails
+                    if let Ok(ldlt) = faer::linalg::solvers::Ldlt::new(h_view.as_ref(), Side::Lower) {
+                        let mut eye = Array2::<f64>::eye(p_dim);
+                        let mut eye_view = array2_to_mat_mut(&mut eye);
+                        ldlt.solve_in_place(eye_view.as_mut());
+                        v_beta_cond.assign(&eye);
+                    } else {
+                        log::warn!("Penalized Hessian not invertible. Skipping correction.");
+                        return Ok((current_rho, None));
+                    }
+                }
+            }
+
+            // Compute Jacobian columns: u_k = - V_beta_cond * (S_k * beta * lambda_k)
+            // S_k = R_k^T R_k.
+            let mut jacobian = Array2::<f64>::zeros((p_dim, n_rho));
+
+            for k in 0..n_rho {
+                let r_k = &rs[k];
+                if r_k.ncols() == 0 {
+                    continue;
+                }
+
+                let lambda = lambdas[k];
+                // S_k beta = R_k^T (R_k beta)
+                let r_beta = r_k.dot(beta);
+                let s_beta = r_k.t().dot(&r_beta);
+
+                let term = s_beta.mapv(|v| v * lambda);
+
+                // col = - V_beta_cond * term
+                let col = v_beta_cond.dot(&term).mapv(|v| -v);
+
+                jacobian.column_mut(k).assign(&col);
+            }
+
+            // V_corr = J * V_rho * J^T
+            let temp = jacobian.dot(&v_rho); // (p, k) * (k, k) -> (p, k)
+            let v_corr = temp.dot(&jacobian.t()); // (p, k) * (k, p) -> (p, p)
+
+            log::info!(
+                "[Boundary] Correction computed. Max element in V_corr: {:.3e}",
+                v_corr.iter().fold(0.0_f64, |a, &b| a.max(b.abs()))
+            );
+
+            // Total Covariance
+            let v_total = v_beta_cond + v_corr;
+
+            Ok((current_rho, Some(v_total)))
         }
     }
 
