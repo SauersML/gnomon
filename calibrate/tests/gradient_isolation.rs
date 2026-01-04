@@ -31,7 +31,7 @@ use gnomon::calibrate::estimate::{
     evaluate_external_cost_and_ridge, evaluate_external_gradients, optimize_external_design,
     ExternalOptimOptions,
 };
-use gnomon::calibrate::faer_ndarray::FaerCholesky;
+use gnomon::calibrate::faer_ndarray::{FaerCholesky, FaerEigh};
 use gnomon::calibrate::model::{
     default_reml_parallel_threshold, BasisConfig, InteractionPenaltyKind, LinkFunction,
     ModelConfig, ModelFamily, PrincipalComponentConfig,
@@ -2825,6 +2825,111 @@ fn hypothesis_random_s_gam_xy() {
         println!("  => GAM X/y alone do NOT trigger failure");
     } else {
         println!("  => GAM X/y DO trigger failure (even with diagonal S)");
+    }
+}
+
+/// DIAGNOSTIC: Deep analysis of spectral vs expected gradient computation.
+/// This test examines each component of the Firth gradient to find exact
+/// point of divergence between analytic and finite-difference gradients.
+#[test]
+fn diagnostic_deep_gradient_analysis() {
+    println!("\n=== DIAGNOSTIC: Deep Gradient Component Analysis ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, layout, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let n = x_gam.nrows();
+    let p = x_gam.ncols();
+    let k = s_list_gam.len();
+    println!("  Dimensions: n={}, p={}, k={} penalties", n, p, k);
+
+    // Compute eigenvalue analysis of penalty structure
+    let rho_val = 12.0_f64;
+    let rho = Array1::from_elem(layout.num_penalties, rho_val);
+
+    // Build S_lambda = sum(exp(rho_k) * S_k)
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    for (idx, s_k) in s_list_gam.iter().enumerate() {
+        let lambda_k = rho[idx].exp();
+        for i in 0..p {
+            for j in 0..p {
+                s_lambda[[i, j]] += lambda_k * s_k[[i, j]];
+            }
+        }
+    }
+
+    // Eigenvalue analysis of S_lambda
+    let (s_eigvals, _): (Array1<f64>, _) = s_lambda.eigh(Side::Lower).expect("S eigh");
+    let s_pos = s_eigvals.iter().filter(|v| **v > 1e-10).count();
+    let s_neg = s_eigvals.iter().filter(|v| **v < -1e-10).count();
+    let s_zero = p - s_pos - s_neg;
+    println!("  S_lambda spectrum: pos={}, neg={}, zero={}", s_pos, s_neg, s_zero);
+    println!("  S_lambda eigenrange: [{:.2e}, {:.2e}]",
+        s_eigvals.iter().cloned().fold(f64::INFINITY, f64::min),
+        s_eigvals.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+
+    // Test gradient at multiple rho values
+    let offset = Array1::<f64>::zeros(n);
+    for rho_test in [0.0_f64, 6.0, 12.0] {
+        let rho_vec = Array1::from_elem(k, rho_test);
+        println!("\n  --- rho = {:.1} ---", rho_test);
+
+        // WITHOUT Firth
+        let opts_no_firth = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0; k],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &s_list_gam, &opts_no_firth, &rho_vec,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.999 { "✓" } else { "✗" };
+                println!("    No Firth: cos={:.6} {}", cos, status);
+            }
+            Err(e) => println!("    No Firth: ERROR {:?}", e),
+        }
+
+        // WITH Firth
+        let opts_firth = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0; k],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &s_list_gam, &opts_firth, &rho_vec,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, rel, max_a, max_fd) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.999 { "✓" } else { "✗" };
+                println!("    Firth: cos={:.6} {} (rel={:.2e}, |a|={:.2e}, |fd|={:.2e})",
+                    cos, status, rel, max_a, max_fd);
+
+                // If failing, show per-component analysis
+                if cos < 0.999 && k <= 15 {
+                    println!("    Per-component (analytic - fd):");
+                    for (i, (a, f)) in analytic.iter().zip(fd.iter()).enumerate() {
+                        let d = a - f;
+                        let rel_err = if f.abs() > 1e-12 { (d / f).abs() } else { f64::INFINITY };
+                        let flag = if rel_err > 0.1 { " <-- SUSPECT" } else { "" };
+                        println!("      [{:2}] a={:+.4e}, fd={:+.4e}, diff={:+.4e}, rel={:.1}%{}",
+                            i, a, f, d, 100.0 * rel_err, flag);
+                    }
+                }
+            }
+            Err(e) => println!("    Firth: ERROR {:?}", e),
+        }
     }
 }
 
