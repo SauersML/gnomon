@@ -1,9 +1,9 @@
 name: Jules Optimizer Loop
 
 on:
-  # Daily CRON at every 20 minutes to maintain constant improvement
+  # Run every 30 minutes
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '*/30 * * * *'
   
   # Manual trigger
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
   optimize:
     runs-on: ubuntu-latest
     # Increase timeout since Jules can take a while
-    timeout-minutes: 45
+    timeout-minutes: 120
     
     steps:
       - name: Checkout repository
