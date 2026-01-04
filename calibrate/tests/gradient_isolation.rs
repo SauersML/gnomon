@@ -2989,6 +2989,78 @@ fn diagnostic_penalty_structure_analysis() {
     println!("    Num penalties: {}", layout.num_penalties);
 }
 
+/// DIAGNOSTIC: Test each penalty individually to isolate the problem
+#[test]
+fn diagnostic_individual_penalty_test() {
+    println!("\n=== DIAGNOSTIC: Individual Penalty Test ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let n = x_gam.nrows();
+    let offset = Array1::<f64>::zeros(n);
+    let rho_single = array![12.0_f64];
+
+    println!("  Testing each penalty individually with Firth:");
+
+    // Test each penalty individually
+    for (idx, s_k) in s_list_gam.iter().enumerate() {
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_k.clone()], &opts, &rho_single,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let suspect = matches!(idx, 1 | 2 | 4 | 6);
+                let flag = if suspect { " <-- was suspect in multi-penalty" } else { "" };
+                let status = if cos > 0.999 { "✓" } else { "✗" };
+                println!("    Penalty [{}]: cos={:.6} {}{}", idx, cos, status, flag);
+            }
+            Err(e) => {
+                println!("    Penalty [{}]: ERROR {:?}", idx, e);
+            }
+        }
+    }
+
+    // Now test consecutive pairs to find interaction effects
+    println!("\n  Testing consecutive penalty pairs with Firth:");
+    for i in 0..s_list_gam.len()-1 {
+        let s_pair = vec![s_list_gam[i].clone(), s_list_gam[i+1].clone()];
+        let rho_pair = array![12.0_f64, 12.0_f64];
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0, 0],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &s_pair, &opts, &rho_pair,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.999 { "✓" } else { "✗" };
+                println!("    Pair [{}, {}]: cos={:.6} {}", i, i+1, cos, status);
+            }
+            Err(e) => {
+                println!("    Pair [{}, {}]: ERROR {:?}", i, i+1, e);
+            }
+        }
+    }
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
@@ -2998,7 +3070,7 @@ fn hypothesis_full_gam_control() {
     let config = logistic_model_config(true, false, &train);
     let (x_gam, s_list_gam, layout, ..) =
         build_design_and_penalty_matrices(&train, &config).expect("design");
-    
+
     let nullspace_dims = vec![0; s_list_gam.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
