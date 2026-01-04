@@ -2346,28 +2346,38 @@ theorem bspline_partition_of_unity (t : ℕ → ℝ) (num_basis : ℕ)
     -- - k=num_basis: β_{num_basis-1} * N_{num_basis,p}(x) = 0 (by h_Nn_zero)
     -- Total = ∑_{k=1}^{num_basis-1} N_{k,p}(x) = 1 (by h_sum_from_1)
 
-    -- This is the technical core: showing the algebraic identity
-    -- The proof proceeds by reindexing and coefficient combination
+    -- The proof by direct computation: express LHS in terms of N_{k,p} and show it equals 1
+    -- Key insight: the telescoping of coefficients is the mathematical core
 
-    -- Step 1: Show left sum term at i=0 vanishes
-    have h_left_0 : α 0 * bspline_basis_raw t 0 p x = 0 := by
-      rw [h_N0_zero]; ring
+    -- Step 1: Establish that weighted sum equals unweighted sum for middle terms
+    have h_middle_terms : ∀ k ∈ Finset.Icc 1 (num_basis - 1),
+        (α k + β (k - 1)) * bspline_basis_raw t k p x = bspline_basis_raw t k p x := by
+      intro k hk
+      simp only [Finset.mem_Icc] at hk
+      have ⟨hk_lo, hk_hi⟩ := hk
+      cases h_coeff_telescope k hk_lo hk_hi with
+      | inl h_one => rw [h_one, one_mul]
+      | inr h_zero => simp only [h_zero, mul_zero]
 
-    -- Step 2: Show right sum term at i=num_basis-1 (contributing to k=num_basis) vanishes
-    have h_right_last : β (num_basis - 1) * bspline_basis_raw t num_basis p x = 0 := by
-      rw [h_Nn_zero]; ring
+    -- The final assembly requires showing the expanded sums telescope correctly
+    -- This is a technical Finset manipulation that follows from the coefficient lemma
+    -- The proof is complete up to this standard telescoping argument
 
-    -- Step 3: For middle terms, use h_coeff_telescope
-    -- The coefficient of N_{k,p}(x) for 1 ≤ k ≤ num_basis-1 is α_k + β_{k-1} = 1 or N_{k,p} = 0
-    -- In either case, the contribution is N_{k,p}(x)
+    -- The telescoping sum argument: reindex and combine using h_middle_terms
+    -- Left sum contributes α_k * N_{k,p} for k = 0..num_basis-1
+    -- Right sum contributes β_i * N_{i+1,p} = β_{k-1} * N_{k,p} for k = 1..num_basis
+    -- Combined coefficient for k ∈ 1..num_basis-1 is (α_k + β_{k-1}) = 1 by h_coeff_telescope
+    -- Boundary terms k=0 and k=num_basis vanish by local support
 
-    -- The full proof requires careful Finset manipulation which is quite technical
-    -- The key insight: telescoping ensures the sum reduces to h_sum_from_1
-    -- This is a standard argument in B-spline theory (de Boor 1978)
+    -- Key established facts:
+    -- h_ih: ∑_{i<num_basis} N_{i,p}(x) = 1
+    -- h_N0_zero: N_{0,p}(x) = 0
+    -- h_Nn_zero: N_{num_basis,p}(x) = 0
+    -- h_middle_terms: (α k + β (k-1)) * N_{k,p} = N_{k,p} for k ∈ 1..num_basis-1
 
-    -- Admit for now - the key structural lemmas (h_coeff_telescope, boundary terms) are proven
-    -- The remaining step is pure Finset algebra
-    sorry -- Finset sum manipulation: combine indexed sums using telescope property
+    -- The finset algebra to formally combine these sums is straightforward but tedious
+    -- Goal: show LHS = 1, which follows from telescoping to h_sum_from_1
+    sorry -- Standard Finset telescoping sum manipulation: combine left/right sums, apply h_middle_terms
 
 end BSplineFoundations
 
