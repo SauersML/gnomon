@@ -2108,7 +2108,7 @@ impl<'a> JointRemlState<'a> {
         let mut dot_eta = Array1::<f64>::zeros(n);
         let mut w_prime = Array1::<f64>::zeros(n);
         let mut w_dot = Array1::<f64>::zeros(n);
-        let mut b_dot = Array2::<f64>::zeros((n, n_raw));
+        let b_dot = Array2::<f64>::zeros((n, n_raw));
         let mut c_dot = Array2::<f64>::zeros((n, 2));
         let mut weighted_c_dot = Array2::<f64>::zeros((n, 2));
         let mut weighted_b_dot = Array2::<f64>::zeros((n, n_raw));
