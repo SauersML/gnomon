@@ -26,30 +26,6 @@ pub enum PenaltyRepresentation {
 }
 
 impl PenaltyRepresentation {
-    fn frobenius_norm(&self) -> f64 {
-        match self {
-            PenaltyRepresentation::Dense(matrix) => {
-                matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
-            }
-            PenaltyRepresentation::Banded { bands, offsets } => {
-                let mut sum = 0.0;
-                for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    if offset < 0 {
-                        continue;
-                    }
-                    let weight = if offset == 0 { 1.0 } else { 2.0 };
-                    sum += weight * band.iter().map(|&x| x * x).sum::<f64>();
-                }
-                sum.sqrt()
-            }
-            PenaltyRepresentation::Kronecker { left, right } => {
-                let left_norm = left.iter().map(|&x| x * x).sum::<f64>().sqrt();
-                let right_norm = right.iter().map(|&x| x * x).sum::<f64>().sqrt();
-                left_norm * right_norm
-            }
-        }
-    }
-
     fn block_dimension(&self) -> usize {
         match self {
             PenaltyRepresentation::Dense(matrix) => matrix.nrows(),
@@ -712,10 +688,6 @@ impl DifferencePenalty {
     fn as_dense(&self) -> &Array2<f64> {
         self.dense
             .get_or_init(|| self.representation.to_block_dense())
-    }
-
-    fn frobenius_norm(&self) -> f64 {
-        self.representation.frobenius_norm()
     }
 }
 
@@ -1855,9 +1827,12 @@ pub fn build_design_and_penalty_matrices(
                 // Subtract cross terms: alpha^T S_cross + S_cross^T alpha
                 // S_cross connects M_pgs (coeff i) with T (coeffs i,j).
                 // Effectively S_cross ~ S_pgs ⊗ 1^T.
-                // We construct S_cross_row = S_pgs_main_constrained ⊗ ones(1, pc_cols).
+                // We need to connect the CONSTRAINED main basis (rows of S_cross)
+                // to the UNCONSTRAINED tensor components (cols of S_cross).
+                // So S_cross_row = (Z^T S_unc) ⊗ ones(1, pc_cols).
+                let s_pgs_main_mixed = pgs_z_transform.t().dot(&s_pgs_main_unc);
                 let ones_pc = Array2::<f64>::ones((1, pc_cols));
-                let s_cross_row = kronecker_product(&s_pgs_main_constrained, &ones_pc); // (k_pgs, k_pgs * k_pc)
+                let s_cross_row = kronecker_product(&s_pgs_main_mixed, &ones_pc); // (k_pgs_con, k_pgs_unc * k_pc)
                 let term2 = alpha_pgs.t().dot(&s_cross_row); // (k_tensor, k_tensor)
 
                 // S_proj = S_raw + alpha^T S_main alpha - (alpha^T S_cross + S_cross^T alpha)
@@ -1917,49 +1892,10 @@ pub fn build_design_and_penalty_matrices(
 
                 // Cross term: S_cross ~ 1^T ⊗ S_pc
                 let ones_pgs = Array2::<f64>::ones((1, pgs_cols)); // (1, k_pgs)
-                                                                   // We need to kronecker (1_pgs) with S_pc_main_constrained? No.
-                                                                   // M_pc corresponds to 1(pgs) * C(pc).
-                                                                   // T corresponds to P(pgs) * C(pc).
-                                                                   // <M_pc, T>_J_pc = <1, P>_I * <C, C>_S_pc.
-                                                                   // <1, P>_I corresponds to summing P coefficients? (Assuming 1 vector).
-                                                                   // Yes, ones_pgs.
-                                                                   // But order is P \otimes C.
-                                                                   // S_cross connects M_pc coeffs to T coeffs.
-                                                                   // M_pc coeffs: k_pc_total.
-                                                                   // T coeffs: k_pgs * k_pc.
-                                                                   // S_cross = ones_pgs ⊗ S_pc_main_constrained ??
-                                                                   // Dimensions:
-                                                                   // Left: 1 (pgs dim of M is collapsed).
-                                                                   // Right: S_pc (pc dim).
-                                                                   // Result needs to be (k_pc_total) x (k_pgs * k_pc_total)?
-                                                                   // Wait, Kronecker product A ⊗ B has dims (ra*rb, ca*cb).
-                                                                   // ones_pgs is (1, k_pgs).
-                                                                   // S_pc_main_constrained is (k_pc_total, k_pc_total).
-                                                                   // We want (k_pc_total, k_pgs * k_pc_total).
-                                                                   // We need S_pc ⊗ ones_pgs?
-                                                                   // (k_pc, k_pc) ⊗ (1, k_pgs) -> (k_pc, k_pc * k_pgs).
-                                                                   // But T is row-wise P ⊗ C.
-                                                                   // So coeffs are ordered (p1 c1, p1 c2, ..., p2 c1, ...).
-                                                                   // i.e. P is the slow index (outer), C is fast index (inner).
-                                                                   // So T ~ P ⊗ C.
-                                                                   // We want something that acts on P part as sum, and C part as S_pc.
-                                                                   // So we want ones_pgs ⊗ S_pc_main_constrained?
-                                                                   // ones_pgs (1, k_pgs). S_pc (k_pc, k_pc).
-                                                                   // (1*k_pc, k_pgs*k_pc).
-                                                                   // This assumes P is inner?
-                                                                   // If P is outer (slow), then we need (Sum P) ⊗ (S_pc).
-                                                                   // Tensor layout: Block 0 is P=0, all C. Block 1 is P=1, all C.
-                                                                   // We want to sum blocks.
-                                                                   // So we want [S_pc, S_pc, ..., S_pc].
-                                                                   // This is exactly ones_pgs ⊗ S_pc ??
-                                                                   // ones_pgs is (1, k_pgs).
-                                                                   // Kronecker(ones_pgs, S_pc) -> (1*k_pc, k_pgs*k_pc)? NO.
-                                                                   // Kronecker(A, B): A is outer.
-                                                                   // Kronecker(ones(1, k_pgs), S_pc)
-                                                                   // = [ 1*S_pc, 1*S_pc, ... ] (Row of blocks).
-                                                                   // Dimensions: (k_pc, k_pgs * k_pc).
-                                                                   // This matches!
-                let s_cross_row_pc = kronecker_product(&ones_pgs, &s_pc_main_constrained);
+
+                // Similar to PGS, we need rectangular cross term connecting constrained Main to unconstrained Tensor
+                let s_pc_main_mixed = z_total.t().dot(&s_pc_main_unc);
+                let s_cross_row_pc = kronecker_product(&ones_pgs, &s_pc_main_mixed);
                 let term2_pc = alpha_pc.t().dot(&s_cross_row_pc);
 
                 s_pc_proj = s_pc_proj + correction_pc - term2_pc.clone() - term2_pc.t();
