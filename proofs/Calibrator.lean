@@ -2111,7 +2111,263 @@ theorem bspline_partition_of_unity (t : ℕ → ℝ) (num_basis : ℕ)
   -- The proof proceeds by induction on degree p, using the Cox-de Boor recursion.
   -- Key insight: the recursion coefficients sum to 1 (telescoping property).
   -- This validates the B-spline implementation in basis.rs.
-  sorry -- B-spline partition of unity (standard result from approximation theory)
+  induction p generalizing num_basis with
+  | zero =>
+    -- Base case: degree 0 splines are indicator functions on [t_i, t_{i+1})
+    -- Exactly one of them equals 1 at x, the rest are 0
+    simp only [bspline_basis_raw]
+
+    -- Strategy: Use the "transition index" - find i such that t_i ≤ x < t_{i+1}
+    -- Since t is sorted and t_0 ≤ x < t_{num_basis}, such i exists uniquely.
+
+    -- Count knots ≤ x to find the transition index
+    -- The set {k | t_k ≤ x} is an initial segment [0, i] by monotonicity
+    have h_lo : t 0 ≤ x := by simpa using h_domain.1
+    have h_hi : x < t num_basis := h_domain.2
+
+    -- There exists a unique interval containing x
+    have h_exists : ∃ i ∈ Finset.range num_basis, t i ≤ x ∧ x < t (i + 1) := by
+      -- Use well-founded recursion on the distance from num_basis
+      -- Since t_0 ≤ x < t_{num_basis} and t is sorted, we can find the transition
+      classical
+      -- The set of indices where t_i ≤ x is nonempty (contains 0) and bounded
+      let S := Finset.filter (fun i => t i ≤ x) (Finset.range (num_basis + 1))
+      have hS_nonempty : S.Nonempty := ⟨0, by simp [S, h_lo]⟩
+      -- Take the maximum element of S
+      let i := S.max' hS_nonempty
+      have hi_in_S : i ∈ S := Finset.max'_mem S hS_nonempty
+      simp only [Finset.mem_filter, Finset.mem_range, S] at hi_in_S
+      have hi_le_x : t i ≤ x := hi_in_S.2
+      have hi_lt : i < num_basis + 1 := hi_in_S.1
+      -- i+1 is NOT in S (otherwise i wouldn't be max), so t_{i+1} > x
+      have hi1_not_in_S : i + 1 ∉ S := by
+        intro h_in
+        have : i + 1 ≤ i := Finset.le_max' S (i + 1) h_in
+        omega
+      simp only [Finset.mem_filter, Finset.mem_range, not_and, not_le, S] at hi1_not_in_S
+      have h_x_lt : x < t (i + 1) := by
+        by_cases h : i + 1 < num_basis + 1
+        · exact hi1_not_in_S h
+        · -- i + 1 ≥ num_basis + 1, so i ≥ num_basis
+          have : i ≥ num_basis := by omega
+          -- But t_i ≤ x < t_{num_basis} and t is sorted, so i < num_basis
+          have : t num_basis ≤ t i := h_sorted num_basis i this
+          have : x < t i := lt_of_lt_of_le h_hi this
+          exact absurd hi_le_x (not_le.mpr this)
+      -- Show i < num_basis
+      have hi_lt_nb : i < num_basis := by
+        by_contra h_ge
+        push_neg at h_ge
+        have : t num_basis ≤ t i := h_sorted num_basis i h_ge
+        have : x < t i := lt_of_lt_of_le h_hi this
+        exact absurd hi_le_x (not_le.mpr this)
+      exact ⟨i, Finset.mem_range.mpr hi_lt_nb, hi_le_x, h_x_lt⟩
+
+    obtain ⟨i, hi_mem, hi_in⟩ := h_exists
+    -- Show the sum equals 1 by splitting into the one nonzero term
+    rw [Finset.sum_eq_single i]
+    · -- The term at i equals 1
+      rw [if_pos hi_in]
+    · -- All other terms are 0
+      intro j hj hne
+      simp only [Finset.mem_range] at hj
+      split_ifs with h_in
+      · -- If j also contains x, contradiction with uniqueness
+        exfalso
+        obtain ⟨h_lo_i, h_hi_i⟩ := hi_in
+        obtain ⟨h_lo_j, h_hi_j⟩ := h_in
+        by_cases h_lt : j < i
+        · have : t (j + 1) ≤ t i := h_sorted (j + 1) i (by omega)
+          have : x < t i := lt_of_lt_of_le h_hi_j this
+          exact not_le.mpr this h_lo_i
+        · push_neg at h_lt
+          have h_gt : i < j := lt_of_le_of_ne h_lt (Ne.symm hne)
+          have : t (i + 1) ≤ t j := h_sorted (i + 1) j (by omega)
+          have : x < t j := lt_of_lt_of_le h_hi_i this
+          exact not_le.mpr this h_lo_j
+      · rfl
+    · -- i is in the range
+      intro hi_not
+      exfalso; exact hi_not hi_mem
+  | succ p ih =>
+    -- Inductive case: Telescoping sum via index splitting
+    --
+    -- Strategy: Split sum into Left and Right parts, shift indices, show coefficients sum to 1
+    -- For each N_{k,p}(x), it appears with:
+    --   - weight (x - t_k)/(t_{k+p+1} - t_k) from Left part of N_{k,p+1}
+    --   - weight (t_{k+p+1} - x)/(t_{k+p+1} - t_k) from Right part of N_{k-1,p+1}
+    -- These sum to 1 (when denominator is nonzero; zero denominator means term vanishes)
+    --
+    -- The boundary terms at k=0 and k=num_basis are zero by local support.
+
+    -- First, establish domain bounds for IH
+    have h_domain_p : t p ≤ x := by
+      have : t p ≤ t (Nat.succ p) := h_sorted p (Nat.succ p) (Nat.le_succ p)
+      exact le_trans this h_domain.1
+    have h_domain_p_full : t p ≤ x ∧ x < t num_basis := ⟨h_domain_p, h_domain.2⟩
+
+    -- Key insight: expand the recursion
+    simp only [bspline_basis_raw]
+
+    -- Split the sum: ∑_i (left_i + right_i) = ∑_i left_i + ∑_i right_i
+    rw [Finset.sum_add_distrib]
+
+    -- We'll show this equals 1 by showing it equals ∑_{k=1}^{num_basis-1} N_{k,p}(x)
+    -- which by IH equals 1 (since N_{0,p}(x) = 0 in the domain)
+
+    -- Left sum: ∑_{i < num_basis} α_i * N_{i,p}(x) where α_i = (x - t_i)/(t_{i+p+1} - t_i)
+    -- Right sum: ∑_{i < num_basis} β_i * N_{i+1,p}(x) where β_i = (t_{i+p+2} - x)/(t_{i+p+2} - t_{i+1})
+
+    -- Apply IH to get the sum of degree-p basis functions
+    have h_valid_p : num_basis > p := Nat.lt_of_succ_lt h_valid
+    have h_ih := ih num_basis h_domain_p_full h_valid_p
+
+    -- N_{0,p}(x) = 0 because x ≥ t_{p+1} and support is [t_0, t_{p+1})
+    have h_N0_zero : bspline_basis_raw t 0 p x = 0 := by
+      apply bspline_local_support t h_sorted 0 p x
+      right
+      simp only [Nat.zero_add]
+      exact h_domain.1
+
+    -- From IH and N_{0,p}(x) = 0, we get: ∑_{k=1}^{num_basis-1} N_{k,p}(x) = 1
+    have h_sum_from_1 : (Finset.Icc 1 (num_basis - 1)).sum (fun k => bspline_basis_raw t k p x) = 1 := by
+      -- Rewrite IH: ∑_{k=0}^{num_basis-1} N_{k,p}(x) = 1
+      -- Since N_{0,p}(x) = 0, we have ∑_{k=1}^{num_basis-1} = 1
+      have h_split : (Finset.range num_basis).sum (fun k => bspline_basis_raw t k p x) =
+                     bspline_basis_raw t 0 p x + (Finset.Icc 1 (num_basis - 1)).sum (fun k => bspline_basis_raw t k p x) := by
+        rw [Finset.range_eq_Ico]
+        have h_split_Ico : Finset.Ico 0 num_basis = {0} ∪ Finset.Icc 1 (num_basis - 1) := by
+          ext k
+          simp only [Finset.mem_Ico, Finset.mem_union, Finset.mem_singleton, Finset.mem_Icc]
+          constructor
+          · intro ⟨h1, h2⟩
+            by_cases hk : k = 0
+            · left; exact hk
+            · right; omega
+          · intro h
+            cases h with
+            | inl h => simp [h]; omega
+            | inr h => omega
+        rw [h_split_Ico]
+        rw [Finset.sum_union]
+        · simp only [Finset.sum_singleton]
+        · simp only [Finset.disjoint_singleton_left, Finset.mem_Icc]
+          omega
+      rw [h_split, h_N0_zero, zero_add] at h_ih
+      exact h_ih
+
+    -- Now we need to show the expanded sum equals ∑_{k=1}^{num_basis-1} N_{k,p}(x)
+    -- This is the telescoping argument
+
+    -- For cleaner notation, define the weight functions
+    let α : ℕ → ℝ := fun i =>
+      let denom := t (i + p + 1) - t i
+      if denom = 0 then 0 else (x - t i) / denom
+    let β : ℕ → ℝ := fun i =>
+      let denom := t (i + p + 2) - t (i + 1)
+      if denom = 0 then 0 else (t (i + p + 2) - x) / denom
+
+    -- The key lemma: for 1 ≤ k ≤ num_basis-1, the coefficients telescope
+    -- α_k (from left sum) + β_{k-1} (from right sum) = 1 when denom ≠ 0
+    -- This is because:
+    --   α_k = (x - t_k)/(t_{k+p+1} - t_k)
+    --   β_{k-1} = (t_{k+p+1} - x)/(t_{k+p+1} - t_k)  (after substitution)
+    --   Sum = (x - t_k + t_{k+p+1} - x)/(t_{k+p+1} - t_k) = 1
+
+    -- N_{num_basis,p}(x) = 0 because x < t_{num_basis} and support is [t_{num_basis}, ...)
+    have h_Nn_zero : bspline_basis_raw t num_basis p x = 0 := by
+      apply bspline_local_support t h_sorted num_basis p x
+      left
+      exact h_domain.2
+
+    -- Rewrite the goal using the established facts
+    -- The key insight: by telescoping, the sum reduces to ∑_{k=1}^{num_basis-1} N_{k,p}(x)
+    -- which equals 1 by h_sum_from_1
+
+    -- Convert to show equivalence with h_sum_from_1
+    rw [← h_sum_from_1]
+
+    -- Now we need to show:
+    -- ∑_{i<num_basis} left_i + ∑_{i<num_basis} right_i = ∑_{k∈Icc 1 (num_basis-1)} N_{k,p}(x)
+
+    -- Define the expanded sums explicitly
+    -- Left sum: ∑ α_i * N_{i,p}
+    -- Right sum: ∑ β_i * N_{i+1,p}
+
+    -- After reindexing right (j = i+1), we get:
+    -- Left: terms for k = 0, 1, ..., num_basis-1
+    -- Right: terms for k = 1, 2, ..., num_basis
+
+    -- Combined coefficient of N_{k,p}:
+    -- k = 0: α_0 (but N_{0,p} = 0)
+    -- k = 1..num_basis-1: α_k + β_{k-1} = 1
+    -- k = num_basis: β_{num_basis-1} (but N_{num_basis,p} = 0)
+
+    -- Key coefficient lemma: α_k + β_{k-1} = 1 when the denominator is nonzero
+    have h_coeff_telescope : ∀ k, 1 ≤ k → k ≤ num_basis - 1 →
+        α k + β (k - 1) = 1 ∨ bspline_basis_raw t k p x = 0 := by
+      intro k hk_lo hk_hi
+      simp only [α, β]
+      -- The denominators: t (k + p + 1) - t k for α_k
+      -- For β_{k-1}: t ((k-1) + p + 2) - t k = t (k + p + 1) - t k (same!)
+      -- Since k ≥ 1, we have k - 1 + 1 = k and k - 1 + p + 2 = k + p + 1
+      have hk_pos : k ≥ 1 := hk_lo
+      have h_idx1 : (k - 1) + 1 = k := Nat.sub_add_cancel hk_pos
+      have h_idx2 : (k - 1) + p + 2 = k + p + 1 := by omega
+      have h_denom_eq : t ((k - 1) + p + 2) - t ((k - 1) + 1) = t (k + p + 1) - t k := by
+        rw [h_idx1, h_idx2]
+      by_cases h_denom : t (k + p + 1) - t k = 0
+      · -- Denominator is zero: both terms are 0, but also N_{k,p}(x) = 0
+        right
+        apply bspline_local_support t h_sorted k p x
+        -- Support is [t_k, t_{k+p+1}) but t_k = t_{k+p+1}
+        have h_eq : t k = t (k + p + 1) := by linarith
+        by_cases hx : x < t k
+        · left; exact hx
+        · right; push_neg at hx; rw [← h_eq]; exact hx
+      · -- Denominator is nonzero: coefficients sum to 1
+        left
+        rw [if_neg h_denom]
+        rw [h_denom_eq, if_neg h_denom]
+        -- Numerator also needs rewriting: t (k - 1 + p + 2) = t (k + p + 1)
+        have h_num_idx : t (k - 1 + p + 2) = t (k + p + 1) := by rw [h_idx2]
+        rw [h_num_idx]
+        -- (x - t k) / d + (t (k+p+1) - x) / d = (x - t k + t (k+p+1) - x) / d = d / d = 1
+        have h_denom_ne : t (k + p + 1) - t k ≠ 0 := h_denom
+        rw [← add_div]
+        have h_num : x - t k + (t (k + p + 1) - x) = t (k + p + 1) - t k := by ring
+        rw [h_num, div_self h_denom_ne]
+
+    -- The actual algebraic manipulation using the coefficient lemma
+    -- The sum after expansion is: ∑_{i<num_basis} (α_i * N_{i,p}) + ∑_{i<num_basis} (β_i * N_{i+1,p})
+    -- After reindexing and using h_coeff_telescope:
+    -- - k=0 term: α_0 * N_{0,p}(x) = 0 (by h_N0_zero)
+    -- - k=1..num_basis-1: (α_k + β_{k-1}) * N_{k,p} = N_{k,p} (by h_coeff_telescope)
+    -- - k=num_basis: β_{num_basis-1} * N_{num_basis,p}(x) = 0 (by h_Nn_zero)
+    -- Total = ∑_{k=1}^{num_basis-1} N_{k,p}(x) = 1 (by h_sum_from_1)
+
+    -- This is the technical core: showing the algebraic identity
+    -- The proof proceeds by reindexing and coefficient combination
+
+    -- Step 1: Show left sum term at i=0 vanishes
+    have h_left_0 : α 0 * bspline_basis_raw t 0 p x = 0 := by
+      rw [h_N0_zero]; ring
+
+    -- Step 2: Show right sum term at i=num_basis-1 (contributing to k=num_basis) vanishes
+    have h_right_last : β (num_basis - 1) * bspline_basis_raw t num_basis p x = 0 := by
+      rw [h_Nn_zero]; ring
+
+    -- Step 3: For middle terms, use h_coeff_telescope
+    -- The coefficient of N_{k,p}(x) for 1 ≤ k ≤ num_basis-1 is α_k + β_{k-1} = 1 or N_{k,p} = 0
+    -- In either case, the contribution is N_{k,p}(x)
+
+    -- The full proof requires careful Finset manipulation which is quite technical
+    -- The key insight: telescoping ensures the sum reduces to h_sum_from_1
+    -- This is a standard argument in B-spline theory (de Boor 1978)
+
+    -- Admit for now - the key structural lemmas (h_coeff_telescope, boundary terms) are proven
+    -- The remaining step is pure Finset algebra
+    sorry -- Finset sum manipulation: combine indexed sums using telescope property
 
 end BSplineFoundations
 
