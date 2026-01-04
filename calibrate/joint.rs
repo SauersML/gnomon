@@ -169,6 +169,9 @@ pub struct JointModelResult {
     pub s_link_constrained: Array2<f64>,
     /// Base trained model artifacts needed for prediction
     pub base_model: Option<crate::calibrate::model::TrainedModel>,
+    /// Ridge stabilization used in the final IRLS solve.
+    /// Included in the cost function as 0.5*δ||β||² to satisfy the Envelope Theorem.
+    pub ridge_used: f64,
 }
 
 impl<'a> JointModelState<'a> {
@@ -222,6 +225,7 @@ impl<'a> JointModelState<'a> {
             quad_ctx,
             firth_bias_reduction: config.firth_bias_reduction,
             last_eta: None,
+            ridge_used: 0.0,
         }
     }
     
@@ -730,15 +734,18 @@ impl<'a> JointModelState<'a> {
         // So target for θ is: z_adjusted = z_firth - u
         let z_adjusted: Array1<f64> = &z_firth - u;
         
-        // Solve: (B'WB + λS)θ = B'W(z - u)
+        // Solve: (B'WB + λS + δI)θ = B'W(z - u)
+        // Track ridge δ to include 0.5*δ||θ||² in cost (Envelope Theorem).
         if b_wiggle.ncols() > 0 {
             let penalty = self.build_link_penalty();
-            let new_theta = Self::solve_weighted_ls(b_wiggle, &z_adjusted, &weights, &penalty, lambda_link);
-            
+            let (new_theta, ridge_link) = Self::solve_weighted_ls(b_wiggle, &z_adjusted, &weights, &penalty, lambda_link);
+
             // Update wiggle coefficients
             if new_theta.len() == self.beta_link.len() {
                 self.beta_link = new_theta;
             }
+            // Accumulate ridge (take max of base and link ridges for joint system)
+            self.ridge_used = self.ridge_used.max(ridge_link);
         }
         
         // Recompute deviance using updated coefficients
@@ -896,9 +903,12 @@ impl<'a> JointModelState<'a> {
             }
         }
         
-        // Solve PWLS: (X'W_eff X + S)β = X'W_eff z_eff
-        let new_beta = Self::solve_weighted_ls(&self.x_base.to_owned(), &z_eff, &w_eff, &penalty, 1.0);
-        
+        // Solve PWLS: (X'W_eff X + S + δI)β = X'W_eff z_eff
+        // Track ridge δ to include 0.5*δ||β||² in cost (Envelope Theorem).
+        let (new_beta, ridge_base) = Self::solve_weighted_ls(&self.x_base.to_owned(), &z_eff, &w_eff, &penalty, 1.0);
+        // Accumulate ridge (take max of base and link ridges for joint system)
+        self.ridge_used = self.ridge_used.max(ridge_base);
+
         // Apply damped update
         for j in 0..p {
             if j < new_beta.len() {
@@ -1108,6 +1118,7 @@ pub fn fit_joint_model<'a>(
         link: state.link.clone(),
         s_link_constrained: state.s_link_constrained.clone().unwrap_or_else(|| Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))),
         base_model: None,
+        ridge_used: state.ridge_used,
     })
 }
 
@@ -1492,9 +1503,28 @@ impl<'a> JointRemlState<'a> {
             e_transformed: Array2::zeros((0, p_base)),
             u_truncated: Array2::zeros((p_base, p_base)),  // All modes truncated in fallback
         });
-        let base_log_det_s = base_reparam.log_det;
-        let base_rank = base_reparam.e_transformed.nrows() as f64;
-        
+        // For the base block, stable_reparameterization computes log|S_λ|_+.
+        // When ridge δ > 0, we need log|S_λ + δI|_+ for consistency.
+        // Compute correction via eigendecomposition of s_transformed.
+        let (base_log_det_s, base_rank) = if state.ridge_used > 0.0 && base_reparam.s_transformed.nrows() > 0 {
+            use crate::calibrate::faer_ndarray::FaerEigh;
+            let (eigs, _) = base_reparam.s_transformed
+                .clone()
+                .eigh(Side::Lower)
+                .unwrap_or_else(|_| (Array1::zeros(p_base), Array2::eye(p_base)));
+            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
+            let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
+            let rank = positive.len() as f64;
+            // Compute log|S_λ + δI|_+ = Σ log(λ_i + δ) for positive eigenvalues
+            let log_det = positive.iter()
+                .map(|&ev| (ev + state.ridge_used).max(1e-300).ln())
+                .sum::<f64>();
+            (log_det, rank)
+        } else {
+            (base_reparam.log_det, base_reparam.e_transformed.nrows() as f64)
+        };
+
         let (link_log_det_s, link_rank) = if p_link > 0 {
             use crate::calibrate::faer_ndarray::FaerEigh;
             let (eigs, _) = link_penalty
@@ -1505,8 +1535,13 @@ impl<'a> JointRemlState<'a> {
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
             let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
             let rank = positive.len() as f64;
-            let log_det = positive.iter().map(|&ev| ev.ln()).sum::<f64>()
-                + rank * lambda_link.max(1e-10).ln();
+            // Compute log|λ_link * S_link + δI|_+ where δ is the stabilization ridge.
+            // Eigenvalues of S_link are `eigs`, so eigenvalues of λ*S + δI are λ*eig + δ.
+            // This ensures the log-det term is consistent with the ridged penalty.
+            let ridge = state.ridge_used;
+            let log_det = positive.iter()
+                .map(|&ev| (lambda_link * ev + ridge).max(1e-300).ln())
+                .sum::<f64>();
             (log_det, rank)
         } else {
             (0.0, 0.0)
@@ -1517,7 +1552,13 @@ impl<'a> JointRemlState<'a> {
         // Null space dimension
         let mp = (p_base as f64 - base_rank) + (p_link as f64 - link_rank);
         
-        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'Sλ beta
+        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'(S_λ + δI)beta
+        //
+        // Envelope Theorem Consistency: When the solver adds ridge δ to ensure
+        // positive definiteness, the effective penalty becomes S_λ + δI.
+        // We must include 0.5*δ||β||² in the penalty term so that:
+        //   ∇_β V(β̂) = 0  (stationarity condition)
+        // Without this, the analytic gradient will have error ≈ δ*||β||.
         let mut penalty_term = 0.0;
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
@@ -1531,6 +1572,13 @@ impl<'a> JointRemlState<'a> {
                 let sb = link_penalty.dot(&state.beta_link);
                 penalty_term += lambda_link * state.beta_link.dot(&sb);
             }
+        }
+        // Add ridge penalty: 0.5*δ*(||β_base||² + ||β_link||²)
+        // This completes the effective penalty S_λ + δI.
+        if state.ridge_used > 0.0 {
+            let beta_base_norm_sq = state.beta_base.dot(&state.beta_base);
+            let beta_link_norm_sq = state.beta_link.dot(&state.beta_link);
+            penalty_term += state.ridge_used * (beta_base_norm_sq + beta_link_norm_sq);
         }
         
         let laml = match state.link {
@@ -2629,6 +2677,7 @@ impl<'a> JointRemlState<'a> {
             link: state.link.clone(),
             s_link_constrained: state.s_link_constrained.unwrap_or_else(|| Array2::zeros((state.n_constrained_basis, state.n_constrained_basis))),
             base_model: None,
+            ridge_used: state.ridge_used,
         }
     }
 }
@@ -3275,8 +3324,9 @@ mod tests {
             link: LinkFunction::Logit,
             base_model: None,
             s_link_constrained: Array2::eye(num_basis),
+            ridge_used: 0.0,
         };
-        
+
         // Test with base eta values
         let eta_base = Array1::from_vec(vec![-2.0, -1.0, 0.0, 1.0, 2.0]);
         
@@ -3330,8 +3380,9 @@ mod tests {
             link: LinkFunction::Logit,
             base_model: None,
             s_link_constrained: Array2::eye(num_basis),
+            ridge_used: 0.0,
         };
-        
+
         let eta_base = Array1::from_vec(vec![0.0, 1.0, 2.0]);
         let se_base = Array1::from_vec(vec![0.5, 0.5, 0.5]);
         
