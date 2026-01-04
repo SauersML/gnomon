@@ -2419,7 +2419,116 @@ theorem bspline_partition_of_unity (t : ℕ → ℝ) (num_basis : ℕ)
     -- 5. For middle terms: (α_k + β_{k-1}) * N_k = N_k by h_middle_terms
     -- 6. Result: ∑_{k∈Icc 1 (num_basis-1)} N_k = h_sum_from_1 = 1
 
-    sorry -- Finset reindexing and combination (mathematically complete)
+    -- Direct approach: show the sum equals h_ih by algebraic manipulation
+    -- Key: h_ih = ∑_{k<num_basis} N_k = 1, and N_0 = 0, so ∑_{k=1}^{num_basis-1} N_k = 1
+
+    -- Step 1: Split left sum at k=0
+    have h_left_split : (Finset.range num_basis).sum (fun i => α i * bspline_basis_raw t i p x)
+        = α 0 * bspline_basis_raw t 0 p x
+        + (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x) := by
+      rw [Finset.range_eq_Ico]
+      have h_split : Finset.Ico 0 num_basis = {0} ∪ Finset.Icc 1 (num_basis - 1) := by
+        ext k; simp only [Finset.mem_Ico, Finset.mem_union, Finset.mem_singleton, Finset.mem_Icc]
+        constructor
+        · intro ⟨_, h2⟩; by_cases hk : k = 0; left; exact hk; right; omega
+        · intro h; cases h with | inl h => simp [h]; omega | inr h => omega
+      rw [h_split, Finset.sum_union]
+      · simp only [Finset.sum_singleton]
+      · simp only [Finset.disjoint_singleton_left, Finset.mem_Icc]; omega
+
+    -- Step 2: Reindex the right sum from range num_basis to Icc 1 num_basis
+    -- Using the substitution j = i + 1, so i = j - 1
+    have h_right_reindex : (Finset.range num_basis).sum (fun i => β i * bspline_basis_raw t (i + 1) p x)
+        = (Finset.Icc 1 num_basis).sum (fun j => β (j - 1) * bspline_basis_raw t j p x) := by
+      -- Use sum_bij' with explicit membership proofs
+      refine Finset.sum_bij' (fun i _ => i + 1) (fun j _ => j - 1) ?_ ?_ ?_ ?_ ?_
+      -- hi : ∀ a ∈ range num_basis, a + 1 ∈ Icc 1 num_basis
+      · intro i hi
+        simp only [Finset.mem_range] at hi
+        simp only [Finset.mem_Icc]
+        constructor <;> omega
+      -- hj : ∀ b ∈ Icc 1 num_basis, b - 1 ∈ range num_basis
+      · intro j hj
+        simp only [Finset.mem_Icc] at hj
+        simp only [Finset.mem_range]
+        omega
+      -- left_inv : ∀ a ∈ range num_basis, (a + 1) - 1 = a
+      · intro i _; simp only [Nat.add_sub_cancel]
+      -- right_inv : ∀ b ∈ Icc 1 num_basis, (b - 1) + 1 = b
+      · intro j hj
+        simp only [Finset.mem_Icc] at hj
+        exact Nat.sub_add_cancel hj.1
+      -- h : f i = g (i + 1)
+      · intro i _; simp only [Nat.add_sub_cancel]
+
+    -- Step 3: Split the right sum at j = num_basis
+    have h_right_split : (Finset.Icc 1 num_basis).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+        = (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+        + β (num_basis - 1) * bspline_basis_raw t num_basis p x := by
+      have h_union : Finset.Icc 1 num_basis = Finset.Icc 1 (num_basis - 1) ∪ {num_basis} := by
+        ext k; simp only [Finset.mem_Icc, Finset.mem_union, Finset.mem_singleton]
+        constructor <;> intro h <;> omega
+      rw [h_union, Finset.sum_union]
+      · simp only [Finset.sum_singleton]
+      · simp only [Finset.disjoint_singleton_right, Finset.mem_Icc]; omega
+
+    -- Step 4: Apply boundary conditions
+    have h_left_boundary : α 0 * bspline_basis_raw t 0 p x = 0 := by
+      rw [h_N0_zero]; ring
+    have h_right_boundary : β (num_basis - 1) * bspline_basis_raw t num_basis p x = 0 := by
+      rw [h_Nn_zero]; ring
+
+    -- Step 5: Combine the middle terms
+    -- After splitting and applying boundaries, we need to show:
+    -- ∑_{k ∈ Icc 1 (num_basis-1)} α_k * N_k + ∑_{k ∈ Icc 1 (num_basis-1)} β_{k-1} * N_k = 1
+
+    have h_middle_combine : (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+        + (Finset.Icc 1 (num_basis - 1)).sum (fun k => β (k - 1) * bspline_basis_raw t k p x)
+        = (Finset.Icc 1 (num_basis - 1)).sum (fun k => bspline_basis_raw t k p x) := by
+      rw [← Finset.sum_add_distrib]
+      apply Finset.sum_congr rfl
+      intro k hk
+      have h_factor : α k * bspline_basis_raw t k p x + β (k - 1) * bspline_basis_raw t k p x
+          = (α k + β (k - 1)) * bspline_basis_raw t k p x := by ring
+      rw [h_factor, h_middle_terms k hk]
+
+    -- Step 6: Assemble the full proof using explicit rewrites
+    -- First rename the bound variable in the right sum of h_middle_combine for matching
+    have h_middle_combine' : (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+        + (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+        = (Finset.Icc 1 (num_basis - 1)).sum (fun k => bspline_basis_raw t k p x) := h_middle_combine
+
+    -- Now build the proof step by step
+    have step1 : (Finset.range num_basis).sum (fun i => α i * bspline_basis_raw t i p x)
+           + (Finset.range num_basis).sum (fun i => β i * bspline_basis_raw t (i + 1) p x)
+        = α 0 * bspline_basis_raw t 0 p x
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 num_basis).sum (fun j => β (j - 1) * bspline_basis_raw t j p x) := by
+      rw [h_left_split, h_right_reindex]
+
+    have step2 : α 0 * bspline_basis_raw t 0 p x
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 num_basis).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+        = α 0 * bspline_basis_raw t 0 p x
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+           + β (num_basis - 1) * bspline_basis_raw t num_basis p x := by
+      rw [h_right_split]; ring
+
+    have step3 : α 0 * bspline_basis_raw t 0 p x
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+           + β (num_basis - 1) * bspline_basis_raw t num_basis p x
+        = (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x) := by
+      rw [h_left_boundary, h_right_boundary]; ring
+
+    have step4 : (Finset.Icc 1 (num_basis - 1)).sum (fun k => α k * bspline_basis_raw t k p x)
+           + (Finset.Icc 1 (num_basis - 1)).sum (fun j => β (j - 1) * bspline_basis_raw t j p x)
+        = 1 := by
+      rw [h_middle_combine', h_sum_from_1]
+
+    linarith [step1, step2, step3, step4]
 
 end BSplineFoundations
 
