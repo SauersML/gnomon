@@ -2213,9 +2213,10 @@ theorem penalty_congruence
     quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
   -- quadForm S (Qβ') = Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = (Qβ')ᵀ S (Qβ')
   -- = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β' = quadForm (QᵀSQ) β'
-  -- This is the standard bilinear form identity for congruence transformation.
-  -- The proof expands dot products, exchanges sums, and uses commutativity.
-  -- See: Mathlib.LinearAlgebra.QuadraticForm for related machinery.
+  -- The proof uses:
+  --   1. (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β')) by Matrix.mulVec_mulVec
+  --   2. The transpose-dot identity: (Qu) ⬝ v = u ⬝ (Qᵀv)
+  -- Reference: Wood (2011), "Fast stable restricted maximum likelihood", Section 3.
   sorry
 
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
