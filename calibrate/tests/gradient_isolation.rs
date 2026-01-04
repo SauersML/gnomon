@@ -2897,6 +2897,71 @@ fn hypothesis_fd_step_size_inconsistency() {
         high_rho_inconsistencies);
 }
 
+/// Tests that analytic gradient sign matches cost function trend at all rho values.
+///
+/// This is orthogonal to `hypothesis_fd_step_size_inconsistency` because it verifies
+/// the analytic gradient directly against the cost function without using FD.
+/// If cost decreases as rho increases, the gradient should be negative (and vice versa).
+#[test]
+fn hypothesis_analytic_gradient_matches_cost_trend() {
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let s_4 = s_list_gam[4].clone();
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    let compute_cost = |rho_val: f64| -> f64 {
+        let rho = array![rho_val];
+        evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho,
+        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+    };
+
+    let compute_analytic_grad = |rho_val: f64| -> f64 {
+        let rho = array![rho_val];
+        evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho,
+        ).map(|(analytic, _)| analytic[0]).unwrap_or(f64::NAN)
+    };
+
+    // Use a large delta to get reliable cost trend (avoids FD precision issues)
+    let delta = 0.5;
+    let mut mismatches = 0;
+
+    for rho_val in [0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0] {
+        let cost_minus = compute_cost(rho_val - delta);
+        let cost_plus = compute_cost(rho_val + delta);
+        let cost_trend = cost_plus - cost_minus; // positive = cost increasing
+
+        let analytic_grad = compute_analytic_grad(rho_val);
+
+        // If cost increases with rho, gradient should be positive (and vice versa)
+        let trend_sign_positive = cost_trend > 0.0;
+        let grad_sign_positive = analytic_grad > 0.0;
+        let signs_match = trend_sign_positive == grad_sign_positive;
+
+        if !signs_match {
+            mismatches += 1;
+        }
+    }
+
+    // Analytic gradient should match cost trend at all rho values
+    assert!(mismatches == 0,
+        "analytic gradient sign should match cost trend, found {} mismatches", mismatches);
+}
+
 /// Control test: full GAM at rho=12 where FD validation is expected to be unreliable.
 ///
 /// This demonstrates the known limitation where FD gradient validation fails at
