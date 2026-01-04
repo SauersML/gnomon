@@ -4279,6 +4279,11 @@ pub mod internal {
         /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
         h_pseudoinverse: Arc<Array2<f64>>,
 
+        /// Spectral factor W where H₊† = W Wᵀ and W = U_valid * diag(1/√λ_valid).
+        /// Shape: (p × rank) where rank = number of positive eigenvalues.
+        /// Used for computing ∇_β log|H₊| via M = X W Wᵀ Xᵀ = (XW)(XW)ᵀ
+        spectral_factor_w: Arc<Array2<f64>>,
+
         /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
     }
@@ -5084,6 +5089,7 @@ pub mod internal {
                 h_total: Arc::new(h_total),
                 h_total_factor,
                 h_pseudoinverse: Arc::new(h_pseudoinverse),
+                spectral_factor_w: Arc::new(w),
                 h_total_log_det,
             })
         }
@@ -5568,40 +5574,12 @@ pub mod internal {
         ///
         /// where M = H_total^{-1} (p × p).
         ///
-        /// ## Term 1 Gradient (diagonal part)
+        /// ## Note
         ///
-        /// Since h_i depends on β through B = W^{1/2} X L_F^{-T}:
-        /// - ∂T_1/∂B contribution: 2 * diag(m ⊙ v) B
-        /// - Coefficient: -0.25 * 2 = -0.5
-        ///
-        /// ## Term 2 Gradient (off-diagonal part)
-        ///
-        /// Using reverse-mode AD through the Khatri-Rao product (A⊙A):
-        /// - ∂T_2/∂B = 4 * (Z ⊙ A) B where Z = Y M Y^T
-        /// - Coefficient: +0.25 * 4 = +1.0
-        /// - Implementation uses M_proj = C^T C for the inverse Hessian projection
-        ///
-        /// ## Chain Rule to β
-        ///
-        /// Final gradient: g_β = X^T g_η where g_η accumulates per-observation gradients.
-        ///
-        /// ## Mathematical Derivation using Adjoint Method
-        ///
-        /// We seek $\nabla_\beta \log |H_{total}|$ where $H_{total} = X^\top W X + S_\lambda - H_\phi$.
-        /// Here $H_\phi$ is the Firth curvature matrix (Hessian of the Firth penalty).
-        ///
-        /// The derivative involves forward differentiation of the components of $H_\phi$ and reverse-mode
-        /// accumulation (adjoint method) to compute the gradient efficiently without forming 3rd order tensors.
-        ///
-        /// 1. **Main Hessian Term:** $\text{tr}(H_{total}^{-1} X^\top \frac{\partial W}{\partial \beta_j} X)$
-        ///    - Implemented by `g_eta += mdiag * w_prime`
-        ///
-        /// 2. **Firth Curvature Term:** $-\text{tr}(H_{total}^{-1} \frac{\partial^3 \Phi}{\partial \beta \partial \beta^\top \partial \beta_j})$
-        ///    - Backpropagated through Cholesky of hat matrix components.
-        ///    - Includes sensitivities for $v = w''/w$, $u = w'/w$, and $b$ (hat factor).
-        ///
-        
-        fn firth_logh_total_grad(
+        /// This is the Cholesky-based version, kept for test compatibility.
+        /// Production code uses `firth_logh_total_grad_spectral` for spectral consistency.
+        #[cfg(test)]
+        pub(crate) fn firth_logh_total_grad(
             &self,
             x_transformed: &DesignMatrix,
             mu: &Array1<f64>,
@@ -5855,6 +5833,183 @@ pub mod internal {
             Ok(g_beta)
         }
 
+        /// Spectral version of `firth_logh_total_grad` for consistency with truncated log-det.
+        ///
+        /// Instead of using Cholesky-based C = X L_t^{-T}, this uses C = X W where
+        /// W is the spectral factor satisfying H₊† = W Wᵀ.
+        ///
+        /// This ensures ∇_β log|H₊| = tr(H₊† ∂H/∂β) uses the same spectral truncation
+        /// as the cost function log|H₊| = Σᵢ log(λᵢ) for λᵢ > ε.
+        fn firth_logh_total_grad_spectral(
+            &self,
+            x_transformed: &DesignMatrix,
+            mu: &Array1<f64>,
+            weights: &Array1<f64>,
+            spectral_w: &Array2<f64>,
+        ) -> Result<Array1<f64>, EstimationError> {
+            let x = self.dense_design_matrix(x_transformed);
+            let n = x.nrows();
+            let p = x.ncols();
+            if n == 0 || p == 0 || mu.len() != n {
+                return Ok(Array1::zeros(p));
+            }
+
+            const PROB_EPS: f64 = 1e-8;
+            const MIN_WEIGHT: f64 = 1e-12;
+
+            let mut w_base = Array1::<f64>::zeros(n);
+            let mut u = Array1::<f64>::zeros(n);
+            let mut v = Array1::<f64>::zeros(n);
+            let mut v_eta = Array1::<f64>::zeros(n);
+            let mut u_eta = Array1::<f64>::zeros(n);
+            let mut w_prime = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let mu_i = mu[i];
+                let w_b = mu_i * (1.0 - mu_i);
+                w_base[i] = w_b;
+                if mu_i <= PROB_EPS || mu_i >= 1.0 - PROB_EPS || w_b < MIN_WEIGHT {
+                    u[i] = 0.0;
+                    v[i] = 0.0;
+                    v_eta[i] = 0.0;
+                    u_eta[i] = 0.0;
+                    w_prime[i] = 0.0;
+                    continue;
+                }
+                let u_i = 1.0 - 2.0 * mu_i;
+                u[i] = u_i;
+                v[i] = u_i * u_i - 2.0 * w_b;
+                v_eta[i] = -6.0 * w_b * u_i;
+                u_eta[i] = -2.0 * w_b;
+                w_prime[i] = weights[i] * u_i;
+            }
+
+            // Forward thin factors:
+            //   B = W^{1/2} X L_f^{-T}   with H_hat = B B^T (unchanged - Fisher info)
+            //   C = X * spectral_W      with M_h = X H₊† X^T = C C^T (SPECTRAL VERSION)
+            let (b, l_f, xw) = self.firth_hat_factor(x.view(), weights.view())?;
+
+            // SPECTRAL: C = X * W instead of Cholesky-based X L_t^{-T}
+            let c = x.dot(spectral_w);
+
+            // Diagonal summaries (no n×n):
+            let h = Self::row_norms_squared(&b);
+            let mdiag = Self::row_norms_squared(&c);
+
+            // g_eta accumulates ∂J/∂eta
+            let mut g_eta = &mdiag * &w_prime;
+            for i in 0..n {
+                g_eta[i] += -0.5 * mdiag[i] * h[i] * v_eta[i];
+            }
+
+            // Backprop through H_phi diagonal term
+            let mut grad_b = Array2::<f64>::zeros((n, p));
+            for i in 0..n {
+                let scale = 0.5 * mdiag[i] * v[i];
+                if scale != 0.0 {
+                    for j in 0..p {
+                        grad_b[(i, j)] -= scale * b[(i, j)];
+                    }
+                }
+            }
+
+            // Reverse-mode AD for off-diagonal Firth correction (using spectral C)
+            let mut tensor_t = vec![0.0_f64; p * p * p];
+            let mut v_mat = faer::Mat::<f64>::zeros(n, p);
+            for i in 0..n {
+                let u_i = u[i];
+                for k in 0..p {
+                    v_mat[(i, k)] = u_i * c[(i, k)];
+                }
+            }
+
+            // Phase 2: Compute tensor slices via BLAS-3 matmul
+            for m in 0..p {
+                let mut scaled_b = faer::Mat::<f64>::zeros(n, p);
+                for j in 0..n {
+                    let b_jm = b[(j, m)];
+                    for l in 0..p {
+                        scaled_b[(j, l)] = b_jm * b[(j, l)];
+                    }
+                }
+                let mut t_slice = faer::Mat::<f64>::zeros(p, p);
+                faer::linalg::matmul::matmul(
+                    t_slice.as_mut(),
+                    faer::Accum::Replace,
+                    v_mat.as_ref().transpose(),
+                    scaled_b.as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
+                for k in 0..p {
+                    for l in 0..p {
+                        tensor_t[k * p * p + l * p + m] = t_slice[(k, l)];
+                    }
+                }
+            }
+
+            // Phase 3: Contract tensor with observation vectors
+            for i in 0..n {
+                let u_i = u[i];
+                if u_i == 0.0 {
+                    continue;
+                }
+                for m in 0..p {
+                    let mut acc = 0.0;
+                    for k in 0..p {
+                        let c_ik = c[(i, k)];
+                        if c_ik == 0.0 {
+                            continue;
+                        }
+                        for l in 0..p {
+                            let b_il = b[(i, l)];
+                            if b_il == 0.0 {
+                                continue;
+                            }
+                            acc += c_ik * b_il * tensor_t[k * p * p + l * p + m];
+                        }
+                    }
+                    grad_b[(i, m)] += u_i * acc;
+                }
+            }
+
+            // Backprop through Cholesky of Fisher info (unchanged)
+            let g_y = grad_b.t().to_owned();
+            let d_xw = Self::solve_upper_triangular(&l_f.t().to_owned(), &g_y);
+            let d_l = {
+                let temp = d_xw.dot(&b);
+                let mut out = temp.t().to_owned();
+                for i in 0..p {
+                    for j in (i + 1)..p {
+                        out[(i, j)] = 0.0;
+                    }
+                }
+                out.mapv(|vv| -vv)
+            };
+            let g_f = Self::chol_reverse(&l_f, &d_l)?;
+            let mut g_xw = xw.dot(&g_f);
+            g_xw.mapv_inplace(|vv| 2.0 * vv);
+            g_xw += &d_xw.t().to_owned();
+
+            // Backprop through X_w = diag(sqrt(w)) X
+            for i in 0..n {
+                let w_i = weights[i];
+                if w_i <= 0.0 {
+                    continue;
+                }
+                let denom = w_i.sqrt();
+                let mut acc = 0.0;
+                for j in 0..p {
+                    acc += x[(i, j)] * g_xw[(i, j)];
+                }
+                let g_w = 0.5 * acc / denom;
+                g_eta[i] += g_w * w_prime[i];
+            }
+
+            // Final chain: g_beta = X^T g_eta
+            let g_beta = x.t().dot(&g_eta);
+            Ok(g_beta)
+        }
+
         // Convert DesignMatrix to dense Array2 for Firth computations.
         
         fn dense_design_matrix(&self, x_transformed: &DesignMatrix) -> Array2<f64> {
@@ -6054,7 +6209,8 @@ pub mod internal {
         }
 
         // Build C = X L_t^{-T} for M_h = X H_total^{-1} X^T = C C^T.
-        
+        // (Cholesky-based, kept for test compatibility)
+        #[cfg(test)]
         fn h_total_factor(
             &self,
             x: ArrayView2<'_, f64>,
@@ -7336,7 +7492,8 @@ pub mod internal {
                         // HESSIAN PASSPORT: Use the EXACT same h_total and factorization
                         // that was used in the cost function computation. This ensures
                         // mathematical consistency between cost and gradient.
-                        let h_for_factor = bundle.h_total.as_ref();
+                        // h_total kept for reference but no longer used directly in gradient
+                        // (spectral factor W is used instead for consistency)
                         let h_phi_opt: Option<()> = if self.config.firth_bias_reduction
                             && matches!(self.config.link_function().expect("link fn"), LinkFunction::Logit)
                         {
@@ -7431,28 +7588,31 @@ pub mod internal {
                         };
 
 
-                        // LAML adds 0.5 * ∂log|H|/∂β. By Jacobi's formula:
-                        //   ∂/∂β_j log|H| = tr(H^{-1} ∂H/∂β_j)
+                        // LAML adds 0.5 * ∂log|H₊|/∂β. By Jacobi's formula:
+                        //   ∂/∂β_j log|H₊| = tr(H₊† ∂H/∂β_j)
                         // For logit, H = Xᵀ W X + S (non-Firth) or H_total = Xᵀ W X + S - H_φ (Firth).
-                        // For Firth, we use the exact gradient via reverse-mode autodiff which
-                        // includes the ∂H_φ/∂β term through the Cholesky factorization backprop.
+                        //
+                        // SPECTRAL CONSISTENCY: We use the spectral factor W (where H₊† = WWᵀ)
+                        // to ensure ∇_β log|H₊| uses the same truncation as the cost function.
+                        // This is critical for the implicit correction term to point in the
+                        // correct direction on the truncated cost surface.
                         let logh_beta_grad: Option<Array1<f64>> = if let LinkFunction::Logit = self
                             .config
                             .link_function()
                             .expect("link_function called on survival model")
                         {
                             if self.config.firth_bias_reduction && h_phi_opt.is_some() {
-                                // Use exact firth_logh_total_grad with full reverse-mode autodiff
-                                // NOTE: Uses stabilized Fisher info (matching cost path) for consistency
-                                match self.firth_logh_total_grad(
+                                // Use SPECTRAL version with W factor for consistency with truncated cost
+                                let spectral_w = bundle.spectral_factor_w.as_ref();
+                                match self.firth_logh_total_grad_spectral(
                                     &pirls_result.x_transformed,
                                     &pirls_result.solve_mu,
                                     &pirls_result.solve_weights,
-                                    &h_for_factor,
+                                    spectral_w,
                                 ) {
                                     Ok(grad) => Some(grad),
                                     Err(_) => {
-                                    // Fallback to approximate gradient
+                                    // Fallback to approximate gradient (also spectral)
                                         self.logh_beta_grad_logit(
                                             &pirls_result.x_transformed,
                                             &pirls_result.solve_mu,
