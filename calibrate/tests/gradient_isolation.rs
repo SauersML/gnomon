@@ -3313,6 +3313,109 @@ fn diagnostic_verify_gradient_via_cost_trend() {
     }
 }
 
+/// DIAGNOSTIC: Detailed FD failure analysis - examine cost at many step sizes.
+/// This test directly computes cost(rho+h) - cost(rho-h) for various h
+/// to understand why FD gives wrong sign.
+#[test]
+fn diagnostic_fd_failure_detailed_analysis() {
+    println!("\n=== DIAGNOSTIC: FD Failure Analysis at rho=12 ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    // Extract penalty [4] - the one that fails
+    let s_4 = s_list_gam[4].clone();
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    // Test at rho=12 where we know FD gives wrong sign
+    let rho_center = 12.0_f64;
+
+    // Get cost at center point
+    let rho_c = array![rho_center];
+    let cost_center = match evaluate_external_cost_and_ridge(
+        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+        &[s_4.clone()], &opts, &rho_c,
+    ) {
+        Ok((c, ..)) => c,
+        Err(e) => panic!("Failed to compute center cost: {:?}", e),
+    };
+
+    println!("  Cost at rho=12.0: {:.15}", cost_center);
+    println!("\n  FD derivatives at different step sizes:");
+    println!("  {:>12} {:>20} {:>20} {:>20} {:>12}", "h", "cost(rho-h)", "cost(rho+h)", "derivative", "sign");
+
+    // Test many step sizes
+    let step_sizes = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10];
+
+    for &h in &step_sizes {
+        let rho_minus = array![rho_center - h];
+        let rho_plus = array![rho_center + h];
+
+        let cost_minus = match evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho_minus,
+        ) {
+            Ok((c, ..)) => c,
+            Err(_) => {
+                println!("  {:>12.2e} {:>20} {:>20} {:>20} {:>12}", h, "ERROR", "---", "---", "---");
+                continue;
+            }
+        };
+
+        let cost_plus = match evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho_plus,
+        ) {
+            Ok((c, ..)) => c,
+            Err(_) => {
+                println!("  {:>12.2e} {:>20.12} {:>20} {:>20} {:>12}", h, cost_minus, "ERROR", "---", "---");
+                continue;
+            }
+        };
+
+        let derivative = (cost_plus - cost_minus) / (2.0 * h);
+        let sign = if derivative > 0.0 { "POS" } else { "NEG" };
+
+        println!("  {:>12.2e} {:>20.12} {:>20.12} {:>20.6e} {:>12}",
+            h, cost_minus, cost_plus, derivative, sign);
+    }
+
+    // Also show the actual cost difference (not normalized by h)
+    println!("\n  Raw cost differences (cost_plus - cost_minus):");
+    for &h in &[1e-2, 1e-3, 1e-4, 1e-5, 1e-6] {
+        let rho_minus = array![rho_center - h];
+        let rho_plus = array![rho_center + h];
+
+        let cost_minus = evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho_minus,
+        ).map(|(c, ..)| c).unwrap_or(f64::NAN);
+
+        let cost_plus = evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho_plus,
+        ).map(|(c, ..)| c).unwrap_or(f64::NAN);
+
+        let diff = cost_plus - cost_minus;
+        println!("    h={:.0e}: diff = {:+.15e}", h, diff);
+    }
+
+    println!("\n  Conclusion:");
+    println!("    Analytic gradient: ~ -2.25e-6 (NEGATIVE)");
+    println!("    True gradient from cost trend: NEGATIVE");
+    println!("    Compare FD derivative sign at different h values above.");
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
