@@ -51,7 +51,7 @@ use crate::calibrate::visualizer;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, Zip, s};
 // faer: high-performance dense solvers
 use crate::calibrate::faer_ndarray::{
-    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerColView, FaerEigh, FaerLinalgError,
+    array2_to_mat_mut, FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError,
 };
 use crate::calibrate::hmc;
 use faer::Mat as FaerMat;
@@ -4270,11 +4270,6 @@ pub mod internal {
         //
         // ══════════════════════════════════════════════════════════════════════
 
-        /// Factorization of h_total (with ridge if needed) for solving linear systems.
-        /// Used for IMPLICIT derivative: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
-        /// This captures the actual curvature surface that PIRLS optimizes over.
-        h_total_factor: Arc<FaerFactor>,
-
         /// Pseudoinverse of H_total from positive eigenvalues only: H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ
         /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
         h_pseudoinverse: Arc<Array2<f64>>,
@@ -5076,18 +5071,12 @@ pub mod internal {
             // w.t() returns a view, so no extra allocation for transpose.
             let h_pseudoinverse = w.dot(&w.t());
 
-            // d. Factorize h_total for linear solves (implicit derivative term).
-            // This uses the same ridge logic as the rest of the system, capturing
-            // the actual curvature surface that PIRLS optimizes over.
-            let h_total_factor = self.get_faer_factor(rho, &h_total);
-
             Ok(EvalShared {
                 key,
                 pirls_result,
                 h_eff: Arc::new(h_eff),
                 ridge_used,
                 h_total: Arc::new(h_total),
-                h_total_factor,
                 h_pseudoinverse: Arc::new(h_pseudoinverse),
                 spectral_factor_w: Arc::new(w),
                 h_total_log_det,
@@ -7411,16 +7400,11 @@ pub mod internal {
 
                         let delta_opt = if grad_beta.iter().all(|v| v.is_finite()) && kkt_ok {
                             // IMPLICIT DERIVATIVE: d/dρ beta_hat = -H^-1 S_k beta.
-                            // We need delta = H^-1 * grad_beta (where grad_beta comes from stationarity or envelope).
-                            // Use the FACTOR (ridged inverse) here, NOT the pseudoinverse.
-                            // The implicit term describes how β moves on the ridged surface that PIRLS
-                            // actually optimizes, so we need (H + δI)^-1 not H_+†.
-                            let rhs_view = FaerColView::new(&grad_beta);
-                            let solved = bundle.h_total_factor.solve(rhs_view.as_ref());
-                            let mut delta: Array1<f64> = Array1::zeros(grad_beta.len());
-                            for i in 0..delta.len() {
-                                delta[i] = solved[(i, 0)];
-                            }
+                            // We need delta = H† * grad_beta (where grad_beta comes from stationarity or envelope).
+                            // Use the PSEUDOINVERSE (H†) here for spectral consistency with the cost function.
+                            // The cost uses log|H|_+ (spectral truncation), so the gradient must use H†
+                            // to ensure ∂V/∂ρ matches the actual cost surface. This matches joint.rs.
+                            let delta: Array1<f64> = h_dagger.dot(&grad_beta);
 
                             let delta_inf =
                                 delta.iter().fold(0.0_f64, |acc: f64, &v: &f64| acc.max(v.abs()));
