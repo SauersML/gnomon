@@ -4243,14 +4243,43 @@ pub mod internal {
         /// The exact H_total matrix used for LAML cost computation.
         /// For Firth: h_eff - h_phi. For non-Firth: h_eff.
         h_total: Arc<Array2<f64>>,
+
+        // ══════════════════════════════════════════════════════════════════════
+        // WHY TWO INVERSES? (Hybrid Approach for Indefinite Hessians)
+        // ══════════════════════════════════════════════════════════════════════
+        //
+        // The LAML gradient has two terms requiring DIFFERENT matrix inverses:
+        //
+        // 1. TRACE TERM (∂/∂ρ log|H|): Uses PSEUDOINVERSE H₊†
+        //    - Cost defines log|H| = Σᵢ log(λᵢ) for λᵢ > ε only (truncated)
+        //    - Derivative: ∂J/∂ρ = ½ tr(H₊† ∂H/∂ρ)
+        //    - H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ for positive λᵢ only
+        //    - Negative eigenvalues contribute 0 to cost, so derivative must be 0
+        //
+        // 2. IMPLICIT TERM (dβ/dρ): Uses RIDGED FACTOR (H + δI)⁻¹
+        //    - PIRLS stabilizes indefinite H by adding ridge: solves (H + δI)β = ...
+        //    - Stationarity condition: G(β,ρ) = ∇L + δβ = 0
+        //    - By Implicit Function Theorem: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
+        //    - Must use ridged inverse because β moves on the RIDGED surface
+        //
+        // EXAMPLE: H = -5 (indefinite), ridge δ = 10
+        //   Trace term: Pseudoinverse → 0 (correct: truncated eigenvalue)
+        //               Ridged inverse → 0.2 (WRONG: gradient of non-existent curve)
+        //   Implicit term: Ridged inverse → 1/5 (correct: solver sees stiffness +5)
+        //                  Pseudoinverse → 0 or ∞ (WRONG: ignores ridge physics)
+        //
+        // ══════════════════════════════════════════════════════════════════════
+
         /// Factorization of h_total (with ridge if needed) for solving linear systems.
-        /// Used for implicit derivative: dβ/dρ = -(H + δI)⁻¹ * ∂²L/∂β∂ρ
-        /// This captures the actual curvature the PIRLS solver sees.
+        /// Used for IMPLICIT derivative: dβ/dρ = (H + δI)⁻¹ (λₖ Sₖ β)
+        /// This captures the actual curvature surface that PIRLS optimizes over.
         h_total_factor: Arc<FaerFactor>,
-        /// The pseudoinverse of H_total, constructed explicitly from valid eigenvalues only.
-        /// Used for trace terms: tr(H⁺† S_k) to match cost function's spectral truncation.
+
+        /// Pseudoinverse of H_total from positive eigenvalues only: H₊† = Σᵢ (1/λᵢ) uᵢuᵢᵀ
+        /// Used for TRACE term: ½ tr(H₊† ∂H/∂ρ) to match cost function's spectral truncation.
         h_pseudoinverse: Arc<Array2<f64>>,
-        /// The log determinant, computed by summing log(lambda) for lambda > epsilon.
+
+        /// Log determinant via truncation: Σᵢ log(λᵢ) for λᵢ > ε only.
         h_total_log_det: f64,
     }
 
