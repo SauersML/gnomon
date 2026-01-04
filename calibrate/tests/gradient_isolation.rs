@@ -2146,7 +2146,7 @@ fn hypothesis_smoothing_sweep() {
     let p = 10;
     let (y, x, w) = generate_logit_data(n, p, 42);
     
-    let s = create_difference_penalty_matrix(p, 2).expect("difference penalty");
+    let s = create_difference_penalty_matrix(p, 2, None).expect("difference penalty");
     let s_list = vec![s];
     let nullspace_dims = vec![2];
     
