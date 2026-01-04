@@ -16,9 +16,6 @@ on:
       - 'score/**'
       - '.github/workflows/convert-score.yml'
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   run-example:
     runs-on: ubuntu-latest
@@ -26,11 +23,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install gnomon
+        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
 
-      - name: Build gnomon
-        run: cargo +nightly build --release
+      - name: Add gnomon to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Run convert_score example
         run: python examples/convert_score.py
