@@ -3345,7 +3345,7 @@ mod tests {
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mu = 1.0 / (1.0 + (-eta[i]).exp());
-            y[i] = if rng.gen::<f64>() < mu { 1.0 } else { 0.0 };
+            y[i] = if rng.r#gen::<f64>() < mu { 1.0 } else { 0.0 };
         }
 
         let weights = Array1::ones(n);
