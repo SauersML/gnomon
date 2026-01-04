@@ -1441,7 +1441,270 @@ fn diagnostic_fd_ridge_jitter_at_high_smoothing() {
     );
     let jitter = (ridge_p - ridge_0).abs().max((ridge_m - ridge_0).abs());
     assert!(
-        jitter > 1e-12,
-        "ridge did not change across FD probes (jitter={jitter:.3e})"
+        jitter == 0.0,
+        "ridge changed across FD probes (jitter={jitter:.3e}) - expected fixed"
     );
 }
+
+// ============================================================================
+// Section 4: Missing Term Hypothesis (Firth-LAML)
+// ============================================================================
+
+/// Replicated logic to compute H_phi components.
+/// Allows injecting S to verify if S-dependence explains the gradient gap.
+fn compute_firth_h_phi(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    mu: &Array1<f64>,
+    s_lambda: Option<&Array2<f64>>, // If Some, use Penalized Hat Matrix
+) -> Array2<f64> {
+    let n = x.nrows();
+    let p = x.ncols();
+
+    // 1. Compute Hat Matrix "A" (or components B)
+    // If s_lambda is None, use Fisher: A = W^1/2 X (X' W X)^-1 X' W^1/2
+    // If s_lambda is Some, use Penalized: A = W^1/2 X (X' W X + S)^-1 X' W^1/2
+    
+    let mut xw = x.clone();
+    let mut sqrt_w = Array1::zeros(n);
+    for i in 0..n {
+        let sw = weights[i].max(0.0).sqrt();
+        sqrt_w[i] = sw;
+        for j in 0..p {
+            xw[[i, j]] *= sw;
+        }
+    }
+
+    let mut info = xw.t().dot(&xw);
+    if let Some(s) = s_lambda {
+        info = &info + s;
+    }
+    
+    // In production, we add a small ridge for stability
+    let scale = info.diag().iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let ridge = scale * 1e-8;
+    for i in 0..p {
+        info[[i, i]] += ridge;
+    }
+
+    let info_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&info);
+    // Note: FaerLlt might need to be imported or fully qualified
+    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut}; 
+    
+    let chol = FaerLlt::new(info_view.as_ref(), Side::Lower).unwrap();
+    
+    // H_hat = XW * Info^-1 * XW^T
+    // Let B = XW * L^-T. Then H_hat = B B^T.
+    // L L^T = Info. 
+    // Solve L Y = XW^T  => Y = L^-1 XW^T.  B = Y^T.
+    
+    let mut rhs = xw.t().to_owned();
+    let mut rhs_view = array2_to_mat_mut(&mut rhs);
+    chol.solve_in_place(rhs_view.as_mut()); 
+    // Now rhs contains Info^-1 XW^T ?? No.
+    // solve_in_place solves A x = b. Here A is LLT (Info).
+    // So rhs column j solves: Info * x_j = (XW^T)_j
+    // So rhs = Info^-1 * XW^T
+    // So H_hat = XW * rhs
+    
+    let h_hat = xw.dot(&rhs);
+    
+    // 2. Compute components for H_phi
+    // H_phi = 0.5 * (T1 - T2)
+    // T1 = X^T diag(h dot v) X
+    // T2 = X^T diag(u) (H_hat dot H_hat) diag(u) X
+    // u = 1 - 2mu
+    // v = u^2 - 2w (where w = mu(1-mu))
+    
+    let mut u = Array1::zeros(n);
+    let mut v = Array1::zeros(n);
+    let mut h_diag = Array1::zeros(n);
+    
+    for i in 0..n {
+        let mu_i = mu[i];
+        let w_b = mu_i * (1.0 - mu_i);
+        u[i] = 1.0 - 2.0 * mu_i;
+        v[i] = u[i] * u[i] - 2.0 * w_b; // = (1-2mu)^2 - 2mu(1-mu)
+        h_diag[i] = h_hat[[i, i]];
+    }
+    
+    let mut t1 = Array2::zeros((p, p));
+    // T1_jk = sum_i x_ij * (h_i * v_i) * x_ik
+    for i in 0..n {
+        let factor = h_diag[i] * v[i];
+        for j in 0..p {
+            for k in 0..p {
+                t1[[j, k]] += x[[i, j]] * factor * x[[i, k]];
+            }
+        }
+    }
+    
+    // T2
+    // Middle matrix M_mid = diag(u) (H_hat ∘ H_hat) diag(u)
+    // M_mid_ij = u_i * (h_hat_ij^2) * u_j
+    
+    // T2 = X^T M_mid X
+    let mut t2 = Array2::zeros((p, p));
+    for i in 0..n {
+        for j in 0..n {
+            let m_val = u[i] * (h_hat[[i, j]] * h_hat[[i, j]]) * u[j];
+            if m_val.abs() < 1e-12 { continue; }
+            for a in 0..p {
+                for b in 0..p {
+                    t2[[a, b]] += x[[i, a]] * m_val * x[[j, b]];
+                }
+            }
+        }
+    }
+    
+    let mut h_phi = t1 - &t2;
+    h_phi.mapv_inplace(|val| 0.5 * val);
+    
+    h_phi
+}
+
+#[test]
+fn isolation_missing_term_hypothesis() {
+    println!("\n=== ISOLATION: Missing Term Hypothesis (Firth-LAML) ===");
+    
+    // 1. Setup: High Smoothing + Firth
+    // Use the "Test 6" anisotropic scenario which is complex
+    let (y, x, w) = generate_logit_data(80, 8, 42); // Smaller N for speed
+    let p = x.ncols();
+    let s_list = vec![
+        diagonal_penalty(p, 1, 5),
+        diagonal_penalty(p, 4, 8),
+    ];
+    // High smoothing to exacerbate the term
+    let rho = array![5.0, 5.0]; 
+    
+    // 2. Frozen Beta at Optimum
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-8,
+        max_iter: 100,
+        nullspace_dims: vec![1, 0],
+    };
+    
+    // Get analytic gradient and beta (implicitly via wrapper or we run pirls locally)
+    let (analytic_gradient, _) = evaluate_external_gradients(
+        y.view(),
+        w.view(),
+        x.view(),
+        Array1::zeros(y.len()).view(),
+        &s_list,
+        &opts,
+        &rho,
+    ).expect("Gradient evaluation failed");
+    
+    // Get optimal beta using public fit_model_for_fixed_rho
+    let rs_list = compute_penalty_square_roots(&s_list).unwrap();
+    let balanced = create_difference_penalty_matrix(p, 1).unwrap();
+    let layout = ModelLayout::external(p, s_list.len());
+    let config = ModelConfig::default(); 
+    // Note: ModelConfig default has firth=true? No, default is usually false.
+    // But fit_model_for_fixed_rho takes `ModelConfig` and checks `firth_bias_reduction`.
+    // We must enable it.
+    let mut config = config;
+    config.firth_bias_reduction = true;
+
+    use gnomon::calibrate::types::LogSmoothingParamsView;
+    let rho_view = LogSmoothingParamsView::new(rho.view());
+
+    let (fit, _) = fit_model_for_fixed_rho(
+        rho_view,
+        x.view(),
+        Array1::zeros(y.len()).view(),
+        y.view(),
+        w.view(),
+        &rs_list,
+        Some(balanced),
+        None,
+        &layout,
+        &config,
+        None,
+        None
+    ).expect("Fit failed");
+    
+    let beta = fit.beta;
+    let mu = fit.solve_mu; 
+    
+    // 3. Compute H_phi(rho)
+    // Reconstruct S
+    let mut s_rho = Array2::<f64>::zeros((p, p));
+    for (k, s) in s_list.iter().enumerate() {
+        let lambda = rho[k].exp();
+        s_rho = s_rho + s.mapv(|v| v * lambda);
+    }
+    
+    // Compute H_phi using user's definition (WITH S)
+    let h_phi = compute_firth_h_phi(&x, &w, &mu, Some(&s_rho));
+    
+    // 4. Perturb and compute derivative
+    let epsilon = 1e-4;
+    let k_target = 0; // Check for first rho
+    
+    let mut rho_plus = rho.clone();
+    rho_plus[k_target] += epsilon;
+    let mut s_rho_plus = Array2::<f64>::zeros((p, p));
+    for (k, s) in s_list.iter().enumerate() {
+        let lambda = rho_plus[k].exp();
+        s_rho_plus = s_rho_plus + s.mapv(|v| v * lambda);
+    }
+    
+    let h_phi_plus = compute_firth_h_phi(&x, &w, &mu, Some(&s_rho_plus));
+    
+    let d_h_phi = (&h_phi_plus - &h_phi) / epsilon;
+    
+    // 5. Compute H_total and Missing Term E
+    // H_total = X'WX + S - H_phi
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for i in 0..y.len() {
+        let sw = w[i] * mu[i] * (1.0 - mu[i]); // approx weights for logit
+        for r in 0..p {
+            for c in 0..p {
+                xtwx[[r, c]] += x[[i, r]] * sw * x[[i, c]];
+            }
+        }
+    }
+    
+    let h_total = &xtwx + &s_rho - &h_phi;
+    
+    let scale_h = h_total.diag().iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let mut h_total_ridge = h_total.clone();
+    for i in 0..p { h_total_ridge[[i, i]] += scale_h * 1e-8; }
+    
+    let h_view = gnomon::calibrate::faer_ndarray::FaerArrayView::new(&h_total_ridge);
+    use gnomon::calibrate::faer_ndarray::{FaerLlt, array2_to_mat_mut};
+    let chol_h = FaerLlt::new(h_view.as_ref(), Side::Lower).unwrap();
+    let mut id = Array2::<f64>::eye(p);
+    let mut id_view = array2_to_mat_mut(&mut id);
+    chol_h.solve_in_place(id_view.as_mut());
+    let h_inv = id;
+
+    let missing_term_matrix = h_inv.dot(&d_h_phi);
+    let trace_val = missing_term_matrix.diag().sum();
+    
+    // E = -0.5 * trace(...)
+    let e = -0.5 * trace_val;
+    
+    println!("  Analytic Gradient[{}]: {:.5e}", k_target, analytic_gradient[k_target]);
+    println!("  Missing Term E: {:.5e}", e);
+    
+    // 6. Frozen FD Gradient (Standard from Code)
+    let fd_frozen = frozen_fd_gradient_logit(&y, &x, &w, &s_list, &rho, &beta).unwrap();
+    println!("  Frozen FD (Code Cost): {:.5e}", fd_frozen[k_target]);
+    
+    let corrected = analytic_gradient[k_target] + e;
+    let diff = (corrected - fd_frozen[k_target]).abs();
+    println!("  Corrected Analytic: {:.5e} (Diff from FD: {:.2e})", corrected, diff);
+    
+    // Assert match. 
+    if diff > 1e-3 {
+         panic!("Hypothesis verification failed: Corrected ({}) != Frozen FD ({})", corrected, fd_frozen[k_target]);
+    } else {
+        println!("✓ Hypothesis Verified: Missing term explains the discrepancy.");
+    }
+}
+

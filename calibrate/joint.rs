@@ -2769,7 +2769,7 @@ pub fn fit_joint_model_with_reml<'a>(
 
         snapshot.restore(&reml_state);
         let initial_z = rho_to_z(&rho);
-        let solver = Bfgs::new(initial_z, |z| {
+        let mut solver = Bfgs::new(initial_z, |z| {
             let rho = z_to_rho(z);
             let (cost, grad_rho) = reml_state.cost_and_grad(&rho);
             let jac = drho_dz(&rho);

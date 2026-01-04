@@ -659,7 +659,7 @@ fn run_bfgs_for_candidate(
     initial_z: Array1<f64>,
 ) -> Result<(BfgsSolution, f64, bool), EstimationError> {
     eprintln!("\n[Candidate {label}] Running BFGS optimization from queued seed");
-    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+    let mut solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(config.reml_convergence_tolerance)
         .with_max_iterations(config.reml_max_iterations as usize)
         .with_fp_tolerances(1e2, 1e2)
@@ -2854,7 +2854,7 @@ pub fn train_survival_model(
             ));
 
             let optimizer_for_bfgs = std::rc::Rc::clone(&optimizer);
-            let solver = Bfgs::new(initial_z.clone(), move |z| {
+            let mut solver = Bfgs::new(initial_z.clone(), move |z| {
                 optimizer_for_bfgs.cost_and_grad(z)
             })
             .with_tolerance(config.reml_convergence_tolerance)
@@ -3595,7 +3595,7 @@ pub fn optimize_external_design(
     let initial_rho = Array1::<f64>::zeros(k);
     // Map bounded rho ∈ [-RHO_BOUND, RHO_BOUND] to unbounded z via z = RHO_BOUND * atanh(r/RHO_BOUND)
     let initial_z = to_z_from_rho(&initial_rho);
-    let solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
+    let mut solver = Bfgs::new(initial_z, |z| reml_state.cost_and_grad(z))
         .with_tolerance(opts.tol)
         .with_max_iterations(opts.max_iter)
         .with_fp_tolerances(1e2, 1e2)
@@ -5506,6 +5506,22 @@ pub mod internal {
         /// ## Chain Rule to β
         ///
         /// Final gradient: g_β = X^T g_η where g_η accumulates per-observation gradients.
+        ///
+        /// ## Mathematical Derivation using Adjoint Method
+        ///
+        /// We seek $\nabla_\beta \log |H_{total}|$ where $H_{total} = X^\top W X + S_\lambda - H_\phi$.
+        /// Here $H_\phi$ is the Firth curvature matrix (Hessian of the Firth penalty).
+        ///
+        /// The derivative involves forward differentiation of the components of $H_\phi$ and reverse-mode
+        /// accumulation (adjoint method) to compute the gradient efficiently without forming 3rd order tensors.
+        ///
+        /// 1. **Main Hessian Term:** $\text{tr}(H_{total}^{-1} X^\top \frac{\partial W}{\partial \beta_j} X)$
+        ///    - Implemented by `g_eta += mdiag * w_prime`
+        ///
+        /// 2. **Firth Curvature Term:** $-\text{tr}(H_{total}^{-1} \frac{\partial^3 \Phi}{\partial \beta \partial \beta^\top \partial \beta_j})$
+        ///    - Backpropagated through Cholesky of hat matrix components.
+        ///    - Includes sensitivities for $v = w''/w$, $u = w'/w$, and $b$ (hat factor).
+        ///
         
         fn firth_logh_total_grad(
             &self,
@@ -6763,6 +6779,36 @@ pub mod internal {
 
         /// Helper function that computes gradient using a shared evaluation bundle
         /// so cost and gradient reuse the identical stabilized Hessian and PIRLS state.
+        ///
+        /// # Derivation of the Analytic Gradient for Firth-Adjusted LAML
+        ///
+        /// This function implements the exact gradient of the Laplace Approximate Marginal Likelihood (LAML)
+        /// with respect to the smoothing parameters $\rho$.
+        ///
+        /// The Outer Objective (LAML) is:
+        /// $$ V(\rho) = - \mathcal{L}(\hat{\beta}, \rho) + \frac{1}{2} \log |H_{total}| - \frac{1}{2} \log |S_\lambda|_+ $$
+        ///
+        /// The gradient is computed via the Total Derivative:
+        /// $$ \frac{d V}{d \rho_k} = \frac{\partial V}{\partial \rho_k} \bigg|_{\hat{\beta}} + \left( \nabla_\beta V \right)^\top \frac{d \hat{\beta}}{d \rho_k} $$
+        ///
+        /// ## Term 1: Direct Partial Derivative $\frac{\partial V}{\partial \rho_k}$
+        /// $$ \frac{\partial V}{\partial \rho_k} = \frac{1}{2} \lambda_k \hat{\beta}^\top S_k \hat{\beta} + \frac{1}{2} \lambda_k \text{tr}(H_{total}^{-1} S_k) - \frac{1}{2} \lambda_k \text{tr}(S_\lambda^+ S_k) $$
+        /// - **Beta Quadratic:** $0.5 \lambda_k \beta^\top S_k \beta$ (`0.5 * beta_terms`)
+        /// - **Log-Det Hessian:** $0.5 \lambda_k \text{tr}(H_{total}^{-1} S_k)$ (`log_det_h_grad_term`)
+        /// - **Log-Det Penalty:** $-0.5 \lambda_k \text{tr}(S^+ S_k)$ (`-0.5 * det1_values`)
+        ///
+        /// ## Term 2: Implicit Correction
+        /// The implicit derivative of the coefficients $\frac{d \hat{\beta}}{d \rho_k}$ accounts for the fact that
+        /// $\hat{\beta}$ moves as $\rho$ changes to maintain the stationarity condition $\nabla_\beta \mathcal{L} = 0$.
+        ///
+        /// $$ \frac{d \hat{\beta}}{d \rho_k} = - H_{total}^{-1} (\lambda_k S_k \hat{\beta}) $$
+        ///
+        /// The correction term is:
+        /// $$ (\nabla_\beta V)^\top \frac{d \hat{\beta}}{d \rho_k} = - (\nabla_\beta V)^\top H_{total}^{-1} (\lambda_k S_k \hat{\beta}) $$
+        ///
+        /// Where $\nabla_\beta V = -\nabla_\beta \mathcal{L} + \frac{1}{2} \nabla_\beta \log |H_{total}|$.
+        /// - At a perfect optimum, $\nabla_\beta \mathcal{L} = 0$, but we include `residual_grad` for robustness.
+        /// - $\frac{1}{2} \nabla_\beta \log |H_{total}|$ is computed via `firth_logh_total_grad`.
         fn compute_gradient_with_bundle(
             &self,
             p: &Array1<f64>,
@@ -7491,12 +7537,20 @@ pub mod internal {
                             //   residual_grad + 0.5 * ∂log|H_total|/∂β
                             //
                             // which is what we construct here.
+                            
+                            // ## 3. The Full Gradient Expression
+                            // Combining into the total derivative:
+                            // dV/drho = Direct Terms + Implicit Correction
+                            // Direct Terms = 0.5 * beta_quad + 0.5 * log|H| - 0.5 * log|S|
+                            // Implicit Correction = (grad_beta)^T * (-H_total^-1 * lambda * S_k * beta)
                             let mut g = residual_grad.clone();
+
                             if let Some(logh_grad) = logh_beta_grad.as_ref() {
                                 g += &(0.5 * logh_grad);
                             }
                             g
                         } else {
+                            // Non-Firth case matches standard LAML
                             residual_grad.clone()
                         };
                         if !self.config.firth_bias_reduction {
@@ -7608,14 +7662,22 @@ pub mod internal {
                                 log_det_h_grad_term - truncation_corrections[k];
                             let log_det_s_grad_term = 0.5 * det1_values[k];
                             
-                            // REML gradient formula (Wood 2017, Section 6.5):
+                            // REML gradient formula (Wood 2017, Section 6.5) / User Derivation Section 2.2:
                             //   ∂V/∂ρ_k = 0.5 * λ_k * β'S_k β   (penalty on coefficients)
                             //           + 0.5 * λ_k * tr(H⁻¹ S_k)  (Hessian log-det derivative)  
                             //           - 0.5 * det1[k]            (penalty log-det derivative)
                             //
                             // Note: log_det_h_grad_term already contains the 0.5 factor and λ_k
+                            // Note: det1_values[k] already contains λ_k * tr(S^{-1} S_k)
                             let mut gradient_value =
                                 0.5 * beta_terms[k] + corrected_log_det_h - log_det_s_grad_term;
+                                
+                            // Add Implicit Correction (Section 2.1 & 4.3):
+                            // term = (nabla_beta V)^T * (d_beta / d_rho)
+                            //      = (grad_beta)^T * (-H^-1 * lambda * S_k * beta)
+                            //      = - (H^-1 grad_beta)^T * (lambda * S_k * beta)
+                            //      = - delta_opt^T * u_k
+
                             if let Some(delta_ref) = delta_opt.as_ref() {
                                 let r_k = &rs_transformed[k];
                                 let r_beta = r_k.dot(beta_ref);
