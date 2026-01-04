@@ -3485,6 +3485,99 @@ fn diagnostic_cost_insensitivity_analysis() {
     println!("    FD simply cannot reliably measure gradients this small.");
 }
 
+/// DIAGNOSTIC: Trace the exact FD step selection algorithm at rho=12.
+/// This mimics the FD algorithm's logic to show exactly where it goes wrong.
+#[test]
+fn diagnostic_trace_fd_step_selection() {
+    println!("\n=== DIAGNOSTIC: Trace FD Step Selection at rho=12 ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let s_4 = s_list_gam[4].clone();
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    let rho_center = 12.0_f64;
+
+    // Helper to compute cost at a given rho
+    let compute_cost = |rho_val: f64| -> f64 {
+        let rho = array![rho_val];
+        evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho,
+        ).map(|(c, ..)| c).unwrap_or(f64::NAN)
+    };
+
+    println!("\n  FD algorithm traces step sizes h, h/2 and computes:");
+    println!("    d_small = (f(rho+h/2) - f(rho-h/2)) / h  (finer step)");
+    println!("    d_big   = (f(rho+h) - f(rho-h)) / (2h)   (coarser step)");
+    println!("\n  Then:");
+    println!("    - If same_sign(d_small, d_big): pick d_small (more refined)");
+    println!("    - If different signs: pick d_big (safer, coarser)");
+    println!("\n  TRUE gradient from cost trend: NEGATIVE (~-1.5e-6)");
+    println!("  Let's see what FD does:\n");
+
+    // Mimic FD algorithm with different starting h values
+    for base_h_init in [2e-3, 1.3e-3, 1e-3, 5e-4] {
+        println!("  Starting h = {:.1e}:", base_h_init);
+        let mut base_h = base_h_init;
+
+        for _ in 0..4 {
+            let f_p = compute_cost(rho_center + base_h * 0.5);  // rho + h/2
+            let f_m = compute_cost(rho_center - base_h * 0.5);  // rho - h/2
+            let f_p2 = compute_cost(rho_center + base_h);       // rho + h
+            let f_m2 = compute_cost(rho_center - base_h);       // rho - h
+
+            let d_small = (f_p - f_m) / base_h;
+            let d_big = (f_p2 - f_m2) / (2.0 * base_h);
+
+            let same_sign = (d_small >= 0.0) == (d_big >= 0.0);
+            let sign_small = if d_small >= 0.0 { "+" } else { "-" };
+            let sign_big = if d_big >= 0.0 { "+" } else { "-" };
+
+            let denom = d_small.abs().max(d_big.abs()).max(1e-12);
+            let rel_gap = (d_small - d_big).abs() / denom;
+
+            println!("    h={:.2e}: d_small={:+.2e}({}) d_big={:+.2e}({}) same_sign={} gap={:.1}",
+                base_h, d_small, sign_small, d_big, sign_big, same_sign, rel_gap);
+
+            if !same_sign {
+                let selected = d_big;  // FD picks d_big when signs differ
+                let verdict = if selected >= 0.0 { "WRONG (should be -)" } else { "CORRECT" };
+                println!("    → Signs differ: FD selects d_big = {:+.2e} → {}", selected, verdict);
+                break;
+            }
+
+            if rel_gap < 0.1 {  // FD_REL_GAP_THRESHOLD
+                let selected = d_small;
+                let verdict = if selected >= 0.0 { "WRONG (should be -)" } else { "CORRECT" };
+                println!("    → Gap small: FD selects d_small = {:+.2e} → {}", selected, verdict);
+                break;
+            }
+
+            base_h *= 0.5;
+        }
+        println!();
+    }
+
+    println!("  CONCLUSION:");
+    println!("    At rho=12, the FD algorithm consistently picks POSITIVE");
+    println!("    derivatives because the numerical noise at f64 precision");
+    println!("    causes inconsistent signs at different step sizes.");
+    println!("    The algorithm's heuristic of 'trust coarser step when signs");
+    println!("    disagree' fails because even the coarser step is unreliable.");
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
