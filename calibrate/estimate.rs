@@ -7556,29 +7556,7 @@ pub mod internal {
                         };
 
                         for k in 0..k_count {
-                            let log_det_h_grad_term = if workspace.solved_rows > 0 {
-                                let (start, end) = workspace.block_ranges[k];
-                                if end > start {
-                                    let solved_block = workspace
-                                        .solved
-                                        .slice(s![..workspace.solved_rows, start..end]);
-                                    let rt_block = workspace
-                                        .concat
-                                        .slice(s![..workspace.solved_rows, start..end]);
-                                    let trace_h_inv_s_k = kahan_sum(
-                                        solved_block
-                                            .iter()
-                                            .zip(rt_block.iter())
-                                            .map(|(&x, &y)| x * y),
-                                    );
-                                    let tra1 = lambdas[k] * trace_h_inv_s_k;
-                                    tra1 / 2.0
-                                } else {
-                                    0.0
-                                }
-                            } else {
-                                0.0
-                            };
+                            let log_det_h_grad_term = 0.5 * lambdas[k] * trace_terms[k];
                             let corrected_log_det_h =
                                 log_det_h_grad_term - truncation_corrections[k];
                             let log_det_s_grad_term = 0.5 * det1_values[k];
