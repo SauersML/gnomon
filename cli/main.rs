@@ -682,13 +682,21 @@ enum Commands {
         #[arg(value_name = "SCORE_PATH")]
         score: PathBuf,
 
-        /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, or BCF file)
+        /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, BCF, or DTC text file)
         #[arg(value_name = "GENOTYPE_PATH")]
         input_path: PathBuf,
 
         /// Path to file containing list of individual IDs to include (optional)
         #[arg(long)]
         keep: Option<PathBuf>,
+
+        /// Reference genome FASTA (optional; auto-downloaded if not provided)
+        #[arg(long)]
+        reference: Option<PathBuf>,
+
+        /// Force genome build (37 or 38); auto-detected if not provided
+        #[arg(long)]
+        build: Option<String>,
     },
 
     /// Fit an HWE PCA model from the provided genotype dataset
@@ -768,7 +776,9 @@ fn main() {
             score,
             input_path,
             keep,
-        }) => run_score(input_path, score, keep),
+            reference,
+            build,
+        }) => run_score(input_path, score, keep, reference, build),
         Some(Commands::Fit {
             genotype_path,
             list,
@@ -929,8 +939,10 @@ fn run_score(
     input_path: PathBuf,
     score: PathBuf,
     keep: Option<PathBuf>,
+    reference: Option<PathBuf>,
+    build: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Call the score calculation logic directly
-    score_main::run_gnomon_with_args(input_path, score, keep)
+    score_main::run_gnomon_with_args(input_path, score, keep, reference, build)
         .map_err(|e| e as Box<dyn std::error::Error>)
 }

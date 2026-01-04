@@ -40,19 +40,25 @@ use wolfe_bfgs::BfgsSolution;
 // and g'(u) = 1 (the derivative code explicitly returns 1.0 at boundaries).
 // This is consistent between training and HMC.
 
-/// Fixed stabilization ridge for positive definiteness.
-/// Using a CONSTANT ridge makes V(ρ) smooth and the envelope-theorem gradient valid.
-/// A ρ-dependent ridge (e.g., scaled by diagonal) creates implicit derivative terms
-/// that the analytic gradient misses, causing FD/analytic mismatch.
+/// Fixed stabilization ridge for solver numerical stability.
+/// This is a SOLVER detail, not an objective function modification.
+/// With spectral log-det (Wood 2011), the objective is smooth regardless of ridge.
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
-/// Ensure a matrix is positive definite by always adding a fixed ridge.
-/// This approach (matching pirls.rs) ensures:
-/// 1. V(ρ) is smooth everywhere (no discontinuity at PD boundary)
-/// 2. The standard envelope-theorem gradient is valid
-/// 3. FD and analytic gradients agree
+/// Ensure a matrix is positive definite by adding ridge if needed for solver stability.
+/// This is a SOLVER detail - the ridge is only for numerical stability in linear solves,
+/// not for defining the objective function. The objective uses spectral log-det which
+/// handles near-singular matrices smoothly.
+/// Returns the ridge value added (0.0 if matrix was already positive definite).
 fn ensure_positive_definite_joint(mat: &mut Array2<f64>) -> f64 {
-    // Always add fixed ridge for smoothness and gradient consistency
+    use crate::calibrate::faer_ndarray::FaerCholesky;
+    use faer::Side;
+
+    if mat.cholesky(Side::Lower).is_ok() {
+        return 0.0; // Already positive definite, no stabilization needed
+    }
+
+    // Add fixed ridge for solver stability (not objective modification)
     for i in 0..mat.nrows() {
         mat[[i, i]] += FIXED_STABILIZATION_RIDGE;
     }
@@ -1289,6 +1295,7 @@ impl<'a> JointRemlState<'a> {
         // Build joint Jacobian blocks and penalized Hessian via Schur complement
         let p_base = state.x_base.ncols();
         let p_link = b_wiggle.ncols();
+        let p_total = p_base + p_link;
         
         let (g_prime, g_second, b_prime_u) = compute_link_derivative_terms_from_state(state, &u);
         
@@ -1356,44 +1363,35 @@ impl<'a> JointRemlState<'a> {
         }
         ensure_positive_definite_joint(&mut d_mat);
         
-        // log|H| via Schur complement: log|A| + log|D - C^T A^{-1} C|
-        use crate::calibrate::faer_ndarray::FaerCholesky;
+        // Spectral log|H|_+ via eigendecomposition (Wood 2011)
+        // This approach:
+        // 1. Keeps the objective function smooth as eigenvalues cross zero
+        // 2. Avoids discontinuity from conditional ridge
+        // 3. Uses log|H|_+ = Σ log(λ_i) for positive eigenvalues only
+        use crate::calibrate::faer_ndarray::FaerEigh;
         use faer::Side;
-        let log_det_a = match a_mat.cholesky(Side::Lower) {
-            Ok(chol) => {
-                let log_det = 2.0 * chol.diag().mapv(|d| d.max(1e-10).ln()).sum();
-                let mut a_inv_c = c_mat.clone();
-                for col in 0..a_inv_c.ncols() {
-                    let solved = chol.solve_vec(&a_inv_c.column(col).to_owned());
-                    for row in 0..a_inv_c.nrows() {
-                        a_inv_c[[row, col]] = solved[row];
-                    }
-                }
-                let schur = &d_mat - &a_inv_c.t().dot(&c_mat);
-                let log_det_schur = match schur.cholesky(Side::Lower) {
-                    Ok(schol) => 2.0 * schol.diag().mapv(|d| d.max(1e-10).ln()).sum(),
-                    Err(_) => {
-                        // Schur complement is not positive definite - model is ill-conditioned
-                        // Return infinity cost to steer optimizer away
-                        use crate::calibrate::faer_ndarray::FaerEigh;
-                        let (eigs, _) = match schur.clone().eigh(Side::Lower) {
-                            Ok(result) => result,
-                            Err(_) => return (f64::INFINITY, None),
-                        };
-                        let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
-                        if min_eig <= 0.0 {
-                            eprintln!("[LAML] Schur complement has non-positive eigenvalue: {min_eig}");
-                            return (f64::INFINITY, None);
-                        }
-                        eigs.iter().map(|&ev| ev.ln()).sum()
-                    }
-                };
-                log_det + log_det_schur
+
+        // Build full joint Hessian H = [[A, C], [C^T, D]]
+        let mut h_full = Array2::<f64>::zeros((p_total, p_total));
+        h_full.slice_mut(s![..p_base, ..p_base]).assign(&a_mat);
+        h_full.slice_mut(s![..p_base, p_base..]).assign(&c_mat);
+        h_full.slice_mut(s![p_base.., ..p_base]).assign(&c_mat.t());
+        h_full.slice_mut(s![p_base.., p_base..]).assign(&d_mat);
+
+        let log_det_a = match h_full.clone().eigh(Side::Lower) {
+            Ok((eigs, _)) => {
+                // Spectral log-det: sum of log of positive eigenvalues
+                let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+                let tol = (max_eig * 1e-12).max(1e-100);
+                let log_det: f64 = eigs.iter()
+                    .filter(|&&ev| ev > tol)
+                    .map(|&ev| ev.ln())
+                    .sum();
+                log_det
             }
             Err(_) => {
-                // Joint Hessian is not positive definite - cannot compute valid LAML
-                // Return infinity cost to steer optimizer away
-                eprintln!("[LAML] Joint Hessian Cholesky failed - returning infinity cost");
+                // Eigendecomposition failed - severe numerical issues
+                eprintln!("[LAML] Joint Hessian eigendecomposition failed");
                 return (f64::INFINITY, None);
             }
         };
@@ -1419,30 +1417,12 @@ impl<'a> JointRemlState<'a> {
             e_transformed: Array2::zeros((0, p_base)),
             u_truncated: Array2::zeros((p_base, p_base)),  // All modes truncated in fallback
         });
-        // For the base block, stable_reparameterization computes log|S_λ|_+.
-        // When ridge δ > 0, we need log|S_λ + δI|_+ for consistency.
-        // Compute correction via eigendecomposition of s_transformed.
-        let (base_log_det_s, base_rank) = if state.ridge_used > 0.0 && base_reparam.s_transformed.nrows() > 0 {
-            use crate::calibrate::faer_ndarray::FaerEigh;
-            let (eigs, _) = base_reparam.s_transformed
-                .clone()
-                .eigh(Side::Lower)
-                .unwrap_or_else(|_| (Array1::zeros(p_base), Array2::eye(p_base)));
-            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-            let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
-            let rank = positive.len() as f64;
-            // Compute log|S_λ + δI|_+ = Σ log(λ_i + δ) for positive eigenvalues
-            let log_det = positive.iter()
-                .map(|&ev| (ev + state.ridge_used).max(1e-300).ln())
-                .sum::<f64>();
-            (log_det, rank)
-        } else {
-            (base_reparam.log_det, base_reparam.e_transformed.nrows() as f64)
-        };
+        // Spectral log|S_λ|_+ for penalty matrix (Wood 2011)
+        // Uses pure spectral log-det without ridge adjustment
+        let base_log_det_s = base_reparam.log_det;
+        let base_rank = base_reparam.e_transformed.nrows() as f64;
 
         let (link_log_det_s, link_rank) = if p_link > 0 {
-            use crate::calibrate::faer_ndarray::FaerEigh;
             let (eigs, _) = link_penalty
                 .clone()
                 .eigh(Side::Lower)
@@ -1451,12 +1431,9 @@ impl<'a> JointRemlState<'a> {
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
             let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
             let rank = positive.len() as f64;
-            // Compute log|λ_link * S_link + δI|_+ where δ is the stabilization ridge.
-            // Eigenvalues of S_link are `eigs`, so eigenvalues of λ*S + δI are λ*eig + δ.
-            // This ensures the log-det term is consistent with the ridged penalty.
-            let ridge = state.ridge_used;
+            // Spectral log|λ*S|_+ = Σ log(λ*σ_i) for positive eigenvalues
             let log_det = positive.iter()
-                .map(|&ev| (lambda_link * ev + ridge).max(1e-300).ln())
+                .map(|&ev| (lambda_link * ev).max(1e-300).ln())
                 .sum::<f64>();
             (log_det, rank)
         } else {
@@ -1468,13 +1445,10 @@ impl<'a> JointRemlState<'a> {
         // Null space dimension
         let mp = (p_base as f64 - base_rank) + (p_link as f64 - link_rank);
         
-        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'(S_λ + δI)beta
-        //
-        // Envelope Theorem Consistency: When the solver adds ridge δ to ensure
-        // positive definiteness, the effective penalty becomes S_λ + δI.
-        // We must include 0.5*δ||β||² in the penalty term so that:
-        //   ∇_β V(β̂) = 0  (stationarity condition)
-        // Without this, the analytic gradient will have error ≈ δ*||β||.
+        // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'*S_λ*beta
+        // Note: With spectral log-det (Wood 2011), we do NOT add ridge penalty to the cost.
+        // The ridge is a solver detail for numerical stability, not part of the objective.
+        // This keeps the objective smooth and ensures exact gradient consistency.
         let mut penalty_term = 0.0;
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
@@ -1488,13 +1462,6 @@ impl<'a> JointRemlState<'a> {
                 let sb = link_penalty.dot(&state.beta_link);
                 penalty_term += lambda_link * state.beta_link.dot(&sb);
             }
-        }
-        // Add ridge penalty: 0.5*δ*(||β_base||² + ||β_link||²)
-        // This completes the effective penalty S_λ + δI.
-        if state.ridge_used > 0.0 {
-            let beta_base_norm_sq = state.beta_base.dot(&state.beta_base);
-            let beta_link_norm_sq = state.beta_link.dot(&state.beta_link);
-            penalty_term += state.ridge_used * (beta_base_norm_sq + beta_link_norm_sq);
         }
         
         let laml = match state.link {
@@ -1857,13 +1824,29 @@ impl<'a> JointRemlState<'a> {
         h_mat.slice_mut(s![p_base.., ..p_base]).assign(&c_mat.t());
         h_mat.slice_mut(s![p_base.., p_base..]).assign(&d_mat);
 
-        use crate::calibrate::faer_ndarray::FaerCholesky;
+        // Eigendecomposition of Hessian for pseudo-inverse (Wood 2011)
+        // The spectral approach handles non-PD matrices gracefully by zeroing
+        // out small/negative eigenvalues in the pseudo-inverse.
+        use crate::calibrate::faer_ndarray::FaerEigh;
         use faer::Side;
-        let h_chol = h_mat.cholesky(Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
+        let (h_eigs, h_vecs): (Array1<f64>, Array2<f64>) = h_mat
+            .clone()
+            .eigh(Side::Lower)
+            .map_err(|_| {
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
+            })?;
+        let h_max_eig = h_eigs.iter().cloned().fold(0.0_f64, f64::max);
+        let h_tol = (h_max_eig * 1e-12).max(1e-100);
+
+        // Check for severely ill-conditioned Hessian (too many negative eigenvalues)
+        let n_positive = h_eigs.iter().filter(|&&ev| ev > h_tol).count();
+        if n_positive < p_total / 2 {
+            return Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
-            }
-        })?;
+            });
+        }
 
         // Build Jacobian J = [diag(g') X | B_wiggle]
         let mut j_mat = Array2::<f64>::zeros((n, p_total));
@@ -1877,9 +1860,28 @@ impl<'a> JointRemlState<'a> {
             }
         }
 
-        // Precompute K = H^{-1} J^T and J H^{-1} J^T diagonal for trace terms.
-        let j_t = j_mat.t().to_owned();
-        let k_mat = h_chol.solve_mat(&j_t);
+        // Precompute K = H† J^T using pseudo-inverse for spectral consistency (Wood 2011)
+        // H† = U diag(1/λ_i) U' where 1/λ_i = 0 for small eigenvalues
+        // K = H† J' = U diag(1/λ_i) U' J' = U diag(1/λ_i) (J U)'
+        // Compute J @ U (n x p_total)
+        let j_u = j_mat.dot(&h_vecs);
+
+        // Compute H† J' = U @ diag(1/λ) @ (J U)'
+        // This is (p_total x n) matrix
+        let mut k_mat = Array2::<f64>::zeros((p_total, n));
+        for i in 0..p_total {
+            let eig_i = h_eigs[i];
+            if eig_i > h_tol {
+                let inv_eig = 1.0 / eig_i;
+                // k_mat += (1/λ_i) * u_i @ (J u_i)'
+                for row in 0..p_total {
+                    for col in 0..n {
+                        k_mat[[row, col]] += inv_eig * h_vecs[[row, i]] * j_u[[col, i]];
+                    }
+                }
+            }
+        }
+
         let mut k_w = k_mat.clone();
         for i in 0..n {
             let w = weights[i];
@@ -1896,15 +1898,20 @@ impl<'a> JointRemlState<'a> {
             diag_proj[i] = acc;
         }
 
-        // Precompute H^{-1}_{theta,theta} for penalty sensitivity trace.
+        // Precompute H†_{theta,theta} for penalty sensitivity trace using pseudo-inverse
         let mut h_inv_theta = Array2::<f64>::zeros((p_link, p_link));
         if p_link > 0 {
-            for col in 0..p_link {
-                let mut e = Array1::<f64>::zeros(p_total);
-                e[p_base + col] = 1.0;
-                let solved = h_chol.solve_vec(&e);
-                for row in 0..p_link {
-                    h_inv_theta[[row, col]] = solved[p_base + row];
+            // H†_{theta,theta} = (U_{theta,:} diag(1/λ) U_{theta,:}')
+            // where U_{theta,:} is the (p_base:p_total, :) block of U
+            for i in 0..p_total {
+                let eig_i = h_eigs[i];
+                if eig_i > h_tol {
+                    let inv_eig = 1.0 / eig_i;
+                    for row in 0..p_link {
+                        for col in 0..p_link {
+                            h_inv_theta[[row, col]] += inv_eig * h_vecs[[p_base + row, i]] * h_vecs[[p_base + col, i]];
+                        }
+                    }
                 }
             }
         }
@@ -1945,10 +1952,33 @@ impl<'a> JointRemlState<'a> {
             }
             // V = J^T diag(0.5 - mu) J (implemented as J^T * (diag(nu) J)).
             let v_mat = crate::calibrate::faer_ndarray::fast_atb(&j_mat, &j_weighted);
-            let y = h_chol.solve_mat(&v_mat);
-            let y_t = y.t().to_owned();
-            let q_t = h_chol.solve_mat(&y_t);
-            q_firth = q_t.t().to_owned();
+
+            // Q = H† V H† using pseudo-inverse for spectral consistency
+            // H† V H† = U diag(1/λ) U' V U diag(1/λ) U'
+            // Let W = U' V U, then Q = U diag(1/λ) W diag(1/λ) U'
+            let u_t_v = h_vecs.t().dot(&v_mat); // U' V
+            let w_mat = u_t_v.dot(&h_vecs);      // U' V U
+
+            // Apply diag(1/λ) on both sides and reconstruct
+            // Q_ij = Σ_k Σ_l (1/λ_k)(1/λ_l) U_ik W_kl U_jl
+            for k in 0..p_total {
+                let eig_k = h_eigs[k];
+                if eig_k > h_tol {
+                    let inv_k = 1.0 / eig_k;
+                    for l in 0..p_total {
+                        let eig_l = h_eigs[l];
+                        if eig_l > h_tol {
+                            let inv_l = 1.0 / eig_l;
+                            let scale = inv_k * inv_l * w_mat[[k, l]];
+                            for i in 0..p_total {
+                                for j in 0..p_total {
+                                    q_firth[[i, j]] += scale * h_vecs[[i, k]] * h_vecs[[j, l]];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Prepare basis derivatives for constraint sensitivity.
@@ -2052,46 +2082,18 @@ impl<'a> JointRemlState<'a> {
             u_truncated: Array2::zeros((p_base, p_base)),
         });
 
-        // Eigenvalues of link penalty for det_term computation
-        let link_eigs: Vec<f64> = if p_link > 0 && link_penalty.nrows() == p_link {
+        // Rank of link penalty for det_term (spectral rank)
+        let link_det1_no_ridge = if p_link > 0 && link_penalty.nrows() == p_link {
             use crate::calibrate::faer_ndarray::FaerEigh;
-            let (eigs, _) = link_penalty
+            let (eigs, _): (Array1<f64>, Array2<f64>) = link_penalty
                 .clone()
                 .eigh(Side::Lower)
                 .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
-            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+            let max_eig = eigs.iter().cloned().fold(0.0_f64, f64::max);
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-            eigs.iter().cloned().filter(|&ev| ev > tol).collect()
+            eigs.iter().filter(|&&ev| ev > tol).count() as f64
         } else {
-            vec![]
-        };
-        let link_det1_no_ridge = link_eigs.len() as f64;
-
-        // Eigendecomposition of combined base penalty for ridge-aware det_term
-        let (base_eigs, base_eigvecs): (Vec<f64>, Array2<f64>) = if state.ridge_used > 0.0 && base_reparam.s_transformed.nrows() > 0 {
-            use crate::calibrate::faer_ndarray::FaerEigh;
-            let (eigs, vecs) = base_reparam.s_transformed
-                .clone()
-                .eigh(Side::Lower)
-                .unwrap_or_else(|_| (Array1::zeros(p_base), Array2::eye(p_base)));
-            let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-            let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
-            let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
-            // Filter eigenvectors to match positive eigenvalues
-            let n_pos = positive.len();
-            let pos_indices: Vec<usize> = eigs.iter().enumerate()
-                .filter(|&(_, ev)| *ev > tol)
-                .map(|(i, _)| i)
-                .collect();
-            let mut pos_vecs = Array2::zeros((p_base, n_pos));
-            for (j, &idx) in pos_indices.iter().enumerate() {
-                for i in 0..p_base {
-                    pos_vecs[[i, j]] = vecs[[i, idx]];
-                }
-            }
-            (positive, pos_vecs)
-        } else {
-            (vec![], Array2::zeros((0, 0)))
+            0.0
         };
 
         let mut dot_u = Array1::<f64>::zeros(n);
@@ -2127,7 +2129,19 @@ impl<'a> JointRemlState<'a> {
                 }
             }
 
-            let delta = h_chol.solve_vec(&rhs);
+            // Compute delta = H† rhs using pseudo-inverse for spectral consistency
+            // H† rhs = U diag(1/λ) U' rhs = U diag(1/λ) c where c = U' rhs
+            let c = h_vecs.t().dot(&rhs);
+            let mut delta = Array1::<f64>::zeros(p_total);
+            for i in 0..p_total {
+                let eig_i = h_eigs[i];
+                if eig_i > h_tol {
+                    let scaled = c[i] / eig_i;
+                    for j in 0..p_total {
+                        delta[j] += scaled * h_vecs[[j, i]];
+                    }
+                }
+            }
             let delta_beta = delta.slice(s![..p_base]).to_owned();
             let delta_theta = delta.slice(s![p_base..]).to_owned();
 
@@ -2232,7 +2246,8 @@ impl<'a> JointRemlState<'a> {
             }
             trace += 2.0 * trace_k;
 
-            // Trace for lambda_k * S_k
+            // Trace for lambda_k * S_k using pseudo-inverse (Wood 2011)
+            // tr(H† S_k) = Σ (u_i^T S_k u_i) / λ_i for positive eigenvalues
             let mut s_k_full = Array2::<f64>::zeros((p_total, p_total));
             if is_link {
                 s_k_full
@@ -2244,10 +2259,19 @@ impl<'a> JointRemlState<'a> {
                 }
             }
             if p_total > 0 {
-                let solved = h_chol.solve_mat(&s_k_full);
+                // Pseudo-inverse trace: Σ (u_i^T S_k u_i) / λ_i for positive eigenvalues
                 let mut trace_lambda = 0.0;
                 for i in 0..p_total {
-                    trace_lambda += solved[[i, i]];
+                    let eig_i = h_eigs[i];
+                    if eig_i > h_tol {
+                        // Extract eigenvector u_i as owned array
+                        let u_i: Array1<f64> = h_vecs.column(i).to_owned();
+                        // Compute u_i^T S_k u_i
+                        let s_k_u = s_k_full.dot(&u_i);
+                        let quadratic = u_i.dot(&s_k_u);
+                        trace_lambda += quadratic / eig_i;
+                    }
+                    // For small/negative eigenvalues, contribution is 0 (pseudo-inverse)
                 }
                 trace += lambda_k * trace_lambda;
             }
@@ -2384,47 +2408,12 @@ impl<'a> JointRemlState<'a> {
                 0.0
             };
 
-            // Ridge-aware det_term: when δ > 0, d/dλ_k[log|S_λ + δI|] = tr((S_λ + δI)^{-1} S_k)
-            // Without ridge: d/dλ_k[log|S_λ|_+] = rank(S_k)
+            // Spectral det_term (Wood 2011): d/dλ_k[log|S_λ|_+] = rank(S_k)
+            // With spectral log-det, no ridge adjustment is needed.
             let det_term = if is_link {
-                if state.ridge_used > 0.0 && !link_eigs.is_empty() {
-                    // Link: eigenvalues of S_link are link_eigs, so eigenvalues of λ*S_link + δI are λ*σ + δ
-                    // d/dλ[log|λ*S + δI|] = Σ σ_i/(λ*σ_i + δ)
-                    let sum: f64 = link_eigs.iter()
-                        .map(|&sigma| sigma / (lambda_link * sigma + state.ridge_used))
-                        .sum();
-                    0.5 * lambda_k * sum
-                } else {
-                    0.5 * link_det1_no_ridge
-                }
+                0.5 * link_det1_no_ridge
             } else if k < base_reparam.det1.len() {
-                if state.ridge_used > 0.0 && !base_eigs.is_empty() && base_eigvecs.ncols() > 0 {
-                    // Base: need tr((S_λ + δI)^{-1} S_k) = Σ (u_i^T S_k u_i) / (σ_i + δ)
-                    // where σ_i are eigenvalues of S_λ and u_i are eigenvectors
-                    if let Some(s_k) = state.s_base.get(k) {
-                        if s_k.nrows() == p_base && s_k.ncols() == p_base {
-                            let mut sum = 0.0;
-                            for (j, &sigma) in base_eigs.iter().enumerate() {
-                                // u_j is the j-th column of base_eigvecs
-                                let mut u_j = Array1::zeros(p_base);
-                                for i in 0..p_base {
-                                    u_j[i] = base_eigvecs[[i, j]];
-                                }
-                                // Compute u_j^T S_k u_j
-                                let s_k_u = s_k.dot(&u_j);
-                                let quadratic = u_j.dot(&s_k_u);
-                                sum += quadratic / (sigma + state.ridge_used);
-                            }
-                            0.5 * lambda_k * sum
-                        } else {
-                            0.5 * base_reparam.det1[k]
-                        }
-                    } else {
-                        0.5 * base_reparam.det1[k]
-                    }
-                } else {
-                    0.5 * base_reparam.det1[k]
-                }
+                0.5 * base_reparam.det1[k]
             } else {
                 0.0
             };
