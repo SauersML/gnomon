@@ -2077,6 +2077,8 @@ The calibration code applies sum-to-zero and polynomial orthogonality constraint
 via nullspace projection. These theorems formalize that the projection is correct.
 -/
 
+set_option linter.unusedSectionVars false
+
 variable {n m k : ℕ} [Fintype (Fin n)] [Fintype (Fin m)] [Fintype (Fin k)]
 variable [DecidableEq (Fin n)] [DecidableEq (Fin m)] [DecidableEq (Fin k)]
 
@@ -2211,27 +2213,10 @@ theorem penalty_congruence
     quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
   -- quadForm S (Qβ') = Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = (Qβ')ᵀ S (Qβ')
   -- = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β' = quadForm (QᵀSQ) β'
-  unfold quadForm
-  -- LHS: Σᵢ (Q.mulVec β') i * (S.mulVec (Q.mulVec β')) i
-  -- RHS: Σᵢ β' i * ((QᵀSQ).mulVec β') i
-
-  -- The key is: (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β'))
-  -- This follows from Matrix.mulVec_mulVec: (AB).mulVec v = A.mulVec (B.mulVec v)
-
-  -- First, simplify the RHS penalty matrix action
-  have h_rhs_eq : (Matrix.transpose Q * S * Q).mulVec β' =
-                   (Matrix.transpose Q).mulVec (S.mulVec (Q.mulVec β')) := by
-    -- (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β'))
-    -- By Matrix.mulVec_mulVec: (AB).mulVec v = A.mulVec (B.mulVec v)
-    -- Apply twice: (Qᵀ(SQ)).mulVec = Qᵀ.mulVec ((SQ).mulVec) = Qᵀ.mulVec (S.mulVec (Q.mulVec))
-    -- See: Mathlib.LinearAlgebra.Matrix.NonsingularInverse, Matrix.mulVec_mulVec
-    sorry -- mulVec associativity via Matrix.mulVec_mulVec
-
-  -- The quadForm equality requires showing the dot products are equal
-  -- This is essentially β'ᵀ (QᵀSQ) β' = (Qβ')ᵀ S (Qβ')
-  -- Which is a standard matrix identity for bilinear forms
-  -- See: Mathlib.LinearAlgebra.QuadraticForm.Basic
-  sorry -- Final step: dot product manipulation β'ᵀQᵀ = (Qβ')ᵀ
+  -- This is the standard bilinear form identity for congruence transformation.
+  -- The proof expands dot products, exchanges sums, and uses commutativity.
+  -- See: Mathlib.LinearAlgebra.QuadraticForm for related machinery.
+  sorry
 
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
     the penalized objective transforms covariantly.
