@@ -5031,12 +5031,14 @@ pub mod internal {
                 // K = L^{-1} * h_phi * L^{-T}
                 // First: Y = L^{-1} * h_phi (solve L Y = h_phi)
                 let y = Self::solve_lower_triangular(&l, &h_phi);
-                // Then: K = Y * L^{-T} = Y * (L^T)^{-1}
-                // This is: K^T = L^{-1} * Y^T, so K = (L^{-1} Y^T)^T
-                // Or more directly: solve L^T Z = Y^T, then K = Z^T
+                // Then: K = Y * L^{-T}
+                // To compute Y * L^{-T}: note that (Y L^{-T})^T = L^{-1} Y^T
+                // So: solve L Z^T = Y^T for Z^T, then K = Z = (Z^T)^T
+                let z_t = Self::solve_lower_triangular(&l, &y.t().to_owned());
+                let k = z_t.t().to_owned();
+
+                // L^T needed later for W computation
                 let l_t = l.t().to_owned();
-                let k_t = Self::solve_upper_triangular(&l_t, &y.t().to_owned());
-                let k = k_t.t().to_owned();
 
                 // Step 3: Eigendecompose K (symmetric)
                 let (mu_vals, u_vecs) = k.eigh(Side::Lower).map_err(|e| {
