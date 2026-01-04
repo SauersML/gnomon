@@ -3225,6 +3225,94 @@ fn diagnostic_penalty_4_rho_threshold() {
     }
 }
 
+/// DIAGNOSTIC: Verify gradient direction via cost function trend
+/// At rho=12, which gradient sign is ACTUALLY correct?
+#[test]
+fn diagnostic_verify_gradient_via_cost_trend() {
+    println!("\n=== DIAGNOSTIC: Verify Gradient Direction via Cost Trend ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let n = x_gam.nrows();
+    let offset = Array1::<f64>::zeros(n);
+
+    // At rho=12, the bug shows analytic=-2.25e-6 (negative) but FD=+2.75e-6 (positive)
+    // If the cost INCREASES with rho, the gradient should be POSITIVE
+    // If the cost DECREASES with rho, the gradient should be NEGATIVE
+
+    println!("  Evaluating cost at rho values around 12.0:");
+    println!("  (If cost increases → gradient should be positive)");
+    println!("  (If cost decreases → gradient should be negative)\n");
+
+    // Use penalty 4 only
+    let s_4 = s_list_gam[4].clone();
+
+    // Evaluate cost at several rho values
+    let rho_values: Vec<f64> = vec![11.9, 11.95, 12.0, 12.05, 12.1];
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-12,  // Very tight tolerance
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    let mut costs: Vec<(f64, f64)> = Vec::new();
+
+    for &rho_val in &rho_values {
+        let rho_single = array![rho_val];
+        match evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho_single,
+        ) {
+            Ok((cost, ..)) => {
+                costs.push((rho_val, cost));
+                println!("    rho={:.4}: cost={:.12}", rho_val, cost);
+            }
+            Err(e) => {
+                println!("    rho={:.4}: ERROR {:?}", rho_val, e);
+            }
+        }
+    }
+
+    // Calculate numerical gradient from costs
+    if costs.len() >= 2 {
+        println!("\n  Numerical gradient from cost differences:");
+        for i in 1..costs.len() {
+            let (rho1, c1) = costs[i-1];
+            let (rho2, c2) = costs[i];
+            let d_rho = rho2 - rho1;
+            let d_cost = c2 - c1;
+            let approx_grad = d_cost / d_rho;
+            let sign_word = if approx_grad > 0.0 { "POSITIVE" } else { "NEGATIVE" };
+            println!("    [{:.3}→{:.3}]: Δcost/Δrho = {:.6e} ({})",
+                rho1, rho2, approx_grad, sign_word);
+        }
+    }
+
+    // Now compare to our gradients
+    println!("\n  Compare to computed gradients at rho=12.0:");
+    let rho_12 = array![12.0_f64];
+    match evaluate_external_gradients(
+        train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+        &[s_4.clone()], &opts, &rho_12,
+    ) {
+        Ok((analytic, fd)) => {
+            let a_sign = if analytic[0] > 0.0 { "POSITIVE" } else { "NEGATIVE" };
+            let fd_sign = if fd[0] > 0.0 { "POSITIVE" } else { "NEGATIVE" };
+            println!("    Analytic:  {:.6e} ({})", analytic[0], a_sign);
+            println!("    FD:        {:.6e} ({})", fd[0], fd_sign);
+            println!("\n    => If cost trend is POSITIVE, then ANALYTIC is WRONG");
+            println!("    => If cost trend is NEGATIVE, then FD is WRONG");
+        }
+        Err(e) => println!("    ERROR: {:?}", e),
+    }
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
