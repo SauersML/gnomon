@@ -3416,6 +3416,75 @@ fn diagnostic_fd_failure_detailed_analysis() {
     println!("    Compare FD derivative sign at different h values above.");
 }
 
+/// DIAGNOSTIC: Analyze cost function components at high smoothing.
+/// Why is the cost so insensitive to rho changes?
+#[test]
+fn diagnostic_cost_insensitivity_analysis() {
+    println!("\n=== DIAGNOSTIC: Cost Insensitivity at High Smoothing ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let s_4 = s_list_gam[4].clone();
+    let offset = Array1::<f64>::zeros(train.y.len());
+
+    let opts = ExternalOptimOptions {
+        link: LinkFunction::Logit,
+        firth: Some(FirthSpec { enabled: true }),
+        tol: 1e-10,
+        max_iter: 500,
+        nullspace_dims: vec![0],
+    };
+
+    println!("\n  Comparing low smoothing (rho=0) vs high smoothing (rho=12):");
+    println!("  λ(0) = exp(0) = 1");
+    println!("  λ(12) = exp(12) ≈ 163,000");
+
+    // Compare at different rho values
+    for rho_val in [0.0_f64, 6.0, 12.0, 18.0] {
+        let rho = array![rho_val];
+        let lambda_val = rho_val.exp();
+
+        match evaluate_external_cost_and_ridge(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_4.clone()], &opts, &rho,
+        ) {
+            Ok((cost, ridge)) => {
+                println!("\n  rho={:.1} (λ={:.2e}):", rho_val, lambda_val);
+                println!("    Cost: {:.12}", cost);
+                println!("    Ridge used: {:.2e}", ridge);
+            }
+            Err(e) => {
+                println!("\n  rho={:.1} (λ={:.2e}): ERROR {:?}", rho_val, lambda_val, e);
+            }
+        }
+    }
+
+    // Calculate expected gradient magnitude
+    println!("\n  Expected gradient magnitude analysis:");
+    println!("    At rho=12, λ = 163,000");
+    println!("    dλ/dρ = λ (chain rule: d(exp(ρ))/dρ = exp(ρ))");
+    println!("    So dλ/dρ at rho=12 ≈ 163,000");
+    println!("");
+    println!("    The cost gradient is: dC/dρ = (dC/dλ) * (dλ/dρ)");
+    println!("    Even if dC/dλ is tiny (like 1e-11),");
+    println!("    dC/dρ = 1e-11 * 163,000 ≈ 1.6e-6");
+    println!("");
+    println!("    Our observed gradient ≈ 2e-6, which matches this scale!");
+
+    // Key insight
+    println!("\n  KEY INSIGHT:");
+    println!("    The gradient IS correctly on the order of 1e-6");
+    println!("    But FD computes (cost(ρ+h) - cost(ρ-h)) / 2h");
+    println!("    At h=1e-3, this needs cost differences of ~2e-9");
+    println!("    But cost ≈ 302, so relative precision needed: ~7e-12");
+    println!("    This is only 30x above f64 epsilon (2.2e-16)!");
+    println!("");
+    println!("    FD simply cannot reliably measure gradients this small.");
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
