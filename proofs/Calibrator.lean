@@ -3118,6 +3118,94 @@ theorem sigmoid_zero : sigmoid 0 = 1 / 2 := by
   simp only [neg_zero, Real.exp_zero]
   norm_num
 
+/-- Sigmoid is greater than 1/2 for positive inputs (monotonicity). -/
+theorem sigmoid_gt_half {x : ℝ} (hx : x > 0) : sigmoid x > 1 / 2 := by
+  unfold sigmoid
+  have hexp_lt : Real.exp (-x) < 1 := by rw [Real.exp_lt_one_iff]; linarith
+  have hexp_pos : Real.exp (-x) > 0 := Real.exp_pos (-x)
+  have hdenom : 1 + Real.exp (-x) > 0 := by linarith
+  have hdenom_lt : 1 + Real.exp (-x) < 2 := by linarith
+  -- Want: 1 / (1 + exp(-x)) > 1/2
+  -- Equivalent to: 1 + exp(-x) < 2 (since 1/a < 1/b ↔ b < a for positive a, b)
+  have h2pos : (2 : ℝ) > 0 := by norm_num
+  rw [gt_iff_lt, one_div_lt_one_div h2pos hdenom]
+  exact hdenom_lt
+
+/-- Sigmoid is less than 1/2 for negative inputs (monotonicity). -/
+theorem sigmoid_lt_half {x : ℝ} (hx : x < 0) : sigmoid x < 1 / 2 := by
+  unfold sigmoid
+  have hexp_gt : Real.exp (-x) > 1 := by
+    rw [gt_iff_lt, ← Real.exp_zero]
+    exact Real.exp_strictMono (by linarith : (0 : ℝ) < -x)
+  have hexp_pos : Real.exp (-x) > 0 := Real.exp_pos (-x)
+  have hdenom : 1 + Real.exp (-x) > 0 := by linarith
+  have hdenom_gt : 1 + Real.exp (-x) > 2 := by linarith
+  -- Want: 1 / (1 + exp(-x)) < 1/2
+  -- Equivalent to: 2 < 1 + exp(-x) (since 1/a < 1/b ↔ b < a for positive a, b)
+  have h2pos : (2 : ℝ) > 0 := by norm_num
+  rw [one_div_lt_one_div hdenom h2pos]
+  exact hdenom_gt
+
+/-- Sigmoid is strictly monotone increasing. -/
+theorem sigmoid_monotone : StrictMono sigmoid := by
+  intro x y hxy
+  unfold sigmoid
+  have hx_pos : 1 + Real.exp (-x) > 0 := by have := Real.exp_pos (-x); linarith
+  have hy_pos : 1 + Real.exp (-y) > 0 := by have := Real.exp_pos (-y); linarith
+  rw [one_div_lt_one_div hx_pos hy_pos]
+  have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
+  linarith
+
+/-- If a quadratic `a*ε + b*ε²` is non-negative for all `ε`, then `a = 0`.
+    This is a key lemma for proving gradient conditions at optima.
+
+    The proof considers two cases:
+    - If b = 0: a linear function a*ε can't be ≥ 0 for all ε unless a = 0
+    - If b ≠ 0: the quadratic either opens upward (b > 0) with negative minimum,
+      or opens downward (b < 0) and becomes negative for large |ε| -/
+lemma linear_coeff_zero_of_quadratic_nonneg (a b : ℝ)
+    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
+  by_contra ha_ne
+  by_cases hb : b = 0
+  · -- Case b = 0: then a*ε ≥ 0 for all ε, impossible if a ≠ 0
+    by_cases ha_pos : 0 < a
+    · have h_neg1 := h (-1)
+      simp only [hb, zero_mul, add_zero, mul_neg, mul_one] at h_neg1
+      linarith
+    · push_neg at ha_pos
+      have ha_neg : a < 0 := lt_of_le_of_ne ha_pos ha_ne
+      have h_1 := h 1
+      simp only [hb, zero_mul, add_zero, mul_one] at h_1
+      linarith
+  · -- Case b ≠ 0: consider the vertex of the parabola
+    by_cases hb_pos : 0 < b
+    · -- b > 0: minimum at ε = -a/(2b) gives value -a²/(4b) < 0
+      let ε := -a / (2 * b)
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = -a^2 / (4 * b) := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : -a^2 / (4 * b) < 0 := by
+        apply div_neg_of_neg_of_pos
+        · linarith
+        · linarith
+      linarith
+    · -- b < 0: quadratic opens downward, eventually negative
+      push_neg at hb_pos
+      have hb_neg : b < 0 := lt_of_le_of_ne hb_pos hb
+      let ε := -2 * a / b
+      have hε := h ε
+      have ha_sq_pos : 0 < a^2 := sq_pos_of_ne_zero ha_ne
+      have eval : a * ε + b * ε^2 = 2 * a^2 / b := by
+        simp only [ε]; field_simp; ring
+      rw [eval] at hε
+      have : 2 * a^2 / b < 0 := by
+        apply div_neg_of_pos_of_neg
+        · linarith
+        · exact hb_neg
+      linarith
+
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
@@ -3163,15 +3251,14 @@ theorem jensen_sigmoid_negative (μ σ : ℝ) (hσ : σ > 0) (hμ : μ < 0) :
 theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0)
     (h_moderate_var : σ < |μ|) :  -- Additional hypothesis needed!
     ∃ E_sigmoid : ℝ, |E_sigmoid - 1/2| < |sigmoid μ - 1/2| := by
-  -- Case split on μ < 0 vs μ > 0 (Ne.lt_or_lt returns μ < 0 ∨ 0 < μ)
-  rcases (Ne.lt_or_lt hμ) with hμ_neg | hμ_pos
+  -- Case split on μ < 0 vs μ > 0 (Ne.lt_or_gt returns μ < 0 ∨ 0 < μ)
+  rcases (Ne.lt_or_gt hμ) with hμ_neg | hμ_pos
   · -- μ < 0
     -- By jensen_sigmoid_negative, ∃ E_sig such that E_sig > sigmoid(μ)
     obtain ⟨E_sig, hE_gt⟩ := jensen_sigmoid_negative μ σ hσ hμ_neg
 
-    -- We need to show sigmoid(μ) < 1/2 when μ < 0
-    have hsig_lt_half : sigmoid μ < 1 / 2 := by
-      sorry  -- Requires: sigmoid monotone + sigmoid(0) = 1/2 + μ < 0
+    -- sigmoid(μ) < 1/2 when μ < 0 (by sigmoid_lt_half)
+    have hsig_lt_half : sigmoid μ < 1 / 2 := sigmoid_lt_half hμ_neg
 
     -- We need to show E_sig < 1/2 using the moderate variance hypothesis
     have hE_lt_half : E_sig < 1 / 2 := by
@@ -3186,10 +3273,8 @@ theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0)
     -- By jensen_sigmoid_positive, ∃ E_sig such that E_sig < sigmoid(μ)
     obtain ⟨E_sig, hE_lt⟩ := jensen_sigmoid_positive μ σ hσ hμ_pos
 
-    -- We need to show sigmoid(μ) > 1/2 when μ > 0
-    -- This follows from sigmoid being monotone increasing and sigmoid(0) = 1/2
-    have hsig_gt_half : sigmoid μ > 1 / 2 := by
-      sorry  -- Requires: sigmoid monotone + sigmoid(0) = 1/2 + μ > 0
+    -- sigmoid(μ) > 1/2 when μ > 0 (by sigmoid_gt_half)
+    have hsig_gt_half : sigmoid μ > 1 / 2 := sigmoid_gt_half hμ_pos
 
     -- We need to show E_sig > 1/2 using the moderate variance hypothesis
     have hE_gt_half : E_sig > 1 / 2 := by
