@@ -2119,7 +2119,7 @@ impl<'a> JointRemlState<'a> {
         let mut dot_eta = Array1::<f64>::zeros(n);
         let mut w_prime = Array1::<f64>::zeros(n);
         let mut w_dot = Array1::<f64>::zeros(n);
-        let b_dot = Array2::<f64>::zeros((n, n_raw));
+        let mut b_dot = Array2::<f64>::zeros((n, n_raw));
         let mut c_dot = Array2::<f64>::zeros((n, 2));
         let mut weighted_c_dot = Array2::<f64>::zeros((n, 2));
         let mut weighted_b_dot = Array2::<f64>::zeros((n, n_raw));
@@ -2203,6 +2203,18 @@ impl<'a> JointRemlState<'a> {
                 let w = state.weights[i]; // Use fixed prior weights
                 weighted_c_dot[[i, 0]] *= w;
                 weighted_c_dot[[i, 1]] *= w;
+            }
+
+            // dB_raw/dρ = (dB_raw/dz) * dz/dρ
+            b_dot.fill(0.0);
+            for i in 0..n {
+                let dz = dot_z[i];
+                if dz == 0.0 {
+                    continue;
+                }
+                for j in 0..n_raw {
+                    b_dot[[i, j]] = b_prime[[i, j]] * dz;
+                }
             }
 
             weighted_b_dot.assign(&b_dot);
