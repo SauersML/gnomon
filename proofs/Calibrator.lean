@@ -2198,6 +2198,29 @@ noncomputable def penalized_objective
 def IsOrthogonal (Q : Matrix (Fin p) (Fin p) ℝ) : Prop :=
   Q * Matrix.transpose Q = 1 ∧ Matrix.transpose Q * Q = 1
 
+/-- Transpose-dot identity: (Au) ⬝ v = u ⬝ (Aᵀv).
+    This is the key algebraic identity for bilinear form transformations. -/
+lemma sum_mulVec_mul_eq_sum_mul_transpose_mulVec
+    (A : Matrix (Fin p) (Fin p) ℝ) (u v : Fin p → ℝ) :
+    ∑ i, (A.mulVec u) i * v i = ∑ i, u i * ((Matrix.transpose A).mulVec v) i := by
+  -- Unfold mulVec and dotProduct to get explicit sums
+  simp only [Matrix.mulVec, dotProduct, Matrix.transpose_apply]
+  -- LHS: ∑ i, (∑ j, A i j * u j) * v i
+  -- RHS: ∑ i, u i * (∑ j, A j i * v j)
+  -- Distribute the outer multiplication into the inner sums
+  simp only [Finset.sum_mul, Finset.mul_sum]
+  -- LHS: ∑ i, ∑ j, A i j * u j * v i
+  -- RHS: ∑ i, ∑ j, u i * A j i * v j
+  -- Convert to sums over Fin p × Fin p using sum_product'
+  simp only [← Finset.sum_product']
+  -- Now both sides are sums over univ ×ˢ univ
+  -- Use Finset.sum_equiv with Equiv.prodComm to swap indices
+  refine Finset.sum_equiv (Equiv.prodComm (Fin p) (Fin p)) ?_ ?_
+  · intro _; simp
+  · intro ⟨i, j⟩ _
+    simp only [Equiv.prodComm_apply, Prod.swap_prod_mk]
+    ring
+
 /-- The penalty transforms as a congruence under reparameterization.
 
     **Proof**: (Qβ')ᵀ S (Qβ') = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β'
@@ -2213,11 +2236,25 @@ theorem penalty_congruence
     quadForm S (Q.mulVec β') = quadForm (Matrix.transpose Q * S * Q) β' := by
   -- quadForm S (Qβ') = Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = (Qβ')ᵀ S (Qβ')
   -- = β'ᵀ Qᵀ S Q β' = β'ᵀ (QᵀSQ) β' = quadForm (QᵀSQ) β'
-  -- The proof uses:
-  --   1. (QᵀSQ).mulVec β' = Qᵀ.mulVec (S.mulVec (Q.mulVec β')) by Matrix.mulVec_mulVec
-  --   2. The transpose-dot identity: (Qu) ⬝ v = u ⬝ (Qᵀv)
-  -- Reference: Wood (2011), "Fast stable restricted maximum likelihood", Section 3.
-  sorry
+  unfold quadForm
+  -- LHS: Σᵢ (Q.mulVec β') i * (S.mulVec (Q.mulVec β')) i
+  -- RHS: Σᵢ β' i * ((QᵀSQ).mulVec β') i
+
+  -- Step 1: Simplify RHS using mulVec_mulVec
+  have h_rhs : (Matrix.transpose Q * S * Q).mulVec β' =
+               (Matrix.transpose Q).mulVec (S.mulVec (Q.mulVec β')) := by
+    simp only [Matrix.mul_assoc, Matrix.mulVec_mulVec]
+
+  rw [h_rhs]
+  -- Now need: Σᵢ (Qβ')ᵢ * (S(Qβ'))ᵢ = Σᵢ β'ᵢ * (Qᵀ(S(Qβ')))ᵢ
+
+  -- Step 2: Apply transpose-dot identity
+  -- Let w = Q.mulVec β' and u = S.mulVec w
+  -- LHS = Σᵢ w i * u i
+  -- RHS = Σᵢ β' i * (Qᵀ.mulVec u) i
+  -- By sum_mulVec_mul_eq_sum_mul_transpose_mulVec with A = Q:
+  --   Σᵢ (Q.mulVec β') i * u i = Σᵢ β' i * (Qᵀ.mulVec u) i
+  exact sum_mulVec_mul_eq_sum_mul_transpose_mulVec Q β' (S.mulVec (Q.mulVec β'))
 
 /-- **Reparameterization Equivalence**: Under orthogonal change of variables β = Qβ',
     the penalized objective transforms covariantly.

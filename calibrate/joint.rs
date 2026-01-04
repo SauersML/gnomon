@@ -42,20 +42,22 @@ use wolfe_bfgs::BfgsSolution;
 
 /// Ensure a matrix is positive definite by adding a minimal conditional ridge.
 /// Only adds regularization if Cholesky fails, avoiding bias on well-conditioned matrices.
-fn ensure_positive_definite_joint(mat: &mut Array2<f64>) {
+/// Returns the ridge value added (0.0 if matrix was already positive definite).
+fn ensure_positive_definite_joint(mat: &mut Array2<f64>) -> f64 {
     use crate::calibrate::faer_ndarray::FaerCholesky;
     use faer::Side;
-    
+
     if mat.cholesky(Side::Lower).is_ok() {
-        return; // Already positive definite, no regularization needed
+        return 0.0; // Already positive definite, no regularization needed
     }
-    
+
     // Matrix needs regularization - use diagonal-scaled nugget
     let diag_scale = mat.diag().iter().map(|&d| d.abs()).fold(0.0_f64, f64::max).max(1.0);
     let nugget = 1e-8 * diag_scale;
     for i in 0..mat.nrows() {
         mat[[i, i]] += nugget;
     }
+    nugget
 }
 
 
@@ -101,6 +103,10 @@ pub struct JointModelState<'a> {
     firth_bias_reduction: bool,
     /// Last full linear predictor (u + wiggle) for weight-aligned constraints.
     last_eta: Option<Array1<f64>>,
+    /// Ridge stabilization used in the most recent IRLS solve.
+    /// This must be tracked to include 0.5*δ||β||² in the cost function,
+    /// ensuring the Envelope Theorem holds for the analytic gradient.
+    ridge_used: f64,
 }
 
 /// Configuration for joint model fitting
@@ -545,26 +551,36 @@ impl<'a> JointModelState<'a> {
         self.s_link_constrained.clone().unwrap_or_else(|| Array2::zeros((0, 0)))
     }
     
-    /// Solve penalized weighted least squares: (X'WX + λS)β = X'Wz
-    /// Returns new coefficients
+    /// Solve penalized weighted least squares: (X'WX + λS + δI)β = X'Wz
+    ///
+    /// Returns (coefficients, ridge_used) where ridge_used is the stabilization
+    /// ridge δ added to ensure positive definiteness.
+    ///
+    /// # Mathematical Note (Envelope Theorem)
+    /// When ridge δ > 0, the solver finds β̂ that minimizes:
+    ///   L_ridge(β) = -ℓ(β) + 0.5*β'S_λβ + 0.5*δ||β||²
+    ///
+    /// For the analytic gradient to be exact, the cost function must include
+    /// the same δ||β||² term. Otherwise, ∇_β V(β̂) ≠ 0 and the Envelope
+    /// Theorem fails, introducing gradient error proportional to δ*||β||.
     fn solve_weighted_ls(
         x: &Array2<f64>,
         z: &Array1<f64>,
         w: &Array1<f64>,
         penalty: &Array2<f64>,
         lambda: f64,
-    ) -> Array1<f64> {
+    ) -> (Array1<f64>, f64) {
         use crate::calibrate::faer_ndarray::FaerCholesky;
         use crate::calibrate::faer_ndarray::{fast_ata, fast_atv};
         use faer::Side;
-        
+
         let n = x.nrows();
         let p = x.ncols();
-        
+
         if p == 0 {
-            return Array1::zeros(0);
+            return (Array1::zeros(0), 0.0);
         }
-        
+
         // Compute X'WX via weighted design
         let mut x_weighted = x.clone();
         let mut z_weighted = z.clone();
@@ -576,26 +592,29 @@ impl<'a> JointModelState<'a> {
             z_weighted[i] *= wi;
         }
         let mut xwx = fast_ata(&x_weighted);
-        
+
         // Add penalty: X'WX + λS (only if penalty matches dimensions)
         if penalty.nrows() == p && penalty.ncols() == p {
             xwx = xwx + penalty * lambda;
         }
-        
-        // Conditional regularization for numerical stability
-        ensure_positive_definite_joint(&mut xwx);
-        
+
+        // Conditional regularization for numerical stability.
+        // The ridge δ must be tracked and included in the cost function
+        // to satisfy the Envelope Theorem (see docstring).
+        let ridge_used = ensure_positive_definite_joint(&mut xwx);
+
         // Compute X'Wz via weighted design
         let xwz = fast_atv(&x_weighted, &z_weighted);
-        
-        // Solve (X'WX + λS)β = X'Wz using Cholesky
-        match xwx.cholesky(Side::Lower) {
+
+        // Solve (X'WX + λS + δI)β = X'Wz using Cholesky
+        let coeffs = match xwx.cholesky(Side::Lower) {
             Ok(chol) => chol.solve_vec(&xwz),
             Err(_) => {
                 eprintln!("[JOINT] Warning: Cholesky factorization failed");
                 Array1::zeros(p)
             }
-        }
+        };
+        (coeffs, ridge_used)
     }
     
     /// Perform one IRLS step for the link block
