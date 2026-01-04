@@ -3173,6 +3173,58 @@ fn diagnostic_penalty_4_deep_investigation() {
     }
 }
 
+/// DIAGNOSTIC: Find exact rho threshold where penalty 4 bug appears
+#[test]
+fn diagnostic_penalty_4_rho_threshold() {
+    println!("\n=== DIAGNOSTIC: Finding Exact Rho Threshold for Penalty [4] Bug ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let n = x_gam.nrows();
+    let offset = Array1::<f64>::zeros(n);
+
+    println!("  Sweeping rho values to find threshold:");
+
+    // Test rho from 6 to 12 in steps
+    for rho_val in [6.0, 7.0, 8.0, 9.0, 10.0, 10.5, 11.0, 11.5, 12.0, 13.0, 14.0, 15.0] {
+        let rho_single = array![rho_val];
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_list_gam[4].clone()], &opts, &rho_single,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.99 {
+                    "✓"
+                } else if cos < -0.99 {
+                    "✗ OPPOSITE!"
+                } else if cos > 0.0 {
+                    "~ degraded"
+                } else {
+                    "✗ wrong sign"
+                };
+                let lambda = rho_val.exp();
+                println!("    rho={:5.1} (λ={:.2e}): cos={:+.6} {} a={:+.4e} fd={:+.4e}",
+                    rho_val, lambda, cos, status, analytic[0], fd[0]);
+            }
+            Err(e) => {
+                println!("    rho={:5.1}: ERROR {:?}", rho_val, e);
+            }
+        }
+    }
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
@@ -3186,7 +3238,7 @@ fn hypothesis_full_gam_control() {
     let nullspace_dims = vec![0; s_list_gam.len()];
     let offset = Array1::<f64>::zeros(train.y.len());
     let rho = Array1::from_elem(layout.num_penalties, 12.0);
-    
+
     let opts = ExternalOptimOptions {
         link: LinkFunction::Logit,
         firth: Some(FirthSpec { enabled: true }),
