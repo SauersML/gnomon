@@ -3061,6 +3061,118 @@ fn diagnostic_individual_penalty_test() {
     }
 }
 
+/// DIAGNOSTIC: Deep investigation of penalty [4] which has cos=-1
+#[test]
+fn diagnostic_penalty_4_deep_investigation() {
+    println!("\n=== DIAGNOSTIC: Deep Investigation of Penalty [4] (cos=-1) ===");
+
+    let train = create_logistic_training_data(100, 3, 31);
+    let config = logistic_model_config(true, false, &train);
+    let (x_gam, s_list_gam, ..) =
+        build_design_and_penalty_matrices(&train, &config).expect("design");
+
+    let n = x_gam.nrows();
+    let p = x_gam.ncols();
+    let offset = Array1::<f64>::zeros(n);
+
+    println!("  Comparing penalty structures:");
+    for idx in [3, 4, 5] {
+        let s_k = &s_list_gam[idx];
+
+        // Check for any negative elements
+        let min_val = s_k.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+        let max_val = s_k.iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+        let has_neg = s_k.iter().any(|v| *v < -1e-15);
+
+        // Sum of diagonal
+        let diag_sum: f64 = (0..p).map(|i| s_k[[i, i]]).sum();
+
+        // Off-diagonal sum
+        let mut offdiag_sum = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                if i != j {
+                    offdiag_sum += s_k[[i, j]];
+                }
+            }
+        }
+
+        let flag = if idx == 4 { " <-- PROBLEM PENALTY" } else { "" };
+        println!("  Penalty [{}]{}:", idx, flag);
+        println!("    Value range: [{:.4e}, {:.4e}]", min_val, max_val);
+        println!("    Has negative: {}", has_neg);
+        println!("    Diagonal sum: {:.4e}", diag_sum);
+        println!("    Off-diag sum: {:.4e}", offdiag_sum);
+
+        // Print the actual non-zero structure
+        let mut nonzero_entries: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..p {
+            for j in 0..p {
+                if s_k[[i, j]].abs() > 1e-12 {
+                    nonzero_entries.push((i, j, s_k[[i, j]]));
+                }
+            }
+        }
+        if nonzero_entries.len() <= 20 {
+            println!("    Non-zero entries: {:?}", nonzero_entries);
+        } else {
+            println!("    Non-zero entries count: {}", nonzero_entries.len());
+        }
+    }
+
+    // Test penalty 4 at different rho values
+    println!("\n  Penalty [4] gradient at different rho:");
+    for rho_val in [0.0_f64, 6.0, 12.0] {
+        let rho_single = array![rho_val];
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: Some(FirthSpec { enabled: true }),
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_list_gam[4].clone()], &opts, &rho_single,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.999 { "✓" } else if cos < -0.999 { "✗ OPPOSITE!" } else { "✗" };
+                println!("    rho={:.1}: cos={:.6} {} a={:.4e} fd={:.4e}",
+                    rho_val, cos, status, analytic[0], fd[0]);
+            }
+            Err(e) => println!("    rho={:.1}: ERROR {:?}", rho_val, e),
+        }
+    }
+
+    // Compare to non-Firth
+    println!("\n  Penalty [4] gradient WITHOUT Firth:");
+    for rho_val in [0.0_f64, 6.0, 12.0] {
+        let rho_single = array![rho_val];
+        let opts = ExternalOptimOptions {
+            link: LinkFunction::Logit,
+            firth: None,  // No Firth
+            tol: 1e-10,
+            max_iter: 200,
+            nullspace_dims: vec![0],
+        };
+
+        match evaluate_external_gradients(
+            train.y.view(), train.weights.view(), x_gam.view(), offset.view(),
+            &[s_list_gam[4].clone()], &opts, &rho_single,
+        ) {
+            Ok((analytic, fd)) => {
+                let (cos, ..) = gradient_metrics(&analytic, &fd);
+                let status = if cos > 0.999 { "✓" } else { "✗" };
+                println!("    rho={:.1}: cos={:.6} {} a={:.4e} fd={:.4e}",
+                    rho_val, cos, status, analytic[0], fd[0]);
+            }
+            Err(e) => println!("    rho={:.1}: ERROR {:?}", rho_val, e),
+        }
+    }
+}
+
 /// Hypothesis 20: Full GAM combination (control - expected to fail).
 #[test]
 fn hypothesis_full_gam_control() {
