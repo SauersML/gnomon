@@ -2526,8 +2526,8 @@ impl<'a> JointRemlState<'a> {
     pub fn compute_gradient_analytic_for_test(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        self.compute_gradient_analytic(rho).map(|(grad, _)| grad)
+    ) -> Result<(Array1<f64>, bool), EstimationError> {
+        self.compute_gradient_analytic(rho)
     }
 
     #[cfg(test)]
@@ -3199,8 +3199,8 @@ mod tests {
         let x = Array2::zeros((n, p));
         let s = vec![Array2::eye(p)];
         let layout = ModelLayout::external(p, 1);
-        let mut config = JointModelConfig::default();
-        config.n_link_knots = 4;
+        let config = JointModelConfig::default();
+        // Use default knot count from config.
         let quad_ctx = QuadratureContext::new();
         
         let state = JointModelState::new(
@@ -3327,91 +3327,120 @@ mod tests {
 
     #[test]
     fn test_joint_analytic_gradient_matches_fd() {
-        let n = 600;
-        let p = 6;
-        let weights = Array1::ones(n);
-        let s = vec![Array2::eye(p)];
-        let layout = ModelLayout::external(p, 1);
-        let config = JointModelConfig::default();
+        fn run_case(
+            n: usize,
+            p: usize,
+            ill_conditioned: bool,
+            seed: u64,
+        ) -> Result<Option<(Array1<f64>, Array1<f64>, bool)>, String> {
+            let weights = Array1::ones(n);
+            let s = vec![Array2::eye(p)];
+            let layout = ModelLayout::external(p, 1);
+            let config = JointModelConfig::default();
 
-        let mut grad_analytic = None;
-        let mut grad_fd = None;
-        let mut last_err: Option<String> = None;
-        for attempt in 0..3 {
-            let mut rng = StdRng::seed_from_u64(123 + attempt);
-            let mut x = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
+            let mut last_err: Option<String> = None;
+            for attempt in 0..3 {
+                let mut rng = StdRng::seed_from_u64(seed + attempt as u64);
+                let mut x = Array2::<f64>::zeros((n, p));
+                for i in 0..n {
+                    for j in 0..p {
+                        x[[i, j]] = rng.gen_range(-2.0..2.0);
+                    }
+                }
+                if ill_conditioned && p > 1 {
+                    for i in 0..n {
+                        x[[i, 1]] = x[[i, 0]] * (1.0 + 1e-6) + rng.gen_range(-1e-8..1e-8);
+                    }
+                }
+
+                let mut beta_true = Array1::<f64>::zeros(p);
                 for j in 0..p {
-                    x[[i, j]] = rng.gen_range(-1.0..1.0);
+                    beta_true[j] = rng.gen_range(-1.0..1.0);
+                }
+                let eta = x.dot(&beta_true);
+                let mut y = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let mu = 1.0 / (1.0 + (-eta[i]).exp());
+                    y[i] = if ill_conditioned {
+                        if rng.r#gen::<f64>() < mu { 1.0 } else { 0.0 }
+                    } else {
+                        mu
+                    };
+                }
+
+                let reml_state = JointRemlState::new(
+                    y.view(),
+                    weights.view(),
+                    x.view(),
+                    s.clone(),
+                    layout.clone(),
+                    LinkFunction::Logit,
+                    &config,
+                    None,
+                    QuadratureContext::new(),
+                );
+                {
+                    let mut state = reml_state.state.borrow_mut();
+                    state.beta_base = beta_true.clone();
+                    *reml_state.cached_beta_base.borrow_mut() = beta_true.clone();
+                    // Reset knot range and constraints so basis is built from the current u,
+                    // not the zero-initialized predictor from JointRemlState::new.
+                    state.knot_range = None;
+                    state.knot_vector = None;
+                    state.link_transform = None;
+                    state.s_link_constrained = None;
+                    let u = state.base_linear_predictor();
+                    if state.build_link_basis(&u).is_err() {
+                        last_err = Some("link basis failed".to_string());
+                        continue;
+                    }
+                }
+
+                let rho = Array1::from_vec(vec![0.0, 5.0]);
+                match reml_state.compute_gradient_analytic_for_test(&rho) {
+                    Ok((ga, audit_needed)) => match reml_state.compute_gradient_fd_for_test(&rho) {
+                        Ok(gf) => return Ok(Some((ga, gf, audit_needed))),
+                        Err(err) => {
+                            last_err = Some(err.to_string());
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        last_err = Some(err.to_string());
+                        continue;
+                    }
                 }
             }
+            Err(last_err.unwrap_or_else(|| "unknown".to_string()))
+        }
 
-            let mut beta_true = Array1::<f64>::zeros(p);
-            for j in 0..p {
-                beta_true[j] = rng.gen_range(-0.5..0.5);
-            }
-            let eta = x.dot(&beta_true);
-            let mut y = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let mu = 1.0 / (1.0 + (-eta[i]).exp());
-                y[i] = if rng.r#gen::<f64>() < mu { 1.0 } else { 0.0 };
-            }
-
-            let reml_state = JointRemlState::new(
-                y.view(),
-                weights.view(),
-                x.view(),
-                s.clone(),
-                layout.clone(),
-                LinkFunction::Logit,
-                &config,
-                None,
-                QuadratureContext::new(),
-            );
-            {
-                let mut state = reml_state.state.borrow_mut();
-                state.beta_base = beta_true.clone();
-                *reml_state.cached_beta_base.borrow_mut() = beta_true.clone();
-                let u = state.base_linear_predictor();
-                if state.build_link_basis(&u).is_err() {
-                    continue;
+        for &(n, ill) in &[(120, false), (120, true), (800, false), (800, true)] {
+            match run_case(n, 6, ill, 123) {
+                Ok(Some((grad_analytic, grad_fd, audit_needed))) => {
+                    let mut diff_norm = 0.0;
+                    let mut fd_norm = 0.0;
+                    for i in 0..grad_fd.len() {
+                        let d = grad_analytic[i] - grad_fd[i];
+                        diff_norm += d * d;
+                        fd_norm += grad_fd[i] * grad_fd[i];
+                    }
+                    let rel = diff_norm.sqrt() / (fd_norm.sqrt().max(1.0));
+                    assert!(
+                        rel < 1e-2,
+                        "analytic/FD gradient mismatch: n={n} ill={ill} audit={audit_needed} rel={rel:.3e}"
+                    );
                 }
-            }
-
-            let rho = Array1::from_vec(vec![0.0, 2.0]);
-            match reml_state.compute_gradient_analytic_for_test(&rho) {
-                Ok(ga) => {
-                    let gf = reml_state
-                        .compute_gradient_fd_for_test(&rho)
-                        .expect("fd gradient");
-                    grad_analytic = Some(ga);
-                    grad_fd = Some(gf);
-                    break;
+                Ok(None) => {
+                    if !ill {
+                        panic!("analytic gradient: no stable case for n={n}");
+                    }
                 }
                 Err(err) => {
-                    last_err = Some(err.to_string());
-                    continue;
+                    if !ill {
+                        panic!("analytic gradient: {err}");
+                    }
                 }
             }
         }
-
-        let grad_analytic = match grad_analytic {
-            Some(g) => g,
-            None => panic!("analytic gradient: {}", last_err.unwrap_or_else(|| "unknown".to_string())),
-        };
-        let grad_fd = grad_fd.expect("fd gradient");
-
-        let mut diff_norm = 0.0;
-        let mut fd_norm = 0.0;
-        for i in 0..grad_fd.len() {
-            let d = grad_analytic[i] - grad_fd[i];
-            diff_norm += d * d;
-            fd_norm += grad_fd[i] * grad_fd[i];
-        }
-        let rel = diff_norm.sqrt() / (fd_norm.sqrt().max(1.0));
-        assert!(
-            rel < 1e-2,
-            "analytic/FD gradient mismatch: rel={rel:.3e}"
-        );
     }
 }

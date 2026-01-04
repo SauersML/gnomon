@@ -1091,7 +1091,7 @@ fn isolation_frozen_beta_fd() {
 // ============================================================================
 
 #[test]
-fn diagnostic_fd_noise_floor_at_high_smoothing() {
+fn isolation_diagnostic_fd_noise_floor_at_high_smoothing() {
     let train = create_logistic_training_data(100, 3, 31);
     let mut config = logistic_model_config(true, false, &train);
     config.firth_bias_reduction = true;
