@@ -296,6 +296,7 @@ pub fn dummy_trained_model(config: ModelConfig) -> TrainedModel {
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples: None,
+        smoothing_correction: None,
     }
 }
 

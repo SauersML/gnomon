@@ -116,6 +116,7 @@ fn create_mock_trained_model(
         survival: Some(disease_model),
         survival_companions: companions,
         mcmc_samples: None,
+        smoothing_correction: None,
     }
 }
 
@@ -231,6 +232,7 @@ fn test_missing_companion_error() {
         survival: Some(disease_model),
         survival_companions: HashMap::new(),
         mcmc_samples: None,
+        smoothing_correction: None,
     };
 
     let res = model.predict_survival(

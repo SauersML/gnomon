@@ -3508,6 +3508,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         let preds_via_predict = model

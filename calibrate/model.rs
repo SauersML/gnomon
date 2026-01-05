@@ -453,6 +453,12 @@ pub struct TrainedModel {
     /// Present when mcmc_enabled=true during training. Enables honest uncertainty quantification.
     #[serde(default)]
     pub mcmc_samples: Option<Array2<f64>>,
+    /// Optional smoothing parameter uncertainty correction matrix V_corr = J * V_ρ * J^T.
+    /// When present, the variance estimate for predictions becomes: Var(η) = x^T H^{-1} x + x^T V_corr x.
+    /// This implements the Wood et al. (2016) correction for smoothing parameter uncertainty,
+    /// ensuring that standard errors properly account for the fact that λ was estimated from data.
+    #[serde(default)]
+    pub smoothing_correction: Option<Array2<f64>>,
 }
 
 /// Optional joint single-index link data for calibrated predictions.
@@ -635,19 +641,37 @@ impl TrainedModel {
             Ok(c) => c,
             Err(_) => return None,
         };
+
+        // Check if smoothing correction is available and compatible
+        let v_corr = self.smoothing_correction.as_ref().filter(|v| {
+            v.nrows() == x_new.ncols() && v.ncols() == x_new.ncols()
+        });
+
         let mut vars = Array1::zeros(x_new.nrows());
         for i in 0..x_new.nrows() {
             let x_row = x_new.row(i).to_owned();
             let v = chol.solve_vec(&x_row);
-            let var_i = x_row.dot(&v);
-            vars[i] = if link_function == LinkFunction::Identity {
-                if let Some(scale) = self.scale {
-                    var_i * scale
-                } else {
-                    var_i
-                }
+            // Base variance: x^T H^{-1} x
+            let var_base = x_row.dot(&v);
+
+            // Add smoothing correction: x^T V_corr x (Wood et al. 2016)
+            // This accounts for uncertainty in the smoothing parameter estimation.
+            let var_corr = if let Some(corr) = v_corr {
+                let corr_x = corr.dot(&x_row);
+                x_row.dot(&corr_x)
             } else {
-                var_i
+                0.0
+            };
+
+            // For Gaussian models, var_base is unitless and needs scaling by σ²,
+            // but var_corr already has variance units (y²) because β has units of y.
+            // Scaling var_corr again would give y⁴ units - a catastrophic error!
+            vars[i] = if link_function == LinkFunction::Identity {
+                let scale = self.scale.unwrap_or(1.0);
+                (var_base * scale) + var_corr  // Scale ONLY the base variance
+            } else {
+                // For GLMs, both terms already have correct units
+                var_base + var_corr
             };
         }
         Some(vars.mapv(|v| v.max(0.0).sqrt()))
@@ -2736,6 +2760,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         // --- Define Test Points ---
@@ -2851,6 +2876,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         let test_points = array![0.25, 0.75];
@@ -2965,6 +2991,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: Some(Array2::<f64>::ones((2, 3))),
+            smoothing_correction: None,
         };
 
         let test_points = array![0.25, 0.75];
@@ -3108,6 +3135,7 @@ mod tests {
             survival: Some(artifacts),
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         let result = model
@@ -3194,6 +3222,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         // Test with mismatched PC dimensions (model expects 1 PC, but we provide 2)
@@ -3518,6 +3547,7 @@ mod tests {
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None,
         };
 
         // Create a temporary file for testing

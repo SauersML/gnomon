@@ -403,6 +403,180 @@ fn smooth_floor_dp(dp: f64) -> (f64, f64) {
     (dp_c, sigma)
 }
 
+/// Compute the smoothing parameter uncertainty correction matrix V_corr = J * V_ρ * J^T.
+///
+/// This implements the Wood et al. (2016) correction for smoothing parameter uncertainty.
+/// The corrected covariance for β is: V*_β = V_β + J * V_ρ * J^T
+/// where:
+/// - V_β = H^{-1} (the conditional covariance treating λ as fixed)
+/// - J = dβ/dρ (the Jacobian of coefficients w.r.t. log-smoothing parameters)
+/// - V_ρ = inverse Hessian of LAML w.r.t. ρ (smoothing parameter covariance)
+///
+/// Returns the correction matrix in the ORIGINAL coefficient basis.
+fn compute_smoothing_correction(
+    reml_state: &internal::RemlState<'_>,
+    final_rho: &Array1<f64>,
+    final_fit: &pirls::PirlsResult,
+) -> Option<Array2<f64>> {
+    use crate::calibrate::faer_ndarray::{FaerCholesky, FaerEigh};
+    use faer::Side;
+
+    let n_rho = final_rho.len();
+    if n_rho == 0 {
+        return None;
+    }
+
+    let n_coeffs_trans = final_fit.beta_transformed.len();
+    let n_coeffs_orig = final_fit.reparam_result.qs.nrows();
+    let lambdas: Array1<f64> = final_rho.mapv(f64::exp);
+
+    // Step 1: Compute the Jacobian J = dβ/dρ in transformed space
+    // For each k: dβ/dρ_k = -H^{-1}(λ_k S_k β)
+    // where H is the penalized Hessian and S_k is the k-th penalty matrix.
+
+    // Get the effective Hessian from the fit - use stabilized version for consistency
+    let h_trans = &final_fit.stabilized_hessian_transformed;
+
+    // Factor the Hessian for solving
+    let h_chol = match h_trans.clone().cholesky(Side::Lower) {
+        Ok(c) => c,
+        Err(_) => {
+            log::warn!("Cholesky decomposition failed for smoothing correction; skipping.");
+            return None;
+        }
+    };
+
+    let beta_trans = final_fit.beta_transformed.as_ref();
+    let rs_transformed = &final_fit.reparam_result.rs_transformed;
+
+    // Build Jacobian matrix J where column k is dβ/dρ_k
+    let mut jacobian_trans = Array2::<f64>::zeros((n_coeffs_trans, n_rho));
+    for k in 0..n_rho {
+        if k >= rs_transformed.len() {
+            continue;
+        }
+        let r_k = &rs_transformed[k];
+        if r_k.ncols() == 0 {
+            continue;
+        }
+        // S_k β = R_k^T (R_k β)
+        let r_beta = r_k.dot(beta_trans);
+        let s_k_beta = r_k.t().dot(&r_beta);
+
+        // dβ/dρ_k = -H^{-1}(λ_k S_k β)
+        let rhs = s_k_beta.mapv(|v| -lambdas[k] * v);
+        let delta = h_chol.solve_vec(&rhs);
+
+        jacobian_trans.column_mut(k).assign(&delta);
+    }
+
+    // Step 2: Compute V_ρ via finite differences of the LAML gradient
+    // V_ρ^{-1} = d²LAML/dρ² (Hessian of LAML w.r.t. ρ)
+    let h_step = 1e-4;
+    let mut hessian_rho = Array2::<f64>::zeros((n_rho, n_rho));
+
+    // Compute Hessian via central differences of gradient
+    for k in 0..n_rho {
+        let mut rho_plus = final_rho.clone();
+        rho_plus[k] += h_step;
+        let mut rho_minus = final_rho.clone();
+        rho_minus[k] -= h_step;
+
+        let grad_plus = match reml_state.compute_gradient(&rho_plus) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let grad_minus = match reml_state.compute_gradient(&rho_minus) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        // Central difference: d²f/dρ_k dρ_j ≈ (∂f/∂ρ_j|ρ_k+h - ∂f/∂ρ_j|ρ_k-h) / (2h)
+        for j in 0..n_rho {
+            hessian_rho[[k, j]] = (grad_plus[j] - grad_minus[j]) / (2.0 * h_step);
+        }
+    }
+
+    // Symmetrize the Hessian
+    for i in 0..n_rho {
+        for j in (i + 1)..n_rho {
+            let avg = 0.5 * (hessian_rho[[i, j]] + hessian_rho[[j, i]]);
+            hessian_rho[[i, j]] = avg;
+            hessian_rho[[j, i]] = avg;
+        }
+    }
+
+    // Step 3: Invert Hessian to get V_ρ
+    // Add small ridge for numerical stability
+    let ridge = 1e-8 * hessian_rho.diag().iter().map(|&v| v.abs()).fold(0.0, f64::max).max(1e-8);
+    for i in 0..n_rho {
+        hessian_rho[[i, i]] += ridge;
+    }
+
+    let v_rho = match hessian_rho.cholesky(Side::Lower) {
+        Ok(chol) => {
+            let mut eye = Array2::<f64>::eye(n_rho);
+            for col in 0..n_rho {
+                let col_vec = eye.column(col).to_owned();
+                let solved = chol.solve_vec(&col_vec);
+                eye.column_mut(col).assign(&solved);
+            }
+            eye
+        }
+        Err(_) => {
+            log::warn!("Failed to invert LAML Hessian for smoothing correction; skipping.");
+            return None;
+        }
+    };
+
+    // Step 4: Compute V_corr = J * V_ρ * J^T in transformed space
+    let j_v_rho = jacobian_trans.dot(&v_rho); // (n_coeffs_trans x n_rho)
+    let v_corr_trans = j_v_rho.dot(&jacobian_trans.t()); // (n_coeffs_trans x n_coeffs_trans)
+
+    // Step 5: Transform back to original coefficient basis
+    // V_corr_orig = Qs * V_corr_trans * Qs^T
+    let qs = &final_fit.reparam_result.qs;
+    let qs_v = qs.dot(&v_corr_trans);
+    let v_corr_orig = qs_v.dot(&qs.t());
+
+    // Validate the result
+    if !v_corr_orig.iter().all(|v| v.is_finite()) {
+        log::warn!("Non-finite values in smoothing correction matrix; skipping.");
+        return None;
+    }
+
+    // Ensure positive semi-definiteness by clamping negative eigenvalues
+    // (can happen due to numerical noise)
+    match v_corr_orig.clone().eigh(Side::Lower) {
+        Ok((eigenvalues, eigenvectors)) => {
+            let min_eig = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            if min_eig < -1e-10 {
+                log::debug!(
+                    "Smoothing correction has negative eigenvalue {:.3e}; clamping to zero.",
+                    min_eig
+                );
+                // Reconstruct with clamped eigenvalues
+                let mut result = Array2::<f64>::zeros((n_coeffs_orig, n_coeffs_orig));
+                for i in 0..n_coeffs_orig {
+                    let eig = eigenvalues[i].max(0.0);
+                    let v = eigenvectors.column(i);
+                    for j in 0..n_coeffs_orig {
+                        for k in 0..n_coeffs_orig {
+                            result[[j, k]] += eig * v[j] * v[k];
+                        }
+                    }
+                }
+                return Some(result);
+            }
+        }
+        Err(_) => {
+            log::warn!("Eigendecomposition failed for smoothing correction validation.");
+        }
+    }
+
+    Some(v_corr_orig)
+}
+
 fn run_gradient_check(
     label: &str,
     reml_state: &RemlState<'_>,
@@ -1321,6 +1495,7 @@ pub fn train_joint_model(
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
+        smoothing_correction: None, // TODO: Implement for joint link models (separate optimization path)
     };
     result.base_model = Some(base_model);
     
@@ -1546,6 +1721,7 @@ pub fn train_model(
             survival: None,
             survival_companions: HashMap::new(),
             mcmc_samples: None,
+            smoothing_correction: None, // No penalties, no smoothing correction needed
         };
 
         trained_model
@@ -2330,6 +2506,18 @@ pub fn train_model(
         }
     };
 
+    // Compute smoothing parameter uncertainty correction (Wood et al. 2016)
+    // V_corr = J * V_ρ * J^T where J = dβ/dρ and V_ρ is the covariance of smoothing parameters
+    let smoothing_correction = if !final_lambda.is_empty() {
+        compute_smoothing_correction(
+            &reml_state,
+            &final_rho,
+            &final_fit,
+        )
+    } else {
+        None
+    };
+
     let trained_model = TrainedModel {
         config: config_with_constraints,
         coefficients: mapped_coefficients,
@@ -2342,6 +2530,7 @@ pub fn train_model(
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
+        smoothing_correction,
     };
 
     trained_model
@@ -3569,6 +3758,7 @@ pub fn train_survival_model(
         survival: Some(final_artifacts),
         survival_companions: companions, // The map of mortality artifacts
         mcmc_samples,
+        smoothing_correction: None, // TODO: Implement for survival models (separate optimization path)
     })
 }
 
