@@ -55,11 +55,10 @@ GENOME_FILES = (
 
 # Beagle configuration
 BEAGLE_JAR_URL = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar"
-CONFORM_GT_URL = "https://faculty.washington.edu/browning/conform-gt/conform-gt.24May16.cee.jar"
 GENETIC_MAP_URL = "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh37.map.zip"
 
-# 1000 Genomes reference panel (VCF format for conform-gt compatibility)
-REF_PANEL_BASE = "https://bochet.gcc.biostat.washington.edu/beagle/1000_Genomes_phase3_v5a/b37.vcf"
+# 1000 Genomes reference panel (bref3 format - pre-filtered, no symbolic alleles)
+REF_PANEL_BASE = "https://bochet.gcc.biostat.washington.edu/beagle/1000_Genomes_phase3_v5a/b37.bref3"
 CHROMOSOMES = [str(i) for i in range(1, 23)]  # chr1-22
 
 # --------------------------------------------------------------------------------------
@@ -149,7 +148,7 @@ def ensure_plink2() -> Path:
 
 
 def ensure_bcftools() -> Path:
-    """Check bcftools is installed (no pre-built binaries available)."""
+    """Check bcftools is installed (needed for GRCh38/HGDP+1KG filtering)."""
     existing = shutil.which("bcftools")
     if existing:
         return Path(existing)
@@ -160,6 +159,7 @@ def ensure_bcftools() -> Path:
         "  Ubuntu: sudo apt install bcftools\n"
         "  conda: conda install -c bioconda bcftools"
     )
+
 
 
 def ensure_java() -> Path:
@@ -225,14 +225,6 @@ def ensure_beagle() -> Path:
     return jar_path
 
 
-def ensure_conform_gt() -> Path:
-    """Download conform-gt JAR if not cached."""
-    tools_dir = CACHE_DIR / "tools"
-    jar_path = tools_dir / "conform-gt.jar"
-    download(CONFORM_GT_URL, jar_path)
-    return jar_path
-
-
 def ensure_genetic_maps() -> Path:
     """Download and extract genetic maps if not cached."""
     maps_dir = CACHE_DIR / "maps" / "GRCh37"
@@ -253,37 +245,17 @@ def ensure_genetic_maps() -> Path:
     return maps_dir
 
 
-def ensure_reference_panel(chrom: str, bcftools: Path) -> Path:
-    """Download reference panel for a chromosome and filter to SNPs only."""
-    ref_dir = CACHE_DIR / "refs" / "1kg_b37_vcf"
-    raw_file = ref_dir / f"chr{chrom}.1kg.phase3.v5a.raw.vcf.gz"
-    filtered_file = ref_dir / f"chr{chrom}.1kg.phase3.v5a.snps.vcf.gz"
+def ensure_reference_panel(chrom: str) -> Path:
+    """Download bref3 reference panel for a chromosome (pre-filtered, no symbolic alleles)."""
+    ref_dir = CACHE_DIR / "refs" / "1kg_b37_bref3"
+    ref_file = ref_dir / f"chr{chrom}.1kg.phase3.v5a.b37.bref3"
 
-    if filtered_file.exists():
-        return filtered_file
+    if ref_file.exists():
+        return ref_file
 
-    # Download raw file
-    if not raw_file.exists():
-        url = f"{REF_PANEL_BASE}/chr{chrom}.1kg.phase3.v5a.vcf.gz"
-        download(url, raw_file)
-
-    # Filter out symbolic alleles (<INS>, <DEL>, etc.) but keep SNPs and indels
-    debug(f"Filtering chr{chrom} reference (removing symbolic alleles)...")
-    result = subprocess.run([
-        bcftools, "view",
-        "-e", 'REF~"<" || ALT~"<"',  # Exclude symbolic alleles in REF or ALT
-        "-O", "z",
-        "-o", filtered_file,
-        raw_file,
-    ], capture_output=True, text=True)
-
-    if result.returncode != 0:
-        raise RuntimeError(f"bcftools filter failed: {result.stderr}")
-
-    # Index the filtered file
-    subprocess.run([bcftools, "index", "-t", filtered_file], capture_output=True)
-
-    return filtered_file
+    url = f"{REF_PANEL_BASE}/chr{chrom}.1kg.phase3.v5a.b37.bref3"
+    download(url, ref_file)
+    return ref_file
 
 
 # --------------------------------------------------------------------------------------
@@ -333,62 +305,31 @@ def plink_to_vcf(plink_prefix: Path, vcf_path: Path, plink2: Path) -> None:
     ])
 
 
-def run_conform_gt(
-    vcf_in: Path,
-    vcf_out: Path,
-    ref_panel: Path,
-    conform_gt_jar: Path,
-    chrom: str,
-    java: Path,
-) -> None:
-    """Run conform-gt to align target alleles with reference panel."""
-    if vcf_out.exists():
-        debug(f"Using cached {vcf_out.name}")
-        return
-
-    out_prefix = vcf_out.with_suffix("").with_suffix("")  # Remove .vcf.gz
-
-    run([
-        java, "-Xmx2g", "-jar", conform_gt_jar,
-        f"gt={vcf_in}",
-        f"ref={ref_panel}",
-        f"chrom={chrom}",
-        f"out={out_prefix}",
-    ])
-
-
 def run_beagle_imputation(
     vcf_in: Path,
     vcf_out: Path,
     beagle_jar: Path,
-    conform_gt_jar: Path,
     maps_dir: Path,
     chrom: str,
     java: Path,
-    bcftools: Path,
-    work_dir: Path,
 ) -> None:
-    """Run conform-gt then Beagle imputation for one chromosome."""
+    """Run Beagle imputation for one chromosome using bref3 reference."""
     if vcf_out.exists():
         debug(f"Using cached {vcf_out.name}")
         return
 
-    ref_panel = ensure_reference_panel(chrom, bcftools)
+    ref_panel = ensure_reference_panel(chrom)
     map_file = maps_dir / f"plink.chr{chrom}.GRCh37.map"
 
-    # Step 1: Run conform-gt to align alleles
-    conformed_vcf = work_dir / f"conformed.chr{chrom}.vcf.gz"
-    run_conform_gt(vcf_in, conformed_vcf, ref_panel, conform_gt_jar, chrom, java)
-
-    # Step 2: Run Beagle imputation on conformed data
     out_prefix = vcf_out.with_suffix("").with_suffix("")  # Remove .vcf.gz
 
     run([
         java, "-Xmx4g", "-jar", beagle_jar,
-        f"gt={conformed_vcf}",
+        f"gt={vcf_in}",
         f"ref={ref_panel}",
         f"map={map_file}",
         f"out={out_prefix}",
+        f"chrom={chrom}",
         "impute=true",
     ])
 
@@ -418,11 +359,10 @@ def impute_genome(
     sample_id: str,
     deps: dict[str, Path],
     beagle_jar: Path,
-    conform_gt_jar: Path,
     maps_dir: Path,
     work_dir: Path,
 ) -> Path:
-    """Full imputation pipeline: DTC → PLINK → VCF → conform-gt → Beagle → merged VCF."""
+    """Full imputation pipeline: DTC → PLINK → VCF → Beagle → merged VCF."""
     debug(f"Processing {genome_path.name}...")
 
     # Step 1: DTC → PLINK
@@ -434,8 +374,8 @@ def impute_genome(
     vcf_path = work_dir / f"{sample_id}.vcf"
     plink_to_vcf(plink_prefix, vcf_path, deps["plink2"])
 
-    # Step 3: Impute each chromosome (includes conform-gt step)
-    debug("Step 3: Running conform-gt + Beagle imputation per chromosome...")
+    # Step 3: Impute each chromosome
+    debug("Step 3: Running Beagle imputation per chromosome...")
     imputed_vcfs = []
 
     sample_work_dir = work_dir / sample_id
@@ -448,12 +388,9 @@ def impute_genome(
             vcf_in=vcf_path,
             vcf_out=chrom_vcf,
             beagle_jar=beagle_jar,
-            conform_gt_jar=conform_gt_jar,
             maps_dir=maps_dir,
             chrom=chrom,
             java=deps["java"],
-            bcftools=deps["bcftools"],
-            work_dir=sample_work_dir,
         )
         imputed_vcfs.append(chrom_vcf)
 
@@ -550,7 +487,6 @@ def main() -> None:
     # Setup Beagle resources
     debug("Setting up Beagle imputation pipeline...")
     beagle_jar = ensure_beagle()
-    conform_gt_jar = ensure_conform_gt()
     maps_dir = ensure_genetic_maps()
 
     # Prepare directories
@@ -573,7 +509,7 @@ def main() -> None:
 
         # Impute the genome
         imputed_vcf = impute_genome(
-            genome_path, sample_id, deps, beagle_jar, conform_gt_jar, maps_dir, work_dir
+            genome_path, sample_id, deps, beagle_jar, maps_dir, work_dir
         )
 
         # Score with each PGS
