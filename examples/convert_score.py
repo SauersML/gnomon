@@ -335,6 +335,12 @@ def ensure_concatenated_reference_panel() -> Path:
             *chrom_vcfs,
         ])
         run([bcftools, "index", "-t", concat_vcf])
+
+        # Delete individual chromosome VCFs to save disk space
+        debug("Cleaning up individual chromosome VCFs...")
+        for vcf in chrom_vcfs:
+            vcf.unlink(missing_ok=True)
+            vcf.with_suffix(".gz.tbi").unlink(missing_ok=True)
     else:
         # Fallback: just use chromosome 1 as representative panel
         debug("bcftools not available, using chromosome 1 as reference panel")
