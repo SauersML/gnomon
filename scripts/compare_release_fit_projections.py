@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from xgboost import XGBClassifier
 SAMPLE_POPULATION_MAPPING_URL = (
     "https://raw.githubusercontent.com/SauersML/genomic_pca/refs/heads/main/data/sample_population_mapping.tsv"
 )
+_DISALLOWED_PATTERN = re.compile(r"nan|unk|unknown|other|others|na|none")
 
 
 @dataclass
@@ -286,8 +288,7 @@ def _normalize_subpop(value: object) -> str | None:
     if not text:
         return None
     lowered = text.lower()
-    disallowed = ("nan", "unk", "unknown", "other", "others", "na", "none")
-    if any(token in lowered for token in disallowed):
+    if _DISALLOWED_PATTERN.search(lowered):
         return None
     return text
 
