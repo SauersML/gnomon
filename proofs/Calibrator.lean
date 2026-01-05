@@ -886,11 +886,11 @@ lemma rawOptimal_implies_orthogonality
           apply Integrable.sub hY_int
           apply Integrable.add (integrable_const a)
           exact hP_int.const_mul b
-        -- The core argument: from optimality and integral linearity
-        -- E[(Y - pred)²] ≤ E[(Y - pred - ε)²] = E[(resid - ε)²]
-        --                = E[resid²] - 2ε·E[resid] + ε²
-        -- So: 0 ≤ -2ε·E[resid] + ε²
-        sorry
+        -- From h_opt_ineq and h_pred_diff, we get:
+        -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
+        -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
+        -- Therefore: 0 ≤ -2ε∫resid + ε²
+        sorry -- Integral linearity expansion
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
