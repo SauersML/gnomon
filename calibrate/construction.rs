@@ -26,30 +26,6 @@ pub enum PenaltyRepresentation {
 }
 
 impl PenaltyRepresentation {
-    fn frobenius_norm(&self) -> f64 {
-        match self {
-            PenaltyRepresentation::Dense(matrix) => {
-                matrix.iter().map(|&x| x * x).sum::<f64>().sqrt()
-            }
-            PenaltyRepresentation::Banded { bands, offsets } => {
-                let mut sum = 0.0;
-                for (band, &offset) in bands.iter().zip(offsets.iter()) {
-                    if offset < 0 {
-                        continue;
-                    }
-                    let weight = if offset == 0 { 1.0 } else { 2.0 };
-                    sum += weight * band.iter().map(|&x| x * x).sum::<f64>();
-                }
-                sum.sqrt()
-            }
-            PenaltyRepresentation::Kronecker { left, right } => {
-                let left_norm = left.iter().map(|&x| x * x).sum::<f64>().sqrt();
-                let right_norm = right.iter().map(|&x| x * x).sum::<f64>().sqrt();
-                left_norm * right_norm
-            }
-        }
-    }
-
     fn block_dimension(&self) -> usize {
         match self {
             PenaltyRepresentation::Dense(matrix) => matrix.nrows(),
@@ -713,10 +689,6 @@ impl DifferencePenalty {
         self.dense
             .get_or_init(|| self.representation.to_block_dense())
     }
-
-    fn frobenius_norm(&self) -> f64 {
-        self.representation.frobenius_norm()
-    }
 }
 
 struct DifferencePenaltyCache {
@@ -1361,7 +1333,7 @@ pub fn build_design_and_penalty_matrices(
         None
     };
 
-    for (pc_idx, pc_config) in config.pc_configs.iter().enumerate() {
+    for (pc_idx, _) in config.pc_configs.iter().enumerate() {
         if pc_idx >= layout.interaction_block_idx.len() {
             break;
         }
@@ -1384,87 +1356,9 @@ pub fn build_design_and_penalty_matrices(
                 });
             }
             InteractionPenaltyKind::Anisotropic => {
-                if block.penalty_indices.len() != 3 {
-                    return Err(EstimationError::LayoutError(format!(
-                        "Interaction block {} should have exactly 3 penalty indices in anisotropic mode, found {}",
-                        block.term_name,
-                        block.penalty_indices.len()
-                    )));
-                }
-
-                let pgs_cols = pgs_int_ncols;
-                let pc_cols = pc_int_ncols[pc_idx];
-                if col_range.len() != pgs_cols * pc_cols {
-                    return Err(EstimationError::LayoutError(format!(
-                        "Interaction block f(PGS,{}) expects {} columns ({}×{}), but layout provided {}",
-                        pc_config.name,
-                        pgs_cols * pc_cols,
-                        pgs_cols,
-                        pc_cols,
-                        col_range.len()
-                    )));
-                }
-
-                let s_pgs_penalty = s_pgs_interaction
-                    .as_ref()
-                    .expect("PGS penalty matrix missing in anisotropic mode");
-                let i_pgs = i_pgs_interaction
-                    .as_ref()
-                    .expect("PGS identity matrix missing in anisotropic mode");
-                let s_pc_penalty = diff_penalty_cache.get(pc_cols, config.penalty_order)?;
-                let i_pc = Array2::<f64>::eye(pc_cols);
-
-                let pc_null_projector = pc_null_projectors[pc_idx]
-                    .as_ref()
-                    .ok_or_else(|| {
-                        EstimationError::LayoutError(format!(
-                            "PC {} is missing a null-space projector required for anisotropic interaction penalties",
-                            pc_config.name
-                        ))
-                    })?;
-
-                let nf1 = (s_pgs_penalty.frobenius_norm() * (pc_cols as f64).sqrt()).max(1e-12);
-                let nf2 = (s_pc_penalty.frobenius_norm() * (pgs_cols as f64).sqrt()).max(1e-12);
-                let nf3_raw =
-                    frobenius_norm(&pgs_null_projector) * frobenius_norm(pc_null_projector);
-                if nf3_raw <= 1e-12 {
-                    return Err(EstimationError::LayoutError(format!(
-                        "Null interaction penalty for f(PGS,{}) is numerically zero; purity projection should leave a non-trivial null⊗null span",
-                        pc_config.name
-                    )));
-                }
-                let nf3 = nf3_raw.max(1e-12);
-
-                let penalty_idx_pgs = block.penalty_indices[0];
-                let penalty_idx_pc = block.penalty_indices[1];
-                let penalty_idx_null = block.penalty_indices[2];
-
-                let s_pgs_left = s_pgs_penalty.as_dense().clone();
-                let s_pc_right = s_pc_penalty.as_dense().clone();
-                let kron_pgs = PenaltyMatrix {
-                    col_range: col_range.clone(),
-                    representation: PenaltyRepresentation::Kronecker {
-                        left: s_pgs_left * (1.0 / nf1),
-                        right: i_pc.clone(),
-                    },
-                };
-                let kron_pc = PenaltyMatrix {
-                    col_range: col_range.clone(),
-                    representation: PenaltyRepresentation::Kronecker {
-                        left: i_pgs.clone(),
-                        right: s_pc_right * (1.0 / nf2),
-                    },
-                };
-                let kron_null = PenaltyMatrix {
-                    col_range: col_range.clone(),
-                    representation: PenaltyRepresentation::Kronecker {
-                        left: pgs_null_projector.clone() * (1.0 / nf3),
-                        right: pc_null_projector.clone(),
-                    },
-                };
-                s_list[penalty_idx_pgs] = Some(kron_pgs);
-                s_list[penalty_idx_pc] = Some(kron_pc);
-                s_list[penalty_idx_null] = Some(kron_null);
+                // Defer penalty construction until AFTER orthogonalization (alpha) is computed.
+                // This allows us to project the penalties into the constrained space
+                // and scale them correctly as recommended by Wood (2017).
             }
         }
     }
@@ -1817,14 +1711,223 @@ pub fn build_design_and_penalty_matrices(
 
             // Save Alpha for use at prediction time
             let interaction_key = format!("f(PGS,{})", pc_name);
-            interaction_orth_alpha.insert(interaction_key.clone(), alpha);
+            interaction_orth_alpha.insert(interaction_key.clone(), alpha.clone());
 
             // Store zero means for backward compatibility
             let zeros = Array1::zeros(tensor_orth.ncols());
             interaction_centering_means.insert(interaction_key.clone(), zeros);
 
             // Assign the orthogonalized tensor block to design matrix (no extra centering)
-            x_matrix.slice_mut(s![.., col_range]).assign(&tensor_orth);
+            x_matrix.slice_mut(s![.., col_range.clone()]).assign(&tensor_orth);
+
+            // Anisotropic penalty construction (projected)
+            // This is done HERE because we need `alpha` to project the penalty matrices
+            if let InteractionPenaltyKind::Anisotropic = config.interaction_penalty {
+                // Ensure layout validity
+                if tensor_block.penalty_indices.len() != 3 {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Interaction block {} should have exactly 3 penalty indices in anisotropic mode, found {}",
+                        tensor_block.term_name,
+                        tensor_block.penalty_indices.len()
+                    )));
+                }
+
+                let pgs_cols = pgs_int_ncols;
+                let pc_cols = pc_int_ncols[pc_idx];
+                if col_range.len() != pgs_cols * pc_cols {
+                    return Err(EstimationError::LayoutError(format!(
+                        "Interaction block f(PGS,{}) expects {} columns ({}×{}), but layout provided {}",
+                        pc_name,
+                        pgs_cols * pc_cols,
+                        pgs_cols,
+                        pc_cols,
+                        col_range.len()
+                    )));
+                }
+
+                // Retrieve raw marginal penalties
+                let s_pgs_penalty = s_pgs_interaction
+                    .as_ref()
+                    .expect("PGS penalty matrix missing in anisotropic mode");
+                let i_pgs = i_pgs_interaction
+                    .as_ref()
+                    .expect("PGS identity matrix missing in anisotropic mode");
+                let s_pc_penalty = diff_penalty_cache.get(pc_cols, config.penalty_order)?;
+                let i_pc = Array2::<f64>::eye(pc_cols);
+
+                let pc_null_projector = pc_null_projectors[pc_idx]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EstimationError::LayoutError(format!(
+                            "PC {} is missing a null-space projector required for anisotropic interaction penalties",
+                            pc_name
+                        ))
+                    })?;
+
+                // Project penalties into the constrained space defined by Alpha
+                // S_proj = S_raw + Correction
+                // where Correction accounts for the projection T -> T - M*alpha
+
+                // Helper to extract rows of alpha corresponding to specific main effect blocks
+                // M layout: [Intercept (1) | Sex (opt) | PGS_main | PC_null (opt) | PC_range]
+                // We reconstruct the offsets used during M matrix construction.
+                let mut current_offset = 0;
+                // Intercept
+                current_offset += 1;
+                // Sex
+                if let Some(sex_col) = sex_main.as_ref() {
+                    current_offset += sex_col.ncols();
+                }
+                // PGS_main
+                let pgs_main_offset = current_offset;
+                let pgs_main_len = pgs_main.ncols();
+                current_offset += pgs_main_len;
+                // PC_null
+                let pc_null_len = pc_null.as_ref().map_or(0, |z| z.ncols());
+                let pc_null_offset = current_offset;
+                current_offset += pc_null_len;
+                // PC_range
+                let pc_range_len = pc_range.ncols();
+                let pc_range_offset = current_offset;
+
+                // Extract Alpha blocks
+                let alpha_pgs = alpha.slice(s![pgs_main_offset..pgs_main_offset + pgs_main_len, ..]);
+                let alpha_pc_null = alpha.slice(s![pc_null_offset..pc_null_offset + pc_null_len, ..]);
+                let alpha_pc_range =
+                    alpha.slice(s![pc_range_offset..pc_range_offset + pc_range_len, ..]);
+
+                // 1. PGS Wiggle Penalty (S_pgs_raw = S_pgs ⊗ I_pc)
+                // The projection subtracts M_pgs * alpha_pgs.
+                // M_pgs corresponds to the PGS main effect basis.
+                // The penalty energy of M_pgs is calculated using s_pgs_main (already computed).
+                // Correction = alpha_pgs^T * (s_pgs_main * N_pc) * alpha_pgs
+                // (Note: N_pc scaling assumes sum-of-squares over PC index in the tensor metric)
+                let s_pgs_raw = kronecker_product(s_pgs_penalty.as_dense(), &i_pc);
+                let mut s_pgs_proj = s_pgs_raw; // Start with raw
+
+                // Add main effect penalty contribution (Wood 2017, Section 5.6.3)
+                // The penalty on the constrained basis is Z^T S_unc Z where Z is the
+                // sum-to-zero transform. We compute this from the unconstrained penalty.
+                let s_pgs_main_unc = diff_penalty_cache
+                    .get(pgs_main_basis_unc.ncols(), config.penalty_order)?
+                    .as_dense()
+                    .clone();
+                let s_pgs_main_constrained = pgs_z_transform
+                    .t()
+                    .dot(&s_pgs_main_unc.dot(&pgs_z_transform));
+
+                // Scale by N_pc (number of columns in the PC dimension of the tensor)
+                let s_pgs_main_scaled = s_pgs_main_constrained.clone() * (pc_cols as f64);
+                let correction_pgs = alpha_pgs.t().dot(&s_pgs_main_scaled.dot(&alpha_pgs));
+
+                // Subtract cross terms: alpha^T S_cross + S_cross^T alpha
+                // S_cross connects M_pgs (coeff i) with T (coeffs i,j).
+                // Effectively S_cross ~ S_pgs ⊗ 1^T.
+                // We need to connect the CONSTRAINED main basis (rows of S_cross)
+                // to the UNCONSTRAINED tensor components (cols of S_cross).
+                // So S_cross_row = (Z^T S_unc) ⊗ ones(1, pc_cols).
+                let s_pgs_main_mixed = pgs_z_transform.t().dot(&s_pgs_main_unc);
+                let ones_pc = Array2::<f64>::ones((1, pc_cols));
+                let s_cross_row = kronecker_product(&s_pgs_main_mixed, &ones_pc); // (k_pgs_con, k_pgs_unc * k_pc)
+                let term2 = alpha_pgs.t().dot(&s_cross_row); // (k_tensor, k_tensor)
+
+                // S_proj = S_raw + alpha^T S_main alpha - (alpha^T S_cross + S_cross^T alpha)
+                // Note: The function is f = T*beta - M*alpha*beta.
+                // J(f) = beta^T S_T beta + beta^T alpha^T S_M alpha beta - 2 beta^T S_TM alpha beta.
+                // S_TM corresponds to <T, M>_J.
+                // Our S_cross_row corresponds to <M, T>_J (rows are M, cols are T).
+                // So term2 is alpha^T <M, T>_J. Matches.
+                s_pgs_proj = s_pgs_proj + correction_pgs - term2.clone() - term2.t();
+
+                // 2. PC Wiggle Penalty (S_pc_raw = I_pgs ⊗ S_pc)
+                // Similar logic for PC parts.
+                // M components: PC_null (if any) and PC_range.
+                // We need the penalty on the full PC main effect basis (null + range).
+                // Reconstruct PC main penalty on (null|range) basis.
+                let s_pc_main_unc = diff_penalty_cache
+                    .get(pc_unconstrained_bases_main[pc_idx].ncols(), config.penalty_order)?
+                    .as_dense()
+                    .clone();
+                // Transform to (Null | Range) space
+                // Z_total = [Z_null | Z_range]
+                let z_null = &pc_null_transforms[pc_name];
+                let z_range = range_transforms.get(pc_name).unwrap();
+                let z_total = if z_null.ncols() > 0 {
+                    let mut combined = Array2::zeros((z_null.nrows(), z_null.ncols() + z_range.ncols()));
+                    combined.slice_mut(s![.., 0..z_null.ncols()]).assign(z_null);
+                    combined
+                        .slice_mut(s![.., z_null.ncols()..])
+                        .assign(z_range);
+                    combined
+                } else {
+                    z_range.clone()
+                };
+
+                let s_pc_main_constrained = z_total.t().dot(&s_pc_main_unc.dot(&z_total));
+                // Note: s_pc_main_constrained should be block diagonal with 0 on null part and I on range part (if whitened).
+                // But we use the actual calculated values to be exact.
+
+                // Combine alpha rows for PC (null and range)
+                let alpha_pc_len = pc_null_len + pc_range_len;
+                let mut alpha_pc = Array2::zeros((alpha_pc_len, alpha.ncols()));
+                if pc_null_len > 0 {
+                    alpha_pc
+                        .slice_mut(s![0..pc_null_len, ..])
+                        .assign(&alpha_pc_null);
+                }
+                alpha_pc
+                    .slice_mut(s![pc_null_len.., ..])
+                    .assign(&alpha_pc_range);
+
+                let s_pc_raw = kronecker_product(i_pgs, s_pc_penalty.as_dense());
+                let mut s_pc_proj = s_pc_raw;
+
+                // Correction terms
+                let s_pc_main_scaled = s_pc_main_constrained.clone() * (pgs_cols as f64);
+                let correction_pc = alpha_pc.t().dot(&s_pc_main_scaled.dot(&alpha_pc));
+
+                // Cross term: S_cross ~ 1^T ⊗ S_pc
+                let ones_pgs = Array2::<f64>::ones((1, pgs_cols)); // (1, k_pgs)
+
+                // Similar to PGS, we need rectangular cross term connecting constrained Main to unconstrained Tensor
+                let s_pc_main_mixed = z_total.t().dot(&s_pc_main_unc);
+                let s_cross_row_pc = kronecker_product(&ones_pgs, &s_pc_main_mixed);
+                let term2_pc = alpha_pc.t().dot(&s_cross_row_pc);
+
+                s_pc_proj = s_pc_proj + correction_pc - term2_pc.clone() - term2_pc.t();
+
+                // 3. Null Penalty (S_null_raw)
+                // The null penalty targets interaction terms (p*z). Main effects have zero
+                // energy in this metric since they lack interaction structure. Therefore
+                // projection has no effect: S_null_proj ≈ S_null_raw. We use the raw form.
+                let s_null_raw = kronecker_product(
+                    &pgs_null_projector,
+                    pc_null_projector,
+                );
+
+                // Calculate norms on the PROJECTED matrices
+                let nf1 = frobenius_norm(&s_pgs_proj).max(1e-12);
+                let nf2 = frobenius_norm(&s_pc_proj).max(1e-12);
+                let nf3 = frobenius_norm(&s_null_raw).max(1e-12);
+
+                let penalty_idx_pgs = tensor_block.penalty_indices[0];
+                let penalty_idx_pc = tensor_block.penalty_indices[1];
+                let penalty_idx_null = tensor_block.penalty_indices[2];
+
+                // Store scaled projected matrices (Dense)
+                s_list[penalty_idx_pgs] = Some(PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Dense(s_pgs_proj * (1.0 / nf1)),
+                });
+                s_list[penalty_idx_pc] = Some(PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Dense(s_pc_proj * (1.0 / nf2)),
+                });
+                s_list[penalty_idx_null] = Some(PenaltyMatrix {
+                    col_range: col_range.clone(),
+                    representation: PenaltyRepresentation::Dense(s_null_raw * (1.0 / nf3)),
+                });
+            }
         }
     }
 
@@ -3559,6 +3662,46 @@ mod tests {
             x.ncols() >= block.col_range.end,
             "design does not contain expected interaction columns"
         );
+    }
+
+    #[test]
+    fn anisotropic_penalty_is_projected_dense() {
+        // Verify that Anisotropic penalties are now stored as Dense matrices (due to projection)
+        // and are not just simple Kronecker products (which have structural zeros).
+        let n = 40;
+        let data = make_toy_data(n);
+        let config = cfg_with_interaction(InteractionPenaltyKind::Anisotropic);
+
+        // Capture penalty_structs (10th element) instead of s_list (2nd element which is dense matrices)
+        let (_, _, layout, _, _, _, _, _, _, penalty_structs) =
+            build_design_and_penalty_matrices(&data, &config)
+                .expect("construction success");
+
+        let ib = layout.interaction_block_idx[0];
+        let block = &layout.penalty_map[ib];
+        let p_pgs_idx = block.penalty_indices[0];
+
+        let penalty_matrix = &penalty_structs[p_pgs_idx];
+
+        // It must be Dense now because of the projection alpha^T S alpha
+        if let PenaltyRepresentation::Dense(mat) = &penalty_matrix.representation {
+            // Check that it is not diagonal/banded-like (simple Kronecker of band matrices often has sparsity).
+            // A projected penalty usually becomes fully dense.
+            let non_zeros = mat.iter().filter(|&&x| x.abs() > 1e-12).count();
+            let total = mat.len();
+            let density = non_zeros as f64 / total as f64;
+
+            // Raw penalty is S_pgs (banded) x I (diag). This is sparse.
+            // Projected penalty adds alpha^T S alpha which mixes everything.
+            // So density should be high.
+            assert!(
+                density > 0.1,
+                "Projected Anisotropic penalty should be relatively dense (got density {:.3})",
+                density
+            );
+        } else {
+            panic!("Anisotropic penalty should be Dense after projection, but found another representation");
+        }
     }
 
     #[test]
