@@ -267,12 +267,11 @@ def ensure_reference_panel(chrom: str, bcftools: Path) -> Path:
         url = f"{REF_PANEL_BASE}/chr{chrom}.1kg.phase3.v5a.vcf.gz"
         download(url, raw_file)
 
-    # Filter to SNPs only (remove structural variants and symbolic alleles)
-    debug(f"Filtering chr{chrom} reference to SNPs only...")
+    # Filter out symbolic alleles (<INS>, <DEL>, etc.) but keep SNPs and indels
+    debug(f"Filtering chr{chrom} reference (removing symbolic alleles)...")
     result = subprocess.run([
         bcftools, "view",
-        "-v", "snps",  # SNPs only
-        "-e", 'ALT="<*>"',  # Exclude symbolic alleles like <INS>, <DEL>, <CN*>
+        "-e", 'ALT~"<"',  # Exclude symbolic alleles like <INS>, <DEL>, <CN*>
         "-O", "z",
         "-o", filtered_file,
         raw_file,
