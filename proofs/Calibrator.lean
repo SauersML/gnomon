@@ -879,10 +879,18 @@ lemma rawOptimal_implies_orthogonality
         -- Expand: ∫(resid - ε)² = ∫resid² - 2ε∫resid + ε² (integral linearity)
         -- So: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
         -- Rearranging: 0 ≤ -2ε∫resid + ε² = ε² - 2ε∫resid
-        --
-        -- The proof requires: simp with h_pred_diff, then integral linearity lemmas
-        -- (integral_sub, integral_add, integral_mul_left) and ∫1 = 1 for prob measure.
-        sorry -- Integral expansion and linearity (infrastructure-heavy)
+        -- Derive integrability of residual from hypotheses
+        have h_resid_int : Integrable residual μ := by
+          unfold residual
+          simp only [hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+        -- The core argument: from optimality and integral linearity
+        -- E[(Y - pred)²] ≤ E[(Y - pred - ε)²] = E[(resid - ε)²]
+        --                = E[resid²] - 2ε·E[resid] + ε²
+        -- So: 0 ≤ -2ε·E[resid] + ε²
+        sorry
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -1542,7 +1550,10 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     -- This is < 0 when H is positive definite and β₁ ≠ β₂
     --
     -- Using the positive definiteness of (1/n)XᵀX (from h_rank) and λS ≥ 0:
-    sorry
+    -- The algebraic expansion shows f(mid) - (1-t)f(β₁) - tf(β₂) = -t(1-t)(β₁-β₂)ᵀH(β₁-β₂)
+    -- where H = (1/n)XᵀX + λS is positive definite by full rank of X.
+    -- This requires `transpose_mul_self_posDef` and the quadratic form inequality.
+    sorry -- Requires algebraic expansion and PD quadratic form lemma
 
 /-- The penalized loss is coercive: L(β) → ∞ as ‖β‖ → ∞.
 
@@ -1887,9 +1898,8 @@ lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
       have h_zero : a^2 + (1-b)^2 = 0 := by linarith
       have ha : a^2 = 0 := by nlinarith [sq_nonneg (1-b)]
       have hb : (1-b)^2 = 0 := by nlinarith [sq_nonneg a]
-      simp [sq_eq_zero_iff] at ha
-      simp [sq_eq_zero_iff, sub_eq_zero] at hb
-      exact ⟨ha, hb.symm⟩
+      simp only [sq_eq_zero_iff] at ha hb
+      exact ⟨ha, by linarith⟩
     · rintro ⟨rfl, rfl⟩
       simp
 
@@ -2340,7 +2350,13 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
   -- h_opt2: ∀ m, expectedSquaredError dgp2 (linearPredictor model1) ≤ expectedSquaredError dgp2 (linearPredictor m)
   -- By uniqueness of condexp, linearPredictor model1 = E[Y|P,C] for each DGP
   -- But they have the same measure, so this implies the trueExpectations are equal.
-  sorry
+  --
+  -- Gap: IsBayesOptimalInClass only says model is optimal *within* the GAM class.
+  -- To conclude linearPredictor = trueExpectation, we need:
+  -- 1. The GAM class is rich enough to represent trueExpectation exactly, OR
+  -- 2. Both trueExpectations have the same L² projection onto the GAM class
+  -- This requires formalizing representability of the model class.
+  sorry -- Requires model class representability assumption
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
@@ -3334,7 +3350,15 @@ theorem optimal_solution_transforms
   -- The reparameterization theorem shows predictions match under coordinate change.
   -- Since β_opt minimizes f and β'_opt minimizes the transformed f', and QQᵀ = I,
   -- we have X·β_opt = (XQ)·β'_opt when β'_opt = Qᵀβ_opt.
-  sorry
+  --
+  -- Key insight: By reparameterization_equivalence, if β_opt minimizes the original
+  -- objective, then Q⁻¹·β_opt = Qᵀ·β_opt minimizes the transformed objective.
+  -- By uniqueness (strict convexity), β'_opt = Qᵀ·β_opt.
+  -- Then X·β_opt = X·(Q·Qᵀ·β_opt) = (X·Q)·(Qᵀ·β_opt) = (X·Q)·β'_opt.
+  --
+  -- However, this requires uniqueness which needs strict convexity assumptions
+  -- not present in the current statement. Adding sorry to indicate this gap.
+  sorry -- Requires uniqueness from strict convexity (not assumed)
 
 end WoodReparameterization
 
