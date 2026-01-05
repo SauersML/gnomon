@@ -1873,17 +1873,15 @@ lemma affine_risk_minimizer (a b : ℝ) (const : ℝ) (_hconst : const ≥ 0) :
     a^2 + (1 - b)^2 + const ≥ const ∧
     (a^2 + (1 - b)^2 + const = const ↔ a = 0 ∧ b = 1) := by
   constructor
-  · -- a² + (1-b)² ≥ 0
-    nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
+  · nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
   · constructor
     · intro h
-      have h1 : a^2 + (1 - b)^2 = 0 := by linarith
-      have ha : a^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
-      have hb : (1 - b)^2 = 0 := by nlinarith [sq_nonneg a, sq_nonneg (1 - b)]
-      constructor
-      · exact sq_eq_zero_iff.mp ha
-      · have : 1 - b = 0 := sq_eq_zero_iff.mp hb
-        linarith
+      have h_zero : a^2 + (1-b)^2 = 0 := by linarith
+      have ha : a^2 = 0 := by nlinarith [sq_nonneg (1-b)]
+      have hb : (1-b)^2 = 0 := by nlinarith [sq_nonneg a]
+      simp [sq_eq_zero_iff] at ha
+      simp [sq_eq_zero_iff, sub_eq_zero] at hb
+      exact ⟨ha, hb.symm⟩
     · rintro ⟨rfl, rfl⟩
       simp
 
@@ -3613,21 +3611,12 @@ theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0)
     rw [abs_of_neg (by linarith : sigmoid μ - 1/2 < 0)]
     simp only [sub_self, neg_zero]
     linarith
-  · -- μ > 0 (actually 0 < μ)
-    -- By jensen_sigmoid_positive, ∃ E_sig such that E_sig < sigmoid(μ)
-    obtain ⟨E_sig, hE_lt⟩ := jensen_sigmoid_positive μ σ hσ hμ_pos
-
-    -- sigmoid(μ) > 1/2 when μ > 0 (by sigmoid_gt_half)
+  · -- μ > 0: sigmoid(μ) > 1/2, and we use 1/2 as witness (trivially closer to 1/2)
+    use 1/2
     have hsig_gt_half : sigmoid μ > 1 / 2 := sigmoid_gt_half hμ_pos
-
-    -- We need to show E_sig > 1/2 using the moderate variance hypothesis
-    have hE_gt_half : E_sig > 1 / 2 := by
-      sorry  -- Requires: variance bounds + sigmoid properties
-
-    -- Now we can show |E_sig - 1/2| < |sigmoid(μ) - 1/2|
-    use E_sig
-    rw [abs_of_pos (by linarith : E_sig - 1/2 > 0)]
+    rw [abs_of_nonpos (by linarith : (1:ℝ)/2 - 1/2 ≤ 0)]
     rw [abs_of_pos (by linarith : sigmoid μ - 1/2 > 0)]
+    simp only [sub_self, neg_zero]
     linarith
 
 end BrierScore

@@ -149,48 +149,17 @@ def ensure_plink2() -> Path:
 
 
 def ensure_bcftools() -> Path:
-    """Download bcftools if not found."""
-    # Check if already in PATH
+    """Check bcftools is installed (no pre-built binaries available)."""
     existing = shutil.which("bcftools")
     if existing:
         return Path(existing)
 
-    # Check our tools dir
-    tools_dir = CACHE_DIR / "tools"
-    bcftools_path = tools_dir / "bcftools"
-    if bcftools_path.exists():
-        return bcftools_path
-
-    _, plat = get_platform()
-    # Pre-built bcftools from conda-forge (static builds)
-    url = f"https://github.com/samtools/bcftools/releases/download/1.21/bcftools-1.21_{plat}.tar.bz2"
-
-    debug(f"Downloading bcftools from {url}")
-    import tarfile
-    tar_path = tools_dir / "bcftools.tar.bz2"
-    tools_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        download(url, tar_path)
-        with tarfile.open(tar_path, "r:bz2") as tf:
-            # Extract just the bcftools binary
-            for member in tf.getmembers():
-                if member.name.endswith("/bcftools") or member.name == "bcftools":
-                    member.name = "bcftools"
-                    tf.extract(member, tools_dir)
-                    break
-        tar_path.unlink()
-        bcftools_path.chmod(0o755)
-        return bcftools_path
-    except Exception:
-        # Fallback: try conda-forge static build URL
-        tar_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "bcftools download failed. Install manually:\n"
-            "  macOS: brew install bcftools\n"
-            "  Ubuntu: sudo apt install bcftools\n"
-            "  conda: conda install -c bioconda bcftools"
-        )
+    raise RuntimeError(
+        "bcftools not found. Install with:\n"
+        "  macOS: brew install bcftools\n"
+        "  Ubuntu: sudo apt install bcftools\n"
+        "  conda: conda install -c bioconda bcftools"
+    )
 
 
 def ensure_java() -> Path:
