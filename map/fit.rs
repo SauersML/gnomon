@@ -4,9 +4,18 @@ use super::progress::{
 use super::variant_filter::VariantKey;
 use core::cmp::{Ordering, min};
 use core::fmt;
+use core::marker::PhantomData;
 use dyn_stack::{MemBuffer, MemStack, StackReq};
+use faer::col::Col;
 use faer::linalg::matmul::matmul;
+use faer::linalg::matmul::triangular as triangular_matmul;
 use faer::linalg::solvers::{Llt as FaerLlt, Solve as FaerSolve};
+use faer::linalg::{temp_mat_scratch, temp_mat_uninit};
+use faer::mat::AsMatMut;
+use faer::matrix_free::LinOp;
+use faer::matrix_free::eigen::{
+    PartialEigenInfo, PartialEigenParams, partial_eigen_scratch, partial_self_adjoint_eigen,
+};
 use faer::prelude::ReborrowMut;
 use faer::{
     Accum, ColMut, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, set_global_parallelism,
@@ -19,16 +28,22 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::Infallible;
 use std::error::Error;
 use std::ops::Range;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::simd::num::SimdFloat;
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use sysinfo::System;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
+const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
+const MAX_PARTIAL_COMPONENTS: usize = 512;
+const FALLBACK_GRAM_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_GRAM_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_LD_WINDOW: usize = 51;
 const DEFAULT_LD_RIDGE: f64 = 1.0e-3;
 const MIN_LD_WEIGHT: f64 = 1.0e-6;
@@ -44,6 +59,63 @@ fn select_top_k_desc(ordering: &mut [(usize, f64)], k: usize) -> usize {
     ordering.select_nth_unstable_by(mid - 1, desc);
     ordering[..mid].sort_by(desc);
     mid
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CovarianceComputationMode {
+    Dense,
+    Partial,
+}
+
+fn default_gram_budget_usize() -> usize {
+    default_gram_budget_bytes()
+        .min(usize::MAX as u64)
+        .try_into()
+        .unwrap()
+}
+
+fn default_gram_budget_bytes() -> u64 {
+    static DEFAULT_GRAM_BUDGET_BYTES: OnceLock<u64> = OnceLock::new();
+
+    *DEFAULT_GRAM_BUDGET_BYTES.get_or_init(compute_default_gram_budget_bytes)
+}
+
+fn compute_default_gram_budget_bytes() -> u64 {
+    match detect_total_memory_bytes() {
+        Some(total) if total > 0 => {
+            let target = total.saturating_mul(3) / 4;
+            target.max(MIN_GRAM_BUDGET_BYTES).min(total).max(1)
+        }
+        _ => FALLBACK_GRAM_BUDGET_BYTES,
+    }
+}
+
+fn detect_total_memory_bytes() -> Option<u64> {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    system.total_memory().checked_mul(1024)
+}
+
+fn gram_matrix_budget_bytes() -> usize {
+    match std::env::var("GNOMON_GRAM_BUDGET_BYTES") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) if parsed == 0 => usize::MAX,
+            Ok(parsed) => (parsed.min(usize::MAX as u64)) as usize,
+            Err(_) => default_gram_budget_usize(),
+        },
+        Err(_) => default_gram_budget_usize(),
+    }
+}
+
+fn gram_matrix_size_bytes(n: usize) -> Option<usize> {
+    n.checked_mul(n)?.checked_mul(core::mem::size_of::<f64>())
+}
+
+fn covariance_computation_mode(n: usize, budget_bytes: usize) -> CovarianceComputationMode {
+    match gram_matrix_size_bytes(n) {
+        Some(bytes) if bytes <= budget_bytes => CovarianceComputationMode::Dense,
+        _ => CovarianceComputationMode::Partial,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -288,6 +360,9 @@ impl Drop for ParallelismGuard {
         set_global_parallelism(self.previous);
     }
 }
+
+#[derive(Debug)]
+struct OperatorError;
 
 pub trait VariantBlockSource {
     type Error;
@@ -1251,9 +1326,13 @@ impl HwePcaModel {
 
         let ld_config = options.resolved_ld(ld_hint)?;
 
-        // Use the new fused implementation for both LD and non-LD paths
-        let (scaler, observed_variants, covariance, ld_weights) = if let Some(ld_cfg) = ld_config {
-            // With LD weights - compute them first, then use fused pass
+        // Determine whether to use dense or matrix-free path based on memory budget
+        let gram_budget = gram_matrix_budget_bytes();
+        let gram_bytes = gram_matrix_size_bytes(n_samples);
+        let gram_mode = covariance_computation_mode(n_samples, gram_budget);
+
+        // Compute LD weights first if requested (applies to both paths)
+        let (ld_weights_arc, ld_weights) = if let Some(ld_cfg) = ld_config {
             let (_, _, ld_weights_computed) = compute_stats_and_ld_weights(
                 source,
                 block_capacity,
@@ -1262,75 +1341,118 @@ impl HwePcaModel {
                 progress,
                 par,
             )?;
-
-            let ld_weights_arc = Arc::<[f64]>::from(ld_weights_computed.weights.clone().into_boxed_slice());
-
-            // Reset source for fused pass
-            source.reset().map_err(|err| HwePcaError::Source(Box::new(err)))?;
-
-            let (scaler, observed, covariance) = compute_stats_and_covariance_blockwise(
-                source,
-                block_capacity,
-                par,
-                progress,
-                n_variants_hint,
-                Some(ld_weights_arc),
-            )?;
-
-            (scaler, observed, covariance, Some(ld_weights_computed))
+            let ld_arc = Arc::<[f64]>::from(ld_weights_computed.weights.clone().into_boxed_slice());
+            (Some(ld_arc), Some(ld_weights_computed))
         } else {
-            // No LD weights - use fused pass directly
-            let (scaler, observed, covariance) = compute_stats_and_covariance_blockwise(
-                source,
-                block_capacity,
-                par,
-                progress,
-                n_variants_hint,
-                None,
-            )?;
-
-            (scaler, observed, covariance, None)
+            (None, None)
         };
 
-        let ld_weights_arc = ld_weights
-            .as_ref()
-            .map(|ld| Arc::<[f64]>::from(ld.weights.clone().into_boxed_slice()));
+        // Reset source after LD computation
+        if ld_weights_arc.is_some() {
+            source.reset().map_err(|err| HwePcaError::Source(Box::new(err)))?;
+        }
 
-        // Now decompose the covariance matrix using faer's self-adjoint eigendecomposition
-        let decomposition = {
-            let eig_result = covariance.as_ref().self_adjoint_eigen(Side::Upper);
-            match eig_result {
-                Ok(eig) => {
-                    let eigenvalues_diag = eig.S();
-                    let eigenvectors_mat = eig.U();
-                    let n_eig = eigenvalues_diag.dim();
+        // Choose between dense and matrix-free paths
+        let (decomposition, scaler, observed_variants) = match gram_mode {
+            CovarianceComputationMode::Dense => {
+                // PATH A: Dense - Use fused pass for small/medium datasets
+                let (scaler, observed_variants, covariance) = compute_stats_and_covariance_blockwise(
+                    source,
+                    block_capacity,
+                    par,
+                    progress,
+                    n_variants_hint,
+                    ld_weights_arc.clone(),
+                )?;
 
-                    // Create index-value pairs for sorting (descending by eigenvalue)
-                    let mut indexed_values: Vec<(usize, f64)> = (0..n_eig)
-                        .map(|i| (i, eigenvalues_diag[i]))
-                        .collect();
+                // Decompose the dense covariance matrix
+                let eig_result = covariance.as_ref().self_adjoint_eigen(Side::Upper);
+                let decomposition = match eig_result {
+                    Ok(eig) => {
+                        let eigenvalues_diag = eig.S();
+                        let eigenvectors_mat = eig.U();
+                        let n_eig = eigenvalues_diag.dim();
 
-                    // Select top k components by eigenvalue magnitude
-                    let kept = select_top_k_desc(&mut indexed_values, target_components);
+                        // Create index-value pairs for sorting (descending by eigenvalue)
+                        let mut indexed_values: Vec<(usize, f64)> = (0..n_eig)
+                            .map(|i| (i, eigenvalues_diag[i]))
+                            .collect();
 
-                    // Extract selected values and vectors
-                    let selected_values: Vec<f64> = indexed_values[..kept].iter().map(|(_, val)| *val).collect();
-                    let selected_vectors = Mat::from_fn(eigenvectors_mat.nrows(), kept, |row, col| {
-                        let original_col = indexed_values[col].0;
-                        eigenvectors_mat[(row, original_col)]
-                    });
+                        // Select top k components by eigenvalue magnitude
+                        let kept = select_top_k_desc(&mut indexed_values, target_components);
 
-                    Eigenpairs {
-                        values: selected_values,
-                        vectors: selected_vectors,
+                        // Extract selected values and vectors
+                        let selected_values: Vec<f64> = indexed_values[..kept].iter().map(|(_, val)| *val).collect();
+                        let selected_vectors = Mat::from_fn(eigenvectors_mat.nrows(), kept, |row, col| {
+                            let original_col = indexed_values[col].0;
+                            eigenvectors_mat[(row, original_col)]
+                        });
+
+                        Eigenpairs {
+                            values: selected_values,
+                            vectors: selected_vectors,
+                        }
                     }
-                }
-                Err(e) => {
-                    return Err(HwePcaError::Eigen(format!(
-                        "Eigendecomposition failed: {:?}",
-                        e
-                    )));
-                }
+                    Err(e) => {
+                        return Err(HwePcaError::Eigen(format!(
+                            "Eigendecomposition failed: {:?}",
+                            e
+                        )));
+                    }
+                };
+
+                (decomposition, scaler, observed_variants)
+            }
+            CovarianceComputationMode::Partial => {
+                // PATH B: Matrix-free - For biobank-scale datasets
+                log::info!(
+                    "Using matrix-free eigensolver (Gram matrix would require {} bytes)",
+                    gram_bytes.unwrap_or(usize::MAX)
+                );
+
+                // First pass: compute statistics only
+                progress.on_stage_start(FitProgressStage::AlleleStatistics, n_variants_hint);
+                let stats_progress = StageProgressHandle::new(Arc::clone(progress), FitProgressStage::AlleleStatistics);
+                let (scaler, observed_variants) = compute_variant_statistics(
+                    source,
+                    block_capacity,
+                    par,
+                    stats_progress,
+                    n_variants_hint,
+                )?;
+
+                // Setup matrix-free operator
+                let operator = StandardizedCovarianceOp::new(
+                    source,
+                    block_capacity,
+                    n_variants_hint,
+                    observed_variants,
+                    scaler.clone(),
+                    ld_weights_arc.clone(),
+                );
+
+                // Progress tracking for Gram matrix computation
+                progress.on_stage_start(FitProgressStage::GramMatrix, n_variants_hint);
+                let gram_progress_handle = Some(StageProgressHandle::new(
+                    Arc::clone(progress),
+                    FitProgressStage::GramMatrix,
+                ));
+
+                // Run matrix-free eigensolver
+                let decomposition_result = compute_covariance_eigenpairs(
+                    &operator,
+                    par,
+                    CovarianceComputationMode::Partial,
+                    target_components,
+                    gram_progress_handle.as_ref(),
+                );
+
+                // Extract source and scaler from operator (ownership handled)
+                operator.into_parts();
+
+                progress.on_stage_finish(FitProgressStage::GramMatrix);
+
+                (decomposition_result?, scaler, observed_variants)
             }
         };
 
@@ -1342,7 +1464,7 @@ impl HwePcaModel {
             ));
         }
 
-        log::info!("Observed {} variants during fused pass", variant_count);
+        log::info!("Observed {} variants during PCA fitting", variant_count);
 
         if decomposition.values.is_empty() {
             return Err(HwePcaError::Eigen(
@@ -1480,9 +1602,1050 @@ impl HwePcaModel {
     }
 }
 
+struct StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    apply_lock: Mutex<()>,
+    source: Mutex<&'a mut S>,
+    n_samples: usize,
+    n_variants_hint: usize,
+    block_capacity: usize,
+    scale: f64,
+    scaler: HweScaler,
+    observed_variants: usize,
+    ld_weights: Option<Arc<[f64]>>,
+    error: Mutex<Option<HwePcaError>>,
+    marker: PhantomData<P>,
+}
+
+impl<'a, S, P> StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    fn new(
+        source: &'a mut S,
+        block_capacity: usize,
+        n_variants_hint: usize,
+        observed_variants: usize,
+        scaler: HweScaler,
+        ld_weights: Option<Arc<[f64]>>,
+    ) -> Self {
+        let n_samples = source.n_samples();
+        let scale = 1.0 / ((n_samples - 1) as f64);
+        Self {
+            apply_lock: Mutex::new(()),
+            source: Mutex::new(source),
+            n_samples,
+            n_variants_hint,
+            block_capacity,
+            scale,
+            scaler,
+            observed_variants,
+            ld_weights,
+            error: Mutex::new(None),
+            marker: PhantomData,
+        }
+    }
+
+    fn into_parts(self) -> (&'a mut S, HweScaler) {
+        let Self {
+            apply_lock: _,
+            source,
+            n_samples: _,
+            n_variants_hint: _,
+            block_capacity: _,
+            scale: _,
+            scaler,
+            observed_variants: _,
+            ld_weights: _,
+            error: _,
+            marker: _,
+        } = self;
+        (
+            source
+                .into_inner()
+                .expect("covariance source mutex poisoned during teardown"),
+            scaler,
+        )
+    }
+
+    fn take_error(&self) -> Option<HwePcaError> {
+        self.error
+            .lock()
+            .expect("operator error mutex poisoned")
+            .take()
+    }
+
+    fn fail_invalid(&self, msg: &'static str) -> ! {
+        self.record_error(HwePcaError::InvalidInput(msg))
+    }
+
+    fn record_error(&self, err: HwePcaError) -> ! {
+        let mut slot = self.error.lock().expect("operator error mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+        std::panic::panic_any(OperatorError);
+    }
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn standardize_block_in_place(
+        &self,
+        mut block: MatMut<'_, f64>,
+        variant_range: Range<usize>,
+        par: Par,
+    ) {
+        self.scaler
+            .standardize_block(block.as_mut(), variant_range.clone(), par);
+        if let Some(weights) = &self.ld_weights {
+            apply_ld_weights(block, variant_range, weights);
+        }
+    }
+}
+
+impl<'a, S, P> fmt::Debug for StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StandardizedCovarianceOp")
+            .field("n_samples", &self.n_samples)
+            .field("n_variants_hint", &self.n_variants_hint)
+            .field("observed_variants", &self.observed_variants)
+            .field("block_capacity", &self.block_capacity)
+            .finish()
+    }
+}
+
+impl<'a, S, P> LinOp<f64> for StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    fn apply_scratch(&self, rhs_ncols: usize, _: Par) -> StackReq {
+        let block_len = self.n_samples * self.block_capacity;
+        let block_req = StackReq::new::<f64>(block_len);
+        let proj_req = temp_mat_scratch::<f64>(self.block_capacity, rhs_ncols);
+        block_req.and(block_req).and(proj_req)
+    }
+
+    fn nrows(&self) -> usize {
+        self.n_samples
+    }
+
+    fn ncols(&self) -> usize {
+        self.n_samples
+    }
+
+    fn apply(
+        &self,
+        mut out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        let apply_guard = self
+            .apply_lock
+            .lock()
+            .expect("covariance apply lock poisoned");
+        let _ = &apply_guard;
+
+        debug_assert_eq!(out.nrows(), self.n_samples);
+        debug_assert_eq!(rhs.nrows(), self.n_samples);
+
+        out.fill(0.0);
+
+        if rhs.ncols() == 0 {
+            return;
+        }
+
+        let block_len = self.n_samples * self.block_capacity;
+        let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        // SAFETY: `buf0_uninit` was allocated with capacity `block_len` and lives
+        // for the entire scope of `apply`. We immediately coerce it to
+        // `&mut [f64]` so it can be passed to `VariantBlockSource::next_block_into`,
+        // which writes the first `n_samples * filled` entries before we read
+        // them. Any remaining slots stay uninitialized but are never observed.
+        let buf0 = unsafe {
+            std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len)
+        };
+        let (buf1_uninit, stack) = stack.make_uninit::<f64>(block_len);
+        // SAFETY: Same reasoning as above for `buf0`; the buffer lives long
+        // enough and only the initialized prefix is observed.
+        let buf1 = unsafe {
+            std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len)
+        };
+        let mut buffer_slices = [buf0, buf1];
+        let [first_slice, second_slice] = &mut buffer_slices;
+        let buffer_ptrs = [
+            SendPtr(first_slice.as_mut_ptr()),
+            SendPtr(second_slice.as_mut_ptr()),
+        ];
+
+        let (mut proj_uninit, _) =
+            // SAFETY: `temp_mat_uninit` returns an uninitialized matrix view that
+            // must not be read before being written. We only use it as the
+            // destination of GEMM calls with `Accum::Replace`, which overwrite
+            // every element touched. The stack capacity was sized by
+            // `apply_scratch`, so the backing storage stays live for the entire
+            // duration of `apply`.
+            unsafe { temp_mat_uninit::<f64, _, _>(self.block_capacity, rhs.ncols(), stack) };
+        let mut proj_storage = proj_uninit.as_mat_mut();
+
+        enum PrefetchMessage {
+            Data {
+                id: usize,
+                filled: usize,
+                start: usize,
+            },
+            End,
+            Error(HwePcaError),
+        }
+
+        let buffer_count = buffer_ptrs.len();
+        let (filled_tx, filled_rx) = sync_channel::<PrefetchMessage>(buffer_count);
+        let (free_tx, free_rx) = sync_channel::<usize>(buffer_count);
+        for id in 0..buffer_count {
+            free_tx.send(id).expect("failed to seed prefetch buffers");
+        }
+
+        let source_mutex = &self.source;
+        let n_samples = self.n_samples;
+        let block_capacity = self.block_capacity;
+        let observed_total = self.observed_variants;
+        let scale = self.scale;
+        let block_len = block_len;
+
+        let processed = thread::scope(|scope| {
+            let buffer_ptrs_prefetch = buffer_ptrs;
+            let filled_sender = filled_tx;
+            let free_receiver = free_rx;
+            scope.spawn(move || {
+                if let Err(err) = {
+                    let mut guard = source_mutex
+                        .lock()
+                        .expect("covariance source mutex poisoned");
+                    let source: &mut S = &mut guard;
+                    source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
+                } {
+                    let _ = filled_sender.send(PrefetchMessage::Error(err));
+                    return;
+                }
+
+                let mut start = 0usize;
+                while let Ok(id) = free_receiver.recv() {
+                    // SAFETY: The raw pointer originated from a mutable slice
+                    // in `buffer_slices` and remains valid until the scoped
+                    // thread exits. Channel ownership ensures each `id`
+                    // corresponds to a single borrower, so the reconstructed
+                    // slice is never aliased. Only the prefix written by
+                    // `next_block_into` is observed after this call.
+                    let buffer_slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
+                    };
+                    let filled_res = {
+                        let mut guard = source_mutex
+                            .lock()
+                            .expect("covariance source mutex poisoned");
+                        let source: &mut S = &mut guard;
+                        source.next_block_into(block_capacity, buffer_slice)
+                    };
+
+                    match filled_res {
+                        Ok(filled) => {
+                            if filled == 0 {
+                                let _ = filled_sender.send(PrefetchMessage::End);
+                                break;
+                            }
+
+                            let _ = filled_sender.send(PrefetchMessage::Data { id, filled, start });
+                            start += filled;
+                        }
+                        Err(err) => {
+                            let _ = filled_sender
+                                .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let free_sender = free_tx;
+            let mut processed = 0usize;
+            let buffer_ptrs_compute = buffer_ptrs;
+            while let Ok(message) = filled_rx.recv() {
+                match message {
+                    PrefetchMessage::Data { id, filled, start } => {
+                        if start != processed {
+                            self.fail_invalid("prefetch produced out-of-order variant ranges");
+                        }
+                        if start + filled > observed_total {
+                            self.fail_invalid(
+                                "VariantBlockSource returned more variants than observed",
+                            );
+                        }
+
+                        // SAFETY: `buffer_ptrs_compute[id]` points to the same
+                        // uniquely-owned buffer handed to the prefetch thread.
+                        // Scoped threads guarantee the memory outlives this use,
+                        // channel coordination prevents concurrent access, and we
+                        // restrict all reads to the portion initialized by the
+                        // source.
+                        let block_slice = unsafe {
+                            std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
+                        };
+                        let mut block = MatMut::from_column_major_slice_mut(
+                            &mut block_slice[..n_samples * filled],
+                            n_samples,
+                            filled,
+                        );
+                        let variant_range = start..start + filled;
+                        self.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+
+                        let mut proj_block = proj_storage.rb_mut().subrows_mut(0, filled);
+
+                        matmul(
+                            proj_block.as_mut(),
+                            Accum::Replace,
+                            block.as_ref().transpose(),
+                            rhs,
+                            1.0,
+                            par,
+                        );
+
+                        matmul(
+                            out.rb_mut(),
+                            Accum::Add,
+                            block.as_ref(),
+                            proj_block.as_ref(),
+                            scale,
+                            par,
+                        );
+
+                        processed = start + filled;
+
+                        if free_sender.send(id).is_err() {
+                            break;
+                        }
+                    }
+                    PrefetchMessage::End => {
+                        break;
+                    }
+                    PrefetchMessage::Error(err) => {
+                        self.record_error(err);
+                    }
+                }
+            }
+
+            processed
+        });
+
+        if processed != self.observed_variants {
+            self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
+        }
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        self.apply(out, rhs, par, stack);
+    }
+}
+
 struct Eigenpairs {
     values: Vec<f64>,
     vectors: Mat<f64>,
+}
+
+#[derive(Debug)]
+struct DenseSymmetricOp<'a> {
+    matrix: MatRef<'a, f64>,
+}
+
+impl<'a> LinOp<f64> for DenseSymmetricOp<'a> {
+    fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        let _ = (rhs_ncols, par);
+        StackReq::empty()
+    }
+
+    fn nrows(&self) -> usize {
+        self.matrix.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.matrix.ncols()
+    }
+
+    fn apply(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, _: &mut MemStack) {
+        matmul(out.rb_mut(), Accum::Replace, self.matrix, rhs, 1.0, par);
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        self.apply(out, rhs, par, stack);
+    }
+}
+
+fn compute_covariance_eigenpairs<S, P>(
+    operator: &StandardizedCovarianceOp<'_, S, P>,
+    par: Par,
+    mode: CovarianceComputationMode,
+    top_k: usize,
+    progress: Option<&StageProgressHandle<P>>,
+) -> Result<Eigenpairs, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let n = operator.n_samples();
+    if n == 0 || top_k == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(0, 0),
+        });
+    }
+
+    let max_rank = n.saturating_sub(1);
+    if max_rank == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    let desired = top_k.min(max_rank);
+    if desired == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    if matches!(mode, CovarianceComputationMode::Dense) {
+        return compute_covariance_eigenpairs_dense(operator, par, desired, progress);
+    }
+
+    let upper_target = max_rank.min(MAX_PARTIAL_COMPONENTS.max(desired));
+    if upper_target == 0 {
+        return compute_covariance_eigenpairs_dense(operator, par, desired, progress);
+    }
+
+    let normalization = (n as f64).sqrt();
+    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+    let mut target = desired.min(upper_target).max(1);
+
+    loop {
+        let params = partial_solver_params(n, target);
+        let (info, eigvals, eigvecs) = run_partial_eigensolver(operator, target, par, &v0, params)?;
+
+        let n_converged = info.n_converged_eigen.min(target);
+
+        let positive = eigvals
+            .iter()
+            .take(n_converged)
+            .filter(|&&v| v > EIGENVALUE_EPSILON)
+            .count();
+
+        if positive == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        let keep = positive.min(desired);
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
+            }
+        }
+
+        if keep >= desired || target >= upper_target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        let next_target = (target * 2).min(upper_target);
+        if next_target == target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        target = next_target;
+    }
+}
+
+fn compute_covariance_eigenpairs_dense<S, P>(
+    operator: &StandardizedCovarianceOp<'_, S, P>,
+    par: Par,
+    top_k: usize,
+    progress: Option<&StageProgressHandle<P>>,
+) -> Result<Eigenpairs, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let mut covariance = accumulate_covariance_matrix(operator, par, progress)?;
+    let n = covariance.nrows();
+
+    if n == 0 || top_k == 0 {
+        return Ok(Eigenpairs {
+            values: Vec::new(),
+            vectors: Mat::zeros(n, 0),
+        });
+    }
+
+    if n <= DENSE_EIGEN_FALLBACK_THRESHOLD || top_k + 8 >= n {
+        let eig = covariance.self_adjoint_eigen(Side::Lower).map_err(|err| {
+            HwePcaError::Eigen(format!("dense eigendecomposition failed: {err:?}"))
+        })?;
+
+        let diag = eig.S();
+        let basis = eig.U();
+
+        let positive = (0..n).filter(|&i| diag[i] > EIGENVALUE_EPSILON).count();
+
+        let keep = positive.min(top_k);
+        if keep == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        let mut ordering = Vec::with_capacity(n);
+        for idx in 0..n {
+            ordering.push((idx, diag[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = basis[(row, src_idx)];
+            }
+        }
+
+        return Ok(Eigenpairs { values, vectors });
+    }
+
+    mirror_lower_to_upper(&mut covariance);
+
+    let gram = covariance.as_ref();
+    let upper_target = n.min(MAX_PARTIAL_COMPONENTS.max(top_k));
+    let mut target = top_k.min(upper_target).max(1);
+
+    let normalization = (n as f64).sqrt();
+    let v0 = Col::from_fn(n, |_| 1.0 / normalization);
+    let op = DenseSymmetricOp { matrix: gram };
+
+    loop {
+        let params = partial_solver_params(n, target);
+        let mut eigvecs = Mat::zeros(n, target);
+        let mut eigvals = vec![0.0f64; target];
+        let scratch = partial_eigen_scratch(&op, params.max_dim, par, params);
+        let mut mem = MemBuffer::new(scratch);
+        let info = {
+            let stack = MemStack::new(&mut mem);
+            partial_self_adjoint_eigen(
+                eigvecs.as_mut(),
+                &mut eigvals,
+                &op,
+                v0.as_ref(),
+                f64::EPSILON * 128.0,
+                par,
+                stack,
+                params,
+            )
+        };
+
+        let n_converged = info.n_converged_eigen.min(target);
+
+        let positive = (0..n_converged)
+            .filter(|&i| eigvals[i] > EIGENVALUE_EPSILON)
+            .count();
+
+        if positive == 0 {
+            return Ok(Eigenpairs {
+                values: Vec::new(),
+                vectors: Mat::zeros(n, 0),
+            });
+        }
+
+        let keep = positive.min(top_k);
+        let mut ordering = Vec::with_capacity(n_converged);
+        for idx in 0..n_converged {
+            ordering.push((idx, eigvals[idx]));
+        }
+
+        let mid = select_top_k_desc(&mut ordering, keep);
+
+        let mut values = Vec::with_capacity(mid);
+        let mut vectors = Mat::zeros(n, mid);
+        for (out_idx, (src_idx, value)) in ordering[..mid].iter().copied().enumerate() {
+            values.push(value);
+            for row in 0..n {
+                vectors[(row, out_idx)] = eigvecs[(row, src_idx)];
+            }
+        }
+
+        if keep >= top_k || target >= upper_target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        let next_target = (target * 2).min(upper_target);
+        if next_target == target {
+            return Ok(Eigenpairs { values, vectors });
+        }
+
+        target = next_target;
+    }
+}
+
+fn accumulate_covariance_matrix<S, P>(
+    operator: &StandardizedCovarianceOp<'_, S, P>,
+    par: Par,
+    progress: Option<&StageProgressHandle<P>>,
+) -> Result<Mat<f64>, HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let apply_guard = operator
+        .apply_lock
+        .lock()
+        .expect("covariance apply lock poisoned");
+    let _ = &apply_guard;
+
+    let n_samples = operator.n_samples;
+    let cross_products = Mat::zeros(n_samples, n_samples);
+
+    if n_samples == 0 {
+        return Ok(Mat::zeros(n_samples, n_samples));
+    }
+
+    let block_capacity = operator.block_capacity;
+    let block_len = n_samples * block_capacity;
+    let buffer_req = StackReq::new::<f64>(block_len).and(StackReq::new::<f64>(block_len));
+    let mut mem = MemBuffer::new(buffer_req);
+    let stack = MemStack::new(&mut mem);
+    let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
+    let buf0 =
+        // SAFETY: `buf0_uninit` owns `block_len` contiguous `f64`s that live for
+        // the duration of this function. We immediately coerce it to
+        // `&mut [f64]` so `VariantBlockSource::next_block_into` can stream data
+        // into the prefix `n_samples * filled`. That prefix is fully written
+        // before being read; any trailing capacity remains untouched.
+        unsafe { std::slice::from_raw_parts_mut(buf0_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let (buf1_uninit, _) = stack.make_uninit::<f64>(block_len);
+    let buf1 =
+        // SAFETY: Mirroring the reasoning for `buf0`, the allocation stays alive
+        // for the entire call and only the written prefix is ever read.
+        unsafe { std::slice::from_raw_parts_mut(buf1_uninit.as_mut_ptr() as *mut f64, block_len) };
+    let mut buffer_slices = [buf0, buf1];
+    let [first_slice, second_slice] = &mut buffer_slices;
+    let buffer_ptrs = [
+        SendPtr(first_slice.as_mut_ptr()),
+        SendPtr(second_slice.as_mut_ptr()),
+    ];
+
+    enum PrefetchMessage {
+        Data {
+            id: usize,
+            filled: usize,
+            start: usize,
+        },
+        End,
+        Error(HwePcaError),
+    }
+
+    let buffer_count = buffer_ptrs.len();
+    let (filled_tx, filled_rx) = sync_channel::<PrefetchMessage>(buffer_count);
+    let (free_tx, free_rx) = sync_channel::<usize>(buffer_count);
+    for id in 0..buffer_count {
+        free_tx.send(id).expect("failed to seed covariance buffers");
+    }
+
+    let source_mutex = &operator.source;
+    let n_variants_hint = operator.n_variants_hint;
+    let observed_total = operator.observed_variants;
+    let block_capacity = operator.block_capacity;
+    let block_len = block_len;
+    let progress_handle = progress;
+
+    let result = thread::scope(|scope| {
+        let buffer_ptrs_prefetch = buffer_ptrs;
+        let filled_sender = filled_tx;
+        let free_receiver = free_rx;
+        let progress_handle = progress_handle;
+        scope.spawn(move || {
+            if let Err(err) = {
+                let mut guard = source_mutex
+                    .lock()
+                    .expect("covariance source mutex poisoned");
+                let source: &mut S = &mut guard;
+                source.reset().map_err(|e| HwePcaError::Source(Box::new(e)))
+            } {
+                let _ = filled_sender.send(PrefetchMessage::Error(err));
+                return;
+            }
+
+            let mut start = 0usize;
+            let mut used_source_progress = false;
+            while let Ok(id) = free_receiver.recv() {
+                // SAFETY: The pointer was derived from a uniquely-owned slice
+                // stored in `buffer_slices` and the scoped threads ensure the
+                // backing storage outlives this reconstruction. Channel
+                // ownership gives each `id` a single borrower, and we only
+                // consume the prefix populated by `next_block_into`.
+                let buffer_slice = unsafe {
+                    std::slice::from_raw_parts_mut(buffer_ptrs_prefetch[id].0, block_len)
+                };
+                let (filled_res, progress_bytes, progress_variants) = {
+                    let mut guard = source_mutex
+                        .lock()
+                        .expect("covariance source mutex poisoned");
+                    let source: &mut S = &mut guard;
+                    let filled = source.next_block_into(block_capacity, buffer_slice);
+                    let bytes = source.progress_bytes();
+                    let variants = source.progress_variants();
+                    (filled, bytes, variants)
+                };
+
+                match filled_res {
+                    Ok(filled) => {
+                        if filled == 0 {
+                            if let Some(handle) = progress_handle {
+                                if let Some((_, Some(total))) = progress_variants {
+                                    handle.set_total(total);
+                                } else if !used_source_progress {
+                                    handle.set_total(start);
+                                }
+                            }
+                            let _ = filled_sender.send(PrefetchMessage::End);
+                            break;
+                        }
+
+                        if let Some(handle) = progress_handle {
+                            if let Some((bytes_read, total_bytes)) = progress_bytes {
+                                used_source_progress = true;
+                                handle.advance_bytes(bytes_read, total_bytes);
+                            } else if let Some((work_done, total_work)) = progress_variants {
+                                used_source_progress = true;
+                                if let Some(total) = total_work {
+                                    handle.set_total(total);
+                                } else if n_variants_hint > 0 {
+                                    handle.estimate(n_variants_hint);
+                                }
+                                handle.advance(work_done);
+                            } else {
+                                handle.advance(start + filled);
+                            }
+                        }
+
+                        let _ = filled_sender.send(PrefetchMessage::Data { id, filled, start });
+                        start += filled;
+                    }
+                    Err(err) => {
+                        let _ = filled_sender
+                            .send(PrefetchMessage::Error(HwePcaError::Source(Box::new(err))));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let free_sender = free_tx;
+        let mut processed = 0usize;
+        let buffer_ptrs_compute = buffer_ptrs;
+        let mut cross_products = cross_products;
+        while let Ok(message) = filled_rx.recv() {
+            match message {
+                PrefetchMessage::Data { id, filled, start } => {
+                    if start != processed {
+                        return Err(HwePcaError::InvalidInput(
+                            "prefetch produced out-of-order variant ranges",
+                        ));
+                    }
+                    if start + filled > observed_total {
+                        return Err(HwePcaError::InvalidInput(
+                            "VariantBlockSource returned more variants than observed",
+                        ));
+                    }
+
+                    // SAFETY: Each `id` corresponds to a single buffer whose
+                    // ownership is passed through the channel. The pointer
+                    // remains valid and uniquely borrowed until we send `id`
+                    // back on the free list, and all reads stay within the
+                    // initialized prefix.
+                    let block_slice = unsafe {
+                        std::slice::from_raw_parts_mut(buffer_ptrs_compute[id].0, block_len)
+                    };
+                    let mut block = MatMut::from_column_major_slice_mut(
+                        &mut block_slice[..n_samples * filled],
+                        n_samples,
+                        filled,
+                    );
+                    let variant_range = start..start + filled;
+                    operator.standardize_block_in_place(block.rb_mut(), variant_range.clone(), par);
+
+                    let block_ref = block.as_ref();
+
+                    triangular_matmul::matmul(
+                        cross_products.as_mut(),
+                        triangular_matmul::BlockStructure::TriangularLower,
+                        Accum::Add,
+                        block_ref,
+                        triangular_matmul::BlockStructure::Rectangular,
+                        block_ref.transpose(),
+                        triangular_matmul::BlockStructure::Rectangular,
+                        1.0,
+                        par,
+                    );
+
+                    processed = start + filled;
+
+                    if free_sender.send(id).is_err() {
+                        break;
+                    }
+                }
+                PrefetchMessage::End => {
+                    break;
+                }
+                PrefetchMessage::Error(err) => {
+                    return Err(err);
+                }
+            }
+        }
+
+        if processed == 0 {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource yielded no variants",
+            ));
+        }
+
+        if processed != observed_total {
+            return Err(HwePcaError::InvalidInput(
+                "VariantBlockSource terminated early during covariance accumulation",
+            ));
+        }
+
+        Ok(cross_products)
+    });
+
+    let mut covariance = result?;
+    let scale = operator.scale;
+    for col in 0..n_samples {
+        for row in col..n_samples {
+            covariance[(row, col)] *= scale;
+        }
+    }
+    mirror_lower_to_upper(&mut covariance);
+
+    Ok(covariance)
+}
+
+fn mirror_lower_to_upper(matrix: &mut Mat<f64>) {
+    debug_assert_eq!(matrix.nrows(), matrix.ncols());
+    let n = matrix.nrows();
+    for col in 0..n {
+        for row in 0..col {
+            let value = matrix[(col, row)];
+            matrix[(row, col)] = value;
+        }
+    }
+}
+
+fn partial_solver_params(n: usize, target: usize) -> PartialEigenParams {
+    let mut params = PartialEigenParams::default();
+    let max_available = n.saturating_sub(1);
+    params.min_dim = target.max(64).min(max_available); // let Faer clamp internally
+    params.max_dim = (2 * target).max(128).min(max_available);
+    if params.max_dim < params.min_dim {
+        params.max_dim = params.min_dim;
+    }
+    params.max_restarts = 2048;
+    params
+}
+
+fn run_partial_eigensolver<S, P>(
+    operator: &StandardizedCovarianceOp<'_, S, P>,
+    target: usize,
+    par: Par,
+    v0: &Col<f64>,
+    params: PartialEigenParams,
+) -> Result<(PartialEigenInfo, Vec<f64>, Mat<f64>), HwePcaError>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    let n = operator.n_samples();
+    let mut eigvecs = Mat::zeros(n, target);
+    let mut eigvals = vec![0.0f64; target];
+
+    // The partial eigensolver can increase its working subspace dimension up to
+    // `params.max_dim` during restarts. The scratch allocator must therefore be
+    // sized for the worst-case dimension rather than the requested target, or
+    // faer's internal workspace requests will overflow the provided buffer.
+    let scratch = partial_eigen_scratch(operator, params.max_dim, par, params);
+    let mut mem = MemBuffer::new(scratch);
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let stack = MemStack::new(&mut mem);
+        partial_self_adjoint_eigen(
+            eigvecs.as_mut(),
+            &mut eigvals,
+            operator,
+            v0.as_ref(),
+            f64::EPSILON * 128.0,
+            par,
+            stack,
+            params,
+        )
+    }));
+
+    let info = match result {
+        Ok(info) => info,
+        Err(payload) => {
+            if payload.downcast_ref::<OperatorError>().is_some() {
+                let err = operator.take_error().unwrap_or_else(|| {
+                    HwePcaError::Eigen(
+                        "matrix-free eigensolver aborted with an internal error".into(),
+                    )
+                });
+                return Err(err);
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+
+    if let Some(err) = operator.take_error() {
+        return Err(err);
+    }
+
+    Ok((info, eigvals, eigvecs))
+}
+
+fn compute_variant_statistics<S, P>(
+    source: &mut S,
+    block_capacity: usize,
+    par: Par,
+    progress: StageProgressHandle<P>,
+    n_variants_hint: usize,
+) -> Result<(HweScaler, usize), HwePcaError>
+where
+    S: VariantBlockSource,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync,
+{
+    let n_samples = source.n_samples();
+    let mut stats = VariantStatsCache::new(block_capacity, n_variants_hint);
+    let mut block_storage = vec![0.0f64; n_samples * block_capacity];
+
+    source
+        .reset()
+        .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+    let mut processed = 0usize;
+    let mut used_source_progress = false;
+
+    loop {
+        let filled = source
+            .next_block_into(block_capacity, &mut block_storage[..])
+            .map_err(|err| HwePcaError::Source(Box::new(err)))?;
+
+        if filled == 0 {
+            break;
+        }
+
+        if processed + filled < processed {
+            return Err(HwePcaError::InvalidInput(
+                "variant count overflow during statistics computation",
+            ));
+        }
+
+        let block = MatMut::from_column_major_slice_mut(
+            &mut block_storage[..n_samples * filled],
+            n_samples,
+            filled,
+        );
+
+        let variant_range = processed..processed + filled;
+        stats.ensure_statistics(block.as_ref(), variant_range.clone(), par);
+
+        processed += filled;
+
+        if let Some((bytes_read, total_bytes)) = source.progress_bytes() {
+            used_source_progress = true;
+            progress.advance_bytes(bytes_read, total_bytes);
+        } else if let Some((work_done, total_work)) = source.progress_variants() {
+            used_source_progress = true;
+            if let Some(total) = total_work {
+                progress.set_total(total);
+            } else if n_variants_hint > 0 {
+                progress.estimate(n_variants_hint);
+            }
+            progress.advance(work_done);
+        } else {
+            progress.advance(processed);
+        }
+    }
+
+    if processed == 0 {
+        progress.finish();
+        return Err(HwePcaError::InvalidInput(
+            "VariantBlockSource yielded no variants",
+        ));
+    }
+
+    if let Some((_, Some(total))) = source.progress_variants() {
+        progress.set_total(total);
+    } else if !used_source_progress {
+        progress.set_total(processed);
+    }
+
+    stats.finalize();
+    let scaler = stats
+        .into_scaler()
+        .expect("finalized statistics must produce a scaler");
+    progress.finish();
+
+    Ok((scaler, processed))
 }
 
 
@@ -1581,8 +2744,7 @@ where
         let scales = &stats.scales[variant_range.clone()];
         standardize_block_impl(block.rb_mut(), freqs, scales, par);
 
-        // Step 3: Apply LD weights if available
-        // TODO: For proper LD weight computation across blocks, implement sliding window buffer
+        // Step 3: Apply LD weights if available (pre-computed weights used directly)
         if let Some(weights) = &ld_weights {
             apply_ld_weights(block.rb_mut(), variant_range.clone(), weights);
         }
