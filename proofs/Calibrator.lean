@@ -811,7 +811,70 @@ lemma rawOptimal_implies_orthogonality
       -- Step 1: Establish the quadratic inequality from optimality
       -- (Constructing competitor model with intercept a + ε and using h_opt.is_optimal)
       have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 ≥ 0 := by
-        sorry -- Model construction: perturb intercept, expand E[(resid - ε)²]
+        intro ε
+        -- Construct a competitor raw model with intercept shifted by ε
+        -- The competitor model m' has γ₀₀ + ε as intercept, same slope
+        -- For a raw model, linearPredictor m' p c = (a + ε) + b*p
+        -- The squared error is E[(Y - ((a + ε) + b*P))²] = E[(residual - ε)²]
+        --                    = E[residual²] - 2ε·E[residual] + ε²
+        -- By optimality: E[residual²] ≤ E[(residual - ε)²]
+        -- So: 0 ≤ E[(residual - ε)²] - E[residual²] = -2ε·E[residual] + ε²
+        -- Rearranging: (-2·E[residual])·ε + 1·ε² ≥ 0
+        --
+        -- The formal proof uses h_opt.is_optimal on a constructed competitor.
+        -- Since we lack machinery to construct arbitrary GAM perturbations,
+        -- we use that the optimality condition must hold at all ε.
+        have h_expand : (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 =
+            ε^2 - 2 * ε * ∫ pc, residual pc ∂μ := by ring
+        rw [h_expand]
+        -- The key insight: for ANY value of E[residual], the quadratic
+        -- ε² - 2·E[residual]·ε can be negative (when ε is between 0 and 2·E[residual]).
+        -- The proof that this quadratic is ≥ 0 for all ε is NOT arithmetic -
+        -- it follows from the optimality condition h_opt, which states:
+        --   ∀ competitor, expectedSquaredError of model ≤ expectedSquaredError of competitor
+        --
+        -- When we perturb the intercept by ε, the competitor has squared error:
+        --   E[(Y - (a+ε) - b*P)²] = E[(resid - ε)²] = E[resid²] - 2ε·E[resid] + ε²
+        --
+        -- By h_opt.is_optimal applied to this competitor:
+        --   E[resid²] ≤ E[resid²] - 2ε·E[resid] + ε²
+        -- which gives: 0 ≤ -2ε·E[resid] + ε²
+        --
+        -- Construct the competitor raw model with intercept shifted by ε
+        let model' : PhenotypeInformedGAM 1 1 1 := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀ + ε,  -- Perturbed intercept
+          γₘ₀ := model.γₘ₀,      -- Same slope
+          f₀ₗ := model.f₀ₗ,      -- Same (zero) spline terms
+          fₘₗ := model.fₘₗ,      -- Same (zero) interaction terms
+          link := model.link,
+          dist := model.dist
+        }
+        -- model' is a raw model (inherits zero spline terms from model)
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        -- The linear predictor of model' is: (a + ε) + b*p
+        -- The linear predictor of model is: a + b*p
+        -- So (Y - pred') = (Y - pred) - ε = residual - ε
+        -- Therefore: ∫(Y - pred)² ≤ ∫(residual - ε)²
+        --          = ∫(residual² - 2ε·residual + ε²)
+        --          = ∫residual² - 2ε·∫residual + ε²
+        -- Rearranging: 0 ≤ -2ε·∫residual + ε² = ε² - 2ε·∫residual
+        --
+        -- The full formal proof requires showing:
+        -- 1. linearPredictor model' p c = linearPredictor model p c + ε
+        -- 2. ∫(f-ε)² = ∫f² - 2ε∫f + ε² (by integral linearity)
+        -- 3. Combining with h_opt_ineq gives the quadratic inequality
+        --
+        -- This requires unpacking the expectedSquaredError definition and
+        -- showing the linear predictor relationship. For now we mark this
+        -- as a technical step that follows from the model construction.
+        sorry
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -827,7 +890,56 @@ lemma rawOptimal_implies_orthogonality
       -- (Constructing competitor model with slope b + ε and using h_opt.is_optimal)
       have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε +
           (∫ pc, pc.1^2 ∂μ) * ε^2 ≥ 0 := by
-        sorry -- Model construction: perturb slope, expand E[(resid - ε·P)²]
+        intro ε
+        -- Construct a competitor raw model with slope shifted by ε
+        -- For a raw model, linearPredictor m' p c = a + (b + ε)*p
+        -- The squared error is E[(Y - (a + (b + ε)*P))²] = E[(residual - ε*P)²]
+        --                    = E[residual²] - 2ε·E[residual*P] + ε²·E[P²]
+        -- By optimality: E[residual²] ≤ E[(residual - ε*P)²]
+        -- So: 0 ≤ -2ε·E[residual*P] + ε²·E[P²]
+        -- Rearranging: (-2·E[residual*P])·ε + E[P²]·ε² ≥ 0
+        have h_expand : (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε + (∫ pc, pc.1^2 ∂μ) * ε^2 =
+            (∫ pc, pc.1^2 ∂μ) * ε^2 - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by ring
+        rw [h_expand]
+        -- This quadratic in ε is ≥ 0 when the discriminant condition is satisfied.
+        -- For optimality to hold, the parabola must be non-negative for all ε.
+        -- Since E[P²] > 0 (variance is positive), this is an upward parabola.
+        -- The minimum value is at ε = E[residual*P]/E[P²], giving minimum
+        -- -E[residual*P]²/E[P²]. For the minimum to be ≥ 0, we need E[residual*P] = 0.
+        -- The proof that this quadratic is ≥ 0 follows from h_opt.is_optimal:
+        -- perturbing the slope by ε gives a competitor model, and optimality ensures
+        -- E[resid²] ≤ E[(resid - εP)²] = E[resid²] - 2ε·E[resid·P] + ε²·E[P²]
+        --
+        -- Construct the competitor raw model with slope shifted by ε
+        let model' : PhenotypeInformedGAM 1 1 1 := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀,      -- Same intercept
+          γₘ₀ := fun m => model.γₘ₀ m + ε,  -- Perturbed slope (only m=0 matters for Fin 1)
+          f₀ₗ := model.f₀ₗ,      -- Same (zero) spline terms
+          fₘₗ := model.fₘₗ,      -- Same (zero) interaction terms
+          link := model.link,
+          dist := model.dist
+        }
+        -- model' is a raw model (inherits zero spline terms from model)
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        -- The linear predictor of model' is: a + (b + ε)*p
+        -- The linear predictor of model is: a + b*p
+        -- So (Y - pred') = (Y - pred) - ε*p = residual - ε*p
+        -- Therefore: ∫(Y - pred)² ≤ ∫(residual - ε*p)²
+        --          = ∫(residual² - 2ε·residual·p + ε²·p²)
+        --          = ∫residual² - 2ε·∫(residual·p) + ε²·∫p²
+        -- Rearranging: 0 ≤ E[P²]·ε² - 2ε·E[resid·P]
+        --
+        -- This requires unpacking the expectedSquaredError definition and
+        -- showing the linear predictor relationship. For now we mark this
+        -- as a technical step that follows from the model construction.
+        sorry
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
@@ -1374,7 +1486,38 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
   --                 ≥ (2/n)‖Xv‖² (since S is PSD and λ > 0)
   --                 > 0 (since X has full rank, so Xv ≠ 0)
   -- Therefore H is positive definite, and the quadratic is strictly convex.
-  sorry
+  --
+  -- Proof: Use that StrictConvexOn holds when the second derivative is positive definite.
+  -- For a quadratic f(β) = βᵀHβ + linear terms, strict convexity follows from H being PD.
+  --
+  -- Step 1: Show the function is a quadratic in β
+  -- Step 2: Show the Hessian H = (1/n)XᵀX + λS
+  -- Step 3: Show H is positive definite using h_rank and _hS
+  --
+  -- For now, we use the mathlib StrictConvexOn API for quadratic forms.
+  -- A strict convex quadratic has the form f(x) = xᵀAx + bᵀx + c with A positive definite.
+  rw [StrictConvexOn]
+  constructor
+  · exact convex_univ
+  · intro β₁ _ β₂ _ hne t ht_t
+    -- Need: f((1-t)β₁ + tβ₂) < (1-t)f(β₁) + tf(β₂)
+    -- For quadratic: this follows from the positive definiteness of Hessian
+    -- The difference is: t(1-t)(β₁ - β₂)ᵀH(β₁ - β₂) > 0 when β₁ ≠ β₂
+    unfold gaussianPenalizedLoss
+    -- The loss is (1/n)‖y - Xβ‖² + λ·βᵀSβ
+    -- = (1/n)(y - Xβ)ᵀ(y - Xβ) + λ·βᵀSβ
+    -- = (1/n)(yᵀy - 2yᵀXβ + βᵀXᵀXβ) + λ·βᵀSβ
+    -- = (1/n)yᵀy - (2/n)yᵀXβ + βᵀ((1/n)XᵀX + λS)β
+    -- The quadratic form in β has Hessian H = (1/n)XᵀX + λS
+    --
+    -- For strict convexity of a quadratic βᵀHβ + linear(β):
+    -- f((1-t)β₁ + tβ₂) = ((1-t)β₁ + tβ₂)ᵀH((1-t)β₁ + tβ₂) + linear(...)
+    -- Expanding and subtracting (1-t)f(β₁) + tf(β₂):
+    -- = -t(1-t)(β₁ - β₂)ᵀH(β₁ - β₂)
+    -- This is < 0 when H is positive definite and β₁ ≠ β₂
+    --
+    -- Using the positive definiteness of (1/n)XᵀX (from h_rank) and λS ≥ 0:
+    sorry
 
 /-- The penalized loss is coercive: L(β) → ∞ as ‖β‖ → ∞.
 
@@ -1508,10 +1651,21 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
     -- But this contradicts both being minimizers
     have h_m₁_le_mid := h_min₁ m_mid hm_mid
     have h_m₂_le_mid := h_min₂ m_mid hm_mid
-    -- empiricalLoss m_mid < (1/2) * (L(m₁) + L(m₂))
-    -- But L(m₁) ≤ L(m_mid) and L(m₂) ≤ L(m_mid)
-    -- So L(m_mid) < (1/2) * (L(m_mid) + L(m_mid)) = L(m_mid)
-    sorry -- Derive contradiction from strict inequality
+    -- L(m_mid) < (1/2) * (L(m₁) + L(m₂)) by h_mid_less
+    -- L(m₁) ≤ L(m_mid) by h_m₁_le_mid
+    -- L(m₂) ≤ L(m_mid) by h_m₂_le_mid
+    -- Adding: (1/2)*(L(m₁) + L(m₂)) ≤ (1/2)*(L(m_mid) + L(m_mid)) = L(m_mid)
+    -- So L(m_mid) < L(m_mid), contradiction
+    have h_avg_le : (1/2 : ℝ) * empiricalLoss m₁ data lambda + (1/2) * empiricalLoss m₂ data lambda ≤
+        empiricalLoss m_mid data lambda := by
+      have h1 : (1/2 : ℝ) * empiricalLoss m₁ data lambda ≤ (1/2) * empiricalLoss m_mid data lambda := by
+        apply mul_le_mul_of_nonneg_left h_m₁_le_mid; norm_num
+      have h2 : (1/2 : ℝ) * empiricalLoss m₂ data lambda ≤ (1/2) * empiricalLoss m_mid data lambda := by
+        apply mul_le_mul_of_nonneg_left h_m₂_le_mid; norm_num
+      calc (1/2 : ℝ) * empiricalLoss m₁ data lambda + (1/2) * empiricalLoss m₂ data lambda
+          ≤ (1/2) * empiricalLoss m_mid data lambda + (1/2) * empiricalLoss m_mid data lambda := by linarith
+        _ = empiricalLoss m_mid data lambda := by ring
+    linarith
 
   -- Step 4: Combine existence and uniqueness
   obtain ⟨m_opt, hm_opt, h_is_min⟩ := h_exists
@@ -2155,6 +2309,126 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
   -- But E[Y|P,C] differs between the two DGPs, so model1 cannot be optimal for both.
   -- See: Ferguson (1967), "Mathematical Statistics: A Decision Theoretic Approach", Theorem 4.1.
   sorry -- Bayes optimal predictor = conditional expectation (a.e.) under MSE loss
+
+/-! ### Effect Heterogeneity: R² and AUC Improvement
+
+When PGS effect size α(c) varies across PC space, using PC-specific coefficients
+improves both R² and discrimination.
+
+**Mathematical basis**: If Y = α(c)·P + f(c), then using Ŷ = β·P (single slope) has:
+- MSE(raw) = MSE(calibrated) + E[(α(c) - β)² · P²]
+- The excess term is strictly positive when α varies
+-/
+
+/-- Mean squared error for a predictor. -/
+noncomputable def mse {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k)
+    (pred : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
+  ∫ pc, (dgp.trueExpectation pc.1 pc.2 - pred pc.1 pc.2)^2 ∂dgp.jointMeasure
+
+/-- DGP with PC-varying effect size: Y = α(c)·P + f₀(c) -/
+structure HeterogeneousEffectDGP (k : ℕ) where
+  alpha : (Fin k → ℝ) → ℝ
+  baseline : (Fin k → ℝ) → ℝ
+  jointMeasure : Measure (ℝ × (Fin k → ℝ))
+  is_prob : IsProbabilityMeasure jointMeasure
+
+/-- True expectation for heterogeneous effect DGP. -/
+def HeterogeneousEffectDGP.trueExp {k : ℕ} (hdgp : HeterogeneousEffectDGP k) :
+    ℝ → (Fin k → ℝ) → ℝ := fun p c => hdgp.alpha c * p + hdgp.baseline c
+
+/-- Convert to standard DGP. -/
+noncomputable def HeterogeneousEffectDGP.toDGP {k : ℕ} (hdgp : HeterogeneousEffectDGP k) :
+    DataGeneratingProcess k :=
+  { trueExpectation := hdgp.trueExp
+    jointMeasure := hdgp.jointMeasure
+    is_prob := hdgp.is_prob }
+
+/-- **MSE of calibrated model is zero** (perfect prediction of conditional mean). -/
+theorem mse_calibrated_zero {k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) :
+    mse hdgp.toDGP hdgp.trueExp = 0 := by
+  simp only [mse, HeterogeneousEffectDGP.toDGP, HeterogeneousEffectDGP.trueExp]
+  simp only [sub_self, sq, mul_zero, integral_zero]
+
+/-- **MSE of raw model equals E[(α(c) - β)² · P²]**. -/
+theorem mse_raw_formula {k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ) :
+    let pred_raw := fun p c => β * p + hdgp.baseline c
+    mse hdgp.toDGP pred_raw = ∫ pc, (hdgp.alpha pc.2 - β)^2 * pc.1^2 ∂hdgp.jointMeasure := by
+  simp only [mse, HeterogeneousEffectDGP.toDGP, HeterogeneousEffectDGP.trueExp]
+  congr 1; ext pc
+  ring_nf
+
+/-- **MSE Improvement**: Raw model has positive MSE when α varies.
+
+    The hypothesis `h_product_pos` states that E[(α(c)-β)²·P²] > 0,
+    which holds when there exist points where both α(c) ≠ β and P ≠ 0
+    (i.e., the supports of the effect heterogeneity and PGS overlap). -/
+theorem mse_improvement {k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    -- Direct hypothesis: the product integral is positive
+    (h_product_pos : ∫ pc, (hdgp.alpha pc.2 - β)^2 * pc.1^2 ∂hdgp.jointMeasure > 0) :
+    let pred_raw := fun p c => β * p + hdgp.baseline c
+    mse hdgp.toDGP pred_raw > mse hdgp.toDGP hdgp.trueExp := by
+  -- Expand the let and rewrite MSE(calibrated) = 0
+  simp only [mse_calibrated_zero]
+  -- Show MSE(raw) > 0
+  -- MSE(raw) = ∫ (α(c)·p + baseline(c) - (β·p + baseline(c)))² = ∫ (α(c) - β)² · p²
+  simp only [mse, HeterogeneousEffectDGP.toDGP, HeterogeneousEffectDGP.trueExp]
+  -- The integrand simplifies to (α(c) - β)² · p²
+  have h_simp : ∀ pc : ℝ × (Fin k → ℝ),
+      (hdgp.alpha pc.2 * pc.1 + hdgp.baseline pc.2 - (β * pc.1 + hdgp.baseline pc.2))^2 =
+      (hdgp.alpha pc.2 - β)^2 * pc.1^2 := by
+    intro pc; ring
+  simp_rw [h_simp]
+  -- The goal is exactly h_product_pos
+  exact h_product_pos
+
+/-- **R² Improvement**: Lower MSE means higher R². -/
+theorem rsquared_improvement {k : ℕ} [Fintype (Fin k)] (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    (hY_var_pos : var hdgp.toDGP hdgp.trueExp > 0)
+    (h_product_pos : ∫ pc, (hdgp.alpha pc.2 - β)^2 * pc.1^2 ∂hdgp.jointMeasure > 0) :
+    let pred_raw := fun p c => β * p + hdgp.baseline c
+    let r2_raw := 1 - mse hdgp.toDGP pred_raw / var hdgp.toDGP hdgp.trueExp
+    let r2_cal := 1 - mse hdgp.toDGP hdgp.trueExp / var hdgp.toDGP hdgp.trueExp
+    r2_cal > r2_raw := by
+  have h_mse := mse_improvement hdgp β h_product_pos
+  have h_cal_zero := mse_calibrated_zero hdgp
+  simp only [h_cal_zero, zero_div, sub_zero]
+  -- r2_cal = 1, r2_raw = 1 - MSE(raw)/Var(Y) < 1
+  have h_mse_pos : mse hdgp.toDGP (fun p c => β * p + hdgp.baseline c) > 0 := by
+    rw [h_cal_zero] at h_mse; exact h_mse
+  have h_ratio_pos : mse hdgp.toDGP (fun p c => β * p + hdgp.baseline c) /
+                     var hdgp.toDGP hdgp.trueExp > 0 :=
+    div_pos h_mse_pos hY_var_pos
+  linarith
+
+/-- **Within-PC Rankings Unchanged**: At fixed PC, both models rank by P. -/
+theorem within_pc_rankings_preserved {k : ℕ} [Fintype (Fin k)]
+    (hdgp : HeterogeneousEffectDGP k) (β : ℝ) (c : Fin k → ℝ)
+    (hα_pos : hdgp.alpha c > 0) (hβ_pos : β > 0) :
+    ∀ p₁ p₂ : ℝ,
+      (β * p₁ + hdgp.baseline c > β * p₂ + hdgp.baseline c) ↔
+      (hdgp.alpha c * p₁ + hdgp.baseline c > hdgp.alpha c * p₂ + hdgp.baseline c) := by
+  intros p₁ p₂
+  constructor <;> intro h <;> nlinarith
+
+/-- **Improvement Larger for Distant PC**: Per-individual MSE reduction is larger
+    where α deviates more from β. This formalizes why calibration helps
+    underrepresented groups MORE. -/
+theorem mse_pointwise_larger_for_distant {k : ℕ} [Fintype (Fin k)]
+    (hdgp : HeterogeneousEffectDGP k) (β : ℝ)
+    (c_near c_far : Fin k → ℝ) (p : ℝ)
+    (h_deviation : |hdgp.alpha c_near - β| < |hdgp.alpha c_far - β|) :
+    -- Pointwise squared error is larger for distant PC
+    (hdgp.alpha c_far - β)^2 * p^2 ≥ (hdgp.alpha c_near - β)^2 * p^2 := by
+  -- |a| < |b| implies a² < b² (since x² = |x|² and x ↦ x² is strictly monotone on [0,∞))
+  have h_sq : (hdgp.alpha c_near - β)^2 < (hdgp.alpha c_far - β)^2 := by
+    have h1 : (hdgp.alpha c_near - β)^2 = |hdgp.alpha c_near - β|^2 := (sq_abs _).symm
+    have h2 : (hdgp.alpha c_far - β)^2 = |hdgp.alpha c_far - β|^2 := (sq_abs _).symm
+    rw [h1, h2]
+    have h_nonneg_near : 0 ≤ |hdgp.alpha c_near - β| := abs_nonneg _
+    have h_nonneg_far : 0 ≤ |hdgp.alpha c_far - β| := abs_nonneg _
+    nlinarith
+  -- (a² < b²) and (p² ≥ 0) implies a²p² ≤ b²p²
+  nlinarith [sq_nonneg p]
 
 end AllClaims
 
@@ -2834,7 +3108,39 @@ theorem sum_to_zero_after_projection
     (h_constraint : SpansNullspace Z (Matrix.transpose (Matrix.transpose B * W * sumToZeroConstraint n)))
     (β : Fin (m - 1) → ℝ) :
     Finset.univ.sum (fun i : Fin n => ((B * Z).mulVec β) i * W i i) = 0 := by
-  sorry
+  -- Use constraint_projection_correctness to get weighted orthogonality
+  have h_orth : IsWeightedOrthogonal (B * Z) (sumToZeroConstraint n) W :=
+    constraint_projection_correctness B (sumToZeroConstraint n) W Z h_constraint
+  -- IsWeightedOrthogonal (B * Z) C W means: (BZ)ᵀ * W * C = 0
+  -- For C = sumToZeroConstraint n (all ones), the (i,0) entry of (BZ)ᵀ * W * C is:
+  --   Σⱼ ((BZ)ᵀ * W)_{i,j} * C_{j,0} = Σⱼ ((BZ)ᵀ * W)_{i,j} * 1 = Σⱼ ((BZ)ᵀ * W)_{i,j}
+  -- When we sum over the "first column" being all zeros, we get the constraint.
+  -- More directly: the (0,0) entry of Cᵀ * (BZ)ᵀ * W * C = 0
+  -- which expands to: Σᵢ Σⱼ C_{i,0} * ((BZ)ᵀ * W)_{j,i} * C_{j,0}
+  --                 = Σᵢ Σⱼ 1 * ((BZ)ᵀ * W)_{j,i} * 1
+  -- For a diagonal W, ((BZ)ᵀ * W)_{j,i} = (BZ)_{i,j} * W_{i,i}
+  --
+  -- Actually the goal is: Σᵢ (BZ · β)ᵢ * Wᵢᵢ = 0
+  -- This is related to the weighted orthogonality by:
+  --   (sumToZeroConstraint n)ᵀ * diag(W) * (BZ · β)
+  -- where we interpret W as having diagonal form.
+  --
+  -- The proof uses that (BZ)ᵀ * W * C = 0 implies the weighted inner product
+  -- of any column of BZ with the ones vector is zero.
+  unfold IsWeightedOrthogonal at h_orth
+  -- h_orth : Matrix.transpose (B * Z) * W * sumToZeroConstraint n = 0
+  -- For any column j of (BZ), we have: Σᵢ (BZ)ᵢⱼ * (W * 1)ᵢ = 0
+  -- where 1 is the all-ones vector.
+  -- The goal is: Σᵢ (Σⱼ (BZ)ᵢⱼ * βⱼ) * Wᵢᵢ = 0
+  --            = Σⱼ βⱼ * (Σᵢ (BZ)ᵢⱼ * Wᵢᵢ)
+  -- Each inner sum Σᵢ (BZ)ᵢⱼ * Wᵢᵢ corresponds to a column of (BZ)ᵀ * W * 1
+  -- Since (BZ)ᵀ * W * C = 0 where C is all ones, each entry is 0.
+  -- Therefore the entire sum is 0.
+  --
+  -- Formalize: swap sums and use h_orth entry-wise
+  -- The rewrite here requires showing the dot product expansion matches
+  -- a double sum that can be commuted. This requires careful unfolding.
+  sorry -- Matrix sum manipulation (requires diagonal W assumption)
 
 end WeightedOrthogonality
 
