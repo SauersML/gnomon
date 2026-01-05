@@ -22,7 +22,7 @@ use crate::calibrate::construction::ModelLayout;
 use crate::calibrate::estimate::EstimationError;
 use crate::calibrate::model::LinkFunction;
 use crate::calibrate::basis::{
-    apply_sum_to_zero_constraint, baseline_lambda_seed, create_basis,
+    baseline_lambda_seed, compute_geometric_constraint_transform, create_basis,
     create_difference_penalty_matrix, BasisOptions, Dense, KnotSource,
 };
 use crate::calibrate::quadrature::QuadratureContext;
@@ -292,46 +292,31 @@ impl<'a> JointModelState<'a> {
 
     /// Initialize the geometric constraint transform from the knot vector.
     ///
-    /// This computes Z and S_c using a fixed geometric grid (proxy for integration),
-    /// which depends only on the knot geometry and not on β. This ensures dZ/dβ = 0 exactly,
-    /// making the analytic gradient correct.
+    /// This computes Z and S_c using Greville abscissae, which depend only on
+    /// the knot geometry and not on β. This ensures dZ/dβ = 0 exactly, making
+    /// the analytic gradient correct.
     ///
     /// Should be called once after knots are determined (first build_link_basis call).
     fn initialize_geometric_constraint(&mut self) -> Result<(), String> {
-        let knots = self.knot_vector.as_ref().ok_or("Knots not initialized")?;
+        let knot_vector = self.knot_vector.as_ref().ok_or_else(|| {
+            "Cannot initialize geometric constraint: knot_vector not set".to_string()
+        })?;
 
-        // Generate geometric reference points (uniform grid on [0,1])
-        // This defines the "shape" of the constraint independent of data distribution.
-        let n_grid = 100;
-        let z_geom = Array1::linspace(0.0, 1.0, n_grid);
+        let (z, s_constrained) =
+            compute_geometric_constraint_transform(knot_vector, self.degree, 2).map_err(|e| {
+                format!("Geometric constraint computation failed: {e}")
+            })?;
 
-        // Evaluate raw basis on geometric grid
-        let (basis_geom_arc, _) = create_basis::<Dense>(
-            z_geom.view(),
-            KnotSource::Provided(knots.view()),
-            self.degree,
-            BasisOptions::value(),
-        ).map_err(|e| e.to_string())?;
+        let n_constrained = z.ncols();
 
-        let basis_geom = basis_geom_arc.as_ref();
-        let n_raw = basis_geom.ncols();
-
-        // Compute constraint transform Z such that sum(B_constrained) ~ 0
-        // We use unweighted sum-to-zero on the geometric grid.
-        let (_, transform) = apply_sum_to_zero_constraint(basis_geom.view(), None)
-            .map_err(|e| e.to_string())?;
-
-        // Compute raw difference penalty S
-        // For cubic splines (degree 3), we typically use 2nd order difference penalty
-        let penalty_order = 2;
-        let s_raw = create_difference_penalty_matrix(n_raw, penalty_order)
-            .map_err(|e| e.to_string())?;
-
-        // Project penalty: S_constrained = Z^T * S * Z
-        let s_constrained = transform.t().dot(&s_raw.dot(&transform));
-
-        self.geometric_link_transform = Some(transform);
+        self.geometric_link_transform = Some(z);
         self.geometric_s_link_constrained = Some(s_constrained);
+
+        // Update dimension tracking and resize beta_link if needed
+        if self.n_constrained_basis != n_constrained {
+            self.n_constrained_basis = n_constrained;
+            self.beta_link = Array1::zeros(n_constrained);
+        }
 
         Ok(())
     }

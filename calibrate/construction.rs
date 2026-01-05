@@ -1805,13 +1805,9 @@ pub fn build_design_and_penalty_matrices(
                 let s_pgs_raw = kronecker_product(s_pgs_penalty.as_dense(), &i_pc);
                 let mut s_pgs_proj = s_pgs_raw; // Start with raw
 
-                // Add main effect penalty contribution
-                // The PGS main effect penalty matrix s_pgs_main is for the unconstrained basis?
-                // Wait, s_pgs_main at line 1175 is raw diff penalty on unconstrained basis.
-                // pgs_main in M has sum-to-zero applied.
-                // We need the penalty on the sum-to-zero basis: Z^T S Z.
-                // We can compute this or reuse if available.
-                // Let's compute it to be safe.
+                // Add main effect penalty contribution (Wood 2017, Section 5.6.3)
+                // The penalty on the constrained basis is Z^T S_unc Z where Z is the
+                // sum-to-zero transform. We compute this from the unconstrained penalty.
                 let s_pgs_main_unc = diff_penalty_cache
                     .get(pgs_main_basis_unc.ncols(), config.penalty_order)?
                     .as_dense()
@@ -1901,15 +1897,9 @@ pub fn build_design_and_penalty_matrices(
                 s_pc_proj = s_pc_proj + correction_pc - term2_pc.clone() - term2_pc.t();
 
                 // 3. Null Penalty (S_null_raw)
-                // For simplicity, we use the raw null penalty. The projection effects on the
-                // null space penalty (which penalizes p*z interaction) are less critical
-                // for the scaling issue, and the "energy" of main effects in the null-interaction
-                // metric is zero (main effects are linear/marginal, S_null targets interaction).
-                // However, we still normalize it post-projection if we were to project it.
-                // We keep it raw but normalized by its own norm.
-                // Actually, let's normalize by the RAW norm for stability if we don't project.
-                // But the user said "calculate norms... based on the constrained penalty".
-                // Since we assume S_null on main effects is 0, S_proj \approx S_raw.
+                // The null penalty targets interaction terms (p*z). Main effects have zero
+                // energy in this metric since they lack interaction structure. Therefore
+                // projection has no effect: S_null_proj ≈ S_null_raw. We use the raw form.
                 let s_null_raw = kronecker_product(
                     &pgs_null_projector,
                     pc_null_projector,
