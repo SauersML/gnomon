@@ -16,29 +16,42 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Reference genome download URLs with fallbacks (tried in order)
-const GRCH37_URLS: &[&str] = &[
-    // Hail (Google Cloud) - fast, reliable, compressed
-    "https://storage.googleapis.com/hail-common/references/human_g1k_v37.fasta.gz",
-    // Gencode/EBI - authoritative source, compressed
-    "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_19/GRCh37.p13.genome.fa.gz",
-    // UCSC - compressed
-    "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/latest/hg19.fa.gz",
-    // Illumina DRAGEN S3 - uncompressed but reliable
-    "https://ilmn-dragen-giab-samples.s3.amazonaws.com/FASTA/GRCh37.fa",
+/// Reference genome sources: (FASTA URL, optional FAI URL)
+/// Sources with pre-built .fai indexes are preferred as they're more reliable
+const GRCH37_SOURCES: &[(&str, Option<&str>)] = &[
+    // 1000 Genomes - has pre-built index (most reliable)
+    (
+        "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.gz",
+        Some("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.fai"),
+    ),
+    // Hail (Google Cloud) - fast, no index
+    (
+        "https://storage.googleapis.com/hail-common/references/human_g1k_v37.fasta.gz",
+        None,
+    ),
+    // Illumina DRAGEN S3 - uncompressed, no index
+    (
+        "https://ilmn-dragen-giab-samples.s3.amazonaws.com/FASTA/GRCh37.fa",
+        None,
+    ),
 ];
 
-const GRCH38_URLS: &[&str] = &[
-    // UCSC - fast, compressed
-    "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/latest/hg38.fa.gz",
-    // Illumina DRAGEN S3 - uncompressed but reliable
-    "https://ilmn-dragen-giab-samples.s3.amazonaws.com/FASTA/hg38.fa",
-    // Ensembl - primary assembly, compressed
-    "https://ftp.ensembl.org/pub/release-109/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz",
-    // Illumina DRAGEN S3 - alt-aware version
-    "https://ilmn-dragen-giab-samples.s3.amazonaws.com/FASTA/hg38_alt_aware_nohla.fa",
-    // Ensembl current - toplevel with index available
-    "https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz",
+const GRCH38_SOURCES: &[(&str, Option<&str>)] = &[
+    // Ensembl indexed - has pre-built index (most reliable)
+    (
+        "https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz",
+        Some("https://ftp.ensembl.org/pub/current_fasta/homo_sapiens/dna_index/Homo_sapiens.GRCh38.dna.toplevel.fa.gz.fai"),
+    ),
+    // UCSC - fast, no index
+    (
+        "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/latest/hg38.fa.gz",
+        None,
+    ),
+    // Illumina DRAGEN S3 - uncompressed, no index
+    (
+        "https://ilmn-dragen-giab-samples.s3.amazonaws.com/FASTA/hg38.fa",
+        None,
+    ),
 ];
 
 /// Supported input formats for genotype data.
@@ -111,18 +124,20 @@ fn get_gnomon_cache_dir() -> PathBuf {
 /// Ensures a reference genome is available, downloading if necessary.
 ///
 /// Tries multiple mirror URLs with fallback if one fails.
+/// Downloads both FASTA and .fai index when available.
 /// Returns the path to the uncompressed reference FASTA file.
 fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let cache_dir = get_gnomon_cache_dir().join("refs");
     fs::create_dir_all(&cache_dir)?;
 
-    let (urls, canonical_filename) = if build.contains("37") || build.to_lowercase().contains("hg19") {
-        (GRCH37_URLS, "human_g1k_v37.fasta")
+    let (sources, canonical_filename) = if build.contains("37") || build.to_lowercase().contains("hg19") {
+        (GRCH37_SOURCES, "human_g1k_v37.fasta")
     } else {
-        (GRCH38_URLS, "GRCh38_reference.fa")
+        (GRCH38_SOURCES, "GRCh38_reference.fa")
     };
 
     let ref_path = cache_dir.join(canonical_filename);
+    let fai_path = cache_dir.join(format!("{}.fai", canonical_filename));
 
     // Check for existing cached reference (uncompressed)
     if ref_path.exists() {
@@ -133,22 +148,31 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
     eprintln!("> Reference genome not found locally.");
     eprintln!("> Downloading {} reference (~900MB)...", build);
 
-    // Try each URL until one works
+    // Try each source until one works
     let mut last_error = String::new();
-    for (i, url) in urls.iter().enumerate() {
-        eprintln!("> Trying mirror {}/{}: {}", i + 1, urls.len(), url);
+    for (i, (fasta_url, fai_url)) in sources.iter().enumerate() {
+        eprintln!("> Trying source {}/{}: {}", i + 1, sources.len(), fasta_url);
 
-        // Download to temp file first
-        let temp_path = if url.ends_with(".gz") {
+        // Download .fai index first if available (small file, fast)
+        if let Some(fai_url) = fai_url {
+            eprintln!("> Downloading index file...");
+            if let Err(e) = download_file(fai_url, &fai_path) {
+                eprintln!("> Warning: Failed to download index: {}", e);
+                // Continue anyway - we'll try to create the index later
+            }
+        }
+
+        // Download FASTA to temp file
+        let temp_path = if fasta_url.ends_with(".gz") {
             cache_dir.join(format!("{}.gz.tmp", canonical_filename))
         } else {
             cache_dir.join(format!("{}.tmp", canonical_filename))
         };
 
-        match download_with_progress(url, &temp_path) {
+        match download_with_progress(fasta_url, &temp_path) {
             Ok(()) => {
                 // Decompress if needed
-                if url.ends_with(".gz") {
+                if fasta_url.ends_with(".gz") {
                     eprintln!("> Decompressing reference genome...");
                     match decompress_gz(&temp_path, &ref_path) {
                         Ok(()) => {
@@ -158,8 +182,9 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
                         }
                         Err(e) => {
                             let _ = fs::remove_file(&temp_path);
+                            let _ = fs::remove_file(&fai_path);
                             last_error = format!("Decompression failed: {}", e);
-                            eprintln!("> {}. Trying next mirror...", last_error);
+                            eprintln!("> {}. Trying next source...", last_error);
                             continue;
                         }
                     }
@@ -172,17 +197,29 @@ fn ensure_reference_genome(build: &str) -> Result<PathBuf, Box<dyn Error + Send 
             }
             Err(e) => {
                 let _ = fs::remove_file(&temp_path);
+                let _ = fs::remove_file(&fai_path);
                 last_error = e.to_string();
-                eprintln!("> Mirror failed: {}. Trying next...", last_error);
+                eprintln!("> Source failed: {}. Trying next...", last_error);
             }
         }
     }
 
     Err(format!(
-        "Failed to download reference genome from all {} mirrors. Last error: {}",
-        urls.len(),
+        "Failed to download reference genome from all {} sources. Last error: {}",
+        sources.len(),
         last_error
     ).into())
+}
+
+/// Simple file download without progress (for small files like .fai)
+fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let response = ureq::get(url).call().map_err(|e| format!("Download failed: {}", e))?;
+    let mut reader = response.into_reader();
+    let file = File::create(dest)?;
+    let mut writer = BufWriter::new(file);
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.flush()?;
+    Ok(())
 }
 
 /// Decompress a gzipped file
