@@ -321,6 +321,12 @@ def ensure_concatenated_reference_panel() -> Path:
     # (gnomon's --panel can work with partial reference)
     bcftools = ensure_bcftools()
     if bcftools:
+        # Index each VCF file first (required for concatenation)
+        debug("Indexing chromosome VCFs...")
+        for vcf in chrom_vcfs:
+            if not vcf.with_suffix(".gz.tbi").exists():
+                run([bcftools, "index", "-t", vcf])
+
         debug("Concatenating all chromosomes into single reference panel...")
         run([
             bcftools, "concat",
