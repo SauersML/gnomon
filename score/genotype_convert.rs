@@ -24,10 +24,10 @@ const GRCH37_SOURCES: &[(&str, Option<&str>)] = &[
         "https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.gz",
         Some("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/human_g1k_v37.fasta.fai"),
     ),
-    // Hail (Google Cloud) - fast, no index
+    // Hail (Google Cloud) - fast, has index
     (
         "https://storage.googleapis.com/hail-common/references/human_g1k_v37.fasta.gz",
-        None,
+        Some("https://storage.googleapis.com/hail-common/references/human_g1k_v37.fasta.fai"),
     ),
     // Illumina DRAGEN S3 - uncompressed, no index
     (
