@@ -271,7 +271,7 @@ def ensure_reference_panel(chrom: str, bcftools: Path) -> Path:
     debug(f"Filtering chr{chrom} reference (removing symbolic alleles)...")
     result = subprocess.run([
         bcftools, "view",
-        "-e", 'ALT~"<"',  # Exclude symbolic alleles like <INS>, <DEL>, <CN*>
+        "-e", 'REF~"<" || ALT~"<"',  # Exclude symbolic alleles in REF or ALT
         "-O", "z",
         "-o", filtered_file,
         raw_file,
