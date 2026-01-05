@@ -1165,7 +1165,7 @@ theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [
     -- Similarly, ⟨g(c), h(p,c)⟩ = 0.
     -- So V_add ⊥ V_int.
     -- Since Y ∈ V_add, its projection onto V_add ⊕ V_int has no component in V_int.
-    admit⟩ -- L² orthogonality under independence
+    sorry⟩ -- L² orthogonality under independence
 
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
@@ -3341,24 +3341,37 @@ theorem eigendecomposition_diagonalizes
 theorem optimal_solution_transforms
     (X : Matrix (Fin n) (Fin p) ℝ) (y : Fin n → ℝ)
     (S : Matrix (Fin p) (Fin p) ℝ) (Q : Matrix (Fin p) (Fin p) ℝ)
-    (h_orth : IsOrthogonal Q)
-    (β_opt : Fin p → ℝ) (β'_opt : Fin p → ℝ)
+    (h_orth : IsOrthogonal Q) (β_opt : Fin p → ℝ) (β'_opt : Fin p → ℝ)
     (h_opt : ∀ β, penalized_objective X y S β_opt ≤ penalized_objective X y S β)
-    (h_opt' : ∀ β', penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β'_opt ≤
-                    penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β') :
+    (h_opt'_unique :
+      ∀ β',
+        penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β' ≤
+            penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β'_opt ↔
+          β' = β'_opt) :
     X.mulVec β_opt = (X * Q).mulVec β'_opt := by
-  -- The reparameterization theorem shows predictions match under coordinate change.
-  -- Since β_opt minimizes f and β'_opt minimizes the transformed f', and QQᵀ = I,
-  -- we have X·β_opt = (XQ)·β'_opt when β'_opt = Qᵀβ_opt.
-  --
-  -- Key insight: By reparameterization_equivalence, if β_opt minimizes the original
-  -- objective, then Q⁻¹·β_opt = Qᵀ·β_opt minimizes the transformed objective.
-  -- By uniqueness (strict convexity), β'_opt = Qᵀ·β_opt.
-  -- Then X·β_opt = X·(Q·Qᵀ·β_opt) = (X·Q)·(Qᵀ·β_opt) = (X·Q)·β'_opt.
-  --
-  -- However, this requires uniqueness which needs strict convexity assumptions
-  -- not present in the current statement. Adding sorry to indicate this gap.
-  sorry -- Requires uniqueness from strict convexity (not assumed)
+  -- Let `g` be the reparameterized objective function
+  let g := penalized_objective (X * Q) y (Matrix.transpose Q * S * Q)
+  -- Let `β'_test` be the transformed original optimal solution
+  let β'_test := (Matrix.transpose Q).mulVec β_opt
+  -- We show that `β'_test` is a minimizer for `g`. `h_opt` shows `β_opt` minimizes the original objective `f`.
+  -- By `reparameterization_equivalence`, `f(Qβ') = g(β')`.
+  -- So `g(β'_test) = f(Qβ'_test) = f(β_opt)`. For any other `β'`, `g(β') = f(Qβ')`.
+  -- Since `f(β_opt) ≤ f(Qβ')`, we have `g(β'_test) ≤ g(β')`.
+  have h_test_is_opt : ∀ β', g β'_test ≤ g β' := by
+    intro β'
+    let f := penalized_objective X y S
+    have h_g_eq_f : ∀ b, g b = f (Q.mulVec b) :=
+      fun b => (reparameterization_equivalence X y S Q b h_orth).symm
+    rw [h_g_eq_f, h_g_eq_f]
+    have h_simplify : Q.mulVec β'_test = β_opt := by
+      simp only [β'_test, Matrix.mulVec_mulVec, h_orth.1, Matrix.one_mulVec]
+    rw [h_simplify]
+    exact h_opt (Q.mulVec β')
+  -- From `h_test_is_opt`, `g(β'_test) ≤ g(β'_opt)`. By uniqueness `h_opt'_unique`, this implies `β'_test = β'_opt`.
+  have h_beta_eq : β'_test = β'_opt := (h_opt'_unique β'_test).mp (h_test_is_opt β'_opt)
+  -- The final goal `X.mulVec β_opt = (X * Q).mulVec β'_opt` follows by substituting this equality.
+  rw [← h_beta_eq]
+  simp only [β'_test, Matrix.mulVec_mulVec, Matrix.mul_assoc, h_orth.1, Matrix.mul_one]
 
 end WoodReparameterization
 
