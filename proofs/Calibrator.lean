@@ -1548,8 +1548,8 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
     (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
-  -- For S = I (ridge): βᵀSβ = βᵀβ = ‖β‖²
-  -- So L(β) ≥ λ·‖β‖² → ∞ as ‖β‖ → ∞
+  -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ ≥ λ·c·‖β‖² → ∞
+  -- The penalty term dominates as ‖β‖ → ∞ since S is positive definite.
   sorry
 
 /-- Existence of minimizer: coercivity + continuity implies minimum exists.
@@ -3314,27 +3314,9 @@ theorem optimal_solution_transforms
     (h_opt' : ∀ β', penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β'_opt ≤
                     penalized_objective (X * Q) y (Matrix.transpose Q * S * Q) β') :
     X.mulVec β_opt = (X * Q).mulVec β'_opt := by
-  -- Both β_opt and β'_opt are unique minimizers of equivalent objective functions.
-  -- The reparameterization theorem (reparameterization_equivalence) shows:
-  --   penalized_objective X y S β = penalized_objective (X*Q) y (QᵀSQ) (Qᵀβ)
-  -- Therefore β'_opt = Qᵀβ_opt, and (X*Q)·β'_opt = (X*Q)·(Qᵀβ_opt) = X·(Q·Qᵀ)·β_opt
-  -- By orthogonality Q·Qᵀ = I, so X·β_opt = (X*Q)·β'_opt
-  have h_equiv := reparameterization_equivalence X y S Q h_orth
-  -- From the equivalence and uniqueness of minimizers:
-  -- Since β_opt minimizes penalized_objective X y S and
-  -- Qᵀβ_opt minimizes penalized_objective (X*Q) y (QᵀSQ),
-  -- by uniqueness β'_opt = Qᵀβ_opt (or equivalently Q·β'_opt = β_opt)
-  -- The predictions are: X·β_opt and (X*Q)·β'_opt = X·Q·β'_opt
-  -- If β'_opt = Qᵀβ_opt, then X·Q·Qᵀ·β_opt = X·β_opt by orthogonality
-  rw [Matrix.mulVec_mulVec]
-  -- Need: X · β_opt = X · (Q · β'_opt)
-  -- This requires showing β_opt = Q · β'_opt, which follows from uniqueness
-  -- and the reparameterization equivalence.
-  congr 1
-  -- Goal: β_opt = Q.mulVec β'_opt
-  -- By reparameterization, the unique minimizer of the transformed problem
-  -- is Qᵀβ_opt, so β'_opt = Qᵀβ_opt, meaning Q·β'_opt = Q·Qᵀ·β_opt = β_opt
-  have h_QQt : Q * Matrix.transpose Q = 1 := h_orth.1
+  -- The reparameterization theorem shows predictions match under coordinate change.
+  -- Since β_opt minimizes f and β'_opt minimizes the transformed f', and QQᵀ = I,
+  -- we have X·β_opt = (XQ)·β'_opt when β'_opt = Qᵀβ_opt.
   sorry
 
 end WoodReparameterization
