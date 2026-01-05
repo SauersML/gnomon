@@ -858,23 +858,31 @@ lemma rawOptimal_implies_orthogonality
         }
         -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
         have h_opt_ineq := h_opt.is_optimal model' h_raw'
-        -- The linear predictor of model' is: (a + ε) + b*p
-        -- The linear predictor of model is: a + b*p
-        -- So (Y - pred') = (Y - pred) - ε = residual - ε
-        -- Therefore: ∫(Y - pred)² ≤ ∫(residual - ε)²
-        --          = ∫(residual² - 2ε·residual + ε²)
-        --          = ∫residual² - 2ε·∫residual + ε²
-        -- Rearranging: 0 ≤ -2ε·∫residual + ε² = ε² - 2ε·∫residual
+        -- Show: linearPredictor model' p c = linearPredictor model p c + ε
+        have h_pred_diff : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε := by
+          intro p_val c_val
+          unfold linearPredictor
+          simp only [model']
+          ring
+        -- The squared error difference:
+        -- (Y - pred')² = (Y - pred - ε)² = (resid - ε)²
+        -- = resid² - 2ε·resid + ε²
+        -- Expected: E[(resid - ε)²] = E[resid²] - 2ε·E[resid] + ε²
         --
-        -- The full formal proof requires showing:
-        -- 1. linearPredictor model' p c = linearPredictor model p c + ε
-        -- 2. ∫(f-ε)² = ∫f² - 2ε∫f + ε² (by integral linearity)
-        -- 3. Combining with h_opt_ineq gives the quadratic inequality
+        -- From optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
+        -- So: E[resid²] ≤ E[resid²] - 2ε·E[resid] + ε²
+        -- Therefore: 0 ≤ -2ε·E[resid] + ε² = ε² - 2ε·E[resid]
+        unfold expectedSquaredError at h_opt_ineq
+        -- h_opt_ineq: ∫(Y - pred)² ≤ ∫(Y - (pred + ε))²
+        -- After h_pred_diff: ∫(Y - pred)² ≤ ∫(Y - pred - ε)² = ∫(resid - ε)²
+        -- Expand: ∫(resid - ε)² = ∫resid² - 2ε∫resid + ε² (integral linearity)
+        -- So: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
+        -- Rearranging: 0 ≤ -2ε∫resid + ε² = ε² - 2ε∫resid
         --
-        -- This requires unpacking the expectedSquaredError definition and
-        -- showing the linear predictor relationship. For now we mark this
-        -- as a technical step that follows from the model construction.
-        sorry
+        -- The proof requires: simp with h_pred_diff, then integral linearity lemmas
+        -- (integral_sub, integral_add, integral_mul_left) and ∫1 = 1 for prob measure.
+        sorry -- Integral expansion and linearity (infrastructure-heavy)
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -1585,7 +1593,6 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
     - λ > 0 (penalty adds strictly positive term)
     A strictly convex function has at most one minimizer.
 
-    **FUTURE REFACTORING (v2.0)**:
     - Unify empirical/theoretical loss via L²(μ) for different measures
     - Use abstract [InnerProductSpace ℝ P] instead of concrete ParamIx
     - Define constraint as LinearMap kernel for cleaner affine subspace handling -/
@@ -1621,7 +1628,8 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
   -- First, we need to show the constraint set is non-empty
   -- (This would require showing the constraints are consistent)
   have h_nonempty : ValidModels.Nonempty := by
-    sorry -- This requires showing sum-to-zero constraints are satisfiable
+    -- The zero model (all coefficients = 0) satisfies all constraints
+    sorry
 
   -- The empiricalLoss function is coercive on ValidModels
   -- This follows from the penalty term λ * ‖spline coefficients‖²
@@ -2313,17 +2321,26 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
       have := congr_fun (congr_fun h_eq_fn 0) c
       simp at this; exact this
     exact h_diff_env this
-  -- h_neq: dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation
-  -- h_opt1: model1 is Bayes-optimal for dgp1
-  -- h_opt2: model1 is Bayes-optimal for dgp2
-  -- But a Bayes-optimal predictor matches the true expectation (up to modification on null sets)
-  -- If model1 is optimal for both, then dgp1.trueExpectation = dgp2.trueExpectation, contradiction
-
-  -- The formal argument: if model1 minimizes E[(Y - pred)²] for both dgp1 and dgp2,
-  -- then pred = E[Y|P,C] for each (conditional expectation is unique minimizer of MSE).
-  -- But E[Y|P,C] differs between the two DGPs, so model1 cannot be optimal for both.
-  -- See: Ferguson (1967), "Mathematical Statistics: A Decision Theoretic Approach", Theorem 4.1.
-  sorry -- Bayes optimal predictor = conditional expectation (a.e.) under MSE loss
+  -- The Bayes-optimal predictor is the conditional expectation E[Y|P,C] = dgp.trueExpectation
+  -- If model1 is Bayes-optimal for both dgp1 and dgp2, then:
+  --   linearPredictor model1 = dgp1.trueExpectation (from h_opt1)
+  --   linearPredictor model1 = dgp2.trueExpectation (from h_opt2)
+  -- Therefore dgp1.trueExpectation = dgp2.trueExpectation, contradicting h_neq.
+  --
+  -- The full proof requires formalizing that IsBayesOptimalInClass implies
+  -- linearPredictor model = trueExpectation (orthogonal projection characterization).
+  -- This uses that expectedSquaredError achieves minimum iff pred = condexp.
+  apply h_neq
+  -- Need to show: dgp1.trueExpectation = dgp2.trueExpectation
+  -- Both dgps have same jointMeasure by h_same_genetics.2
+  -- If model1 is optimal for both under the same measure...
+  funext p_val c_val
+  -- The linear predictor of model1 must equal both trueExpectations
+  -- h_opt1: ∀ m, expectedSquaredError dgp1 (linearPredictor model1) ≤ expectedSquaredError dgp1 (linearPredictor m)
+  -- h_opt2: ∀ m, expectedSquaredError dgp2 (linearPredictor model1) ≤ expectedSquaredError dgp2 (linearPredictor m)
+  -- By uniqueness of condexp, linearPredictor model1 = E[Y|P,C] for each DGP
+  -- But they have the same measure, so this implies the trueExpectations are equal.
+  sorry
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
