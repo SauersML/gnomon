@@ -822,75 +822,57 @@ lemma rawOptimal_implies_orthogonality
         -- Rearranging: (-2·E[residual])·ε + 1·ε² ≥ 0
         --
         -- The formal proof uses h_opt.is_optimal on a constructed competitor.
-        -- Since we lack machinery to construct arbitrary GAM perturbations,
-        -- we use that the optimality condition must hold at all ε.
-        have h_expand : (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 =
-            ε^2 - 2 * ε * ∫ pc, residual pc ∂μ := by ring
-        rw [h_expand]
-        -- The key insight: for ANY value of E[residual], the quadratic
-        -- ε² - 2·E[residual]·ε can be negative (when ε is between 0 and 2·E[residual]).
-        -- The proof that this quadratic is ≥ 0 for all ε is NOT arithmetic -
-        -- it follows from the optimality condition h_opt, which states:
-        --   ∀ competitor, expectedSquaredError of model ≤ expectedSquaredError of competitor
-        --
-        -- When we perturb the intercept by ε, the competitor has squared error:
-        --   E[(Y - (a+ε) - b*P)²] = E[(resid - ε)²] = E[resid²] - 2ε·E[resid] + ε²
-        --
-        -- By h_opt.is_optimal applied to this competitor:
-        --   E[resid²] ≤ E[resid²] - 2ε·E[resid] + ε²
-        -- which gives: 0 ≤ -2ε·E[resid] + ε²
-        --
-        -- Construct the competitor raw model with intercept shifted by ε
         let model' : PhenotypeInformedGAM 1 1 1 := {
           pgsBasis := model.pgsBasis,
           pcSplineBasis := model.pcSplineBasis,
-          γ₀₀ := model.γ₀₀ + ε,  -- Perturbed intercept
-          γₘ₀ := model.γₘ₀,      -- Same slope
-          f₀ₗ := model.f₀ₗ,      -- Same (zero) spline terms
-          fₘₗ := model.fₘₗ,      -- Same (zero) interaction terms
+          γ₀₀ := model.γ₀₀ + ε,
+          γₘ₀ := model.γₘ₀,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
           link := model.link,
           dist := model.dist
         }
-        -- model' is a raw model (inherits zero spline terms from model)
-        have h_raw' : IsRawScoreModel model' := {
-          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
-          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
-        }
-        -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
+        have h_raw' : IsRawScoreModel model' := by
+          exact h_opt.is_raw
         have h_opt_ineq := h_opt.is_optimal model' h_raw'
-        -- Show: linearPredictor model' p c = linearPredictor model p c + ε
-        have h_pred_diff : ∀ p_val (c_val : Fin 1 → ℝ),
-            linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε := by
-          intro p_val c_val
-          unfold linearPredictor
-          simp only [model']
-          ring
-        -- The squared error difference:
-        -- (Y - pred')² = (Y - pred - ε)² = (resid - ε)²
-        -- = resid² - 2ε·resid + ε²
-        -- Expected: E[(resid - ε)²] = E[resid²] - 2ε·E[resid] + ε²
-        --
-        -- From optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
-        -- So: E[resid²] ≤ E[resid²] - 2ε·E[resid] + ε²
-        -- Therefore: 0 ≤ -2ε·E[resid] + ε² = ε² - 2ε·E[resid]
+        have h_pred_model : ∀ p c, linearPredictor model p c = a + b * p :=
+          linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear
+        have h_pred_model' : ∀ p c, linearPredictor model' p c = (a + ε) + b * p := by
+          have h_model'_raw : IsRawScoreModel model' := h_raw'
+          have h_model'_linear : model'.pgsBasis.B 1 = id ∧ model'.pgsBasis.B 0 = fun _ => 1 := h_linear
+          have h_affine := linearPredictor_eq_affine_of_raw model' h_model'_raw h_model'_linear
+          intro p c; rw [h_affine]; simp [model']; rfl
+        simp_rw [h_pred_model, h_pred_model'] at h_opt_ineq
         unfold expectedSquaredError at h_opt_ineq
-        -- h_opt_ineq: ∫(Y - pred)² ≤ ∫(Y - (pred + ε))²
-        -- After h_pred_diff: ∫(Y - pred)² ≤ ∫(Y - pred - ε)² = ∫(resid - ε)²
-        -- Expand: ∫(resid - ε)² = ∫resid² - 2ε∫resid + ε² (integral linearity)
-        -- So: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
-        -- Rearranging: 0 ≤ -2ε∫resid + ε² = ε² - 2ε∫resid
-        -- Derive integrability of residual from hypotheses
+        have h_ineq_resid : ∫ pc, (residual pc)^2 ∂μ ≤ ∫ pc, (residual pc - ε)^2 ∂μ := by
+          have h_lhs : (fun pc => (Y pc.1 pc.2 - (a + b * pc.1))^2) = (fun pc => (residual pc)^2) := by
+            funext pc; rw [hres_def]; rfl
+          have h_rhs : (fun pc => (Y pc.1 pc.2 - ((a + ε) + b * pc.1))^2) = (fun pc => (residual pc - ε)^2) := by
+            funext pc; rw [hres_def]; ring
+          simpa [h_lhs, h_rhs] using h_opt_ineq
         have h_resid_int : Integrable residual μ := by
-          unfold residual
-          simp only [hY_def, ha_def, hb_def, hμ_def]
-          apply Integrable.sub hY_int
-          apply Integrable.add (integrable_const a)
-          exact hP_int.const_mul b
-        -- From h_opt_ineq and h_pred_diff, we get:
-        -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
-        -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
-        -- Therefore: 0 ≤ -2ε∫resid + ε²
-        sorry -- Integral linearity expansion
+          unfold residual; simp only [hY_def, ha_def, hb_def, hμ_def]
+          exact hY_int.sub (Integrable.add (integrable_const a) (hP_int.const_mul b))
+        have i_resid_sq : Integrable (fun pc => residual pc ^ 2) μ := h_resid_sq_int
+        have i_resid : Integrable (fun pc => residual pc) μ := h_resid_int
+        have i_eps_resid : Integrable (fun pc => 2 * ε * residual pc) μ := i_resid.const_mul (2 * ε)
+        have i_eps_sq : Integrable (fun _ => ε ^ 2) μ := integrable_const _
+        have i_full : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2) μ :=
+          (i_resid_sq.sub i_eps_resid).add i_eps_sq
+        have h_rhs_expand : ∫ pc, (residual pc - ε)^2 ∂μ = ∫ pc, residual pc^2 ∂μ - 2 * ε * (∫ pc, residual pc ∂μ) + ε^2 := by
+          have h_integrand_eq : (fun pc => (residual pc - ε)^2) = (fun pc => residual pc^2 - 2 * ε * residual pc + ε^2) := by
+            funext pc; ring
+          rw [integral_congr_ae (ae_of_all _ h_integrand_eq)]
+          rw [integral_add (i_resid_sq.sub i_eps_resid) i_eps_sq]
+          rw [integral_sub i_resid_sq i_eps_resid]
+          rw [integral_const_mul, integral_const]
+          ring
+        rw [h_rhs_expand] at h_ineq_resid
+        have h_ge_zero := sub_nonneg.mpr h_ineq_resid
+        have h_cancel : (∫ pc, residual pc ^ 2 ∂μ) - (2 * ε * ∫ pc, residual pc ∂μ) + ε ^ 2 - (∫ pc, residual pc ^ 2 ∂μ) =
+                         (-2 * ∫ pc, residual pc ∂μ) * ε + ε^2 := by ring
+        rw [← h_cancel]
+        exact sub_le_sub_right h_ge_zero (∫ (pc : ℝ × (Fin 1 → ℝ)), residual pc ^ 2 ∂μ)
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -955,7 +937,60 @@ lemma rawOptimal_implies_orthogonality
         -- This requires unpacking the expectedSquaredError definition and
         -- showing the linear predictor relationship. For now we mark this
         -- as a technical step that follows from the model construction.
-        sorry
+        let model' : PhenotypeInformedGAM 1 1 1 := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀,
+          γₘ₀ := fun m => model.γₘ₀ m + ε,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
+          link := model.link,
+          dist := model.dist
+        }
+        have h_raw' : IsRawScoreModel model' := by
+          exact h_opt.is_raw
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_pred_model : ∀ p c, linearPredictor model p c = a + b * p :=
+          linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear
+        have h_pred_model' : ∀ p c, linearPredictor model' p c = a + (b + ε) * p := by
+          have h_model'_raw : IsRawScoreModel model' := h_raw'
+          have h_model'_linear : model'.pgsBasis.B 1 = id ∧ model'.pgsBasis.B 0 = fun _ => 1 := h_linear
+          have h_affine := linearPredictor_eq_affine_of_raw model' h_model'_raw h_model'_linear
+          intro p c; rw [h_affine]; simp [model', hb_def]; ring
+        simp_rw [h_pred_model, h_pred_model'] at h_opt_ineq
+        unfold expectedSquaredError at h_opt_ineq
+        have h_ineq_resid : ∫ pc, (residual pc)^2 ∂μ ≤ ∫ pc, (residual pc - ε * pc.1)^2 ∂μ := by
+          have h_lhs : (fun pc => (Y pc.1 pc.2 - (a + b * pc.1))^2) = (fun pc => (residual pc)^2) := by
+            funext pc; rw [hres_def]; rfl
+          have h_rhs : (fun pc => (Y pc.1 pc.2 - (a + (b + ε) * pc.1))^2) = (fun pc => (residual pc - ε * pc.1)^2) := by
+            funext pc; rw [hres_def]; ring
+          simpa [h_lhs, h_rhs] using h_opt_ineq
+        have h_resid_p_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          unfold residual; simp only [hY_def, ha_def, hb_def, hμ_def]
+          have h1 : Integrable (fun pc => a * pc.1) μ := hP_int.const_mul a
+          have h2 : Integrable (fun pc => b * pc.1^2) μ := hP2_int.const_mul b
+          have h_lin_int : Integrable (fun pc => a * pc.1 + b * pc.1^2) μ := h1.add h2
+          refine (hYP_int.sub h_lin_int).congr ?_
+          filter_upwards with pc; ring
+        have i_resid_sq : Integrable (fun pc => residual pc ^ 2) μ := h_resid_sq_int
+        have i_resid_p : Integrable (fun pc => 2 * ε * residual pc * pc.1) μ := h_resid_p_int.const_mul (2 * ε)
+        have i_p_sq : Integrable (fun pc => ε^2 * pc.1^2) μ := hP2_int.const_mul (ε^2)
+        have i_full : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1^2) μ :=
+          (i_resid_sq.sub i_resid_p).add i_p_sq
+        have h_rhs_expand : ∫ pc, (residual pc - ε * pc.1)^2 ∂μ = ∫ pc, residual pc^2 ∂μ - 2 * ε * (∫ pc, residual pc * pc.1 ∂μ) + ε^2 * (∫ pc, pc.1^2 ∂μ) := by
+          have h_integrand_eq : (fun pc => (residual pc - ε * pc.1)^2) = (fun pc => residual pc^2 - 2 * ε * residual pc * pc.1 + ε^2 * pc.1^2) := by
+            funext pc; ring
+          rw [integral_congr_ae (ae_of_all _ h_integrand_eq)]
+          rw [integral_add (i_resid_sq.sub i_resid_p) i_p_sq]
+          rw [integral_sub i_resid_sq i_resid_p]
+          rw [integral_const_mul, integral_const_mul]
+          ring
+        rw [h_rhs_expand] at h_ineq_resid
+        have h_ge_zero := sub_nonneg.mpr h_ineq_resid
+        have h_cancel : (∫ pc, residual pc ^ 2 ∂μ) - (2 * ε * ∫ pc, residual pc * pc.1 ∂μ) + ε^2 * (∫ pc, pc.1^2 ∂μ) - (∫ pc, residual pc ^ 2 ∂μ) =
+                         (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε + (∫ pc, pc.1^2 ∂μ) * ε^2 := by ring
+        rw [← h_cancel]
+        exact sub_le_sub_right h_ge_zero (∫ (pc : ℝ × (Fin 1 → ℝ)), residual pc ^ 2 ∂μ)
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
