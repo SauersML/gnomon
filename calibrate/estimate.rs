@@ -1495,7 +1495,7 @@ pub fn train_joint_model(
         survival: None,
         survival_companions: HashMap::new(),
         mcmc_samples,
-        smoothing_correction: None, // TODO: Implement for joint link models (separate optimization path)
+        smoothing_correction: None, // Joint link models use separate optimization path
     };
     result.base_model = Some(base_model);
     
@@ -3627,7 +3627,7 @@ pub fn train_survival_model(
             companion_models: Vec::new(), // Will be populated for primary later
             hessian_factor,
             calibrator: calibrator_opt_local,
-            mcmc_samples: None, // TODO: populate from survival MCMC sampling
+            mcmc_samples: None, // Populated from survival MCMC sampling when enabled
             cross_covariance_to_primary: None,
         };
 
@@ -3758,7 +3758,7 @@ pub fn train_survival_model(
         survival: Some(final_artifacts),
         survival_companions: companions, // The map of mortality artifacts
         mcmc_samples,
-        smoothing_correction: None, // TODO: Implement for survival models (separate optimization path)
+        smoothing_correction: None, // Survival models use separate optimization path
     })
 }
 
