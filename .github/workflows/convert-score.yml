@@ -23,8 +23,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y bcftools default-jdk
+      - name: Install Java
+        run: sudo apt-get update && sudo apt-get install -y default-jdk
+
+      - name: Install bcftools 1.23
+        run: |
+          sudo apt-get install -y libz-dev libbz2-dev liblzma-dev libcurl4-openssl-dev
+          curl -L https://github.com/samtools/bcftools/releases/download/1.23/bcftools-1.23.tar.bz2 | tar -xj
+          cd bcftools-1.23 && make -j4 && sudo make install
 
       - name: Install gnomon
         run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
