@@ -890,7 +890,33 @@ lemma rawOptimal_implies_orthogonality
         -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
         -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
         -- Therefore: 0 ≤ -2ε∫resid + ε²
-        sorry -- Integral linearity expansion
+        -- The formal proof uses h_opt.is_optimal on a constructed competitor.
+        let model' : PhenotypeInformedGAM 1 1 1 := { model with γ₀₀ := model.γ₀₀ + ε }
+        have h_raw' : IsRawScoreModel model' := by unfold IsRawScoreModel; exact h_opt.is_raw
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        unfold expectedSquaredError at h_opt_ineq
+        have h_resid_int : Integrable residual μ := by
+          unfold residual; exact hY_int.sub ((integrable_const a).add (hP_int.const_mul b))
+        have h_pred_model' (p c) : linearPredictor model' p c = (a + b * p) + ε := by
+          simp [linearPredictor_eq_affine_of_raw _ h_raw' h_linear, ha_def]
+        have h_pred_model (p c) : linearPredictor model p c = a + b * p :=
+          linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear p c
+        simp_rw [h_pred_model', h_pred_model] at h_opt_ineq
+        have h_expand : ∫ pc, (Y pc.1 pc.2 - (a + b * pc.1 + ε))^2 ∂μ =
+            ∫ pc, (residual pc - ε)^2 ∂μ := by
+          congr 1; ext pc; simp only [hres_def]; ring
+        rw [h_expand] at h_opt_ineq
+        have h_rhs_expand : ∫ pc, (residual pc - ε)^2 ∂μ =
+            (∫ pc, residual pc^2 ∂μ) - 2*ε*(∫ pc, residual pc ∂μ) + ε^2 := by
+          have h_ae : ∀ pc, (residual pc - ε)^2 = residual pc^2 - 2*ε*residual pc + ε^2 := by intro; ring
+          calc ∫ pc, (residual pc - ε) ^ 2 ∂μ
+              = ∫ pc, residual pc^2 - 2*ε*residual pc + ε^2 ∂μ := integral_congr_ae (ae_of_all _ h_ae)
+            _ = (∫ pc, residual pc^2 ∂μ) - (∫ pc, 2*ε*residual pc ∂μ) + (∫ pc, ε^2 ∂μ) := by
+                rw [integral_add (h_resid_sq_int.sub (h_resid_int.const_mul _)) (integrable_const _)]
+                rw [integral_sub h_resid_sq_int (h_resid_int.const_mul _)]
+            _ = _ := by simp [integral_const_mul, integral_const]
+        rw [h_rhs_expand] at h_opt_ineq
+        linarith
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -952,10 +978,47 @@ lemma rawOptimal_implies_orthogonality
         --          = ∫residual² - 2ε·∫(residual·p) + ε²·∫p²
         -- Rearranging: 0 ≤ E[P²]·ε² - 2ε·E[resid·P]
         --
-        -- This requires unpacking the expectedSquaredError definition and
-        -- showing the linear predictor relationship. For now we mark this
-        -- as a technical step that follows from the model construction.
-        sorry
+        -- The formal proof uses h_opt.is_optimal on a constructed competitor.
+        let model' : PhenotypeInformedGAM 1 1 1 := { model with γₘ₀ := fun m => model.γₘ₀ m + ε }
+        have h_raw' : IsRawScoreModel model' := by unfold IsRawScoreModel; exact h_opt.is_raw
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        unfold expectedSquaredError at h_opt_ineq
+        have h_resid_int : Integrable residual μ := by
+          unfold residual; exact hY_int.sub ((integrable_const a).add (hP_int.const_mul b))
+        have h_resid_p_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          unfold residual
+          have h1 : Integrable (fun pc => Y pc.1 pc.2 * pc.1) μ := hYP_int
+          have h2 : Integrable (fun pc => (a + b * pc.1) * pc.1) μ := by
+            have haP : Integrable (fun pc => a * pc.1) μ := hP_int.const_mul a
+            have hbP2 : Integrable (fun pc => b * pc.1^2) μ := hP2_int.const_mul b
+            refine (haP.add hbP2).congr ?_
+            filter_upwards with pc; ring
+          exact h1.sub h2
+        have h_pred_model' (p c) : linearPredictor model' p c = (a + b * p) + ε * p := by
+          simp [linearPredictor_eq_affine_of_raw _ h_raw' h_linear, ha_def, hb_def]
+          ring
+        have h_pred_model (p c) : linearPredictor model p c = a + b * p :=
+          linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear p c
+        simp_rw [h_pred_model', h_pred_model] at h_opt_ineq
+        have h_expand : ∫ pc, (Y pc.1 pc.2 - (a + b * pc.1 + ε * pc.1))^2 ∂μ =
+            ∫ pc, (residual pc - ε * pc.1)^2 ∂μ := by
+          congr 1; ext pc; simp only [hres_def]; ring
+        rw [h_expand] at h_opt_ineq
+        have h_rhs_expand : ∫ pc, (residual pc - ε * pc.1)^2 ∂μ =
+            (∫ pc, residual pc^2 ∂μ) - 2*ε*(∫ pc, residual pc * pc.1 ∂μ) + ε^2*(∫ pc, pc.1^2 ∂μ) := by
+          have h_ae : ∀ pc, (residual pc - ε * pc.1)^2 = residual pc^2 - 2*ε*(residual pc * pc.1) + ε^2 * pc.1^2 := by intro; ring
+          have i_resid_sq_p : Integrable (fun pc => residual pc^2 - 2*ε*(residual pc * pc.1)) μ := by
+            apply Integrable.sub h_resid_sq_int
+            exact h_resid_p_int.const_mul (2*ε)
+          have i_p2_eps : Integrable (fun pc => ε^2 * pc.1^2) μ := hP2_int.const_mul (ε^2)
+          calc ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ
+              = ∫ pc, residual pc^2 - 2*ε*(residual pc * pc.1) + ε^2 * pc.1^2 ∂μ := integral_congr_ae (ae_of_all _ h_ae)
+            _ = (∫ pc, residual pc^2 - 2*ε*(residual pc * pc.1) ∂μ) + (∫ pc, ε^2 * pc.1^2 ∂μ) := integral_add i_resid_sq_p i_p2_eps
+            _ = (∫ pc, residual pc^2 ∂μ) - (∫ pc, 2*ε*(residual pc * pc.1) ∂μ) + (∫ pc, ε^2 * pc.1^2 ∂μ) := by
+                rw [integral_sub h_resid_sq_int (h_resid_p_int.const_mul (2*ε))]
+            _ = _ := by simp [integral_const_mul]
+        rw [h_rhs_expand] at h_opt_ineq
+        linarith
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
