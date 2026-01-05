@@ -344,18 +344,16 @@ def ensure_concatenated_reference_panel() -> Path:
 
 
 def convert_dtc_to_plink(genome_path: Path, gnomon: Path, work_dir: Path) -> Path:
-    """Convert DTC text file to PLINK using gnomon.
-
-    Note: For production use with imputation, use gnomon's --panel option to
-    harmonize strand orientation with your reference panel. This example skips
-    harmonization to avoid downloading large reference VCFs in CI.
-    """
+    """Convert DTC text file to PLINK using gnomon with harmonization."""
     cache_dir = genome_path.parent / f"{genome_path.stem}.gnomon_cache"
     plink_prefix = cache_dir / "genotypes"
 
     if plink_prefix.with_suffix(".bed").exists():
         debug(f"Using cached PLINK files for {genome_path.name}")
         return plink_prefix
+
+    # Get reference panel for harmonization
+    ref_panel = ensure_concatenated_reference_panel()
 
     # Run gnomon with a dummy score to trigger conversion
     dummy_score = work_dir / "dummy.txt"
@@ -364,10 +362,10 @@ def convert_dtc_to_plink(genome_path: Path, gnomon: Path, work_dir: Path) -> Pat
         "rs1\t1\t1000\tA\t0.0\n"
     )
 
-    # gnomon will convert and cache PLINK files
-    debug(f"Converting {genome_path.name} to PLINK...")
+    # gnomon will convert and cache PLINK files with strand harmonization
+    debug(f"Converting {genome_path.name} to PLINK with strand harmonization...")
     subprocess.run(
-        [gnomon, "score", dummy_score, genome_path, "--build", "37"],
+        [gnomon, "score", dummy_score, genome_path, "--build", "37", "--panel", ref_panel],
         capture_output=True,
     )
 
