@@ -57,8 +57,9 @@ GENOME_FILES = (
 BEAGLE_JAR_URL = "https://faculty.washington.edu/browning/beagle/beagle.27Feb25.75f.jar"
 GENETIC_MAP_URL = "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh37.map.zip"
 
-# 1000 Genomes reference panel (bref3 format - pre-filtered, no symbolic alleles)
-REF_PANEL_BASE = "https://bochet.gcc.biostat.washington.edu/beagle/1000_Genomes_phase3_v5a/b37.bref3"
+# 1000 Genomes reference panel (bref3 for Beagle, VCF for harmonization)
+REF_PANEL_BREF3 = "https://bochet.gcc.biostat.washington.edu/beagle/1000_Genomes_phase3_v5a/b37.bref3"
+REF_PANEL_VCF = "https://bochet.gcc.biostat.washington.edu/beagle/1000_Genomes_phase3_v5a/b37.vcf"
 CHROMOSOMES = [str(i) for i in range(1, 23)]  # chr1-22
 
 # --------------------------------------------------------------------------------------
@@ -245,17 +246,52 @@ def ensure_genetic_maps() -> Path:
     return maps_dir
 
 
-def ensure_reference_panel(chrom: str) -> Path:
-    """Download bref3 reference panel for a chromosome (pre-filtered, no symbolic alleles)."""
+def ensure_reference_panel_bref3(chrom: str) -> Path:
+    """Download bref3 reference panel for Beagle imputation."""
     ref_dir = CACHE_DIR / "refs" / "1kg_b37_bref3"
     ref_file = ref_dir / f"chr{chrom}.1kg.phase3.v5a.b37.bref3"
 
     if ref_file.exists():
         return ref_file
 
-    url = f"{REF_PANEL_BASE}/chr{chrom}.1kg.phase3.v5a.b37.bref3"
+    url = f"{REF_PANEL_BREF3}/chr{chrom}.1kg.phase3.v5a.b37.bref3"
     download(url, ref_file)
     return ref_file
+
+
+def ensure_reference_panel_vcf(chrom: str) -> Path:
+    """Download VCF reference panel for allele alignment."""
+    ref_dir = CACHE_DIR / "refs" / "1kg_b37_vcf"
+    ref_file = ref_dir / f"chr{chrom}.1kg.phase3.v5a.vcf.gz"
+
+    if ref_file.exists():
+        return ref_file
+
+    url = f"{REF_PANEL_VCF}/chr{chrom}.1kg.phase3.v5a.vcf.gz"
+    download(url, ref_file)
+    return ref_file
+
+
+def create_ref_allele_file(ref_vcf: Path, output: Path, chrom: str) -> None:
+    """Extract REF alleles from reference VCF for plink2 --ref-allele."""
+    if output.exists():
+        return
+
+    debug(f"Creating ref allele file for chr{chrom}...")
+    # Extract: ID REF (tab-separated) - skip symbolic alleles
+    with gzip.open(ref_vcf, 'rt') as f, open(output, 'w') as out:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            parts = line.split('\t', 5)
+            chrom_vcf, pos, vid, ref, alt = parts[:5]
+            # Skip symbolic alleles
+            if '<' in ref or '<' in alt:
+                continue
+            # Use chr:pos:ref:alt as ID if no rsID
+            if vid == '.':
+                vid = f"{chrom_vcf}:{pos}:{ref}:{alt}"
+            out.write(f"{vid}\t{ref}\n")
 
 
 # --------------------------------------------------------------------------------------
@@ -263,14 +299,55 @@ def ensure_reference_panel(chrom: str) -> Path:
 # --------------------------------------------------------------------------------------
 
 
+def ensure_concatenated_reference_panel() -> Path:
+    """Get or create a concatenated reference panel VCF for harmonization."""
+    ref_dir = CACHE_DIR / "refs" / "1kg_b37_concat"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    concat_vcf = ref_dir / "all_chromosomes.1kg.phase3.v5a.vcf.gz"
+
+    if concat_vcf.exists():
+        debug(f"Using cached concatenated reference panel: {concat_vcf}")
+        return concat_vcf
+
+    debug("Creating concatenated reference panel for harmonization...")
+
+    # Download all chromosome VCFs
+    chrom_vcfs = []
+    for chrom in CHROMOSOMES:
+        chrom_vcf = ensure_reference_panel_vcf(chrom)
+        chrom_vcfs.append(chrom_vcf)
+
+    # Concatenate using bcftools if available, otherwise just use first chromosome
+    # (gnomon's --panel can work with partial reference)
+    bcftools = ensure_bcftools()
+    if bcftools:
+        debug("Concatenating all chromosomes into single reference panel...")
+        run([
+            bcftools, "concat",
+            "-O", "z",  # Output gzipped VCF
+            "-o", concat_vcf,
+            *chrom_vcfs,
+        ])
+        run([bcftools, "index", "-t", concat_vcf])
+    else:
+        # Fallback: just use chromosome 1 as representative panel
+        debug("bcftools not available, using chromosome 1 as reference panel")
+        shutil.copy(chrom_vcfs[0], concat_vcf)
+
+    return concat_vcf
+
+
 def convert_dtc_to_plink(genome_path: Path, gnomon: Path, work_dir: Path) -> Path:
-    """Convert DTC text file to PLINK using gnomon."""
+    """Convert DTC text file to PLINK using gnomon with harmonization."""
     cache_dir = genome_path.parent / f"{genome_path.stem}.gnomon_cache"
     plink_prefix = cache_dir / "genotypes"
 
     if plink_prefix.with_suffix(".bed").exists():
         debug(f"Using cached PLINK files for {genome_path.name}")
         return plink_prefix
+
+    # Get reference panel for harmonization
+    ref_panel = ensure_concatenated_reference_panel()
 
     # Run gnomon with a dummy score to trigger conversion
     dummy_score = work_dir / "dummy.txt"
@@ -279,9 +356,10 @@ def convert_dtc_to_plink(genome_path: Path, gnomon: Path, work_dir: Path) -> Pat
         "rs1\t1\t1000\tA\t0.0\n"
     )
 
-    # gnomon will convert and cache PLINK files
+    # gnomon will convert and cache PLINK files with strand harmonization
+    debug(f"Converting {genome_path.name} to PLINK with strand harmonization...")
     subprocess.run(
-        [gnomon, "score", dummy_score, genome_path, "--build", "37"],
+        [gnomon, "score", dummy_score, genome_path, "--build", "37", "--panel", ref_panel],
         capture_output=True,
     )
 
@@ -318,7 +396,7 @@ def run_beagle_imputation(
         debug(f"Using cached {vcf_out.name}")
         return
 
-    ref_panel = ensure_reference_panel(chrom)
+    ref_panel = ensure_reference_panel_bref3(chrom)
     map_file = maps_dir / f"plink.chr{chrom}.GRCh37.map"
 
     out_prefix = vcf_out.with_suffix("").with_suffix("")  # Remove .vcf.gz

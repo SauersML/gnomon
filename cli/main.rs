@@ -697,6 +697,10 @@ enum Commands {
         /// Force genome build (37 or 38); auto-detected if not provided
         #[arg(long)]
         build: Option<String>,
+
+        /// Reference panel VCF for strand harmonization (flips alleles to match panel)
+        #[arg(long)]
+        panel: Option<PathBuf>,
     },
 
     /// Fit an HWE PCA model from the provided genotype dataset
@@ -778,7 +782,8 @@ fn main() {
             keep,
             reference,
             build,
-        }) => run_score(input_path, score, keep, reference, build),
+            panel,
+        }) => run_score(input_path, score, keep, reference, build, panel),
         Some(Commands::Fit {
             genotype_path,
             list,
@@ -941,8 +946,9 @@ fn run_score(
     keep: Option<PathBuf>,
     reference: Option<PathBuf>,
     build: Option<String>,
+    panel: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Call the score calculation logic directly
-    score_main::run_gnomon_with_args(input_path, score, keep, reference, build)
+    score_main::run_gnomon_with_args(input_path, score, keep, reference, build, panel)
         .map_err(|e| e as Box<dyn std::error::Error>)
 }

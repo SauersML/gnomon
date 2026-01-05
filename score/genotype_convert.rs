@@ -340,6 +340,7 @@ fn is_cache_valid(source_path: &Path, cache_dir: &Path) -> bool {
 /// * `input_path` - Path to the input genotype file (PLINK prefix, VCF, BCF, or DTC text)
 /// * `reference` - Optional path to reference genome FASTA (required for DTC, auto-downloaded if None)
 /// * `build` - Optional genome build override (auto-detected or defaults to GRCh38)
+/// * `panel` - Optional reference panel VCF for strand harmonization (flips alleles to match panel)
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - Path to the PLINK prefix (either original or converted)
@@ -348,6 +349,7 @@ pub fn ensure_plink_format(
     input_path: &Path,
     reference: Option<&Path>,
     build: Option<&str>,
+    panel: Option<&Path>,
 ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
     let format = detect_input_format(input_path).ok_or_else(|| {
         format!(
@@ -412,7 +414,7 @@ pub fn ensure_plink_format(
                 sex: None,
                 par_boundaries: None,
                 standardize: false,
-                panel: None,
+                panel: panel.map(|p| p.to_path_buf()),
             };
 
             // Run conversion
@@ -481,7 +483,7 @@ pub fn ensure_plink_format(
                 sex: None,
                 par_boundaries: None,
                 standardize: false,
-                panel: None,
+                panel: panel.map(|p| p.to_path_buf()),
             };
 
             // Run conversion

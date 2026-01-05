@@ -62,6 +62,10 @@ struct Args {
     /// Force genome build (37 or 38); auto-detected if not provided
     #[clap(long)]
     build: Option<String>,
+
+    /// Reference panel VCF for strand harmonization
+    #[clap(long)]
+    panel: Option<PathBuf>,
 }
 
 // ========================================================================================
@@ -78,6 +82,7 @@ pub fn run_gnomon_with_args(
     keep: Option<PathBuf>,
     reference: Option<PathBuf>,
     build: Option<String>,
+    panel: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
@@ -85,6 +90,7 @@ pub fn run_gnomon_with_args(
         input_path,
         reference,
         build,
+        panel,
     };
     run_gnomon_impl(args)
 }
@@ -107,10 +113,12 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // --- Genotype Format Conversion (if needed) ---
     // Transparently convert VCF/BCF/DTC text to PLINK format before proceeding.
+    // If --panel is provided, convert_genome will harmonize alleles to match the reference panel.
     let effective_input_path = genotype_convert::ensure_plink_format(
         &args.input_path,
         args.reference.as_deref(),
         args.build.as_deref(),
+        args.panel.as_deref(),
     )?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
