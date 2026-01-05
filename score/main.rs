@@ -19,7 +19,7 @@ use gnomon::score::pipeline::{self, PipelineContext};
 use gnomon::score::prepare;
 use gnomon::score::reformat;
 use gnomon::score::types::{GenomicRegion, PreparationResult};
-use gnomon::score::vcf_convert;
+use gnomon::score::genotype_convert;
 use natord::compare;
 use std::collections::HashMap;
 use std::error::Error;
@@ -51,9 +51,17 @@ struct Args {
     #[clap(long)]
     keep: Option<PathBuf>,
 
-    /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, or BCF file)
+    /// Path to genotype data (PLINK .bed/.bim/.fam prefix, VCF, BCF, or DTC text file)
     #[clap(value_name = "GENOTYPE_PATH")]
     input_path: PathBuf,
+
+    /// Reference genome FASTA (optional; auto-downloaded if not provided for DTC files)
+    #[clap(long)]
+    reference: Option<PathBuf>,
+
+    /// Force genome build (37 or 38); auto-detected if not provided
+    #[clap(long)]
+    build: Option<String>,
 }
 
 // ========================================================================================
@@ -68,11 +76,15 @@ pub fn run_gnomon_with_args(
     input_path: PathBuf,
     score: PathBuf,
     keep: Option<PathBuf>,
+    reference: Option<PathBuf>,
+    build: Option<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args {
         score,
         keep,
         input_path,
+        reference,
+        build,
     };
     run_gnomon_impl(args)
 }
@@ -93,9 +105,13 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let overall_start_time = Instant::now();
 
-    // --- VCF/BCF Conversion (if needed) ---
-    // Transparently convert VCF/BCF to PLINK format before proceeding.
-    let effective_input_path = vcf_convert::ensure_plink_format(&args.input_path)?;
+    // --- Genotype Format Conversion (if needed) ---
+    // Transparently convert VCF/BCF/DTC text to PLINK format before proceeding.
+    let effective_input_path = genotype_convert::ensure_plink_format(
+        &args.input_path,
+        args.reference.as_deref(),
+        args.build.as_deref(),
+    )?;
 
     let fileset_prefixes = resolve_filesets(&effective_input_path)?;
 

@@ -8,4 +8,4 @@ pub mod pipeline;
 pub mod prepare;
 pub mod reformat;
 pub mod types;
-pub mod vcf_convert;
+pub mod genotype_convert;
