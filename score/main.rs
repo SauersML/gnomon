@@ -30,6 +30,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::Instant;
+use rayon::prelude::*;
 
 // ========================================================================================
 //                              Command-line interface definition
@@ -204,7 +205,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
                 // This avoids O(n²) nested loops when checking cache freshness
                 let source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
                     all_files
-                        .iter()
+                        .par_iter()
                         .filter(|p| {
                             !p.file_name()
                                 .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
@@ -218,7 +219,7 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 // O(n) pass: check which caches are fresh
                 let fresh_cache_stems: std::collections::HashSet<String> = all_files
-                    .iter()
+                    .par_iter()
                     .filter(|p| {
                         p.file_name()
                             .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
