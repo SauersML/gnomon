@@ -1,7 +1,6 @@
 name: Jules Optimizer Loop
 
 on:
-  # Run every 30 minutes
   schedule:
     - cron: '*/3000 * * * *'
   
