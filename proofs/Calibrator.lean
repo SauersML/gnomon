@@ -1205,6 +1205,27 @@ theorem prediction_causality_tradeoff_linear_case (p sp : ℕ) [Fintype (Fin p)]
   -- This contradicts h_confounding: E[P*C] ≠ 0
   -- The full proof requires unpacking IsBayesOptimalInClass to get the
   -- normal equations, then deriving a contradiction from h_eq.
+  -- The proof is simple if we assume the model is linear, as the comments suggest.
+  -- However, `IsBayesOptimalInClass` does not imply linearity.
+  -- The statement is likely missing a hypothesis that `model` is a raw score model.
+  -- Assuming this missing hypothesis to complete a partial proof.
+  -- A complete proof would require showing the optimal model must be linear.
+  by_contra h_contra
+  -- Assume the optimal model is a raw score model for simplicity
+  -- A full proof would need to establish this first.
+  let model_raw := model
+  have h_raw : IsRawScoreModel model_raw := sorry -- Missing hypothesis
+  have h_opt_raw : IsBayesOptimalInRawClass dgp_env.to_dgp model_raw := {
+    is_raw := h_raw,
+    is_optimal := by
+      intro m_raw _
+      exact h_opt m_raw
+  }
+  -- Now we can apply the same logic as raw_score_bias_general
+  -- The true DGP is Y = 2P + 3C. So β_gen = 2, β_env = 3
+  -- The optimal raw model should have γ_m0 = 2 + 3 * E[PC]/E[P^2]
+  -- Under confounding, E[PC] != 0, so γ_m0 != 2
+  -- The formal proof requires re-deriving the normal equations for this DGP
   sorry
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
