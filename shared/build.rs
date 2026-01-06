@@ -1094,9 +1094,9 @@ fn main() {
     install_stage_panic_hook();
     configure_linker_for_low_memory();
 
-    // Always rerun this script if the build script itself changes.
+    // Cargo re-runs the build script when any file in the package changes.
+    // Do not narrow the rerun scope with cargo:rerun-if-changed directives.
     update_stage("initialization");
-    println!("cargo:rerun-if-changed=build.rs");
 
     // Emit build timestamp for version command (always, even when lint checks are skipped)
     let build_time = std::time::SystemTime::now()
