@@ -3435,7 +3435,7 @@ theorem expectedBrierScore_deriv (p π : ℝ) :
 
     Proof: The expected score is quadratic in p with positive leading coefficient,
     so it has a unique minimum where the derivative equals zero, i.e., p = π. -/
-theorem brierScore_minimized_at_true_prob (π : ℝ) (hπ : 0 ≤ π ∧ π ≤ 1) :
+theorem brierScore_minimized_at_true_prob (π : ℝ) :
     ∀ p : ℝ, expectedBrierScore π π ≤ expectedBrierScore p π := by
   intro p
   -- Expand both sides
@@ -3498,13 +3498,13 @@ structure PosteriorPrediction where
 
     This theorem justifies `quadrature.rs` and `hmc.rs` in the Rust codebase. -/
 theorem posterior_mean_optimal (pred : PosteriorPrediction)
-    (π : ℝ) (hπ : 0 ≤ π ∧ π ≤ 1)
+    (π : ℝ) (_hπ : 0 ≤ π ∧ π ≤ 1)
     (h_true : π = pred.prob_mean) :
     expectedBrierScore pred.prob_mean π ≤ expectedBrierScore pred.prob_mode π := by
   -- The posterior mean IS the true probability, so by the proper scoring rule,
   -- it achieves the minimum Brier score
   rw [← h_true]
-  exact brierScore_minimized_at_true_prob π hπ pred.prob_mode
+  exact brierScore_minimized_at_true_prob π pred.prob_mode
 
 /-- Strict optimality: if there's genuine uncertainty (Mode ≠ Mean), Mode is strictly worse. -/
 theorem posterior_mean_strictly_better (pred : PosteriorPrediction)
