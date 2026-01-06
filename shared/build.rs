@@ -72,6 +72,12 @@ struct DebugAssertCollector {
     file_path: PathBuf,
 }
 
+// A custom collector for comments that reference previous/old code or implementations
+struct PreviousCodeReferenceCollector {
+    violations: Vec<String>,
+    file_path: PathBuf,
+}
+
 static CURRENT_STAGE: OnceLock<Mutex<String>> = OnceLock::new();
 
 fn warnings_enabled() -> bool {
@@ -576,6 +582,39 @@ impl DebugAssertCollector {
     }
 }
 
+impl PreviousCodeReferenceCollector {
+    fn new(file_path: &Path) -> Self {
+        Self {
+            violations: Vec::new(),
+            file_path: file_path.to_path_buf(),
+        }
+    }
+
+    fn check_and_get_error_message(&self) -> Option<String> {
+        if self.violations.is_empty() {
+            return None;
+        }
+
+        let file_name = self.file_path.to_str().unwrap_or("?");
+        let mut error_msg = format!(
+            "\n❌ ERROR: Found {} comments referencing previous/old code or implementations in {}:\n",
+            self.violations.len(),
+            file_name
+        );
+
+        for violation in &self.violations {
+            error_msg.push_str(&format!("   {violation}\n"));
+        }
+
+        error_msg.push_str("\n⚠️ Comments that reference previous/old code, implementations, or bugs are STRICTLY FORBIDDEN in this project.\n");
+        error_msg.push_str("   Comments should describe the current code, not reference old code that no longer exists.\n");
+        error_msg.push_str("   Referencing non-existent code is confusing since readers cannot see what is being referred to.\n");
+        error_msg.push_str("   Rewrite the comment to explain the current implementation without referencing what came before.\n");
+
+        Some(error_msg)
+    }
+}
+
 // Implement the `Sink` trait for our collector.
 // The `matched` method is called by the searcher for every line that matches the regex.
 impl Sink for ViolationCollector {
@@ -1073,6 +1112,21 @@ impl Sink for DebugAssertCollector {
     }
 }
 
+impl Sink for PreviousCodeReferenceCollector {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
+        let line_text = std::str::from_utf8(mat.bytes()).unwrap_or("").trim_end();
+
+        // This collector is only used with patterns that match comments,
+        // so we just record all matches as violations
+        self.violations.push(format!("{line_number}:{line_text}"));
+
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum EmptyBlockTokenKind {
     Ident(String),
@@ -1117,6 +1171,16 @@ fn main() {
         return;
     }
 
+    // Skip lint checks when this package is being built as a dependency
+    // CARGO_PRIMARY_PACKAGE is only set for packages Cargo is directly building
+    if std::env::var("CARGO_PRIMARY_PACKAGE").is_err() {
+        update_stage("skipping lint checks (not primary package - built as dependency)");
+        return;
+    }
+
+    // Get the manifest directory to scope file scans to this crate only
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+
     // Manually check for unused variables in the build script
     update_stage("manual lint self-check");
     manually_check_for_unused_variables();
@@ -1126,7 +1190,7 @@ fn main() {
 
     // Scan Rust source files for underscore prefixed variables
     update_stage("scan underscore-prefixed bindings");
-    let underscore_violations = scan_for_underscore_prefixes();
+    let underscore_violations = scan_for_underscore_prefixes(&manifest_dir);
     let underscore_report = format!(
         "underscore scan identified {} violation groups",
         underscore_violations.len()
@@ -1136,7 +1200,7 @@ fn main() {
 
     // Scan Rust source files for disallowed `let _ = token;` patterns
     update_stage("scan disallowed let ignore patterns");
-    let disallowed_let_violations = scan_for_disallowed_let_patterns();
+    let disallowed_let_violations = scan_for_disallowed_let_patterns(&manifest_dir);
     let disallowed_let_report = format!(
         "disallowed let pattern scan identified {} violation groups",
         disallowed_let_violations.len()
@@ -1146,7 +1210,7 @@ fn main() {
 
     // Scan Rust source files for tuple destructuring patterns that discard values
     update_stage("scan tuple destructuring ignores");
-    let tuple_wildcard_violations = scan_for_tuple_wildcard_patterns();
+    let tuple_wildcard_violations = scan_for_tuple_wildcard_patterns(&manifest_dir);
     let tuple_wildcard_report = format!(
         "tuple destructuring ignore scan identified {} violation groups",
         tuple_wildcard_violations.len()
@@ -1156,7 +1220,7 @@ fn main() {
 
     // Scan Rust source files for forbidden comment patterns
     update_stage("scan forbidden comment patterns");
-    let comment_violations = scan_for_forbidden_comment_patterns();
+    let comment_violations = scan_for_forbidden_comment_patterns(&manifest_dir);
     let comment_report = format!(
         "forbidden comment scan identified {} violation groups",
         comment_violations.len()
@@ -1164,9 +1228,19 @@ fn main() {
     emit_stage_detail(&comment_report);
     all_violations.extend(comment_violations);
 
+    // Scan Rust source files for comments referencing previous/old code
+    update_stage("scan previous code reference comments");
+    let previous_code_violations = scan_for_previous_code_references(&manifest_dir);
+    let previous_code_report = format!(
+        "previous code reference scan identified {} violation groups",
+        previous_code_violations.len()
+    );
+    emit_stage_detail(&previous_code_report);
+    all_violations.extend(previous_code_violations);
+
     // Scan Rust source files for #[allow(dead_code)] attributes
     update_stage("scan allow(dead_code) attributes");
-    let dead_code_violations = scan_for_allow_dead_code();
+    let dead_code_violations = scan_for_allow_dead_code(&manifest_dir);
     let dead_code_report = format!(
         "allow(dead_code) scan identified {} violation groups",
         dead_code_violations.len()
@@ -1176,7 +1250,7 @@ fn main() {
 
     // Scan Rust source files for #[ignore] test attributes
     update_stage("scan #[ignore] test annotations");
-    let ignored_test_violations = scan_for_ignored_tests();
+    let ignored_test_violations = scan_for_ignored_tests(&manifest_dir);
     let ignored_report = format!(
         "ignored test scan identified {} violation groups",
         ignored_test_violations.len()
@@ -1186,7 +1260,7 @@ fn main() {
 
     // Scan build scripts for forbidden drop(...) usage
     update_stage("scan build script drop usage");
-    let drop_usage_violations = scan_for_drop_in_build_scripts();
+    let drop_usage_violations = scan_for_drop_in_build_scripts(&manifest_dir);
     let drop_usage_report = format!(
         "build script drop scan identified {} violation groups",
         drop_usage_violations.len()
@@ -1196,7 +1270,7 @@ fn main() {
 
     // Scan Rust source files for forbidden drop(...) usage
     update_stage("scan drop usage");
-    let drop_usage_violations = scan_for_drop_usage();
+    let drop_usage_violations = scan_for_drop_usage(&manifest_dir);
     let drop_usage_report = format!(
         "drop usage scan identified {} violation groups",
         drop_usage_violations.len()
@@ -1205,7 +1279,7 @@ fn main() {
     all_violations.extend(drop_usage_violations);
 
     update_stage("scan empty control-flow blocks");
-    let empty_block_violations = scan_for_empty_control_blocks();
+    let empty_block_violations = scan_for_empty_control_blocks(&manifest_dir);
     let empty_block_report = format!(
         "empty control-flow block scan identified {} violation groups",
         empty_block_violations.len()
@@ -1214,7 +1288,7 @@ fn main() {
     all_violations.extend(empty_block_violations);
 
     update_stage("scan debug_assert usage");
-    let debug_assert_violations = scan_for_debug_assert_usage();
+    let debug_assert_violations = scan_for_debug_assert_usage(&manifest_dir);
     let debug_assert_report = format!(
         "debug_assert scan identified {} violation groups",
         debug_assert_violations.len()
@@ -1505,7 +1579,7 @@ fn command_preview(program: &OsStr, args: &[OsString]) -> String {
     parts.join(" ")
 }
 
-fn scan_for_underscore_prefixes() -> Vec<String> {
+fn scan_for_underscore_prefixes(manifest_dir: &str) -> Vec<String> {
     // Regex pattern to find underscore prefixed variable names.
     // This pattern needs to be more generalized to catch all underscore-prefixed variables,
     // especially in match statements and destructuring patterns
@@ -1518,7 +1592,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
 
             // Use `walkdir` to find all Rust files, replacing the `find` command.
             // This is more portable and robust.
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(&manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok()) // Ignore any errors during directory traversal.
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories.
@@ -1575,7 +1649,7 @@ fn scan_for_underscore_prefixes() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_disallowed_let_patterns() -> Vec<String> {
+fn scan_for_disallowed_let_patterns(manifest_dir: &str) -> Vec<String> {
     let pattern = r"\blet\s+(?:mut\s+)?_\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;";
     let mut all_violations = Vec::new();
 
@@ -1583,7 +1657,7 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -1620,7 +1694,7 @@ fn scan_for_disallowed_let_patterns() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
+fn scan_for_tuple_wildcard_patterns(manifest_dir: &str) -> Vec<String> {
     let pattern = r"\blet\s*\([^)]*\b_\b[^)]*\)\s*(?::[^=]*)?=";
     let mut all_violations = Vec::new();
 
@@ -1628,7 +1702,7 @@ fn scan_for_tuple_wildcard_patterns() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -1669,7 +1743,7 @@ fn is_doc_comment(line: &str) -> bool {
     line.trim_start().starts_with("///")
 }
 
-fn scan_for_forbidden_comment_patterns() -> Vec<String> {
+fn scan_for_forbidden_comment_patterns(manifest_dir: &str) -> Vec<String> {
     // Regex patterns to find forbidden comment patterns
     // Note: We specifically target comments by looking for // or /* */ patterns
     // This ensures we don't flag these terms in actual code
@@ -1690,7 +1764,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         Ok(forbidden_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
@@ -1724,7 +1798,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         Ok(stars_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
@@ -1759,7 +1833,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         Ok(all_caps_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -1792,7 +1866,7 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
         Ok(dash_matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -1822,7 +1896,48 @@ fn scan_for_forbidden_comment_patterns() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_allow_dead_code() -> Vec<String> {
+fn scan_for_previous_code_references(manifest_dir: &str) -> Vec<String> {
+    // Regex pattern to catch comments that reference previous/old code or implementations
+    // This catches phrases like "previous implementation", "old code", "previously", "was before", etc.
+    // We use case-insensitive matching with (?i) and word boundaries where appropriate
+    let previous_code_pattern = r"(?i)(//|/\*|///).*\b(previous(ly)?|formerly|old(er)?|prior|past|before|used to|original(ly)?|was removed|we removed|removed the|deleted|we deleted|deprecated|replaced|obsolete|legacy|no longer|refactored from|changed from|switched from|migrated from|ported from|converted from|updated from|evolved from)\b.*(implementation|code|approach|version|logic|method|function|algorithm|behavior|behaviour|bug|error|issue|fix|solution|way|design|pattern|system|structure|handling)";
+    let mut all_violations = Vec::new();
+
+    match RegexMatcher::new_line_matcher(previous_code_pattern) {
+        Ok(matcher) => {
+            let mut searcher = Searcher::new();
+
+            for entry in WalkDir::new(manifest_dir)
+                .into_iter()
+                .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+                .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
+                .filter(|e: &walkdir::DirEntry| e.file_name() != "build.rs") // Exclude the build script itself
+                .filter(|e: &walkdir::DirEntry| e.path().extension().is_some_and(|ext| ext == "rs"))
+            {
+                let path = entry.path();
+
+                let mut collector = PreviousCodeReferenceCollector::new(path);
+                if searcher.search_path(&matcher, path, &mut collector).is_err() {
+                    continue;
+                }
+
+                if let Some(error_message) = collector.check_and_get_error_message() {
+                    all_violations.push(error_message);
+                }
+            }
+        }
+        Err(e) => {
+            all_violations.push(format!(
+                "Error creating previous code reference regex: {}",
+                e
+            ));
+        }
+    }
+
+    all_violations
+}
+
+fn scan_for_allow_dead_code(manifest_dir: &str) -> Vec<String> {
     // Regex pattern to find #[allow(dead_code)] attributes
     let pattern = r"#\s*\[\s*allow\s*\(\s*dead_code\s*\)\s*\]";
     let mut all_violations = Vec::new();
@@ -1831,7 +1946,7 @@ fn scan_for_allow_dead_code() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
@@ -1875,7 +1990,7 @@ fn scan_for_allow_dead_code() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_ignored_tests() -> Vec<String> {
+fn scan_for_ignored_tests(manifest_dir: &str) -> Vec<String> {
     // Regex pattern to find #[ignore] test attributes
     let pattern = r"#\s*\[\s*ignore\s*\]";
     let mut all_violations = Vec::new();
@@ -1884,7 +1999,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path())) // Exclude ignored directories
@@ -1928,7 +2043,7 @@ fn scan_for_ignored_tests() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_drop_in_build_scripts() -> Vec<String> {
+fn scan_for_drop_in_build_scripts(manifest_dir: &str) -> Vec<String> {
     let pattern = r"\bdrop\s*\(";
     let mut all_violations = Vec::new();
 
@@ -1936,7 +2051,7 @@ fn scan_for_drop_in_build_scripts() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -1975,7 +2090,7 @@ fn scan_for_drop_in_build_scripts() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_drop_usage() -> Vec<String> {
+fn scan_for_drop_usage(manifest_dir: &str) -> Vec<String> {
     let pattern = r"\bdrop\s*\(";
     let mut all_violations = Vec::new();
 
@@ -1983,7 +2098,7 @@ fn scan_for_drop_usage() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -2020,10 +2135,10 @@ fn scan_for_drop_usage() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_empty_control_blocks() -> Vec<String> {
+fn scan_for_empty_control_blocks(manifest_dir: &str) -> Vec<String> {
     let mut all_violations = Vec::new();
 
-    for entry in WalkDir::new(".")
+    for entry in WalkDir::new(&manifest_dir)
         .into_iter()
         .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
         .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
@@ -2047,7 +2162,7 @@ fn scan_for_empty_control_blocks() -> Vec<String> {
     all_violations
 }
 
-fn scan_for_debug_assert_usage() -> Vec<String> {
+fn scan_for_debug_assert_usage(manifest_dir: &str) -> Vec<String> {
     let pattern = r"\bdebug_assert!\s*\(";
     let mut all_violations = Vec::new();
 
@@ -2055,7 +2170,7 @@ fn scan_for_debug_assert_usage() -> Vec<String> {
         Ok(matcher) => {
             let mut searcher = Searcher::new();
 
-            for entry in WalkDir::new(".")
+            for entry in WalkDir::new(manifest_dir)
                 .into_iter()
                 .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
                 .filter(|e: &walkdir::DirEntry| !is_in_ignored_directory(e.path()))
