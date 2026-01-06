@@ -890,7 +890,30 @@ lemma rawOptimal_implies_orthogonality
         -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
         -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
         -- Therefore: 0 ≤ -2ε∫resid + ε²
-        sorry -- Integral linearity expansion
+        have h_integrable_sq_resid : Integrable (fun pc => residual pc ^ 2) μ := by
+          unfold residual; simp only [hY_def, ha_def, hb_def, hμ_def];
+          exact h_resid_sq_int
+        have h_integrable_resid : Integrable residual μ := by
+          unfold residual; simp only [hY_def, ha_def, hb_def, hμ_def];
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+        have h_calc : ∫ (pc : ℝ × (Fin 1 → ℝ)), (residual pc - ε) ^ 2 ∂μ = ∫ (pc : ℝ × (Fin 1 → ℝ)), residual pc ^ 2 ∂μ - 2 * ε * ∫ (pc : ℝ × (Fin 1 → ℝ)), residual pc ∂μ + ε ^ 2 := by
+          have h_expand_ae : ∀ᵐ (pc : ℝ × (Fin 1 → ℝ)) ∂μ, (residual pc - ε) ^ 2 = residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 := by
+            filter_upwards; intro pc; ring
+          rw [integral_congr_ae h_expand_ae]
+          have h_int_rhs1 : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc) μ := by
+            apply Integrable.sub h_integrable_sq_resid
+            exact h_integrable_resid.const_mul (2 * ε)
+          rw [integral_add h_int_rhs1 (integrable_const (ε^2))]
+          have h_int_rhs2 : Integrable (fun pc => 2 * ε * residual pc) μ := h_integrable_resid.const_mul (2 * ε)
+          rw [integral_sub h_integrable_sq_resid h_int_rhs2]
+          simp [integral_const_mul, integral_const]
+          ring
+        have h_ineq : ∫ (pc : ℝ × (Fin 1 → ℝ)), (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ ≤ ∫ (pc : ℝ × (Fin 1 → ℝ)), (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ := h_opt_ineq
+        simp_rw [linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear, h_pred_diff, ←hres_def] at h_ineq
+        rw [h_calc] at h_ineq
+        linarith
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
