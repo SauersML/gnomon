@@ -1253,16 +1253,23 @@ fn manually_check_for_unused_variables() {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let build_path = manifest_dir.join("shared/build.rs");
-
-    if !build_path.exists() {
+    
+    // Support both workspace (shared/build.rs) and standalone (build.rs) configurations
+    let shared_build_path = manifest_dir.join("shared/build.rs");
+    let toplevel_build_path = manifest_dir.join("build.rs");
+    
+    let build_path = if shared_build_path.exists() {
+        shared_build_path
+    } else if toplevel_build_path.exists() {
+        toplevel_build_path
+    } else {
         emit_stage_detail("manual lint self-check: build script source not found");
         eprintln!(
-            "manual lint self-check fatal error: build script source file {:?} is missing",
-            build_path
+            "manual lint self-check fatal error: build script source file not found at {:?} or {:?}",
+            shared_build_path, toplevel_build_path
         );
         std::process::exit(1);
-    }
+    };
 
     let deps_dir = match build_dependencies_directory() {
         Some(path) => path,
