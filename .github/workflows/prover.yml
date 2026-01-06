@@ -2,7 +2,7 @@ name: Lean Prover CI
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/140 * * * *'
   push:
     branches: [ "main" ]
     paths:
