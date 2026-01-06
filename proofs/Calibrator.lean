@@ -890,7 +890,30 @@ lemma rawOptimal_implies_orthogonality
         -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
         -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
         -- Therefore: 0 ≤ -2ε∫resid + ε²
-        admit -- Integral linearity expansion
+        -- From h_opt_ineq, we have `0 ≤ E[(Y - pred')²] - E[(Y - pred)²]`.
+        -- We expand this difference and show it equals `ε² - 2ε·E[residual]`.
+        have h_resid_int : Integrable residual μ := by
+          unfold residual; simp [hY_def, ha_def, hb_def, hμ_def]; exact hY_int.sub ((integrable_const a).add (hP_int.const_mul b))
+        have h_resid_sq_int' : Integrable (residual ^ 2) μ := by
+          unfold residual; simp [hY_def, ha_def, hb_def, hμ_def, h_resid_sq_int]
+        have h_competitor_resid_sq_int : Integrable (fun pc => (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2) μ := by
+          have h_equiv : (fun pc => (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2) = (fun pc => (residual pc - ε) ^ 2) := by
+            funext pc; unfold residual; simp [h_pred_diff]; ring
+          rw [h_equiv]
+          have h_expand : (fun pc => (residual pc - ε) ^ 2) = (fun pc => residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2) := by
+            funext pc; ring
+          rw [h_expand]
+          exact (h_resid_sq_int'.sub (h_resid_int.const_mul (2 * ε))).add (integrable_const _)
+        calc 0
+            ≤ (∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ) - (∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ) := by
+              unfold expectedSquaredError at h_opt_ineq; linarith
+          _ = ∫ pc, ((Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 - (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2) ∂μ := by
+              rw [integral_sub h_competitor_resid_sq_int h_resid_sq_int']
+          _ = ∫ pc, (ε ^ 2 - 2 * ε * residual pc) ∂μ := by
+              congr 1; funext pc; unfold residual; simp [h_pred_diff]; ring
+          _ = ε ^ 2 - 2 * ε * ∫ pc, residual pc ∂μ := by
+              rw [integral_sub (integrable_const _) (h_resid_int.const_mul (2 * ε))]
+              simp [integral_const, integral_const_mul]
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -898,65 +921,54 @@ lemma rawOptimal_implies_orthogonality
     simpa [hres_def] using h1
 
   · -- Orthogonality with P: E[residual · P] = 0
-    -- **Quadratic Perturbation Proof**:
-    -- L(ε) = E[(residual - εP)²] = E[residual²] - 2ε·E[residual·P] + ε²·E[P²]
-    -- Optimality: 0 ≤ -2ε·E[residual·P] + ε²·E[P²]
     have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
-      -- Step 1: Establish the quadratic inequality from optimality
-      -- (Constructing competitor model with slope b + ε and using h_opt.is_optimal)
       have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε +
           (∫ pc, pc.1^2 ∂μ) * ε^2 ≥ 0 := by
         intro ε
-        -- Construct a competitor raw model with slope shifted by ε
-        -- For a raw model, linearPredictor m' p c = a + (b + ε)*p
-        -- The squared error is E[(Y - (a + (b + ε)*P))²] = E[(residual - ε*P)²]
-        --                    = E[residual²] - 2ε·E[residual*P] + ε²·E[P²]
-        -- By optimality: E[residual²] ≤ E[(residual - ε*P)²]
-        -- So: 0 ≤ -2ε·E[residual*P] + ε²·E[P²]
-        -- Rearranging: (-2·E[residual*P])·ε + E[P²]·ε² ≥ 0
-        have h_expand : (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε + (∫ pc, pc.1^2 ∂μ) * ε^2 =
-            (∫ pc, pc.1^2 ∂μ) * ε^2 - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by ring
-        rw [h_expand]
-        -- This quadratic in ε is ≥ 0 when the discriminant condition is satisfied.
-        -- For optimality to hold, the parabola must be non-negative for all ε.
-        -- Since E[P²] > 0 (variance is positive), this is an upward parabola.
-        -- The minimum value is at ε = E[residual*P]/E[P²], giving minimum
-        -- -E[residual*P]²/E[P²]. For the minimum to be ≥ 0, we need E[residual*P] = 0.
-        -- The proof that this quadratic is ≥ 0 follows from h_opt.is_optimal:
-        -- perturbing the slope by ε gives a competitor model, and optimality ensures
-        -- E[resid²] ≤ E[(resid - εP)²] = E[resid²] - 2ε·E[resid·P] + ε²·E[P²]
-        --
-        -- Construct the competitor raw model with slope shifted by ε
         let model' : PhenotypeInformedGAM 1 1 1 := {
           pgsBasis := model.pgsBasis,
           pcSplineBasis := model.pcSplineBasis,
-          γ₀₀ := model.γ₀₀,      -- Same intercept
-          γₘ₀ := fun m => model.γₘ₀ m + ε,  -- Perturbed slope (only m=0 matters for Fin 1)
-          f₀ₗ := model.f₀ₗ,      -- Same (zero) spline terms
-          fₘₗ := model.fₘₗ,      -- Same (zero) interaction terms
+          γ₀₀ := model.γ₀₀,
+          γₘ₀ := fun m => model.γₘ₀ m + ε,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
           link := model.link,
           dist := model.dist
         }
-        -- model' is a raw model (inherits zero spline terms from model)
         have h_raw' : IsRawScoreModel model' := {
           f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
           fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
         }
-        -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
         have h_opt_ineq := h_opt.is_optimal model' h_raw'
-        -- The linear predictor of model' is: a + (b + ε)*p
-        -- The linear predictor of model is: a + b*p
-        -- So (Y - pred') = (Y - pred) - ε*p = residual - ε*p
-        -- Therefore: ∫(Y - pred)² ≤ ∫(residual - ε*p)²
-        --          = ∫(residual² - 2ε·residual·p + ε²·p²)
-        --          = ∫residual² - 2ε·∫(residual·p) + ε²·∫p²
-        -- Rearranging: 0 ≤ E[P²]·ε² - 2ε·E[resid·P]
-        --
-        -- This requires unpacking the expectedSquaredError definition and
-        -- showing the linear predictor relationship. For now we mark this
-        -- as a technical step that follows from the model construction.
-        admit
-      -- Step 2: Apply the quadratic perturbation lemma
+        have h_pred_diff' : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε * p_val := by
+          intro p_val c_val; unfold linearPredictor; simp [model']; ring_nf
+        have h_resid_int : Integrable residual μ := by
+          unfold residual; simp [hY_def, ha_def, hb_def, hμ_def]; exact hY_int.sub ((integrable_const a).add (hP_int.const_mul b))
+        have h_resid_p_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          unfold residual; simp [hY_def, ha_def, hb_def, hμ_def]
+          exact (hYP_int.sub (hP_int.const_mul a)).sub (hP2_int.const_mul b)
+        have h_resid_sq_int' : Integrable (residual ^ 2) μ := by
+          unfold residual; simp [hY_def, ha_def, hb_def, hμ_def, h_resid_sq_int]
+        have h_competitor_resid_sq_int : Integrable (fun pc => (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2) μ := by
+          have h_equiv : (fun pc => (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2) = (fun pc => (residual pc - ε * pc.1) ^ 2) := by
+            funext pc; unfold residual; simp [h_pred_diff']; ring
+          rw [h_equiv]
+          have h_expand : (fun pc => (residual pc - ε * pc.1) ^ 2) = (fun pc => residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2) := by
+            funext pc; ring
+          rw [h_expand]
+          exact (h_resid_sq_int'.sub (h_resid_p_int.const_mul (2 * ε))).add (hP2_int.const_mul (ε^2))
+        calc 0
+            ≤ (∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ) - (∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ) := by
+              unfold expectedSquaredError at h_opt_ineq; linarith
+          _ = ∫ pc, ((Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 - (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2) ∂μ := by
+              rw [integral_sub h_competitor_resid_sq_int h_resid_sq_int']
+          _ = ∫ pc, (ε^2 * pc.1^2 - 2 * ε * residual pc * pc.1) ∂μ := by
+              congr 1; funext pc; unfold residual; simp [h_pred_diff']; ring
+          _ = (∫ pc, ε^2 * pc.1^2 ∂μ) - (∫ pc, 2 * ε * residual pc * pc.1 ∂μ) := by
+              rw [integral_sub (hP2_int.const_mul (ε^2)) (h_resid_p_int.const_mul (2*ε))]
+          _ = ε^2 * (∫ pc, pc.1^2 ∂μ) - 2 * ε * (∫ pc, residual pc * pc.1 ∂μ) := by
+              simp [integral_const_mul]
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
       linarith
