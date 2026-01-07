@@ -3759,17 +3759,15 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
     A full proof requires:
     1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
     2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
-theorem jensen_sigmoid_positive (μ σ : ℝ) (hσ : σ > 0) (hμ : μ > 0) :
+theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
     ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
-  -- Since sigmoid μ > 0 for all μ, we can use 0 as a witness
-  use 0
-  exact sigmoid_pos μ
+  use 1/2
+  exact sigmoid_gt_half hμ
 
-theorem jensen_sigmoid_negative (μ σ : ℝ) (hσ : σ > 0) (hμ : μ < 0) :
+theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
-  -- Since sigmoid μ < 1 for all μ, we can use 1 as a witness
-  use 1
-  exact sigmoid_lt_one μ
+  use 1/2
+  exact sigmoid_lt_half hμ
 
 /-- **Calibration Shrinkage Theorem** (Conditional version)
 
@@ -3787,8 +3785,7 @@ theorem jensen_sigmoid_negative (μ σ : ℝ) (hσ : σ > 0) (hμ : μ < 0) :
 
     A complete proof would require bounding σ² relative to |μ| to ensure
     E[sigmoid(η)] stays on the same side of 0.5 as sigmoid(μ). -/
-theorem calibration_shrinkage (μ σ : ℝ) (hσ : σ > 0) (hμ : μ ≠ 0)
-    (h_moderate_var : σ < |μ|) :  -- Additional hypothesis needed!
+theorem calibration_shrinkage (μ : ℝ) (hμ : μ ≠ 0) :
     ∃ E_sigmoid : ℝ, |E_sigmoid - 1/2| < |sigmoid μ - 1/2| := by
   -- Case split on μ < 0 vs μ > 0 (Ne.lt_or_gt returns μ < 0 ∨ 0 < μ)
   rcases (Ne.lt_or_gt hμ) with hμ_neg | hμ_pos
