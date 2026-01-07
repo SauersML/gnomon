@@ -1379,10 +1379,41 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   unfold Matrix.mulVec designMatrix packParams
   simp only [Matrix.of_apply]
 
-  -- The rest requires matching the ParamIx sum structure with linearPredictor's definition.
-  -- This involves showing that the vectorized parameters reconstruct the original prediction.
-  -- See: Wood (2017), "Generalized Additive Models", Section 4.2 on basis representation.
-  sorry -- Sum manipulation with ParamIx (basis reconstruction proof)
+  -- Proof by direct expansion of both sides and rearranging sums.
+  -- The key is that both `linearPredictor` and the `designMatrix` construction
+  -- are organized around the same 4-part structure of parameters, which we
+  -- formalize using `ParamIx`.
+
+  -- Unfold all relevant definitions to expose the raw summations.
+  unfold linearPredictor designMatrix packParams Matrix.mulVec evalSmooth Matrix.of_apply
+  simp_rw [h_pgs, h_spline, hm.basis_match, hm.spline_match]
+  dsimp
+
+  -- Rewrite the sum over the structured index `ParamIx` to a sum over the
+  -- equivalent `Sum` type, which can be broken apart.
+  rw [Fintype.sum_equiv (ParamIx.equivSum p k sp) _ _ (by simp)]
+  simp only [Function.comp_apply, Equiv.symm_apply_apply]
+
+  -- Split the sum over the four parts of the `ParamIxSum` type.
+  rw [Finset.sum_sum_type, Finset.sum_sum_type, Finset.sum_sum_type, Finset.sum_unit]
+  dsimp
+
+  -- Rearrange the sums on the RHS to match the structure of the LHS.
+  -- The interaction term has a sum over `Fin p × Fin k × Fin sp`.
+  -- We use `Finset.sum_sum_type` to break this down. `Fin p × Fin k × Fin sp` is `(Fin p × Fin k) × Fin sp`.
+  rw [Finset.sum_sum_type]
+  conv_rhs =>
+    arg 1
+    find (_ : Fin p × Fin k) =>
+      rw [Finset.sum_sum_type]
+  -- The PC spline term has a sum over `Fin k × Fin sp`.
+  rw [Finset.sum_product]
+
+  -- On the LHS, distribute the `pgs_basis_val` term.
+  rw [Finset.sum_add_distrib]
+
+  -- All terms now match up to associativity and commutativity of addition.
+  ac_rfl
 
 /-- Full column rank implies `X.mulVec` is injective.
 
