@@ -886,11 +886,70 @@ lemma rawOptimal_implies_orthogonality
           apply Integrable.sub hY_int
           apply Integrable.add (integrable_const a)
           exact hP_int.const_mul b
-        -- From h_opt_ineq and h_pred_diff, we get:
-        -- ∫(Y - pred)² ≤ ∫(Y - (pred + ε))² = ∫(residual - ε)²
-        -- Expanding: ∫resid² ≤ ∫resid² - 2ε∫resid + ε²
-        -- Therefore: 0 ≤ -2ε∫resid + ε²
-        admit -- Integral linearity expansion
+        -- Complete the proof by showing the integral expansion
+        -- Strategy: ∫(resid - ε)² = ∫resid² - 2ε∫resid + ε²
+        -- Then: ∫resid² ≤ ∫(resid - ε)² from optimality
+        -- Gives: 0 ≤ ε² - 2ε∫resid
+
+        -- Show the linearPredictor relationship for model
+        have h_pred_model : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model' p_val c_val = a + b * p_val + ε := by
+          intro p_val c_val
+          have h := h_pred_diff p_val c_val
+          rw [h_pred_model] at h
+          linarith
+
+        -- The key: expand (Y - pred')² in terms of residual
+        -- Y - pred' = Y - (a + b*p + ε) = (Y - a - b*p) - ε = residual - ε
+        have h_resid_shift : ∀ pc : ℝ × (Fin 1 → ℝ),
+            Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2 = residual pc - ε := by
+          intro pc
+          simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+          ring
+
+        -- The optimality inequality becomes: ∫resid² ≤ ∫(resid - ε)²
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+            congr 1; ext pc; exact congrArg (· ^ 2) (h_resid_shift pc)
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        -- Expand: (resid - ε)² = resid² - 2ε·resid + ε²
+        -- ∫(resid - ε)² = ∫resid² - 2ε·∫resid + ε² (by integral linearity)
+        have h_expand : ∫ pc, (residual pc - ε) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+          -- The algebraic expansion and integral linearity
+          have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+            simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]; exact h_resid_sq_int
+          have h_cross_int : Integrable (fun pc => residual pc) μ := h_resid_int
+          -- (a - b)² = a² - 2ab + b²
+          have heq : ∀ pc, (residual pc - ε) ^ 2 = residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 := by
+            intro pc; ring
+          -- Integral linearity: ∫(f + g + h) = ∫f + ∫g + ∫h
+          calc ∫ pc, (residual pc - ε) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+                -- Split using integral linearity
+                have h1 : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc) μ :=
+                  h_resid_sq_int'.sub (h_cross_int.const_mul (2 * ε))
+                have h2 : Integrable (fun _ : ℝ × (Fin 1 → ℝ) => ε ^ 2) μ := integrable_const _
+                rw [integral_add h1 h2, integral_sub h_resid_sq_int' (h_cross_int.const_mul (2 * ε))]
+                simp [MeasureTheory.integral_const, MeasureTheory.integral_const_mul]
+
+        -- Combine: from h_ineq and h_expand, derive 0 ≤ ε² - 2ε∫resid
+        rw [h_expand] at h_ineq
+        linarith
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
@@ -944,18 +1003,110 @@ lemma rawOptimal_implies_orthogonality
         }
         -- Apply optimality: E[(Y - pred)²] ≤ E[(Y - pred')²]
         have h_opt_ineq := h_opt.is_optimal model' h_raw'
-        -- The linear predictor of model' is: a + (b + ε)*p
-        -- The linear predictor of model is: a + b*p
-        -- So (Y - pred') = (Y - pred) - ε*p = residual - ε*p
-        -- Therefore: ∫(Y - pred)² ≤ ∫(residual - ε*p)²
-        --          = ∫(residual² - 2ε·residual·p + ε²·p²)
-        --          = ∫residual² - 2ε·∫(residual·p) + ε²·∫p²
-        -- Rearranging: 0 ≤ E[P²]·ε² - 2ε·E[resid·P]
-        --
-        -- This requires unpacking the expectedSquaredError definition and
-        -- showing the linear predictor relationship. For now we mark this
-        -- as a technical step that follows from the model construction.
-        admit
+        -- Complete the proof by showing the integral expansion
+        -- We need: ∫(resid - ε*P)² = ∫resid² - 2ε∫(resid*P) + ε²∫P²
+        -- Then use: ∫resid² ≤ ∫(resid - ε*P)² from optimality
+        -- To get: 0 ≤ ε²∫P² - 2ε∫(resid*P)
+
+        -- Derive integrability of residual
+        have h_resid_int : Integrable residual μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+
+        -- Derive integrability of residual * P
+        have h_resid_P_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          -- (Y - a - b*P) * P = Y*P - a*P - b*P²
+          have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) μ := hYP_int
+          have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => a * pc.1) μ := hP_int.const_mul a
+          have h3 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => b * pc.1 ^ 2) μ := hP2_int.const_mul b
+          have heq : ∀ pc : ℝ × (Fin 1 → ℝ),
+              (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 =
+              dgp.trueExpectation pc.1 pc.2 * pc.1 - a * pc.1 - b * pc.1 ^ 2 := by
+            intro pc; ring
+          exact ((h1.sub h2).sub h3).congr (ae_of_all _ (fun pc => (heq pc).symm))
+
+        -- Squared residual is integrable
+        have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+          simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]
+          exact h_resid_sq_int
+
+        -- Show the linearPredictor relationships
+        have h_pred_model : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin 1 → ℝ),
+            linearPredictor model' p_val c_val = a + (b + ε) * p_val := by
+          intro p_val c_val
+          have h := linearPredictor_eq_affine_of_raw model' h_raw' h_linear p_val c_val
+          -- h : linearPredictor model' p_val c_val = model'.γ₀₀ + model'.γₘ₀ 0 * p_val
+          -- model' has γ₀₀ = a, γₘ₀ = fun m => b + ε (at m=0)
+          simp only [model', ha_def, hb_def] at h
+          -- h : linearPredictor model' ... = model.γ₀₀ + (model.γₘ₀ 0 + ε) * p_val
+          convert h using 2 <;> ring
+
+        -- Expand the integral of (resid - ε*P)²
+        have h_expand_full : ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ + ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+          have heq : ∀ pc, (residual pc - ε * pc.1) ^ 2 =
+              residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 := by
+            intro pc; ring
+          calc ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                -- Split the integral using linearity
+                have h1 : Integrable (fun pc => residual pc ^ 2) μ := h_resid_sq_int'
+                have h2 : Integrable (fun pc => 2 * ε * residual pc * pc.1) μ := by
+                  have h := h_resid_P_int.const_mul (2 * ε)
+                  refine h.congr (ae_of_all _ ?_)
+                  intro pc; ring
+                have h3 : Integrable (fun pc => ε ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (ε ^ 2)
+                -- Rewrite f - g + h = (f - g) + h, then split
+                have hsum_eq : ∀ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 =
+                    (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 := by
+                  intro pc; ring
+                calc ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ
+                    = ∫ pc, (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      rfl
+                  _ = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 ∂μ + ∫ pc, ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      exact integral_add (h1.sub h2) h3
+                  _ = (∫ pc, residual pc ^ 2 ∂μ - ∫ pc, 2 * ε * residual pc * pc.1 ∂μ) +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      rw [integral_sub h1 h2, integral_const_mul]
+                  _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      -- Show ∫ 2*ε*resid*P = 2*ε * ∫ resid*P
+                      have hcm : ∫ pc, 2 * ε * residual pc * pc.1 ∂μ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by
+                        have heq' : ∀ pc, 2 * ε * residual pc * pc.1 = 2 * ε * (residual pc * pc.1) := by
+                          intro pc; ring
+                        calc ∫ pc, 2 * ε * residual pc * pc.1 ∂μ
+                            = ∫ pc, 2 * ε * (residual pc * pc.1) ∂μ := by congr 1; funext pc; exact heq' pc
+                          _ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := integral_const_mul _ _
+                      rw [hcm]
+
+        -- The optimality inequality in terms of residuals
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+            ring
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        -- Combine: from h_ineq and h_expand_full, derive the quadratic inequality
+        rw [h_expand_full] at h_ineq
+        linarith
       -- Step 2: Apply the quadratic perturbation lemma
       have h_coeff := linear_coeff_zero_of_quadratic_nonneg
         (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
