@@ -2414,44 +2414,30 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   --
   -- Assuming we had this hypothesis, the proof would proceed as:
 
-  -- Step 1: Assume linear basis (this should be added to theorem hypotheses)
-  by_cases h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id
-  case pos =>
-    -- Use linearPredictor_decomp with the linear basis hypothesis
-    have h_decomp := linearPredictor_decomp model h_linear_basis
+  -- Use linearPredictor_decomp with the linear basis hypothesis
+  have h_decomp := linearPredictor_decomp model h_linear_basis
 
-    -- Apply decomposition at p=0 and p=1
-    rw [h_decomp 0 c] at h_at_0
-    rw [h_decomp 1 c] at h_at_1
+  -- Apply decomposition at p=0 and p=1
+  rw [h_decomp 0 c] at h_at_0
+  rw [h_decomp 1 c] at h_at_1
 
-    -- At p=0: predictorBase + predictorSlope * 0 = 0
-    simp only [mul_zero, add_zero] at h_at_0
-    -- This gives: predictorBase model c = 0
+  -- At p=0: predictorBase + predictorSlope * 0 = 0
+  simp only [mul_zero, add_zero] at h_at_0
+  -- This gives: predictorBase model c = 0
 
-    -- At p=1: predictorBase + predictorSlope * 1 = α(c)
-    simp only [mul_one] at h_at_1
-    -- This gives: predictorBase model c + predictorSlope model c = α(c)
+  -- At p=1: predictorBase + predictorSlope * 1 = α(c)
+  simp only [mul_one] at h_at_1
+  -- This gives: predictorBase model c + predictorSlope model c = α(c)
 
-    -- Combining: 0 + predictorSlope model c = α(c)
-    rw [h_at_0] at h_at_1
-    simp only [zero_add] at h_at_1
+  -- Combining: 0 + predictorSlope model c = α(c)
+  rw [h_at_0] at h_at_1
+  simp only [zero_add] at h_at_1
 
-    -- Now predictorSlope model c = α(c)
-    -- By definition of predictorSlope:
-    unfold predictorSlope at h_at_1
-    -- This gives exactly the goal: γₘ₀[0] + Σₗ evalSmooth(...) = α(c)
-    exact h_at_1
-
-  case neg =>
-    -- Without the linear basis hypothesis, we cannot use linearPredictor_decomp
-    -- This is a fundamental gap: the theorem assumes a linear relationship
-    -- between P and the prediction, but doesn't enforce it via the PGS basis.
-    --
-    -- For the theorem to be provable, we need to either:
-    -- 1. Add h_linear_basis as a hypothesis, OR
-    -- 2. Add a constraint that IsBayesOptimalInClass forces the model to have
-    --    a linear basis when the DGP is linear in P
-    sorry
+  -- Now predictorSlope model c = α(c)
+  -- By definition of predictorSlope:
+  unfold predictorSlope at h_at_1
+  -- This gives exactly the goal: γₘ₀[0] + Σₗ evalSmooth(...) = α(c)
+  exact h_at_1
 
 /-- Predictions are invariant under affine transformations of ancestry coordinates.
 
