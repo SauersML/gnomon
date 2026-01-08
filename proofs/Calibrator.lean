@@ -1331,30 +1331,33 @@ structure DGPWithEnvironment (k : ℕ) where
   trueGeneticEffect : ℝ → ℝ
   is_additive_causal : to_dgp.trueExpectation = fun p c => trueGeneticEffect p + environmentalEffect c
 
-theorem prediction_causality_tradeoff_linear_case (p sp : ℕ) [Fintype (Fin p)] [Fintype (Fin sp)] (dgp_env : DGPWithEnvironment 1)
-    (hp_pos : p > 0)
+theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fintype (Fin sp)]
+    (dgp_env : DGPWithEnvironment 1)
     (h_gen : dgp_env.trueGeneticEffect = fun p => 2 * p)
     (h_env : dgp_env.environmentalEffect = fun c => 3 * (c ⟨0, by norm_num⟩))
-    (h_confounding : ∫ pc, pc.1 * (pc.2 ⟨0, by norm_num⟩) ∂dgp_env.to_dgp.jointMeasure ≠ 0)
-    (model : PhenotypeInformedGAM p 1 sp)
-    (h_opt : IsBayesOptimalInClass dgp_env.to_dgp model) :
-    model.γₘ₀ ⟨0, hp_pos⟩ ≠ 2 := by
-  -- Under confounding (E[P*C] ≠ 0), the Bayes-optimal coefficient absorbs
-  -- the confounding effect and differs from the true genetic effect (2).
+    (h_confounding : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure ≠ 0)
+    (model : PhenotypeInformedGAM 1 1 sp)
+    (h_opt : IsBayesOptimalInRawClass dgp_env.to_dgp model)
+    (h_pgs_basis_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
+    (hP0 : ∫ pc, pc.1 ∂dgp_env.to_dgp.jointMeasure = 0)
+    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
+    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
+    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
+    model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
+  -- Under confounding (E[P*C] ≠ 0), the Bayes-optimal raw-score coefficient for P
+  -- absorbs the confounding effect and differs from the true genetic effect (2).
   --
   -- The true DGP is: Y = 2P + 3C
-  -- Under h_opt, the model minimizes E[(Y - pred)²]
-  -- For a linear model pred = γ₀ + γ₁*P (ignoring C for raw models):
-  --   γ₁ = Cov(Y, P) / Var(P) = (2*Var(P) + 3*Cov(C,P)) / Var(P)
-  --      = 2 + 3*Cov(C,P)/Var(P)
-  -- Since Cov(C,P) = E[P*C] - E[P]*E[C] and under confounding E[P*C] ≠ 0,
-  -- we have γ₁ ≠ 2.
-  intro h_eq
-  apply h_confounding
-  -- If γₘ₀ = 2, then the confounding term must be zero for optimality
-  -- This contradicts h_confounding: E[P*C] ≠ 0
-  -- The full proof requires unpacking IsBayesOptimalInClass to get the
-  -- normal equations, then deriving a contradiction from h_eq.
+  -- The raw model is misspecified: Ŷ = a + bP
+  -- The normal equations for the L² projection of Y onto span{1, P} are:
+  --   a = E[Y] - b*E[P] = E[2P + 3C] = 0
+  --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
+  --
+  -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
   sorry
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
