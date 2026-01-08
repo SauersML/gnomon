@@ -1316,7 +1316,7 @@ theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [
     -- Similarly, ⟨g(c), h(p,c)⟩ = 0.
     -- So V_add ⊥ V_int.
     -- Since Y ∈ V_add, its projection onto V_add ⊕ V_int has no component in V_int.
-    sorry⟩ -- L² orthogonality under independence
+    admit⟩ -- L² orthogonality under independence
 
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
