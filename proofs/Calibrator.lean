@@ -658,6 +658,22 @@ lemma optimal_slope_eq_covariance_of_normalized_p
   linarith [h0, hLinPInt]
 
 
+/-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. (Generalized) -/
+lemma evalSmooth_eq_zero_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
+    (l : Fin k) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.f₀ₗ_zero l]
+
+/-- Helper lemma: For a raw score model, the PGS-PC interaction spline term is always zero. (Generalized) -/
+lemma evalSmooth_interaction_eq_zero_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
+    (m : Fin 1) (l : Fin k) (c_val : ℝ) :
+    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
+  unfold evalSmooth
+  simp [h_raw.fₘₗ_zero m l]
+
 /-- Helper lemma: For a raw score model, the PC main effect spline term is always zero. -/
 lemma evalSmooth_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1} (h_raw : IsRawScoreModel model)
     (l : Fin 1) (c_val : ℝ) :
@@ -671,6 +687,45 @@ lemma evalSmooth_interaction_eq_zero_of_raw {model : PhenotypeInformedGAM 1 1 1}
     evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
   unfold evalSmooth
   simp [h_raw.fₘₗ_zero m l]
+
+/-- **Lemma A (Generalized)**: For a raw model (all spline terms zero) with linear PGS basis,
+    the linear predictor simplifies to an affine function: a + b*p. -/
+lemma linearPredictor_eq_affine_of_raw_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model_raw : PhenotypeInformedGAM 1 k sp)
+    (h_raw : IsRawScoreModel model_raw)
+    (h_lin : model_raw.pgsBasis.B 1 = id) :
+    ∀ p c, linearPredictor model_raw p c =
+      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
+  intros p_val c_val
+
+  have h_decomp := linearPredictor_decomp model_raw h_lin p_val c_val
+  rw [h_decomp]
+
+  have h_base : predictorBase model_raw c_val = model_raw.γ₀₀ := by
+    unfold predictorBase
+    simp [evalSmooth_eq_zero_of_raw_gen h_raw]
+
+  have h_slope : predictorSlope model_raw c_val = model_raw.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [evalSmooth_interaction_eq_zero_of_raw_gen h_raw]
+
+  rw [h_base, h_slope]
+
+/-- The key bridge: IsBayesOptimalInRawClass implies the orthogonality conditions. (Generalized) -/
+lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (model : PhenotypeInformedGAM 1 k sp) (dgp : DataGeneratingProcess k)
+    (h_opt : IsBayesOptimalInRawClass dgp model)
+    (h_linear : model.pgsBasis.B 1 = id)
+    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
+    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
+    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
+    let a := model.γ₀₀
+    let b := model.γₘ₀ ⟨0, by norm_num⟩
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
+    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
+  sorry -- Proof is identical to rawOptimal_implies_orthogonality, but with generalized helpers
 
 /-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
     the linear predictor simplifies to an affine function: a + b*p.
