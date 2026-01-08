@@ -2304,7 +2304,8 @@ structure DGPWithLatentRisk (k : ℕ) where
     This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1) :
+    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1)
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
