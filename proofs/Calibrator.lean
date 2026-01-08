@@ -3303,7 +3303,7 @@ def sumToZeroConstraint (n : ℕ) : Matrix (Fin n) (Fin 1) ℝ :=
     Note: This theorem uses a specialized constraint for k=1. -/
 theorem sum_to_zero_after_projection
     (B : Matrix (Fin n) (Fin m) ℝ)
-    (W : Matrix (Fin n) (Fin n) ℝ)
+    (W : Matrix (Fin n) (Fin n) ℝ) (hW_diag : W = Matrix.diagonal (fun i => W i i))
     (Z : Matrix (Fin m) (Fin (m - 1)) ℝ)
     (h_constraint : SpansNullspace Z (Matrix.transpose (Matrix.transpose B * W * sumToZeroConstraint n)))
     (β : Fin (m - 1) → ℝ) :
