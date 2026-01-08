@@ -194,80 +194,76 @@ fn run_gnomon_impl(args: Args) -> Result<(), Box<dyn Error + Send + Sync>> {
             (resolved.paths, resolved.regions)
         } else {
             let files: Vec<PathBuf> = if args.score.is_dir() {
-                let all_files: Vec<PathBuf> = fs::read_dir(&args.score)?
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|p| p.is_file())
-                    .collect();
+                // Single pass to collect files and build metadata maps
+                // Consolidating iterations improves performance by reducing I/O and vector traversals
+                let mut source_files: Vec<(PathBuf, String)> = Vec::new();
+                let mut cache_files: Vec<(PathBuf, String)> = Vec::new();
+                let mut source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
+                    std::collections::HashMap::new();
 
-                // O(n) pre-pass: build HashMap of stem -> source file mtime
-                // This avoids O(n²) nested loops when checking cache freshness
-                let source_mtimes: std::collections::HashMap<String, std::time::SystemTime> =
-                    all_files
-                        .iter()
-                        .filter(|p| {
-                            !p.file_name()
-                                .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
-                        })
-                        .filter_map(|p| {
-                            let stem = p.file_stem()?.to_string_lossy().to_string();
-                            let mtime = fs::metadata(p).and_then(|m| m.modified()).ok()?;
-                            Some((stem, mtime))
-                        })
-                        .collect();
+                for entry in fs::read_dir(&args.score)? {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
 
-                // O(n) pass: check which caches are fresh
-                let fresh_cache_stems: std::collections::HashSet<String> = all_files
-                    .iter()
-                    .filter(|p| {
-                        p.file_name()
-                            .map_or(false, |n| n.to_string_lossy().ends_with(".gnomon.tsv"))
-                    })
-                    .filter_map(|cache_path| {
-                        let name = cache_path.file_name()?.to_string_lossy();
-                        let stem = name.strip_suffix(".gnomon.tsv")?;
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
 
-                        // O(1) lookup instead of O(n) scan
-                        let source_mtime = source_mtimes.get(stem);
-
-                        if source_mtime.is_none() {
-                            // No source file, cache is standalone (keep it)
-                            return Some(stem.to_string());
+                    if name.ends_with(".gnomon.tsv") {
+                        if let Some(stem) = name.strip_suffix(".gnomon.tsv") {
+                            cache_files.push((path, stem.to_string()));
                         }
-
-                        let cache_mtime =
-                            fs::metadata(cache_path).and_then(|m| m.modified()).ok()?;
-                        let source_is_newer =
-                            source_mtime.map_or(false, |&src_time| src_time > cache_mtime);
-
-                        if source_is_newer {
-                            None // Cache is stale, don't skip source
-                        } else {
-                            Some(stem.to_string()) // Cache is fresh, skip source
-                        }
-                    })
-                    .collect();
-
-                // O(n) final filter
-                all_files
-                    .into_iter()
-                    .filter(|p| {
-                        let name = p
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if name.ends_with(".gnomon.tsv") {
-                            let stem = name.strip_suffix(".gnomon.tsv").unwrap_or(&name);
-                            return fresh_cache_stems.contains(stem);
-                        }
-                        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                            if fresh_cache_stems.contains(&stem) {
-                                return false;
+                    } else {
+                        if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                            // Grab mtime eagerly for source files
+                            if let Ok(m) = fs::metadata(&path) {
+                                if let Ok(mtime) = m.modified() {
+                                    source_mtimes.insert(stem.clone(), mtime);
+                                }
                             }
+                            source_files.push((path, stem));
                         }
-                        true
-                    })
-                    .collect()
+                    }
+                }
+
+                let mut final_files = Vec::with_capacity(source_files.len() + cache_files.len());
+                let mut covered_stems = std::collections::HashSet::new();
+
+                // Process cache files first to determine which are fresh
+                for (path, stem) in cache_files {
+                    let keep_cache = match source_mtimes.get(&stem) {
+                        Some(&src_mtime) => {
+                            // Source exists, check if cache is fresh
+                            // Cache is fresh if it exists and is not older than source
+                            fs::metadata(&path)
+                                .and_then(|m| m.modified())
+                                .map(|cache_mtime| cache_mtime >= src_mtime)
+                                .unwrap_or(false)
+                        }
+                        None => true, // Orphan cache -> keep
+                    };
+
+                    if keep_cache {
+                        final_files.push(path);
+                        covered_stems.insert(stem);
+                    }
+                }
+
+                // Add source files that aren't covered by a fresh cache
+                for (path, stem) in source_files {
+                    if !covered_stems.contains(&stem) {
+                        final_files.push(path);
+                    }
+                }
+
+                final_files
             } else {
                 vec![args.score.clone()]
             };
