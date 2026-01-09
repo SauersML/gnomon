@@ -725,7 +725,213 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
     let b := model.γₘ₀ ⟨0, by norm_num⟩
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  sorry -- Proof is identical to rawOptimal_implies_orthogonality, but with generalized helpers
+
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+  set μ := dgp.jointMeasure with hμ_def
+  set Y := dgp.trueExpectation with hY_def
+
+  set residual : ℝ × (Fin k → ℝ) → ℝ := fun pc => Y pc.1 pc.2 - (a + b * pc.1) with hres_def
+  constructor
+  · have h1 : ∫ pc, residual pc ∂μ = 0 := by
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 ≥ 0 := by
+        intro ε
+        have h_expand : (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 =
+            ε^2 - 2 * ε * ∫ pc, residual pc ∂μ := by ring
+        rw [h_expand]
+        let model' : PhenotypeInformedGAM 1 k sp := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀ + ε,
+          γₘ₀ := model.γₘ₀,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
+          link := model.link,
+          dist := model.dist
+        }
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_pred_diff : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = linearPredictor model p_val c_val + ε := by
+          intro p_val c_val
+          unfold linearPredictor
+          simp only [model']
+          ring
+        unfold expectedSquaredError at h_opt_ineq
+        have h_resid_int : Integrable residual μ := by
+          unfold residual
+          simp only [hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+
+        have h_pred_model : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw_gen model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = a + b * p_val + ε := by
+          intro p_val c_val
+          have h := h_pred_diff p_val c_val
+          rw [h_pred_model] at h
+          linarith
+
+        have h_resid_shift : ∀ pc : ℝ × (Fin k → ℝ),
+            Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2 = residual pc - ε := by
+          intro pc
+          simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+          ring
+
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε) ^ 2 ∂μ := by
+            congr 1; ext pc; exact congrArg (· ^ 2) (h_resid_shift pc)
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        have h_expand : ∫ pc, (residual pc - ε) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+          have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+            simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]; exact h_resid_sq_int
+          have h_cross_int : Integrable (fun pc => residual pc) μ := h_resid_int
+          have heq : ∀ pc, (residual pc - ε) ^ 2 = residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 := by
+            intro pc; ring
+          calc ∫ pc, (residual pc - ε) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc + ε ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc ∂μ + ε ^ 2 := by
+                have h1 : Integrable (fun pc => residual pc ^ 2 - 2 * ε * residual pc) μ :=
+                  h_resid_sq_int'.sub (h_cross_int.const_mul (2 * ε))
+                have h2 : Integrable (fun _ : ℝ × (Fin k → ℝ) => ε ^ 2) μ := integrable_const _
+                rw [integral_add h1 h2, integral_sub h_resid_sq_int' (h_cross_int.const_mul (2 * ε))]
+                simp [MeasureTheory.integral_const, MeasureTheory.integral_const_mul]
+
+        rw [h_expand] at h_ineq
+        linarith
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc ∂μ) 1 h_quad
+      linarith
+    simpa [hres_def] using h1
+
+  · have h2 : ∫ pc, residual pc * pc.1 ∂μ = 0 := by
+      have h_quad : ∀ ε : ℝ, (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε +
+          (∫ pc, pc.1^2 ∂μ) * ε^2 ≥ 0 := by
+        intro ε
+        have h_expand : (-2 * ∫ pc, residual pc * pc.1 ∂μ) * ε + (∫ pc, pc.1^2 ∂μ) * ε^2 =
+            (∫ pc, pc.1^2 ∂μ) * ε^2 - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by ring
+        rw [h_expand]
+        let model' : PhenotypeInformedGAM 1 k sp := {
+          pgsBasis := model.pgsBasis,
+          pcSplineBasis := model.pcSplineBasis,
+          γ₀₀ := model.γ₀₀,
+          γₘ₀ := fun m => model.γₘ₀ m + ε,
+          f₀ₗ := model.f₀ₗ,
+          fₘₗ := model.fₘₗ,
+          link := model.link,
+          dist := model.dist
+        }
+        have h_raw' : IsRawScoreModel model' := {
+          f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
+          fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
+        }
+        have h_opt_ineq := h_opt.is_optimal model' h_raw'
+        have h_resid_int : Integrable residual μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          apply Integrable.sub hY_int
+          apply Integrable.add (integrable_const a)
+          exact hP_int.const_mul b
+
+        have h_resid_P_int : Integrable (fun pc => residual pc * pc.1) μ := by
+          simp only [hres_def, hY_def, ha_def, hb_def, hμ_def]
+          have h1 : Integrable (fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) μ := hYP_int
+          have h2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => a * pc.1) μ := hP_int.const_mul a
+          have h3 : Integrable (fun pc : ℝ × (Fin k → ℝ) => b * pc.1 ^ 2) μ := hP2_int.const_mul b
+          have heq : ∀ pc : ℝ × (Fin k → ℝ),
+              (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 =
+              dgp.trueExpectation pc.1 pc.2 * pc.1 - a * pc.1 - b * pc.1 ^ 2 := by
+            intro pc; ring
+          exact ((h1.sub h2).sub h3).congr (ae_of_all _ (fun pc => (heq pc).symm))
+
+        have h_resid_sq_int' : Integrable (fun pc => residual pc ^ 2) μ := by
+          simp only [hμ_def, hres_def, hY_def, ha_def, hb_def]
+          exact h_resid_sq_int
+
+        have h_pred_model : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model p_val c_val = a + b * p_val := by
+          intro p_val c_val
+          exact linearPredictor_eq_affine_of_raw_gen model h_opt.is_raw h_linear p_val c_val
+
+        have h_pred_model' : ∀ p_val (c_val : Fin k → ℝ),
+            linearPredictor model' p_val c_val = a + (b + ε) * p_val := by
+          intro p_val c_val
+          have h := linearPredictor_eq_affine_of_raw_gen model' h_raw' h_linear p_val c_val
+          simp only [model', ha_def, hb_def] at h
+          convert h using 2 <;> ring
+
+        have h_expand_full : ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ =
+            ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ + ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+          have heq : ∀ pc, (residual pc - ε * pc.1) ^ 2 =
+              residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 := by
+            intro pc; ring
+          calc ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ
+              = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                congr 1; funext pc; exact heq pc
+            _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                have h1 : Integrable (fun pc => residual pc ^ 2) μ := h_resid_sq_int'
+                have h2 : Integrable (fun pc => 2 * ε * residual pc * pc.1) μ := by
+                  have h := h_resid_P_int.const_mul (2 * ε)
+                  refine h.congr (ae_of_all _ ?_)
+                  intro pc; ring
+                have h3 : Integrable (fun pc => ε ^ 2 * pc.1 ^ 2) μ := hP2_int.const_mul (ε ^ 2)
+                have hsum_eq : ∀ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 =
+                    (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 := by
+                  intro pc; ring
+                calc ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 + ε ^ 2 * pc.1 ^ 2 ∂μ
+                    = ∫ pc, (residual pc ^ 2 - 2 * ε * residual pc * pc.1) + ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      rfl
+                  _ = ∫ pc, residual pc ^ 2 - 2 * ε * residual pc * pc.1 ∂μ + ∫ pc, ε ^ 2 * pc.1 ^ 2 ∂μ := by
+                      exact integral_add (h1.sub h2) h3
+                  _ = (∫ pc, residual pc ^ 2 ∂μ - ∫ pc, 2 * ε * residual pc * pc.1 ∂μ) +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      rw [integral_sub h1 h2, integral_const_mul]
+                  _ = ∫ pc, residual pc ^ 2 ∂μ - 2 * ε * ∫ pc, residual pc * pc.1 ∂μ +
+                      ε ^ 2 * ∫ pc, pc.1 ^ 2 ∂μ := by
+                      have hcm : ∫ pc, 2 * ε * residual pc * pc.1 ∂μ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := by
+                        have heq' : ∀ pc, 2 * ε * residual pc * pc.1 = 2 * ε * (residual pc * pc.1) := by
+                          intro pc; ring
+                        calc ∫ pc, 2 * ε * residual pc * pc.1 ∂μ
+                            = ∫ pc, 2 * ε * (residual pc * pc.1) ∂μ := by congr 1; funext pc; exact heq' pc
+                          _ = 2 * ε * ∫ pc, residual pc * pc.1 ∂μ := integral_const_mul _ _
+                      rw [hcm]
+
+        have h_ineq : ∫ pc, residual pc ^ 2 ∂μ ≤ ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+          have hLHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, residual pc ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model pc.1 pc.2]
+          have hRHS : ∫ pc, (Y pc.1 pc.2 - linearPredictor model' pc.1 pc.2) ^ 2 ∂μ =
+              ∫ pc, (residual pc - ε * pc.1) ^ 2 ∂μ := by
+            congr 1; ext pc
+            simp only [hres_def, hY_def, h_pred_model' pc.1 pc.2]
+            ring
+          rw [← hLHS, ← hRHS]
+          exact h_opt_ineq
+
+        rw [h_expand_full] at h_ineq
+        linarith
+      have h_coeff := linear_coeff_zero_of_quadratic_nonneg
+        (-2 * ∫ pc, residual pc * pc.1 ∂μ) (∫ pc, pc.1^2 ∂μ) h_quad
+      linarith
+    simpa [hres_def] using h2
 
 /-- **Lemma A**: For a raw model (all spline terms zero) with linear PGS basis,
     the linear predictor simplifies to an affine function: a + b*p.
