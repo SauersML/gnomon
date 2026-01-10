@@ -1,7 +1,9 @@
-use crate::calibrate::basis::{self, create_basis, create_bspline_basis_nd_with_knots, BasisOptions, Dense, KnotSource};
+use crate::calibrate::basis::{
+    self, BasisOptions, Dense, KnotSource, create_basis, create_bspline_basis_nd_with_knots,
+};
 use crate::calibrate::data::TrainingData;
 use crate::calibrate::estimate::EstimationError;
-use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use crate::calibrate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd, fast_ata};
 use crate::calibrate::model::{InteractionPenaltyKind, ModelConfig};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -618,6 +620,79 @@ fn row_wise_tensor_product(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     result
 }
 
+/// Row tensor helper from Camarda (2012) Eq. (8).
+/// For each row r of X, produces x_r ⊗ x_r as a single flattened row.
+fn row_tensor(matrix: &Array2<f64>) -> Array2<f64> {
+    let (rows, cols) = matrix.dim();
+    let mut result = Array2::<f64>::zeros((rows, cols * cols));
+
+    result
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(r, mut out_row)| {
+            let src = matrix.row(r);
+            let mut k = 0;
+            for i in 0..cols {
+                let lhs = src[i];
+                for j in 0..cols {
+                    out_row[k] = lhs * src[j];
+                    k += 1;
+                }
+            }
+        });
+
+    result
+}
+
+/// Compute (B_b ⊗ B_a)^T W (B_b ⊗ B_a) using the GLAM identity without
+/// materializing the full tensor-product design matrix. `weights` must match the
+/// grid layout of B_a (rows) × B_b (rows).
+fn glam_xtwx(b_a: &Array2<f64>, b_b: &Array2<f64>, weights: &Array2<f64>) -> Array2<f64> {
+    let (a_rows, a_cols) = b_a.dim();
+    let (b_rows, b_cols) = b_b.dim();
+    assert_eq!(weights.dim(), (a_rows, b_rows));
+
+    let mut xtwx = Array2::<f64>::zeros((a_cols * b_cols, a_cols * b_cols));
+
+    // Precompute the row tensor of the second basis once; it is reused for every
+    // column-specific A^T W A block.
+    let g_b = row_tensor(b_b);
+
+    // For each column in the grid, compute A^T (diag w_j) A once, then scale by
+    // the corresponding products from B.
+    for j in 0..b_rows {
+        let weight_col = weights.column(j);
+        if weight_col.iter().all(|&w| w == 0.0) {
+            continue;
+        }
+
+        // sqrt(W_j) * B_a for faer::fast_ata efficiency
+        let sqrt_w = weight_col.mapv(f64::sqrt).insert_axis(Axis(1));
+        let weighted_a = b_a * &sqrt_w;
+        let inner_a = fast_ata(&weighted_a);
+
+        for s in 0..b_cols {
+            for t in 0..b_cols {
+                let weight = g_b[[j, s * b_cols + t]];
+                if weight == 0.0 {
+                    continue;
+                }
+
+                let row_offset = s * a_cols;
+                let col_offset = t * a_cols;
+                let mut block = xtwx.slice_mut(s![
+                    row_offset..row_offset + a_cols,
+                    col_offset..col_offset + a_cols
+                ]);
+                block.scaled_add(weight, &inner_a);
+            }
+        }
+    }
+
+    xtwx
+}
+
 fn binomial(n: usize, k: usize) -> usize {
     if k == 0 || k == n {
         return 1;
@@ -644,7 +719,11 @@ fn build_banded_difference_penalty(
     }
 
     let coeffs: Array1<f64> = Array1::from_iter((0..=order).map(|j| {
-        let sign = if (order - j).is_multiple_of(2) { 1.0 } else { -1.0 };
+        let sign = if (order - j).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
         sign * binomial(order, j) as f64
     }));
     let num_rows = num_basis_functions - order;
@@ -1496,27 +1575,28 @@ pub fn build_design_and_penalty_matrices(
         // Fill null-space columns
         let null_cols = &layout.pc_null_cols[pc_idx];
         if !null_cols.is_empty()
-            && let Some(null_basis) = &pc_null_bases[pc_idx] {
-                if null_basis.nrows() != n_samples {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC null basis {} has {} rows but expected {} samples",
-                        pc_name,
-                        null_basis.nrows(),
-                        n_samples
-                    )));
-                }
-                if null_basis.ncols() != null_cols.len() {
-                    return Err(EstimationError::LayoutError(format!(
-                        "PC null basis {} has {} columns but layout expects {} columns",
-                        pc_name,
-                        null_basis.ncols(),
-                        null_cols.len()
-                    )));
-                }
-                x_matrix
-                    .slice_mut(s![.., null_cols.clone()])
-                    .assign(null_basis);
+            && let Some(null_basis) = &pc_null_bases[pc_idx]
+        {
+            if null_basis.nrows() != n_samples {
+                return Err(EstimationError::LayoutError(format!(
+                    "PC null basis {} has {} rows but expected {} samples",
+                    pc_name,
+                    null_basis.nrows(),
+                    n_samples
+                )));
             }
+            if null_basis.ncols() != null_cols.len() {
+                return Err(EstimationError::LayoutError(format!(
+                    "PC null basis {} has {} columns but layout expects {} columns",
+                    pc_name,
+                    null_basis.ncols(),
+                    null_cols.len()
+                )));
+            }
+            x_matrix
+                .slice_mut(s![.., null_cols.clone()])
+                .assign(null_basis);
+        }
         // Fill penalized range-space columns
         for block in &layout.penalty_map {
             if block.term_name == format!("f({pc_name})") {
@@ -2097,10 +2177,7 @@ pub fn precompute_reparam_invariant(
     }
 
     let rs_faer: Vec<Mat<f64>> = rs_list.iter().map(array_to_faer).collect();
-    let s_original_list: Vec<Mat<f64>> = rs_faer
-        .iter()
-        .map(penalty_from_root_faer)
-        .collect();
+    let s_original_list: Vec<Mat<f64>> = rs_faer.iter().map(penalty_from_root_faer).collect();
 
     let mut s_balanced = Mat::<f64>::zeros(p, p);
     let mut has_nonzero = false;
@@ -2246,7 +2323,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: vec![],
             rs_transposed: vec![],
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)),  // All modes truncated when no penalties
+            u_truncated: Array2::zeros((p, p)), // All modes truncated when no penalties
         });
     }
 
@@ -2259,7 +2336,7 @@ pub fn stable_reparameterization_with_invariant(
             rs_transformed: rs_list.to_vec(),
             rs_transposed: rs_list.iter().map(transpose_owned).collect(),
             e_transformed: Array2::zeros((0, p)),
-            u_truncated: Array2::zeros((p, p)),  // All modes truncated when zero penalty
+            u_truncated: Array2::zeros((p, p)), // All modes truncated when zero penalty
         });
     }
 
@@ -2383,7 +2460,7 @@ pub fn stable_reparameterization_with_invariant(
     // The fix: use the precomputed structural rank (penalized_rank) which is the number
     // of non-null penalty dimensions based on the model geometry, not the current lambda.
     // Sort eigenvalues descending and take exactly the top `penalized_rank` values.
-    
+
     // Sort eigenvalues descending with their indices
     let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
         .iter()
@@ -2391,19 +2468,21 @@ pub fn stable_reparameterization_with_invariant(
         .map(|(i, &ev)| (i, ev))
         .collect();
     sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     // Take exactly the top `penalized_rank` eigenvalues (structural rank from invariant)
     let structural_rank = penalized_rank.min(sorted_eigs.len());
-    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(structural_rank).cloned().collect();
-    
+    let selected_eigs: Vec<(usize, f64)> =
+        sorted_eigs.iter().take(structural_rank).cloned().collect();
+
     // Extract truncated eigenvector indices (those NOT in selected_eigs)
     // These span the null space and are needed for gradient correction
-    let truncated_indices: Vec<usize> = sorted_eigs.iter()
+    let truncated_indices: Vec<usize> = sorted_eigs
+        .iter()
         .skip(structural_rank)
         .map(|&(idx, _)| idx)
         .collect();
     let truncated_count = truncated_indices.len();
-    
+
     // Build u_truncated matrix (p × truncated_count)
     let mut u_truncated_mat = Mat::<f64>::zeros(p, truncated_count);
     for (col_out, &col_in) in truncated_indices.iter().enumerate() {
@@ -2411,7 +2490,7 @@ pub fn stable_reparameterization_with_invariant(
             u_truncated_mat[(row, col_out)] = s_eigenvectors[(row, col_in)];
         }
     }
-    
+
     // Tiny absolute floor to prevent ln(0) - we never filter structural modes
     let ln_floor = 1e-300_f64;
 
@@ -2464,13 +2543,13 @@ pub fn stable_reparameterization_with_invariant(
 
     // Rebuild s_transformed from e_transformed to ensure rank consistency.
     //
-    // The sum of λ*S_k may contain numerical noise modes (eigenvalues ~1e-15) that 
-    // become significant when λ is large (e.g., 10^12). These modes would appear in H 
+    // The sum of λ*S_k may contain numerical noise modes (eigenvalues ~1e-15) that
+    // become significant when λ is large (e.g., 10^12). These modes would appear in H
     // but are truncated from log|S|_+, creating a "phantom penalty" in the objective.
     //
     // By reconstructing s_transformed = E^T * E, we force the penalty matrix used
     // in H to have the EXACT same rank structure as the one used for log|S|_+.
-    // Any mode truncated from the prior is now strictly zero in the Hessian 
+    // Any mode truncated from the prior is now strictly zero in the Hessian
     // calculation, ensuring mathematical consistency of the gradients.
     let mut s_truncated = Mat::<f64>::zeros(p, p);
     matmul(
@@ -2580,6 +2659,44 @@ mod tests {
         }
         let vt = eigenvectors.t();
         eigenvectors.dot(&inv_diag.dot(&vt))
+    }
+
+    #[test]
+    fn glam_xtwx_matches_explicit_tensor_product() {
+        let b_a = array![[0.2, 0.5, 0.3], [0.4, 0.1, 0.5], [0.3, 0.6, 0.1],];
+        let b_b = array![[0.6, 0.2], [0.1, 0.5], [0.3, 0.4], [0.2, 0.7],];
+        let weights = array![
+            [1.0, 0.4, 0.3, 0.2],
+            [0.5, 0.7, 0.6, 0.3],
+            [0.2, 0.1, 0.8, 0.9],
+        ];
+
+        let glam = glam_xtwx(&b_a, &b_b, &weights);
+
+        // Explicit tensor-product design construction for validation
+        let (a_rows, a_cols) = b_a.dim();
+        let (b_rows, b_cols) = b_b.dim();
+        let mut design = Array2::<f64>::zeros((a_rows * b_rows, a_cols * b_cols));
+        for i in 0..a_rows {
+            let a_row = b_a.row(i);
+            for j in 0..b_rows {
+                let b_row = b_b.row(j);
+                let row_idx = i * b_rows + j;
+                let mut k = 0;
+                for p in 0..a_cols {
+                    for q in 0..b_cols {
+                        design[[row_idx, k]] = a_row[p] * b_row[q];
+                        k += 1;
+                    }
+                }
+            }
+        }
+
+        let flat_weights = Array1::from_iter(weights.iter().map(|w| w.sqrt()));
+        let weighted_design = &design * &flat_weights.insert_axis(Axis(1));
+        let explicit = fast_ata(&weighted_design);
+
+        assert_abs_diff_eq!(max_abs_diff(&glam, &explicit), 0.0, epsilon = 1e-12);
     }
 
     /// Helper asserting that the reparameterization preserves critical invariants.
