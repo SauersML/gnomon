@@ -1233,6 +1233,8 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
+    (hYP_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1) dgp_env.to_dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
     model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
   -- Under confounding (E[P*C] ≠ 0), the Bayes-optimal raw-score coefficient for P
