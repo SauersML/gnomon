@@ -1247,7 +1247,42 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
   --
   -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
-  sorry
+  set Y := dgp_env.to_dgp.trueExpectation with hY_def
+  set μ := dgp_env.to_dgp.jointMeasure with hμ_def
+
+  have h_orth := rawOptimal_implies_orthogonality_gen model dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth1, h_orthP⟩ := h_orth
+
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+
+  have hY_is_additive : Y = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    rw [hY_def, dgp_env.is_additive_causal, h_gen, h_env]
+    rfl
+
+  have hYP_mean : ∫ pc, Y pc.1 pc.2 * pc.1 ∂μ = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ := by
+    rw [hY_is_additive]
+    have heq : ∀ pc, (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1 = 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩) := by
+      intro pc; ring
+    rw [integral_congr_ae (ae_of_all _ heq)]
+    have h1 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => 2 * pc.1 ^ 2) μ := hP2_int.const_mul 2
+    have h2 : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := by
+      refine hPC_int.const_mul 3
+    rw [integral_add h1 h2]
+    rw [integral_const_mul, integral_const_mul, hP2]
+    ring
+
+  have hb : b = ∫ pc, Y pc.1 pc.2 * pc.1 ∂μ := by
+    exact optimal_slope_eq_covariance_of_normalized_p μ Y a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orthP
+  rw [hYP_mean] at hb
+
+  rw [hb_def, hb]
+  intro h_contra
+  have h_zero : 3 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
+    linarith
+  have h_int_zero : ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
+    linarith
+  exact h_confounding h_int_zero
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
