@@ -3261,7 +3261,6 @@ avoid numerical instability. This section proves the algebraic equivalence.
 -/
 
 variable {n p : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
-variable [DecidableEq (Fin p)]
 
 /-- Quadratic form: βᵀSβ computed as dot product. -/
 noncomputable def quadForm (S : Matrix (Fin p) (Fin p) ℝ) (β : Fin p → ℝ) : ℝ :=
