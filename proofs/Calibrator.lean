@@ -1241,9 +1241,8 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   let Y := dgp_env.to_dgp.trueExpectation
   -- The true DGP is Y = 2P + 3C.
   have h_Y_def : Y = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
-    unfold DGPWithEnvironment.trueGeneticEffect DGPWithEnvironment.environmentalEffect at h_gen h_env
-    ext p c
-    simp only [dgp_env.is_additive_causal, h_gen, h_env]
+    rw [dgp_env.is_additive_causal, h_gen, h_env]
+    rfl
 
   -- Step 1: Use optimality to get the normal equations.
   let model_1_1_sp := model
