@@ -1237,29 +1237,29 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (hYP_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1) dgp_env.to_dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
     model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
-  -- Let Y be the true expectation function for convenience.
-  let Y := dgp_env.to_dgp.trueExpectation
   -- The true DGP is Y = 2P + 3C.
-  have h_Y_def : Y = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
-    rw [dgp_env.is_additive_causal, h_gen, h_env]
-    rfl
+  have h_Y_def : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    unfold DGPWithEnvironment.is_additive_causal
+    unfold DGPWithEnvironment.trueGeneticEffect
+    unfold DGPWithEnvironment.environmentalEffect
+    simp only [h_gen, h_env]
 
   -- Step 1: Use optimality to get the normal equations.
   let model_1_1_sp := model
   have h_orth := rawOptimal_implies_orthogonality_gen model_1_1_sp dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
-  let a := model.γ₀₀
-  let b := model.γₘ₀ ⟨0, by norm_num⟩
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
   obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
 
   -- Step 2: Use the normal equations to solve for the coefficient `b`.
-  have hb : b = ∫ pc, Y pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
-    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure (fun pc => Y pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+  have hb : b = ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
+    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
 
   -- Step 3: Calculate E[Y*P] for this DGP.
   -- E[Y*P] = E[(2P + 3C)P] = 2*E[P^2] + 3*E[PC] = 2 + 3*E[PC].
-  have h_E_YP : ∫ pc, Y pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+  have h_E_YP : ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
     rw [h_Y_def]
-    have h_expand: (fun pc => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun pc => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
+    have h_expand: (fun (pc : ℝ × (Fin 1 → ℝ)) => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun (pc : ℝ × (Fin 1 → ℝ)) => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
       funext pc; ring
     rw [integral_congr_ae (ae_of_all _ h_expand)]
     have h2P2_int := hP2_int.const_mul 2
@@ -1269,9 +1269,10 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
 
   -- Step 4: Combine the results to show b ≠ 2.
   -- We have b = E[YP] = 2 + 3*E[PC].
-  rw [hb, h_E_YP]
   -- The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
   intro h_b_eq_2
+  rw [hb_def] at h_b_eq_2
+  rw [hb, h_E_YP] at h_b_eq_2
   have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
     linarith
   -- This contradicts the `h_confounding` hypothesis.
