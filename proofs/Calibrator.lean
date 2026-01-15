@@ -1237,17 +1237,46 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (hYP_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1) dgp_env.to_dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp_env.to_dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp_env.to_dgp.jointMeasure) :
     model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
-  -- Under confounding (E[P*C] ≠ 0), the Bayes-optimal raw-score coefficient for P
-  -- absorbs the confounding effect and differs from the true genetic effect (2).
-  --
-  -- The true DGP is: Y = 2P + 3C
-  -- The raw model is misspecified: Ŷ = a + bP
-  -- The normal equations for the L² projection of Y onto span{1, P} are:
-  --   a = E[Y] - b*E[P] = E[2P + 3C] = 0
-  --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
-  --
-  -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
-  sorry
+  -- Let Y be the true expectation function for convenience.
+  let Y := dgp_env.to_dgp.trueExpectation
+  -- The true DGP is Y = 2P + 3C.
+  have h_Y_def : Y = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    unfold DGPWithEnvironment.trueGeneticEffect DGPWithEnvironment.environmentalEffect at h_gen h_env
+    ext p c
+    simp only [dgp_env.is_additive_causal, h_gen, h_env]
+
+  -- Step 1: Use optimality to get the normal equations.
+  let model_1_1_sp := model
+  have h_orth := rawOptimal_implies_orthogonality_gen model_1_1_sp dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  let a := model.γ₀₀
+  let b := model.γₘ₀ ⟨0, by norm_num⟩
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  -- Step 2: Use the normal equations to solve for the coefficient `b`.
+  have hb : b = ∫ pc, Y pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
+    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure (fun pc => Y pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  -- Step 3: Calculate E[Y*P] for this DGP.
+  -- E[Y*P] = E[(2P + 3C)P] = 2*E[P^2] + 3*E[PC] = 2 + 3*E[PC].
+  have h_E_YP : ∫ pc, Y pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+    rw [h_Y_def]
+    have h_expand: (fun pc => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun pc => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
+      funext pc; ring
+    rw [integral_congr_ae (ae_of_all _ h_expand)]
+    have h2P2_int := hP2_int.const_mul 2
+    have h3PC_int := hPC_int.const_mul 3
+    rw [integral_add h2P2_int h3PC_int, integral_const_mul, integral_const_mul, hP2]
+    ring
+
+  -- Step 4: Combine the results to show b ≠ 2.
+  -- We have b = E[YP] = 2 + 3*E[PC].
+  rw [hb, h_E_YP]
+  -- The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
+  intro h_b_eq_2
+  have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
+    linarith
+  -- This contradicts the `h_confounding` hypothesis.
+  exact h_confounding h_E_PC_zero
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
