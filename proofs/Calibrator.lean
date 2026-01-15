@@ -1246,8 +1246,52 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   --   a = E[Y] - b*E[P] = E[2P + 3C] = 0
   --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
   --
-  -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
-  sorry
+  -- The proof follows the logic of the normal equations for L² projection.
+  -- Let Y = 2P + 3C be the true phenotype. The raw model projects Y onto span{1, P}.
+  -- The optimal coefficients are a = E[Y] and b = E[YP], given E[P]=0 and E[P²]=1.
+
+  -- Step 1: Get the orthogonality conditions from optimality.
+  have h_orth := rawOptimal_implies_orthogonality_gen model dgp_env.to_dgp h_opt h_pgs_basis_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+  obtain ⟨_, h_orthP⟩ := h_orth
+
+  -- Step 2: Use the normal equations to solve for `b`.
+  have hb : b = ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
+    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure dgp_env.to_dgp.trueExpectation a b
+      hY_int hP_int hYP_int hP2_int hP0 hP2 h_orthP
+
+  -- Step 3: Compute E[YP] for Y = 2P + 3C.
+  -- E[YP] = E[(2P + 3C)P] = E[2P² + 3PC] = 2*E[P²] + 3*E[PC] = 2*1 + 3*E[PC]
+  have hYP_val : ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure =
+      2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+    -- Expand trueExpectation
+    have h_true_exp : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+      ext p c; simp [dgp_env.is_additive_causal, h_gen, h_env]
+    simp only [h_true_exp]
+    -- Expand the integrand
+    have h_integrand : ∀ pc, (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1 = 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩) := by
+      intro pc; ring
+    simp_rw [h_integrand]
+    -- Apply linearity of integral
+    have h_p2_int : Integrable (fun pc => 2 * pc.1^2) dgp_env.to_dgp.jointMeasure := hP2_int.const_mul 2
+    have h_pc_int : Integrable (fun pc => 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) dgp_env.to_dgp.jointMeasure := hPC_int.const_mul 3
+    rw [integral_add h_p2_int h_pc_int, integral_const_mul, integral_const_mul]
+    -- Substitute known values
+    rw [hP2]
+    ring
+
+  -- Step 4: Combine results to show b ≠ 2.
+  rw [hb, hYP_val]
+  -- We have b = 2 + 3 * E[PC]. Since E[PC] ≠ 0, b ≠ 2.
+  intro h_b_eq_2
+  have h_zero : (0 : ℝ) = 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+    linarith
+  have h_int_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
+    -- 0 = 3 * x -> x = 0
+    field_simp at h_zero; exact h_zero
+  -- This contradicts h_confounding
+  exact h_confounding h_int_zero
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
