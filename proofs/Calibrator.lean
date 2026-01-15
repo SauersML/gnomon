@@ -1265,10 +1265,8 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     ring
 
   -- Step 4: Combine the results to show b ≠ 2.
-  -- We have b = E[YP] = 2 + 3*E[PC].
-  -- The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
+  -- We have b = E[YP] = 2 + 3*E[PC]. The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
   intro h_b_eq_2
-  rw [←hb_def] at h_b_eq_2
   rw [hb, h_E_YP] at h_b_eq_2
   have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
     linarith
