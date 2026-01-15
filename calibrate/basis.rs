@@ -2387,24 +2387,17 @@ pub(crate) mod internal {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
 
-        // Always use uniformly spaced knots (optimized for P-splines with D^T D penalty)
-        let internal_knots = if num_internal_knots == 0 {
-            Array1::from_vec(vec![])
-        } else {
-            let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
-            Array::from_iter((1..=num_internal_knots).map(|i| min_val + i as f64 * h))
-        };
+        // Use uniformly spaced knots optimized for P-splines with D^T D penalty.
+        // Instead of clamping the boundary knots, extend the grid by `degree + 1`
+        // points on each side using the same spacing. This preserves the shift-
+        // invariant property of the basis near the boundaries while still
+        // covering the data domain.
+        let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
 
-        // B-splines require `degree + 1` repeated knots at each boundary.
-        let min_knots = Array1::from_elem(degree + 1, min_val);
-        let max_knots = Array1::from_elem(degree + 1, max_val);
+        let total_knots = num_internal_knots + 2 * (degree + 1);
+        let start = min_val - h * (degree as f64 + 1.0);
 
-        // Concatenate [boundary_min, internal, boundary_max] to form the full knot vector.
-        Ok(ndarray::concatenate(
-            Axis(0),
-            &[min_knots.view(), internal_knots.view(), max_knots.view()],
-        )
-        .expect("Knot vector concatenation should never fail with correct inputs"))
+        Ok(Array::from_iter((0..total_knots).map(|i| start + i as f64 * h)))
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
@@ -2709,7 +2702,7 @@ mod tests {
         let knots = internal::generate_full_knot_vector((0.0, 10.0), 3, 2).unwrap();
         // 3 internal + 2 * (2+1) boundary = 9 knots
         assert_eq!(knots.len(), 9);
-        let expected_knots = array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0];
+        let expected_knots = array![-7.5, -5.0, -2.5, 0.0, 2.5, 5.0, 7.5, 10.0, 12.5];
         assert_abs_diff_eq!(
             knots.as_slice().unwrap(),
             expected_knots.as_slice().unwrap(),
@@ -2725,7 +2718,7 @@ mod tests {
         // Since quantile knots are disabled, this should generate uniform knots
         // 3 internal knots + 2 * (2+1) boundary = 9 knots
         assert_eq!(knots.len(), 9);
-        let expected_knots = array![0.0, 0.0, 0.0, 2.5, 5.0, 7.5, 10.0, 10.0, 10.0];
+        let expected_knots = array![-7.5, -5.0, -2.5, 0.0, 2.5, 5.0, 7.5, 10.0, 12.5];
         assert_abs_diff_eq!(
             knots.as_slice().unwrap(),
             expected_knots.as_slice().unwrap(),
