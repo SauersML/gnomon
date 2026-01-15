@@ -1245,9 +1245,63 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   -- The normal equations for the L² projection of Y onto span{1, P} are:
   --   a = E[Y] - b*E[P] = E[2P + 3C] = 0
   --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
-  --
-  -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
-  sorry
+  -- The true DGP is Y = 2P + 3C. The raw model is misspecified as Ŷ = a + bP.
+  -- The normal equations for the L² projection of Y onto span{1, P} are:
+  --   a = E[Y]
+  --   b = E[YP]
+  -- We compute these expectations and show b ≠ 2.
+
+  -- Let Y be the true expectation function for brevity.
+  set Y := dgp_env.to_dgp.trueExpectation with hY_def
+  set μ := dgp_env.to_dgp.jointMeasure with hμ_def
+
+  -- From the DGP structure: Y(p,c) = 2p + 3c.
+  have h_Y_form : Y = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+    unfold DGPWithEnvironment.is_additive_causal at dgp_env
+    simp only [dgp_env.is_additive_causal, h_gen, h_env]
+
+  -- Get the orthogonality conditions from optimality.
+  have h_orth := rawOptimal_implies_orthogonality model dgp_env.to_dgp h_opt h_pgs_basis_linear
+    hY_int hP_int hP2_int hYP_int h_resid_sq_int
+
+  -- Let a and b be the model coefficients.
+  set a := model.γ₀₀ with ha_def
+  set b := model.γₘ₀ ⟨0, by norm_num⟩ with hb_def
+
+  -- Solve for 'a' using the first normal equation.
+  have ha : a = ∫ pc, Y pc.1 pc.2 ∂μ := by
+    exact optimal_intercept_eq_mean_of_zero_mean_p μ Y a b hY_int hP_int hP0 h_orth.1
+
+  -- Solve for 'b' using the second normal equation.
+  have hb : b = ∫ pc, Y pc.1 pc.2 * pc.1 ∂μ := by
+    exact optimal_slope_eq_covariance_of_normalized_p μ Y a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth.2
+
+  -- Compute E[Y] = E[2P + 3C] = 2E[P] + 3E[C] = 0.
+  have h_mean_Y : ∫ pc, Y pc.1 pc.2 ∂μ = 0 := by
+    rw [h_Y_form]
+    have h_int_2P : Integrable (fun pc => 2 * pc.1) μ := hP_int.const_mul 2
+    have h_int_3C : Integrable (fun pc => 3 * pc.2 ⟨0, by norm_num⟩) μ := hC_int.const_mul 3
+    simp [integral_add h_int_2P h_int_3C, integral_const_mul, hP0, hC0]
+
+  -- Compute E[YP] = E[(2P + 3C)P] = 2E[P²] + 3E[PC] = 2 + 3E[PC].
+  have h_cov_YP : ∫ pc, Y pc.1 pc.2 * pc.1 ∂μ = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ := by
+    rw [h_Y_form]
+    have h_expand : ∀ pc, (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1 = 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩) := by
+      intro pc; ring
+    simp_rw [h_expand]
+    have h_int_2P2 : Integrable (fun pc => 2 * pc.1^2) μ := hP2_int.const_mul 2
+    have h_int_3PC : Integrable (fun pc => 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) μ := hPC_int.const_mul 3
+    simp [integral_add h_int_2P2 h_int_3PC, integral_const_mul, hP2]
+
+  -- Substitute to find b's value.
+  rw [hb, h_cov_YP] at hb_def
+  -- Goal: b ≠ 2, which is 2 + 3*E[PC] ≠ 2
+  -- This is equivalent to 3*E[PC] ≠ 0, which is E[PC] ≠ 0.
+  intro h_contra
+  rw [h_contra] at hb_def
+  have h_zero : (3 * ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.1 * pc.2 { val := 0, isLt := by norm_num } ∂μ) = 0 := by linarith
+  have h_int_zero : ∫ (pc : ℝ × (Fin 1 → ℝ)), pc.1 * pc.2 { val := 0, isLt := by norm_num } ∂μ = 0 := by linarith
+  exact h_confounding h_int_zero
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
