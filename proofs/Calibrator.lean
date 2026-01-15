@@ -1239,10 +1239,7 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     model.γₘ₀ ⟨0, by norm_num⟩ ≠ 2 := by
   -- The true DGP is Y = 2P + 3C.
   have h_Y_def : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
-    unfold DGPWithEnvironment.is_additive_causal
-    unfold DGPWithEnvironment.trueGeneticEffect
-    unfold DGPWithEnvironment.environmentalEffect
-    simp only [h_gen, h_env]
+    rw [dgp_env.is_additive_causal, h_gen, h_env]
 
   -- Step 1: Use optimality to get the normal equations.
   let model_1_1_sp := model
@@ -1261,7 +1258,7 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     rw [h_Y_def]
     have h_expand: (fun (pc : ℝ × (Fin 1 → ℝ)) => (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1) = (fun (pc : ℝ × (Fin 1 → ℝ)) => 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
       funext pc; ring
-    rw [integral_congr_ae (ae_of_all _ h_expand)]
+    rw [h_expand]
     have h2P2_int := hP2_int.const_mul 2
     have h3PC_int := hPC_int.const_mul 3
     rw [integral_add h2P2_int h3PC_int, integral_const_mul, integral_const_mul, hP2]
@@ -1271,7 +1268,7 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   -- We have b = E[YP] = 2 + 3*E[PC].
   -- The goal is b ≠ 2, which is true iff E[PC] ≠ 0.
   intro h_b_eq_2
-  rw [hb_def] at h_b_eq_2
+  rw [←hb_def] at h_b_eq_2
   rw [hb, h_E_YP] at h_b_eq_2
   have h_E_PC_zero : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0 := by
     linarith
