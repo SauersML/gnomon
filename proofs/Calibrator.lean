@@ -1247,7 +1247,50 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
   --   b = E[YP] / E[P²] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2 + 3*E[PC]
   --
   -- Since h_confounding implies E[PC] ≠ 0, we have b ≠ 2.
-  sorry
+
+  -- Let a and b be the model's coefficients
+  let a := model.γ₀₀
+  let b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  -- From optimality, we get the normal equations (orthogonality conditions)
+  have h_orth := rawOptimal_implies_orthogonality_gen model dgp_env.to_dgp h_opt h_pgs_basis_linear.1
+    hY_int hP_int hP2_int hYP_int h_resid_sq_int
+
+  -- The second normal equation gives b = E[YP]
+  have hb_eq_EYP : b = ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure := by
+    exact optimal_slope_eq_covariance_of_normalized_p dgp_env.to_dgp.jointMeasure dgp_env.to_dgp.trueExpectation a b
+      hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth.2
+
+  -- Now compute E[YP] for this DGP
+  -- E[YP] = E[(2P + 3C)P] = 2*E[P²] + 3*E[PC] = 2*1 + 3*E[PC]
+  have h_EYP : ∫ pc, dgp_env.to_dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp_env.to_dgp.jointMeasure
+      = 2 + 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure := by
+    -- Expand Y and use linearity of integral
+    have h_dgp_def : dgp_env.to_dgp.trueExpectation = fun p c => 2 * p + 3 * c ⟨0, by norm_num⟩ := by
+      ext p c; rw [dgp_env.is_additive_causal, h_gen, h_env]; rfl
+    simp_rw [h_dgp_def]
+    -- Need to show ∫ (2P + 3C)P = 2 + 3∫ PC
+    have h_expand : ∀ pc, (2 * pc.1 + 3 * pc.2 ⟨0, by norm_num⟩) * pc.1 = 2 * pc.1^2 + 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩) := by
+      intro pc; ring
+    simp_rw [h_expand]
+    -- Apply linearity
+    have h1 : Integrable (fun pc => 2 * pc.1^2) dgp_env.to_dgp.jointMeasure := hP2_int.const_mul 2
+    have h2 : Integrable (fun pc => 3 * (pc.1 * pc.2 ⟨0, by norm_num⟩)) dgp_env.to_dgp.jointMeasure := hPC_int.const_mul 3
+    rw [integral_add h1 h2, integral_const_mul, integral_const_mul]
+    -- Substitute E[P²]=1
+    rw [hP2]
+    ring
+
+  -- Combine to get b = 2 + 3*E[PC]
+  rw [hb_eq_EYP, h_EYP]
+
+  -- By confounding hypothesis, E[PC] ≠ 0, so 3*E[PC] ≠ 0
+  have h_conf_ne_zero : 3 * ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure ≠ 0 := by
+    -- 3 * x = 0 ↔ x = 0
+    apply mul_ne_zero (by norm_num) h_confounding
+
+  -- Therefore, b ≠ 2
+  linarith
 
 def total_params (p k sp : ℕ) : ℕ := 1 + p + k*sp + p*k*sp
 
