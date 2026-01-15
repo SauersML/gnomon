@@ -602,10 +602,11 @@ def _evaluate_models(
     random_state: int,
 ) -> list[dict[str, object]]:
     labels = list(datasets.keys())
-    y = next(iter(datasets.values()))["Subpopulation"].to_numpy()
+    y_series = next(iter(datasets.values()))["Subpopulation"]
+    y = y_series.to_numpy()
     classes = np.unique(y)
     label_to_index = {label: idx for idx, label in enumerate(classes)}
-    y_encoded = np.array([label_to_index[label] for label in y], dtype=int)
+    y_encoded = y_series.map(label_to_index).to_numpy(dtype=int)
 
     matrices = {
         label: df[feature_columns].to_numpy(dtype=float)
