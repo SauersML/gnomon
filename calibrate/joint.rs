@@ -2112,24 +2112,31 @@ impl<'a> JointRemlState<'a> {
             let is_link = k == n_base;
             let lambda_k = if is_link { lambda_link } else { lambda_base[k] };
 
+            // Compute rhs for the implicit function theorem (IFT).
+            // For the penalized likelihood L = log-lik - 0.5*β'S_λβ, the gradient condition is:
+            //   g = ∇_β(log-lik) - S_λ β = 0
+            // Taking derivative w.r.t. ρ_k: ∂g/∂ρ_k = -λ_k S_k β (since ∂S_λ/∂ρ_k = λ_k S_k)
+            // By IFT: ∂β/∂ρ_k = -H^{-1} ∂g/∂ρ_k = -H^{-1}(-λ_k S_k β) = +H^{-1}(λ_k S_k β)
+            // So rhs = +λ_k S_k β gives the correct delta = H^{-1}(rhs) = ∂β/∂ρ_k.
             let mut rhs = Array1::<f64>::zeros(p_total);
             if is_link {
                 if p_link > 0 && link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
                     let sb = link_penalty.dot(&state.beta_link);
                     for i in 0..p_link {
-                        rhs[p_base + i] = -lambda_k * sb[i];
+                        rhs[p_base + i] = lambda_k * sb[i];
                     }
                 }
             } else if let Some(s_k) = state.s_base.get(k) {
                 if s_k.nrows() == p_base && s_k.ncols() == p_base {
                     let sb = s_k.dot(&state.beta_base);
                     for i in 0..p_base {
-                        rhs[i] = -lambda_k * sb[i];
+                        rhs[i] = lambda_k * sb[i];
                     }
                 }
             }
 
             // Compute delta = H† rhs using pseudo-inverse for spectral consistency
+            // delta = ∂β/∂ρ_k represents how the coefficients move when smoothing changes
             // H† rhs = U diag(1/λ) U' rhs = U diag(1/λ) c where c = U' rhs
             let c = h_vecs.t().dot(&rhs);
             let mut delta = Array1::<f64>::zeros(p_total);
@@ -2422,7 +2429,6 @@ impl<'a> JointRemlState<'a> {
             grad[k] = grad_laml;
         }
 
-        println!("Analytic Grad: {:?}", grad);
         Ok((grad, audit_needed))
     }
 

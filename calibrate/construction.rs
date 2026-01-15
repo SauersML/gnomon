@@ -2473,20 +2473,20 @@ pub fn stable_reparameterization_with_invariant(
     let (s_eigenvalues_raw, s_eigenvectors) =
         robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
 
-    // Use STRUCTURAL RANK to ensure consistency between log|S|_+ and log|H|.
+    // Use ADAPTIVE RANK based on current eigenvalues to ensure numerical stability.
     //
-    // Previously, the code used a relative tolerance (max_eigenval * 1e-12) to filter
-    // eigenvalues. This caused gradient mismatches for anisotropic tensor product
-    // penalties where the eigenvalue spectrum spans 10+ orders of magnitude:
-    // - As lambda increases, the tolerance threshold rises
-    // - Valid structural modes with smaller coefficients fall below the rising threshold
-    // - These modes are dropped from log|S|_+ but remain in log|H| (Cholesky doesn't filter)
-    // - Result: FD gradient sees cost growing (via log|H|) while analytic assumes cancellation
+    // The LAML objective includes log|S_λ|_+ (log-pseudo-determinant of the penalty).
+    // When a smoothing parameter λ_k is very small, its contribution to S_λ drops to
+    // machine noise (~10^-16). Including these noise eigenvalues adds ln(10^-16) ≈ -36.8
+    // to the cost function, creating gradient explosions from differentiating numerical noise.
     //
-    // The fix: use the precomputed structural rank (penalized_rank) which is the number
-    // of non-null penalty dimensions based on the model geometry, not the current lambda.
-    // Sort eigenvalues descending and take exactly the top `penalized_rank` values.
-    
+    // The fix: use adaptive relative tolerance (max_eig * 1e-12) on the CURRENT S_λ
+    // eigenvalues. This is the industry standard (used in LAPACK/mgcv). Eigenvalues below
+    // this threshold are treated as null space, not penalized modes.
+    //
+    // Consistency is ensured because both log|S|_+ AND the reconstructed s_transformed
+    // (which feeds into H) use the same adaptive rank.
+
     // Sort eigenvalues descending with their indices
     let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
         .iter()
@@ -2494,10 +2494,26 @@ pub fn stable_reparameterization_with_invariant(
         .map(|(i, &ev)| (i, ev))
         .collect();
     sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    
-    // Take exactly the top `penalized_rank` eigenvalues (structural rank from invariant)
-    let structural_rank = penalized_rank.min(sorted_eigs.len());
-    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(structural_rank).cloned().collect();
+
+    // Adaptive rank: include eigenvalues above relative tolerance
+    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(0.0);
+
+    // Absolute floor: if max eigenvalue is essentially zero, treat as zero penalty
+    // This prevents computing log_det of numerical noise
+    const ABSOLUTE_EIG_FLOOR: f64 = 1e-30;
+    let (structural_rank, selected_eigs) = if max_eig < ABSOLUTE_EIG_FLOOR {
+        // All eigenvalues are noise - return empty penalty (rank 0)
+        (0usize, Vec::new())
+    } else {
+        let adaptive_tol = max_eig * 1e-12;
+        let rank = sorted_eigs
+            .iter()
+            .take_while(|(_, ev)| *ev > adaptive_tol)
+            .count()
+            .max(1); // At least 1 mode when max_eig is valid
+        let eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(rank).cloned().collect();
+        (rank, eigs)
+    };
     
     // Extract truncated eigenvector indices (those NOT in selected_eigs)
     // These span the null space and are needed for gradient correction

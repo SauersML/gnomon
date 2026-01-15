@@ -2373,7 +2373,12 @@ pub(crate) mod internal {
         }
     }
 
-    /// Generates the full knot vector, including repeated boundary knots.
+    /// Generates the full knot vector with clamped boundary knots.
+    ///
+    /// Standard B-spline construction: boundary values are repeated (degree + 1) times
+    /// to ensure the basis functions are well-supported across the entire data domain.
+    /// This prevents "ghost" basis functions with support mostly outside the data range,
+    /// which would create near-zero columns in the design matrix and ill-conditioned systems.
     pub(super) fn generate_full_knot_vector(
         data_range: (f64, f64),
         num_internal_knots: usize,
@@ -2387,17 +2392,27 @@ pub(crate) mod internal {
             return Err(BasisError::DegenerateRange(num_internal_knots));
         }
 
-        // Use uniformly spaced knots optimized for P-splines with D^T D penalty.
-        // Instead of clamping the boundary knots, extend the grid by `degree + 1`
-        // points on each side using the same spacing. This preserves the shift-
-        // invariant property of the basis near the boundaries while still
-        // covering the data domain.
         let h = (max_val - min_val) / (num_internal_knots as f64 + 1.0);
-
         let total_knots = num_internal_knots + 2 * (degree + 1);
-        let start = min_val - h * (degree as f64 + 1.0);
 
-        Ok(Array::from_iter((0..total_knots).map(|i| start + i as f64 * h)))
+        let mut knots = Vec::with_capacity(total_knots);
+
+        // Clamped start: repeat min_val (degree + 1) times
+        for _ in 0..=degree {
+            knots.push(min_val);
+        }
+
+        // Internal knots: uniformly spaced
+        for i in 1..=num_internal_knots {
+            knots.push(min_val + i as f64 * h);
+        }
+
+        // Clamped end: repeat max_val (degree + 1) times
+        for _ in 0..=degree {
+            knots.push(max_val);
+        }
+
+        Ok(Array::from_vec(knots))
     }
 
     /// Evaluates all B-spline basis functions at a single point `x`.
