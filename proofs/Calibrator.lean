@@ -13,7 +13,7 @@ import Mathlib.LinearAlgebra.Matrix.PosDef
 import Mathlib.LinearAlgebra.Matrix.ToLin
 import Mathlib.LinearAlgebra.Dimension.OrzechProperty
 import Mathlib.Data.Matrix.Basic
-import Mathlib.Data.Matrix.DotProduct
+import Mathlib.LinearAlgebra.Matrix.DotProduct
 import Mathlib.Data.Matrix.Reflection
 import Mathlib.Data.Matrix.Mul
 import Mathlib.LinearAlgebra.Matrix.Trace
