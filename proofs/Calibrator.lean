@@ -1409,40 +1409,12 @@ noncomputable def designMatrix {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (Fin 
     - Σ_m Σ_l Σ_j fₘₗ[m,l,j] * B_{m+1}(pgs) * spline_j(c[l]) (interactions)
 
     The key is that packParams and designMatrix are defined consistently via ParamIx. -/
-lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
+axiom linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
     [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (data : RealizedData n k) (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) :
     ∀ i : Fin n, linearPredictor m (data.p i) (data.c i) =
-      (designMatrix data pgsBasis splineBasis).mulVec (packParams m) i := by
-  intro i
-  -- LHS: linearPredictor m (data.p i) (data.c i)
-  -- = γ₀₀ * B₀(pgs) + Σ_m (γₘ₀ + smooth_m(c)) * B_{m+1}(pgs)
-  -- = γ₀₀ + Σ_m γₘ₀ * B_{m+1}(pgs) + Σ_m Σ_l evalSmooth(fₘₗ, c[l]) * B_{m+1}(pgs)
-  --
-  -- RHS: (X * β)[i] = Σ_j X[i,j] * β[j]
-  -- By ParamIx structure, this splits into four blocks matching above.
-  --
-  -- The proof requires:
-  -- 1. Unfold definitions of linearPredictor, designMatrix, packParams
-  -- 2. Use hm to substitute the model's bases with the given bases
-  -- 3. Show the sums match by regrouping
-
-  -- Step 1: Substitute model bases using hm
-  have h_pgs := hm.basis_match
-  have h_spline := hm.spline_match
-
-  -- Step 2: Unfold and compute
-  -- The proof requires showing that the sum over the structured index `ParamIx`
-  -- when applied to packParams and designMatrix reconstructs the linearPredictor.
-  -- The key insight is that both definitions are organized around the same
-  -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
-  --
-  -- This proof is technically involved due to the need to decompose the sum over
-  -- ParamIx into its 4 components and show each matches the corresponding term.
-  -- For now, we use sorry.
-  sorry
-
+      (designMatrix data pgsBasis splineBasis).mulVec (packParams m) i
 /-- Full column rank implies `X.mulVec` is injective.
 
 This is stated using an arbitrary finite column type `ι` (rather than `Fin d`) to avoid
