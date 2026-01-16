@@ -179,6 +179,13 @@ impl BedSource {
         Self { byte_source, mmap }
     }
 
+    pub fn from_byte_source(byte_source: Arc<dyn ByteRangeSource>) -> Self {
+        Self {
+            byte_source,
+            mmap: None,
+        }
+    }
+
     pub fn byte_source(&self) -> Arc<dyn ByteRangeSource> {
         Arc::clone(&self.byte_source)
     }

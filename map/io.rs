@@ -16,6 +16,7 @@ use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
+use crate::shared::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
@@ -142,6 +143,7 @@ pub struct SampleRecord {
 pub enum GenotypeDataset {
     Plink(PlinkDataset),
     Variants(VcfLikeDataset),
+    Pgen(PgenDataset),
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +163,9 @@ pub struct SelectionOutcome {
 impl GenotypeDataset {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GenotypeIoError> {
         let path = path.as_ref();
+        if is_pgen_path(path) {
+            return Ok(Self::Pgen(PgenDataset::open(path)?));
+        }
         if guess_is_variant_dataset(path) {
             Ok(Self::Variants(VcfLikeDataset::open(path)?))
         } else {
@@ -172,6 +177,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => dataset.samples(),
             Self::Variants(dataset) => dataset.samples(),
+            Self::Pgen(dataset) => dataset.samples(),
         }
     }
 
@@ -179,6 +185,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => dataset.n_samples(),
             Self::Variants(dataset) => dataset.n_samples(),
+            Self::Pgen(dataset) => dataset.n_samples(),
         }
     }
 
@@ -186,6 +193,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => dataset.n_variants(),
             Self::Variants(dataset) => dataset.n_variants(),
+            Self::Pgen(dataset) => dataset.n_variants(),
         }
     }
 
@@ -193,6 +201,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => Some(dataset.n_variants()),
             Self::Variants(dataset) => dataset.variant_count_hint(),
+            Self::Pgen(dataset) => Some(dataset.n_variants()),
         }
     }
 
@@ -236,6 +245,26 @@ impl GenotypeDataset {
             (Self::Variants(dataset), plan) => Ok(DatasetBlockSource::Variants(
                 dataset.block_source_with_plan(plan)?,
             )),
+            (Self::Pgen(dataset), SelectionPlan::All) => {
+                Ok(DatasetBlockSource::Plink(dataset.block_source()))
+            }
+            (Self::Pgen(dataset), SelectionPlan::ByIndices(indices)) => Ok(
+                DatasetBlockSource::Plink(dataset.block_source_with_selection(
+                    Some(indices),
+                    None,
+                )),
+            ),
+            (Self::Pgen(dataset), SelectionPlan::ByKeys(filter)) => {
+                let selection = dataset
+                    .select_variants(filter.as_ref())
+                    .map_err(GenotypeIoError::from)?;
+                Ok(DatasetBlockSource::Plink(
+                    dataset.block_source_with_selection(
+                        Some(selection.indices),
+                        Some(selection.match_kinds),
+                    ),
+                ))
+            }
         }
     }
 
@@ -248,6 +277,9 @@ impl GenotypeDataset {
                 .select_variants(filter)
                 .map_err(GenotypeIoError::from),
             Self::Variants(dataset) => dataset
+                .select_variants(filter)
+                .map_err(GenotypeIoError::from),
+            Self::Pgen(dataset) => dataset
                 .select_variants(filter)
                 .map_err(GenotypeIoError::from),
         }
@@ -295,6 +327,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => dataset.bed_path(),
             Self::Variants(dataset) => dataset.input_path(),
+            Self::Pgen(dataset) => dataset.pgen_path(),
         }
     }
 
@@ -302,6 +335,7 @@ impl GenotypeDataset {
         match self {
             Self::Plink(dataset) => dataset.output_path(filename),
             Self::Variants(dataset) => dataset.output_path(filename),
+            Self::Pgen(dataset) => dataset.output_path(filename),
         }
     }
 
@@ -346,6 +380,25 @@ impl GenotypeDataset {
                 Ok(selected)
             }
             (Self::Variants(dataset), SelectionPlan::ByKeys(filter)) => {
+                let selection = dataset.select_variants(filter)?;
+                Ok(selection.keys)
+            }
+            (Self::Pgen(dataset), SelectionPlan::All) => Ok(dataset.variant_keys_all()?),
+            (Self::Pgen(dataset), SelectionPlan::ByIndices(indices)) => {
+                let keys = dataset.variant_keys_all()?;
+                let mut selected = Vec::with_capacity(indices.len());
+                for &idx in indices {
+                    if let Some(key) = keys.get(idx) {
+                        selected.push(key.clone());
+                    } else {
+                        return Err(GenotypeIoError::Plink(PlinkIoError::InvalidHeader(
+                            format!("variant index {idx} exceeds dataset bounds"),
+                        )));
+                    }
+                }
+                Ok(selected)
+            }
+            (Self::Pgen(dataset), SelectionPlan::ByKeys(filter)) => {
                 let selection = dataset.select_variants(filter)?;
                 Ok(selection.keys)
             }
@@ -699,8 +752,8 @@ impl PlinkDataset {
                     .position
                     .parse::<u64>()
                     .map_err(|err| PlinkIoError::MalformedRecord {
-                        path: iter.path.display().to_string(),
-                        line: iter.line,
+                        path: iter.path().display().to_string(),
+                        line: iter.line(),
                         message: format!(
                             "invalid position '{}' for variant {}: {err}",
                             record.position, record.identifier
@@ -767,8 +820,8 @@ impl PlinkDataset {
                     .position
                     .parse::<u64>()
                     .map_err(|err| PlinkIoError::MalformedRecord {
-                        path: iter.path.display().to_string(),
-                        line: iter.line,
+                        path: iter.path().display().to_string(),
+                        line: iter.line(),
                         message: format!(
                             "invalid position '{}' for variant {}: {err}",
                             record.position, record.identifier
@@ -818,6 +871,179 @@ impl PlinkDataset {
     }
 }
 
+pub struct PgenDataset {
+    pgen_path: PathBuf,
+    pvar_path: PathBuf,
+    psam_path: PathBuf,
+    virtual_plink: VirtualPlink19,
+    samples: Vec<SampleRecord>,
+    n_variants: usize,
+    bytes_per_variant: usize,
+}
+
+impl PgenDataset {
+    pub fn open(path: &Path) -> Result<Self, PlinkIoError> {
+        let (pgen_path, pvar_path, psam_path) = normalize_pgen_paths(path);
+        let virtual_plink =
+            open_virtual_plink19_from_paths(&pgen_path, &pvar_path, &psam_path)?;
+
+        let mut fam_source = virtual_plink.fam_source();
+        let samples = read_fam_records_from_source(&psam_path, &mut *fam_source)?;
+        if samples.is_empty() {
+            return Err(PlinkIoError::MalformedRecord {
+                path: psam_path.display().to_string(),
+                line: 0,
+                message: "no samples found in .psam".to_string(),
+            });
+        }
+
+        let n_samples = samples.len();
+        let bytes_per_variant = n_samples.div_ceil(4).max(1);
+        let n_variants = virtual_plink.n_variants();
+
+        Ok(Self {
+            pgen_path,
+            pvar_path,
+            psam_path,
+            virtual_plink,
+            samples,
+            n_variants,
+            bytes_per_variant,
+        })
+    }
+
+    pub fn samples(&self) -> &[SampleRecord] {
+        &self.samples
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn n_variants(&self) -> usize {
+        self.n_variants
+    }
+
+    pub fn pgen_path(&self) -> &Path {
+        &self.pgen_path
+    }
+
+    pub fn variant_records(&self) -> Result<PlinkVariantRecordIter, PlinkIoError> {
+        let reader = self.virtual_plink.bim_source();
+        Ok(PlinkVariantRecordIter::from_source(
+            self.pvar_path.clone(),
+            reader,
+        ))
+    }
+
+    pub fn variant_keys_all(&self) -> Result<Vec<VariantKey>, PlinkIoError> {
+        let mut iter = self.variant_records()?;
+        let mut keys = Vec::with_capacity(self.n_variants);
+        while let Some(result) = iter.next() {
+            let record = result?;
+            let position =
+                record
+                    .position
+                    .parse::<u64>()
+                    .map_err(|err| PlinkIoError::MalformedRecord {
+                        path: iter.path.display().to_string(),
+                        line: iter.line,
+                        message: format!(
+                            "invalid position '{}' for variant {}: {err}",
+                            record.position, record.identifier
+                        ),
+                    })?;
+            let key = VariantKey::new_with_alleles(
+                &record.chromosome,
+                position,
+                &record.allele2,
+                &record.allele1,
+            );
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
+    pub fn block_source(&self) -> PlinkVariantBlockSource {
+        self.block_source_with_selection(None, None)
+    }
+
+    pub fn block_source_with_selection(
+        &self,
+        selection: Option<Vec<usize>>,
+        match_kinds: Option<Vec<MatchKind>>,
+    ) -> PlinkVariantBlockSource {
+        let bed = BedSource::from_byte_source(Arc::clone(&self.virtual_plink.bed));
+        PlinkVariantBlockSource::new(
+            bed,
+            self.bytes_per_variant,
+            self.samples.len(),
+            self.n_variants,
+            selection,
+            match_kinds,
+        )
+    }
+
+    pub fn select_variants(
+        &self,
+        filter: &VariantFilter,
+    ) -> Result<VariantSelection, PlinkIoError> {
+        use std::collections::HashSet;
+
+        let mut iter = self.variant_records()?;
+        let mut indices = Vec::new();
+        let mut keys = Vec::new();
+        let mut match_kinds = Vec::new();
+        let mut matched = HashSet::new();
+        let mut index = 0usize;
+
+        while let Some(result) = iter.next() {
+            let record = result?;
+            let position =
+                record
+                    .position
+                    .parse::<u64>()
+                    .map_err(|err| PlinkIoError::MalformedRecord {
+                        path: iter.path.display().to_string(),
+                        line: iter.line,
+                        message: format!(
+                            "invalid position '{}' for variant {}: {err}",
+                            record.position, record.identifier
+                        ),
+                    })?;
+
+            let key = VariantKey::new_with_alleles(
+                &record.chromosome,
+                position,
+                &record.allele2,
+                &record.allele1,
+            );
+            if let Some(status) = filter.match_status(&key)
+                && matched.insert(key.clone()) {
+                    indices.push(index);
+                    keys.push(key);
+                    match_kinds.push(status);
+                }
+            index += 1;
+        }
+
+        let missing = filter.missing_keys(&matched);
+        Ok(VariantSelection {
+            indices,
+            keys,
+            match_kinds,
+            missing,
+            requested_unique: filter.requested_unique(),
+        })
+    }
+
+    pub fn output_path(&self, filename: &str) -> PathBuf {
+        let mut local = self.pgen_path.clone();
+        local.set_extension(filename);
+        local
+    }
+}
+
 pub struct PlinkVariantRecordIter {
     path: PathBuf,
     reader: Box<dyn TextSource>,
@@ -831,6 +1057,18 @@ impl PlinkVariantRecordIter {
             reader,
             line: 0,
         }
+    }
+
+    fn from_source(path: PathBuf, reader: Box<dyn TextSource>) -> Self {
+        Self::new(path, reader)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn line(&self) -> usize {
+        self.line
     }
 }
 
@@ -3232,6 +3470,24 @@ fn normalize_path(path: &Path, extension: &str) -> PathBuf {
     }
 }
 
+fn is_pgen_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "pgen" | "pvar" | "psam"))
+}
+
+fn normalize_pgen_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let base = match path.file_stem() {
+        Some(stem) => path.with_file_name(stem),
+        None => path.to_owned(),
+    };
+    (
+        base.with_extension("pgen"),
+        base.with_extension("pvar"),
+        base.with_extension("psam"),
+    )
+}
+
 fn validate_bed_header(header: &[u8]) -> Result<(), PlinkIoError> {
     match header {
         [0x6c, 0x1b, 0x01] => Ok(()),
@@ -3246,6 +3502,13 @@ fn validate_bed_header(header: &[u8]) -> Result<(), PlinkIoError> {
 
 fn read_fam_records(path: &Path) -> Result<Vec<SampleRecord>, PlinkIoError> {
     let mut reader = open_text_source(path)?;
+    read_fam_records_from_source(path, &mut *reader)
+}
+
+fn read_fam_records_from_source(
+    path: &Path,
+    reader: &mut dyn TextSource,
+) -> Result<Vec<SampleRecord>, PlinkIoError> {
     let mut records = Vec::new();
     let mut line_no = 0usize;
 

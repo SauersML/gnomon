@@ -51,11 +51,11 @@ use crate::score::pipeline::PipelineError;
 pub struct VirtualPlink19 {
     /// Random-access virtual `.bed` (PLINK-1.9 bytes).
     pub bed: Arc<dyn ByteRangeSource>,
-    /// Streaming virtual `.bim` (PLINK-1.9 tab text).
-    pub bim: Box<dyn TextSource>,
-    /// Streaming virtual `.fam` (PLINK-1.9 tab text).
-    pub fam: Box<dyn TextSource>,
     build: GenomeBuild,
+    bim_lines: Vec<BimLine>,
+    fam_rows: Vec<FamRow>,
+    n_samples: usize,
+    n_variants: usize,
 }
 
 impl VirtualPlink19 {
@@ -65,6 +65,22 @@ impl VirtualPlink19 {
             GenomeBuild::Grch37 => "GRCh37",
             GenomeBuild::Grch38 => "GRCh38",
         }
+    }
+
+    pub fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    pub fn n_variants(&self) -> usize {
+        self.n_variants
+    }
+
+    pub fn bim_source(&self) -> Box<dyn TextSource> {
+        Box::new(VirtualBim::from_lines(self.bim_lines.clone()))
+    }
+
+    pub fn fam_source(&self) -> Box<dyn TextSource> {
+        Box::new(VirtualFam::from_rows(self.fam_rows.clone()))
     }
 }
 
@@ -142,14 +158,13 @@ pub fn open_virtual_plink19_from_sources(
         }
     };
 
-    let bim: Box<dyn TextSource> = Box::new(VirtualBim::from_lines(bim_lines));
-    let fam: Box<dyn TextSource> = Box::new(VirtualFam::from_rows(fam_rows));
-
     Ok(VirtualPlink19 {
         bed: bed_source,
-        bim,
-        fam,
         build: inferred_build,
+        bim_lines,
+        fam_rows,
+        n_samples: psam_info.n_samples,
+        n_variants: plan.out_variants,
     })
 }
 

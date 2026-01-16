@@ -38,6 +38,7 @@ use sysinfo::System;
 
 pub const HWE_VARIANCE_EPSILON: f64 = 1.0e-12;
 pub const HWE_SCALE_FLOOR: f64 = 1.0e-6;
+const POPCOUNT_MAX_COLS: usize = 8;
 pub const EIGENVALUE_EPSILON: f64 = 1.0e-9;
 pub const DEFAULT_BLOCK_WIDTH: usize = 2_048;
 const DENSE_EIGEN_FALLBACK_THRESHOLD: usize = 64;
@@ -396,6 +397,519 @@ pub trait VariantBlockSource {
         for value in storage.iter_mut().take(filled) {
             *value = 1.0;
         }
+    }
+
+    /// Provides a packed 2-bit hard-call view of the data when available.
+    /// The default implementation returns None.
+    fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
+        None
+    }
+}
+
+pub struct HardCallPacked<'a> {
+    data: &'a [u8],
+    bytes_per_variant: usize,
+    n_variants: usize,
+}
+
+impl<'a> HardCallPacked<'a> {
+    fn slice(&self, start: usize, count: usize) -> Option<&'a [u8]> {
+        let byte_start = start.checked_mul(self.bytes_per_variant)?;
+        let byte_len = count.checked_mul(self.bytes_per_variant)?;
+        let byte_end = byte_start.checked_add(byte_len)?;
+        if byte_end > self.data.len() {
+            return None;
+        }
+        Some(&self.data[byte_start..byte_end])
+    }
+}
+
+#[derive(Debug)]
+enum CacheState {
+    Disabled,
+    BuildingHardCall {
+        packed: Vec<u8>,
+        bytes_per_variant: usize,
+        observed_variants: usize,
+    },
+    BuildingDense {
+        data: Vec<f64>,
+        observed_variants: usize,
+        max_bytes: usize,
+    },
+    ReadyHardCall {
+        packed: Vec<u8>,
+        bytes_per_variant: usize,
+        n_variants: usize,
+    },
+    ReadyDense {
+        data: Vec<f64>,
+        n_variants: usize,
+    },
+}
+
+/// A smart cache that opportunistically stores hard-call genotypes in 2-bit packed
+/// form. If any non-hard-call values are encountered, caching is disabled and the
+/// underlying source is used directly.
+struct CachedVariantBlockSource<'a, S>
+where
+    S: VariantBlockSource,
+{
+    source: &'a mut S,
+    n_samples: usize,
+    n_variants: usize,
+    cursor: usize,
+    state: CacheState,
+}
+
+impl<'a, S> CachedVariantBlockSource<'a, S>
+where
+    S: VariantBlockSource,
+{
+    fn new(source: &'a mut S, enable_cache: bool) -> Self {
+        let n_samples = source.n_samples();
+        let n_variants = source.n_variants();
+        let bytes_per_variant = bytes_per_variant(n_samples);
+        let packed_capacity = bytes_per_variant.saturating_mul(n_variants);
+        let state = if !enable_cache || n_samples == 0 {
+            CacheState::Disabled
+        } else {
+            CacheState::BuildingHardCall {
+                packed: Vec::with_capacity(packed_capacity),
+                bytes_per_variant,
+                observed_variants: 0,
+            }
+        };
+        Self {
+            source,
+            n_samples,
+            n_variants,
+            cursor: 0,
+            state,
+        }
+    }
+
+    fn reset_cache_build(&mut self) {
+        if self.n_samples == 0 {
+            self.state = CacheState::Disabled;
+            return;
+        }
+        let bytes_per_variant = bytes_per_variant(self.n_samples);
+        let packed_capacity = bytes_per_variant.saturating_mul(self.n_variants);
+        self.state = CacheState::BuildingHardCall {
+            packed: Vec::with_capacity(packed_capacity),
+            bytes_per_variant,
+            observed_variants: 0,
+        };
+    }
+
+    fn decode_from_cache(&self, start_variant: usize, filled: usize, storage: &mut [f64]) {
+        match &self.state {
+            CacheState::ReadyHardCall {
+                packed,
+                bytes_per_variant,
+                n_variants,
+            } => {
+                let total_bytes = bytes_per_variant
+                    .checked_mul(*n_variants)
+                    .unwrap_or(0);
+                if packed.len() < total_bytes {
+                    return;
+                }
+
+                let table = hard_call_decode_table();
+                for variant_idx in 0..filled {
+                    let global_idx = start_variant + variant_idx;
+                    let byte_start = global_idx * bytes_per_variant;
+                    let byte_end = byte_start + bytes_per_variant;
+                    if byte_end > packed.len() {
+                        break;
+                    }
+                    let dest_offset = variant_idx * self.n_samples;
+                    let dest = &mut storage[dest_offset..dest_offset + self.n_samples];
+                    decode_packed_hard_calls(&packed[byte_start..byte_end], dest, self.n_samples, table);
+                }
+            }
+            CacheState::ReadyDense { data, n_variants } => {
+                let total = self.n_samples.saturating_mul(*n_variants);
+                if data.len() < total {
+                    return;
+                }
+                for variant_idx in 0..filled {
+                    let global_idx = start_variant + variant_idx;
+                    let src_offset = global_idx * self.n_samples;
+                    let dest_offset = variant_idx * self.n_samples;
+                    if src_offset + self.n_samples > data.len() {
+                        break;
+                    }
+                    storage[dest_offset..dest_offset + self.n_samples]
+                        .copy_from_slice(&data[src_offset..src_offset + self.n_samples]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a, S> VariantBlockSource for CachedVariantBlockSource<'a, S>
+where
+    S: VariantBlockSource,
+{
+    type Error = S::Error;
+
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    fn n_variants(&self) -> usize {
+        self.n_variants
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.cursor = 0;
+        match self.state {
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => Ok(()),
+            CacheState::Disabled => self.source.reset(),
+            CacheState::BuildingHardCall { .. } | CacheState::BuildingDense { .. } => {
+                self.reset_cache_build();
+                self.source.reset()
+            }
+        }
+    }
+
+    fn next_block_into(
+        &mut self,
+        max_variants: usize,
+        storage: &mut [f64],
+    ) -> Result<usize, Self::Error> {
+        if max_variants == 0 {
+            return Ok(0);
+        }
+
+        if matches!(self.state, CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. }) {
+            let remaining = self.n_variants.saturating_sub(self.cursor);
+            if remaining == 0 {
+                return Ok(0);
+            }
+            let filled = remaining.min(max_variants);
+            self.decode_from_cache(self.cursor, filled, storage);
+            self.cursor += filled;
+            return Ok(filled);
+        }
+
+        let filled = self.source.next_block_into(max_variants, storage)?;
+        if filled == 0 {
+            match &mut self.state {
+                CacheState::BuildingHardCall {
+                    packed,
+                    bytes_per_variant,
+                    observed_variants,
+                } => {
+                    if *observed_variants > 0 {
+                        let packed = std::mem::take(packed);
+                        let n_variants = *observed_variants;
+                        self.n_variants = n_variants;
+                        self.state = CacheState::ReadyHardCall {
+                            packed,
+                            bytes_per_variant: *bytes_per_variant,
+                            n_variants,
+                        };
+                    } else {
+                        self.state = CacheState::Disabled;
+                    }
+                }
+                CacheState::BuildingDense {
+                    data,
+                    observed_variants,
+                    ..
+                } => {
+                    if *observed_variants > 0 {
+                        let data = std::mem::take(data);
+                        let n_variants = *observed_variants;
+                        self.n_variants = n_variants;
+                        self.state = CacheState::ReadyDense { data, n_variants };
+                    } else {
+                        self.state = CacheState::Disabled;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(0);
+        }
+
+        match &mut self.state {
+            CacheState::BuildingHardCall {
+                packed,
+                bytes_per_variant,
+                observed_variants,
+            } => {
+                let base_observed = *observed_variants;
+                let mut scratch = vec![0u8; *bytes_per_variant];
+                let mut packed_count = 0usize;
+                let mut hard_call_only = true;
+                for variant_idx in 0..filled {
+                    let src_offset = variant_idx * self.n_samples;
+                    let src = &storage[src_offset..src_offset + self.n_samples];
+                    if !pack_hard_calls_into(&mut scratch, src, self.n_samples) {
+                        hard_call_only = false;
+                        break;
+                    }
+                    packed.extend_from_slice(&scratch);
+                    packed_count += 1;
+                }
+                *observed_variants = base_observed.saturating_add(packed_count);
+                if !hard_call_only {
+                    let packed_snapshot = std::mem::take(packed);
+                    if let Some(mut dense) = DenseCacheBuilder::from_packed(
+                        packed_snapshot,
+                        *bytes_per_variant,
+                        self.n_samples,
+                        *observed_variants,
+                    ) {
+                        if packed_count < filled {
+                            dense.push_block_range(
+                                storage,
+                                packed_count,
+                                filled,
+                                self.n_samples,
+                            );
+                            *observed_variants = base_observed.saturating_add(filled);
+                        }
+                        self.state = CacheState::BuildingDense {
+                            data: dense.data,
+                            observed_variants: *observed_variants,
+                            max_bytes: dense.max_bytes,
+                        };
+                    } else {
+                        self.state = CacheState::Disabled;
+                    }
+                } else {
+                    *observed_variants = base_observed.saturating_add(filled);
+                }
+            }
+            CacheState::BuildingDense {
+                data,
+                observed_variants,
+                max_bytes,
+            } => {
+                let start = data.len();
+                let needed = self.n_samples.saturating_mul(filled);
+                data.resize(start + needed, 0.0);
+                let src = &storage[..self.n_samples * filled];
+                data[start..start + needed].copy_from_slice(src);
+                *observed_variants = observed_variants.saturating_add(filled);
+                if data.len().saturating_mul(std::mem::size_of::<f64>()) > *max_bytes {
+                    self.state = CacheState::Disabled;
+                }
+            }
+            CacheState::Disabled => {}
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => {}
+        }
+
+        self.cursor += filled;
+        Ok(filled)
+    }
+
+    fn progress_bytes(&self) -> Option<(u64, Option<u64>)> {
+        match self.state {
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => None,
+            _ => self.source.progress_bytes(),
+        }
+    }
+
+    fn progress_variants(&self) -> Option<(usize, Option<usize>)> {
+        match self.state {
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => {
+                Some((self.cursor.min(self.n_variants), Some(self.n_variants)))
+            }
+            _ => self.source.progress_variants(),
+        }
+    }
+
+    fn variant_quality(&self, filled: usize, storage: &mut [f64]) {
+        match self.state {
+            CacheState::ReadyHardCall { .. } | CacheState::ReadyDense { .. } => {
+                for value in storage.iter_mut().take(filled) {
+                    *value = 1.0;
+                }
+            }
+            _ => (&*self.source).variant_quality(filled, storage),
+        }
+    }
+
+    fn hard_call_packed(&mut self) -> Option<HardCallPacked<'_>> {
+        match &self.state {
+            CacheState::ReadyHardCall {
+                packed,
+                bytes_per_variant,
+                n_variants,
+            } => Some(HardCallPacked {
+                data: packed,
+                bytes_per_variant: *bytes_per_variant,
+                n_variants: *n_variants,
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn bytes_per_variant(n_samples: usize) -> usize {
+    (n_samples + 3) / 4
+}
+
+fn pack_hard_calls_into(dst: &mut [u8], src: &[f64], n_samples: usize) -> bool {
+    for (byte_idx, out) in dst.iter_mut().enumerate() {
+        let base = byte_idx * 4;
+        let mut byte = 0u8;
+        for offset in 0..4 {
+            let sample_idx = base + offset;
+            if sample_idx >= n_samples {
+                break;
+            }
+            let val = src[sample_idx];
+            let code = if val.is_nan() {
+                1u8
+            } else if val == 0.0 {
+                0u8
+            } else if val == 1.0 {
+                2u8
+            } else if val == 2.0 {
+                3u8
+            } else {
+                return false;
+            };
+            byte |= code << (offset * 2);
+        }
+        *out = byte;
+    }
+    true
+}
+
+fn decode_packed_hard_calls(
+    bytes: &[u8],
+    dest: &mut [f64],
+    n_samples: usize,
+    table: &[[f64; 4]; 256],
+) {
+    let mut sample_idx = 0usize;
+    for &byte in bytes {
+        if sample_idx >= n_samples {
+            break;
+        }
+        let decoded = &table[byte as usize];
+        let remaining = n_samples - sample_idx;
+        let take = remaining.min(4);
+        dest[sample_idx..sample_idx + take].copy_from_slice(&decoded[..take]);
+        sample_idx += take;
+    }
+}
+
+fn hard_call_decode_table() -> &'static [[f64; 4]; 256] {
+    static TABLE: OnceLock<[[f64; 4]; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0.0f64; 4]; 256];
+        for byte in 0u16..256 {
+            for offset in 0..4 {
+                let code = ((byte >> (offset * 2)) & 0b11) as u8;
+                table[byte as usize][offset] = match code {
+                    0 => 0.0,
+                    1 => f64::NAN,
+                    2 => 1.0,
+                    3 => 2.0,
+                    _ => unreachable!(),
+                };
+            }
+        }
+        table
+    })
+}
+
+fn hard_call_code_table() -> &'static [[u8; 4]; 256] {
+    static TABLE: OnceLock<[[u8; 4]; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0u8; 4]; 256];
+        for byte in 0u16..256 {
+            for offset in 0..4 {
+                let code = ((byte >> (offset * 2)) & 0b11) as u8;
+                table[byte as usize][offset] = code;
+            }
+        }
+        table
+    })
+}
+
+struct DenseCacheBuilder {
+    data: Vec<f64>,
+    max_bytes: usize,
+}
+
+impl DenseCacheBuilder {
+    fn from_packed(
+        packed: Vec<u8>,
+        bytes_per_variant: usize,
+        n_samples: usize,
+        observed_variants: usize,
+    ) -> Option<Self> {
+        if n_samples == 0 {
+            return None;
+        }
+        let max_bytes = cache_budget_bytes();
+        if max_bytes == 0 {
+            return None;
+        }
+        let needed = n_samples
+            .checked_mul(observed_variants)?
+            .checked_mul(std::mem::size_of::<f64>())?;
+        if needed > max_bytes {
+            return None;
+        }
+        let mut data = Vec::with_capacity(n_samples.saturating_mul(observed_variants));
+        data.resize(n_samples.saturating_mul(observed_variants), 0.0);
+        if observed_variants > 0 {
+            let table = hard_call_decode_table();
+            for variant_idx in 0..observed_variants {
+                let byte_start = variant_idx * bytes_per_variant;
+                let byte_end = byte_start + bytes_per_variant;
+                if byte_end > packed.len() {
+                    break;
+                }
+                let dest_offset = variant_idx * n_samples;
+                let dest = &mut data[dest_offset..dest_offset + n_samples];
+                decode_packed_hard_calls(&packed[byte_start..byte_end], dest, n_samples, table);
+            }
+        }
+        Some(Self { data, max_bytes })
+    }
+
+    fn push_block_range(
+        &mut self,
+        storage: &[f64],
+        start_variant: usize,
+        end_variant: usize,
+        n_samples: usize,
+    ) {
+        if end_variant <= start_variant {
+            return;
+        }
+        let variant_count = end_variant - start_variant;
+        let needed = n_samples.saturating_mul(variant_count);
+        let offset = data_offset(start_variant, n_samples);
+        let src = &storage[offset..offset + needed];
+        self.data.extend_from_slice(src);
+    }
+}
+
+fn data_offset(variant_idx: usize, n_samples: usize) -> usize {
+    variant_idx.saturating_mul(n_samples)
+}
+
+fn cache_budget_bytes() -> usize {
+    match detect_total_memory_bytes() {
+        Some(total) if total > 0 => {
+            let target = total.saturating_mul(1) / 3;
+            target.min(usize::MAX as u64) as usize
+        }
+        _ => 0,
     }
 }
 
@@ -1331,6 +1845,12 @@ impl HwePcaModel {
         let gram_bytes = gram_matrix_size_bytes(n_samples);
         let gram_mode = covariance_computation_mode(n_samples, gram_budget);
 
+        let mut cached_source = CachedVariantBlockSource::new(
+            source,
+            matches!(gram_mode, CovarianceComputationMode::Partial),
+        );
+        let source = &mut cached_source;
+
         // Compute LD weights first if requested (applies to both paths)
         let (ld_weights_arc, ld_weights) = if let Some(ld_cfg) = ld_config {
             let (_, _, ld_weights_computed) = compute_stats_and_ld_weights(
@@ -1770,6 +2290,12 @@ where
             return;
         }
 
+        if rhs.ncols() <= POPCOUNT_MAX_COLS {
+            if self.try_apply_hardcall_packed(out.rb_mut(), rhs) {
+                return;
+            }
+        }
+
         let block_len = self.n_samples * self.block_capacity;
         let (buf0_uninit, stack) = stack.make_uninit::<f64>(block_len);
         // SAFETY: `buf0_uninit` was allocated with capacity `block_len` and lives
@@ -1954,6 +2480,113 @@ where
         if processed != self.observed_variants {
             self.fail_invalid("VariantBlockSource terminated early during covariance accumulation");
         }
+    }
+
+    fn try_apply_hardcall_packed(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>) -> bool {
+        let mut guard = self
+            .source
+            .lock()
+            .expect("covariance source mutex poisoned");
+        let source: &mut S = &mut guard;
+        let _ = source.reset();
+        let packed = match source.hard_call_packed() {
+            Some(packed) => packed,
+            None => return false,
+        };
+
+        let n_samples = self.n_samples;
+        let ncols = rhs.ncols();
+        let freqs = self.scaler.allele_frequencies();
+        let scales = self.scaler.variant_scales();
+        let max_variants = self.observed_variants.min(packed.n_variants);
+        let max_variants = max_variants.min(freqs.len()).min(scales.len());
+        let code_table = hard_call_code_table();
+
+        for variant_idx in 0..max_variants {
+            let mean = 2.0 * freqs[variant_idx];
+            let denom = scales[variant_idx].max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            if inv == 0.0 {
+                continue;
+            }
+
+            let z0 = (0.0 - mean) * inv;
+            let z1 = (1.0 - mean) * inv;
+            let z2 = (2.0 - mean) * inv;
+
+            let weight_sq = if let Some(weights) = &self.ld_weights {
+                let w = weights.get(variant_idx).copied().unwrap_or(1.0);
+                w * w
+            } else {
+                1.0
+            };
+            let coeff = self.scale * weight_sq;
+
+            let variant_bytes = match packed.slice(variant_idx, 1) {
+                Some(slice) => slice,
+                None => break,
+            };
+
+            let mut proj = [0.0f64; POPCOUNT_MAX_COLS];
+            for col in 0..ncols {
+                let mut sum0 = 0.0f64;
+                let mut sum1 = 0.0f64;
+                let mut sum2 = 0.0f64;
+
+                let mut sample_idx = 0usize;
+                for &byte in variant_bytes {
+                    if sample_idx >= n_samples {
+                        break;
+                    }
+                    let codes = &code_table[byte as usize];
+                    for offset in 0..4 {
+                        let idx = sample_idx + offset;
+                        if idx >= n_samples {
+                            break;
+                        }
+                        let val = rhs[(idx, col)];
+                        match codes[offset] {
+                            0 => sum0 += val,
+                            2 => sum1 += val,
+                            3 => sum2 += val,
+                            _ => {}
+                        }
+                    }
+                    sample_idx += 4;
+                }
+
+                let p = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
+                proj[col] = p;
+            }
+
+            let mut sample_idx = 0usize;
+            for &byte in variant_bytes {
+                if sample_idx >= n_samples {
+                    break;
+                }
+                let codes = &code_table[byte as usize];
+                for offset in 0..4 {
+                    let idx = sample_idx + offset;
+                    if idx >= n_samples {
+                        break;
+                    }
+                    let z = match codes[offset] {
+                        0 => z0,
+                        2 => z1,
+                        3 => z2,
+                        _ => 0.0,
+                    };
+                    if z != 0.0 {
+                        for col in 0..ncols {
+                            out[(idx, col)] += z * proj[col];
+                        }
+                    }
+                }
+                sample_idx += 4;
+            }
+        }
+
+        true
     }
 
     fn conj_apply(
