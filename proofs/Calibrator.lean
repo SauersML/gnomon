@@ -1437,25 +1437,11 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   -- when applied to packParams and designMatrix reconstructs the linearPredictor.
   -- The key insight is that both definitions are organized around the same
   -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
-  -- The proof idea from PR #834 uses sum manipulation with ParamIx.equivSum and ac_rfl,
-  -- but requires more careful adjustment to compile cleanly.
-  -- Step 1: Substitute model bases using hm
-  have h_pgs := hm.basis_match
-  have h_spline := hm.spline_match
-
-  -- Step 2: Unfold and compute
-  -- The proof requires showing that the sum over the structured index `ParamIx`
-  -- when applied to packParams and designMatrix reconstructs the linearPredictor.
-  -- The key insight is that both definitions are organized around the same
-  -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
-  unfold linearPredictor designMatrix Matrix.mulVec dotProduct packParams
-  rw [h_pgs, h_spline]
-  -- Use the equivalence between ParamIx and the sum type to split the sum
-  rw [Fintype.sum_equiv (ParamIx.equivSum p k sp).symm]
-  -- Unfold the sum type and simplify
-  simp [ParamIx.equivSum, ParamIxSum, evalSmooth, Finset.sum_sum_type, Finset.sum_prod_type, Finset.sum_mul, Finset.mul_sum]
-  -- The rest should be algebraic rearrangement
-  ac_rfl
+  --
+  -- This proof is technically involved due to the need to decompose the sum over
+  -- ParamIx into its 4 components and show each matches the corresponding term.
+  -- For now, we use sorry.
+  sorry
 
 /-- Full column rank implies `X.mulVec` is injective.
 
@@ -1605,10 +1591,13 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
   rw [StrictConvexOn]
   constructor
   · exact convex_univ
-  · intro β₁ _ β₂ _ hne t ht_t
-    -- Need: f((1-t)β₁ + tβ₂) < (1-t)f(β₁) + tf(β₂)
+  · -- StrictConvexOn introduces: x ∈ s, y ∈ s, x ≠ y, a, b, 0 < a, 0 < b, a + b = 1
+    -- Note: a and b are introduced before their positivity proofs due to ⦃a b : ℝ⦄ syntax
+    -- The goal is: f(a • x + b • y) < a • f(x) + b • f(y)
+    intro β₁ _ β₂ _ hne a b ha hb hab
+    -- Need: f(a•β₁ + b•β₂) < a•f(β₁) + b•f(β₂)
     -- For quadratic: this follows from the positive definiteness of Hessian
-    -- The difference is: t(1-t)(β₁ - β₂)ᵀH(β₁ - β₂) > 0 when β₁ ≠ β₂
+    -- The difference is: a*b*(β₁ - β₂)ᵀH(β₁ - β₂) > 0 when β₁ ≠ β₂
     unfold gaussianPenalizedLoss
     -- The loss is (1/n)‖y - Xβ‖² + λ·βᵀSβ
     -- = (1/n)(y - Xβ)ᵀ(y - Xβ) + λ·βᵀSβ
@@ -1617,16 +1606,237 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     -- The quadratic form in β has Hessian H = (1/n)XᵀX + λS
     --
     -- For strict convexity of a quadratic βᵀHβ + linear(β):
-    -- f((1-t)β₁ + tβ₂) = ((1-t)β₁ + tβ₂)ᵀH((1-t)β₁ + tβ₂) + linear(...)
-    -- Expanding and subtracting (1-t)f(β₁) + tf(β₂):
-    -- = -t(1-t)(β₁ - β₂)ᵀH(β₁ - β₂)
-    -- This is < 0 when H is positive definite and β₁ ≠ β₂
+    -- f(a•β₁ + b•β₂) with a + b = 1:
+    -- a•f(β₁) + b•f(β₂) - f(a•β₁ + b•β₂) = a*b*(β₁ - β₂)ᵀH(β₁ - β₂)
+    -- This is > 0 when H is positive definite and β₁ ≠ β₂
     --
     -- Using the positive definiteness of (1/n)XᵀX (from h_rank) and λS ≥ 0:
-    -- The algebraic expansion shows f(mid) - (1-t)f(β₁) - tf(β₂) = -t(1-t)(β₁-β₂)ᵀH(β₁-β₂)
+    -- The algebraic expansion shows a•f(β₁) + b•f(β₂) - f(β_mid) = a*b*(β₁-β₂)ᵀH(β₁-β₂)
     -- where H = (1/n)XᵀX + λS is positive definite by full rank of X.
     -- This requires `transpose_mul_self_posDef` and the quadratic form inequality.
-    sorry -- Requires algebraic expansion and PD quadratic form lemma
+    --
+    -- For a quadratic f(β) = βᵀHβ + cᵀβ + d, the strict convexity inequality
+    -- a•f(β₁) + b•f(β₂) - f(a•β₁ + b•β₂) = a*b*(β₁-β₂)ᵀH(β₁-β₂) > 0
+    -- holds when H is positive definite and β₁ ≠ β₂.
+
+    -- Note: a + b = 1, so b = 1 - a. We'll use a and b directly.
+    -- Set up intermediate point
+    set β_mid := a • β₁ + b • β₂ with hβ_mid
+
+    -- The difference β₁ - β₂ is nonzero by hypothesis
+    have h_diff_ne : β₁ - β₂ ≠ 0 := sub_ne_zero.mpr hne
+
+    -- Get positive definiteness from full rank
+    have h_XtX_pd := transpose_mul_self_posDef X h_rank (β₁ - β₂) h_diff_ne
+
+    -- The core algebraic identity for quadratics:
+    -- For f(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ, we have the convexity gap:
+    -- a•f(β₁) + b•f(β₂) - f(a•β₁ + b•β₂) = a*b * [(1/n)‖X(β₁-β₂)‖² + λ·(β₁-β₂)ᵀS(β₁-β₂)]
+    --
+    -- First, decompose the residual term:
+    -- ‖y - X(a•β₁ + b•β₂)‖² = ‖a•(y - Xβ₁) + b•(y - Xβ₂)‖²
+    --   by linearity: y - Xβ_mid = a•y + b•y - X(a•β₁ + b•β₂)  (using a + b = 1)
+    --                            = a•y - a•Xβ₁ + b•y - b•Xβ₂
+    --                            = a•(y - Xβ₁) + b•(y - Xβ₂)
+
+    -- Define residuals for cleaner notation
+    set r₁ := y - X.mulVec β₁ with hr₁
+    set r₂ := y - X.mulVec β₂ with hr₂
+    set r_mid := y - X.mulVec β_mid with hr_mid
+
+    -- Residual decomposition: r_mid = a•r₁ + b•r₂
+    -- This follows from linearity of matrix-vector multiplication and a + b = 1:
+    -- r_mid = y - X(a•β₁ + b•β₂)
+    --       = y - a•Xβ₁ - b•Xβ₂
+    --       = (a+b)•y - a•Xβ₁ - b•Xβ₂   [using a+b=1]
+    --       = a•(y - Xβ₁) + b•(y - Xβ₂)
+    --       = a•r₁ + b•r₂
+    have h_r_decomp : r_mid = a • r₁ + b • r₂ := by
+      -- Standard linear algebra identity
+      sorry
+
+    -- For squared norms with convex combination: a‖u‖² + b‖v‖² - ‖a•u + b•v‖² = ab‖u-v‖²
+    have h_sq_norm_gap : a * ‖r₁‖^2 + b * ‖r₂‖^2 - ‖r_mid‖^2 = a * b * ‖r₁ - r₂‖^2 := by
+      -- Standard convex combination norm identity using inner product structure
+      sorry
+
+    -- r₁ - r₂ = (y - Xβ₁) - (y - Xβ₂) = Xβ₂ - Xβ₁ = X(β₂ - β₁)
+    have h_r_diff : r₁ - r₂ = X.mulVec (β₂ - β₁) := by
+      simp only [hr₁, hr₂]
+      ext i
+      simp only [Pi.sub_apply, Matrix.mulVec_sub]
+      ring
+
+    -- ‖r₁ - r₂‖² = ‖X(β₂-β₁)‖² = ‖X(β₁-β₂)‖² (since ‖-v‖ = ‖v‖)
+    have h_norm_r_diff : ‖r₁ - r₂‖^2 = ‖X.mulVec (β₁ - β₂)‖^2 := by
+      rw [h_r_diff]
+      -- ‖X(β₂ - β₁)‖ = ‖-(X(β₁ - β₂))‖ = ‖X(β₁ - β₂)‖
+      congr 1
+      rw [show β₂ - β₁ = -(β₁ - β₂) by ring, Matrix.mulVec_neg, norm_neg]
+
+    -- Similarly for the penalty term: a·β₁ᵀSβ₁ + b·β₂ᵀSβ₂ - β_midᵀSβ_mid = a*b*(β₁-β₂)ᵀS(β₁-β₂)
+    -- when S is symmetric (which we assume for penalty matrices)
+
+    -- The penalty quadratic form
+    set Q := fun β => Finset.univ.sum (fun i => β i * (S.mulVec β) i) with hQ
+
+    -- For PSD S, the penalty gap is also a*b*(β₁-β₂)ᵀS(β₁-β₂) ≥ 0
+    have h_Q_gap : a * Q β₁ + b * Q β₂ - Q β_mid ≥ 0 := by
+      -- This follows from convexity of quadratic form with PSD matrix
+      -- For any β, βᵀSβ ≥ 0, and the quadratic form is convex
+      simp only [hQ, hβ_mid]
+      -- The quadratic form βᵀSβ is convex when S is PSD
+      -- Using _hS : IsPosSemidef S, i.e., ∀ v, 0 ≤ dotProduct' (S.mulVec v) v
+      -- Convexity: a·f(x) + b·f(y) ≥ f(a•x + b•y) for convex f when a+b=1
+      -- For PSD S, the gap a·xᵀSx + b·yᵀSy - (a•x+b•y)ᵀS(a•x+b•y) = a*b*(x-y)ᵀS(x-y) ≥ 0
+      have h_psd_gap : a * dotProduct' (S.mulVec β₁) β₁ + b * dotProduct' (S.mulVec β₂) β₂
+                     - dotProduct' (S.mulVec (a • β₁ + b • β₂)) (a • β₁ + b • β₂)
+                     = a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) := by
+        -- Expand using bilinearity of quadratic form
+        unfold dotProduct'
+        simp only [Matrix.mulVec_add, Matrix.mulVec_smul, Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+        simp only [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul]
+        ring_nf
+        -- The algebraic identity requires expanding and collecting terms
+        -- a(Σᵢ β₁ᵢ·(Sβ₁)ᵢ) + b(Σᵢ β₂ᵢ·(Sβ₂)ᵢ) - Σᵢ(a·β₁ᵢ + b·β₂ᵢ)·(a·(Sβ₁)ᵢ + b·(Sβ₂)ᵢ)
+        -- = a*b Σᵢ (β₁ᵢ - β₂ᵢ)·((Sβ₁)ᵢ - (Sβ₂)ᵢ)
+        -- = a*b Σᵢ (β₁ - β₂)ᵢ · (S(β₁-β₂))ᵢ (by linearity of S)
+        simp only [Matrix.mulVec_sub, Pi.sub_apply]
+        have hab' : a + b = 1 := hab
+        -- After ring_nf, we need to show the algebraic identity with a+b=1
+        sorry -- algebraic identity
+      -- The RHS is ≥ 0 by PSD of S
+      have h_rhs_nonneg : a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) ≥ 0 := by
+        apply mul_nonneg
+        apply mul_nonneg
+        · exact le_of_lt ha
+        · exact le_of_lt hb
+        · exact _hS (β₁ - β₂)
+      -- Convert between sum notation and dotProduct'
+      have h_sum_eq : ∀ β, Finset.univ.sum (fun i => β i * (S.mulVec β) i) = dotProduct' (S.mulVec β) β := by
+        intro β
+        unfold dotProduct'
+        congr 1
+        ext i
+        ring
+      simp only [h_sum_eq]
+      linarith [h_psd_gap, h_rhs_nonneg]
+
+    -- Now combine: the total gap is a*b times positive definite term plus nonneg term
+    -- Total: a·L(β₁) + b·L(β₂) - L(β_mid)
+    --      = (1/n)[a*b*‖X(β₁-β₂)‖²] + λ[penalty gap]
+    --      ≥ (1/n)[a*b*‖X(β₁-β₂)‖²] > 0
+
+    -- Expand the loss definition
+    simp only [hβ_mid]
+    -- Goal: L(a•β₁ + b•β₂) < a*L(β₁) + b*L(β₂)
+    -- i.e., (1/n)‖r_mid‖² + λ·Q(β_mid) < a((1/n)‖r₁‖² + λ·Q(β₁)) + b((1/n)‖r₂‖² + λ·Q(β₂))
+
+    -- Rewrite using our intermediate definitions
+    have h_L_at_1 : gaussianPenalizedLoss X y S lam β₁ = (1/n) * ‖r₁‖^2 + lam * Q β₁ := rfl
+    have h_L_at_2 : gaussianPenalizedLoss X y S lam β₂ = (1/n) * ‖r₂‖^2 + lam * Q β₂ := rfl
+    have h_L_at_mid : gaussianPenalizedLoss X y S lam (a • β₁ + b • β₂) =
+                      (1/n) * ‖r_mid‖^2 + lam * Q (a • β₁ + b • β₂) := rfl
+
+    -- The gap: a·L(β₁) + b·L(β₂) - L(β_mid)
+    --        = (1/n)[a‖r₁‖² + b‖r₂‖² - ‖r_mid‖²] + λ[a·Q(β₁) + b·Q(β₂) - Q(β_mid)]
+    --        = (1/n)[a*b*‖X(β₁-β₂)‖²] + λ[nonneg] by h_sq_norm_gap, h_norm_r_diff, h_Q_gap
+
+    -- The residual term gap
+    have h_res_gap : a * ((1/n) * ‖r₁‖^2) + b * ((1/n) * ‖r₂‖^2) - (1/n) * ‖r_mid‖^2
+                   = (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+      -- First, use h_sq_norm_gap to convert norm gap to a * b * ‖r₁ - r₂‖^2
+      -- Then, use h_norm_r_diff to convert ‖r₁ - r₂‖^2 to ‖X(β₁ - β₂)‖^2
+      calc a * ((1/n) * ‖r₁‖^2) + b * ((1/n) * ‖r₂‖^2) - (1/n) * ‖r_mid‖^2
+          = (1/n) * (a * ‖r₁‖^2 + b * ‖r₂‖^2 - ‖r_mid‖^2) := by ring
+        _ = (1/n) * (a * b * ‖r₁ - r₂‖^2) := by rw [h_sq_norm_gap]
+        _ = (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by rw [h_norm_r_diff]
+
+    -- The ‖X(β₁-β₂)‖² term is positive by injectivity
+    have h_Xdiff_pos : 0 < ‖X.mulVec (β₁ - β₂)‖^2 := by
+      rw [sq_pos_iff, norm_ne_zero_iff]
+      intro h_eq
+      have h_inj := mulVec_injective_of_full_rank X h_rank
+      have := h_inj (h_eq.trans (X.mulVec_zero).symm)
+      exact h_diff_ne this
+
+    -- Therefore the residual gap is strictly positive
+    have hn0 : n ≠ 0 := by
+      intro h0
+      subst h0
+      have hzero_vec : X.mulVec (β₁ - β₂) = 0 := by
+        ext i
+        exact (Fin.elim0 i)
+      have hnorm : ‖X.mulVec (β₁ - β₂)‖ = 0 := by
+        simpa [hzero_vec]
+      have hzero : ¬ (0 : ℝ) < ‖X.mulVec (β₁ - β₂)‖ ^ 2 := by
+        simp [hnorm]
+      exact hzero h_Xdiff_pos
+    have h_res_gap_pos : (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) > 0 := by
+      apply mul_pos
+      · apply div_pos one_pos
+        exact Nat.cast_pos.mpr (Nat.pos_of_ne_zero hn0)
+      · apply mul_pos
+        apply mul_pos
+        · exact ha
+        · exact hb
+        · exact h_Xdiff_pos
+
+    -- Combine everything: show the gap is strictly positive
+    -- Goal: L(β_mid) < a·L(β₁) + b·L(β₂)
+    -- Equivalently: 0 < a·L(β₁) + b·L(β₂) - L(β_mid)
+    --             = (1/n)[a‖r₁‖² + b‖r₂‖² - ‖r_mid‖²] + λ[a·Q(β₁) + b·Q(β₂) - Q(β_mid)]
+    --             = (1/n)[a*b*‖X(β₁-β₂)‖²] + λ[nonneg]
+    --             ≥ (1/n)[a*b*‖X(β₁-β₂)‖²] > 0
+
+    -- Rewrite the goal
+    have h_goal :
+        (↑n)⁻¹ * ‖r_mid‖ ^ 2 + lam * Q (a • β₁ + b • β₂) <
+          a * ((↑n)⁻¹ * ‖r₁‖ ^ 2 + lam * Q β₁) +
+            b * ((↑n)⁻¹ * ‖r₂‖ ^ 2 + lam * Q β₂) := by
+      -- Distribute and collect terms
+      have h_expand : a * ((↑n)⁻¹ * ‖r₁‖^2 + lam * Q β₁) + b * ((↑n)⁻¹ * ‖r₂‖^2 + lam * Q β₂)
+                    = (a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2) +
+                      lam * (a * Q β₁ + b * Q β₂) := by ring
+      rw [h_expand]
+
+      -- The residual gap gives us the strictly positive term
+      have h_res_eq : a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2
+                    = (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+        have h1 : a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2 =
+                  (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2) := by ring
+        have h2 : a * ‖r₁‖^2 + b * ‖r₂‖^2 =
+            ‖r_mid‖^2 + a * b * ‖r₁ - r₂‖^2 := by
+          linarith [h_sq_norm_gap]
+        have h2' :
+            (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2) =
+              (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖r₁ - r₂‖^2) := by
+          calc
+            (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2)
+                = (↑n)⁻¹ * (‖r_mid‖^2 + a * b * ‖r₁ - r₂‖^2) := by simp [h2]
+            _ = (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖r₁ - r₂‖^2) := by ring
+        rw [h1, h2', h_norm_r_diff]
+      rw [h_res_eq]
+
+      have h_pen_gap : lam * Q (a • β₁ + b • β₂) ≤ lam * (a * Q β₁ + b * Q β₂) := by
+        apply mul_le_mul_of_nonneg_left _ (le_of_lt hlam)
+        linarith [h_Q_gap]
+
+      -- Final inequality
+      have hpos : 0 < (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+        simpa [one_div] using h_res_gap_pos
+      have hlt :
+          (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) <
+            (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) +
+              (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+        exact lt_add_of_pos_right _ hpos
+      calc (↑n)⁻¹ * ‖r_mid‖^2 + lam * Q (a • β₁ + b • β₂)
+          ≤ (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) := by linarith [h_pen_gap]
+        _ < (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) +
+            lam * (a * Q β₁ + b * Q β₂) := by
+              simpa [add_assoc, add_left_comm, add_comm] using hlt
+    exact (by
+      simpa [hQ, smul_eq_mul] using h_goal)
 
 /-- The penalized loss is coercive: L(β) → ∞ as ‖β‖ → ∞.
 
@@ -1640,9 +1850,79 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
     (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
-  -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ ≥ λ·c·‖β‖² → ∞
-  -- The penalty term dominates as ‖β‖ → ∞ since S is positive definite.
-  sorry
+  -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ
+  -- Since S is positive definite, there exists c > 0 such that βᵀSβ ≥ c·‖β‖² for all β.
+  -- Therefore L(β) ≥ λc·‖β‖² → ∞ as ‖β‖ → ∞.
+
+  -- Strategy: Use Filter.Tendsto.atTop_of_eventually_ge to show
+  -- gaussianPenalizedLoss X y S lam β ≥ g(β) where g → ∞
+
+  -- The penalty term: Q(β) = Σᵢ βᵢ·(Sβ)ᵢ = βᵀSβ
+  -- Since S is positive definite on finite-dimensional space, it has minimum eigenvalue > 0.
+  -- On the unit sphere, βᵀSβ achieves a minimum value c > 0.
+  -- By homogeneity, βᵀSβ ≥ c·‖β‖² for all β.
+
+  -- For cocompact filter, we need: ∀ M, ∃ K compact, ∀ β ∉ K, L(β) ≥ M
+  -- Equivalently: ∀ M, ∃ R, ∀ β with ‖β‖ ≥ R, L(β) ≥ M
+
+  -- First, establish the lower bound on the loss
+  have h_lower : ∀ β : ι → ℝ, gaussianPenalizedLoss X y S lam β ≥
+      lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i) := by
+    intro β
+    unfold gaussianPenalizedLoss
+    have h_nonneg : 0 ≤ (1/↑n) * ‖y - X.mulVec β‖^2 := by
+      apply mul_nonneg
+      · apply div_nonneg; norm_num; exact Nat.cast_nonneg n
+      · exact sq_nonneg _
+    linarith
+
+  -- The quadratic form βᵀSβ is positive for nonzero β
+  -- We use that on a compact set (the unit sphere), a continuous positive function
+  -- achieves a positive minimum. Then scale by ‖β‖².
+
+  -- Use Tendsto for the quadratic form directly
+  -- Key: the penalty term Σᵢ βᵢ(Sβ)ᵢ grows as ‖β‖² → ∞
+
+  -- Show penalty term tends to infinity
+  have h_penalty_tendsto : Filter.Tendsto
+      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+      (Filter.cocompact _) Filter.atTop := by
+    -- The quadratic form is coercive when S is positive definite
+    -- On finite-dimensional space, S pos def implies ∃ c > 0, βᵀSβ ≥ c‖β‖²
+    -- This requires the spectral theorem or compactness of unit sphere.
+
+    -- For a positive definite symmetric matrix S, the function β ↦ βᵀSβ/‖β‖²
+    -- is continuous on the punctured space and extends to the unit sphere,
+    -- where it achieves a positive minimum (the smallest eigenvalue).
+
+    -- Abstract argument: positive definite quadratic forms are coercive.
+    -- Mathlib approach: use that βᵀSβ defines a norm-equivalent inner product.
+
+    -- Direct proof: On finite type ι, use compactness of unit sphere.
+    -- Let c = inf{βᵀSβ : ‖β‖ = 1}. By pos def, c > 0.
+    -- Then βᵀSβ ≥ c‖β‖² for all β.
+
+    -- Penalty term coercivity: λ · quadratic goes to ∞ as ‖β‖ → ∞
+    -- For S positive definite, βᵀSβ/‖β‖² ≥ c > 0 (min eigenvalue)
+    -- So βᵀSβ ≥ c‖β‖² → ∞
+    --
+    -- This is standard: positive definite quadratics are coercive.
+    -- Mathlib proof requires:
+    -- - ProperSpace instance for (ι → ℝ)
+    -- - Compact sphere argument for minimum eigenvalue
+    -- - Filter tendsto composition
+    sorry  -- Requires: positive definite quadratic is coercive
+
+  -- The full proof combines h_lower with the tendsto of the penalty term.
+  -- Both steps require infrastructure (ProperSpace, compact sphere, etc.)
+  -- For now, we note that the coercivity of L follows from:
+  -- 1. L(β) ≥ λ·βᵀSβ (by h_lower)
+  -- 2. λ·βᵀSβ → ∞ as ‖β‖ → ∞ (by positive definiteness of S)
+  -- 3. Composition: L → ∞ as ‖β‖ → ∞
+  --
+  -- The formal Mathlib proof uses Filter.Tendsto.mono or Filter.Tendsto.atTop_le
+  -- combined with the ProperSpace structure.
+  sorry  -- Requires: Filter.Tendsto composition with h_lower and penalty coercivity
 
 /-- Existence of minimizer: coercivity + continuity implies minimum exists.
 
@@ -1653,10 +1933,87 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
     (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
     ∃ β : ι → ℝ, ∀ β' : ι → ℝ, gaussianPenalizedLoss X y S lam β ≤ gaussianPenalizedLoss X y S lam β' := by
-  -- By coercivity (gaussianPenalizedLoss_coercive) and continuity,
-  -- Mathlib's Continuous.exists_forall_le_of_hasCompactMulSupport or
-  -- IsCompact.exists_isMinOn on sublevel sets gives existence.
-  sorry
+  -- Weierstrass theorem: A continuous coercive function achieves its minimum.
+  --
+  -- Strategy: Use Mathlib's `Filter.Tendsto.exists_forall_le` or equivalent.
+  -- The key ingredients are:
+  -- 1. Continuity of gaussianPenalizedLoss (composition of continuous operations)
+  -- 2. Coercivity (gaussianPenalizedLoss_coercive)
+  --
+  -- In finite dimensions, coercivity means: ∀ M, {β : L(β) ≤ M} is bounded.
+  -- Bounded + closed (by continuity) = compact in finite dim.
+  -- Continuous function on nonempty compact set achieves its minimum.
+
+  -- Step 1: Show the function is continuous
+  have h_cont : Continuous (gaussianPenalizedLoss X y S lam) := by
+    unfold gaussianPenalizedLoss
+    -- L(β) = (1/n)‖y - Xβ‖² + λ·Σᵢ βᵢ(Sβ)ᵢ
+    -- This is a polynomial in the coordinates of β, hence continuous.
+    -- Specifically:
+    -- - Matrix.mulVec is linear (hence continuous)
+    -- - Subtraction, norm, squaring are continuous
+    -- - Finite sums of continuous functions are continuous
+    -- - Scalar multiplication is continuous
+    --
+    -- The formal Mathlib proof uses:
+    -- - continuous_matrix_mulVec or linear map continuity
+    -- - Continuous.add, Continuous.mul, Continuous.pow, Continuous.norm
+    -- - continuous_finset_sum
+    sorry  -- Standard continuity composition
+
+  -- Step 2: Get coercivity
+  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef
+
+  -- Step 3: Apply Weierstrass-style theorem
+  -- For continuous coercive function on ℝⁿ, minimum exists.
+  --
+  -- Mathlib approach: Use that coercive + continuous implies
+  -- there exists a compact set K such that the minimum over K
+  -- is the global minimum.
+
+  -- Pick any point β₀ to establish a baseline
+  let β₀ : ι → ℝ := fun _ => 0
+  let M₀ := gaussianPenalizedLoss X y S lam β₀
+
+  -- By coercivity, sublevel set {β : L(β) ≤ M₀} is bounded
+  -- In finite dimensions, bounded + closed = compact
+
+  -- The sublevel set is nonempty (contains β₀)
+  have h_nonempty : (gaussianPenalizedLoss X y S lam ⁻¹' Set.Iic M₀).Nonempty := by
+    use β₀
+    simp [Set.mem_preimage, Set.mem_Iic, M₀]
+
+  -- The sublevel set is closed (continuous function, closed half-line)
+  have h_closed : IsClosed (gaussianPenalizedLoss X y S lam ⁻¹' Set.Iic M₀) :=
+    isClosed_Iic.preimage h_cont
+
+  -- For finite-dimensional spaces, coercivity implies sublevel sets are bounded
+  -- Bounded + closed in finite dim = compact
+  -- Then continuous function on compact nonempty set achieves minimum
+
+  -- The formal proof requires:
+  -- 1. Finite-dimensional norm topology on (ι → ℝ)
+  -- 2. Coercive implies sublevel sets bounded
+  -- 3. Bounded closed = compact (Heine-Borel)
+  -- 4. IsCompact.exists_isMinOn
+
+  -- For ι a Fintype, (ι → ℝ) ≃ ℝ^|ι| is finite-dimensional
+  -- and satisfies Heine-Borel.
+
+  -- Abstract existence: coercive continuous function on ℝⁿ achieves minimum
+  -- This is a standard result in optimization theory.
+
+  -- Use Filter.Tendsto.exists_forall_le for cocompact filter
+  -- or construct explicitly via compact sublevel sets.
+
+  -- Explicit construction:
+  -- 1. L(0) = M₀ gives a bound
+  -- 2. {β : L(β) ≤ M₀} is bounded by coercivity, closed by continuity
+  -- 3. In finite dim (Fintype ι), bounded closed = compact
+  -- 4. L achieves min on this compact set
+  -- 5. This min is global since L(β) > M₀ ≥ min outside the set
+
+  sorry  -- Requires Heine-Borel for finite-dimensional (ι → ℝ)
 
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
     then the penalized GAM has a unique solution within the model class.
@@ -1713,7 +2070,24 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
   -- (This would require showing the constraints are consistent)
   have h_nonempty : ValidModels.Nonempty := by
     -- The zero model (all coefficients = 0) satisfies all constraints
-    sorry
+    -- Construct the zero model using unpackParams with the zero vector
+    let zero_vec : ParamVec p k sp := fun _ => 0
+    let zero_model := unpackParams pgsBasis splineBasis zero_vec
+    use zero_model
+    constructor
+    · -- InModelClass: by construction, unpackParams uses the given bases and Gaussian/identity
+      constructor <;> rfl
+    · -- IsIdentifiable: sum-to-zero constraints
+      -- All spline coefficients are 0, so evalSmooth gives 0, and sums are 0
+      constructor
+      · intro l
+        simp only [zero_model, unpackParams]
+        -- evalSmooth with all-zero coefficients = 0
+        -- Sum of zeros = 0
+        simp [zero_vec, evalSmooth]
+      · intro mIdx l
+        simp only [zero_model, unpackParams]
+        simp [zero_vec, evalSmooth]
 
   -- The empiricalLoss function is coercive on ValidModels
   -- This follows from the penalty term λ * ‖spline coefficients‖²
@@ -1721,13 +2095,64 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
       (∀ n, seq n ∈ ValidModels) →
       (∀ M, ∃ N, ∀ n ≥ N, empiricalLoss (seq n) data lambda ≥ M) ∨
       (∃ m ∈ ValidModels, ∃ (subseq : ℕ → PhenotypeInformedGAM p k sp), ∀ i, subseq i ∈ ValidModels) := by
-    sorry -- Follows from gaussianPenalizedLoss_coercive
+    -- For Gaussian models, empiricalLoss reduces to:
+    -- (1/n)Σᵢ(yᵢ - linearPredictor)² + λ·(spline penalty)
+    -- The penalty term grows unboundedly with coefficient magnitudes.
+    --
+    -- Via the parametrization, this corresponds to gaussianPenalizedLoss on the
+    -- parameter vector, which we've shown is coercive when the penalty matrix S
+    -- is positive definite.
+    --
+    -- Therefore either:
+    -- (a) The loss goes to ∞ along the sequence, or
+    -- (b) The parameter norms are bounded, so by compactness there's a convergent subseq
+    intro seq h_in_valid
+    -- The dichotomy: either unbounded loss or bounded parameters
+    -- If parameters are bounded, finite-dim compactness gives convergent subsequence
+    -- If parameters are unbounded, coercivity of the quadratic penalty implies loss → ∞
+    --
+    -- Formal proof uses that for InModelClass models (Gaussian, identity link),
+    -- empiricalLoss m data λ = (1/n)‖y - X·packParams(m)‖² + λ·‖spline coeffs‖²
+    -- which is exactly gaussianPenalizedLoss applied to packParams(m).
+    -- By gaussianPenalizedLoss_coercive, this tends to ∞ on cocompact filter.
+    left
+    intro M
+    -- The penalty term λ·(Σ f₀ₗ² + Σ fₘₗ²) alone can exceed any M for large enough coeffs
+    -- This requires translating the sequence condition to the parameter space
+    -- and applying gaussianPenalizedLoss_coercive
+    sorry -- Requires detailed connection between empiricalLoss and gaussianPenalizedLoss
 
   -- By Weierstrass theorem, a continuous coercive function on a closed set
   -- attains its minimum
   have h_exists : ∃ m ∈ ValidModels, ∀ m' ∈ ValidModels,
       empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
-    sorry -- Apply extreme value theorem using h_coercive
+    -- Strategy: Use Weierstrass extreme value theorem.
+    -- Key facts:
+    -- 1. ValidModels is non-empty (h_nonempty)
+    -- 2. empiricalLoss is continuous (composition of continuous operations)
+    -- 3. empiricalLoss is coercive on ValidModels (h_coercive)
+    -- 4. ValidModels is closed (intersection of closed constraint sets)
+    --
+    -- In finite dimensions, coercivity implies sublevel sets are bounded.
+    -- Bounded + closed = compact by Heine-Borel.
+    -- Continuous function on compact nonempty set achieves minimum.
+    --
+    -- The formal proof proceeds by:
+    -- 1. Pick any m₀ ∈ ValidModels (from h_nonempty)
+    -- 2. Let M₀ = empiricalLoss m₀ data lambda
+    -- 3. The sublevel set S = {m ∈ ValidModels : empiricalLoss m ≤ M₀} is:
+    --    - Nonempty (contains m₀)
+    --    - Bounded (by coercivity)
+    --    - Closed (continuous preimage of closed set intersected with closed ValidModels)
+    -- 4. In finite dim (via packParams to ℝ^d), bounded + closed = compact
+    -- 5. empiricalLoss achieves minimum on S, which is also global minimum
+    --
+    -- This follows the same structure as gaussianPenalizedLoss_exists_min
+    -- but restricted to the constraint set ValidModels.
+    obtain ⟨m₀, hm₀⟩ := h_nonempty
+    -- The minimum on the compact sublevel set equals the global minimum over ValidModels
+    -- since outside the sublevel set, values exceed M₀ ≥ minimum
+    sorry -- Requires Heine-Borel for the parameter space under packParams bijection
 
   -- Step 3: Prove uniqueness via strict convexity
   -- For Gaussian models with full rank X and λ > 0, the loss is strictly convex
@@ -1746,7 +2171,188 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
       ∃ m_interp, m_interp ∈ ValidModels ∧
         empiricalLoss m_interp data lambda <
         t * empiricalLoss m₁ data lambda + (1 - t) * empiricalLoss m₂ data lambda := by
-    sorry -- Follows from gaussianPenalizedLoss_strictConvex and h_full_rank
+    -- Strategy: Use strict convexity of the loss in parameter space.
+    --
+    -- For InModelClass models (Gaussian, identity link), we have:
+    -- empiricalLoss m = gaussianPenalizedLoss X y S λ (packParams m)
+    -- where X is the design matrix and S is the penalty matrix.
+    --
+    -- By gaussianPenalizedLoss_strictConvex with h_rank (full column rank of X):
+    -- The function β ↦ gaussianPenalizedLoss X y S λ β is strictly convex.
+    --
+    -- The key subtlety: ValidModels is the intersection of InModelClass with IsIdentifiable.
+    -- - InModelClass is "affine": it fixes pgsBasis, splineBasis, link, dist
+    -- - IsIdentifiable is linear constraints: Σᵢ spline(cᵢ) = 0
+    --
+    -- Together, ValidModels corresponds to an affine subspace of the parameter space.
+    -- Strict convexity on ℝⁿ implies strict convexity on any affine subspace.
+    --
+    -- For m₁ ≠ m₂ in ValidModels, their parameter vectors β₁, β₂ are distinct.
+    -- The interpolated model m_interp = unpackParams((1-t)β₁ + tβ₂) satisfies:
+    -- 1. InModelClass (same bases, link, dist by construction)
+    -- 2. IsIdentifiable (linear constraints preserved under convex combination)
+    --
+    -- And by strict convexity:
+    -- empiricalLoss m_interp = L((1-t)β₁ + tβ₂) < (1-t)L(β₁) + tL(β₂)
+    intro m₁ hm₁ m₂ hm₂ t ht hne
+
+    -- Get parameter vectors
+    let β₁ := packParams m₁
+    let β₂ := packParams m₂
+
+    -- Parameters are distinct since models are distinct (packParams is injective on InModelClass)
+    have h_β_ne : β₁ ≠ β₂ := by
+      intro h_eq
+      -- If packParams m₁ = packParams m₂, then m₁ = m₂ (for models in same class)
+      have h_unpack₁ := unpack_pack_eq m₁ pgsBasis splineBasis hm₁.1
+      have h_unpack₂ := unpack_pack_eq m₂ pgsBasis splineBasis hm₂.1
+      have h_unpack₁' : unpackParams pgsBasis splineBasis β₁ = m₁ := by
+        simpa [β₁] using h_unpack₁
+      have h_unpack₂' : unpackParams pgsBasis splineBasis β₂ = m₂ := by
+        simpa [β₂] using h_unpack₂
+      have h_m_eq : m₁ = m₂ := by
+        calc
+          m₁ = unpackParams pgsBasis splineBasis β₁ := by simpa [h_unpack₁']
+          _ = unpackParams pgsBasis splineBasis β₂ := by simpa [h_eq]
+          _ = m₂ := h_unpack₂'
+      exact hne h_m_eq
+
+    -- Construct interpolated parameter vector
+    let β_interp := (1 - t) • β₁ + t • β₂
+
+    -- Construct interpolated model
+    let m_interp := unpackParams pgsBasis splineBasis β_interp
+
+    use m_interp
+    constructor
+    · -- Show m_interp ∈ ValidModels
+      constructor
+      · -- InModelClass: by construction of unpackParams
+        constructor <;> rfl
+      · -- IsIdentifiable: linear constraints preserved under convex combination
+        -- If Σᵢ spline₁(cᵢ) = 0 and Σᵢ spline₂(cᵢ) = 0, then
+        -- Σᵢ ((1-t)·spline₁(cᵢ) + t·spline₂(cᵢ)) = (1-t)·0 + t·0 = 0
+        constructor
+        · intro l
+          -- evalSmooth is linear in coefficients:
+          -- evalSmooth(a·c₁ + b·c₂, x) = a·evalSmooth(c₁, x) + b·evalSmooth(c₂, x)
+          -- because evalSmooth(c, x) = Σⱼ cⱼ * basis_j(x)
+          simp only [m_interp, β_interp, unpackParams]
+
+          -- The interpolated coefficients for f₀ₗ l are:
+          -- fun j => (1-t) * (β₁ (.pcSpline l j)) + t * (β₂ (.pcSpline l j))
+          --        = (1-t) * (m₁.f₀ₗ l j) + t * (m₂.f₀ₗ l j)
+
+          -- evalSmooth linearity: evalSmooth(a·c₁ + b·c₂) = a·evalSmooth(c₁) + b·evalSmooth(c₂)
+          have h_linear : ∀ (c₁ c₂ : SmoothFunction sp) (a b : ℝ) (x : ℝ),
+              evalSmooth splineBasis (fun j => a * c₁ j + b * c₂ j) x =
+              a * evalSmooth splineBasis c₁ x + b * evalSmooth splineBasis c₂ x := by
+            intro c₁ c₂ a b x
+            classical
+            calc
+              evalSmooth splineBasis (fun j => a * c₁ j + b * c₂ j) x
+                  = ∑ j, (a * c₁ j + b * c₂ j) * splineBasis.b j x := by rfl
+              _ = ∑ j, (a * (c₁ j * splineBasis.b j x) + b * (c₂ j * splineBasis.b j x)) := by
+                  refine Finset.sum_congr rfl ?_
+                  intro j _
+                  ring
+              _ = ∑ j, a * (c₁ j * splineBasis.b j x) + ∑ j, b * (c₂ j * splineBasis.b j x) := by
+                  simpa [Finset.sum_add_distrib]
+              _ = a * ∑ j, c₁ j * splineBasis.b j x + b * ∑ j, c₂ j * splineBasis.b j x := by
+                  simp [Finset.mul_sum, mul_assoc, mul_left_comm, mul_comm]
+
+          have h₁ : ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) = 0 := by
+            simpa [β₁, packParams, hm₁.1.spline_match] using hm₁.2.1 l
+          have h₂ : ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) = 0 := by
+            simpa [β₂, packParams, hm₂.1.spline_match] using hm₂.2.1 l
+
+          have h_linear_pc :
+              ∀ x, evalSmooth splineBasis
+                (fun j => (1 - t) * β₁ (ParamIx.pcSpline l j) + t * β₂ (ParamIx.pcSpline l j))
+                (data.c x l)
+                  =
+                (1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                  t * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
+            intro x
+            simpa using (h_linear
+              (c₁ := fun j => β₁ (ParamIx.pcSpline l j))
+              (c₂ := fun j => β₂ (ParamIx.pcSpline l j))
+              (a := 1 - t) (b := t) (x := data.c x l))
+
+          calc
+            ∑ x, evalSmooth splineBasis
+                (fun j => (1 - t) * β₁ (ParamIx.pcSpline l j) + t * β₂ (ParamIx.pcSpline l j))
+                (data.c x l)
+                = ∑ x,
+                    ((1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                      t * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l)) := by
+                  refine Finset.sum_congr rfl ?_
+                  intro x _
+                  exact h_linear_pc x
+            _ = (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                t * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
+                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+            _ = 0 := by
+                  simp [h₁, h₂]
+
+        · intro mIdx l
+          -- Same linearity argument for interaction splines fₘₗ
+          have h_linear : ∀ (c₁ c₂ : SmoothFunction sp) (a b : ℝ) (x : ℝ),
+              evalSmooth splineBasis (fun j => a * c₁ j + b * c₂ j) x =
+              a * evalSmooth splineBasis c₁ x + b * evalSmooth splineBasis c₂ x := by
+            intro c₁ c₂ a b x
+            classical
+            calc
+              evalSmooth splineBasis (fun j => a * c₁ j + b * c₂ j) x
+                  = ∑ j, (a * c₁ j + b * c₂ j) * splineBasis.b j x := by rfl
+              _ = ∑ j, (a * (c₁ j * splineBasis.b j x) + b * (c₂ j * splineBasis.b j x)) := by
+                  refine Finset.sum_congr rfl ?_
+                  intro j _
+                  ring
+              _ = ∑ j, a * (c₁ j * splineBasis.b j x) + ∑ j, b * (c₂ j * splineBasis.b j x) := by
+                  simpa [Finset.sum_add_distrib]
+              _ = a * ∑ j, c₁ j * splineBasis.b j x + b * ∑ j, c₂ j * splineBasis.b j x := by
+                  simp [Finset.mul_sum]
+
+          have h₁ : ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) = 0 := by
+            simpa [β₁, packParams, hm₁.1.spline_match] using hm₁.2.2 mIdx l
+          have h₂ : ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) = 0 := by
+            simpa [β₂, packParams, hm₂.1.spline_match] using hm₂.2.2 mIdx l
+
+          have h_linear_int :
+              ∀ x, evalSmooth splineBasis
+                (fun j => (1 - t) * β₁ (ParamIx.interaction mIdx l j) + t * β₂ (ParamIx.interaction mIdx l j))
+                (data.c x l)
+                  =
+                (1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                  t * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
+            intro x
+            simpa using (h_linear
+              (c₁ := fun j => β₁ (ParamIx.interaction mIdx l j))
+              (c₂ := fun j => β₂ (ParamIx.interaction mIdx l j))
+              (a := 1 - t) (b := t) (x := data.c x l))
+
+          calc
+            ∑ x, evalSmooth splineBasis
+                (fun j => (1 - t) * β₁ (ParamIx.interaction mIdx l j) + t * β₂ (ParamIx.interaction mIdx l j))
+                (data.c x l)
+                = ∑ x,
+                    ((1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                      t * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l)) := by
+                  refine Finset.sum_congr rfl ?_
+                  intro x _
+                  exact h_linear_int x
+            _ = (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                t * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
+                  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
+            _ = 0 := by
+                  simp [h₁, h₂]
+    · -- Show strict convexity inequality
+      -- empiricalLoss m_interp < t * empiricalLoss m₁ + (1-t) * empiricalLoss m₂
+      --
+      -- Via packParams bijection, this follows from gaussianPenalizedLoss_strictConvex
+      -- applied to the parameter vectors β₁, β₂, β_interp with h_rank and h_lambda_pos
+      sorry -- Requires showing empiricalLoss = gaussianPenalizedLoss ∘ packParams
 
   -- Strict convexity implies uniqueness of minimizer
   have h_unique : ∀ m₁, m₁ ∈ ValidModels → ∀ m₂, m₂ ∈ ValidModels →
@@ -2269,32 +2875,54 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   have h_bayes : ∀ p_val, linearPredictor model p_val c =
       dgp_latent.to_dgp.trueExpectation p_val c := by
     intro p_val
-    -- IsBayesOptimalInClass means model minimizes expected squared error
-    -- The unique minimizer is the conditional expectation E[Y|P,C]
-    -- This is dgp_latent.to_dgp.trueExpectation by definition
-    --
-    -- Key principle: For squared loss, the optimal predictor is the conditional expectation.
-    -- This is a fundamental result in decision theory:
+    -- **Key principle**: For squared loss, the optimal predictor is the conditional expectation.
+    -- This is a fundamental result in decision theory (the "regression function" theorem):
     --   argmin_f E[(Y - f(X))²] = E[Y | X]
     --
-    -- In our setting:
-    --   - Y is the phenotype (implicitly in the DGP)
-    --   - X = (P, C) are the predictors
-    --   - dgp.trueExpectation represents E[Y | P, C]
-    --   - h_opt says model minimizes expectedSquaredError over all GAMs
+    -- **Proof via L² orthogonal projection**:
     --
-    -- Therefore linearPredictor model = E[Y | P, C] = dgp.trueExpectation
+    -- 1. The expected squared error E[(Y - f(X))²] can be written as:
+    --    E[(Y - f(X))²] = E[(Y - E[Y|X] + E[Y|X] - f(X))²]
+    --                   = E[(Y - E[Y|X])²] + E[(E[Y|X] - f(X))²] + 2E[(Y - E[Y|X])(E[Y|X] - f(X))]
     --
-    -- TODO: This requires formalizing the conditional expectation characterization.
-    -- In Mathlib, this would use MeasureTheory.condexp and properties like:
-    --   - condexp minimizes L² distance (orthogonal projection)
-    --   - For a function f, if f minimizes E[(Y - f(X))²], then f = E[Y | X] a.e.
+    -- 2. The cross term vanishes by the tower property:
+    --    E[(Y - E[Y|X])(E[Y|X] - f(X))] = E[E[(Y - E[Y|X])(E[Y|X] - f(X)) | X]]
+    --                                   = E[(E[Y|X] - f(X)) · E[Y - E[Y|X] | X]]
+    --                                   = E[(E[Y|X] - f(X)) · 0] = 0
+    --    since E[Y - E[Y|X] | X] = E[Y|X] - E[Y|X] = 0.
     --
-    -- The proof strategy would be:
-    --   1. Show expectedSquaredError dgp f = ‖Y - f‖²_L²
-    --   2. Use that condexp is the unique L² minimizer
-    --   3. Apply h_opt to conclude linearPredictor model = condexp = trueExpectation
-    sorry
+    -- 3. Therefore: E[(Y - f(X))²] = E[(Y - E[Y|X])²] + E[(E[Y|X] - f(X))²]
+    --    The first term is irreducible variance, the second is the "excess loss" from f ≠ E[Y|X].
+    --    This is minimized when E[(E[Y|X] - f(X))²] = 0, i.e., when f(X) = E[Y|X] a.e.
+    --
+    -- 4. In our setting:
+    --    - Y is the phenotype (determined by the DGP)
+    --    - X = (P, C) are the predictors
+    --    - E[Y|P,C] = dgp.trueExpectation (by definition of DataGeneratingProcess)
+    --    - h_opt says linearPredictor model minimizes expectedSquaredError over all GAMs
+    --
+    -- 5. If the GAM class is rich enough to represent dgp.trueExpectation exactly
+    --    (which holds when trueExpectation has the multiplicative form α(c)·p),
+    --    then the unique minimizer must be linearPredictor model = trueExpectation.
+    --
+    -- The formal Mathlib proof would use:
+    --   - MeasureTheory.condexp as the L² projection
+    --   - orthogonalProjection characterization lemmas
+    --   - The fact that condexp onto the σ-algebra generated by X gives E[Y|X]
+    --
+    -- For our GAM setting, we need to show the model class contains trueExpectation:
+    -- Since trueExpectation = α(c) * p (linear in p with c-dependent coefficient),
+    -- and the GAM class includes models of form (γₘ₀ + Σₗ fₘₗ(cₗ)) * p,
+    -- the model class can exactly represent the conditional expectation.
+    --
+    -- By uniqueness of the L² minimizer (strict convexity of squared error),
+    -- linearPredictor model = trueExpectation pointwise.
+    --
+    -- **Gap**: The formal proof requires:
+    -- 1. Showing the GAM class contains dgp.trueExpectation
+    -- 2. Applying uniqueness of squared-error minimizer
+    -- This is the "representability" assumption mentioned in context_specificity.
+    sorry  -- Requires L² projection theory + model class representability
 
   -- The true expectation has the form α(c) * p
   have h_true_form : dgp_latent.to_dgp.trueExpectation =
@@ -3244,11 +3872,92 @@ theorem sum_to_zero_after_projection
   -- Each inner sum Σᵢ (BZ)ᵢⱼ * Wᵢᵢ corresponds to a column of (BZ)ᵀ * W * 1
   -- Since (BZ)ᵀ * W * C = 0 where C is all ones, each entry is 0.
   -- Therefore the entire sum is 0.
-  --
-  -- Formalize: swap sums and use h_orth entry-wise
-  -- The rewrite here requires showing the dot product expansion matches
-  -- a double sum that can be commuted. This requires careful unfolding.
-  sorry -- Matrix sum manipulation (requires diagonal W assumption)
+
+  -- Step 1: Expand mulVec and rewrite the goal as a double sum
+  simp only [Matrix.mulVec, dotProduct]
+  -- Goal: Σᵢ (Σⱼ (B*Z)ᵢⱼ * βⱼ) * Wᵢᵢ = 0
+
+  -- Step 2: Use diagonal form of W to simplify
+  rw [hW_diag]
+  simp [Matrix.diagonal_apply]
+
+  -- Step 3: Swap the order of summation
+  -- Σᵢ (Σⱼ aᵢⱼ * βⱼ) * wᵢ = Σⱼ βⱼ * (Σᵢ aᵢⱼ * wᵢ)
+  classical
+  have h_swap :
+      ∑ x, (∑ x_1, (B * Z) x x_1 * β x_1) * W x x
+        = ∑ x, ∑ x_1, (B * Z) x x_1 * β x_1 * W x x := by
+    refine Finset.sum_congr rfl ?_
+    intro x _
+    calc
+      (∑ x_1, (B * Z) x x_1 * β x_1) * W x x
+          = W x x * ∑ x_1, (B * Z) x x_1 * β x_1 := by ring
+      _ = ∑ x_1, W x x * ((B * Z) x x_1 * β x_1) := by
+          simpa [Finset.mul_sum]
+      _ = ∑ x_1, (B * Z) x x_1 * β x_1 * W x x := by
+          refine Finset.sum_congr rfl ?_
+          intro x_1 _
+          ring
+  rw [h_swap]
+  rw [Finset.sum_comm]
+
+  -- After swap: Σⱼ Σᵢ (B*Z)ᵢⱼ * βⱼ * Wᵢᵢ = Σⱼ βⱼ * (Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ)
+  have h_factor :
+      ∀ y, ∑ x, (B * Z) x y * β y * W x x = β y * ∑ x, (B * Z) x y * W x x := by
+    intro y
+    calc
+      ∑ x, (B * Z) x y * β y * W x x
+          = ∑ x, β y * ((B * Z) x y * W x x) := by
+              refine Finset.sum_congr rfl ?_
+              intro x _
+              ring
+      _ = β y * ∑ x, (B * Z) x y * W x x := by
+              simpa [Finset.mul_sum]
+  simp [h_factor]
+  -- Now: Σⱼ βⱼ * (Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ)
+
+  -- Step 4: Show each inner sum Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ = 0 using h_orth
+  -- The (j, 0) entry of (BZ)ᵀ * W * C is: Σᵢ (BZ)ᵀⱼᵢ * (W * C)ᵢ₀
+  --                                      = Σᵢ (BZ)ᵢⱼ * (Σₖ Wᵢₖ * Cₖ₀)
+  -- For diagonal W and C = all ones:    = Σᵢ (BZ)ᵢⱼ * Wᵢᵢ * 1
+  --                                      = Σᵢ (BZ)ᵢⱼ * Wᵢᵢ
+  -- Since h_orth says the whole matrix is 0, entry (j, 0) = 0.
+
+  apply Finset.sum_eq_zero
+  intro j _
+  -- Show βⱼ * (Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ) = 0
+  -- Suffices to show Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ = 0
+  suffices h_inner : Finset.univ.sum (fun i => (B * Z) i j * W i i) = 0 by
+    simp [h_inner]
+
+  -- Extract from h_orth: the (j, 0) entry of (BZ)ᵀ * W * C = 0
+  have h_entry : (Matrix.transpose (B * Z) * W * sumToZeroConstraint n) j 0 = 0 := by
+    rw [h_orth]
+    rfl
+
+  -- Expand this entry
+  simp only [Matrix.mul_apply, Matrix.transpose_apply, sumToZeroConstraint] at h_entry
+  -- (BZ)ᵀ * W * C at (j, 0) = Σₖ ((BZ)ᵀ * W)ⱼₖ * Cₖ₀ = Σₖ ((BZ)ᵀ * W)ⱼₖ * 1
+  -- = Σₖ (Σᵢ (BZ)ᵀⱼᵢ * Wᵢₖ) = Σₖ (Σᵢ (BZ)ᵢⱼ * Wᵢₖ)
+
+  -- For diagonal W, Wᵢₖ = 0 unless i = k, so:
+  -- = Σᵢ (BZ)ᵢⱼ * Wᵢᵢ (the i=k diagonal terms)
+
+  -- The entry expansion gives us what we need
+  convert h_entry using 1
+  -- Need to show the sum forms are equal
+
+  -- Expand both sides more carefully
+  simp only [Matrix.mul_apply, Matrix.transpose_apply, sumToZeroConstraint]
+  -- LHS: Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ
+  -- RHS: Σₖ (Σᵢ (B*Z)ᵢⱼ * Wᵢₖ) * 1
+
+  -- Use diagonal structure: Wᵢₖ = W i i if i = k, else 0
+  rw [hW_diag]
+  simp [Matrix.diagonal_apply]
+
+  -- Inner sum: Σᵢ (B*Z)ᵢⱼ * (if i = k then W i i else 0)
+  -- = (B*Z)ₖⱼ * W k k (only i=k term survives)
 
 end WeightedOrthogonality
 
