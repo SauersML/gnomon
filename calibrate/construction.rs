@@ -3266,7 +3266,7 @@ mod tests {
 
         // PGS projected penalty
         let s_pgs_main_unc = create_difference_penalty_matrix(
-            pgs_main_basis_unc.ncols(),
+            pgs_cols,
             config.penalty_order,
             None,
         )

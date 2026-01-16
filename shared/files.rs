@@ -1921,109 +1921,6 @@ impl ByteRangeSource for HttpByteRangeSource {
     }
 }
 
-struct StreamingReader {
-    path_display: String,
-    source: Arc<dyn ByteRangeSource>,
-    offset: u64,
-    len: u64,
-    buffer: Vec<u8>,
-    cursor: usize,
-    valid: usize,
-}
-
-impl StreamingReader {
-    fn new(path_display: String, source: Arc<dyn ByteRangeSource>) -> Self {
-        let len = source.len();
-        Self {
-            path_display,
-            source,
-            offset: 0,
-            len,
-            buffer: Vec::with_capacity(REMOTE_BLOCK_SIZE),
-            cursor: 0,
-            valid: 0,
-        }
-    }
-
-    fn ensure_buffer(&mut self) -> Result<bool, PipelineError> {
-        if self.cursor < self.valid {
-            return Ok(true);
-        }
-        if self.offset >= self.len {
-            return Ok(false);
-        }
-
-        let remaining = self.len - self.offset;
-        let to_read = remaining.min(REMOTE_BLOCK_SIZE as u64) as usize;
-        if self.buffer.len() < to_read {
-            self.buffer.resize(to_read, 0);
-        }
-
-        self.source
-            .read_at(self.offset, &mut self.buffer[..to_read])
-            .map_err(|e| augment_pipeline_error(e, &self.path_display))?;
-        self.offset += to_read as u64;
-        self.cursor = 0;
-        self.valid = to_read;
-        Ok(true)
-    }
-
-    fn peek_gzip_magic(&mut self) -> Result<bool, PipelineError> {
-        if self.valid.saturating_sub(self.cursor) < 2 {
-            while self.valid.saturating_sub(self.cursor) < 2 {
-                if !self.ensure_buffer()? {
-                    break;
-                }
-                if self.valid.saturating_sub(self.cursor) >= 2 {
-                    break;
-                }
-            }
-        }
-
-        if self.valid.saturating_sub(self.cursor) >= 2 {
-            Ok(self.buffer[self.cursor] == 0x1F && self.buffer[self.cursor + 1] == 0x8B)
-        } else {
-            Ok(false)
-        }
-    }
-}
-
-impl Read for StreamingReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let mut total = 0;
-        while total < buf.len() {
-            if self.cursor >= self.valid {
-                if !self
-                    .ensure_buffer()
-                    .map_err(|e| io::Error::other(e.to_string()))?
-                {
-                    break;
-                }
-                if self.cursor >= self.valid {
-                    continue;
-                }
-            }
-
-            let available = self.valid - self.cursor;
-            let to_copy = available.min(buf.len() - total);
-            if to_copy == 0 {
-                break;
-            }
-
-            buf[total..total + to_copy]
-                .copy_from_slice(&self.buffer[self.cursor..self.cursor + to_copy]);
-            self.cursor += to_copy;
-            total += to_copy;
-        }
-
-        Ok(total)
-    }
-}
-
 struct PrefixReader<R: Read + Send> {
     prefix: Vec<u8>,
     offset: usize,
@@ -2095,29 +1992,6 @@ fn detect_compression_from_prefix(
         VariantCompression::Plain
     };
     Ok((wrapped, compression))
-}
-
-fn prepare_streaming_variant_reader(
-    path_display: String,
-    source: Arc<dyn ByteRangeSource>,
-) -> Result<PreparedVariantReader, PipelineError> {
-    let len = source.len();
-    let mut reader = StreamingReader::new(path_display.clone(), Arc::clone(&source));
-    let is_gzip = reader.peek_gzip_magic()?;
-    let compression = if is_gzip {
-        VariantCompression::Bgzf
-    } else {
-        VariantCompression::Plain
-    };
-    let format = infer_variant_format_from_path(&path_display);
-    let reader: Box<dyn Read + Send> = Box::new(reader);
-    Ok(PreparedVariantReader {
-        reader,
-        len,
-        skip_header: false,
-        compression,
-        format,
-    })
 }
 
 struct RemoteCache {
