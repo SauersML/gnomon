@@ -741,16 +741,7 @@ lemma rawOptimal_implies_orthogonality_gen {k sp : ℕ} [Fintype (Fin k)] [Finty
         have h_expand : (-2 * ∫ pc, residual pc ∂μ) * ε + 1 * ε^2 =
             ε^2 - 2 * ε * ∫ pc, residual pc ∂μ := by ring
         rw [h_expand]
-        let model' : PhenotypeInformedGAM 1 k sp := {
-          pgsBasis := model.pgsBasis,
-          pcSplineBasis := model.pcSplineBasis,
-          γ₀₀ := model.γ₀₀ + ε,
-          γₘ₀ := model.γₘ₀,
-          f₀ₗ := model.f₀ₗ,
-          fₘₗ := model.fₘₗ,
-          link := model.link,
-          dist := model.dist
-        }
+        let model' : PhenotypeInformedGAM 1 k sp := { model with γ₀₀ := model.γ₀₀ + ε }
         have h_raw' : IsRawScoreModel model' := {
           f₀ₗ_zero := h_opt.is_raw.f₀ₗ_zero,
           fₘₗ_zero := h_opt.is_raw.fₘₗ_zero
@@ -1227,10 +1218,10 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (h_opt : IsBayesOptimalInRawClass dgp_env.to_dgp model)
     (h_pgs_basis_linear : model.pgsBasis.B 1 = id ∧ model.pgsBasis.B 0 = fun _ => 1)
     (hP0 : ∫ pc, pc.1 ∂dgp_env.to_dgp.jointMeasure = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
+    (_hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
     (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (_hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
