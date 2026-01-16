@@ -4270,34 +4270,23 @@ fn compute_firth_hat_and_half_logdet(
     // to match the outer LAML objective and ensure consistent gradients.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    let mut fisher = Array2::<f64>::zeros((p, p));
-    for i in 0..n {
-        let wi = weights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let xi = x_design.row(i);
-        for j in 0..p {
-            let xij = xi[j];
-            for k in 0..p {
-                fisher[[j, k]] += wi * xij * xi[k];
-            }
-        }
-    }
-    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
-    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+    let h_view = FaerArrayView::new(&stabilized);
+    let chol_stabilized = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
     })?;
-    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
 
-    let h_view = FaerArrayView::new(&stabilized);
-    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
+    // Compute log determinant from the penalized Hessian
+    // This ensures consistency between the log|H| term and the gradient
+    let l_diag = chol_stabilized.L().diagonal().column_vector().as_mat();
+    let dim = stabilized.nrows();
+    let mut half_log_det = 0.0;
+    for i in 0..dim {
+        half_log_det += l_diag[(i, 0)].ln();
+    }
+
+    let chol_faer = chol_stabilized;
     let mut rhs = workspace.wx.t().to_owned();
     let mut rhs_view = array2_to_mat_mut(&mut rhs);
     chol_faer.solve_in_place(rhs_view.as_mut());

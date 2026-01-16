@@ -2473,19 +2473,19 @@ pub fn stable_reparameterization_with_invariant(
     let (s_eigenvalues_raw, s_eigenvectors) =
         robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
 
-    // Use ADAPTIVE RANK based on current eigenvalues to ensure numerical stability.
+    // Use FIXED STRUCTURAL RANK to ensure C² smoothness of the LAML objective.
     //
-    // The LAML objective includes log|S_λ|_+ (log-pseudo-determinant of the penalty).
-    // When a smoothing parameter λ_k is very small, its contribution to S_λ drops to
-    // machine noise (~10^-16). Including these noise eigenvalues adds ln(10^-16) ≈ -36.8
-    // to the cost function, creating gradient explosions from differentiating numerical noise.
+    // The structural rank is determined at precompute time from the balanced penalties
+    // and represents the number of truly penalized directions in the model geometry.
     //
-    // The fix: use adaptive relative tolerance (max_eig * 1e-12) on the CURRENT S_λ
-    // eigenvalues. This is the industry standard (used in LAPACK/mgcv). Eigenvalues below
-    // this threshold are treated as null space, not penalized modes.
+    // CRITICAL: Using adaptive rank (based on current eigenvalues) creates DISCONTINUITIES
+    // in the objective function. When an eigenvalue crosses the threshold, the rank jumps,
+    // causing a step change in log|S|_+. This violates the C² assumption required by BFGS.
     //
-    // Consistency is ensured because both log|S|_+ AND the reconstructed s_transformed
-    // (which feeds into H) use the same adaptive rank.
+    // To handle noise eigenvalues without discontinuities:
+    // 1. Use FIXED structural rank (smooth, continuous objective)
+    // 2. Clamp eigenvalues to a relative floor when computing log_det
+    //    This bounds the contribution of noise without changing the rank.
 
     // Sort eigenvalues descending with their indices
     let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
@@ -2495,25 +2495,18 @@ pub fn stable_reparameterization_with_invariant(
         .collect();
     sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Adaptive rank: include eigenvalues above relative tolerance
-    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(0.0);
+    // Use FIXED structural rank from invariant (ensures smooth objective)
+    let structural_rank = penalized_rank.min(sorted_eigs.len());
+    let selected_eigs: Vec<(usize, f64)> = sorted_eigs
+        .iter()
+        .take(structural_rank)
+        .cloned()
+        .collect();
 
-    // Absolute floor: if max eigenvalue is essentially zero, treat as zero penalty
-    // This prevents computing log_det of numerical noise
-    const ABSOLUTE_EIG_FLOOR: f64 = 1e-30;
-    let (structural_rank, selected_eigs) = if max_eig < ABSOLUTE_EIG_FLOOR {
-        // All eigenvalues are noise - return empty penalty (rank 0)
-        (0usize, Vec::new())
-    } else {
-        let adaptive_tol = max_eig * 1e-12;
-        let rank = sorted_eigs
-            .iter()
-            .take_while(|(_, ev)| *ev > adaptive_tol)
-            .count()
-            .max(1); // At least 1 mode when max_eig is valid
-        let eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(rank).cloned().collect();
-        (rank, eigs)
-    };
+    // Relative floor for log_det: clamp small eigenvalues to avoid ln(noise)
+    // This is applied when computing log_det, NOT when selecting rank
+    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(1.0);
+    let eigenvalue_floor = max_eig * 1e-12;
     
     // Extract truncated eigenvector indices (those NOT in selected_eigs)
     // These span the null space and are needed for gradient correction
@@ -2531,21 +2524,22 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
     
-    // Tiny absolute floor to prevent ln(0) - we never filter structural modes
-    let ln_floor = 1e-300_f64;
+    // Use relative floor for eigenvalue clamping (prevents ln(noise) without changing rank)
+    // eigenvalue_floor = max_eig * 1e-12 ensures bounded contribution from noise modes
 
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
     for (row_idx, &(eig_idx, eigenval)) in selected_eigs.iter().enumerate() {
-        let safe_eigenval = eigenval.max(ln_floor);
+        let safe_eigenval = eigenval.max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
         for row in 0..p {
             e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, eig_idx)] * sqrt_eigenval;
         }
     }
 
+    // Clamp eigenvalues to floor when computing log_det (bounded noise contribution)
     let log_det: f64 = selected_eigs
         .iter()
-        .map(|&(_, ev)| ev.max(ln_floor).ln())
+        .map(|&(_, ev)| ev.max(eigenvalue_floor).ln())
         .sum();
 
     let mut det1_vec = vec![0.0; lambdas.len()];
@@ -2553,7 +2547,7 @@ pub fn stable_reparameterization_with_invariant(
     // Build S⁺ using the selected eigenvalues (structural rank)
     let mut s_plus = Mat::<f64>::zeros(p, p);
     for &(eig_idx, eigenval) in selected_eigs.iter() {
-        if eigenval > ln_floor {
+        if eigenval > eigenvalue_floor {
             let inv = 1.0 / eigenval;
             for i in 0..p {
                 let vi = s_eigenvectors[(i, eig_idx)];

@@ -2552,7 +2552,7 @@ pub(crate) mod internal {
 
             for r in 0..d {
                 let den = right[r + 1] + left[d - r];
-                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+                let temp = if den != 0.0 { n[r] / den } else { 0.0 };
 
                 n[r] = saved + right[r + 1] * temp;
                 saved = left[d - r] * temp;
@@ -2671,7 +2671,7 @@ mod tests {
         let last_knot = *knots.last().expect("knot vector should be non-empty");
         let last_basis_index = knots.len() - degree - 2;
 
-        if (x - last_knot).abs() < 1e-12 {
+        if x == last_knot {
             return if i == last_basis_index { 1.0 } else { 0.0 };
         }
 
@@ -2697,13 +2697,13 @@ mod tests {
 
             // First term
             let den1 = knots[i + degree] - knots[i];
-            if den1.abs() > 1e-12 {
+            if den1 != 0.0 {
                 result += (x - knots[i]) / den1 * evaluate_bspline(x, knots, i, degree - 1);
             }
 
             // Second term
             let den2 = knots[i + degree + 1] - knots[i + 1];
-            if den2.abs() > 1e-12 {
+            if den2 != 0.0 {
                 result += (knots[i + degree + 1] - x) / den2
                     * evaluate_bspline(x, knots, i + 1, degree - 1);
             }
