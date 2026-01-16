@@ -1049,8 +1049,6 @@ lemma optimal_coefficients_for_additive_dgp
     -- Goal: ∫ pc, pc.1 + β_env * pc.2 ⟨0, _⟩ ∂μ = 0
     -- We need integrability hypotheses. Since we assume a probability measure
     -- with finite moments (implicit in hP0, hC0, hP2), we admit integrability.
-    have hP_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure := hP_int
-    have hC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure := hC_int
     calc ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure
         = (∫ pc, pc.1 ∂dgp.jointMeasure) + β_env * (∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
           rw [integral_add hP_int (hC_int.const_mul β_env)]
