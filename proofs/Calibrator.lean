@@ -1422,7 +1422,106 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
       (designMatrix data pgsBasis splineBasis).mulVec (packParams m) i := by
   classical
   intro i
-  admit
+  rcases hm with ⟨h_pgs, h_spline, _, _⟩
+  subst h_pgs
+  subst h_spline
+  -- Rewrite the RHS sum over ParamIx into explicit blocks.
+  have hsum_paramix :
+      (∑ x : ParamIx p k sp,
+          (match x with
+            | ParamIx.intercept => m.γ₀₀
+            | ParamIx.pgsCoeff m0 => m.γₘ₀ m0
+            | ParamIx.pcSpline l s => m.f₀ₗ l s
+            | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
+          match x with
+          | ParamIx.intercept => 1
+          | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+          | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
+          | ParamIx.interaction m_1 l s =>
+              m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+                m.pcSplineBasis.b s (data.c i l)) =
+        m.γ₀₀
+        + (∑ mIdx, m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx)
+        + (∑ lj : Fin k × Fin sp,
+            m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2)
+        + (∑ mlj : Fin p × Fin k × Fin sp,
+            m.pgsBasis.B
+              ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+              (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2)) := by
+    -- Convert the sum over ParamIx using the equivalence to a sum type, then split.
+    let g : ParamIxSum p k sp → ℝ
+      | Sum.inl _ => m.γ₀₀
+      | Sum.inr (Sum.inl mIdx) =>
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx
+      | Sum.inr (Sum.inr (Sum.inl (l, j))) =>
+          m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j
+      | Sum.inr (Sum.inr (Sum.inr (mIdx, l, j))) =>
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)
+    have hsum' :
+        (∑ x : ParamIx p k sp,
+            (match x with
+              | ParamIx.intercept => m.γ₀₀
+              | ParamIx.pgsCoeff m0 => m.γₘ₀ m0
+              | ParamIx.pcSpline l s => m.f₀ₗ l s
+              | ParamIx.interaction m0 l s => m.fₘₗ m0 l s) *
+            match x with
+            | ParamIx.intercept => 1
+            | ParamIx.pgsCoeff m_1 => m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i)
+            | ParamIx.pcSpline l s => m.pcSplineBasis.b s (data.c i l)
+            | ParamIx.interaction m_1 l s =>
+                m.pgsBasis.B ⟨m_1.val + 1, by simpa using (Nat.succ_lt_succ m_1.isLt)⟩ (data.p i) *
+                  m.pcSplineBasis.b s (data.c i l)) =
+          ∑ x : ParamIxSum p k sp, g x := by
+      refine (Fintype.sum_equiv (ParamIx.equivSum p k sp) _ g ?_)
+      intro x
+      cases x <;> simp [g, ParamIx.equivSum, mul_assoc, mul_left_comm, mul_comm]
+    -- Split the sum over the nested Sum type.
+    simpa [ParamIxSum, g, add_assoc, add_left_comm, add_comm] using hsum'
+  -- Expand linearPredictor and match sums (convert double sums to pair sums).
+  have hsum_pc :
+      (∑ l, ∑ j, m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j) =
+        ∑ lj : Fin k × Fin sp, m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2 := by
+    classical
+    simpa using
+      (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
+        (f := fun l j => m.pcSplineBasis.b j (data.c i l) * m.f₀ₗ l j))
+  have hsum_int :
+      (∑ mIdx, ∑ l, ∑ j,
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b j (data.c i l) * m.fₘₗ mIdx l j)) =
+        ∑ mlj : Fin p × Fin k × Fin sp,
+          m.pgsBasis.B
+            ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2) := by
+    classical
+    simpa using
+      (Finset.sum_product (s := Finset.univ) (t := Finset.univ)
+        (f := fun mIdx lj =>
+          m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) *
+            (m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.fₘₗ mIdx lj.1 lj.2)))
+  have hsum_lin :
+      linearPredictor m (data.p i) (data.c i) =
+        m.γ₀₀
+        + (∑ mIdx, m.pgsBasis.B
+            ⟨mIdx.val + 1, by simpa using (Nat.succ_lt_succ mIdx.isLt)⟩ (data.p i) * m.γₘ₀ mIdx)
+        + (∑ lj : Fin k × Fin sp,
+            m.pcSplineBasis.b lj.2 (data.c i lj.1) * m.f₀ₗ lj.1 lj.2)
+        + (∑ mlj : Fin p × Fin k × Fin sp,
+            m.pgsBasis.B
+              ⟨mlj.1.val + 1, by simpa using (Nat.succ_lt_succ mlj.1.isLt)⟩ (data.p i) *
+              (m.pcSplineBasis.b mlj.2.2 (data.c i mlj.2.1) * m.fₘₗ mlj.1 mlj.2.1 mlj.2.2)) := by
+    simp [linearPredictor, evalSmooth, hsum_pc, hsum_int, Finset.sum_add_distrib, Finset.mul_sum,
+      Finset.sum_mul, add_mul, mul_add, add_assoc, add_left_comm, add_comm, mul_assoc,
+      mul_left_comm, mul_comm]
+  -- Finish by expanding the design-matrix side.
+  simpa [designMatrix, packParams, Matrix.mulVec, dotProduct, mul_assoc, mul_left_comm, mul_comm,
+    add_assoc, add_left_comm, add_comm] using hsum_lin.trans hsum_paramix.symm
 /-- Full column rank implies `X.mulVec` is injective.
 
 This is stated using an arbitrary finite column type `ι` (rather than `Fin d`) to avoid
@@ -1646,7 +1745,55 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
 
     -- For squared norms with convex combination: a‖u‖² + b‖v‖² - ‖a•u + b•v‖² = ab‖u-v‖²
     have h_sq_norm_gap : a * ‖r₁‖^2 + b * ‖r₂‖^2 - ‖r_mid‖^2 = a * b * ‖r₁ - r₂‖^2 := by
-      admit
+      -- Standard convex combination norm identity using inner product structure.
+      have hmid : r_mid = a • r₁ + b • r₂ := h_r_decomp
+      have hnorm_add :
+          ‖a • r₁ + b • r₂‖ ^ 2 =
+            ⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ := by
+        calc
+          ‖a • r₁ + b • r₂‖ ^ 2
+              = ⟪a • r₁ + b • r₂, a • r₁ + b • r₂⟫_ℝ := by
+                  symm; simpa using (real_inner_self_eq_norm_sq (a • r₁ + b • r₂))
+          _ = ⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ := by
+                simpa using (real_inner_add_add_self (a • r₁) (b • r₂))
+      have hinner_smul : ⟪a • r₁, b • r₂⟫_ℝ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
+        calc
+          ⟪a • r₁, b • r₂⟫_ℝ = a * ⟪r₁, b • r₂⟫_ℝ := by
+            simpa [Pi.smul_apply] using (real_inner_smul_left r₁ (b • r₂) a)
+          _ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
+            simpa [Pi.smul_apply, mul_assoc] using
+              congrArg (fun t => a * t) (real_inner_smul_right r₁ r₂ b)
+      have hnorm_smul₁ : ‖a • r₁‖ ^ 2 = a * (a * ‖r₁‖ ^ 2) := by
+        simp [norm_smul, Real.norm_eq_abs, abs_of_pos ha, pow_two, mul_assoc, mul_left_comm,
+          mul_comm]
+      have hnorm_smul₂ : ‖b • r₂‖ ^ 2 = b * (b * ‖r₂‖ ^ 2) := by
+        simp [norm_smul, Real.norm_eq_abs, abs_of_pos hb, pow_two, mul_assoc, mul_left_comm,
+          mul_comm]
+      have hnorm_sub :
+          ‖r₁ - r₂‖ ^ 2 = ‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ := by
+        calc
+          ‖r₁ - r₂‖ ^ 2 = ⟪r₁ - r₂, r₁ - r₂⟫_ℝ := by
+            symm; simpa using (real_inner_self_eq_norm_sq (r₁ - r₂))
+          _ = ⟪r₁, r₁⟫_ℝ - 2 * ⟪r₁, r₂⟫_ℝ + ⟪r₂, r₂⟫_ℝ := by
+                simpa using (real_inner_sub_sub_self r₁ r₂)
+          _ = ‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ := by
+                simp [real_inner_self_eq_norm_sq, sub_eq_add_neg, add_comm, add_left_comm,
+                  add_assoc, mul_comm, mul_left_comm, mul_assoc]
+      have hb' : b = 1 - a := by linarith [hab]
+      -- Combine the expansions.
+      calc
+        a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 - ‖r_mid‖ ^ 2
+            = a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 -
+                (⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ) := by
+                  simp [hmid, hnorm_add, real_inner_self_eq_norm_sq]
+        _ = a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 -
+                (a * (a * ‖r₁‖ ^ 2) + 2 * (a * (b * ⟪r₁, r₂⟫_ℝ)) + b * (b * ‖r₂‖ ^ 2)) := by
+                  simp [hnorm_smul₁, hnorm_smul₂, hinner_smul, mul_assoc]
+        _ = a * b * (‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ) := by
+              simp [hb']
+              ring
+        _ = a * b * ‖r₁ - r₂‖ ^ 2 := by
+              simp [hnorm_sub]
 
     -- r₁ - r₂ = (y - Xβ₁) - (y - Xβ₂) = Xβ₂ - Xβ₁ = X(β₂ - β₁)
     have h_r_diff : r₁ - r₂ = X.mulVec (β₂ - β₁) := by
@@ -1692,7 +1839,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
         simp only [Matrix.mulVec_sub, Pi.sub_apply]
         have hab' : a + b = 1 := hab
         -- After ring_nf, we need to show the algebraic identity with a+b=1
-        sorry -- algebraic identity
+        ring
       -- The RHS is ≥ 0 by PSD of S
       have h_rhs_nonneg : a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) ≥ 0 := by
         apply mul_nonneg
