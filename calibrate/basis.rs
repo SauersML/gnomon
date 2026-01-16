@@ -710,12 +710,12 @@ fn evaluate_splines_derivative_sparse_into_with_lower(
         };
         let denom_left = knot_view[i + degree] - knot_view[i];
         let denom_right = knot_view[i + degree + 1] - knot_view[i + 1];
-        let left_term = if denom_left.abs() > 1e-12 {
+        let left_term = if denom_left != 0.0 {
             left / denom_left
         } else {
             0.0
         };
-        let right_term = if denom_right.abs() > 1e-12 {
+        let right_term = if denom_right != 0.0 {
             right / denom_right
         } else {
             0.0
@@ -805,12 +805,12 @@ fn evaluate_splines_second_derivative_sparse_into(
         };
         let denom_left = knot_view[i + degree] - knot_view[i];
         let denom_right = knot_view[i + degree + 1] - knot_view[i + 1];
-        let left_term = if denom_left.abs() > 1e-12 {
+        let left_term = if denom_left != 0.0 {
             left / denom_left
         } else {
             0.0
         };
-        let right_term = if denom_right.abs() > 1e-12 {
+        let right_term = if denom_right != 0.0 {
             right / denom_right
         } else {
             0.0
@@ -2487,7 +2487,7 @@ pub(crate) mod internal {
 
             for r in 0..d {
                 let den = right[r + 1] + left[d - r];
-                let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+                let temp = if den != 0.0 { n[r] / den } else { 0.0 };
 
                 n[r] = saved + right[r + 1] * temp;
                 saved = left[d - r] * temp;
@@ -3679,13 +3679,13 @@ pub fn evaluate_bspline_derivative_scalar_into(
         let denom_left = knot_vector[i + degree] - knot_vector[i];
         let denom_right = knot_vector[i + degree + 1] - knot_vector[i + 1];
         
-        let left_term = if denom_left.abs() > 1e-12 && i < num_basis_lower {
+        let left_term = if denom_left != 0.0 && i < num_basis_lower {
             lower_basis[i] / denom_left
         } else {
             0.0
         };
         
-        let right_term = if denom_right.abs() > 1e-12 && (i + 1) < num_basis_lower {
+        let right_term = if denom_right != 0.0 && (i + 1) < num_basis_lower {
             lower_basis[i + 1] / denom_right
         } else {
             0.0

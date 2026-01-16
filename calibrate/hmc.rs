@@ -167,7 +167,12 @@ fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> 
             // Divide by diagonal (L^T[i,i] = L[i,i])
             let diag = l[[i, i]];
             if diag.abs() < 1e-15 {
-                result[[i, col]] = 0.0; // Regularize near-zero diagonal
+                // Near-zero diagonal implies infinite variance in this direction.
+                // We set a large value to reflect high uncertainty, rather than 0.0
+                // which would imply false precision (perfect certainty).
+                // This prevents MCMC from getting "pinned" in uninformed directions.
+                let sign = if sum == 0.0 { 1.0 } else { sum.signum() };
+                result[[i, col]] = sign * 1e8;
             } else {
                 result[[i, col]] = sum / diag;
             }

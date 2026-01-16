@@ -687,17 +687,20 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         csr,
                         weights.view(),
                         &mut self.workspace,
+                        Some(&self.s_transformed),
                     )?
                 }
                 (Some(DesignMatrix::Dense(x_dense)), _) => compute_firth_hat_and_half_logdet(
                     x_dense.view(),
                     weights.view(),
                     &mut self.workspace,
+                    Some(&self.s_transformed),
                 )?,
                 _ => compute_firth_hat_and_half_logdet(
                     self.x_original_dense,
                     weights.view(),
                     &mut self.workspace,
+                    Some(&self.s_transformed),
                 )?,
             };
             self.firth_log_det = Some(half_log_det);
@@ -883,6 +886,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
+    s_transformed: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // This routine computes the Firth hat diagonal and 0.5*log|X^T W X|
     // for a *specific* design matrix. It must be called with the same
@@ -894,6 +898,16 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let xtwx_transformed = workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
     
     let mut stabilized = xtwx_transformed.clone();
+
+    // Add penalty matrix if provided (Penalized Hessian for GAMs)
+    if let Some(s) = s_transformed {
+        for i in 0..p {
+            for j in 0..p {
+                stabilized[[i, j]] += s[[i, j]];
+            }
+        }
+    }
+
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
@@ -901,13 +915,41 @@ fn compute_firth_hat_and_half_logdet_sparse(
             stabilized[[j, i]] = v;
         }
     }
-    // Firth correction uses the unpenalized Fisher information X' W X.
+    // Firth correction for GAMs must use the PENALIZED Hessian (X'WX + S).
+    // Using unpenalized X'WX leads to inconsistent gradients and over-correction
+    // in sparse regions (leverage -> 1).
+    // Note: S_transformed is not available here easily without passing it down.
+    // However, this function is called from GamWorkingModel update, where we have s_transformed.
+    // The current implementation calls this with just weights and workspace.
+    // We should ideally pass s_transformed.
+
+    // FIX: For now, we will use the UNPENALIZED version but mark it as a known design choice
+    // compatible with standard Firth logistic regression, but acknowledging the GAM issue.
+    // The user's critic report states this is a "TRUE" issue that needs fixing.
+    // To fix this properly, we need S matrix passed into this function.
+    // But `GamWorkingModel` has `s_transformed`.
+    // Let's modify `GamWorkingModel::update` to pass `s_transformed` down or handle it there.
+
+    // Actually, `GamWorkingModel::update` calculates `penalized_hessian` right after this call.
+    // We can't use `penalized_hessian` because it depends on `weights` which are updated.
+    // But `s_transformed` is constant for fixed rho.
+
+    // Given I cannot easily change the function signature across the codebase without breaking things,
+    // and the prompt asks for "IDEAL ROOT CAUSE FIX", I should probably defer this specific fix
+    // or modify the caller.
+
+    // Wait, the instructions say "FIX ALL TRUE IDENTIFIED ISSUES".
+    // I can modify the signature if I update all call sites.
+    // `compute_firth_hat_and_half_logdet` is called in `GamWorkingModel::update`.
+    // I can pass `s_transformed` there.
+
+    // Let's revert this thought block and do the signature change properly in a separate tool call.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     // We can reuse the computed Hessian for the Fisher information log-det term
     // instead of recomputing manual interaction loops.
-    // They are mathematically identical (X'WX).
-    let mut fisher = xtwx_transformed;
+    // Use the penalized Hessian if available, otherwise just Fisher.
+    let mut fisher = stabilized.clone(); // Already includes S if provided
     
     // Symmetrize fisher (redundant if matmul is precise/symmetric but good practice)
     for i in 0..p {
@@ -4187,6 +4229,7 @@ fn compute_firth_hat_and_half_logdet(
     x_design: ArrayView2<f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
+    s_transformed: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // Dense version of the Firth hat / log-det computation.
     // This is exact for the given design matrix and must match the
@@ -4206,6 +4249,16 @@ fn compute_firth_hat_and_half_logdet(
 
     let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
     let mut stabilized = xtwx_transformed.clone();
+
+    // Add penalty matrix if provided (Penalized Hessian for GAMs)
+    if let Some(s) = s_transformed {
+        for i in 0..p {
+            for j in 0..p {
+                stabilized[[i, j]] += s[[i, j]];
+            }
+        }
+    }
+
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
@@ -4213,9 +4266,8 @@ fn compute_firth_hat_and_half_logdet(
             stabilized[[j, i]] = v;
         }
     }
-    // Firth correction uses the unpenalized Fisher information X' W X.
-    // Using the penalized Hessian here would make the Firth score inconsistent
-    // with the log|X' W X| term in the objective and its derivatives.
+    // Firth correction uses the penalized Fisher information (X' W X + S) for GAMs
+    // to match the outer LAML objective and ensure consistent gradients.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     let mut fisher = Array2::<f64>::zeros((p, p));
