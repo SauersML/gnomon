@@ -1,0 +1,76 @@
+name: Rust Release Tests (Scheduled)
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  rust_tests_release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            filter_expr: "not test(calibrate::) and not test(map::) and not test(score::)"
+          - suite: score
+            filter_expr: "test(score::)"
+          - suite: calibrate
+            filter_expr: "test(calib)"
+          - suite: map
+            filter_expr: "test(map::)"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare cache metadata
+        id: cache_meta
+        shell: bash
+        run: |
+          echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
+          DEPS_HASH=$(find . -name "Cargo.toml" -o -name "Cargo.lock" | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo registry (CI speed only)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ steps.cache_meta.outputs.deps_hash }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Restore Cargo build cache (CI speed only)
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-W${{ steps.cache_meta.outputs.week }}-
+            ${{ runner.os }}-cargo-build-nightly-${{ github.ref_name }}-
+            ${{ runner.os }}-cargo-build-nightly-
+
+      - name: Cargo fetch (prepopulate deps cache)
+        run: cargo +nightly fetch
+
+      - name: Install cargo-nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run nextest (release, no timeout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +nightly nextest run --profile ci --release \
+            --filter-expr "${{ matrix.filter_expr }}"

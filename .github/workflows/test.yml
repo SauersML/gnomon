@@ -36,16 +36,18 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
-  build_and_test:
+  detect_changes:
     runs-on: ubuntu-latest
     outputs:
-      rust_changes: ${{ steps.rust_changes.outputs.rust }}
-      artifact_available: ${{ steps.artifact_status.outputs.available }}
+      rust: ${{ needs.detect_changes.outputs.rust }}
+      core: ${{ needs.detect_changes.outputs.core }}
+      score: ${{ needs.detect_changes.outputs.score }}
+      map: ${{ needs.detect_changes.outputs.map }}
+      calibrate: ${{ needs.detect_changes.outputs.calibrate }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Detect if any Rust-relevant files changed ------------------------------
       - name: Detect Rust source changes
         id: rust_changes
         uses: dorny/paths-filter@v2
@@ -72,7 +74,16 @@ jobs:
               - 'calibrate/**'
               - 'calibrate/**/*.rs'
               - 'calibrate/*.rs'
-      # -----------------------------------------------------------------------
+
+  build_and_test:
+    needs: detect_changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust_changes: ${{ needs.detect_changes.outputs.rust }}
+      artifact_available: ${{ steps.artifact_status.outputs.available }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -86,7 +97,7 @@ jobs:
           echo "deps_hash=$DEPS_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo registry (CI speed only)
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: needs.detect_changes.outputs.rust == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -96,6 +107,18 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ steps.cache_meta.outputs.deps_hash }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
+
+      - name: Cache release build artifacts (CI speed only)
+        if: needs.detect_changes.outputs.rust == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/release
+            target/nextest
+          key: ${{ runner.os }}-cargo-release-${{ steps.cache_meta.outputs.deps_hash }}-W${{ steps.cache_meta.outputs.week }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ steps.cache_meta.outputs.deps_hash }}-
+            ${{ runner.os }}-cargo-release-
 
       - name: Restore Cargo build cache (CI speed only)
         id: cargo_build_cache_restore
@@ -110,51 +133,27 @@ jobs:
 
       # -------------------- PREWARM EVERYTHING (so artifacts are complete) --------------------
       - name: Cargo fetch (prepopulate deps cache)
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: needs.detect_changes.outputs.rust == 'true'
         run: cargo +nightly fetch
 
       - name: "Prebuild debug (lib/bin/tests, no-run)"
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           cargo +nightly build
           cargo +nightly test --no-run
 
       - name: Install cargo-nextest
-        if: steps.rust_changes.outputs.rust == 'true'
+        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Run Rust unit tests
-        id: test_step
-        if: steps.rust_changes.outputs.core == 'true'
+      - name: "Prebuild release tests (nextest no-run)"
+        if: needs.detect_changes.outputs.rust == 'true'
         run: |
-          set -euo pipefail
-          rm -f cargo-test.log
-          cargo +nightly nextest run --profile ci --release \
-            --filter-expr 'not test(calibrate::) and not test(map::)' \
-            2>&1 | tee cargo-test.log
-        continue-on-error: true
-
-      - name: Run score-specific tests
-        id: score_test_step
-        if: steps.rust_changes.outputs.score == 'true'
-        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(score::)"'
-        continue-on-error: true
-
-      - name: Run calibrate-specific tests
-        id: calibrate_test_step
-        if: steps.rust_changes.outputs.calibrate == 'true'
-        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(calib)"'
-        continue-on-error: true
-
-      - name: Run map-specific tests
-        id: map_test_step
-        if: steps.rust_changes.outputs.map == 'true'
-        run: 'cargo +nightly nextest run --profile ci --release --filter-expr "test(map::)"'
-        continue-on-error: true
+          cargo +nightly nextest run --profile ci --release --no-run
 
       - name: Inspect Assembly for Performance Analysis
-        if: steps.rust_changes.outputs.rust == 'false'
+        if: needs.detect_changes.outputs.rust == 'false'
         run: |
           cargo +nightly install cargo-show-asm --features disasm
           echo "--- Building test harness for inspection ---"
@@ -172,30 +171,8 @@ jobs:
           # aligned with the library's public path to avoid false CI failures.
           cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::score::batch::process_tile 0
 
-      - name: Cache getdoc binary
-        id: getdoc_cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/getdoc
-          key: ${{ runner.os }}-getdoc-v1
-
-      - name: Install getdoc
-        if: steps.rust_changes.outputs.rust == 'true' && steps.getdoc_cache.outputs.cache-hit != 'true' && steps.test_step.outcome == 'failure'
-        run: cargo +nightly install getdoc --locked
-
-      - name: Generate custom report with getdoc
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
-        run: |
-          ~/.cargo/bin/getdoc --features default
-          cat report.md
-
       - name: Build Gnomon binaries (Release and Profiling)
-        if: |
-          steps.rust_changes.outputs.rust == 'true' &&
-          steps.test_step.outcome != 'failure' &&
-          steps.score_test_step.outcome != 'failure' &&
-          steps.calibrate_test_step.outcome != 'failure' &&
-          steps.map_test_step.outcome != 'failure'
+        if: needs.detect_changes.outputs.rust == 'true'
         run: |
           cargo +nightly build --release
           cargo +nightly build --profile profiling --features no-inline-profiling
@@ -244,7 +221,7 @@ jobs:
           retention-days: 30
 
       - name: Pack target-all cache tar (main only)
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        if: needs.detect_changes.outputs.rust == 'true' && github.ref_name == 'main'
         shell: bash
         run: |
           set -euo pipefail
@@ -257,7 +234,7 @@ jobs:
           tar -cf "target-all-${{ steps.naming.outputs.short_sha }}.tar" "${paths[@]}"
           ls -lh "target-all-${{ steps.naming.outputs.short_sha }}.tar"
       - name: Upload artifact – target-all cache (main only)
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        if: needs.detect_changes.outputs.rust == 'true' && github.ref_name == 'main'
         uses: actions/upload-artifact@v4
         with:
           name: target-all-${{ steps.naming.outputs.short_sha }}
@@ -265,7 +242,7 @@ jobs:
           retention-days: 3
 
       - name: Cleanup target-all tar after upload (free disk space)
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'success' && github.ref_name == 'main'
+        if: needs.detect_changes.outputs.rust == 'true' && github.ref_name == 'main'
         run: rm -f target-all-*.tar
 
       - name: Prepare trimmed build artifact (always)
@@ -291,23 +268,7 @@ jobs:
           if [[ -f report.md ]]; then
             cp report.md build-output/
           fi
-          if [[ -f cargo-test.log ]]; then
-            cp cargo-test.log build-output/
-          fi
           rm -rf target/debug target/.fingerprint target/incremental
-
-      - name: Summarize Rust test failures
-        if: steps.rust_changes.outputs.rust == 'true' && steps.test_step.outcome == 'failure'
-        shell: bash
-        run: |
-          if [[ ! -s cargo-test.log ]]; then
-            echo "::warning::cargo-test.log missing or empty; skipping failure summary."
-            exit 0
-          fi
-          echo '=== Rust test failure context (FAILED ±20 lines) ==='
-          if ! rg --color=never --no-heading --context 20 'FAILED' cargo-test.log; then
-            echo "::warning::No lines containing 'FAILED' found in cargo-test.log."
-          fi
 
       - name: Cleanup workspace leftovers (always)
         if: always()
@@ -315,19 +276,6 @@ jobs:
           rm -rf export
           du -sh build-output || true
 
-      - name: Fail job if any tests failed
-        if: |
-          steps.test_step.outcome == 'failure' ||
-          steps.score_test_step.outcome == 'failure' ||
-          steps.calibrate_test_step.outcome == 'failure' ||
-          steps.map_test_step.outcome == 'failure'
-        run: |
-          echo "::error::One or more test suites failed"
-          echo "Unit tests: ${{ steps.test_step.outcome }}"
-          echo "Score tests: ${{ steps.score_test_step.outcome }}"
-          echo "Calibrate tests: ${{ steps.calibrate_test_step.outcome }}"
-          echo "Map tests: ${{ steps.map_test_step.outcome }}"
-          exit 1
 
       - name: Upload build artifacts for all downstream jobs
         uses: actions/upload-artifact@v4
@@ -336,6 +284,15 @@ jobs:
           path: build-output
           retention-days: 1
           if-no-files-found: ignore
+
+      - name: Upload test build artifacts for parallel runs
+        if: needs.detect_changes.outputs.rust == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-build
+          path: target
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Determine artifact availability (always)
         id: artifact_status
@@ -347,6 +304,59 @@ jobs:
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
+
+  rust_tests:
+    needs: build_and_test
+    runs-on: ubuntu-latest
+    if: needs.build_and_test.outputs.rust_changes == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            change_key: core
+            filter_expr: "not test(calibrate::) and not test(map::)"
+          - suite: score
+            change_key: score
+            filter_expr: "test(score::)"
+          - suite: calibrate
+            change_key: calibrate
+            filter_expr: "test(calib)"
+          - suite: map
+            change_key: map
+            filter_expr: "test(map::)"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Download test build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-test-build
+          path: .
+
+      - name: Install cargo-nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run nextest (3m timeout)
+        id: nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          timeout --signal=INT --kill-after=30s 3m \
+            cargo +nightly nextest run --profile ci --release --no-build \
+            --filter-expr "${{ matrix.filter_expr }}" \
+            2>&1 | tee cargo-test.log || status=$?
+          if [ $status -eq 124 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+            exit 78
+          fi
+          exit $status
 
   python_test_integration:
     needs: build_and_test

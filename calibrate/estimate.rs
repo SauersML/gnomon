@@ -8304,8 +8304,14 @@ pub mod internal {
         fn test_remlstate_helpers_basic() {
             let n_samples = 220;
             let y = Array1::from_shape_fn(n_samples, |i| i as f64 * 0.05);
-            let p = Array1::zeros(n_samples);
-            let pcs = Array2::zeros((n_samples, 1));
+            let p = Array1::linspace(-1.0, 1.0, n_samples);
+            let pcs = Array2::from_shape_fn((n_samples, 1), |(i, _)| {
+                if n_samples > 1 {
+                    -1.0 + 2.0 * (i as f64) / ((n_samples - 1) as f64)
+                } else {
+                    0.0
+                }
+            });
             let data = TrainingData {
                 y,
                 p,

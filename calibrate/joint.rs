@@ -118,6 +118,10 @@ pub struct JointModelState<'a> {
     /// This must be tracked to include 0.5*δ||β||² in the cost function,
     /// ensuring the Envelope Theorem holds for the analytic gradient.
     ridge_used: f64,
+    /// Ridge stabilization used for the base block solve.
+    ridge_base_used: f64,
+    /// Ridge stabilization used for the link block solve.
+    ridge_link_used: f64,
 }
 
 /// Configuration for joint model fitting
@@ -240,6 +244,8 @@ impl<'a> JointModelState<'a> {
             firth_bias_reduction: config.firth_bias_reduction,
             last_eta: None,
             ridge_used: 0.0,
+            ridge_base_used: 0.0,
+            ridge_link_used: 0.0,
         }
     }
     
@@ -658,6 +664,7 @@ impl<'a> JointModelState<'a> {
         
         // Solve: (B'WB + λS + δI)θ = B'W(z - u)
         // Track ridge δ to include 0.5*δ||θ||² in cost (Envelope Theorem).
+        self.ridge_link_used = 0.0;
         if b_wiggle.ncols() > 0 {
             let penalty = self.build_link_penalty();
             let (new_theta, ridge_link) = Self::solve_weighted_ls(b_wiggle, &z_adjusted, &weights, &penalty, lambda_link);
@@ -666,6 +673,7 @@ impl<'a> JointModelState<'a> {
             if new_theta.len() == self.beta_link.len() {
                 self.beta_link = new_theta;
             }
+            self.ridge_link_used = ridge_link;
             // Accumulate ridge (take max of base and link ridges for joint system)
             self.ridge_used = self.ridge_used.max(ridge_link);
         }
@@ -828,6 +836,7 @@ impl<'a> JointModelState<'a> {
         // Solve PWLS: (X'W_eff X + S + δI)β = X'W_eff z_eff
         // Track ridge δ to include 0.5*δ||β||² in cost (Envelope Theorem).
         let (new_beta, ridge_base) = Self::solve_weighted_ls(&self.x_base.to_owned(), &z_eff, &w_eff, &penalty, 1.0);
+        self.ridge_base_used = ridge_base;
         // Accumulate ridge (take max of base and link ridges for joint system)
         self.ridge_used = self.ridge_used.max(ridge_base);
 
@@ -1446,9 +1455,10 @@ impl<'a> JointRemlState<'a> {
         let mp = (p_base as f64 - base_rank) + (p_link as f64 - link_rank);
         
         // Penalized log-likelihood term: -0.5*deviance - 0.5*beta'*S_λ*beta
-        // Note: With spectral log-det (Wood 2011), we do NOT add ridge penalty to the cost.
-        // The ridge is a solver detail for numerical stability, not part of the objective.
-        // This keeps the objective smooth and ensures exact gradient consistency.
+        // Include stabilization ridge to satisfy Envelope Theorem consistency:
+        // inner solver minimizes L_inner = -ℓ + 0.5 βᵀS_λβ + 0.5 δ||β||².
+        // If cost omits δ||β||², then ∇_β V = -δ β̂ ≠ 0 and dV/dρ picks up a bias
+        // via (∇_β V)ᵀ dβ/dρ. Adding the ridge restores ∇_β V ≈ 0 at β̂.
         let mut penalty_term = 0.0;
         for (idx, s_k) in state.s_base.iter().enumerate() {
             let lambda_k = lambda_base.get(idx).cloned().unwrap_or(0.0);
@@ -1462,6 +1472,14 @@ impl<'a> JointRemlState<'a> {
                 let sb = link_penalty.dot(&state.beta_link);
                 penalty_term += lambda_link * state.beta_link.dot(&sb);
             }
+        }
+        if state.ridge_base_used > 0.0 {
+            // 0.5 * δ ||β_base||² with δ tracked from the actual PWLS solve.
+            penalty_term += state.ridge_base_used * state.beta_base.dot(&state.beta_base);
+        }
+        if p_link > 0 && state.beta_link.len() == p_link && state.ridge_link_used > 0.0 {
+            // Same ridge term for the link block to keep cost/gradient surfaces aligned.
+            penalty_term += state.ridge_link_used * state.beta_link.dot(&state.beta_link);
         }
         
         let laml = match state.link {

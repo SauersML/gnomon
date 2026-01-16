@@ -2473,19 +2473,20 @@ pub fn stable_reparameterization_with_invariant(
     let (s_eigenvalues_raw, s_eigenvectors) =
         robust_eigh_faer(&s_transformed, Side::Lower, "combined penalty matrix")?;
 
-    // Use ADAPTIVE RANK based on current eigenvalues to ensure numerical stability.
+    // Use FIXED STRUCTURAL RANK to ensure C² smoothness of the LAML objective.
     //
     // The LAML objective includes log|S_λ|_+ (log-pseudo-determinant of the penalty).
-    // When a smoothing parameter λ_k is very small, its contribution to S_λ drops to
-    // machine noise (~10^-16). Including these noise eigenvalues adds ln(10^-16) ≈ -36.8
-    // to the cost function, creating gradient explosions from differentiating numerical noise.
+    // The structural rank is determined at precompute time from the balanced penalties
+    // and represents the number of truly penalized directions in the model geometry.
     //
-    // The fix: use adaptive relative tolerance (max_eig * 1e-12) on the CURRENT S_λ
-    // eigenvalues. This is the industry standard (used in LAPACK/mgcv). Eigenvalues below
-    // this threshold are treated as null space, not penalized modes.
+    // CRITICAL: Using adaptive rank (based on current eigenvalues) creates DISCONTINUITIES
+    // in the objective function. When an eigenvalue crosses the threshold, the rank jumps,
+    // causing a step change in log|S|_+. This violates the C² assumption required by BFGS.
     //
-    // Consistency is ensured because both log|S|_+ AND the reconstructed s_transformed
-    // (which feeds into H) use the same adaptive rank.
+    // To handle noise eigenvalues without discontinuities:
+    // 1. Use FIXED structural rank (smooth, continuous objective)
+    // 2. Clamp eigenvalues to a relative floor when computing log_det
+    //    This bounds the contribution of noise without changing the rank.
 
     // Sort eigenvalues descending with their indices
     let mut sorted_eigs: Vec<(usize, f64)> = s_eigenvalues_raw
@@ -2495,25 +2496,14 @@ pub fn stable_reparameterization_with_invariant(
         .collect();
     sorted_eigs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Adaptive rank: include eigenvalues above relative tolerance
-    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(0.0);
+    // Use FIXED structural rank from invariant (ensures smooth objective)
+    let structural_rank = penalized_rank.min(sorted_eigs.len());
+    let selected_eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(structural_rank).cloned().collect();
 
-    // Absolute floor: if max eigenvalue is essentially zero, treat as zero penalty
-    // This prevents computing log_det of numerical noise
-    const ABSOLUTE_EIG_FLOOR: f64 = 1e-30;
-    let (structural_rank, selected_eigs) = if max_eig < ABSOLUTE_EIG_FLOOR {
-        // All eigenvalues are noise - return empty penalty (rank 0)
-        (0usize, Vec::new())
-    } else {
-        let adaptive_tol = max_eig * 1e-12;
-        let rank = sorted_eigs
-            .iter()
-            .take_while(|(_, ev)| *ev > adaptive_tol)
-            .count()
-            .max(1); // At least 1 mode when max_eig is valid
-        let eigs: Vec<(usize, f64)> = sorted_eigs.iter().take(rank).cloned().collect();
-        (rank, eigs)
-    };
+    // Relative floor for log_det: clamp small eigenvalues to avoid ln(noise)
+    // This is applied when computing log_det, NOT when selecting rank
+    let max_eig = sorted_eigs.first().map(|(_, v)| *v).unwrap_or(1.0);
+    let eigenvalue_floor = max_eig * 1e-12;
     
     // Extract truncated eigenvector indices (those NOT in selected_eigs)
     // These span the null space and are needed for gradient correction
@@ -2531,21 +2521,22 @@ pub fn stable_reparameterization_with_invariant(
         }
     }
     
-    // Tiny absolute floor to prevent ln(0) - we never filter structural modes
-    let ln_floor = 1e-300_f64;
+    // Use relative floor for eigenvalue clamping (prevents ln(noise) without changing rank)
+    // eigenvalue_floor = max_eig * 1e-12 ensures bounded contribution from noise modes
 
     let mut e_transformed_mat = Mat::<f64>::zeros(structural_rank, p);
     for (row_idx, &(eig_idx, eigenval)) in selected_eigs.iter().enumerate() {
-        let safe_eigenval = eigenval.max(ln_floor);
+        let safe_eigenval = eigenval.max(eigenvalue_floor);
         let sqrt_eigenval = safe_eigenval.sqrt();
         for row in 0..p {
             e_transformed_mat[(row_idx, row)] = s_eigenvectors[(row, eig_idx)] * sqrt_eigenval;
         }
     }
 
+    // Clamp eigenvalues to floor when computing log_det (bounded noise contribution)
     let log_det: f64 = selected_eigs
         .iter()
-        .map(|&(_, ev)| ev.max(ln_floor).ln())
+        .map(|&(_, ev)| ev.max(eigenvalue_floor).ln())
         .sum();
 
     let mut det1_vec = vec![0.0; lambdas.len()];
@@ -2553,7 +2544,7 @@ pub fn stable_reparameterization_with_invariant(
     // Build S⁺ using the selected eigenvalues (structural rank)
     let mut s_plus = Mat::<f64>::zeros(p, p);
     for &(eig_idx, eigenval) in selected_eigs.iter() {
-        if eigenval > ln_floor {
+        if eigenval > eigenvalue_floor {
             let inv = 1.0 / eigenval;
             for i in 0..p {
                 let vi = s_eigenvectors[(i, eig_idx)];
@@ -3137,8 +3128,18 @@ mod tests {
     #[test]
     fn test_interaction_term_has_correct_penalty_structure() {
         let (data, config) = create_test_data_for_construction(100, 1);
-        let (_, s_list, layout, _, _, _, _, _, _, penalty_structs) =
-            build_design_and_penalty_matrices(&data, &config).unwrap();
+        let (
+            _,
+            s_list,
+            layout,
+            sum_to_zero_constraints,
+            _,
+            range_transforms,
+            pc_null_transforms,
+            _,
+            interaction_orth_alpha,
+            penalty_structs,
+        ) = build_design_and_penalty_matrices(&data, &config).unwrap();
 
         // With null-space penalization and the sex×PGS varying coefficient:
         // PC null + PC range + three anisotropic interaction penalties + one sex×PGS penalty
@@ -3213,17 +3214,124 @@ mod tests {
         let i_pgs = Array2::<f64>::eye(pgs_cols);
         let i_pc = Array2::<f64>::eye(pc_cols);
 
-        let expected_pgs = kronecker_product(&s_pgs, &i_pc);
-        let expected_pc = kronecker_product(&i_pgs, &s_pc);
+        let expected_pgs_raw = kronecker_product(&s_pgs, &i_pc);
+        let expected_pc_raw = kronecker_product(&i_pgs, &s_pc);
         let (z_null_pgs, _) = basis::null_range_whiten(&s_pgs).expect("PGS null/range");
         let (z_null_pc, _) = basis::null_range_whiten(&s_pc).expect("PC null/range");
         let expected_null = kronecker_product(
             &z_null_pgs.dot(&z_null_pgs.t()),
             &z_null_pc.dot(&z_null_pc.t()),
         );
+
+        // Reproduce the same projection used in build_design_and_penalty_matrices.
+        // For T_proj = T_raw - M*alpha, the roughness penalty expands as:
+        // J(T_proj β) = βᵀ S_raw β + βᵀ alphaᵀ S_main alpha β - 2 βᵀ (S_cross alpha) β.
+        // This matches the S_raw + correction - cross_terms construction in production.
+        let pgs_z_transform = sum_to_zero_constraints
+            .get("pgs_main")
+            .expect("pgs_main transform missing");
+        let pc_name = &pc_config.name;
+        let interaction_key = format!("f(PGS,{})", pc_name);
+        let alpha = interaction_orth_alpha
+            .get(&interaction_key)
+            .expect("interaction alpha missing");
+
+        let mut current_offset = 0usize;
+        current_offset += 1; // intercept
+        if layout.sex_col.is_some() {
+            current_offset += 1;
+        }
+        let pgs_main_offset = current_offset;
+        let pgs_main_len = pgs_z_transform.ncols();
+        current_offset += pgs_main_len;
+        let pc_null_len = pc_null_transforms
+            .get(pc_name)
+            .map(|z| z.ncols())
+            .unwrap_or(0);
+        let pc_null_offset = current_offset;
+        current_offset += pc_null_len;
+        let pc_range_len = range_transforms
+            .get(pc_name)
+            .expect("pc range transform missing")
+            .ncols();
+        let pc_range_offset = current_offset;
+
+        let alpha_pgs = alpha.slice(s![pgs_main_offset..pgs_main_offset + pgs_main_len, ..]);
+        let alpha_pc_null = if pc_null_len > 0 {
+            alpha.slice(s![pc_null_offset..pc_null_offset + pc_null_len, ..])
+        } else {
+            alpha.slice(s![0..0, ..])
+        };
+        let alpha_pc_range = alpha.slice(s![pc_range_offset..pc_range_offset + pc_range_len, ..]);
+
+        // PGS projected penalty
+        let s_pgs_main_unc = create_difference_penalty_matrix(
+            pgs_main_basis_unc.ncols(),
+            config.penalty_order,
+            None,
+        )
+        .expect("PGS main penalty");
+        let s_pgs_main_constrained = pgs_z_transform
+            .t()
+            .dot(&s_pgs_main_unc.dot(pgs_z_transform));
+        let s_pgs_main_scaled = s_pgs_main_constrained * (pc_cols as f64);
+        let correction_pgs = alpha_pgs.t().dot(&s_pgs_main_scaled.dot(&alpha_pgs));
+        let s_pgs_main_mixed = pgs_z_transform.t().dot(&s_pgs_main_unc);
+        let ones_pc = Array2::<f64>::ones((1, pc_cols));
+        let s_cross_row = kronecker_product(&s_pgs_main_mixed, &ones_pc);
+        let term2 = alpha_pgs.t().dot(&s_cross_row);
+        let expected_pgs_proj = &expected_pgs_raw + &correction_pgs - &term2 - &term2.t();
+
+        // PC projected penalty
+        let pc_null_transform = pc_null_transforms
+            .get(pc_name)
+            .cloned()
+            .unwrap_or_else(|| Array2::zeros((pc_cols, 0)));
+        let pc_range_transform = range_transforms
+            .get(pc_name)
+            .expect("pc range transform missing");
+        let z_total = if pc_null_transform.ncols() > 0 {
+            let mut combined = Array2::zeros((
+                pc_null_transform.nrows(),
+                pc_null_transform.ncols() + pc_range_transform.ncols(),
+            ));
+            combined
+                .slice_mut(s![.., 0..pc_null_transform.ncols()])
+                .assign(&pc_null_transform);
+            combined
+                .slice_mut(s![.., pc_null_transform.ncols()..])
+                .assign(pc_range_transform);
+            combined
+        } else {
+            pc_range_transform.clone()
+        };
+        let s_pc_main_unc = create_difference_penalty_matrix(
+            pc_basis_unc.ncols() - 1,
+            config.penalty_order,
+            None,
+        )
+        .expect("PC main penalty");
+        let s_pc_main_constrained = z_total.t().dot(&s_pc_main_unc.dot(&z_total));
+        let mut alpha_pc = Array2::zeros((pc_null_len + pc_range_len, alpha.ncols()));
+        if pc_null_len > 0 {
+            alpha_pc
+                .slice_mut(s![0..pc_null_len, ..])
+                .assign(&alpha_pc_null);
+        }
+        alpha_pc
+            .slice_mut(s![pc_null_len.., ..])
+            .assign(&alpha_pc_range);
+        let s_pc_main_scaled = s_pc_main_constrained * (pgs_cols as f64);
+        let correction_pc = alpha_pc.t().dot(&s_pc_main_scaled.dot(&alpha_pc));
+        let s_pc_main_mixed = z_total.t().dot(&s_pc_main_unc);
+        let ones_pgs = Array2::<f64>::ones((1, pgs_cols));
+        let s_cross_row_pc = kronecker_product(&ones_pgs, &s_pc_main_mixed);
+        let term2_pc = alpha_pc.t().dot(&s_cross_row_pc);
+        let expected_pc_proj = &expected_pc_raw + &correction_pc - &term2_pc - &term2_pc.t();
+
         let frob = |m: &Array2<f64>| m.iter().map(|&x| x * x).sum::<f64>().sqrt().max(1e-12);
-        let expected_pgs_norm = &expected_pgs / frob(&expected_pgs);
-        let expected_pc_norm = &expected_pc / frob(&expected_pc);
+        let expected_pgs_norm = &expected_pgs_proj / frob(&expected_pgs_proj);
+        let expected_pc_norm = &expected_pc_proj / frob(&expected_pc_proj);
         let expected_null_norm = &expected_null / frob(&expected_null);
 
         let s_interaction_pgs = &s_list[interaction_block.penalty_indices[0]];
