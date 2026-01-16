@@ -16,7 +16,7 @@ use crate::map::fit::{HwePcaModel, VariantBlockSource};
 use crate::map::project::ProjectionResult;
 use crate::map::variant_filter::{MatchKind, VariantFilter, VariantKey, VariantSelection};
 use crate::score::pipeline::PipelineError;
-use crate::shared::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
+use crate::adapt_plink2::{VirtualPlink19, open_virtual_plink19_from_paths};
 use crate::shared::files::{
     BedSource, ReadMetrics, TextSource, VariantCompression, VariantFormat, VariantSource,
     list_variant_paths, open_bed_source, open_text_source, open_variant_source,
@@ -874,7 +874,6 @@ impl PlinkDataset {
 pub struct PgenDataset {
     pgen_path: PathBuf,
     pvar_path: PathBuf,
-    psam_path: PathBuf,
     virtual_plink: VirtualPlink19,
     samples: Vec<SampleRecord>,
     n_variants: usize,
@@ -904,7 +903,6 @@ impl PgenDataset {
         Ok(Self {
             pgen_path,
             pvar_path,
-            psam_path,
             virtual_plink,
             samples,
             n_variants,
@@ -1041,6 +1039,16 @@ impl PgenDataset {
         let mut local = self.pgen_path.clone();
         local.set_extension(filename);
         local
+    }
+}
+
+impl fmt::Debug for PgenDataset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PgenDataset")
+            .field("pgen_path", &self.pgen_path)
+            .field("n_samples", &self.n_samples())
+            .field("n_variants", &self.n_variants)
+            .finish()
     }
 }
 

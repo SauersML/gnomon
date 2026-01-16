@@ -67,6 +67,10 @@ impl VirtualPlink19 {
         }
     }
 
+    pub fn bed_source(&self) -> Arc<dyn ByteRangeSource> {
+        Arc::clone(&self.bed)
+    }
+
     pub fn n_samples(&self) -> usize {
         self.n_samples
     }

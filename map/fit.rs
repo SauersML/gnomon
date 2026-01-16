@@ -2482,112 +2482,6 @@ where
         }
     }
 
-    fn try_apply_hardcall_packed(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>) -> bool {
-        let mut guard = self
-            .source
-            .lock()
-            .expect("covariance source mutex poisoned");
-        let source: &mut S = &mut guard;
-        let _ = source.reset();
-        let packed = match source.hard_call_packed() {
-            Some(packed) => packed,
-            None => return false,
-        };
-
-        let n_samples = self.n_samples;
-        let ncols = rhs.ncols();
-        let freqs = self.scaler.allele_frequencies();
-        let scales = self.scaler.variant_scales();
-        let max_variants = self.observed_variants.min(packed.n_variants);
-        let max_variants = max_variants.min(freqs.len()).min(scales.len());
-        let code_table = hard_call_code_table();
-
-        for variant_idx in 0..max_variants {
-            let mean = 2.0 * freqs[variant_idx];
-            let denom = scales[variant_idx].max(HWE_SCALE_FLOOR);
-            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
-            if inv == 0.0 {
-                continue;
-            }
-
-            let z0 = (0.0 - mean) * inv;
-            let z1 = (1.0 - mean) * inv;
-            let z2 = (2.0 - mean) * inv;
-
-            let weight_sq = if let Some(weights) = &self.ld_weights {
-                let w = weights.get(variant_idx).copied().unwrap_or(1.0);
-                w * w
-            } else {
-                1.0
-            };
-            let coeff = self.scale * weight_sq;
-
-            let variant_bytes = match packed.slice(variant_idx, 1) {
-                Some(slice) => slice,
-                None => break,
-            };
-
-            let mut proj = [0.0f64; POPCOUNT_MAX_COLS];
-            for col in 0..ncols {
-                let mut sum0 = 0.0f64;
-                let mut sum1 = 0.0f64;
-                let mut sum2 = 0.0f64;
-
-                let mut sample_idx = 0usize;
-                for &byte in variant_bytes {
-                    if sample_idx >= n_samples {
-                        break;
-                    }
-                    let codes = &code_table[byte as usize];
-                    for offset in 0..4 {
-                        let idx = sample_idx + offset;
-                        if idx >= n_samples {
-                            break;
-                        }
-                        let val = rhs[(idx, col)];
-                        match codes[offset] {
-                            0 => sum0 += val,
-                            2 => sum1 += val,
-                            3 => sum2 += val,
-                            _ => {}
-                        }
-                    }
-                    sample_idx += 4;
-                }
-
-                let p = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
-                proj[col] = p;
-            }
-
-            let mut sample_idx = 0usize;
-            for &byte in variant_bytes {
-                if sample_idx >= n_samples {
-                    break;
-                }
-                let codes = &code_table[byte as usize];
-                for offset in 0..4 {
-                    let idx = sample_idx + offset;
-                    if idx >= n_samples {
-                        break;
-                    }
-                    let z = match codes[offset] {
-                        0 => z0,
-                        2 => z1,
-                        3 => z2,
-                        _ => 0.0,
-                    };
-                    if z != 0.0 {
-                        for col in 0..ncols {
-                            out[(idx, col)] += z * proj[col];
-                        }
-                    }
-                }
-                sample_idx += 4;
-            }
-        }
-
-        true
-    }
 
     fn conj_apply(
         &self,
@@ -3120,6 +3014,120 @@ fn mirror_lower_to_upper(matrix: &mut Mat<f64>) {
             let value = matrix[(col, row)];
             matrix[(row, col)] = value;
         }
+    }
+}
+
+impl<'a, S, P> StandardizedCovarianceOp<'a, S, P>
+where
+    S: VariantBlockSource + Send,
+    S::Error: Error + Send + Sync + 'static,
+    P: FitProgressObserver + Send + Sync + 'static,
+{
+    fn try_apply_hardcall_packed(&self, mut out: MatMut<'_, f64>, rhs: MatRef<'_, f64>) -> bool {
+        let mut guard = self
+            .source
+            .lock()
+            .expect("covariance source mutex poisoned");
+        let source: &mut S = &mut guard;
+        let _ = source.reset();
+        let packed = match source.hard_call_packed() {
+            Some(packed) => packed,
+            None => return false,
+        };
+
+        let n_samples = self.n_samples;
+        let ncols = rhs.ncols();
+        let freqs = self.scaler.allele_frequencies();
+        let scales = self.scaler.variant_scales();
+        let max_variants = self.observed_variants.min(packed.n_variants);
+        let max_variants = max_variants.min(freqs.len()).min(scales.len());
+        let code_table = hard_call_code_table();
+
+        for variant_idx in 0..max_variants {
+            let mean = 2.0 * freqs[variant_idx];
+            let denom = scales[variant_idx].max(HWE_SCALE_FLOOR);
+            let inv = if denom > 0.0 { denom.recip() } else { 0.0 };
+            if inv == 0.0 {
+                continue;
+            }
+
+            let z0 = (0.0 - mean) * inv;
+            let z1 = (1.0 - mean) * inv;
+            let z2 = (2.0 - mean) * inv;
+
+            let weight_sq = if let Some(weights) = &self.ld_weights {
+                let w = weights.get(variant_idx).copied().unwrap_or(1.0);
+                w * w
+            } else {
+                1.0
+            };
+            let coeff = self.scale * weight_sq;
+
+            let variant_bytes = match packed.slice(variant_idx, 1) {
+                Some(slice) => slice,
+                None => break,
+            };
+
+            let mut proj = [0.0f64; POPCOUNT_MAX_COLS];
+            for col in 0..ncols {
+                let mut sum0 = 0.0f64;
+                let mut sum1 = 0.0f64;
+                let mut sum2 = 0.0f64;
+
+                let mut sample_idx = 0usize;
+                for &byte in variant_bytes {
+                    if sample_idx >= n_samples {
+                        break;
+                    }
+                    let codes = &code_table[byte as usize];
+                    for offset in 0..4 {
+                        let idx = sample_idx + offset;
+                        if idx >= n_samples {
+                            break;
+                        }
+                        let val = rhs[(idx, col)];
+                        match codes[offset] {
+                            0 => sum0 += val,
+                            2 => sum1 += val,
+                            3 => sum2 += val,
+                            _ => {}
+                        }
+                    }
+                    sample_idx += 4;
+                }
+
+                let p = (z0 * sum0 + z1 * sum1 + z2 * sum2) * coeff;
+                proj[col] = p;
+            }
+
+            let mut sample_idx = 0usize;
+            for &byte in variant_bytes {
+                if sample_idx >= n_samples {
+                    break;
+                }
+                let codes = &code_table[byte as usize];
+                for offset in 0..4 {
+                    let idx = sample_idx + offset;
+                    if idx >= n_samples {
+                        break;
+                    }
+                    let z = match codes[offset] {
+                        0 => z0,
+                        2 => z1,
+                        3 => z2,
+                        _ => 0.0,
+                    };
+                    if z != 0.0 {
+                        for col in 0..ncols {
+                            out[(idx, col)] += z * proj[col];
+                        }
+                    }
+                }
+                sample_idx += 4;
+            }
+        }
+
+        true
     }
 }
 

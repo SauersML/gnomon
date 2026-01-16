@@ -164,7 +164,7 @@ fn run_fit(
             .map_err(|err| map_variant_list_error(list_path, err))?;
 
         match &dataset {
-            GenotypeDataset::Plink(_) => {
+            GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_) => {
                 let selection = dataset.select_variants(&filter)?;
                 if selection.indices.is_empty() {
                     return Err(MapDriverError::InvalidState(format!(
@@ -353,7 +353,7 @@ fn run_project(genotype_path: &Path, model_name: Option<&str>) -> Result<(), Map
 
     if let Some(keys) = model.variant_keys() {
         match &dataset {
-            GenotypeDataset::Plink(_) => {
+            GenotypeDataset::Plink(_) | GenotypeDataset::Pgen(_) => {
                 let selection = dataset.select_variants_by_keys(keys)?;
                 if !selection.missing.is_empty() {
                     return Err(MapDriverError::InvalidState(
