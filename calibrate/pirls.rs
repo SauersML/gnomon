@@ -687,17 +687,20 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                         csr,
                         weights.view(),
                         &mut self.workspace,
+                        Some(&self.s_transformed),
                     )?
                 }
                 (Some(DesignMatrix::Dense(x_dense)), _) => compute_firth_hat_and_half_logdet(
                     x_dense.view(),
                     weights.view(),
                     &mut self.workspace,
+                    Some(&self.s_transformed),
                 )?,
                 _ => compute_firth_hat_and_half_logdet(
                     self.x_original_dense,
                     weights.view(),
                     &mut self.workspace,
+                    Some(&self.s_transformed),
                 )?,
             };
             self.firth_log_det = Some(half_log_det);
@@ -883,6 +886,7 @@ fn compute_firth_hat_and_half_logdet_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
+    s_transformed: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // This routine computes the Firth hat diagonal and 0.5*log|X^T W X|
     // for a *specific* design matrix. It must be called with the same
@@ -894,6 +898,13 @@ fn compute_firth_hat_and_half_logdet_sparse(
     let xtwx_transformed = workspace.compute_hessian_sparse_faer(x_design_csr, &weights.to_owned())?;
     
     let mut stabilized = xtwx_transformed.clone();
+    if let Some(s) = s_transformed {
+        for i in 0..p {
+            for j in 0..p {
+                stabilized[[i, j]] += s[[i, j]];
+            }
+        }
+    }
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
@@ -901,13 +912,13 @@ fn compute_firth_hat_and_half_logdet_sparse(
             stabilized[[j, i]] = v;
         }
     }
-    // Firth correction uses the unpenalized Fisher information X' W X.
+    // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
     // We can reuse the computed Hessian for the Fisher information log-det term
     // instead of recomputing manual interaction loops.
-    // They are mathematically identical (X'WX).
-    let mut fisher = xtwx_transformed;
+    // Use the penalized matrix when provided.
+    let mut fisher = stabilized.clone();
     
     // Symmetrize fisher (redundant if matmul is precise/symmetric but good practice)
     for i in 0..p {
@@ -4187,6 +4198,7 @@ fn compute_firth_hat_and_half_logdet(
     x_design: ArrayView2<f64>,
     weights: ArrayView1<f64>,
     workspace: &mut PirlsWorkspace,
+    s_transformed: Option<&Array2<f64>>,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // Dense version of the Firth hat / log-det computation.
     // This is exact for the given design matrix and must match the
@@ -4206,6 +4218,13 @@ fn compute_firth_hat_and_half_logdet(
 
     let xtwx_transformed = workspace.wx.t().dot(&workspace.wx);
     let mut stabilized = xtwx_transformed.clone();
+    if let Some(s) = s_transformed {
+        for i in 0..p {
+            for j in 0..p {
+                stabilized[[i, j]] += s[[i, j]];
+            }
+        }
+    }
     for i in 0..p {
         for j in 0..i {
             let v = 0.5 * (stabilized[[i, j]] + stabilized[[j, i]]);
@@ -4213,25 +4232,11 @@ fn compute_firth_hat_and_half_logdet(
             stabilized[[j, i]] = v;
         }
     }
-    // Firth correction uses the unpenalized Fisher information X' W X.
-    // Using the penalized Hessian here would make the Firth score inconsistent
-    // with the log|X' W X| term in the objective and its derivatives.
+    // Firth correction for GAMs uses the penalized Fisher information (X' W X + S)
+    // to match the outer LAML objective and its derivatives.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    let mut fisher = Array2::<f64>::zeros((p, p));
-    for i in 0..n {
-        let wi = weights[i].max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let xi = x_design.row(i);
-        for j in 0..p {
-            let xij = xi[j];
-            for k in 0..p {
-                fisher[[j, k]] += wi * xij * xi[k];
-            }
-        }
-    }
+    let mut fisher = stabilized.clone();
     ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
     let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {

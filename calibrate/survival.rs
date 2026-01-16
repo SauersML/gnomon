@@ -1312,7 +1312,18 @@ impl WorkingModelSurvival {
                 continue;
             }
 
+            let entry_design = self.layout.combined_entry.row(i);
+            let eta_entry = entry_design.dot(beta);
+            if !eta_entry.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+            let hazard_entry = eta_entry.exp();
+            if !hazard_entry.is_finite() {
+                return Err(SurvivalError::NonFiniteLinearPredictor);
+            }
+
             let mut design = Array1::<f64>::zeros(p);
+            let mut derivative_design = Array1::<f64>::zeros(p);
             
             // Pre-compute PGS basis for this subject if time-varying effects are present
             let pgs_basis_reduced: Option<Vec<f64>> = if time_cols > 0 {
@@ -1360,12 +1371,21 @@ impl WorkingModelSurvival {
                 
                 // Assign baseline columns from quadrature design
                 design.assign(&self.monotonicity.quadrature_design.row(j));
+                derivative_design.assign(&self.monotonicity.derivative_design.row(j));
                 
                 // Compute time-varying columns: tensor product of baseline_basis(grid_age) ⊗ pgs_basis
                 if time_cols > 0 {
                     if let Some(ref pgs_reduced) = pgs_basis_reduced {
                         // baseline basis at this grid point is in quadrature_design columns 0..baseline_cols
                         let baseline_at_grid: Vec<f64> = self.monotonicity.quadrature_design
+                            .row(j)
+                            .slice(s![..baseline_cols])
+                            .iter()
+                            .copied()
+                            .collect();
+                        let baseline_derivative_at_grid: Vec<f64> = self
+                            .monotonicity
+                            .derivative_design
                             .row(j)
                             .slice(s![..baseline_cols])
                             .iter()
@@ -1380,6 +1400,13 @@ impl WorkingModelSurvival {
                             for &base_val in &baseline_at_grid {
                                 for &pgs_val in pgs_reduced {
                                     design[idx] = base_val * pgs_val;
+                                    idx += 1;
+                                }
+                            }
+                            let mut idx = baseline_cols;
+                            for &base_val in &baseline_derivative_at_grid {
+                                for &pgs_val in pgs_reduced {
+                                    derivative_design[idx] = base_val * pgs_val;
                                     idx += 1;
                                 }
                             }
@@ -1405,7 +1432,17 @@ impl WorkingModelSurvival {
                 if !hazard.is_finite() {
                     return Err(SurvivalError::NonFiniteLinearPredictor);
                 }
-                let scale = weight * (right - left) * hazard;
+                let derivative_eta = derivative_design.dot(beta);
+                if !derivative_eta.is_finite() {
+                    return Err(SurvivalError::NonFiniteLinearPredictor);
+                }
+                if derivative_eta <= guard_threshold {
+                    continue;
+                }
+                let hazard_rate = hazard * derivative_eta;
+                let hazard_delta = (hazard - hazard_entry).max(0.0);
+                let survival_prob = (-hazard_delta).exp();
+                let scale = weight * (right - left) * hazard_rate * survival_prob;
                 accumulate_symmetric_outer(&mut expected, scale, &design);
             }
 
