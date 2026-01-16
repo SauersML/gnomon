@@ -1446,8 +1446,23 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
   -- The proof idea from PR #834 uses sum manipulation with ParamIx.equivSum and ac_rfl,
   -- but requires more careful adjustment to compile cleanly.
-  -- For now, we mark this as a known correct result pending tactic adjustment.
-  sorry -- Sum manipulation with ParamIx (basis reconstruction proof)
+  -- Step 1: Substitute model bases using hm
+  have h_pgs := hm.basis_match
+  have h_spline := hm.spline_match
+
+  -- Step 2: Unfold and compute
+  -- The proof requires showing that the sum over the structured index `ParamIx`
+  -- when applied to packParams and designMatrix reconstructs the linearPredictor.
+  -- The key insight is that both definitions are organized around the same
+  -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
+  unfold linearPredictor designMatrix Matrix.mulVec packParams
+  rw [h_pgs, h_spline]
+  -- Use the equivalence between ParamIx and the sum type to split the sum
+  rw [Fintype.sum_equiv (ParamIx.equivSum p k sp).symm]
+  -- Unfold the sum type and simplify
+  simp [ParamIx.equivSum, ParamIxSum, evalSmooth, Finset.sum_sum_type, Finset.sum_prod_type, Finset.sum_mul, Finset.mul_sum]
+  -- The rest should be algebraic rearrangement
+  ac_rfl
 
 /-- Full column rank implies `X.mulVec` is injective.
 
