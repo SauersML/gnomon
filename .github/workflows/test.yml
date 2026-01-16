@@ -39,11 +39,11 @@ jobs:
   detect_changes:
     runs-on: ubuntu-latest
     outputs:
-      rust: ${{ needs.detect_changes.outputs.rust }}
-      core: ${{ needs.detect_changes.outputs.core }}
-      score: ${{ needs.detect_changes.outputs.score }}
-      map: ${{ needs.detect_changes.outputs.map }}
-      calibrate: ${{ needs.detect_changes.outputs.calibrate }}
+      rust: ${{ steps.rust_changes.outputs.rust }}
+      core: ${{ steps.rust_changes.outputs.core }}
+      score: ${{ steps.rust_changes.outputs.score }}
+      map: ${{ steps.rust_changes.outputs.map }}
+      calibrate: ${{ steps.rust_changes.outputs.calibrate }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
