@@ -152,6 +152,15 @@ jobs:
         run: |
           cargo +nightly nextest run --profile ci --release --no-run
 
+      - name: Upload debug test build artifacts for full test runs
+        if: needs.detect_changes.outputs.rust == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-test-build-debug
+          path: target/debug
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Inspect Assembly for Performance Analysis
         if: needs.detect_changes.outputs.rust == 'false'
         run: |
@@ -357,6 +366,33 @@ jobs:
             exit 78
           fi
           exit $status
+
+  rust_tests_full_debug:
+    needs: build_and_test
+    runs-on: ubuntu-latest
+    if: needs.build_and_test.outputs.rust_changes == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Download debug test build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-test-build-debug
+          path: target/debug
+
+      - name: Install cargo-nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run full nextest (debug, no timeout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +nightly nextest run --profile ci --no-build
 
   python_test_integration:
     needs: build_and_test
