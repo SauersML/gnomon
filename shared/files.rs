@@ -935,9 +935,21 @@ fn open_remote_variant_source(path: &Path) -> Result<VariantSource, PipelineErro
     let (bucket, objects) = resolve_remote_variant_objects(path)?;
     let mut readers = Vec::with_capacity(objects.len());
     for object in objects {
-        let source = create_remote_byte_source(&bucket, &object)?;
         let path_display = format!("gs://{bucket}/{object}");
-        readers.push(prepare_streaming_variant_reader(path_display, source)?);
+        let (runtime, storage, len, user_project) =
+            create_remote_streaming_context(&bucket, &object)?;
+        let reader = GcsStreamingReader::new(
+            Arc::clone(&runtime),
+            storage,
+            format!("projects/_/buckets/{bucket}"),
+            object.clone(),
+            user_project,
+        );
+        readers.push(prepare_sequential_variant_reader(
+            path_display,
+            Box::new(reader),
+            len,
+        )?);
     }
     VariantSource::from_readers(readers)
 }
@@ -946,10 +958,110 @@ fn open_http_variant_source(path: &Path) -> Result<VariantSource, PipelineError>
     let url = path
         .to_str()
         .ok_or_else(|| PipelineError::Io("Invalid UTF-8 in path".to_string()))?;
-    let remote = HttpByteRangeSource::new(url)?;
-    let source: Arc<dyn ByteRangeSource> = Arc::new(remote);
-    let reader = prepare_streaming_variant_reader(url.to_string(), source)?;
+    let client = Client::builder()
+        .user_agent(HTTP_USER_AGENT)
+        .build()
+        .map_err(|e| PipelineError::Io(format!("Failed to build HTTP client: {e}")))?;
+    let len = fetch_http_length(&client, url)?;
+    let reader = HttpStreamingReader::new(client, url.to_string());
+    let reader = prepare_sequential_variant_reader(url.to_string(), Box::new(reader), len)?;
     VariantSource::from_readers(vec![reader])
+}
+
+fn create_remote_streaming_context(
+    bucket: &str,
+    object: &str,
+) -> Result<(Arc<Runtime>, Storage, u64, Option<String>), PipelineError> {
+    let runtime = get_shared_runtime()?;
+    let (mut storage, control) = RemoteByteRangeSource::create_clients(&runtime, None)?;
+    let bucket_path = format!("projects/_/buckets/{bucket}");
+    let user_project = gcs_billing_project_from_env();
+    let metadata = match RemoteByteRangeSource::fetch_object_metadata(
+        &runtime,
+        &control,
+        &bucket_path,
+        object,
+    ) {
+        Ok(metadata) => metadata,
+        Err(err) if RemoteByteRangeSource::is_authentication_error(&err) => {
+            let err_msg = err.to_string();
+            debug!(
+                "Retrying metadata fetch for gs://{bucket}/{object} with anonymous credentials after authentication failure: {err_msg}"
+            );
+            let (fallback_storage, fallback_control) = RemoteByteRangeSource::create_clients(
+                &runtime,
+                Some(AnonymousCredentials::new().build()),
+            )
+            .map_err(|client_err| {
+                PipelineError::Io(format!(
+                    "Failed to initialize Cloud Storage clients with anonymous credentials after authentication failure: {client_err} (initial error: {err_msg})"
+                ))
+            })?;
+            storage = fallback_storage;
+            RemoteByteRangeSource::fetch_object_metadata(
+                &runtime,
+                &fallback_control,
+                &bucket_path,
+                object,
+            )
+            .map_err(|retry_err| {
+                PipelineError::Io(format!(
+                    "Failed to fetch metadata for gs://{bucket}/{object} with anonymous credentials: {retry_err} (initial error: {err_msg})"
+                ))
+            })?
+        }
+        Err(err) => {
+            return Err(PipelineError::Io(format!(
+                "Failed to fetch metadata for gs://{bucket}/{object}: {err}"
+            )));
+        }
+    };
+    if metadata.size < 0 {
+        return Err(PipelineError::Io(format!(
+            "Remote object gs://{bucket}/{object} reported negative size"
+        )));
+    }
+    Ok((runtime, storage, metadata.size as u64, user_project))
+}
+
+fn fetch_http_length(client: &Client, url: &str) -> Result<u64, PipelineError> {
+    match client.head(url).send() {
+        Ok(response) if response.status().is_success() => {
+            if let Some(len) =
+                HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH))
+            {
+                return Ok(len);
+            }
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .map_err(|e| {
+            PipelineError::Io(format!("Failed to request HTTP range for {url}: {e:?}"))
+        })?;
+
+    if response.status() == StatusCode::PARTIAL_CONTENT
+        && let Some(total) =
+            HttpByteRangeSource::parse_content_range(response.headers().get(CONTENT_RANGE)) {
+            let _ = response.bytes();
+            return Ok(total);
+        }
+
+    if response.status().is_success()
+        && let Some(len) =
+            HttpByteRangeSource::parse_content_length(response.headers().get(CONTENT_LENGTH)) {
+            let _ = response.bytes();
+            return Ok(len);
+        }
+
+    let status = response.status();
+    Err(PipelineError::Io(format!(
+        "Failed to determine content length for {url}: HTTP {status}"
+    )))
 }
 
 struct MmapByteRangeSource {
@@ -1139,6 +1251,137 @@ impl TextSource for StreamingTextSource {
                 self.cursor = self.valid;
             }
         }
+    }
+}
+
+struct GcsStreamingReader {
+    runtime: Arc<Runtime>,
+    storage: Storage,
+    bucket_path: String,
+    object: String,
+    user_project: Option<String>,
+    response: Option<google_cloud_storage::read_object::ReadObjectResponse>,
+    buffer: Vec<u8>,
+    cursor: usize,
+    done: bool,
+}
+
+impl GcsStreamingReader {
+    fn new(
+        runtime: Arc<Runtime>,
+        storage: Storage,
+        bucket_path: String,
+        object: String,
+        user_project: Option<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            storage,
+            bucket_path,
+            object,
+            user_project,
+            response: None,
+            buffer: Vec::new(),
+            cursor: 0,
+            done: false,
+        }
+    }
+
+    fn start_response(&mut self) -> io::Result<()> {
+        if self.response.is_some() {
+            return Ok(());
+        }
+        let bucket_path = self.bucket_path.clone();
+        let object = self.object.clone();
+        let storage = self.storage.clone();
+        let user_project = self.user_project.clone();
+        let response = self.runtime.block_on(async move {
+            storage
+                .read_object(bucket_path.clone(), object.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if user_project.is_none() && msg.to_lowercase().contains("requester pays") {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Requester Pays bucket requires a billing project. Set GOOGLE_PROJECT (or run `gcloud config set project ...`) and re-run. Original error: {msg}"
+                            ),
+                        )
+                    } else {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Failed to start read for gs://{}/{}: {msg}",
+                                bucket_path, object
+                            ),
+                        )
+                    }
+                })
+        })?;
+        self.response = Some(response);
+        Ok(())
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        self.start_response()?;
+        let response = self.response.as_mut().unwrap();
+        loop {
+            let chunk = self
+                .runtime
+                .block_on(async { response.next().await })
+                .transpose()
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "Error streaming data from gs://{}/{}: {e}",
+                            self.bucket_path, self.object
+                        ),
+                    )
+                })?;
+            match chunk {
+                Some(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    self.buffer = bytes.to_vec();
+                    self.cursor = 0;
+                    return Ok(true);
+                }
+                None => {
+                    self.done = true;
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+impl Read for GcsStreamingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        while total < buf.len() {
+            if self.cursor >= self.buffer.len() {
+                if !self.fill_buffer()? {
+                    break;
+                }
+            }
+            let available = self.buffer.len() - self.cursor;
+            let to_copy = available.min(buf.len() - total);
+            buf[total..total + to_copy]
+                .copy_from_slice(&self.buffer[self.cursor..self.cursor + to_copy]);
+            self.cursor += to_copy;
+            total += to_copy;
+        }
+        Ok(total)
     }
 }
 
@@ -1414,6 +1657,70 @@ struct HttpByteRangeSource {
     url: String,
     len: u64,
     cache: Mutex<RemoteCache>,
+}
+
+struct HttpStreamingReader {
+    client: Client,
+    url: String,
+    response: Option<reqwest::blocking::Response>,
+    done: bool,
+}
+
+impl HttpStreamingReader {
+    fn new(client: Client, url: String) -> Self {
+        Self {
+            client,
+            url,
+            response: None,
+            done: false,
+        }
+    }
+
+    fn start_response(&mut self) -> io::Result<()> {
+        if self.response.is_some() {
+            return Ok(());
+        }
+        let response = self
+            .client
+            .get(&self.url)
+            .send()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to start HTTP read for {}: {e}", self.url),
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "HTTP read for {} returned unexpected status {}",
+                    self.url,
+                    response.status()
+                ),
+            ));
+        }
+        self.response = Some(response);
+        Ok(())
+    }
+}
+
+impl Read for HttpStreamingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.done {
+            return Ok(0);
+        }
+        self.start_response()?;
+        let response = self.response.as_mut().unwrap();
+        let read = response.read(buf)?;
+        if read == 0 {
+            self.done = true;
+        }
+        Ok(read)
+    }
 }
 
 impl HttpByteRangeSource {
@@ -1715,6 +2022,79 @@ impl Read for StreamingReader {
 
         Ok(total)
     }
+}
+
+struct PrefixReader<R: Read + Send> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: R,
+}
+
+impl<R: Read + Send> PrefixReader<R> {
+    fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<R: Read + Send> Read for PrefixReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.offset < self.prefix.len() {
+            let available = self.prefix.len() - self.offset;
+            let to_copy = available.min(buf.len());
+            buf[..to_copy].copy_from_slice(&self.prefix[self.offset..self.offset + to_copy]);
+            self.offset += to_copy;
+            return Ok(to_copy);
+        }
+        self.inner.read(buf)
+    }
+}
+
+fn prepare_sequential_variant_reader(
+    path_display: String,
+    reader: Box<dyn Read + Send>,
+    len: u64,
+) -> Result<PreparedVariantReader, PipelineError> {
+    let (reader, compression) = detect_compression_from_prefix(reader)
+        .map_err(|e| PipelineError::Io(format!("Error reading {path_display}: {e}")))?;
+    let format = infer_variant_format_from_path(&path_display);
+    Ok(PreparedVariantReader {
+        reader,
+        len,
+        skip_header: false,
+        compression,
+        format,
+    })
+}
+
+fn detect_compression_from_prefix(
+    mut reader: Box<dyn Read + Send>,
+) -> io::Result<(Box<dyn Read + Send>, VariantCompression)> {
+    let mut prefix = [0u8; 2];
+    let mut read = 0usize;
+    while read < 2 {
+        let n = reader.read(&mut prefix[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    let is_gzip = read == 2 && prefix[0] == 0x1F && prefix[1] == 0x8B;
+    let mut stored = Vec::with_capacity(read);
+    stored.extend_from_slice(&prefix[..read]);
+    let wrapped: Box<dyn Read + Send> = Box::new(PrefixReader::new(stored, reader));
+    let compression = if is_gzip {
+        VariantCompression::Bgzf
+    } else {
+        VariantCompression::Plain
+    };
+    Ok((wrapped, compression))
 }
 
 fn prepare_streaming_variant_reader(

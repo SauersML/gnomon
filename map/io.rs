@@ -1667,7 +1667,8 @@ impl fmt::Debug for SpoolEntry {
 }
 
 const PREFETCH_RING_CAPACITY: usize = 16 * 1024 * 1024;
-const PREFETCH_CHUNK_SIZE: usize = 256 * 1024;
+const PREFETCH_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const REMOTE_PREFETCH_PARTS: usize = 2;
 
 struct PrefetchState {
     inner: Mutex<PrefetchInner>,
@@ -1976,6 +1977,35 @@ impl VcfLikeVariantBlockSource {
         SpoolEntry::spawn(idx, &path, &root)
     }
 
+    fn prefetch_remote_parts(&mut self, current_idx: usize) {
+        if REMOTE_PREFETCH_PARTS == 0 || self.parts.is_empty() {
+            return;
+        }
+        let start = current_idx.saturating_add(1);
+        if start >= self.parts.len() {
+            return;
+        }
+        let mut end = current_idx.saturating_add(REMOTE_PREFETCH_PARTS);
+        if end >= self.parts.len() {
+            end = self.parts.len() - 1;
+        }
+        for idx in start..=end {
+            if self.spool_entries.len() <= idx {
+                self.spool_entries.resize(idx + 1, None);
+            }
+            if self.spool_entries[idx].is_some() {
+                continue;
+            }
+            let path = self.parts[idx].clone();
+            if !(is_remote_path(&path) || is_http_path(&path)) {
+                continue;
+            }
+            if let Ok(entry) = self.spool_part(idx) {
+                self.spool_entries[idx] = Some(entry);
+            }
+        }
+    }
+
     fn reader_for_part(
         &mut self,
         idx: usize,
@@ -1989,49 +2019,41 @@ impl VcfLikeVariantBlockSource {
         VariantIoError,
     > {
         let path = self.parts[idx].clone();
-        if is_http_path(&path) {
-            return create_variant_reader_for_file(&path);
-        }
-
-        if is_remote_path(&path) {
-            if let Ok(result) = create_variant_reader_for_file(&path) {
-                return Ok(result);
-            }
-
-            if self.spool_entries.len() <= idx {
-                self.spool_entries.resize(idx + 1, None);
-            }
-
-            if let Some(entry) = self.spool_entries[idx].as_ref() {
-                if entry.is_complete() {
-                    return entry.open_local_reader();
-                }
-
-                match entry.attach_reader() {
-                    Ok(result) => return Ok(result),
-                    Err(err) => {
-                        if entry.is_complete() {
-                            return entry.open_local_reader();
-                        }
-                        if let Some(source_err) = entry.error() {
-                            return Err(VariantIoError::Io(source_err));
-                        }
-                        return Err(VariantIoError::Io(err));
-                    }
-                }
-            }
-
-            let entry = self.spool_part(idx)?;
-            let result = entry.attach_reader().map_err(VariantIoError::Io)?;
-            self.spool_entries[idx] = Some(entry);
-            return Ok(result);
-        }
+        let is_remote = is_remote_path(&path) || is_http_path(&path);
 
         if self.spool_entries.len() <= idx {
             self.spool_entries.resize(idx + 1, None);
         }
 
-        create_variant_reader_for_file(&path)
+        let result = if is_remote {
+            if let Some(entry) = self.spool_entries[idx].as_ref() {
+                if entry.is_complete() {
+                    entry.open_local_reader()
+                } else if let Ok(result) = entry.attach_reader() {
+                    Ok(result)
+                } else {
+                    create_variant_reader_for_file(&path)
+                }
+            } else {
+                match create_variant_reader_for_file(&path) {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        if let Ok(entry) = self.spool_part(idx) {
+                            let result = entry.attach_reader().map_err(VariantIoError::Io)?;
+                            self.spool_entries[idx] = Some(entry);
+                            Ok(result)
+                        } else {
+                            Err(err)
+                        }
+                    }
+                }
+            }
+        } else {
+            create_variant_reader_for_file(&path)
+        };
+
+        self.prefetch_remote_parts(idx);
+        result
     }
 
     fn new(
