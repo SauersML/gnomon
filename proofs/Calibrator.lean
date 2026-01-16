@@ -1457,7 +1457,7 @@ lemma linearPredictor_eq_designMatrix_mulVec {n p k sp : ℕ}
   -- when applied to packParams and designMatrix reconstructs the linearPredictor.
   -- The key insight is that both definitions are organized around the same
   -- 4-part structure of parameters (intercept, PGS coefficients, PC splines, interactions).
-  unfold linearPredictor designMatrix Matrix.mulVec Matrix.dotProduct packParams
+  unfold linearPredictor designMatrix Matrix.mulVec dotProduct packParams
   rw [h_pgs, h_spline]
   -- Use the equivalence between ParamIx and the sum type to split the sum
   rw [Fintype.sum_equiv (ParamIx.equivSum p k sp).symm]
