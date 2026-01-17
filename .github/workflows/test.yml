@@ -178,13 +178,13 @@ jobs:
           echo "---"
           # `score::batch` now lives under the `score` module, so keep the inspected symbol
           # aligned with the library's public path to avoid false CI failures.
-          cargo +nightly asm -C lto=off --profile profiling --features no-inline-profiling --lib --intel gnomon::score::batch::process_tile 0
+          cargo +nightly asm -C lto=off --profile profiling --lib --intel gnomon::score::batch::process_tile 0
 
       - name: Build Gnomon binaries (Release and Profiling)
         if: needs.detect_changes.outputs.rust == 'true'
         run: |
           cargo +nightly build --release
-          cargo +nightly build --profile profiling --features no-inline-profiling
+          cargo +nightly build --profile profiling
       # ----------------------------------------------------------------------------------------
 
       # -------------------- EXPORT: GATHER ONLY ESSENTIAL METADATA --------------------
@@ -619,7 +619,7 @@ jobs:
 
           if [ -z "$BIN_PATH" ]; then
             echo "Profiling binary missing from artifact; rebuilding with cargo."
-            cargo +nightly build --profile profiling --features no-inline-profiling
+            cargo +nightly build --profile profiling
             BIN_PATH=$(find_profiling_binary)
           fi
 
