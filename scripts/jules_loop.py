@@ -272,7 +272,7 @@ def main():
         prompt = (
             "The Lean Proof build passed successfully. "
             "Please find one thing to do or strengthen in the Lean proof files "
-            "(specifically files in proofs/). You must successfully compile the code yourself. If the build times out or fails, do not submit it and keep working. You are not allowed to use 'native_decide' or similar."
+            "(specifically files in proofs/). Do not create new files. Do not edit any file besides 'proofs/Calibrator.lean'. You must successfully compile the code yourself. If the build times out or fails, do not submit it and keep working. You are not allowed to use 'native_decide' or similar."
             "If the build executes and terminates the shell, count that as a failure. Always tail build logs. You can optimize code, strengthen proofs, replace 'sorry' or 'axiom' with actual proofs. Feel free to try big or multiple tasks."
             "IMPORTANT: Ensure your changes compile and that all proofs are valid. Axioms are just as bad as sorrys and all axioms must be replaced with real proofs. Do not assume more than is necessary. Do not attempt low-importance small changes like style improvements, comments, etc."
             "Do not break existing functionality."
