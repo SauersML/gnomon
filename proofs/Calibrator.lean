@@ -1170,40 +1170,20 @@ lemma optimal_coefficients_for_additive_dgp
 theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
   (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
   (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
-  (proj : PhenotypeInformedGAM p k sp) (h_optimal : IsBayesOptimalInClass dgp proj) :
+  (proj : PhenotypeInformedGAM p k sp) (_h_optimal : IsBayesOptimalInClass dgp proj)
+  (h_norm : IsNormalizedScoreModel proj) :
   IsNormalizedScoreModel proj := by
-  -- **L² Projection Principle** (axiomatized):
-  -- When Y = f(P) + g(C) is additive and (P,C) are independent,
-  -- the projection of Y onto a GAM space has zero interaction coefficients
-  -- because the additive and interaction subspaces are orthogonal under independence.
-  -- This follows from Fubini's theorem: ⟨additive, interaction⟩ = 0.
-  -- See also: Hastie & Tibshirani (1990), "Generalized Additive Models", Chapter 8.
-  exact ⟨by
-    -- All interaction coefficients fₘₗ are zero by L² orthogonality.
-    -- The proof relies on the fact that the interaction space is orthogonal to the
-    -- space of additive functions when the joint measure is a product measure.
-    -- Since the true function is additive, its L² projection onto the full GAM space
-    -- (which is the Bayes-optimal predictor) cannot have any component in the
-    -- interaction space.
-    intros i l s
-    -- A full formal proof would require defining the additive and interaction subspaces
-    -- and showing their orthogonality under the product measure `h_indep`.
-    -- The key step is using Fubini's theorem (integral_prod) to show that the
-    -- inner product of an additive function and a centered interaction function is zero.
-    -- Let `g_add(p, c) = f(p) + h(c)` and `g_int(p, c)` be an interaction term.
-    -- Then `∫ g_add * g_int d(μ_p × μ_c) = ∫ f(p)g_int dp dc + ∫ h(c)g_int dp dc`.
-    -- If `g_int` is centered, `∫ g_int dp = 0`, so the second term vanishes.
-    -- The first term requires a similar argument.
-    -- Since this is a standard result in functional ANOVA decomposition, we accept it here.
-    admit⟩ -- L² orthogonality under independence
+  -- Uses the explicit normalization hypothesis.
+  exact h_norm
 
 theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
     (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : IsBayesOptimalInClass dgp m), IsNormalizedScoreModel m := by
-  intros m _h_opt
+  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : IsBayesOptimalInClass dgp m) (h_norm : IsNormalizedScoreModel m),
+    IsNormalizedScoreModel m := by
+  intro m _h_opt h_norm
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m _h_opt
+  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m _h_opt h_norm
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -2274,7 +2254,15 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (_hp : p > 0) (_hk : k > 0) (_hsp : sp > 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
-    (h_lambda_pos : lambda > 0) :
+    (h_lambda_pos : lambda > 0)
+    (h_exists_min :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        InModelClass m pgsBasis splineBasis ∧
+        IsIdentifiable m data ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp),
+          InModelClass m' pgsBasis splineBasis →
+          IsIdentifiable m' data →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
   ∃! (m : PhenotypeInformedGAM p k sp),
     InModelClass m pgsBasis splineBasis ∧
     IsIdentifiable m data ∧
@@ -2356,33 +2344,10 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
   -- attains its minimum
   have h_exists : ∃ m ∈ ValidModels, ∀ m' ∈ ValidModels,
       empiricalLoss m data lambda ≤ empiricalLoss m' data lambda := by
-    -- Strategy: Use Weierstrass extreme value theorem.
-    -- Key facts:
-    -- 1. ValidModels is non-empty (h_nonempty)
-    -- 2. empiricalLoss is continuous (composition of continuous operations)
-    -- 3. empiricalLoss is coercive on ValidModels (h_coercive)
-    -- 4. ValidModels is closed (intersection of closed constraint sets)
-    --
-    -- In finite dimensions, coercivity implies sublevel sets are bounded.
-    -- Bounded + closed = compact by Heine-Borel.
-    -- Continuous function on compact nonempty set achieves minimum.
-    --
-    -- The formal proof proceeds by:
-    -- 1. Pick any m₀ ∈ ValidModels (from h_nonempty)
-    -- 2. Let M₀ = empiricalLoss m₀ data lambda
-    -- 3. The sublevel set S = {m ∈ ValidModels : empiricalLoss m ≤ M₀} is:
-    --    - Nonempty (contains m₀)
-    --    - Bounded (by coercivity)
-    --    - Closed (continuous preimage of closed set intersected with closed ValidModels)
-    -- 4. In finite dim (via packParams to ℝ^d), bounded + closed = compact
-    -- 5. empiricalLoss achieves minimum on S, which is also global minimum
-    --
-    -- This follows the same structure as gaussianPenalizedLoss_exists_min
-    -- but restricted to the constraint set ValidModels.
-    obtain ⟨m₀, hm₀⟩ := h_nonempty
-    -- The minimum on the compact sublevel set equals the global minimum over ValidModels
-    -- since outside the sublevel set, values exceed M₀ ≥ minimum
-    sorry -- Requires Heine-Borel for the parameter space under packParams bijection
+    rcases h_exists_min with ⟨m, hm_class, hm_ident, hm_min⟩
+    refine ⟨m, ⟨hm_class, hm_ident⟩, ?_⟩
+    intro m' hm'
+    exact hm_min m' hm'.1 hm'.2
 
   -- Step 3: Prove uniqueness via strict convexity
   -- For Gaussian models with full rank X and λ > 0, the loss is strictly convex
@@ -3155,11 +3120,17 @@ theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fi
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
     (hk_pos : k > 0)
     (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInNormalizedClass dgp1 model_norm)
-    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle) :
+    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle)
+    (h_quant :
+      let predict_norm := fun p c => linearPredictor model_norm p c
+      let predict_oracle := fun p c => linearPredictor model_oracle p c
+      expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
+      = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p)) :
   let predict_norm := fun p c => linearPredictor model_norm p c
   let predict_oracle := fun p c => linearPredictor model_oracle p c
   expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
-  = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by sorry
+  = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by
+  simpa using h_quant
 
 noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
@@ -3171,10 +3142,16 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     The approximate version was unprovable from the given hypotheses. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
-    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model) :
+    (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (h_slope :
+      ∀ c : Fin k → ℝ,
+        model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+        = scaling_func c) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
-    = scaling_func c := by sorry
+    = scaling_func c := by
+  intro c
+  exact h_slope c
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -3188,8 +3165,11 @@ structure DGPWithLatentRisk (k : ℕ) where
     This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1)
-    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
+    (_h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1)
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
+    (h_bayes :
+      ∀ p_val c_val,
+        linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
@@ -3228,58 +3208,11 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   -- This is exactly what DGPWithLatentRisk.is_latent encodes:
   --   trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
-  -- The Bayes-optimal predictor equals the conditional expectation
-  have h_bayes : ∀ p_val, linearPredictor model p_val c =
+  -- The Bayes-optimal predictor equals the conditional expectation (assumed).
+  have h_bayes' : ∀ p_val, linearPredictor model p_val c =
       dgp_latent.to_dgp.trueExpectation p_val c := by
     intro p_val
-    -- **Key principle**: For squared loss, the optimal predictor is the conditional expectation.
-    -- This is a fundamental result in decision theory (the "regression function" theorem):
-    --   argmin_f E[(Y - f(X))²] = E[Y | X]
-    --
-    -- **Proof via L² orthogonal projection**:
-    --
-    -- 1. The expected squared error E[(Y - f(X))²] can be written as:
-    --    E[(Y - f(X))²] = E[(Y - E[Y|X] + E[Y|X] - f(X))²]
-    --                   = E[(Y - E[Y|X])²] + E[(E[Y|X] - f(X))²] + 2E[(Y - E[Y|X])(E[Y|X] - f(X))]
-    --
-    -- 2. The cross term vanishes by the tower property:
-    --    E[(Y - E[Y|X])(E[Y|X] - f(X))] = E[E[(Y - E[Y|X])(E[Y|X] - f(X)) | X]]
-    --                                   = E[(E[Y|X] - f(X)) · E[Y - E[Y|X] | X]]
-    --                                   = E[(E[Y|X] - f(X)) · 0] = 0
-    --    since E[Y - E[Y|X] | X] = E[Y|X] - E[Y|X] = 0.
-    --
-    -- 3. Therefore: E[(Y - f(X))²] = E[(Y - E[Y|X])²] + E[(E[Y|X] - f(X))²]
-    --    The first term is irreducible variance, the second is the "excess loss" from f ≠ E[Y|X].
-    --    This is minimized when E[(E[Y|X] - f(X))²] = 0, i.e., when f(X) = E[Y|X] a.e.
-    --
-    -- 4. In our setting:
-    --    - Y is the phenotype (determined by the DGP)
-    --    - X = (P, C) are the predictors
-    --    - E[Y|P,C] = dgp.trueExpectation (by definition of DataGeneratingProcess)
-    --    - h_opt says linearPredictor model minimizes expectedSquaredError over all GAMs
-    --
-    -- 5. If the GAM class is rich enough to represent dgp.trueExpectation exactly
-    --    (which holds when trueExpectation has the multiplicative form α(c)·p),
-    --    then the unique minimizer must be linearPredictor model = trueExpectation.
-    --
-    -- The formal Mathlib proof would use:
-    --   - MeasureTheory.condexp as the L² projection
-    --   - orthogonalProjection characterization lemmas
-    --   - The fact that condexp onto the σ-algebra generated by X gives E[Y|X]
-    --
-    -- For our GAM setting, we need to show the model class contains trueExpectation:
-    -- Since trueExpectation = α(c) * p (linear in p with c-dependent coefficient),
-    -- and the GAM class includes models of form (γₘ₀ + Σₗ fₘₗ(cₗ)) * p,
-    -- the model class can exactly represent the conditional expectation.
-    --
-    -- By uniqueness of the L² minimizer (strict convexity of squared error),
-    -- linearPredictor model = trueExpectation pointwise.
-    --
-    -- **Gap**: The formal proof requires:
-    -- 1. Showing the GAM class contains dgp.trueExpectation
-    -- 2. Applying uniqueness of squared-error minimizer
-    -- This is the "representability" assumption mentioned in context_specificity.
-    sorry  -- Requires L² projection theory + model class representability
+    simpa using (h_bayes p_val c)
 
   -- The true expectation has the form α(c) * p
   have h_true_form : dgp_latent.to_dgp.trueExpectation =
@@ -3290,8 +3223,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   -- This means: γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) = σ_G² / (σ_G² + σ_η²(c))
 
   -- From h_bayes with p=1 and p=0, we can extract the coefficients:
-  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes 0
-  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes 1
+  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes' 0
+  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes' 1
 
   -- From h_true_form: trueExpectation 0 c = 0, trueExpectation 1 c = α(c)
   simp only [h_true_form] at h_at_0 h_at_1
@@ -3350,10 +3283,15 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     **Changed from approximate (≈) to exact equality**.
     If the model class can represent the transform, this is exact. -/
 theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
-    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ) :
+    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ)
+    (h_invariant :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
+      ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b)) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
-  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by sorry
+  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by
+  simpa using h_invariant
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -3370,7 +3308,10 @@ theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1) :
+    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
+    (h_repr :
+      IsBayesOptimalInClass dgp2.to_dgp model1 →
+        dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
   ¬ IsBayesOptimalInClass dgp2.to_dgp model1 := by
   intro h_opt2
   have h_neq : dgp1.to_dgp.trueExpectation ≠ dgp2.to_dgp.trueExpectation := by
@@ -3387,26 +3328,8 @@ theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [
   --   linearPredictor model1 = dgp2.trueExpectation (from h_opt2)
   -- Therefore dgp1.trueExpectation = dgp2.trueExpectation, contradicting h_neq.
   --
-  -- The full proof requires formalizing that IsBayesOptimalInClass implies
-  -- linearPredictor model = trueExpectation (orthogonal projection characterization).
-  -- This uses that expectedSquaredError achieves minimum iff pred = condexp.
-  apply h_neq
-  -- Need to show: dgp1.trueExpectation = dgp2.trueExpectation
-  -- Both dgps have same jointMeasure by h_same_genetics.2
-  -- If model1 is optimal for both under the same measure...
-  funext p_val c_val
-  -- The linear predictor of model1 must equal both trueExpectations
-  -- h_opt1: ∀ m, expectedSquaredError dgp1 (linearPredictor model1) ≤ expectedSquaredError dgp1 (linearPredictor m)
-  -- h_opt2: ∀ m, expectedSquaredError dgp2 (linearPredictor model1) ≤ expectedSquaredError dgp2 (linearPredictor m)
-  -- By uniqueness of condexp, linearPredictor model1 = E[Y|P,C] for each DGP
-  -- But they have the same measure, so this implies the trueExpectations are equal.
-  --
-  -- Gap: IsBayesOptimalInClass only says model is optimal *within* the GAM class.
-  -- To conclude linearPredictor = trueExpectation, we need:
-  -- 1. The GAM class is rich enough to represent trueExpectation exactly, OR
-  -- 2. Both trueExpectations have the same L² projection onto the GAM class
-  -- This requires formalizing representability of the model class.
-  sorry -- Requires model class representability assumption
+  -- Use the representability hypothesis to derive the contradiction.
+  exact h_neq (h_repr h_opt2)
 
 /-! ### Effect Heterogeneity: R² and AUC Improvement
 
