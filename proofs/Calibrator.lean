@@ -1,6 +1,7 @@
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
+import Mathlib.Analysis.InnerProductSpace.PiL2
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
 import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
 import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
@@ -30,7 +31,10 @@ import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
+import Mathlib.Topology.Algebra.Module.FiniteDimension
+import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
+import Mathlib.Topology.MetricSpace.ProperSpace
 
 open scoped InnerProductSpace
 
@@ -1655,6 +1659,91 @@ noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)]
 /-- A matrix is positive semidefinite if vᵀSv ≥ 0 for all v. -/
 def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
   ∀ v : ι → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
+
+/-- Positive definite quadratic penalties are coercive. -/
+theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq ι]
+    (S : Matrix ι ι ℝ) (lam : ℝ) (hlam : 0 < lam)
+    (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < Matrix.dotProduct (S.mulVec v) v) :
+    Filter.Tendsto
+      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+      (Filter.cocompact (ι → ℝ)) Filter.atTop := by
+  -- Define the quadratic form Q(β) = βᵀSβ
+  let Q := fun β => Matrix.dotProduct (S.mulVec β) β
+  have hQ_def : ∀ β, Q β = Finset.univ.sum (fun i => β i * (S.mulVec β) i) := by
+    intro β
+    simp [Q, Matrix.dotProduct, mul_comm]
+
+  -- Q is continuous
+  have hQ_cont : Continuous Q := by
+    unfold Q Matrix.dotProduct
+    simp only [Matrix.dotProduct, Matrix.mulVec]
+    continuity
+
+  -- Restrict Q to the unit sphere
+  let sphere := Metric.sphere (0 : ι → ℝ) 1
+  have h_sphere_compact : IsCompact sphere := Metric.isCompact_sphere 0 1
+
+  -- Sphere is nonempty (handle empty ι separately)
+  rcases isEmpty_or_nonempty ι with h_empty | h_nonempty
+  · simp [Filter.cocompact_eq_bot]
+
+  have h_sphere_nonempty : sphere.Nonempty := by
+    obtain ⟨i⟩ := h_nonempty
+    let v := EuclideanSpace.single i (1 : ℝ)
+    have hv : ‖v‖ = 1 := by
+      simp [EuclideanSpace.norm_single, abs_one]
+    use v
+    simp [sphere, hv]
+
+  -- Q attains a minimum on the sphere
+  obtain ⟨v_min, hv_min_in, h_min_le⟩ :=
+    h_sphere_compact.exists_forall_le h_sphere_nonempty hQ_cont.continuousOn
+
+  let c := Q v_min
+  have hc_pos : 0 < c := by
+    apply hS_posDef
+    intro h0
+    simp [sphere] at hv_min_in
+    rw [h0, norm_zero] at hv_min_in
+    linarith
+
+  -- For any β, Q(β) ≥ c * ‖β‖²
+  have h_bound : ∀ β, Q β ≥ c * ‖β‖^2 := by
+    intro β
+    by_cases hβ : β = 0
+    · subst hβ
+      simp [Q, Matrix.dotProduct, Matrix.mulVec_zero, Matrix.dotProduct_zero, norm_zero]
+      linarith
+    · let u := (‖β‖⁻¹) • β
+      have hu_norm : ‖u‖ = 1 := by
+        rw [norm_smul, norm_inv, norm_norm, inv_mul_cancel]
+        rwa [norm_eq_zero]
+      have hu_in : u ∈ sphere := by simp [sphere, hu_norm]
+      have hQu : Q u ≥ c := h_min_le u hu_in
+      -- Q(u) = Q( (1/‖β‖) β ) = (1/‖β‖)^2 Q(β)
+      have h_scale : Q u = (‖β‖⁻¹)^2 * Q β := by
+        simp [Q, Matrix.dotProduct, Matrix.mulVec_smul]
+        ring
+      rw [h_scale] at hQu
+      rw [inv_pow] at hQu
+      have hnorm_sq_pos : 0 < ‖β‖^2 := pow_pos (norm_pos_iff.mpr hβ) 2
+      rw [le_div_iff hnorm_sq_pos] at hQu
+      linarith
+
+  -- Show lam * Q(β) → ∞ using a quadratic lower bound
+  apply Filter.tendsto_atTop_mono (fun β => lam * c * ‖β‖^2)
+  · intro β
+    simp only [hQ_def] at h_bound
+    rw [← hQ_def]
+    apply mul_le_mul_of_nonneg_left (h_bound β) (le_of_lt hlam)
+  · have h_coeff_pos : 0 < lam * c := mul_pos hlam hc_pos
+    have h_norm_tendsto : Filter.Tendsto (fun β => ‖β‖) (Filter.cocompact (ι → ℝ)) Filter.atTop := by
+      rw [Metric.cocompact_eq_cocompact_norm]
+      exact Filter.tendsto_norm_cocompact_atTop
+    have h_sq_tendsto : Filter.Tendsto (fun x : ℝ => x^2) Filter.atTop Filter.atTop :=
+      Filter.tendsto_pow_atTop two_ne_zero
+    have h_comp := h_sq_tendsto.comp h_norm_tendsto
+    apply Filter.Tendsto.const_mul_atTop h_coeff_pos h_comp
 
 
 -- Lower-bounded domination preserves tendsto to atTop on cocompact.
