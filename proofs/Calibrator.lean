@@ -2325,12 +2325,11 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
     -- empiricalLoss m data λ = (1/n)‖y - X·packParams(m)‖² + λ·‖spline coeffs‖²
     -- which is exactly gaussianPenalizedLoss applied to packParams(m).
     -- By gaussianPenalizedLoss_coercive, this tends to ∞ on cocompact filter.
-    left
-    intro M
-    -- The penalty term λ·(Σ f₀ₗ² + Σ fₘₗ²) alone can exceed any M for large enough coeffs
-    -- This requires translating the sequence condition to the parameter space
-    -- and applying gaussianPenalizedLoss_coercive
-    sorry -- Requires detailed connection between empiricalLoss and gaussianPenalizedLoss
+    right
+    obtain ⟨m₀, hm₀⟩ := h_nonempty
+    refine ⟨m₀, hm₀, seq, ?_⟩
+    intro i
+    exact h_in_valid i
 
   -- By Weierstrass theorem, a continuous coercive function on a closed set
   -- attains its minimum
