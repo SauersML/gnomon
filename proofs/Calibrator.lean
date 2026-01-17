@@ -1582,6 +1582,10 @@ These are written over an arbitrary finite index type `ι`, so they can be used 
 def dotProduct' {ι : Type*} [Fintype ι] (u v : ι → ℝ) : ℝ :=
   Finset.univ.sum (fun i => u i * v i)
 
+/-- Squared L2 norm for functions on a finite index type. -/
+def l2norm_sq {ι : Type*} [Fintype ι] (v : ι → ℝ) : ℝ :=
+  Finset.univ.sum (fun i => v i ^ 2)
+
 /-- XᵀX is positive definite when X has full column rank.
     This is the algebraic foundation for uniqueness of least squares.
 
@@ -1658,7 +1662,8 @@ lemma transpose_mul_self_posDef {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintyp
 noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ) (lam : ℝ)
     (β : ι → ℝ) : ℝ :=
-  (1 / n) * ‖y - X.mulVec β‖^2 + lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)
+  (1 / n) * l2norm_sq (y - X.mulVec β) +
+    lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)
 
 /-- A matrix is positive semidefinite if vᵀSv ≥ 0 for all v. -/
 def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
@@ -1714,7 +1719,6 @@ axiom continuous_coercive_exists_min
     - Use Mathlib's Matrix.PosDef API directly for cleaner integration
     - Abstract to LinearMap for kernel/image reasoning -/
 lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
-    [InnerProductSpace ℝ (Fin n → ℝ)]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
     (lam : ℝ) (hlam : lam > 0) (h_rank : Matrix.rank X = Fintype.card ι) (_hS : IsPosSemidef S) :
     StrictConvexOn ℝ Set.univ (gaussianPenalizedLoss X y S lam) := by
@@ -1808,60 +1812,38 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
         _ = a * (y i - X.mulVec β₁ i) + b * (y i - X.mulVec β₂ i) := by
               ring
 
-    -- For squared norms with convex combination: a‖u‖² + b‖v‖² - ‖a•u + b•v‖² = ab‖u-v‖²
-    have h_sq_norm_gap : a * ‖r₁‖^2 + b * ‖r₂‖^2 - ‖r_mid‖^2 = a * b * ‖r₁ - r₂‖^2 := by
-      -- Standard convex combination norm identity using inner product structure.
-      have hmid : r_mid = a • r₁ + b • r₂ := h_r_decomp
-      have hnorm_add :
-          ‖a • r₁ + b • r₂‖ ^ 2 =
-            ⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ := by
-        calc
-          ‖a • r₁ + b • r₂‖ ^ 2
-              = ⟪a • r₁ + b • r₂, a • r₁ + b • r₂⟫_ℝ := by
-                  symm; simpa using (real_inner_self_eq_norm_sq (a • r₁ + b • r₂))
-          _ = ⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ := by
-                simpa using (real_inner_add_add_self (a • r₁) (b • r₂))
-      have hinner_smul : ⟪a • r₁, b • r₂⟫_ℝ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
-        calc
-          ⟪a • r₁, b • r₂⟫_ℝ = a • ⟪r₁, b • r₂⟫_ℝ := by
-            simpa using (inner_smul_left_eq_smul (x := r₁) (y := b • r₂) (r := a))
-          _ = a * ⟪r₁, b • r₂⟫_ℝ := by
-            simp [smul_eq_mul]
-          _ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
-            have h_right : ⟪r₁, b • r₂⟫_ℝ = b • ⟪r₁, r₂⟫_ℝ := by
-              simpa using (inner_smul_right_eq_smul (x := r₁) (y := r₂) (r := b))
-            simp [h_right, smul_eq_mul, mul_assoc]
-      have hnorm_smul₁ : ‖a • r₁‖ ^ 2 = a * (a * ‖r₁‖ ^ 2) := by
-        simp [norm_smul, Real.norm_eq_abs, abs_of_pos ha, pow_two, mul_assoc, mul_left_comm,
-          mul_comm]
-      have hnorm_smul₂ : ‖b • r₂‖ ^ 2 = b * (b * ‖r₂‖ ^ 2) := by
-        simp [norm_smul, Real.norm_eq_abs, abs_of_pos hb, pow_two, mul_assoc, mul_left_comm,
-          mul_comm]
-      have hnorm_sub :
-          ‖r₁ - r₂‖ ^ 2 = ‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ := by
-        calc
-          ‖r₁ - r₂‖ ^ 2 = ⟪r₁ - r₂, r₁ - r₂⟫_ℝ := by
-            symm; simpa using (real_inner_self_eq_norm_sq (r₁ - r₂))
-          _ = ⟪r₁, r₁⟫_ℝ - 2 * ⟪r₁, r₂⟫_ℝ + ⟪r₂, r₂⟫_ℝ := by
-                simpa using (real_inner_sub_sub_self r₁ r₂)
-          _ = ‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ := by
-                simp [real_inner_self_eq_norm_sq, sub_eq_add_neg, add_comm, add_left_comm,
-                  add_assoc, mul_comm, mul_left_comm, mul_assoc]
+    -- For squared L2 norms: a‖u‖² + b‖v‖² - ‖a•u + b•v‖² = ab‖u-v‖²
+    have h_sq_norm_gap :
+        a * l2norm_sq r₁ + b * l2norm_sq r₂ - l2norm_sq r_mid =
+          a * b * l2norm_sq (r₁ - r₂) := by
       have hb' : b = 1 - a := by linarith [hab]
-      -- Combine the expansions.
+      unfold l2norm_sq
+      have hsum :
+          a * (∑ i, r₁ i ^ 2) + b * (∑ i, r₂ i ^ 2) - (∑ i, r_mid i ^ 2) =
+            ∑ i, (a * r₁ i ^ 2 + b * r₂ i ^ 2 - r_mid i ^ 2) := by
+        simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+          add_comm, add_left_comm, add_assoc]
+      have hsum' :
+          a * b * (∑ i, (r₁ i - r₂ i) ^ 2) =
+            ∑ i, a * b * (r₁ i - r₂ i) ^ 2 := by
+        simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+      have hsum'' :
+          a * b * (∑ i, (r₁ - r₂) i ^ 2) =
+            a * b * (∑ i, (r₁ i - r₂ i) ^ 2) := by
+        simp [Pi.sub_apply]
+      rw [hsum, hsum'', hsum']
+      refine Finset.sum_congr rfl ?_
+      intro i _
+      have hmid_i : r_mid i = a * r₁ i + b * r₂ i := by
+        have h := congrArg (fun f => f i) h_r_decomp
+        simpa [Pi.add_apply, Pi.smul_apply, smul_eq_mul] using h
       calc
-        a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 - ‖r_mid‖ ^ 2
-            = a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 -
-                (⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ) := by
-                  simp [hmid, hnorm_add, real_inner_self_eq_norm_sq]
-        _ = a * ‖r₁‖ ^ 2 + b * ‖r₂‖ ^ 2 -
-                (a * (a * ‖r₁‖ ^ 2) + 2 * (a * (b * ⟪r₁, r₂⟫_ℝ)) + b * (b * ‖r₂‖ ^ 2)) := by
-                  simp [hnorm_smul₁, hnorm_smul₂, hinner_smul, mul_assoc]
-        _ = a * b * (‖r₁‖ ^ 2 + ‖r₂‖ ^ 2 - 2 * ⟪r₁, r₂⟫_ℝ) := by
+        a * r₁ i ^ 2 + b * r₂ i ^ 2 - r_mid i ^ 2
+            = a * r₁ i ^ 2 + b * r₂ i ^ 2 - (a * r₁ i + b * r₂ i) ^ 2 := by
+                simp [hmid_i]
+        _ = a * b * (r₁ i - r₂ i) ^ 2 := by
               simp [hb']
               ring
-        _ = a * b * ‖r₁ - r₂‖ ^ 2 := by
-              simp [hnorm_sub]
 
     -- r₁ - r₂ = (y - Xβ₁) - (y - Xβ₂) = Xβ₂ - Xβ₁ = X(β₂ - β₁)
     have h_r_diff : r₁ - r₂ = X.mulVec (β₂ - β₁) := by
@@ -1871,11 +1853,20 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       ring
 
     -- ‖r₁ - r₂‖² = ‖X(β₂-β₁)‖² = ‖X(β₁-β₂)‖² (since ‖-v‖ = ‖v‖)
-    have h_norm_r_diff : ‖r₁ - r₂‖^2 = ‖X.mulVec (β₁ - β₂)‖^2 := by
+    have h_norm_r_diff : l2norm_sq (r₁ - r₂) = l2norm_sq (X.mulVec (β₁ - β₂)) := by
       rw [h_r_diff]
-      -- ‖X(β₂ - β₁)‖ = ‖-(X(β₁ - β₂))‖ = ‖X(β₁ - β₂)‖
-      congr 1
-      rw [show β₂ - β₁ = -(β₁ - β₂) by ring, Matrix.mulVec_neg, norm_neg]
+      -- L2 norm is invariant under negation.
+      have hneg : β₂ - β₁ = -(β₁ - β₂) := by ring
+      have hneg' : X.mulVec (β₂ - β₁) = -(X.mulVec (β₁ - β₂)) := by
+        rw [hneg, Matrix.mulVec_neg]
+      unfold l2norm_sq
+      refine Finset.sum_congr rfl ?_
+      intro i _
+      have hneg_i : (X.mulVec (β₂ - β₁)) i = - (X.mulVec (β₁ - β₂)) i := by
+        simpa using congrArg (fun f => f i) hneg'
+      calc
+        (X.mulVec (β₂ - β₁) i) ^ 2 = (-(X.mulVec (β₁ - β₂) i)) ^ 2 := by simpa [hneg_i]
+        _ = (X.mulVec (β₁ - β₂) i) ^ 2 := by ring
 
     -- Similarly for the penalty term: a·β₁ᵀSβ₁ + b·β₂ᵀSβ₂ - β_midᵀSβ_mid = a*b*(β₁-β₂)ᵀS(β₁-β₂)
     -- when S is symmetric (which we assume for penalty matrices)
@@ -1946,32 +1937,50 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
     -- i.e., (1/n)‖r_mid‖² + λ·Q(β_mid) < a((1/n)‖r₁‖² + λ·Q(β₁)) + b((1/n)‖r₂‖² + λ·Q(β₂))
 
     -- Rewrite using our intermediate definitions
-    have h_L_at_1 : gaussianPenalizedLoss X y S lam β₁ = (1/n) * ‖r₁‖^2 + lam * Q β₁ := rfl
-    have h_L_at_2 : gaussianPenalizedLoss X y S lam β₂ = (1/n) * ‖r₂‖^2 + lam * Q β₂ := rfl
+    have h_L_at_1 : gaussianPenalizedLoss X y S lam β₁ = (1/n) * l2norm_sq r₁ + lam * Q β₁ := rfl
+    have h_L_at_2 : gaussianPenalizedLoss X y S lam β₂ = (1/n) * l2norm_sq r₂ + lam * Q β₂ := rfl
     have h_L_at_mid : gaussianPenalizedLoss X y S lam (a • β₁ + b • β₂) =
-                      (1/n) * ‖r_mid‖^2 + lam * Q (a • β₁ + b • β₂) := rfl
+                      (1/n) * l2norm_sq r_mid + lam * Q (a • β₁ + b • β₂) := rfl
 
     -- The gap: a·L(β₁) + b·L(β₂) - L(β_mid)
     --        = (1/n)[a‖r₁‖² + b‖r₂‖² - ‖r_mid‖²] + λ[a·Q(β₁) + b·Q(β₂) - Q(β_mid)]
     --        = (1/n)[a*b*‖X(β₁-β₂)‖²] + λ[nonneg] by h_sq_norm_gap, h_norm_r_diff, h_Q_gap
 
     -- The residual term gap
-    have h_res_gap : a * ((1/n) * ‖r₁‖^2) + b * ((1/n) * ‖r₂‖^2) - (1/n) * ‖r_mid‖^2
-                   = (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+    have h_res_gap :
+        a * ((1/n) * l2norm_sq r₁) + b * ((1/n) * l2norm_sq r₂) - (1/n) * l2norm_sq r_mid
+          = (1/n) * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) := by
       -- First, use h_sq_norm_gap to convert norm gap to a * b * ‖r₁ - r₂‖^2
       -- Then, use h_norm_r_diff to convert ‖r₁ - r₂‖^2 to ‖X(β₁ - β₂)‖^2
-      calc a * ((1/n) * ‖r₁‖^2) + b * ((1/n) * ‖r₂‖^2) - (1/n) * ‖r_mid‖^2
-          = (1/n) * (a * ‖r₁‖^2 + b * ‖r₂‖^2 - ‖r_mid‖^2) := by ring
-        _ = (1/n) * (a * b * ‖r₁ - r₂‖^2) := by rw [h_sq_norm_gap]
-        _ = (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by rw [h_norm_r_diff]
+      calc a * ((1/n) * l2norm_sq r₁) + b * ((1/n) * l2norm_sq r₂) - (1/n) * l2norm_sq r_mid
+          = (1/n) * (a * l2norm_sq r₁ + b * l2norm_sq r₂ - l2norm_sq r_mid) := by ring
+        _ = (1/n) * (a * b * l2norm_sq (r₁ - r₂)) := by rw [h_sq_norm_gap]
+        _ = (1/n) * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) := by rw [h_norm_r_diff]
 
-    -- The ‖X(β₁-β₂)‖² term is positive by injectivity
-    have h_Xdiff_pos : 0 < ‖X.mulVec (β₁ - β₂)‖^2 := by
-      rw [sq_pos_iff, norm_ne_zero_iff]
-      intro h_eq
+    -- The L2 squared term is positive by injectivity
+    have h_Xdiff_pos : 0 < l2norm_sq (X.mulVec (β₁ - β₂)) := by
       have h_inj := mulVec_injective_of_full_rank X h_rank
-      have := h_inj (h_eq.trans (X.mulVec_zero).symm)
-      exact h_diff_ne this
+      have h_ne : X.mulVec (β₁ - β₂) ≠ 0 := by
+        intro h0
+        have hzero : β₁ - β₂ = 0 := by
+          apply h_inj
+          simpa [h0] using (X.mulVec_zero : X.mulVec (0 : ι → ℝ) = 0)
+        exact h_diff_ne (by simpa using hzero)
+      have h_nonneg : 0 ≤ l2norm_sq (X.mulVec (β₁ - β₂)) := by
+        unfold l2norm_sq
+        exact Finset.sum_nonneg (by intro i _; exact sq_nonneg _)
+      have h_ne_sum : l2norm_sq (X.mulVec (β₁ - β₂)) ≠ 0 := by
+        intro hsum
+        have h_all :
+            ∀ i, (X.mulVec (β₁ - β₂)) i = 0 := by
+          intro i
+          have hsum' := (Finset.sum_eq_zero_iff_of_nonneg
+            (by intro j _; exact sq_nonneg ((X.mulVec (β₁ - β₂)) j))).1 hsum
+          specialize hsum' i (Finset.mem_univ i)
+          have : (X.mulVec (β₁ - β₂)) i ^ 2 = 0 := hsum'
+          exact sq_eq_zero_iff.mp this
+        exact h_ne (by ext i; exact h_all i)
+      exact lt_of_le_of_ne h_nonneg (Ne.symm h_ne_sum)
 
     -- Therefore the residual gap is strictly positive
     have hn0 : n ≠ 0 := by
@@ -1980,12 +1989,10 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hzero_vec : X.mulVec (β₁ - β₂) = 0 := by
         ext i
         exact (Fin.elim0 i)
-      have hnorm : ‖X.mulVec (β₁ - β₂)‖ = 0 := by
-        simpa [hzero_vec]
-      have hzero : ¬ (0 : ℝ) < ‖X.mulVec (β₁ - β₂)‖ ^ 2 := by
-        simp [hnorm]
+      have hzero : ¬ (0 : ℝ) < l2norm_sq (X.mulVec (β₁ - β₂)) := by
+        simp [hzero_vec, l2norm_sq]
       exact hzero h_Xdiff_pos
-    have h_res_gap_pos : (1/n) * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) > 0 := by
+    have h_res_gap_pos : (1/n) * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) > 0 := by
       apply mul_pos
       · apply div_pos one_pos
         exact Nat.cast_pos.mpr (Nat.pos_of_ne_zero hn0)
@@ -2004,30 +2011,35 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
 
     -- Rewrite the goal
     have h_goal :
-        (↑n)⁻¹ * ‖r_mid‖ ^ 2 + lam * Q (a • β₁ + b • β₂) <
-          a * ((↑n)⁻¹ * ‖r₁‖ ^ 2 + lam * Q β₁) +
-            b * ((↑n)⁻¹ * ‖r₂‖ ^ 2 + lam * Q β₂) := by
+        (↑n)⁻¹ * l2norm_sq r_mid + lam * Q (a • β₁ + b • β₂) <
+          a * ((↑n)⁻¹ * l2norm_sq r₁ + lam * Q β₁) +
+            b * ((↑n)⁻¹ * l2norm_sq r₂ + lam * Q β₂) := by
       -- Distribute and collect terms
-      have h_expand : a * ((↑n)⁻¹ * ‖r₁‖^2 + lam * Q β₁) + b * ((↑n)⁻¹ * ‖r₂‖^2 + lam * Q β₂)
-                    = (a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2) +
-                      lam * (a * Q β₁ + b * Q β₂) := by ring
+      have h_expand :
+          a * ((↑n)⁻¹ * l2norm_sq r₁ + lam * Q β₁) + b * ((↑n)⁻¹ * l2norm_sq r₂ + lam * Q β₂)
+            = (a * (↑n)⁻¹ * l2norm_sq r₁ + b * (↑n)⁻¹ * l2norm_sq r₂) +
+              lam * (a * Q β₁ + b * Q β₂) := by ring
       rw [h_expand]
 
       -- The residual gap gives us the strictly positive term
-      have h_res_eq : a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2
-                    = (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
-        have h1 : a * (↑n)⁻¹ * ‖r₁‖^2 + b * (↑n)⁻¹ * ‖r₂‖^2 =
-                  (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2) := by ring
-        have h2 : a * ‖r₁‖^2 + b * ‖r₂‖^2 =
-            ‖r_mid‖^2 + a * b * ‖r₁ - r₂‖^2 := by
+      have h_res_eq :
+          a * (↑n)⁻¹ * l2norm_sq r₁ + b * (↑n)⁻¹ * l2norm_sq r₂
+            = (↑n)⁻¹ * l2norm_sq r_mid +
+              (↑n)⁻¹ * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) := by
+        have h1 :
+            a * (↑n)⁻¹ * l2norm_sq r₁ + b * (↑n)⁻¹ * l2norm_sq r₂ =
+              (↑n)⁻¹ * (a * l2norm_sq r₁ + b * l2norm_sq r₂) := by ring
+        have h2 :
+            a * l2norm_sq r₁ + b * l2norm_sq r₂ =
+              l2norm_sq r_mid + a * b * l2norm_sq (r₁ - r₂) := by
           linarith [h_sq_norm_gap]
         have h2' :
-            (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2) =
-              (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖r₁ - r₂‖^2) := by
+            (↑n)⁻¹ * (a * l2norm_sq r₁ + b * l2norm_sq r₂) =
+              (↑n)⁻¹ * l2norm_sq r_mid + (↑n)⁻¹ * (a * b * l2norm_sq (r₁ - r₂)) := by
           calc
-            (↑n)⁻¹ * (a * ‖r₁‖^2 + b * ‖r₂‖^2)
-                = (↑n)⁻¹ * (‖r_mid‖^2 + a * b * ‖r₁ - r₂‖^2) := by simp [h2]
-            _ = (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖r₁ - r₂‖^2) := by ring
+            (↑n)⁻¹ * (a * l2norm_sq r₁ + b * l2norm_sq r₂)
+                = (↑n)⁻¹ * (l2norm_sq r_mid + a * b * l2norm_sq (r₁ - r₂)) := by simp [h2]
+            _ = (↑n)⁻¹ * l2norm_sq r_mid + (↑n)⁻¹ * (a * b * l2norm_sq (r₁ - r₂)) := by ring
         rw [h1, h2', h_norm_r_diff]
       rw [h_res_eq]
 
@@ -2036,16 +2048,16 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
         linarith [h_Q_gap]
 
       -- Final inequality
-      have hpos : 0 < (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+      have hpos : 0 < (↑n)⁻¹ * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) := by
         simpa [one_div] using h_res_gap_pos
       have hlt :
-          (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) <
-            (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) +
-              (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) := by
+          (↑n)⁻¹ * l2norm_sq r_mid + lam * (a * Q β₁ + b * Q β₂) <
+            (↑n)⁻¹ * l2norm_sq r_mid + lam * (a * Q β₁ + b * Q β₂) +
+              (↑n)⁻¹ * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) := by
         exact lt_add_of_pos_right _ hpos
-      calc (↑n)⁻¹ * ‖r_mid‖^2 + lam * Q (a • β₁ + b • β₂)
-          ≤ (↑n)⁻¹ * ‖r_mid‖^2 + lam * (a * Q β₁ + b * Q β₂) := by linarith [h_pen_gap]
-        _ < (↑n)⁻¹ * ‖r_mid‖^2 + (↑n)⁻¹ * (a * b * ‖X.mulVec (β₁ - β₂)‖^2) +
+      calc (↑n)⁻¹ * l2norm_sq r_mid + lam * Q (a • β₁ + b • β₂)
+          ≤ (↑n)⁻¹ * l2norm_sq r_mid + lam * (a * Q β₁ + b * Q β₂) := by linarith [h_pen_gap]
+        _ < (↑n)⁻¹ * l2norm_sq r_mid + (↑n)⁻¹ * (a * b * l2norm_sq (X.mulVec (β₁ - β₂))) +
             lam * (a * Q β₁ + b * Q β₂) := by
               simpa [add_assoc, add_left_comm, add_comm] using hlt
     exact (by
@@ -2083,10 +2095,11 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
       lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i) := by
     intro β
     unfold gaussianPenalizedLoss
-    have h_nonneg : 0 ≤ (1/↑n) * ‖y - X.mulVec β‖^2 := by
+    have h_nonneg : 0 ≤ (1/↑n) * l2norm_sq (y - X.mulVec β) := by
       apply mul_nonneg
       · apply div_nonneg; norm_num; exact Nat.cast_nonneg n
-      · exact sq_nonneg _
+      · unfold l2norm_sq
+        exact Finset.sum_nonneg (by intro i _; exact sq_nonneg _)
     linarith
 
   -- The quadratic form βᵀSβ is positive for nonzero β
@@ -2159,7 +2172,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
 
   -- Step 1: Show the function is continuous
   have h_cont : Continuous (gaussianPenalizedLoss X y S lam) := by
-    unfold gaussianPenalizedLoss
+    unfold gaussianPenalizedLoss l2norm_sq
     -- L(β) = (1/n)‖y - Xβ‖² + λ·Σᵢ βᵢ(Sβ)ᵢ
     -- This is a polynomial in the coordinates of β, hence continuous.
     -- Specifically:
@@ -2176,7 +2189,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
       fun_prop
         : Continuous
             (fun β : ι → ℝ =>
-              (1 / n) * ‖y - X.mulVec β‖ ^ 2 +
+              (1 / n) * Finset.univ.sum (fun i => (y i - X.mulVec β i) ^ 2) +
                 lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)))
 
   -- Step 2: Get coercivity
