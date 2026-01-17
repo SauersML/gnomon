@@ -358,7 +358,7 @@ jobs:
           set -euo pipefail
           status=0
           timeout --signal=INT --kill-after=30s 3m \
-            cargo +nightly nextest run --profile ci --release --no-build \
+            cargo +nightly nextest run --profile ci --release \
             --filter-expr "${{ matrix.filter_expr }}" \
             2>&1 | tee cargo-test.log || status=$?
           if [ $status -eq 124 ]; then
@@ -392,7 +392,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +nightly nextest run --profile ci --no-build
+          cargo +nightly nextest run --profile ci
 
   python_test_integration:
     needs: build_and_test
