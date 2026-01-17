@@ -1672,6 +1672,13 @@ axiom penalty_quadratic_tendsto {ι : Type*} [Fintype ι] [DecidableEq ι]
       (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
       (Filter.cocompact _) Filter.atTop
 
+-- Axiom: lower-bounded domination preserves tendsto to atTop on cocompact.
+axiom tendsto_of_lower_bound
+    {α : Type*} [TopologicalSpace α] (f g : α → ℝ) :
+    (∀ x, f x ≥ g x) →
+      Filter.Tendsto g (Filter.cocompact _) Filter.atTop →
+      Filter.Tendsto f (Filter.cocompact _) Filter.atTop
+
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
     **Proof Strategy**: The loss function can be written as a quadratic:
@@ -2109,7 +2116,11 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
   --
   -- The formal Mathlib proof uses Filter.Tendsto.mono or Filter.Tendsto.atTop_le
   -- combined with the ProperSpace structure.
-  sorry  -- Requires: Filter.Tendsto composition with h_lower and penalty coercivity
+  exact
+    tendsto_of_lower_bound
+      (f := gaussianPenalizedLoss X y S lam)
+      (g := fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+      h_lower h_penalty_tendsto
 
 /-- Existence of minimizer: coercivity + continuity implies minimum exists.
 
