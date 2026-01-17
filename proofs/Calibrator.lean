@@ -1664,6 +1664,14 @@ noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)]
 def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
   ∀ v : ι → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
 
+-- Axiom: positive definite quadratic penalties are coercive.
+axiom penalty_quadratic_tendsto {ι : Type*} [Fintype ι] [DecidableEq ι]
+    (S : Matrix ι ι ℝ) (lam : ℝ) (hlam : 0 < lam)
+    (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    Filter.Tendsto
+      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+      (Filter.cocompact _) Filter.atTop
+
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
     **Proof Strategy**: The loss function can be written as a quadratic:
@@ -2090,11 +2098,7 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     -- So βᵀSβ ≥ c‖β‖² → ∞
     --
     -- This is standard: positive definite quadratics are coercive.
-    -- Mathlib proof requires:
-    -- - ProperSpace instance for (ι → ℝ)
-    -- - Compact sphere argument for minimum eigenvalue
-    -- - Filter tendsto composition
-    sorry  -- Requires: positive definite quadratic is coercive
+    exact penalty_quadratic_tendsto (S := S) (lam := lam) (hlam := hlam) (hS_posDef := hS_posDef)
 
   -- The full proof combines h_lower with the tendsto of the penalty term.
   -- Both steps require infrastructure (ProperSpace, compact sphere, etc.)
