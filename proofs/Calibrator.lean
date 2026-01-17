@@ -1,6 +1,7 @@
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
+import Mathlib.Analysis.InnerProductSpace.PiL2
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
 import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
 import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
@@ -33,6 +34,7 @@ import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
+import Mathlib.Topology.MetricSpace.ProperSpace
 
 open scoped InnerProductSpace
 
