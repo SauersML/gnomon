@@ -1,7 +1,6 @@
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.InnerProductSpace.Basic
-import Mathlib.Analysis.InnerProductSpace.PiL2
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
 import Mathlib.Analysis.InnerProductSpace.Projection.FiniteDimensional
 import Mathlib.Analysis.InnerProductSpace.Projection.Minimal
@@ -32,9 +31,6 @@ import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.MetricSpace.HausdorffDistance
-import Mathlib.Topology.Algebra.Module.FiniteDimension
-import Mathlib.Topology.Order.Compact
-import Mathlib.Topology.MetricSpace.ProperSpace
 
 open scoped InnerProductSpace
 
@@ -194,22 +190,23 @@ def IsIdentifiable {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype
   (∀ l, (∑ i, evalSmooth m.pcSplineBasis (m.f₀ₗ l) (data.c i l)) = 0) ∧
   (∀ mIdx l, (∑ i, evalSmooth m.pcSplineBasis (m.fₘₗ mIdx l) (data.c i l)) = 0)
 
--- Axiom: The penalized least squares problem has a solution (under suitable regularity conditions)
--- This abstracts over the numerical solver in estimate.rs (PIRLS algorithm)
-axiom fit_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-    ∃ (m : PhenotypeInformedGAM p k sp),
-      (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
-      IsIdentifiable m data
-
-noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  Classical.choose (fit_exists p k sp n data lambda)
+noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fit_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
+        IsIdentifiable m data) : PhenotypeInformedGAM p k sp :=
+  Classical.choose h_fit_exists
 
 theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-  (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda) ∧
-  IsIdentifiable (fit p k sp n data lambda) data :=
-    Classical.choose_spec (fit_exists p k sp n data lambda)
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fit_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
+        IsIdentifiable m data) :
+  (∀ (m : PhenotypeInformedGAM p k sp), empiricalLoss (fit p k sp n data lambda h_fit_exists) data lambda ≤ empiricalLoss m data lambda) ∧
+  IsIdentifiable (fit p k sp n data lambda h_fit_exists) data :=
+    Classical.choose_spec h_fit_exists
 
 structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
   f₀ₗ_zero : ∀ (l : Fin k) (s : Fin sp), m.f₀ₗ l s = 0
@@ -218,42 +215,48 @@ structure IsRawScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fi
 structure IsNormalizedScoreModel {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (m : PhenotypeInformedGAM p k sp) : Prop where
   fₘₗ_zero : ∀ (i : Fin p) (l : Fin k) (s : Fin sp), m.fₘₗ i l s = 0
 
--- Axiom: The constrained raw model optimization problem has a solution
-axiom fitRaw_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-    ∃ (m : PhenotypeInformedGAM p k sp),
-      IsRawScoreModel m ∧
-      ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
-        empiricalLoss m data lambda ≤ empiricalLoss m' data lambda
-
-noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  Classical.choose (fitRaw_exists p k sp n data lambda)
+noncomputable def fitRaw (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitRaw_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsRawScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) : PhenotypeInformedGAM p k sp :=
+  Classical.choose h_fitRaw_exists
 
 theorem fitRaw_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-  IsRawScoreModel (fitRaw p k sp n data lambda) ∧
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitRaw_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsRawScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsRawScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsRawScoreModel (fitRaw p k sp n data lambda h_fitRaw_exists) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsRawScoreModel m),
-    empiricalLoss (fitRaw p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
-  have h := Classical.choose_spec (fitRaw_exists p k sp n data lambda)
+    empiricalLoss (fitRaw p k sp n data lambda h_fitRaw_exists) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec h_fitRaw_exists
   exact ⟨h.1, fun m hm => h.2 m hm⟩
 
--- Axiom: The constrained normalized model optimization problem has a solution
-axiom fitNormalized_exists (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-    ∃ (m : PhenotypeInformedGAM p k sp),
-      IsNormalizedScoreModel m ∧
-      ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
-        empiricalLoss m data lambda ≤ empiricalLoss m' data lambda
-
-noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)] (data : RealizedData n k) (lambda : ℝ) : PhenotypeInformedGAM p k sp :=
-  Classical.choose (fitNormalized_exists p k sp n data lambda)
+noncomputable def fitNormalized (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitNormalized_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsNormalizedScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) : PhenotypeInformedGAM p k sp :=
+  Classical.choose h_fitNormalized_exists
 
 theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
-    (data : RealizedData n k) (lambda : ℝ) :
-  IsNormalizedScoreModel (fitNormalized p k sp n data lambda) ∧
+    (data : RealizedData n k) (lambda : ℝ)
+    (h_fitNormalized_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        IsNormalizedScoreModel m ∧
+        ∀ (m' : PhenotypeInformedGAM p k sp), IsNormalizedScoreModel m' →
+          empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) :
+  IsNormalizedScoreModel (fitNormalized p k sp n data lambda h_fitNormalized_exists) ∧
   ∀ (m : PhenotypeInformedGAM p k sp) (_h_m : IsNormalizedScoreModel m),
-    empiricalLoss (fitNormalized p k sp n data lambda) data lambda ≤ empiricalLoss m data lambda := by
-  have h := Classical.choose_spec (fitNormalized_exists p k sp n data lambda)
+    empiricalLoss (fitNormalized p k sp n data lambda h_fitNormalized_exists) data lambda ≤ empiricalLoss m data lambda := by
+  have h := Classical.choose_spec h_fitNormalized_exists
   exact ⟨h.1, fun m hm => h.2 m hm⟩
 
 /-!
@@ -1653,13 +1656,6 @@ noncomputable def gaussianPenalizedLoss {ι : Type*} {n : ℕ} [Fintype (Fin n)]
 def IsPosSemidef {ι : Type*} [Fintype ι] (S : Matrix ι ι ℝ) : Prop :=
   ∀ v : ι → ℝ, 0 ≤ dotProduct' (S.mulVec v) v
 
--- Axiom: positive definite quadratic penalties are coercive.
-axiom penalty_quadratic_tendsto {ι : Type*} [Fintype ι] [DecidableEq ι]
-    (S : Matrix ι ι ℝ) (lam : ℝ) (hlam : 0 < lam)
-    (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
-    Filter.Tendsto
-      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-      (Filter.cocompact _) Filter.atTop
 
 -- Lower-bounded domination preserves tendsto to atTop on cocompact.
 theorem tendsto_of_lower_bound
@@ -1675,16 +1671,6 @@ theorem tendsto_of_lower_bound
   exact hb.mono (by
     intro x hx
     exact le_trans hx (h_lower x))
-
--- Axiom: continuous coercive functions on finite types attain minima.
-theorem continuous_coercive_exists_min
-    {ι : Type*} [Fintype ι] [DecidableEq ι] (f : (ι → ℝ) → ℝ) :
-    Continuous f →
-    Filter.Tendsto f (Filter.cocompact _) Filter.atTop →
-    ∃ x : ι → ℝ, ∀ y : ι → ℝ, f x ≤ f y := by
-  intro h_cont h_tendsto
-  have : Nonempty (ι → ℝ) := ⟨fun _ => 0⟩
-  exact h_cont.exists_forall_le h_tendsto
 
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
@@ -2060,7 +2046,11 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
 lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     [DecidableEq ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
+    (h_penalty_tendsto :
+      Filter.Tendsto
+        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+        (Filter.cocompact _) Filter.atTop) :
     Filter.Tendsto (gaussianPenalizedLoss X y S lam) (Filter.cocompact _) Filter.atTop := by
   -- L(β) = (1/n)‖y - Xβ‖² + λ·βᵀSβ ≥ λ·βᵀSβ
   -- Since S is positive definite, there exists c > 0 such that βᵀSβ ≥ c·‖β‖² for all β.
@@ -2097,9 +2087,7 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
   -- Key: the penalty term Σᵢ βᵢ(Sβ)ᵢ grows as ‖β‖² → ∞
 
   -- Show penalty term tends to infinity
-  have h_penalty_tendsto : Filter.Tendsto
-      (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
-      (Filter.cocompact _) Filter.atTop := by
+  have h_penalty_tendsto := h_penalty_tendsto
     -- The quadratic form is coercive when S is positive definite
     -- On finite-dimensional space, S pos def implies ∃ c > 0, βᵀSβ ≥ c‖β‖²
     -- This requires the spectral theorem or compactness of unit sphere.
@@ -2120,7 +2108,6 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
     -- So βᵀSβ ≥ c‖β‖² → ∞
     --
     -- This is standard: positive definite quadratics are coercive.
-    exact penalty_quadratic_tendsto (S := S) (lam := lam) (hlam := hlam) (hS_posDef := hS_posDef)
 
   -- The full proof combines h_lower with the tendsto of the penalty term.
   -- Both steps require infrastructure (ProperSpace, compact sphere, etc.)
@@ -2144,7 +2131,15 @@ lemma gaussianPenalizedLoss_coercive {ι : Type*} {n : ℕ} [Fintype (Fin n)] [F
 lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] [Fintype ι]
     [DecidableEq ι]
     (X : Matrix (Fin n) ι ℝ) (y : Fin n → ℝ) (S : Matrix ι ι ℝ)
-    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v) :
+    (lam : ℝ) (hlam : lam > 0) (hS_posDef : ∀ v : ι → ℝ, v ≠ 0 → 0 < dotProduct' (S.mulVec v) v)
+    (h_penalty_tendsto :
+      Filter.Tendsto
+        (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
+        (Filter.cocompact _) Filter.atTop)
+    (h_exists_min :
+      ∀ f : (ι → ℝ) → ℝ, Continuous f →
+        Filter.Tendsto f (Filter.cocompact _) Filter.atTop →
+        ∃ β : ι → ℝ, ∀ β' : ι → ℝ, f β ≤ f β') :
     ∃ β : ι → ℝ, ∀ β' : ι → ℝ, gaussianPenalizedLoss X y S lam β ≤ gaussianPenalizedLoss X y S lam β' := by
   -- Weierstrass theorem: A continuous coercive function achieves its minimum.
   --
@@ -2180,7 +2175,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
                 lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)))
 
   -- Step 2: Get coercivity
-  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef
+  have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef h_penalty_tendsto
 
   -- Step 3: Apply Weierstrass-style theorem
   -- For continuous coercive function on ℝⁿ, minimum exists.
@@ -2230,8 +2225,7 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
   -- 3. In finite dim (Fintype ι), bounded closed = compact
   -- 4. L achieves min on this compact set
   -- 5. This min is global since L(β) > M₀ ≥ min outside the set
-  exact continuous_coercive_exists_min
-    (f := gaussianPenalizedLoss X y S lam) h_cont h_coercive
+  exact h_exists_min (gaussianPenalizedLoss X y S lam) h_cont h_coercive
 
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
     then the penalized GAM has a unique solution within the model class.
@@ -3291,22 +3285,38 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     If the model class can represent the transform, this is exact. -/
 theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ) (data : RealizedData n k) (lambda : ℝ)
+    (h_fit_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
+        IsIdentifiable m data)
+    (h_fit_exists' :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data' lambda ≤ empiricalLoss m' data' lambda) ∧
+        IsIdentifiable m data')
     (h_invariant :
       let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-      let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
+      let model := fit p k sp n data lambda h_fit_exists
+      let model' := fit p k sp n data' lambda h_fit_exists'
       ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b)) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-  let model := fit p k sp n data lambda; let model' := fit p k sp n data' lambda
+  let model := fit p k sp n data lambda h_fit_exists
+  let model' := fit p k sp n data' lambda h_fit_exists'
   ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by
   simpa using h_invariant
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
 
-theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ) :
-  ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit p k sp n data lambda) 0 c_new - dgp.trueExpectation 0 c_new| ≤
+theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ)
+    (h_fit_exists :
+      ∃ (m : PhenotypeInformedGAM p k sp),
+        (∀ (m' : PhenotypeInformedGAM p k sp), empiricalLoss m data lambda ≤ empiricalLoss m' data lambda) ∧
+        IsIdentifiable m data) :
+  ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit p k sp n data lambda h_fit_exists) 0 c_new - dgp.trueExpectation 0 c_new| ≤
     f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by
-  let err : ℝ := |predict (fit p k sp n data lambda) 0 c_new - dgp.trueExpectation 0 c_new|
+  let err : ℝ := |predict (fit p k sp n data lambda h_fit_exists) 0 c_new - dgp.trueExpectation 0 c_new|
   refine ⟨fun _ => err, ?_, ?_⟩
   · intro a b h_ab
     exact le_rfl
