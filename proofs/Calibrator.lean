@@ -2578,7 +2578,138 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
             _ = 0 := by
                   simp [h₁, h₂]
     refine ⟨hm_interp, ?_⟩
-    sorry
+    -- Show strict convexity inequality
+    classical
+    -- Penalty mask: only spline and interaction coefficients are penalized.
+    let s : ParamIx p k sp → ℝ
+      | .intercept => 0
+      | .pgsCoeff _ => 0
+      | .pcSpline _ _ => 1
+      | .interaction _ _ _ => 1
+    let S : Matrix (ParamIx p k sp) (ParamIx p k sp) ℝ := Matrix.diagonal s
+
+    have hS_psd : IsPosSemidef S := by
+      intro v
+      unfold dotProduct'
+      refine Finset.sum_nonneg ?_
+      intro i _
+      have hmul : (S.mulVec v) i = s i * v i := by
+        classical
+        simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
+          Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
+      cases i <;> simp [s, hmul, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+
+    have h_emp_eq :
+        ∀ m, InModelClass m pgsBasis splineBasis →
+          empiricalLoss m data lambda =
+            gaussianPenalizedLoss X data.y S lambda (packParams m) := by
+      intro m hm
+      have h_lin := linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm
+      -- data term (Gaussian)
+      have h_data :
+          (∑ i, pointwiseNLL m.dist (data.y i)
+              (linearPredictor m (data.p i) (data.c i))) =
+            l2norm_sq (data.y - X.mulVec (packParams m)) := by
+        classical
+        unfold l2norm_sq
+        refine Finset.sum_congr rfl ?_
+        intro i _
+        simp [pointwiseNLL, hm.dist_gaussian, Pi.sub_apply, h_lin, X]
+      -- penalty term (diagonal mask)
+      have h_diag : ∀ i, (S.mulVec (packParams m)) i = s i * (packParams m) i := by
+        intro i
+        classical
+        simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
+          Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
+      have h_penalty :
+          Finset.univ.sum (fun i => (packParams m) i * (S.mulVec (packParams m)) i) =
+            (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
+              (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
+        classical
+        have hsum :
+            Finset.univ.sum (fun i => (packParams m) i * (S.mulVec (packParams m)) i) =
+              Finset.univ.sum (fun i => s i * (packParams m i) ^ 2) := by
+          refine Finset.sum_congr rfl ?_
+          intro i _
+          simp [h_diag, pow_two, mul_comm, mul_left_comm, mul_assoc]
+        let g : ParamIxSum p k sp → ℝ
+          | Sum.inl _ => 0
+          | Sum.inr (Sum.inl _) => 0
+          | Sum.inr (Sum.inr (Sum.inl (l, j))) => (m.f₀ₗ l j) ^ 2
+          | Sum.inr (Sum.inr (Sum.inr (mIdx, l, j))) => (m.fₘₗ mIdx l j) ^ 2
+        have hsum' :
+            (∑ i : ParamIx p k sp, s i * (packParams m i) ^ 2) =
+              ∑ x : ParamIxSum p k sp, g x := by
+          refine (Fintype.sum_equiv (ParamIx.equivSum p k sp) _ g ?_)
+          intro x
+          cases x <;> simp [g, s, packParams, ParamIx.equivSum]
+        have hsum_pc :
+            (∑ x : Fin k × Fin sp, (m.f₀ₗ x.1 x.2) ^ 2) =
+              ∑ l, ∑ j, (m.f₀ₗ l j) ^ 2 := by
+          simpa using
+            (Finset.sum_product (s := (Finset.univ : Finset (Fin k)))
+              (t := (Finset.univ : Finset (Fin sp)))
+              (f := fun lj => (m.f₀ₗ lj.1 lj.2) ^ 2))
+        have hsum_int :
+            (∑ x : Fin p × Fin k × Fin sp, (m.fₘₗ x.1 x.2.1 x.2.2) ^ 2) =
+              ∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2 := by
+          have hsum_int' :
+              (∑ x : Fin p × Fin k × Fin sp, (m.fₘₗ x.1 x.2.1 x.2.2) ^ 2) =
+                ∑ mIdx, ∑ lj : Fin k × Fin sp, (m.fₘₗ mIdx lj.1 lj.2) ^ 2 := by
+            simpa using
+              (Finset.sum_product (s := (Finset.univ : Finset (Fin p)))
+                (t := (Finset.univ : Finset (Fin k × Fin sp)))
+                (f := fun mIdx_lj => (m.fₘₗ mIdx_lj.1 mIdx_lj.2.1 mIdx_lj.2.2) ^ 2))
+          have hsum_int'' :
+              ∀ mIdx : Fin p,
+                (∑ lj : Fin k × Fin sp, (m.fₘₗ mIdx lj.1 lj.2) ^ 2) =
+                  ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2 := by
+            intro mIdx
+            simpa using
+              (Finset.sum_product (s := (Finset.univ : Finset (Fin k)))
+                (t := (Finset.univ : Finset (Fin sp)))
+                (f := fun lj => (m.fₘₗ mIdx lj.1 lj.2) ^ 2))
+          calc
+            (∑ x : Fin p × Fin k × Fin sp, (m.fₘₗ x.1 x.2.1 x.2.2) ^ 2) =
+                ∑ mIdx, ∑ lj : Fin k × Fin sp, (m.fₘₗ mIdx lj.1 lj.2) ^ 2 := hsum_int'
+            _ = ∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2 := by
+              refine Finset.sum_congr rfl ?_
+              intro mIdx _
+              simpa using (hsum_int'' mIdx)
+        have hsum'' :
+            (∑ x : ParamIxSum p k sp, g x) =
+              (∑ l, ∑ j, (m.f₀ₗ l j) ^ 2) +
+                (∑ mIdx, ∑ l, ∑ j, (m.fₘₗ mIdx l j) ^ 2) := by
+          simp [ParamIxSum, g, hsum_pc, hsum_int, Finset.sum_add_distrib]
+        simpa [hsum, hsum'] using hsum''
+      unfold empiricalLoss gaussianPenalizedLoss
+      simp [h_data, h_penalty]
+
+    have h_pack_interp : packParams m_interp = β_interp := by
+      ext j
+      cases j <;> simp [m_interp, β_interp, packParams, unpackParams]
+
+    have h_strict :=
+      gaussianPenalizedLoss_strictConvex X data.y S lambda h_lambda_pos h_full_rank hS_psd
+
+    have h_gap :
+        gaussianPenalizedLoss X data.y S lambda β_interp <
+          t * gaussianPenalizedLoss X data.y S lambda β₁ +
+            (1 - t) * gaussianPenalizedLoss X data.y S lambda β₂ := by
+      have hmem : (β₁ : ParamIx p k sp → ℝ) ∈ Set.univ := by trivial
+      have hmem' : (β₂ : ParamIx p k sp → ℝ) ∈ Set.univ := by trivial
+      rcases ht with ⟨ht1, ht2⟩
+      have hpos : 0 < (1 - t) := by linarith [ht2]
+      have hab : t + (1 - t) = 1 := by ring
+      simpa [β_interp] using
+        (h_strict.2 hmem hmem' h_β_ne ht1 hpos hab)
+
+    have h_emp₁ := h_emp_eq m₁ hm₁.1
+    have h_emp₂ := h_emp_eq m₂ hm₂.1
+    have h_emp_mid := h_emp_eq m_interp hm_interp.1
+
+    -- Rewrite the strict convexity gap in terms of empiricalLoss.
+    simpa [h_emp₁, h_emp₂, h_emp_mid, h_pack_interp] using h_gap
 
   -- Strict convexity implies uniqueness of minimizer
   have h_unique : ∀ m₁, m₁ ∈ ValidModels → ∀ m₂, m₂ ∈ ValidModels →
