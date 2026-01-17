@@ -412,6 +412,135 @@ theorem linear_noise_implies_nonlinear_slope
   -- For now we allow a sketch.
   admit
 
+/-! ### Generalized Population Structure (No Admixture Assumption)
+
+We model population structure via an ancestry-indexed LD environment Σ(C),
+and decompose genetic variance into genic (diagonal) and covariance (off-diagonal)
+components. This captures admixture, divergence, and drift uniformly. -/
+
+structure GeneticArchitecture (k : ℕ) where
+  /-- Genic variance (as if loci were independent). -/
+  V_genic : (Fin k → ℝ) → ℝ
+  /-- Structural covariance / LD contribution. -/
+  V_cov : (Fin k → ℝ) → ℝ
+  /-- Selection effect (positive = divergent, negative = stabilizing). -/
+  selection_effect : (Fin k → ℝ) → ℝ
+
+noncomputable def totalVariance {k : ℕ} (arch : GeneticArchitecture k) (c : Fin k → ℝ) : ℝ :=
+  arch.V_genic c + arch.V_cov c
+
+noncomputable def optimalSlopeFromVariance {k : ℕ} (arch : GeneticArchitecture k) (c : Fin k → ℝ) : ℝ :=
+  (totalVariance arch c) / (arch.V_genic c)
+
+theorem directionalLD_nonzero_implies_slope_ne_one {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1 := by
+  -- Sketch: (V_genic + V_cov)/V_genic = 1 iff V_cov = 0.
+  admit
+
+theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
+    (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
+    (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
+    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
+    optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
+  -- Placeholder: selection-effect variation implies LD contribution varies, hence slope varies.
+  admit
+
+/-! ### LD Decay Theorem (Signal-to-Noise)
+
+Genetic distance increases error variance, so the optimal slope decays hyperbolically.
+This is the general statement used for divergence and admixture alike. -/
+
+theorem ld_decay_implies_nonlinear_calibration
+    (sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
+  -- Reuse the linear-noise lemma (proof deferred).
+  admit
+
+/-! ### Normalization Failure under Directional LD
+
+Normalization forces Var(P|C)=1, which removes the LD covariance term. -/
+
+theorem normalization_erases_heritability {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_pos : arch.V_cov c > 0) :
+    optimalSlopeFromVariance arch c > 1 := by
+  -- Sketch: (V_genic + V_cov)/V_genic > 1 when V_cov > 0.
+  admit
+
+/-! ### Neutral Score Drift (Artifactual Mean Shift in P)
+
+The score drifts with ancestry while true liability does not.
+The calibrator must subtract the drift term (PC main effects). -/
+
+structure NeutralScoreDrift (k : ℕ) where
+  /-- True genetic liability (ancestry-invariant in this mechanism). -/
+  true_liability : ℝ
+  /-- Artifactual drift in the observed score. -/
+  drift_artifact : (Fin k → ℝ) → ℝ
+
+def driftedScore {k : ℕ} (mech : NeutralScoreDrift k) (c : Fin k → ℝ) : ℝ :=
+  mech.true_liability + mech.drift_artifact c
+
+theorem neutral_drift_implies_additive_correction {k : ℕ} [Fintype (Fin k)]
+    (mech : NeutralScoreDrift k) :
+    ∀ c : Fin k → ℝ, driftedScore mech c - mech.drift_artifact c = mech.true_liability := by
+  intro c
+  simp [driftedScore]
+
+/-! ### Biological Mechanisms → Statistical DGPs
+
+These lightweight structures capture the causal story and map it into the
+statistical DGPs used in the main proofs. -/
+
+structure DifferentialTagging (k : ℕ) where
+  /-- Tagging efficiency as a function of ancestry (LD decay). -/
+  tagging_efficiency : (Fin k → ℝ) → ℝ
+
+noncomputable def taggingDGP {k : ℕ} [Fintype (Fin k)] (mech : DifferentialTagging k) : DataGeneratingProcess k := {
+  trueExpectation := fun p c => mech.tagging_efficiency c * p
+  jointMeasure := stdNormalProdMeasure k
+}
+
+structure StratifiedEnvironment (k : ℕ) where
+  /-- Additive environmental bias correlated with ancestry. -/
+  beta_env : ℝ
+
+noncomputable def stratifiedDGP {k : ℕ} [Fintype (Fin k)] (mech : StratifiedEnvironment k) : DataGeneratingProcess k :=
+  dgpAdditiveBias k mech.beta_env
+
+structure BiologicalGxE (k : ℕ) where
+  /-- Multiplicative environmental scaling of genetic effect. -/
+  scaling : (Fin k → ℝ) → ℝ
+
+noncomputable def gxeDGP {k : ℕ} [Fintype (Fin k)] (mech : BiologicalGxE k) : DataGeneratingProcess k := {
+  trueExpectation := fun p c => mech.scaling c * p
+  jointMeasure := stdNormalProdMeasure k
+}
+
+inductive BiologicalMechanism (k : ℕ)
+  | taggingDecay (m : DifferentialTagging k)
+  | stratifiedEnv (m : StratifiedEnvironment k)
+  | gxe (m : BiologicalGxE k)
+
+noncomputable def realize_mechanism {k : ℕ} [Fintype (Fin k)] : BiologicalMechanism k → DataGeneratingProcess k
+  | .taggingDecay m => taggingDGP m
+  | .stratifiedEnv m => stratifiedDGP m
+  | .gxe m => gxeDGP m
+
+theorem confounding_preserves_ranking {k : ℕ} [Fintype (Fin k)]
+    (β_env : ℝ) (p1 p2 : ℝ) (c : Fin k → ℝ) (h_le : p1 ≤ p2) :
+    p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l) := by
+  linarith
+
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
