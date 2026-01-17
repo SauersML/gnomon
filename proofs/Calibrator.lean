@@ -2448,14 +2448,14 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
       exact hne h_m_eq
 
     -- Construct interpolated parameter vector
-    let β_interp := (1 - t) • β₁ + t • β₂
+    let β_interp := t • β₁ + (1 - t) • β₂
 
     -- Construct interpolated model
     let m_interp := unpackParams pgsBasis splineBasis β_interp
 
     use m_interp
-    constructor
-    · -- Show m_interp ∈ ValidModels
+    have hm_interp : m_interp ∈ ValidModels := by
+      -- Show m_interp ∈ ValidModels
       constructor
       · -- InModelClass: by construction of unpackParams
         constructor <;> rfl
@@ -2498,29 +2498,29 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
 
           have h_linear_pc :
               ∀ x, evalSmooth splineBasis
-                (fun j => (1 - t) * β₁ (ParamIx.pcSpline l j) + t * β₂ (ParamIx.pcSpline l j))
+                (fun j => t * β₁ (ParamIx.pcSpline l j) + (1 - t) * β₂ (ParamIx.pcSpline l j))
                 (data.c x l)
                   =
-                (1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
-                  t * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
+                t * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                  (1 - t) * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
             intro x
             simpa using (h_linear
               (c₁ := fun j => β₁ (ParamIx.pcSpline l j))
               (c₂ := fun j => β₂ (ParamIx.pcSpline l j))
-              (a := 1 - t) (b := t) (x := data.c x l))
+              (a := t) (b := 1 - t) (x := data.c x l))
 
           calc
             ∑ x, evalSmooth splineBasis
-                (fun j => (1 - t) * β₁ (ParamIx.pcSpline l j) + t * β₂ (ParamIx.pcSpline l j))
+                (fun j => t * β₁ (ParamIx.pcSpline l j) + (1 - t) * β₂ (ParamIx.pcSpline l j))
                 (data.c x l)
                 = ∑ x,
-                    ((1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
-                      t * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l)) := by
+                    (t * evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                      (1 - t) * evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l)) := by
                   refine Finset.sum_congr rfl ?_
                   intro x _
                   exact h_linear_pc x
-            _ = (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
-                t * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
+            _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) +
+                (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.pcSpline l j)) (data.c x l) := by
                   simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
             _ = 0 := by
                   simp [h₁, h₂]
@@ -2551,38 +2551,34 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
 
           have h_linear_int :
               ∀ x, evalSmooth splineBasis
-                (fun j => (1 - t) * β₁ (ParamIx.interaction mIdx l j) + t * β₂ (ParamIx.interaction mIdx l j))
+                (fun j => t * β₁ (ParamIx.interaction mIdx l j) + (1 - t) * β₂ (ParamIx.interaction mIdx l j))
                 (data.c x l)
                   =
-                (1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
-                  t * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
+                t * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                  (1 - t) * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
             intro x
             simpa using (h_linear
               (c₁ := fun j => β₁ (ParamIx.interaction mIdx l j))
               (c₂ := fun j => β₂ (ParamIx.interaction mIdx l j))
-              (a := 1 - t) (b := t) (x := data.c x l))
+              (a := t) (b := 1 - t) (x := data.c x l))
 
           calc
             ∑ x, evalSmooth splineBasis
-                (fun j => (1 - t) * β₁ (ParamIx.interaction mIdx l j) + t * β₂ (ParamIx.interaction mIdx l j))
+                (fun j => t * β₁ (ParamIx.interaction mIdx l j) + (1 - t) * β₂ (ParamIx.interaction mIdx l j))
                 (data.c x l)
                 = ∑ x,
-                    ((1 - t) * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
-                      t * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l)) := by
+                    (t * evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                      (1 - t) * evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l)) := by
                   refine Finset.sum_congr rfl ?_
                   intro x _
                   exact h_linear_int x
-            _ = (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
-                t * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
+            _ = t * ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.interaction mIdx l j)) (data.c x l) +
+                (1 - t) * ∑ x, evalSmooth splineBasis (fun j => β₂ (ParamIx.interaction mIdx l j)) (data.c x l) := by
                   simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc, mul_left_comm, mul_comm]
             _ = 0 := by
                   simp [h₁, h₂]
-    · -- Show strict convexity inequality
-      -- empiricalLoss m_interp < t * empiricalLoss m₁ + (1-t) * empiricalLoss m₂
-      --
-      -- Via packParams bijection, this follows from gaussianPenalizedLoss_strictConvex
-      -- applied to the parameter vectors β₁, β₂, β_interp with h_rank and h_lambda_pos
-      sorry -- Requires showing empiricalLoss = gaussianPenalizedLoss ∘ packParams
+    refine ⟨hm_interp, ?_⟩
+    sorry
 
   -- Strict convexity implies uniqueness of minimizer
   have h_unique : ∀ m₁, m₁ ∈ ValidModels → ∀ m₂, m₂ ∈ ValidModels →
