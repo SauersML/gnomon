@@ -31,6 +31,8 @@ import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.MetricSpace.HausdorffDistance
+import Mathlib.Topology.Algebra.Module.FiniteDimension
+import Mathlib.Topology.Order.Compact
 
 open scoped InnerProductSpace
 
@@ -1673,11 +1675,14 @@ theorem tendsto_of_lower_bound
     exact le_trans hx (h_lower x))
 
 -- Axiom: continuous coercive functions on finite types attain minima.
-axiom continuous_coercive_exists_min
+theorem continuous_coercive_exists_min
     {ι : Type*} [Fintype ι] [DecidableEq ι] (f : (ι → ℝ) → ℝ) :
     Continuous f →
     Filter.Tendsto f (Filter.cocompact _) Filter.atTop →
-    ∃ x : ι → ℝ, ∀ y : ι → ℝ, f x ≤ f y
+    ∃ x : ι → ℝ, ∀ y : ι → ℝ, f x ≤ f y := by
+  intro h_cont h_tendsto
+  have : Nonempty (ι → ℝ) := ⟨fun _ => 0⟩
+  exact h_cont.exists_forall_le h_tendsto
 
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
