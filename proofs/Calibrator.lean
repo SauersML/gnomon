@@ -2139,10 +2139,15 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
     -- - Scalar multiplication is continuous
     --
     -- The formal Mathlib proof uses:
-    -- - continuous_matrix_mulVec or linear map continuity
+    -- - linear map continuity for mulVec
     -- - Continuous.add, Continuous.mul, Continuous.pow, Continuous.norm
     -- - continuous_finset_sum
-    sorry  -- Standard continuity composition
+    simpa using (by
+      fun_prop
+        : Continuous
+            (fun β : ι → ℝ =>
+              (1 / n) * ‖y - X.mulVec β‖ ^ 2 +
+                lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i)))
 
   -- Step 2: Get coercivity
   have h_coercive := gaussianPenalizedLoss_coercive X y S lam hlam hS_posDef
