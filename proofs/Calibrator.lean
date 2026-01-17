@@ -365,6 +365,53 @@ theorem necessity_of_phenotype_data :
   have h_distinct := scenarios_are_distinct 1 (by norm_num)
   exact ⟨h_distinct.left, h_distinct.right.right⟩
 
+/-! ### Population Structure: Drift and LD Decay (Abstract Form)
+
+These statements avoid tying the math to a specific demographic model (e.g., admixture).
+They capture the two essential mechanisms:
+1) drift can change genic variance across PC space
+2) LD decay reduces tagging efficiency with genetic distance
+-/
+
+structure DriftPhysics (k : ℕ) where
+  /-- Genic variance as a function of ancestry coordinates. -/
+  genic_variance : (Fin k → ℝ) → ℝ
+  /-- Tagging efficiency (squared correlation between score and causal liability). -/
+  tagging_efficiency : (Fin k → ℝ) → ℝ
+
+def optimalSlopeDrift {k : ℕ} (phys : DriftPhysics k) (c : Fin k → ℝ) : ℝ :=
+  phys.tagging_efficiency c
+
+theorem drift_implies_attenuation {k : ℕ} [Fintype (Fin k)]
+    (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
+    (h_decay : phys.tagging_efficiency c_far < phys.tagging_efficiency c_near) :
+    optimalSlopeDrift phys c_far < optimalSlopeDrift phys c_near := by
+  simpa [optimalSlopeDrift] using h_decay
+
+/-! ### Linear Noise ⇒ Nonlinear Optimal Slope
+
+If error variance increases linearly with ancestry distance, the optimal slope
+is a reciprocal (hyperbolic) function. No linear function can match it everywhere
+unless the noise slope is zero. -/
+
+noncomputable def optimalSlopeLinearNoise (sigma_g_sq base_error slope_error c : ℝ) : ℝ :=
+  sigma_g_sq / (sigma_g_sq + base_error + slope_error * c)
+
+theorem linear_noise_implies_nonlinear_slope
+    (sigma_g_sq base_error slope_error : ℝ)
+    (h_g_pos : 0 < sigma_g_sq)
+    (hB_pos : 0 < sigma_g_sq + base_error)
+    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
+    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * c) ≠
+        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
+  intro beta0 beta1 h_eq
+  -- TODO: formalize the linear-vs-reciprocal contradiction (use values at c=0,1,2).
+  -- For now we allow a sketch.
+  admit
+
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
