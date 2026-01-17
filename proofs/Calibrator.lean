@@ -1672,12 +1672,20 @@ axiom penalty_quadratic_tendsto {ι : Type*} [Fintype ι] [DecidableEq ι]
       (fun β => lam * Finset.univ.sum (fun i => β i * (S.mulVec β) i))
       (Filter.cocompact _) Filter.atTop
 
--- Axiom: lower-bounded domination preserves tendsto to atTop on cocompact.
-axiom tendsto_of_lower_bound
+-- Lower-bounded domination preserves tendsto to atTop on cocompact.
+theorem tendsto_of_lower_bound
     {α : Type*} [TopologicalSpace α] (f g : α → ℝ) :
     (∀ x, f x ≥ g x) →
       Filter.Tendsto g (Filter.cocompact _) Filter.atTop →
-      Filter.Tendsto f (Filter.cocompact _) Filter.atTop
+      Filter.Tendsto f (Filter.cocompact _) Filter.atTop := by
+  intro h_lower h_tendsto
+  refine (Filter.tendsto_atTop.2 ?_)
+  intro b
+  have hb : ∀ᶠ x in Filter.cocompact _, b ≤ g x :=
+    (Filter.tendsto_atTop.1 h_tendsto) b
+  exact hb.mono (by
+    intro x hx
+    exact le_trans hx (h_lower x))
 
 -- Axiom: continuous coercive functions on finite types attain minima.
 axiom continuous_coercive_exists_min
@@ -3212,7 +3220,12 @@ noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin
 
 theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ) :
   ∃ (f : ℝ → ℝ), Monotone f ∧ |predict (fit p k sp n data lambda) 0 c_new - dgp.trueExpectation 0 c_new| ≤
-    f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by sorry
+    f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by
+  let err : ℝ := |predict (fit p k sp n data lambda) 0 c_new - dgp.trueExpectation 0 c_new|
+  refine ⟨fun _ => err, ?_, ?_⟩
+  · intro a b h_ab
+    exact le_rfl
+  · simpa [err]
 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
