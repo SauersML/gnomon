@@ -541,6 +541,54 @@ theorem confounding_preserves_ranking {k : ℕ} [Fintype (Fin k)]
     p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l) := by
   linarith
 
+/-! ### Biological → Statistical Bridges (Sketches)
+
+These statements connect biological mechanisms to statistical DGPs and to the
+need for nonlinear calibration. Proofs are sketched; fill in with measure-theory
+and L² projection lemmas. -/
+
+structure LDDecayMechanism (k : ℕ) where
+  /-- Genetic distance proxy (e.g., PC-distance from training centroid). -/
+  distance : (Fin k → ℝ) → ℝ
+  /-- Tagging efficiency ρ² decreases with distance. -/
+  tagging_efficiency : ℝ → ℝ
+
+def decaySlope {k : ℕ} (mech : LDDecayMechanism k) (c : Fin k → ℝ) : ℝ :=
+  mech.tagging_efficiency (mech.distance c)
+
+theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k) (c_near c_far : Fin k → ℝ)
+    (h_dist : mech.distance c_near < mech.distance c_far)
+    (h_mono : StrictAnti (mech.tagging_efficiency)) :
+    decaySlope mech c_far < decaySlope mech c_near := by
+  -- Sketch: monotone decrease of tagging efficiency with distance.
+  admit
+
+theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
+    (mech : LDDecayMechanism k)
+    (h_nonlin : ¬ ∃ a b, ∀ d, mech.tagging_efficiency d = a + b * d) :
+    ∀ (beta0 beta1 : ℝ),
+      (fun c => beta0 + beta1 * mech.distance c) ≠
+        (fun c => decaySlope mech c) := by
+  -- Sketch: if decay is not linear in distance, no linear PC interaction matches it.
+  admit
+
+theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0) :
+    optimalSlopeFromVariance arch c =
+      1 + (arch.V_cov c) / (arch.V_genic c) := by
+  -- Sketch: algebra on (V_genic + V_cov)/V_genic.
+  admit
+
+theorem normalization_suboptimal_under_ld {k : ℕ} [Fintype (Fin k)]
+    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
+    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_cov_ne : arch.V_cov c ≠ 0) :
+    optimalSlopeFromVariance arch c ≠ 1 := by
+  -- Sketch: normalization fixes slope=1, but LD covariance shifts optimal slope.
+  admit
+
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
 
