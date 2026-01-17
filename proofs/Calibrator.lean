@@ -1792,9 +1792,15 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
           _ = ⟪a • r₁, a • r₁⟫_ℝ + 2 * ⟪a • r₁, b • r₂⟫_ℝ + ⟪b • r₂, b • r₂⟫_ℝ := by
                 simpa using (real_inner_add_add_self (a • r₁) (b • r₂))
       have hinner_smul : ⟪a • r₁, b • r₂⟫_ℝ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
-        -- TODO: resolve smul instance mismatch for inner-product bilinearity.
-        -- This is a standard identity over ℝ inner product spaces.
-        sorry
+        calc
+          ⟪a • r₁, b • r₂⟫_ℝ = a • ⟪r₁, b • r₂⟫_ℝ := by
+            simpa using (inner_smul_left_eq_smul (x := r₁) (y := b • r₂) (r := a))
+          _ = a * ⟪r₁, b • r₂⟫_ℝ := by
+            simp [smul_eq_mul]
+          _ = a * (b * ⟪r₁, r₂⟫_ℝ) := by
+            have h_right : ⟪r₁, b • r₂⟫_ℝ = b • ⟪r₁, r₂⟫_ℝ := by
+              simpa using (inner_smul_right_eq_smul (x := r₁) (y := r₂) (r := b))
+            simp [h_right, smul_eq_mul, mul_assoc]
       have hnorm_smul₁ : ‖a • r₁‖ ^ 2 = a * (a * ‖r₁‖ ^ 2) := by
         simp [norm_smul, Real.norm_eq_abs, abs_of_pos ha, pow_two, mul_assoc, mul_left_comm,
           mul_comm]
@@ -1859,8 +1865,31 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have h_psd_gap : a * dotProduct' (S.mulVec β₁) β₁ + b * dotProduct' (S.mulVec β₂) β₂
                      - dotProduct' (S.mulVec (a • β₁ + b • β₂)) (a • β₁ + b • β₂)
                      = a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) := by
-        -- TODO: algebraic expansion of the quadratic form.
-        sorry
+        classical
+        have hb' : b = 1 - a := by linarith [hab]
+        unfold dotProduct'
+        calc
+          a * (∑ i, (S.mulVec β₁) i * β₁ i) +
+              b * (∑ i, (S.mulVec β₂) i * β₂ i) -
+              (∑ i, (S.mulVec (a • β₁ + b • β₂)) i * (a • β₁ + b • β₂) i)
+              =
+              ∑ i,
+                (a * ((S.mulVec β₁) i * β₁ i) +
+                  b * ((S.mulVec β₂) i * β₂ i) -
+                  ((S.mulVec (a • β₁ + b • β₂)) i * (a • β₁ + b • β₂) i)) := by
+                simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                  add_comm, add_left_comm, add_assoc]
+          _ = ∑ i, a * b * ((S.mulVec (β₁ - β₂)) i * (β₁ - β₂) i) := by
+                apply Finset.sum_congr rfl
+                intro i _
+                simp [Matrix.mulVec_add, Matrix.mulVec_smul, Matrix.mulVec_sub, Matrix.mulVec_neg,
+                  Pi.add_apply, Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul, mul_add,
+                  add_mul, sub_eq_add_neg, hb']
+                ring
+          _ = a * b * ∑ i, (S.mulVec (β₁ - β₂)) i * (β₁ - β₂) i := by
+                simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+          _ = a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) := by
+                rfl
       -- The RHS is ≥ 0 by PSD of S
       have h_rhs_nonneg : a * b * dotProduct' (S.mulVec (β₁ - β₂)) (β₁ - β₂) ≥ 0 := by
         apply mul_nonneg
@@ -1872,9 +1901,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have h_sum_eq : ∀ β, Finset.univ.sum (fun i => β i * (S.mulVec β) i) = dotProduct' (S.mulVec β) β := by
         intro β
         unfold dotProduct'
-        congr 1
-        ext i
-        ring
+        simp [mul_comm]
       simp only [h_sum_eq]
       linarith [h_psd_gap, h_rhs_nonneg]
 
