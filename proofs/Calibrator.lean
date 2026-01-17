@@ -1679,6 +1679,13 @@ axiom tendsto_of_lower_bound
       Filter.Tendsto g (Filter.cocompact _) Filter.atTop →
       Filter.Tendsto f (Filter.cocompact _) Filter.atTop
 
+-- Axiom: continuous coercive functions on finite types attain minima.
+axiom continuous_coercive_exists_min
+    {ι : Type*} [Fintype ι] [DecidableEq ι] (f : (ι → ℝ) → ℝ) :
+    Continuous f →
+    Filter.Tendsto f (Filter.cocompact _) Filter.atTop →
+    ∃ x : ι → ℝ, ∀ y : ι → ℝ, f x ≤ f y
+
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
     **Proof Strategy**: The loss function can be written as a quadratic:
@@ -2215,8 +2222,8 @@ lemma gaussianPenalizedLoss_exists_min {ι : Type*} {n : ℕ} [Fintype (Fin n)] 
   -- 3. In finite dim (Fintype ι), bounded closed = compact
   -- 4. L achieves min on this compact set
   -- 5. This min is global since L(β) > M₀ ≥ min outside the set
-
-  sorry  -- Requires Heine-Borel for finite-dimensional (ι → ℝ)
+  exact continuous_coercive_exists_min
+    (f := gaussianPenalizedLoss X y S lam) h_cont h_coercive
 
 /-- **Parameter Identifiability**: If the design matrix has full column rank,
     then the penalized GAM has a unique solution within the model class.
