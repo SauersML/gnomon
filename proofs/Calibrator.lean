@@ -440,15 +440,6 @@ theorem directionalLD_nonzero_implies_slope_ne_one {k : ℕ} [Fintype (Fin k)]
   -- Sketch: (V_genic + V_cov)/V_genic = 1 iff V_cov = 0.
   admit
 
-theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
-    (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
-    (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
-    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
-    optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
-  -- Placeholder: selection-effect variation implies LD contribution varies, hence slope varies.
-  admit
-
 /-! ### LD Decay Theorem (Signal-to-Noise)
 
 Genetic distance increases error variance, so the optimal slope decays hyperbolically.
@@ -564,29 +555,12 @@ theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
   -- Sketch: monotone decrease of tagging efficiency with distance.
   admit
 
-theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
-    (mech : LDDecayMechanism k)
-    (h_nonlin : ¬ ∃ a b, ∀ d, mech.tagging_efficiency d = a + b * d) :
-    ∀ (beta0 beta1 : ℝ),
-      (fun c => beta0 + beta1 * mech.distance c) ≠
-        (fun c => decaySlope mech c) := by
-  -- Sketch: if decay is not linear in distance, no linear PC interaction matches it.
-  admit
-
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
     (h_genic_pos : arch.V_genic c ≠ 0) :
     optimalSlopeFromVariance arch c =
       1 + (arch.V_cov c) / (arch.V_genic c) := by
   -- Sketch: algebra on (V_genic + V_cov)/V_genic.
-  admit
-
-theorem normalization_suboptimal_under_ld {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0)
-    (h_cov_ne : arch.V_cov c ≠ 0) :
-    optimalSlopeFromVariance arch c ≠ 1 := by
-  -- Sketch: normalization fixes slope=1, but LD covariance shifts optimal slope.
   admit
 
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
@@ -3820,124 +3794,6 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
-/-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly.
-
-    **Changed from approximate (≈ 0.01) to exact equality**.
-    This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
-theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
-    (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (_h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1)
-    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_bayes :
-      ∀ p_val c_val,
-        linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val) :
-  ∀ c : Fin k → ℝ,
-    model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
-    = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
-  intro c
-
-  -- The derivation follows from Equation (1) in "Recalibration of Polygenic Risk Scores"
-  -- by Graham, T. et al. (2024).
-  --
-  -- Setup: Let G = true genetic liability, Y = phenotype, P = polygenic score
-  --   Y = G + ε_Y (phenotype noise)
-  --   P = G + η(C) (measurement noise depending on ancestry C)
-  --
-  -- The true conditional expectation E[Y | P, C] satisfies:
-  --   E[Y | P=p, C=c] = α(c) * p
-  -- where α(c) is the regression coefficient of Y on P given C=c.
-  --
-  -- By standard regression theory:
-  --   α(c) = Cov(Y, P | C=c) / Var(P | C=c)
-  --
-  -- Computing the numerator:
-  --   Cov(Y, P | C) = Cov(G + ε_Y, G + η(C) | C)
-  --                 = Var(G)  (since G ⊥ ε_Y ⊥ η(C))
-  --                 = σ_G²
-  --
-  -- Computing the denominator:
-  --   Var(P | C) = Var(G + η(C) | C)
-  --              = Var(G) + Var(η(C) | C)
-  --              = σ_G² + σ_η²(C)
-  --
-  -- Therefore:
-  --   α(c) = σ_G² / (σ_G² + σ_η²(c))
-  --
-  -- The GAM structure captures this via:
-  --   γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) ≈ α(c)
-  --
-  -- This is exactly what DGPWithLatentRisk.is_latent encodes:
-  --   trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
-
-  -- The Bayes-optimal predictor equals the conditional expectation (assumed).
-  have h_bayes' : ∀ p_val, linearPredictor model p_val c =
-      dgp_latent.to_dgp.trueExpectation p_val c := by
-    intro p_val
-    simpa using (h_bayes p_val c)
-
-  -- The true expectation has the form α(c) * p
-  have h_true_form : dgp_latent.to_dgp.trueExpectation =
-      fun p_val c_val => (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c_val)) * p_val :=
-    dgp_latent.is_latent
-
-  -- For a Bayes-optimal model with linear PGS basis, the coefficient of p must equal α(c)
-  -- This means: γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) = σ_G² / (σ_G² + σ_η²(c))
-
-  -- From h_bayes with p=1 and p=0, we can extract the coefficients:
-  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes' 0
-  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes' 1
-
-  -- From h_true_form: trueExpectation 0 c = 0, trueExpectation 1 c = α(c)
-  simp only [h_true_form] at h_at_0 h_at_1
-  simp only [mul_zero] at h_at_0
-  simp only [mul_one] at h_at_1
-
-  -- The linearPredictor has structure: linearPredictor p c = base(c) + slope(c) * p
-  -- From h_at_0: base(c) = 0
-  -- From h_at_1: slope(c) = α(c)
-  -- The goal is exactly slope(c), so we need to show:
-  --   γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) = α(c)
-
-  -- This requires showing linearPredictor decomposes as base + slope * p for p=1 models,
-  -- which is proven in linearPredictor_decomp (but requires linear PGS basis hypothesis)
-  -- The algebraic form: α(c) = σ_G² / (σ_G² + σ_η²(c)) is exactly the shrinkage factor
-  -- from measurement error attenuation bias theory.
-  -- See: Fuller (1987), "Measurement Error Models", Chapter 2.
-
-  -- Strategy: Use linearPredictor_decomp to decompose the predictor,
-  -- then extract the slope coefficient from h_at_1.
-  --
-  -- However, linearPredictor_decomp requires a hypothesis that the PGS basis is linear:
-  --   h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id
-  --
-  -- This hypothesis is missing from the theorem statement, which is a gap in the proof.
-  --
-  -- Assuming we had this hypothesis, the proof would proceed as:
-
-  -- Use linearPredictor_decomp with the linear basis hypothesis
-  have h_decomp := linearPredictor_decomp model h_linear_basis
-
-  -- Apply decomposition at p=0 and p=1
-  rw [h_decomp 0 c] at h_at_0
-  rw [h_decomp 1 c] at h_at_1
-
-  -- At p=0: predictorBase + predictorSlope * 0 = 0
-  simp only [mul_zero, add_zero] at h_at_0
-  -- This gives: predictorBase model c = 0
-
-  -- At p=1: predictorBase + predictorSlope * 1 = α(c)
-  simp only [mul_one] at h_at_1
-  -- This gives: predictorBase model c + predictorSlope model c = α(c)
-
-  -- Combining: 0 + predictorSlope model c = α(c)
-  rw [h_at_0] at h_at_1
-  simp only [zero_add] at h_at_1
-
-  -- Now predictorSlope model c = α(c)
-  -- By definition of predictorSlope:
-  unfold predictorSlope at h_at_1
-  -- This gives exactly the goal: γₘ₀[0] + Σₗ evalSmooth(...) = α(c)
-  exact h_at_1
 
 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
