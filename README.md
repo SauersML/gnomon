@@ -16,6 +16,9 @@ The word "gnomon" shares a root with the Ancient Greek γνώμη (gnṓmē), me
 
 Gnomon is a high-performance Rust engine for computing and calibrating polygenic scores at biobank scale. It combines streaming genotype processing with penalized generalized additive models to produce calibrated risk predictions that account for population structure and sex-specific effects.
 
+## Check out later
+https://discourse.mc-stan.org/t/bayesian-implementation-of-the-royston-parmar-survival-model/14706/6
+
 ## Architecture
 
 - **[`cli/`](cli/)** – Run polygenic score calculations, fit ancestry models, and train calibration models from the command line. See [`cli/README.md`](cli/README.md) for usage.
