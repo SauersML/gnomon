@@ -560,8 +560,8 @@ theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (h_genic_pos : arch.V_genic c ≠ 0) :
     optimalSlopeFromVariance arch c =
       1 + (arch.V_cov c) / (arch.V_genic c) := by
-  -- Sketch: algebra on (V_genic + V_cov)/V_genic.
-  admit
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self h_genic_pos]
 
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
