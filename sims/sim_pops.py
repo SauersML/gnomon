@@ -312,15 +312,15 @@ def _compute_pcs_from_sites(
     scaler = StandardScaler(with_mean=True, with_std=True)
     Xz = scaler.fit_transform(X)
 
-    pca = PCA(n_components=2, svd_solver="randomized", random_state=seed)
+    pca = PCA(n_components=5, svd_solver="randomized", random_state=seed)
     pcs = pca.fit_transform(Xz).astype(np.float64)
 
     # Standardize PC axes to make downstream functions stable.
     pc_scaler = StandardScaler(with_mean=True, with_std=True)
     pcs_z = pc_scaler.fit_transform(pcs)
-    pc1 = pcs_z[:, 0].astype(np.float64)
-    pc2 = pcs_z[:, 1].astype(np.float64)
-    return pc1, pc2
+    
+    # Return all 5 PCs as a list/tuple of arrays
+    return [pcs_z[:, k].astype(np.float64) for k in range(5)]
 
 
 def _make_genetic_component(
@@ -484,7 +484,8 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
     # --- Compute PCs ---
     print(f"[{cfg.sim_name}] Computing PCs with scikit-learn PCA (features={len(pca_site_ids)}) ...")
-    pc1, pc2 = _compute_pcs_from_sites(ts, a_idx, b_idx, pca_site_ids, seed=cfg.seed + 23)
+    pcs = _compute_pcs_from_sites(ts, a_idx, b_idx, pca_site_ids, seed=cfg.seed + 23)
+    pc1 = pcs[0] # Keep pc1 handy for simulation logic
 
     # --- Compute true genetic component ---
     print(f"[{cfg.sim_name}] Building G_true from {len(causal_site_ids)} causal sites ...")
@@ -580,6 +581,9 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         "pop_label",
         "pc1",
         "pc2",
+        "pc3",
+        "pc4",
+        "pc5",
         "G_true",
         "P_observed",
         "y",
@@ -608,8 +612,11 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
             int(ts_ind_id[i]),
             int(pop_idx[i]),
             pop_label,
-            float(pc1[i]),
-            float(pc2[i]),
+            float(pcs[0][i]), # pc1
+            float(pcs[1][i]), # pc2
+            float(pcs[2][i]), # pc3
+            float(pcs[3][i]), # pc4
+            float(pcs[4][i]), # pc5
             float(G_true[i]),
             float(P_obs[i]),
             int(y[i]),

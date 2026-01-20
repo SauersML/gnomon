@@ -37,7 +37,7 @@ def load_simulation_data(sim_id: int) -> pd.DataFrame:
     return df
 
 
-def prepare_data(df: pd.DataFrame, n_pcs: int = 2):
+def prepare_data(df: pd.DataFrame, n_pcs: int = 5):
     """
     Extract P, PC, y arrays from dataframe.
     
@@ -176,7 +176,7 @@ def main():
     
     # Prepare arrays
     print("[2/5] Preparing data...")
-    P, PC, y, pop_labels = prepare_data(df, n_pcs=2)
+    P, PC, y, pop_labels = prepare_data(df, n_pcs=5)
     
     # Split train/test
     indices = np.arange(len(y))
@@ -201,7 +201,7 @@ def main():
         NormalizationMethod(method='mean'),
         NormalizationMethod(method='mean+var'),
         GAMMethod(
-            n_pcs=2,
+            n_pcs=5,
             k_pgs=10,        # Spline basis dimension for PGS
             k_pc=10,         # Spline basis dimension for PCs
             k_interaction=5, # Interaction term basis dimension
