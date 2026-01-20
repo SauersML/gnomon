@@ -35,19 +35,34 @@ jobs:
           echo "R_LIBS_USER=$HOME/R/library" >> $GITHUB_ENV
 
       - name: Cache R packages
+        id: cache-r-packages
         uses: actions/cache@v4
         with:
-          path: ${{ env.R_LIBS_USER }}
-          key: ${{ runner.os }}-r-v1-${{ hashFiles('.github/workflows/sim_pops.yml') }}
+          path: ~/R/library
+          key: ${{ runner.os }}-r-ldpred2-v2-${{ hashFiles('.github/workflows/sim_pops.yml') }}
           restore-keys: |
-            ${{ runner.os }}-r-v1-
+            ${{ runner.os }}-r-ldpred2-v2-
 
-      - name: Install R and mgcv
+      - name: Install R and R packages
         run: |
           sudo apt-get update
           sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
-          # Install mgcv and dependencies to user lib (should be cached)
-          Rscript -e 'if(!require("mgcv")) install.packages("mgcv", repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
+          # Check if packages are already installed (from cache)
+          Rscript -e '
+            lib_path <- Sys.getenv("R_LIBS_USER")
+            .libPaths(c(lib_path, .libPaths()))
+            
+            needed <- c("mgcv", "bigsnpr", "bigstatsr")
+            installed <- rownames(installed.packages(lib.loc = lib_path))
+            missing <- setdiff(needed, installed)
+            
+            if (length(missing) > 0) {
+              cat("Installing missing packages:", paste(missing, collapse=", "), "\n")
+              install.packages(missing, repos="https://cloud.r-project.org", lib=lib_path)
+            } else {
+              cat("All R packages already cached.\n")
+            }
+          '
 
       - name: Install dependencies (Python)
         run: |
@@ -81,15 +96,11 @@ jobs:
           which gctb
           echo "PRSCSX_PATH=$PRSCSX_PATH"
           python -c "import msprime, tskit, pandas; print('Python deps ok')"
+          Rscript -e 'library(bigsnpr); library(bigstatsr); cat("R packages ok\n")'
 
       - name: Run simulation
         run: |
           python sims/sim_pops.py ${{ matrix.sim }}
-
-      - name: Install R packages (LDpred2 dependencies)
-        run: |
-          # Install heavy packages to user lib (cached)
-          Rscript -e 'install.packages(c("bigsnpr", "bigstatsr"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
 
       - name: Run method comparison analysis
         run: |
