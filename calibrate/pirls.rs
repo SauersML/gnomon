@@ -915,42 +915,18 @@ fn compute_firth_hat_and_half_logdet_sparse(
     // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    // We can reuse the computed Hessian for the Fisher information log-det term
-    // instead of recomputing manual interaction loops.
-    // Use the penalized matrix when provided.
-    let mut fisher = stabilized.clone();
-    
-    // Symmetrize fisher (redundant if matmul is precise/symmetric but good practice)
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (fisher[[i, j]] + fisher[[j, i]]);
-            fisher[[i, j]] = v;
-            fisher[[j, i]] = v;
-        }
-    }
-    
-    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
-    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
     })?;
-    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+    let half_log_det = chol.diag().mapv(f64::ln).sum();
 
-
-    let h_view = FaerArrayView::new(&stabilized);
-    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
     let mut identity = Array2::<f64>::zeros((p, p));
     for i in 0..p {
         identity[[i, i]] = 1.0;
     }
-    let mut identity_view = array2_to_mat_mut(&mut identity);
-    chol_faer.solve_in_place(identity_view.as_mut());
-    let h_inv_arr = identity;
+    let h_inv_arr = chol.solve_mat(&identity);
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     let x_view = x_design_csr.as_ref();
@@ -4236,24 +4212,14 @@ fn compute_firth_hat_and_half_logdet(
     // to match the outer LAML objective and its derivatives.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    let mut fisher = stabilized.clone();
-    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
-    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
     })?;
-    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+    let half_log_det = chol.diag().mapv(f64::ln).sum();
 
-    let h_view = FaerArrayView::new(&stabilized);
-    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
-    let mut rhs = workspace.wx.t().to_owned();
-    let mut rhs_view = array2_to_mat_mut(&mut rhs);
-    chol_faer.solve_in_place(rhs_view.as_mut());
+    let rhs = chol.solve_mat(&workspace.wx.t().to_owned());
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     for i in 0..n {
