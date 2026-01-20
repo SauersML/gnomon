@@ -646,8 +646,10 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     ts.dump(trees_path)
 
     print(f"[{cfg.sim_name}] Writing {vcf_path} (for PLINK conversion) ...")
+    # Generate individual names matching TSV individual_id so PLINK filtering works
+    individual_names = [str(i) for i in range(ts.num_individuals)]
     with open(vcf_path, "w") as f:
-        ts.write_vcf(f)
+        ts.write_vcf(f, individual_names=individual_names)
 
 
     print(f"[{cfg.sim_name}] Writing {tsv_path} ...")
