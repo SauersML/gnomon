@@ -3,6 +3,7 @@ Helper functions for managing PLINK and external tools integration.
 """
 import subprocess
 import os
+import shutil
 from pathlib import Path
 
 def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
