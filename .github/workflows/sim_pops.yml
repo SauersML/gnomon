@@ -53,13 +53,6 @@ jobs:
         run: |
           uv pip install --system numpy stdpopsim msprime tskit scipy scikit-learn matplotlib pandas seaborn rpy2 h5py
 
-      - name: Verify Environment
-        run: |
-          which plink2
-          which gctb
-          echo "PRSCSX_PATH=$PRSCSX_PATH"
-          python -c "import msprime, tskit, pandas; print('Python deps ok')"
-
       - name: Install PLINK2
         run: |
           wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
@@ -81,6 +74,13 @@ jobs:
           git clone https://github.com/getian107/PRScsx.git
           echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
           ls -l PRScsx/PRScsx.py
+
+      - name: Verify Environment
+        run: |
+          which plink2
+          which gctb
+          echo "PRSCSX_PATH=$PRSCSX_PATH"
+          python -c "import msprime, tskit, pandas; print('Python deps ok')"
 
       - name: Run simulation
         run: |
