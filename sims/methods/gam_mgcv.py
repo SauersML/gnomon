@@ -7,11 +7,8 @@ import numpy as np
 import rpy2.robjects as ro
 from rpy2.robjects import pandas2ri, numpy2ri
 from rpy2.robjects.packages import importr
+from rpy2.robjects.conversion import localconverter
 from .base import PGSMethod
-
-# Activate automatic conversion between pandas/numpy and R
-pandas2ri.activate()
-numpy2ri.activate()
 
 
 class GAMMethod(PGSMethod):
@@ -46,8 +43,9 @@ class GAMMethod(PGSMethod):
         for i in range(min(self.n_pcs, PC.shape[1])):
             data_dict[f'PC{i+1}'] = PC[:, i]
         
-        # Convert to R data frame
-        r_df = ro.DataFrame(data_dict)
+        # Convert to R data frame using conversion context
+        with localconverter(ro.default_converter + pandas2ri.converter + numpy2ri.converter):
+            r_df = ro.DataFrame(data_dict)
         
         # Build formula string
         pc_vars = ', '.join([f'PC{i+1}' for i in range(min(self.n_pcs, PC.shape[1]))])
@@ -74,14 +72,16 @@ class GAMMethod(PGSMethod):
         for i in range(min(self.n_pcs, PC.shape[1])):
             data_dict[f'PC{i+1}'] = PC[:, i]
         
-        r_newdata = ro.DataFrame(data_dict)
-        
-        # Predict on response scale (probabilities)
-        predictions = self.stats.predict_glm(
-            self.r_model,
-            newdata=r_newdata,
-            type='response'
-        )
-        
-        # Convert R vector to numpy array
-        return np.array(predictions)
+        # Convert and predict using conversion context
+        with localconverter(ro.default_converter + pandas2ri.converter + numpy2ri.converter):
+            r_newdata = ro.DataFrame(data_dict)
+            
+            # Predict on response scale (probabilities)
+            predictions = self.stats.predict_glm(
+                self.r_model,
+                newdata=r_newdata,
+                type='response'
+            )
+            
+            # Convert R vector to numpy array
+            return np.array(predictions)
