@@ -42,6 +42,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-r-v1-
 
+      - name: Install R and mgcv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
+          # Install mgcv and dependencies to user lib (should be cached)
+          Rscript -e 'if(!require("mgcv")) install.packages("mgcv", repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
+
       - name: Install dependencies (Python)
         run: |
           uv pip install --system numpy stdpopsim msprime tskit scipy scikit-learn matplotlib pandas seaborn rpy2 h5py
@@ -78,13 +85,6 @@ jobs:
       - name: Run simulation
         run: |
           python sims/sim_pops.py ${{ matrix.sim }}
-
-      - name: Install R and mgcv
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
-          # Install mgcv and dependencies to user lib (should be cached)
-          Rscript -e 'if(!require("mgcv")) install.packages("mgcv", repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
 
       - name: Install R packages (LDpred2 dependencies)
         run: |
