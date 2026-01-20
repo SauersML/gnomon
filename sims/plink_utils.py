@@ -14,6 +14,7 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
     
+    cmd = [
         plink_exe,
         "--vcf", vcf_path,
         "--max-alleles", "2",
