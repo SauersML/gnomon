@@ -200,7 +200,14 @@ def main():
         NormalizationMethod(method='empirical'),
         NormalizationMethod(method='mean'),
         NormalizationMethod(method='mean+var'),
-        GAMMethod(n_pcs=2),
+        GAMMethod(
+            n_pcs=2,
+            k_pgs=10,        # Spline basis dimension for PGS
+            k_pc=10,         # Spline basis dimension for PCs
+            k_interaction=5, # Interaction term basis dimension
+            method='REML',   # Use REML for smoothing parameter selection
+            use_ti=True,     # Use decomposed form: s() + ti()
+        ),
     ]
     
     results = {}
@@ -218,10 +225,22 @@ def main():
                 'y_pred': y_pred,
                 'pop_labels': pop_test,
                 'metrics': metrics,
+                'method': method,  # Store method for diagnostics
             }
             
             print(f"    AUC: {metrics['auc']['overall']:.3f}, "
                   f"Brier: {metrics['brier']['overall']:.3f}")
+            
+            # Print GAM diagnostics if applicable
+            if hasattr(method, 'get_edf'):
+                try:
+                    edf = method.get_edf()
+                    print(f"    GAM effective degrees of freedom:")
+                    for term, edf_val in edf.items():
+                        print(f"      {term}: {edf_val:.2f}")
+                except Exception:
+                    pass  # Skip if EDF extraction fails
+                    
         except Exception as e:
             print(f"    ERROR: {e}")
     
