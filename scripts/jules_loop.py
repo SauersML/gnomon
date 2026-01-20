@@ -254,6 +254,51 @@ def call_jules(prompt, attempt=1):
     return None
 
 
+def validate_patch(patch):
+    """
+    Validates the patch to ensure it doesn't:
+    1. Delete theorems
+    2. Only delete lines (zero additions)
+    
+    Returns (is_valid, reason) tuple.
+    """
+    print("\n--- Validating Patch ---")
+    
+    # Check if patch only has deletions (no additions)
+    additions = 0
+    deletions = 0
+    deleted_theorem_lines = []
+    
+    for line in patch.split('\n'):
+        # Count additions and deletions
+        if line.startswith('+') and not line.startswith('+++'):
+            additions += 1
+        elif line.startswith('-') and not line.startswith('---'):
+            deletions += 1
+            # Check if a theorem is being deleted
+            if 'theorem ' in line:
+                deleted_theorem_lines.append(line)
+    
+    print(f"Patch stats: +{additions} -{deletions}")
+    
+    # Rule 1: Reject if deleting theorems
+    if deleted_theorem_lines:
+        print(f"\n🚫 REJECTED: Patch deletes {len(deleted_theorem_lines)} theorem(s):")
+        for line in deleted_theorem_lines[:5]:  # Show first 5
+            print(f"  {line[:100]}")
+        if len(deleted_theorem_lines) > 5:
+            print(f"  ... and {len(deleted_theorem_lines) - 5} more")
+        return False, "Patch deletes theorems"
+    
+    # Rule 2: Reject if only deletions (no additions)
+    if deletions > 0 and additions == 0:
+        print(f"\n🚫 REJECTED: Patch only deletes lines (0 additions, {deletions} deletions)")
+        return False, "Patch only deletes lines with zero additions"
+    
+    print("✅ Patch validation passed")
+    return True, ""
+
+
 def main():
     conclusion, logs = get_run_info()
 
@@ -265,6 +310,7 @@ def main():
         "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version).\n"
         "- Focus ONLY on proofs/*.lean files for improvements.\n"
         "- Always try to improve something--commit and finish. No further instruction will be given.\n"
+        "- CRITICAL: DO NOT delete theorems. DO NOT submit patches that only delete lines.\n"
     )
 
     # Build the prompt based on previous run status
@@ -275,7 +321,7 @@ def main():
             "(specifically files in proofs/). Do not create new files. Do not edit any file besides 'proofs/Calibrator.lean'. You must successfully compile the code yourself. If the build times out or fails, do not submit it and keep working. You are not allowed to use 'native_decide' or similar."
             "If the build executes and terminates the shell, count that as a failure. Always tail build logs. You can optimize code, strengthen proofs, replace 'sorry' or 'axiom' with actual proofs. Feel free to try big or multiple tasks. We should also remove and fix specification gaming or vacuous verification. It involves writing theorem statements that appear rigorous in natural language but are mathematically constructed to be trivial or tautological. The most common tactic is begging the question, where the theorem explicitly includes the desired conclusion within its own hypothesis, rendering the proof a simple restatement of the input. Another tactic is the trivial witness, where a property regarding a complex mathematical object is proven by providing a hardcoded constant that technically satisfies a loose inequality without actually computing or representing the complex object itself. Finally, ex post facto construction involves defining a bounding function or rule only after calculating the specific error value, ensuring the condition is met by definition rather than by deriving a meaningful general law. For all of these, if they occur, we need to address them well and improve the code."
             "IMPORTANT: Ensure your changes compile and that all proofs are valid. Axioms are just as bad as sorrys and all axioms must be replaced with real proofs. Do not assume more than is necessary. Do not attempt low-importance small changes like style improvements, comments, etc."
-            "Do not break existing functionality."
+            "Do not break existing functionality. DO NOT DELETE THEOREMS. DO NOT submit patches that only delete lines."
             + version_restriction
         )
     else:
@@ -283,7 +329,7 @@ def main():
         prompt = (
             f"The Lean Proof build failed. "
             f"Here are the logs from the run (ANSI colors stripped):\n\n{logs}\n\n"
-            "Please analyze the logs and fix the errors in the Lean proof files. If the code does not compile, you can commit a small improvement even if it is not a complete fix. You can search the web to find the latest documentation for the dependencies/libraries you’re using. You can proactively find examples or code snippets that can help inform your edits. It's a good idea to web search."
+            "Please analyze the logs and fix the errors in the Lean proof files. If the code does not compile, you can commit a small improvement even if it is not a complete fix. You can search the web to find the latest documentation for the dependencies/libraries you're using. You can proactively find examples or code snippets that can help inform your edits. It's a good idea to web search."
             "You should check if your changes compile and that all proofs are valid. However, if the code does not compile, improve what you can as much as possible before submitting. It's okay if it still fails to compile as long as it is in a better state. At the same time, feel free to fix multiple issues at once, and don't afraid to make big improvements. You can do it!"
             + version_restriction
         )
@@ -318,6 +364,13 @@ def main():
 
     print("\n--- Applying Patch ---")
     print(f"Patch content:\n{patch}\n")
+
+    # Validate patch before applying
+    is_valid, rejection_reason = validate_patch(patch)
+    if not is_valid:
+        print(f"\n🚫 PATCH REJECTED: {rejection_reason}")
+        print("Aborting - no changes will be committed.")
+        sys.exit(0)
 
     with open("jules.patch", "w") as f:
         f.write(patch)
