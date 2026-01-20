@@ -40,7 +40,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 toml = "0.9.7"
 polars = { version = "0.51.0", features = ["csv", "ndarray", "parquet"] }
-wolfe_bfgs = "0.2.1"
+wolfe_bfgs = "0.2.2"
 log = "0.4.28"
 faer = "0.23.2"
 spindle = "0.2.6"
