@@ -687,15 +687,44 @@ impl TrainedModel {
         }
         let (min_u, max_u) = joint.knot_range;
         let range_width = (max_u - min_u).max(1e-6);
-        let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+        let z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
+        let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
 
         let (basis, _) = crate::calibrate::basis::create_basis::<Dense>(
-            z.view(),
+            z_c.view(),
             KnotSource::Provided(joint.knot_vector.view()),
             joint.degree,
             BasisOptions::value(),
         ).ok()?;
-        let raw = basis.as_ref();
+        let mut raw = basis.as_ref().clone();
+        // Math note: to avoid a C^1 discontinuity from hard clamping, extend the basis
+        // linearly outside [0,1]: B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
+        let mut needs_ext = false;
+        for i in 0..z_raw.len() {
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                needs_ext = true;
+                break;
+            }
+        }
+        if needs_ext {
+            if let Ok((b_prime_arc, _)) = crate::calibrate::basis::create_basis::<Dense>(
+                z_c.view(),
+                KnotSource::Provided(joint.knot_vector.view()),
+                joint.degree,
+                BasisOptions::first_derivative(),
+            ) {
+                let b_prime = b_prime_arc.as_ref();
+                for i in 0..z_raw.len() {
+                    let dz = z_raw[i] - z_c[i];
+                    if dz.abs() <= 1e-12 {
+                        continue;
+                    }
+                    for j in 0..raw.ncols() {
+                        raw[[i, j]] += dz * b_prime[[i, j]];
+                    }
+                }
+            }
+        }
         if joint.link_transform.nrows() != raw.ncols()
             || joint.link_transform.ncols() != joint.beta_link.len()
         {
@@ -721,7 +750,8 @@ impl TrainedModel {
 
         let (min_u, max_u) = joint.knot_range;
         let range_width = (max_u - min_u).max(1e-6);
-        let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+        let _z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
+        let z_c: Array1<f64> = _z_raw.mapv(|z| z.clamp(0.0, 1.0));
 
         let n_raw = joint.knot_vector.len().saturating_sub(joint.degree + 1);
         let n_constrained = joint.link_transform.ncols();
@@ -738,11 +768,9 @@ impl TrainedModel {
         let mut lower_scratch = BsplineScratch::new(joint.degree.saturating_sub(1));
 
         for i in 0..n {
-            let z_i = z[i];
-            if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-                deriv[i] = 1.0;
-                continue;
-            }
+            // For the linear extension, d/dz_raw B_ext(z_raw) = B'(z_c) everywhere,
+            // so we always evaluate B' at the clamped coordinate.
+            let z_i = z_c[i];
             deriv_raw.fill(0.0);
             if evaluate_bspline_derivative_scalar_into(
                 z_i,
