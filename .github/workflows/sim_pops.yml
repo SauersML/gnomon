@@ -1,0 +1,45 @@
+name: Run stdpopsim simulations (chr22)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "sims/sim_pops.py"
+      - ".github/workflows/sim_pops.yml"
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sim: [1, 2, 3]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy stdpopsim msprime tskit scipy
+
+      - name: Run simulation
+        run: |
+          python sims/sim_pops.py ${{ matrix.sim }}
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-${{ matrix.sim }}-outputs
+          path: |
+            sim${{ matrix.sim }}.trees
+            sim${{ matrix.sim }}.tsv
+            sim${{ matrix.sim }}*.npz
+          if-no-files-found: error
