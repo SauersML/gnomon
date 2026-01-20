@@ -552,8 +552,8 @@ theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
     (h_dist : mech.distance c_near < mech.distance c_far)
     (h_mono : StrictAnti (mech.tagging_efficiency)) :
     decaySlope mech c_far < decaySlope mech c_near := by
-  -- Sketch: monotone decrease of tagging efficiency with distance.
-  admit
+  unfold decaySlope
+  exact h_mono h_dist
 
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
