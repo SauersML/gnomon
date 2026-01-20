@@ -237,20 +237,17 @@ jobs:
           
           RELEASE_TAG="models-v1"
           
-          # Create release if it doesn't exist
           if ! gh release view "$RELEASE_TAG" &>/dev/null; then
-            gh release create "$RELEASE_TAG" \
-              --title "PCA Models v1" \
-              --notes "Pre-trained HWE-scaled PCA models for gnomon.
+            gh release create "$RELEASE_TAG" --title "PCA Models v1" --notes-file - <<'EOF'
+Pre-trained HWE-scaled PCA models for gnomon.
 
 These models are trained on gnomAD 1KG+HGDP phased reference panel (GRCh38).
 
-**Available models:**
-- \`hwe_1kg_hgdp_gsa_v2.json.zst\` - GSA v2 array variants
-- \`hwe_1kg_hgdp_gsa_v3.json.zst\` - GSA v3 array variants  
-- \`hwe_1kg_hgdp_gda_v1.json.zst\` - GDA v1 array variants
-
-Run ID: ${{ github.run_id }}"
+Available models:
+- hwe_1kg_hgdp_gsa_v2.json.zst - GSA v2 array variants
+- hwe_1kg_hgdp_gsa_v3.json.zst - GSA v3 array variants  
+- hwe_1kg_hgdp_gda_v1.json.zst - GDA v1 array variants
+EOF
           fi
           
           # Upload each model file (clobber existing)
