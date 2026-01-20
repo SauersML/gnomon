@@ -11,6 +11,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from scipy.special import expit as sigmoid
 from scipy.optimize import brentq
+import matplotlib.pyplot as plt
 
 
 @dataclass(frozen=True)
@@ -393,6 +394,48 @@ def _write_tsv(path: str, header: List[str], rows: List[List[object]]) -> None:
             f.write("\t".join(str(x) for x in r) + "\n")
 
 
+def _plot_pcs(
+    pc1: np.ndarray,
+    pc2: np.ndarray,
+    pop_labels: np.ndarray,
+    output_path: str,
+) -> None:
+    """
+    Create a scatter plot of PC1 vs PC2 colored by population.
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Get unique populations and assign colors
+    unique_pops = sorted(set(pop_labels))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_pops)))
+    color_map = {pop: colors[i] for i, pop in enumerate(unique_pops)}
+    
+    # Plot each population separately for proper legend
+    for pop in unique_pops:
+        mask = pop_labels == pop
+        ax.scatter(
+            pc1[mask],
+            pc2[mask],
+            c=[color_map[pop]],
+            label=pop,
+            alpha=0.6,
+            s=30,
+            edgecolors='white',
+            linewidth=0.5,
+        )
+    
+    ax.set_xlabel("PC1", fontsize=12, fontweight='bold')
+    ax.set_ylabel("PC2", fontsize=12, fontweight='bold')
+    ax.set_title("Population Structure (PC1 vs PC2)", fontsize=14, fontweight='bold')
+    ax.legend(title="Population", loc='best', framealpha=0.9)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Plot saved: {output_path}")
+
+
 # --------------------------------------------------------------------
 # Three simulation designs (paper-aligned)
 # --------------------------------------------------------------------
@@ -554,9 +597,12 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         "causal_maf_min",
     ] + extra_cols
 
+    # Create population labels array for plotting
+    pop_labels = np.array([_pop_label(model, int(pop_idx[i])) for i in range(n_ind)], dtype=object)
+
     rows: List[List[object]] = []
     for i in range(n_ind):
-        pop_label = _pop_label(model, int(pop_idx[i]))
+        pop_label = pop_labels[i]
         base = [
             i,
             int(ts_ind_id[i]),
@@ -607,6 +653,11 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         genetic_map=np.asarray([cfg.genome.genetic_map]),
         samples=np.asarray([str(cfg.samples)], dtype=object),
     )
+
+    # --- Generate PC plot ---
+    plot_path = f"{cfg.sim_name}_pcs.png"
+    print(f"[{cfg.sim_name}] Plotting PC1 vs PC2 -> {plot_path} ...")
+    _plot_pcs(pc1, pc2, pop_labels, plot_path)
 
     print(f"[{cfg.sim_name}] Done.")
 

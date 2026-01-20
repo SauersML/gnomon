@@ -29,7 +29,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install --system numpy stdpopsim msprime tskit scipy scikit-learn
+          uv pip install --system numpy stdpopsim msprime tskit scipy scikit-learn matplotlib
 
       - name: Run simulation
         run: |
@@ -43,4 +43,5 @@ jobs:
             sim${{ matrix.sim }}.trees
             sim${{ matrix.sim }}.tsv
             sim${{ matrix.sim }}*.npz
+            sim${{ matrix.sim }}_pcs.png
           if-no-files-found: error
