@@ -34,9 +34,9 @@ jobs:
           mkdir -p $HOME/R/library
           echo "R_LIBS_USER=$HOME/R/library" >> $GITHUB_ENV
 
-      - name: Cache R packages
+      - name: Restore R packages cache
         id: cache-r-packages
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/R/library
           key: ${{ runner.os }}-r-ldpred2-v2-${{ hashFiles('.github/workflows/sim_pops.yml') }}
@@ -63,6 +63,13 @@ jobs:
               cat("All R packages already cached.\n")
             }
           '
+
+      - name: Save R packages cache
+        if: always() && steps.cache-r-packages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/R/library
+          key: ${{ runner.os }}-r-ldpred2-v2-${{ hashFiles('.github/workflows/sim_pops.yml') }}
 
       - name: Install dependencies (Python)
         run: |

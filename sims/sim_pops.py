@@ -608,7 +608,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     for i in range(n_ind):
         pop_label = pop_labels[i]
         base = [
-            i,
+            f"ind_{i+1}",  # Match VCF sample ID format (1-indexed with prefix)
             int(ts_ind_id[i]),
             int(pop_idx[i]),
             pop_label,
@@ -647,7 +647,8 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
     print(f"[{cfg.sim_name}] Writing {vcf_path} (for PLINK conversion) ...")
     # Generate individual names matching TSV individual_id so PLINK filtering works
-    individual_names = [str(i) for i in range(ts.num_individuals)]
+    # PLINK2 doesn't allow sample ID '0', so we use 1-indexed IDs: "ind_1", "ind_2", etc.
+    individual_names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
     with open(vcf_path, "w") as f:
         ts.write_vcf(f, individual_names=individual_names)
 
