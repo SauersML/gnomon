@@ -670,7 +670,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     # --- Generate PC plot ---
     plot_path = f"{cfg.sim_name}_pcs.png"
     print(f"[{cfg.sim_name}] Plotting PC1 vs PC2 -> {plot_path} ...")
-    _plot_pcs(pc1, pc2, pop_labels, plot_path)
+    _plot_pcs(pcs[0], pcs[1], pop_labels, plot_path)
 
     print(f"[{cfg.sim_name}] Done.")
 
