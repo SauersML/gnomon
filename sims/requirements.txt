@@ -6,3 +6,5 @@ seaborn
 scipy
 rpy2
 tabulate
+scipy
+h5py
