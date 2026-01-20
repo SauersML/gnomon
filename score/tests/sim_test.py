@@ -3,8 +3,6 @@ import pandas as pd
 import sys
 import os
 import subprocess
-import requests
-import zipfile
 import shutil
 import time
 import math
@@ -346,7 +344,7 @@ def run_simple_dosage_test(workdir: Path, gnomon_path: Path, plink_path: Path, p
     if gnomon_res and gnomon_res.returncode == 0:
         print_file_header(gnomon_output_path, "Gnomon")
 
-    plink_cmd = [f"./{plink_path.name}", "--bfile", prefix.name, "--score", score_file.name, "1", "2", "4", "header", "no-mean-imputation", "--out", prefix.name + "_plink"]
+    plink_cmd = [str(plink_path), "--bfile", prefix.name, "--score", score_file.name, "1", "2", "4", "header", "no-mean-imputation", "--out", prefix.name + "_plink"]
     plink_res = run_cmd_func(plink_cmd, "Simple Plink2 Test", workdir)
     plink_output_path = workdir / f"{prefix.name}_plink.sscore"
     if plink_res and plink_res.returncode == 0:
@@ -604,8 +602,7 @@ def run_multi_score_file_test(workdir: Path, gnomon_path: Path, run_cmd_func):
 
 def run_and_validate_tools(runtimes):
     """Downloads tools, runs them, validates results, and collects runtimes."""
-    PLINK2_URL = "https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_avx2_20250609.zip"
-    PLINK2_BINARY_PATH = WORKDIR / "plink2"
+    PLINK2_BINARY_PATH = Path(shutil.which("plink2") or "/usr/local/bin/plink2")
     GNOMON_BINARY_PATH = Path("./target/release/gnomon").resolve()
     PYLINK_SCRIPT_PATH = (Path(__file__).resolve().parent / "pylink.py").resolve()
     overall_success = True
@@ -640,24 +637,16 @@ def run_and_validate_tools(runtimes):
             return None
 
     def setup_tools():
-        _print_header("Step A: Setting up tools")
+        _print_header("Step A: Validation of tools")
         if not GNOMON_BINARY_PATH.exists():
             print(f"  > ❌ ERROR: Gnomon binary not found at '{GNOMON_BINARY_PATH}'. Please build it first with 'cargo build --release'.")
             return False
-        if not PLINK2_BINARY_PATH.exists():
-            print(f"  > Downloading PLINK2 to '{PLINK2_BINARY_PATH}'...")
-            zip_path = WORKDIR / "plink.zip"
-            try:
-                with requests.get(PLINK2_URL, stream=True, timeout=120) as r:
-                    r.raise_for_status()
-                    with open(zip_path, 'wb') as f: shutil.copyfileobj(r.raw, f)
-                with zipfile.ZipFile(zip_path, 'r') as z: z.extract('plink2', path=WORKDIR)
-                zip_path.unlink()
-                PLINK2_BINARY_PATH.chmod(0o755)
-                print("  > PLINK2 downloaded and extracted successfully.")
-            except Exception as e:
-                print(f"  > ❌ FAILED to download or extract PLINK2: {e}")
-                return False
+            
+        # Verify PLINK2 is available in system
+        if not shutil.which("plink2") and not Path("/usr/local/bin/plink2").exists():
+             print(f"  > ❌ ERROR: PLINK2 not found in PATH or /usr/local/bin/plink2. Please install it via CI workflow.")
+             return False
+
         if not PYLINK_SCRIPT_PATH.exists():
             print(f"  > ⚠️ WARNING: PyLink script not found at '{PYLINK_SCRIPT_PATH}'. It will be skipped in the simple test.")
 
