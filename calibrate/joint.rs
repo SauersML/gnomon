@@ -357,9 +357,7 @@ impl<'a> JointModelState<'a> {
         let degree = self.degree;
 
         // Freeze knot range after first initialization to keep the objective stable.
-        let (min_u, max_u) = if let Some(range) = self.knot_range {
-            range
-        } else {
+        if self.knot_range.is_none() {
             let min_val = eta_base.iter().cloned().fold(f64::INFINITY, f64::min);
             let max_val = eta_base.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let range_width = max_val - min_val;
@@ -371,8 +369,7 @@ impl<'a> JointModelState<'a> {
                 (center - pad, center + pad)
             };
             self.knot_range = Some(range);
-            range
-        };
+        }
 
         // Standardize: z_raw = (u - min)/(max - min), z_c = clamp(z_raw, 0, 1).
         let (z_raw, z_c, _) = self.standardized_z(eta_base);
@@ -1426,6 +1423,14 @@ impl<'a> JointRemlState<'a> {
                 wb[[i, j]] *= scale;
             }
         }
+        let mut wb_resid = b_prime_u.clone();
+        for i in 0..n {
+            let scale = residual[i];
+            for j in 0..p_link {
+                wb_resid[[i, j]] *= scale;
+            }
+        }
+        wb += &wb_resid;
         let c_mat = crate::calibrate::faer_ndarray::fast_atb(&state.x_base, &wb);
         
         // D = B' W B + S_link

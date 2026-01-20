@@ -8086,9 +8086,9 @@ mod tests {
         )
         .unwrap();
 
-        // Extract only the beta values from the results
-        let (beta_uniform, ..) = fit_uniform;
-        let (beta_nonuniform, ..) = fit_nonuniform;
+        // Extract only the beta values from the results (not used directly in this test).
+        let (_beta_uniform, ..) = fit_uniform;
+        let (_beta_nonuniform, ..) = fit_nonuniform;
 
         // Verify column means vs coefficient sums
         // Stage: Confirm that column means are approximately zero in both cases (STZ guarantee)
