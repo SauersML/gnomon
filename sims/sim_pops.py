@@ -692,7 +692,12 @@ def main() -> None:
     _simulate_dataset(cfg)
     
     # Convert to PLINK format
-    from .plink_utils import run_plink_conversion
+    try:
+        from plink_utils import run_plink_conversion
+    except ImportError:
+        # Fallback if run as module
+        from .plink_utils import run_plink_conversion
+        
     run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name)
 
 
