@@ -76,8 +76,8 @@ class GAMMethod(PGSMethod):
         with localconverter(ro.default_converter + pandas2ri.converter + numpy2ri.converter):
             r_newdata = ro.DataFrame(data_dict)
             
-            # Predict on response scale (probabilities)
-            predictions = self.stats.predict_glm(
+            # Predict on response scale (probabilities) using mgcv's predict
+            predictions = ro.r['predict'](
                 self.r_model,
                 newdata=r_newdata,
                 type='response'

@@ -2,18 +2,12 @@
 Generate GitHub Actions Summary report combining all simulation results.
 
 Writes markdown to $GITHUB_STEP_SUMMARY for display in GitHub Actions UI.
+Uses artifact download links instead of base64 to avoid size limits.
 """
 import sys
 import os
-import base64
 from pathlib import Path
 import pandas as pd
-
-
-def encode_image_base64(image_path: str) -> str:
-    """Encode image to base64 for embedding in markdown."""
-    with open(image_path, 'rb') as f:
-        return base64.b64encode(f.read()).decode('utf-8')
 
 
 def generate_summary_report():
@@ -24,6 +18,13 @@ def generate_summary_report():
     if not summary_file:
         print("$GITHUB_STEP_SUMMARY not set, writing to summary.md instead")
         summary_file = 'summary.md'
+    
+    # Get workflow run info for artifact links
+    github_server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
+    github_repo = os.environ.get('GITHUB_REPOSITORY', 'SauersML/gnomon')
+    github_run_id = os.environ.get('GITHUB_RUN_ID', '')
+    
+    artifact_base = f"{github_server}/{github_repo}/actions/runs/{github_run_id}"
     
     lines = []
     
@@ -63,13 +64,12 @@ def generate_summary_report():
         lines.append(f"## Simulation {sim_id} Results")
         lines.append("")
         
-        # Add PC plot
+        # Link to PC plot
         pc_plot = Path(f"sim{sim_id}_pcs.png")
         if pc_plot.exists():
             lines.append("### Population Structure")
             lines.append("")
-            pc_base64 = encode_image_base64(str(pc_plot))
-            lines.append(f'<img src="data:image/png;base64,{pc_base64}" width="600" />')
+            lines.append(f"📊 [View PC Plot](../../actions/runs/{github_run_id}#artifacts) - Download `sim-{sim_id}-outputs` artifact")
             lines.append("")
         
         # Add metrics table
@@ -90,23 +90,14 @@ def generate_summary_report():
             lines.append(f"**🏆 Best Overall AUC:** {best_method} ({best_auc:.3f})")
             lines.append("")
         
-        # Add ROC curves
-        roc_plot = Path(f"sim{sim_id}_comparison_roc.png")
-        if roc_plot.exists():
-            lines.append("### ROC Curves")
-            lines.append("")
-            roc_base64 = encode_image_base64(str(roc_plot))
-            lines.append(f'<img src="data:image/png;base64,{roc_base64}" width="700" />')
-            lines.append("")
-        
-        # Add calibration curves
-        cal_plot = Path(f"sim{sim_id}_comparison_calibration.png")
-        if cal_plot.exists():
-            lines.append("### Calibration Curves")
-            lines.append("")
-            cal_base64 = encode_image_base64(str(cal_plot))
-            lines.append(f'<img src="data:image/png;base64,{cal_base64}" width="700" />')
-            lines.append("")
+        # Link to plots
+        lines.append("### Visualizations")
+        lines.append("")
+        lines.append(f"- 📈 [ROC Curves](../../actions/runs/{github_run_id}#artifacts)")
+        lines.append(f"- 📉 [Calibration Curves](../../actions/runs/{github_run_id}#artifacts)")
+        lines.append("")
+        lines.append(f"*Download `sim-{sim_id}-outputs` artifact to view plots*")
+        lines.append("")
     
     # Summary conclusions
     lines.append("---")
@@ -117,6 +108,10 @@ def generate_summary_report():
     lines.append("- **Simulation 2**: Demonstrates need for non-linear calibration when PGS accuracy varies with ancestry")
     lines.append("- **Simulation 3**: Evaluates performance in underrepresented populations with imbalanced training data")
     lines.append("")
+    lines.append("## 📦 Download Results")
+    lines.append("")
+    lines.append(f"All plots and data files are available in the [workflow artifacts]({artifact_base}#artifacts).")
+    lines.append("")
     lines.append("*Generated automatically by GitHub Actions*")
     lines.append("")
     
@@ -125,6 +120,7 @@ def generate_summary_report():
         f.write('\n'.join(lines))
     
     print(f"✅ Summary report written to {summary_file}")
+    print(f"   Report size: {len('\\n'.join(lines))} bytes (within 1MB limit)")
 
 
 if __name__ == '__main__':

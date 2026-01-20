@@ -5,6 +5,10 @@ on:
   push:
     paths:
       - "sims/sim_pops.py"
+      - "sims/analyze_methods.py"
+      - "sims/methods/**"
+      - "sims/metrics.py"
+      - "sims/generate_summary.py"
       - ".github/workflows/sim_pops.yml"
 
 jobs:
