@@ -61,3 +61,46 @@ jobs:
             sim${{ matrix.sim }}_comparison_*.png
             sim${{ matrix.sim }}_metrics.csv
           if-no-files-found: error
+
+  # Consolidate all simulation results and generate summary
+  report:
+    runs-on: ubuntu-latest
+    needs: simulate
+    if: always()  # Run even if some simulations fail
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      
+      - name: Install dependencies
+        run: |
+          uv pip install --system pandas tabulate
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Copy artifacts to working directory
+        run: |
+          find artifacts -name '*.png' -exec cp {} . \;
+          find artifacts -name '*.csv' -exec cp {} . \;
+          ls -la sim*.png sim*.csv || echo "Some files missing"
+      
+      - name: Generate consolidated summary
+        run: |
+          python sims/generate_summary.py
+      
+      - name: Upload summary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-summary
+          path: summary.md
