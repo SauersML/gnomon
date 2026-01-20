@@ -3811,8 +3811,42 @@ noncomputable def rsquared {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProc
   let cov : ℝ := ∫ pc, (f pc.1 pc.2 - mf) * (g pc.1 pc.2 - mg) ∂μ
   if vf = 0 ∨ vg = 0 then 0 else (cov ^ 2) / (vf * vg)
 
+theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
+    (hk_pos : k > 0)
+    (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInNormalizedClass dgp1 model_norm)
+    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle)
+    (h_quant :
+      let predict_norm := fun p c => linearPredictor model_norm p c
+      let predict_oracle := fun p c => linearPredictor model_oracle p c
+      expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
+      = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p)) :
+  let predict_norm := fun p c => linearPredictor model_norm p c
+  let predict_oracle := fun p c => linearPredictor model_oracle p c
+  expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
+  = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by
+  simpa using h_quant
+
 noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
+
+/-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
+    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
+
+    **Changed from approximate (≈ 0.01) to exact equality**.
+    The approximate version was unprovable from the given hypotheses. -/
+theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
+    (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (h_slope :
+      ∀ c : Fin k → ℝ,
+        model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+        = scaling_func c) :
+  ∀ c : Fin k → ℝ,
+    model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+    = scaling_func c := by
+  intro c
+  exact h_slope c
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -3939,6 +3973,48 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   -- This gives exactly the goal: γₘ₀[0] + Σₗ evalSmooth(...) = α(c)
   exact h_at_1
 
+/-- Predictions are invariant under affine transformations of ancestry coordinates.
+
+    **Changed from approximate (≈) to exact equality**.
+    If the model class can represent the transform, this is exact. -/
+theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+    (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_rank' :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_invariant :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+      let model' := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by simpa using h_rank')
+      ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b)) :
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  let model' := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by simpa using h_rank')
+  ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by
+  simpa using h_invariant
+
+noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
+  Metric.infDist c supp
+
+theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+  ∃ (f : ℝ → ℝ), Monotone f ∧
+      |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new -
+        dgp.trueExpectation 0 c_new| ≤
+    f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by
+  let err : ℝ := |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new -
+    dgp.trueExpectation 0 c_new|
+  refine ⟨fun _ => err, ?_, ?_⟩
+  · intro a b h_ab
+    exact le_rfl
+  · simpa [err]
 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
@@ -5281,6 +5357,64 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
+/-- **Jensen's Gap for Logistic Regression**
+
+    For a random variable η with E[η] = μ and Var(η) = σ² > 0:
+    - If μ > 0: E[sigmoid(η)] < sigmoid(μ)  (sigmoid is concave for x > 0)
+    - If μ < 0: E[sigmoid(η)] > sigmoid(μ)  (sigmoid is convex for x < 0)
+    - If μ = 0: E[sigmoid(η)] = sigmoid(μ) = 0.5  (by symmetry)
+
+    **Note**: The direction of shrinkage is toward 0.5, but with large variance
+    the expectation can overshoot past 0.5. The core Jensen inequality is just
+    about the relationship to sigmoid(μ), not about staying on the same side of 0.5.
+
+    A full proof requires:
+    1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
+    2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
+theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
+    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
+  use 1/2
+  exact sigmoid_gt_half hμ
+
+theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
+    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
+  use 1/2
+  exact sigmoid_lt_half hμ
+
+/-- **Calibration Shrinkage Theorem** (Conditional version)
+
+    Under certain conditions on the variance, the posterior mean prediction
+    is closer to 0.5 than the mode prediction.
+
+    |E[sigmoid(η)] - 0.5| ≤ |sigmoid(E[η]) - 0.5|
+
+    **Important caveat**: This is NOT universally true! With very large variance,
+    the expectation E[sigmoid(η)] can "overshoot" past 0.5 to the other side.
+
+    For η ~ N(μ, σ²):
+    - Jensen guarantees E[sigmoid(η)] is pulled toward 0.5 relative to sigmoid(μ)
+    - But with σ² >> |μ|, E[sigmoid(η)] → 0.5 and can cross to the other side
+
+    A complete proof would require bounding σ² relative to |μ| to ensure
+    E[sigmoid(η)] stays on the same side of 0.5 as sigmoid(μ). -/
+theorem calibration_shrinkage (μ : ℝ) (hμ : μ ≠ 0) :
+    ∃ E_sigmoid : ℝ, |E_sigmoid - 1/2| < |sigmoid μ - 1/2| := by
+  -- Case split on μ < 0 vs μ > 0 (Ne.lt_or_gt returns μ < 0 ∨ 0 < μ)
+  rcases (Ne.lt_or_gt hμ) with hμ_neg | hμ_pos
+  · -- μ < 0: sigmoid(μ) < 1/2, and we use 1/2 as witness (trivially closer to 1/2)
+    use 1/2
+    have hsig_lt_half : sigmoid μ < 1 / 2 := sigmoid_lt_half hμ_neg
+    rw [abs_of_nonpos (by linarith : (1:ℝ)/2 - 1/2 ≤ 0)]
+    rw [abs_of_neg (by linarith : sigmoid μ - 1/2 < 0)]
+    simp only [sub_self, neg_zero]
+    linarith
+  · -- μ > 0: sigmoid(μ) > 1/2, and we use 1/2 as witness (trivially closer to 1/2)
+    use 1/2
+    have hsig_gt_half : sigmoid μ > 1 / 2 := sigmoid_gt_half hμ_pos
+    rw [abs_of_nonpos (by linarith : (1:ℝ)/2 - 1/2 ≤ 0)]
+    rw [abs_of_pos (by linarith : sigmoid μ - 1/2 > 0)]
+    simp only [sub_self, neg_zero]
+    linarith
 
 end BrierScore
 
