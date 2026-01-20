@@ -4290,21 +4290,24 @@ fn ensure_positive_definite_with_ridge(
     } else {
         0.0
     };
+ 
+    if hess.cholesky(Side::Lower).is_ok() {
+        return Ok(0.0);
+    }
+ 
     if ridge > 0.0 {
         for i in 0..hess.nrows() {
             hess[[i, i]] += ridge;
         }
-    }
-
-    if hess.cholesky(Side::Lower).is_ok() {
-        if ridge > 0.0 {
+ 
+        if hess.cholesky(Side::Lower).is_ok() {
             log::debug!(
                 "{} stabilized with fixed ridge {:.1e}.",
                 label,
                 ridge
             );
+            return Ok(ridge);
         }
-        return Ok(ridge);
     }
 
     if let Ok((evals, _)) = hess.eigh(Side::Lower) {
