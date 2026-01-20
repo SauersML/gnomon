@@ -39,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y r-base r-base-dev
-          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+          sudo Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
 
       - name: Install analysis dependencies
         run: |
