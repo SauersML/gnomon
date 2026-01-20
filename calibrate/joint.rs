@@ -35,10 +35,12 @@ use crate::calibrate::visualizer;
 use wolfe_bfgs::BfgsSolution;
 
 
-// NOTE on z standardization: We use hard clamp(0,1) everywhere.
-// At clamped boundaries (z=0 or z=1), the wiggle contribution is constant (not extrapolated),
-// and g'(u) = 1 (the derivative code explicitly returns 1.0 at boundaries).
-// This is consistent between training and HMC.
+// NOTE on z standardization:
+// We standardize u = Xβ into z_raw = (u - min_u) / (max_u - min_u).
+// To avoid a C^1 discontinuity from hard clamping, we evaluate the spline basis at
+// z_c = clamp(z_raw, 0, 1) and apply a first-order extension outside the knot range:
+//   B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
+// This keeps the link correction g(u) differentiable w.r.t. u (and hence β) everywhere.
 
 /// Fixed stabilization ridge for solver numerical stability.
 /// This is a SOLVER detail, not an objective function modification.
@@ -358,16 +360,14 @@ impl<'a> JointModelState<'a> {
             range
         };
 
-        // Standardize: z = (u - min) / (max - min) to [0, 1]
-        let range_width = (max_u - min_u).max(1e-6);
-        let z: Array1<f64> = eta_base
-            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+        // Standardize: z_raw = (u - min)/(max - min), z_c = clamp(z_raw, 0, 1).
+        let (z_raw, z_c, _) = self.standardized_z(eta_base);
 
         // Build B-spline basis on z ∈ [0, 1]
         let data_range = (0.0, 1.0);
         let basis_result = if let Some(knots) = self.knot_vector.as_ref() {
             create_basis::<Dense>(
-                z.view(),
+                z_c.view(),
                 KnotSource::Provided(knots.view()),
                 degree,
                 BasisOptions::value(),
@@ -375,7 +375,7 @@ impl<'a> JointModelState<'a> {
             .map(|(basis, _)| (basis, knots.clone()))
         } else {
             create_basis::<Dense>(
-                z.view(),
+                z_c.view(),
                 KnotSource::Generate {
                     data_range,
                     num_internal_knots: k,
@@ -387,7 +387,34 @@ impl<'a> JointModelState<'a> {
 
         match basis_result {
             Ok((bspline_basis, knots)) => {
-                let bspline_basis = bspline_basis.as_ref();
+                let mut bspline_basis = bspline_basis.as_ref().clone();
+                // Linear extension outside [0,1]: B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
+                let mut needs_ext = false;
+                for i in 0..z_raw.len() {
+                    if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                        needs_ext = true;
+                        break;
+                    }
+                }
+                if needs_ext {
+                    let (b_prime_arc, _) = create_basis::<Dense>(
+                        z_c.view(),
+                        KnotSource::Provided(knots.view()),
+                        degree,
+                        BasisOptions::first_derivative(),
+                    )
+                    .map_err(|e| format!("B-spline derivative basis construction failed: {e}"))?;
+                    let b_prime = b_prime_arc.as_ref();
+                    for i in 0..z_raw.len() {
+                        let dz = z_raw[i] - z_c[i];
+                        if dz.abs() <= 1e-12 {
+                            continue;
+                        }
+                        for j in 0..bspline_basis.ncols() {
+                            bspline_basis[[i, j]] += dz * b_prime[[i, j]];
+                        }
+                    }
+                }
 
                 // Store knot vector and initialize geometric constraint if first call
                 let first_init = self.knot_vector.is_none();
@@ -440,13 +467,10 @@ impl<'a> JointModelState<'a> {
         let Some(knot_vector) = self.knot_vector.as_ref() else {
             return Array2::zeros((n, 0));
         };
-        let (min_u, max_u) = self.knot_range.unwrap_or((0.0, 1.0));
-        let range_width = (max_u - min_u).max(1e-6);
-        let z: Array1<f64> = eta_base
-            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+        let (z_raw, z_c, _) = self.standardized_z(eta_base);
 
         let b_raw = match create_basis::<Dense>(
-            z.view(),
+            z_c.view(),
             KnotSource::Provided(knot_vector.view()),
             self.degree,
             BasisOptions::value(),
@@ -454,6 +478,35 @@ impl<'a> JointModelState<'a> {
             Ok((basis, _)) => basis.as_ref().clone(),
             Err(_) => return Array2::zeros((n, 0)),
         };
+
+        // Apply the same linear extension used during training.
+        let mut b_raw = b_raw;
+        let mut needs_ext = false;
+        for i in 0..z_raw.len() {
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                needs_ext = true;
+                break;
+            }
+        }
+        if needs_ext {
+            if let Ok((b_prime_arc, _)) = create_basis::<Dense>(
+                z_c.view(),
+                KnotSource::Provided(knot_vector.view()),
+                self.degree,
+                BasisOptions::first_derivative(),
+            ) {
+                let b_prime = b_prime_arc.as_ref();
+                for i in 0..z_raw.len() {
+                    let dz = z_raw[i] - z_c[i];
+                    if dz.abs() <= 1e-12 {
+                        continue;
+                    }
+                    for j in 0..b_raw.ncols() {
+                        b_raw[[i, j]] += dz * b_prime[[i, j]];
+                    }
+                }
+            }
+        }
 
         // Use geometric transform (preferred) or fall back to link_transform
         let transform = self
@@ -469,13 +522,16 @@ impl<'a> JointModelState<'a> {
         Array2::zeros((n, self.beta_link.len()))
     }
     
-    /// Compute standardized z values and range width for current knot range.
-    fn standardized_z(&self, eta_base: &Array1<f64>) -> (Array1<f64>, f64) {
+    /// Compute standardized coordinates for the link spline.
+    /// Returns (z_raw, z_clamped, range_width) where:
+    ///   z_raw = (u - min_u) / range_width
+    ///   z_clamped = clamp(z_raw, 0, 1)
+    fn standardized_z(&self, eta_base: &Array1<f64>) -> (Array1<f64>, Array1<f64>, f64) {
         let (min_u, max_u) = self.knot_range.unwrap_or((0.0, 1.0));
         let range_width = (max_u - min_u).max(1e-6);
-        let z: Array1<f64> = eta_base
-            .mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
-        (z, range_width)
+        let z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
+        let z_clamped: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
+        (z_raw, z_clamped, range_width)
     }
     
     /// Return the stored projected penalty for link block (Z'SZ)
@@ -2016,7 +2072,7 @@ impl<'a> JointRemlState<'a> {
             ));
         }
 
-        let (z, range_width) = state.standardized_z(&u);
+        let (z_raw, z_c, range_width) = state.standardized_z(&u);
         let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
         if n_raw == 0 {
             return Err(EstimationError::RemlOptimizationFailed(
@@ -2026,22 +2082,42 @@ impl<'a> JointRemlState<'a> {
 
         use crate::calibrate::basis::{create_basis, BasisOptions, KnotSource, Dense};
         let (b_raw_arc, _) = create_basis::<Dense>(
-            z.view(),
+            z_c.view(),
             KnotSource::Provided(knot_vector.view()),
             state.degree,
             BasisOptions::value(),
         )
         .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
         let (b_prime_arc, _) = create_basis::<Dense>(
-            z.view(),
+            z_c.view(),
             KnotSource::Provided(knot_vector.view()),
             state.degree,
             BasisOptions::first_derivative(),
         )
         .map_err(|e| EstimationError::InvalidSpecification(e.to_string()))?;
 
-        let b_raw = b_raw_arc.as_ref();
+        // Apply the same C^1 linear extension used in build_link_basis:
+        //   B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c).
+        let mut b_raw = b_raw_arc.as_ref().clone();
         let b_prime = b_prime_arc.as_ref();
+        let mut needs_ext = false;
+        for i in 0..z_raw.len() {
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                needs_ext = true;
+                break;
+            }
+        }
+        if needs_ext {
+            for i in 0..z_raw.len() {
+                let dz = z_raw[i] - z_c[i];
+                if dz.abs() <= 1e-12 {
+                    continue;
+                }
+                for j in 0..b_raw.ncols() {
+                    b_raw[[i, j]] += dz * b_prime[[i, j]];
+                }
+            }
+        }
 
         // NOTE: With geometric constraints (Greville abscissae), Z is constant w.r.t. β,
         // so dZ/dβ = 0 exactly. The constraint matrix M and its pseudoinverse are no longer
@@ -2064,7 +2140,7 @@ impl<'a> JointRemlState<'a> {
         let mut clamp_z_count = 0usize;
         let mut clamp_mu_count = 0usize;
         for i in 0..n {
-            if z[i] <= 1e-8 || z[i] >= 1.0 - 1e-8 {
+            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
                 clamp_z_count += 1;
             }
             if matches!(state.link, LinkFunction::Logit)
@@ -2174,15 +2250,12 @@ impl<'a> JointRemlState<'a> {
 
             dot_u.assign(&state.x_base.dot(&delta_beta));
 
-            // dot_z with clamp mask
+            // dot_z_raw = d/ dρ_k [ (u - min_u) / range_width ]
+            //          = (1 / range_width) * dot_u.
+            // For the linearly-extended basis, dB_ext/dz_raw = B'(z_c) everywhere.
             let inv_rw = 1.0 / range_width;
             for i in 0..n {
-                let zi = z[i];
-                if zi > 0.0 && zi < 1.0 {
-                    dot_z[i] = dot_u[i] * inv_rw;
-                } else {
-                    dot_z[i] = 0.0;
-                }
+                dot_z[i] = dot_u[i] * inv_rw;
             }
 
             dot_eta.assign(&j_mat.dot(&delta));
@@ -2208,7 +2281,7 @@ impl<'a> JointRemlState<'a> {
                 w_dot[i] = w_prime[i] * dot_eta[i];
             }
 
-            // dB_raw/dρ = (dB_raw/dz) * dz/dρ
+            // dB_ext/dρ = (dB_ext/dz_raw) * dz_raw/dρ with dB_ext/dz_raw = B'(z_c).
             b_dot.fill(0.0);
             for i in 0..n {
                 let dz = dot_z[i];
@@ -2228,7 +2301,7 @@ impl<'a> JointRemlState<'a> {
             dot_j_theta.assign(
                 &crate::calibrate::faer_ndarray::fast_ab(&b_dot, link_transform),
             );
-            dot_j_theta += &crate::calibrate::faer_ndarray::fast_ab(b_raw, &z_dot);
+            dot_j_theta += &crate::calibrate::faer_ndarray::fast_ab(&b_raw, &z_dot);
 
             // dot_g_prime
             let mut dot_g_prime = Array1::<f64>::zeros(n);
@@ -2825,7 +2898,7 @@ fn compute_link_derivative_from_state(
         return deriv;
     };
     
-    let (z, range_width) = state.standardized_z(u);
+    let (_z_raw, z_c, range_width) = state.standardized_z(u);
     let n_raw = knot_vector.len().saturating_sub(state.degree + 1);
     
     // Get link_transform, return early if not set
@@ -2844,14 +2917,7 @@ fn compute_link_derivative_from_state(
     let mut lower_scratch = BsplineScratch::new(state.degree.saturating_sub(1));
     
     for i in 0..n {
-        let z_i = z[i];
-        
-        // At boundaries (clamped), g'(u) = 1 (wiggle is constant w.r.t. u)
-        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-            deriv[i] = 1.0;
-            continue;
-        }
-        
+        let z_i = z_c[i];
         deriv_raw.fill(0.0);
         if evaluate_bspline_derivative_scalar_into(
             z_i, knot_vector.view(), state.degree,
@@ -2907,7 +2973,7 @@ fn compute_link_derivative_terms_from_state(
         return (g_prime, g_second, b_prime_u);
     }
 
-    let (z, range_width) = state.standardized_z(u);
+    let (z_raw, z_c, range_width) = state.standardized_z(u);
     let inv_rw = 1.0 / range_width;
     let inv_rw2 = inv_rw * inv_rw;
 
@@ -2923,10 +2989,7 @@ fn compute_link_derivative_terms_from_state(
     let mut lower_scratch_second = BsplineScratch::new(state.degree.saturating_sub(2));
 
     for i in 0..n {
-        let z_i = z[i];
-        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-            continue;
-        }
+        let z_i = z_c[i];
 
         deriv_raw.fill(0.0);
         if evaluate_bspline_derivative_scalar_into(
@@ -2951,27 +3014,31 @@ fn compute_link_derivative_terms_from_state(
         }
         g_prime[i] = 1.0 + d_wiggle_dz * inv_rw;
 
-        second_raw.fill(0.0);
-        if evaluate_bspline_second_derivative_scalar_into(
-            z_i,
-            knot_vector.view(),
-            state.degree,
-            &mut second_raw,
-            &mut deriv_lower,
-            &mut lower_basis_second,
-            &mut lower_scratch_second,
-        ).is_err() {
-            continue;
-        }
-        let mut d2_wiggle_dz2 = 0.0;
-        for c in 0..p_link {
-            let mut b_second_c = 0.0;
-            for r in 0..n_raw {
-                b_second_c += second_raw[r] * link_transform[[r, c]];
+        // For the linearly-extended basis, the curvature is zero outside [0, 1].
+        // That is, d²/dz_raw² B_ext(z_raw) = 0 when z_raw != z_c.
+        if (z_raw[i] - z_c[i]).abs() <= 1e-12 {
+            second_raw.fill(0.0);
+            if evaluate_bspline_second_derivative_scalar_into(
+                z_i,
+                knot_vector.view(),
+                state.degree,
+                &mut second_raw,
+                &mut deriv_lower,
+                &mut lower_basis_second,
+                &mut lower_scratch_second,
+            ).is_err() {
+                continue;
             }
-            d2_wiggle_dz2 += b_second_c * state.beta_link[c];
+            let mut d2_wiggle_dz2 = 0.0;
+            for c in 0..p_link {
+                let mut b_second_c = 0.0;
+                for r in 0..n_raw {
+                    b_second_c += second_raw[r] * link_transform[[r, c]];
+                }
+                d2_wiggle_dz2 += b_second_c * state.beta_link[c];
+            }
+            g_second[i] = d2_wiggle_dz2 * inv_rw2;
         }
-        g_second[i] = d2_wiggle_dz2 * inv_rw2;
     }
 
     (g_prime, g_second, b_prime_u)
@@ -3002,7 +3069,8 @@ fn compute_link_derivative_from_result(
     
     let (min_u, max_u) = result.knot_range;
     let range_width = (max_u - min_u).max(1e-6);
-    let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+    let z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
+    let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
     let n_raw = result.knot_vector.len().saturating_sub(result.degree + 1);
     let n_constrained = result.link_transform.ncols();
     if n_raw == 0 || n_constrained == 0 || result.beta_link.len() != n_constrained {
@@ -3016,14 +3084,7 @@ fn compute_link_derivative_from_result(
     let mut lower_scratch = BsplineScratch::new(result.degree.saturating_sub(1));
     
     for i in 0..n {
-        let z_i = z[i];
-        
-        // At boundaries (clamped), g'(u) = 1 (wiggle is constant w.r.t. u)
-        if z_i <= 1e-8 || z_i >= 1.0 - 1e-8 {
-            deriv[i] = 1.0;
-            continue;
-        }
-        
+        let z_i = z_c[i];
         deriv_raw.fill(0.0);
         if evaluate_bspline_derivative_scalar_into(
             z_i, result.knot_vector.view(), result.degree,
@@ -3066,18 +3127,46 @@ pub fn predict_joint(
     let (min_u, max_u) = result.knot_range;
     let range_width = (max_u - min_u).max(1e-6);
     
-    // Standardize: z = (u - min) / range
-    let z: Array1<f64> = eta_base.mapv(|u| ((u - min_u) / range_width).clamp(0.0, 1.0));
+    // Standardize and apply the same linear extension used during training.
+    let z_raw: Array1<f64> = eta_base.mapv(|u| (u - min_u) / range_width);
+    let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
     
     // Build B-spline basis at prediction points using stored parameters
     let b_wiggle = match create_basis::<Dense>(
-        z.view(),
+        z_c.view(),
         KnotSource::Provided(result.knot_vector.view()),
         result.degree,
         BasisOptions::value(),
     ) {
         Ok((basis, _)) => {
-            let raw = basis.as_ref();
+            let mut raw = basis.as_ref().clone();
+            // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
+            let mut needs_ext = false;
+            for i in 0..z_raw.len() {
+                if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+                    needs_ext = true;
+                    break;
+                }
+            }
+            if needs_ext {
+                if let Ok((b_prime_arc, _)) = create_basis::<Dense>(
+                    z_c.view(),
+                    KnotSource::Provided(result.knot_vector.view()),
+                    result.degree,
+                    BasisOptions::first_derivative(),
+                ) {
+                    let b_prime = b_prime_arc.as_ref();
+                    for i in 0..z_raw.len() {
+                        let dz = z_raw[i] - z_c[i];
+                        if dz.abs() <= 1e-12 {
+                            continue;
+                        }
+                        for j in 0..raw.ncols() {
+                            raw[[i, j]] += dz * b_prime[[i, j]];
+                        }
+                    }
+                }
+            }
             if result.link_transform.ncols() > 0 && result.link_transform.nrows() == raw.ncols() {
                 raw.dot(&result.link_transform)
             } else {
