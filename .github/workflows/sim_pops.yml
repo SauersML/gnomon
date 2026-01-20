@@ -35,6 +35,20 @@ jobs:
         run: |
           python sims/sim_pops.py ${{ matrix.sim }}
 
+      - name: Install R and mgcv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y r-base r-base-dev
+          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+
+      - name: Install analysis dependencies
+        run: |
+          uv pip install --system pandas scikit-learn seaborn rpy2
+
+      - name: Run method comparison analysis
+        run: |
+          python sims/analyze_methods.py ${{ matrix.sim }}
+
       - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
@@ -44,4 +58,6 @@ jobs:
             sim${{ matrix.sim }}.tsv
             sim${{ matrix.sim }}*.npz
             sim${{ matrix.sim }}_pcs.png
+            sim${{ matrix.sim }}_comparison_*.png
+            sim${{ matrix.sim }}_metrics.csv
           if-no-files-found: error
