@@ -8131,19 +8131,9 @@ mod tests {
             "STZ failed to zero weighted column means: max |mean| = {max_abs_col_mean_nonuniform:e}"
         );
 
-        // Highlight that enforcing sum-to-zero on the design columns does not
-        // collapse the fitted spline coefficients onto the all-ones nullspace.
-        let pred_coef_sum_uniform: f64 = beta_uniform.slice(s![pred_range_uniform]).sum();
-        let pred_coef_sum_nonuniform: f64 = beta_nonuniform.slice(s![pred_range_nonuniform]).sum();
-
-        let coef_sum_tol = 1e-6;
-        assert!(
-            pred_coef_sum_uniform.abs() > coef_sum_tol,
-            "Sum-to-zero constraint should not force coefficients to sum to zero (uniform case); |sum| = {pred_coef_sum_uniform:e}"
-        );
-        assert!(
-            pred_coef_sum_nonuniform.abs() > coef_sum_tol,
-            "Sum-to-zero constraint should not force coefficients to sum to zero (non-uniform case); |sum| = {pred_coef_sum_nonuniform:e}"
-        );
+        // Math note: the sum-to-zero (STZ) constraint is a property of the *basis*:
+        //   1ᵀ W B = 0  (weighted column means are zero).
+        // It imposes no constraint that the fitted coefficients themselves must have
+        // a non-zero sum; in symmetric problems the coefficient sum can legitimately be 0.
     }
 }
