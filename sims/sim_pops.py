@@ -6,40 +6,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
-
-# ---- Hard dependency: stdpopsim (+msprime, +tskit) ----
-try:
-    import stdpopsim
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency: stdpopsim (and its stack: msprime, tskit).\n"
-        "Install: pip install stdpopsim msprime tskit\n"
-        f"Import error: {e}"
-    )
-
-# ---- Library-first PCA + standardization ----
-try:
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency: scikit-learn.\n"
-        "Install: pip install scikit-learn\n"
-        f"Import error: {e}"
-    )
-
-# ---- Library-first sigmoid + intercept root-find ----
-_SCIPY_OK = True
-try:
-    from scipy.special import expit as sigmoid
-    from scipy.optimize import brentq
-except Exception:
-    _SCIPY_OK = False
-
-    def sigmoid(x: np.ndarray) -> np.ndarray:
-        # Small fallback if scipy is unavailable.
-        x = np.clip(x, -40.0, 40.0)
-        return 1.0 / (1.0 + np.exp(-x))
+import stdpopsim
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from scipy.special import expit as sigmoid
+from scipy.optimize import brentq
 
 
 @dataclass(frozen=True)
@@ -290,17 +261,7 @@ def _solve_intercept_for_prevalence(target_prev: float, eta_no_intercept: np.nda
 
     # Wide bracket; sigmoid saturates hard, so this is safe in practice.
     lo, hi = -60.0, 60.0
-
-    if _SCIPY_OK:
-        return float(brentq(f, lo, hi, maxiter=200))
-    # Minimal fallback if scipy missing.
-    for _ in range(200):
-        mid = 0.5 * (lo + hi)
-        if f(mid) < 0.0:
-            lo = mid
-        else:
-            hi = mid
-    return float(0.5 * (lo + hi))
+    return float(brentq(f, lo, hi, maxiter=200))
 
 
 def _compute_pcs_from_sites(
