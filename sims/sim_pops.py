@@ -639,10 +639,16 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     # --- Write outputs ---
     trees_path = f"{cfg.sim_name}.trees"
     tsv_path = f"{cfg.sim_name}.tsv"
+    vcf_path = f"{cfg.sim_name}.vcf"
     npz_path = f"{cfg.sim_name}_sites.npz"
 
     print(f"[{cfg.sim_name}] Writing {trees_path} ...")
     ts.dump(trees_path)
+
+    print(f"[{cfg.sim_name}] Writing {vcf_path} (for PLINK conversion) ...")
+    with open(vcf_path, "w") as f:
+        ts.write_vcf(f)
+
 
     print(f"[{cfg.sim_name}] Writing {tsv_path} ...")
     _write_tsv(tsv_path, header, rows)
@@ -684,6 +690,10 @@ def main() -> None:
         raise SystemExit("Unknown simulation. Use 1, 2, or 3.")
 
     _simulate_dataset(cfg)
+    
+    # Convert to PLINK format
+    from .plink_utils import run_plink_conversion
+    run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name)
 
 
 if __name__ == "__main__":
