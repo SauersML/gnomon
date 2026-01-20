@@ -18,6 +18,14 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
         "--silent"
     ]
     
+    # Check if plink2 is in PATH, otherwise try likely locations
+    if shutil.which("plink2") is None:
+        # Fallback for GitHub Actions or standard Linux installs
+        if Path("/usr/local/bin/plink2").exists():
+            cmd[0] = "/usr/local/bin/plink2"
+        else:
+             print("WARNING: plink2 not found in PATH or /usr/local/bin/plink2")
+
     print(f"Running PLINK conversion: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
