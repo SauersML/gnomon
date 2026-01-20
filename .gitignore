@@ -13,6 +13,9 @@ calibrate/tests/bench_workdir/
 report.md
 diff.txt
 .devcontainer/
+**/proofs/lakefile.lean
+**/proofs/lean-toolchain
+
 
 # Lean
 .lake/
