@@ -26,38 +26,21 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+           enable-cache: true
 
-      - name: Install PLINK2
+      - name: Set up R library path
         run: |
-          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
-          unzip plink2.zip
-          sudo mv plink2 /usr/local/bin/
-          rm plink2.zip
-          plink2 --version
+          mkdir -p $HOME/R/library
+          echo "R_LIBS_USER=$HOME/R/library" >> $GITHUB_ENV
 
-      - name: Install GCTB
-        run: |
-          wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
-          unzip gctb_2.03beta_Linux.zip
-          sudo mv gctb_2.03beta_Linux/gctb /usr/local/bin/
-          rm -rf gctb_2.03beta_Linux*
-          gctb --help || true  # gctb returns non-zero on help sometimes? Just check it runs.
-
-      - name: Install PRS-CSx
-        run: |
-          git clone https://github.com/getian107/PRScsx.git
-          echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
-          ls -l PRScsx/PRScsx.py
-
-      - name: Install R and mgcv
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
-          sudo Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
-
-      - name: Install R packages (LDpred2 dependencies)
-        run: |
-          sudo Rscript -e 'install.packages(c("bigsnpr", "bigstatsr"), repos="https://cloud.r-project.org")'
+      - name: Cache R packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.R_LIBS_USER }}
+          key: ${{ runner.os }}-r-v1-${{ hashFiles('.github/workflows/sim_pops.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-r-v1-
 
       - name: Install dependencies (Python)
         run: |
@@ -73,6 +56,18 @@ jobs:
       - name: Run simulation
         run: |
           python sims/sim_pops.py ${{ matrix.sim }}
+
+      - name: Install R and mgcv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
+          # Install mgcv and dependencies to user lib (should be cached)
+          Rscript -e 'if(!require("mgcv")) install.packages("mgcv", repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
+
+      - name: Install R packages (LDpred2 dependencies)
+        run: |
+          # Install heavy packages to user lib (cached)
+          Rscript -e 'install.packages(c("bigsnpr", "bigstatsr"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"))'
 
       - name: Run method comparison analysis
         run: |
