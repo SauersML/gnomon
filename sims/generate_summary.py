@@ -116,11 +116,12 @@ def generate_summary_report():
     lines.append("")
     
     # Write to summary file
+    content = '\n'.join(lines)
     with open(summary_file, 'w') as f:
-        f.write('\n'.join(lines))
+        f.write(content)
     
     print(f"✅ Summary report written to {summary_file}")
-    print(f"   Report size: {len('\\n'.join(lines))} bytes (within 1MB limit)")
+    print(f"   Report size: {len(content)} bytes (within 1MB limit)")
 
 
 if __name__ == '__main__':
