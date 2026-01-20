@@ -31,7 +31,7 @@ pub struct BuiltinModel {
 pub const BUILTIN_MODELS: &[BuiltinModel] = &[
     BuiltinModel {
         name: "hwe_1kg_hgdp_gsa_v2",
-        url: "https://raw.githubusercontent.com/SauersML/gnomon/main/map/models/hwe_1kg_hgdp_gsa_v2.json.zst",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gsa_v2.json.zst",
         sha256: "", // Will be populated after first training run
         build: "GRCh38",
         components: 20,
@@ -39,7 +39,7 @@ pub const BUILTIN_MODELS: &[BuiltinModel] = &[
     },
     BuiltinModel {
         name: "hwe_1kg_hgdp_gsa_v3",
-        url: "https://raw.githubusercontent.com/SauersML/gnomon/main/map/models/hwe_1kg_hgdp_gsa_v3.json.zst",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gsa_v3.json.zst",
         sha256: "", // Will be populated after first training run
         build: "GRCh38",
         components: 20,
@@ -47,7 +47,7 @@ pub const BUILTIN_MODELS: &[BuiltinModel] = &[
     },
     BuiltinModel {
         name: "hwe_1kg_hgdp_gda_v1",
-        url: "https://raw.githubusercontent.com/SauersML/gnomon/main/map/models/hwe_1kg_hgdp_gda_v1.json.zst",
+        url: "https://github.com/SauersML/gnomon/releases/download/models-v1/hwe_1kg_hgdp_gda_v1.json.zst",
         sha256: "", // Will be populated after first training run
         build: "GRCh38",
         components: 20,
@@ -251,6 +251,6 @@ mod tests {
         let names = list_model_names();
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v2"));
         assert!(names.contains(&"hwe_1kg_hgdp_gsa_v3"));
-        assert!(names.contains(&"hwe_1kg_hgdp_gda_v1"));
+        assert!(names.contains(&"hwe_1kg_hgdp_gda_v1")); // GDA is still available via release
     }
 }

@@ -65,50 +65,6 @@ jobs:
           name: variant-lists
           path: manifests/*_variants.tsv
 
-  # Fit on ALL variants (no --list)
-  fit-all:
-    name: Fit PCA (all variants)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 480
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install gnomon
-        run: curl -fsSL https://raw.githubusercontent.com/SauersML/gnomon/main/install.sh | bash
-
-      - name: Fit PCA
-        run: |
-          set -euo pipefail
-          mkdir -p map/models
-
-          gnomon fit \
-            gs://gcp-public-data--gnomad/resources/hgdp_1kg/phased_haplotypes_v2/ \
-            --components ${{ env.COMPONENTS }} \
-            --ld \
-            2>&1 | tee fit.log
-
-          mv phased_haplotypes_v2.hwe.json map/models/hwe_1kg_hgdp.json
-          [ -f phased_haplotypes_v2.hwe_summary.tsv ] && mv phased_haplotypes_v2.hwe_summary.tsv map/models/hwe_1kg_hgdp_summary.tsv
-          [ -f phased_haplotypes_v2.samples.tsv ] && mv phased_haplotypes_v2.samples.tsv map/models/hwe_1kg_hgdp_samples.tsv
-
-      - name: Compress model
-        run: |
-          set -euo pipefail
-          zstd -19 --rm map/models/hwe_1kg_hgdp.json
-          ls -lh map/models/
-
-      - name: Upload model
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-all
-          path: |
-            map/models/hwe_1kg_hgdp.*
-            fit.log
-
-  # Fit on GSA v2 variants
   fit-gsa2:
     name: Fit PCA (GSA v2)
     runs-on: ubuntu-22.04
@@ -243,11 +199,11 @@ jobs:
             map/models/hwe_1kg_hgdp_gda_v1.*
             fit.log
 
-  # Commit all models after fits complete
-  commit-models:
-    name: Commit models to repository
+  # Upload models to GitHub Release
+  upload-models:
+    name: Upload models to GitHub Release
     runs-on: ubuntu-22.04
-    needs: [fit-all, fit-gsa2, fit-gsa3, fit-gda]
+    needs: [fit-gsa2, fit-gsa3, fit-gda]
     permissions:
       contents: write
     steps:
@@ -261,37 +217,46 @@ jobs:
           path: artifacts
           merge-multiple: false
 
-      - name: Organize models
+      - name: Collect model files
+        id: collect
         run: |
           set -euo pipefail
-          mkdir -p map/models
+          mkdir -p models
+          
+          # Copy all .zst model files
+          find artifacts -name '*.json.zst' -exec cp {} models/ \;
+          
+          ls -lh models/
+          echo "files=$(ls models/*.json.zst | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
-          # Copy all model files
-          cp artifacts/model-all/map/models/* map/models/ 2>/dev/null || true
-          cp artifacts/model-gsa2/map/models/* map/models/ 2>/dev/null || true
-          cp artifacts/model-gsa3/map/models/* map/models/ 2>/dev/null || true
-          cp artifacts/model-gda/map/models/* map/models/ 2>/dev/null || true
-
-          ls -la map/models/
-
-      - name: Commit and push
+      - name: Create or update models release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          
+          RELEASE_TAG="models-v1"
+          
+          # Create release if it doesn't exist
+          if ! gh release view "$RELEASE_TAG" &>/dev/null; then
+            gh release create "$RELEASE_TAG" \
+              --title "PCA Models v1" \
+              --notes "Pre-trained HWE-scaled PCA models for gnomon.
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+These models are trained on gnomAD 1KG+HGDP phased reference panel (GRCh38).
 
-          git add map/models/
+**Available models:**
+- \`hwe_1kg_hgdp_gsa_v2.json.zst\` - GSA v2 array variants
+- \`hwe_1kg_hgdp_gsa_v3.json.zst\` - GSA v3 array variants  
+- \`hwe_1kg_hgdp_gda_v1.json.zst\` - GDA v1 array variants
 
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
+Run ID: ${{ github.run_id }}"
           fi
-
-          git commit -m "Update PCA models: ${{ env.COMPONENTS }} components with LD shrinkage
-
-          HWE-scaled PCA trained on gnomAD 1KG+HGDP phased reference panel.
-          Models: all variants, GSA v2, GSA v3, GDA v1
-          Run ID: ${{ github.run_id }}"
-
-          git push
+          
+          # Upload each model file (clobber existing)
+          for f in models/*.json.zst; do
+            echo "Uploading $f..."
+            gh release upload "$RELEASE_TAG" "$f" --clobber
+          done
+          
+          echo "✓ Models uploaded to release: $RELEASE_TAG"
