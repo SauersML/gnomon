@@ -12,23 +12,38 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     Uses plink2.
     """
     cmd = [
-        "plink2",
+        "plink2", # Default
         "--vcf", vcf_path,
         "--make-bed",
         "--out", out_prefix,
         "--silent"
     ]
     
-    # Check if plink2 is in PATH, otherwise try likely locations
-    if shutil.which("plink2") is None:
-        # Fallback for GitHub Actions or standard Linux installs
-        if Path("/usr/local/bin/plink2").exists():
-            cmd[0] = "/usr/local/bin/plink2"
-        else:
-             print("WARNING: plink2 not found in PATH or /usr/local/bin/plink2")
+    # Debug detection
+    plink_in_path = shutil.which("plink2")
+    print(f"[DEBUG] shutil.which('plink2') -> {plink_in_path}")
+    
+    # If not in regular PATH, check common locations
+    if plink_in_path:
+        cmd[0] = plink_in_path # Use full path found
+    elif Path("/usr/local/bin/plink2").exists():
+        print(f"[DEBUG] Found at /usr/local/bin/plink2")
+        cmd[0] = "/usr/local/bin/plink2"
+    elif Path("./plink2").exists():
+        print(f"[DEBUG] Found at ./plink2")
+        cmd[0] = str(Path("./plink2").resolve())
+    else:
+        print("[WARNING] plink2 not found in PATH or standard locations. Keeping 'plink2' and hoping for the best.")
 
-    print(f"Running PLINK conversion: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"Running PLINK conversion: '{' '.join(cmd)}'")
+    
+    # Use shell=False (default), explicitly passing executable if needed? 
+    # Usually list args is fine.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError as e:
+         # One last try with shell if strictly needed, but unlikely for plink
+         raise RuntimeError(f"Could not execute plink2 command: {e}. PATH={os.environ.get('PATH')}")
     
     if result.returncode != 0:
         raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
