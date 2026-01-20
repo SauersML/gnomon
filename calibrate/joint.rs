@@ -60,13 +60,27 @@ fn ensure_positive_definite_joint(mat: &mut Array2<f64>) -> f64 {
         return 0.0; // Already positive definite, no stabilization needed
     }
 
-    // Add fixed ridge for solver stability (not objective modification)
+    // Add diagonal stabilization for solver stability.
+    //
+    // IMPORTANT (math wiring): whenever the inner solver uses (A + δI) rather than A,
+    // δ must be tracked and included in the outer cost as:
+    //   0.5 * δ * ||β||²     and     log|S_λ + δI|_+
+    // otherwise the Envelope Theorem (∂V/∂β = 0 at β̂) does not apply.
+    //
+    // We keep δ fixed and rho-independent to avoid introducing kinks into the
+    // profiled objective when the penalty matrix changes with smoothing parameters.
     for i in 0..mat.nrows() {
         mat[[i, i]] += FIXED_STABILIZATION_RIDGE;
     }
+    if mat.cholesky(Side::Lower).is_ok() {
+        return FIXED_STABILIZATION_RIDGE;
+    }
+    eprintln!(
+        "[JOINT] Warning: matrix remained non-SPD after fixed ridge (delta={:.1e}).",
+        FIXED_STABILIZATION_RIDGE
+    );
     FIXED_STABILIZATION_RIDGE
 }
-
 
 /// State for the joint single-index model optimization.
 pub struct JointModelState<'a> {
@@ -1393,7 +1407,16 @@ impl<'a> JointRemlState<'a> {
                 a_mat.scaled_add(lambda_k, s_k);
             }
         }
-        ensure_positive_definite_joint(&mut a_mat);
+        
+        // Symmetrize: the Gauss-Newton construction should be symmetric, but
+        // rounding and mixed products can introduce tiny asymmetry.
+        for i in 0..p_base {
+            for j in 0..i {
+                let v = 0.5 * (a_mat[[i, j]] + a_mat[[j, i]]);
+                a_mat[[i, j]] = v;
+                a_mat[[j, i]] = v;
+            }
+        }
         
         // C = X' diag(W * g') B + X' diag(r) B'
         let mut wb = b_wiggle.clone();
@@ -1403,14 +1426,6 @@ impl<'a> JointRemlState<'a> {
                 wb[[i, j]] *= scale;
             }
         }
-        let mut wb_resid = b_prime_u.clone();
-        for i in 0..n {
-            let scale = residual[i];
-            for j in 0..p_link {
-                wb_resid[[i, j]] *= scale;
-            }
-        }
-        wb += &wb_resid;
         let c_mat = crate::calibrate::faer_ndarray::fast_atb(&state.x_base, &wb);
         
         // D = B' W B + S_link
@@ -1426,7 +1441,14 @@ impl<'a> JointRemlState<'a> {
         if link_penalty.nrows() == p_link && link_penalty.ncols() == p_link {
             d_mat.scaled_add(lambda_link, &link_penalty);
         }
-        ensure_positive_definite_joint(&mut d_mat);
+        // Same symmetry rationale as for A.
+        for i in 0..p_link {
+            for j in 0..i {
+                let v = 0.5 * (d_mat[[i, j]] + d_mat[[j, i]]);
+                d_mat[[i, j]] = v;
+                d_mat[[j, i]] = v;
+            }
+        }
         
         // Spectral log|H|_+ via eigendecomposition (Wood 2011)
         // This approach:
@@ -1497,11 +1519,16 @@ impl<'a> JointRemlState<'a> {
             for i in 0..p {
                 s_ridge[[i, i]] += state.ridge_base_used;
             }
-            let chol = s_ridge.clone().cholesky(Side::Lower).unwrap_or_else(|_| {
-                // Fall back to the pseudo-determinant if even the ridged matrix fails.
-                // This is a severe numerical issue; keep behavior stable.
-                base_reparam.s_transformed.clone().cholesky(Side::Lower).expect("S cholesky")
-            });
+            let chol = match s_ridge.clone().cholesky(Side::Lower) {
+                Ok(ch) => ch,
+                Err(_) => {
+                    eprintln!(
+                        "[LAML] Failed to factor S_base + ridge I (ridge={:.1e}); aborting cost.",
+                        state.ridge_base_used
+                    );
+                    return (f64::INFINITY, None);
+                }
+            };
             2.0 * chol.diag().mapv(f64::ln).sum()
         } else {
             base_reparam.log_det
@@ -1509,10 +1536,13 @@ impl<'a> JointRemlState<'a> {
         let base_rank = base_reparam.e_transformed.nrows() as f64;
 
         let (link_log_det_s, link_rank) = if p_link > 0 {
-            let (eigs, _) = link_penalty
-                .clone()
-                .eigh(Side::Lower)
-                .unwrap_or_else(|_| (Array1::zeros(p_link), Array2::eye(p_link)));
+            let (eigs, _) = match link_penalty.clone().eigh(Side::Lower) {
+                Ok(res) => res,
+                Err(_) => {
+                    eprintln!("[LAML] Link penalty eigendecomposition failed");
+                    return (f64::INFINITY, None);
+                }
+            };
             let max_eig = eigs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
             let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
@@ -1524,10 +1554,16 @@ impl<'a> JointRemlState<'a> {
                 for i in 0..p_link {
                     s_ridge[[i, i]] += state.ridge_link_used;
                 }
-                let chol = s_ridge.clone().cholesky(Side::Lower).unwrap_or_else(|_| {
-                    // Severe numerical issue; fall back to spectral path.
-                    s_ridge.clone().cholesky(Side::Lower).expect("S_link+ridge cholesky")
-                });
+                let chol = match s_ridge.clone().cholesky(Side::Lower) {
+                    Ok(ch) => ch,
+                    Err(_) => {
+                        eprintln!(
+                            "[LAML] Failed to factor S_link*λ + ridge I (ridge={:.1e}); aborting cost.",
+                            state.ridge_link_used
+                        );
+                        return (f64::INFINITY, None);
+                    }
+                };
                 let log_det = 2.0 * chol.diag().mapv(f64::ln).sum();
                 (log_det, rank)
             } else {
