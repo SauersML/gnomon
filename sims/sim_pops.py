@@ -649,6 +649,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     with open(vcf_path, "w") as f:
         ts.write_vcf(f)
 
+
     print(f"[{cfg.sim_name}] Writing {tsv_path} ...")
     _write_tsv(tsv_path, header, rows)
 

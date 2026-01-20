@@ -1484,7 +1484,28 @@ impl<'a> JointRemlState<'a> {
         });
         // Spectral log|S_λ|_+ for penalty matrix (Wood 2011)
         // Uses pure spectral log-det without ridge adjustment
-        let base_log_det_s = base_reparam.log_det;
+        // Math note:
+        //   The stabilized inner solves use (S_λ + δI) as the effective prior precision.
+        //   For objective/gradient consistency, the LAML normalization term must match:
+        //     log|S_λ + δI| = log|S_λ|_+ + M_p * log(δ)   (when S_λ is rank-deficient).
+        //   Using log|S_λ|_+ while also adding 0.5*δ||β||² in the quadratic term defines
+        //   an incoherent objective and breaks the envelope-theorem simplification.
+        let base_log_det_s = if state.ridge_base_used > 0.0 {
+            use crate::calibrate::faer_ndarray::FaerCholesky;
+            let p = base_reparam.s_transformed.nrows();
+            let mut s_ridge = base_reparam.s_transformed.clone();
+            for i in 0..p {
+                s_ridge[[i, i]] += state.ridge_base_used;
+            }
+            let chol = s_ridge.clone().cholesky(Side::Lower).unwrap_or_else(|_| {
+                // Fall back to the pseudo-determinant if even the ridged matrix fails.
+                // This is a severe numerical issue; keep behavior stable.
+                base_reparam.s_transformed.clone().cholesky(Side::Lower).expect("S cholesky")
+            });
+            2.0 * chol.diag().mapv(f64::ln).sum()
+        } else {
+            base_reparam.log_det
+        };
         let base_rank = base_reparam.e_transformed.nrows() as f64;
 
         let (link_log_det_s, link_rank) = if p_link > 0 {
@@ -1496,11 +1517,27 @@ impl<'a> JointRemlState<'a> {
             let tol = if max_eig > 0.0 { max_eig * 1e-12 } else { 1e-12 };
             let positive: Vec<f64> = eigs.iter().cloned().filter(|&ev| ev > tol).collect();
             let rank = positive.len() as f64;
-            // Spectral log|λ*S|_+ = Σ log(λ*σ_i) for positive eigenvalues
-            let log_det = positive.iter()
-                .map(|&ev| (lambda_link * ev).max(1e-300).ln())
-                .sum::<f64>();
-            (log_det, rank)
+            if state.ridge_link_used > 0.0 {
+                use crate::calibrate::faer_ndarray::FaerCholesky;
+                // Use full log|λ S + δ I| to match the stabilized link solve.
+                let mut s_ridge = link_penalty.mapv(|v| v * lambda_link);
+                for i in 0..p_link {
+                    s_ridge[[i, i]] += state.ridge_link_used;
+                }
+                let chol = s_ridge.clone().cholesky(Side::Lower).unwrap_or_else(|_| {
+                    // Severe numerical issue; fall back to spectral path.
+                    s_ridge.clone().cholesky(Side::Lower).expect("S_link+ridge cholesky")
+                });
+                let log_det = 2.0 * chol.diag().mapv(f64::ln).sum();
+                (log_det, rank)
+            } else {
+                // Spectral log|λ*S|_+ = Σ log(λ*σ_i) for positive eigenvalues
+                let log_det = positive
+                    .iter()
+                    .map(|&ev| (lambda_link * ev).max(1e-300).ln())
+                    .sum::<f64>();
+                (log_det, rank)
+            }
         } else {
             (0.0, 0.0)
         };

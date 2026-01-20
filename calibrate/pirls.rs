@@ -915,42 +915,18 @@ fn compute_firth_hat_and_half_logdet_sparse(
     // Firth correction for GAMs uses the penalized Fisher information (X' W X + S).
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    // We can reuse the computed Hessian for the Fisher information log-det term
-    // instead of recomputing manual interaction loops.
-    // Use the penalized matrix when provided.
-    let mut fisher = stabilized.clone();
-    
-    // Symmetrize fisher (redundant if matmul is precise/symmetric but good practice)
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (fisher[[i, j]] + fisher[[j, i]]);
-            fisher[[i, j]] = v;
-            fisher[[j, i]] = v;
-        }
-    }
-    
-    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
-    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
     })?;
-    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+    let half_log_det = chol.diag().mapv(f64::ln).sum();
 
-
-    let h_view = FaerArrayView::new(&stabilized);
-    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
     let mut identity = Array2::<f64>::zeros((p, p));
     for i in 0..p {
         identity[[i, i]] = 1.0;
     }
-    let mut identity_view = array2_to_mat_mut(&mut identity);
-    chol_faer.solve_in_place(identity_view.as_mut());
-    let h_inv_arr = identity;
+    let h_inv_arr = chol.solve_mat(&identity);
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     let x_view = x_design_csr.as_ref();
@@ -2206,6 +2182,11 @@ pub fn solve_penalized_least_squares(
     // Apply a constant ridge whenever penalties are present:
     //   H = X'WX + S_λ + ridge * I
     // This makes the objective smooth in rho and keeps cost/gradient consistent.
+    //
+    // Math note (Envelope Theorem consistency): if we solve for β using a stabilized
+    // system (H + δI)β = b, then the outer objective must include the matching
+    // quadratic term 0.5 * δ * ||β||². Otherwise ∇β V(β, ρ) ≠ 0 at the reported
+    // solution and the standard dV/dρ formula (ignoring dβ/dρ) becomes invalid.
     let has_penalty = e_transformed.nrows() > 0;
     let use_svd_path = !has_penalty;
     let nugget = if has_penalty {
@@ -2224,7 +2205,8 @@ pub fn solve_penalized_least_squares(
     // Build the RHS for the system H * beta = X'Wz
     let rhs_vec = &workspace.vec_buf_p; // X'Wz
 
-    // Track detected numerical rank for SVD path
+    // Track detected numerical rank and the actual stabilization used.
+    let mut ridge_used = nugget;
     let (beta_vec, detected_rank) = if use_svd_path {
         // SVD-based pseudoinverse for exact least squares on rank-deficient problems.
         // Solve H β = b where H = X'WX is rank-deficient using H⁺ = V Σ⁺ U'.
@@ -2235,6 +2217,7 @@ pub fn solve_penalized_least_squares(
         // Use the FaerEigh trait which returns (eigenvalues: Array1, eigenvectors: Array2)
         match penalized_hessian.eigh(Side::Lower) {
             Ok((eigenvalues, eigenvectors)) => {
+                ridge_used = 0.0;
                 // Find maximum eigenvalue for tolerance calculation
                 let max_eig: f64 = eigenvalues.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
                 let tol = 1e-12 * max_eig;
@@ -2263,11 +2246,15 @@ pub fn solve_penalized_least_squares(
             Err(_) => {
                 // Fallback to LDLT with fixed ridge if eigendecomposition fails
                 let mut reg_h = penalized_hessian.clone();
-                if FIXED_STABILIZATION_RIDGE > 0.0 {
+                ridge_used = if FIXED_STABILIZATION_RIDGE > 0.0 {
                     for i in 0..p_dim {
                         reg_h[[i, i]] += FIXED_STABILIZATION_RIDGE;
                     }
-                }
+                    FIXED_STABILIZATION_RIDGE
+                } else {
+                    0.0
+                };
+                regularized_hessian = reg_h.clone();
                 let h_reg_view = FaerArrayView::new(&reg_h);
                 let rhs_mat = {
                     let mut m = faer::Mat::zeros(p_dim, 1);
@@ -2340,7 +2327,7 @@ pub fn solve_penalized_least_squares(
             penalized_hessian: penalized_hessian, // Return original H for derivatives
             edf,
             scale,
-            ridge_used: nugget, // Report the fixed ridge (may be 0 without penalties)
+            ridge_used,
         },
         detected_rank, // Return actual numerical rank detected by solver
     ))
@@ -4236,24 +4223,14 @@ fn compute_firth_hat_and_half_logdet(
     // to match the outer LAML objective and its derivatives.
     ensure_positive_definite_with_label(&mut stabilized, "Firth Fisher information")?;
 
-    let mut fisher = stabilized.clone();
-    ensure_positive_definite_with_label(&mut fisher, "Firth Fisher information")?;
-    let chol_fisher = fisher.clone().cholesky(Side::Lower).map_err(|_| {
+    let chol = stabilized.clone().cholesky(Side::Lower).map_err(|_| {
         EstimationError::HessianNotPositiveDefinite {
             min_eigenvalue: f64::NEG_INFINITY,
         }
     })?;
-    let half_log_det = chol_fisher.diag().mapv(f64::ln).sum();
+    let half_log_det = chol.diag().mapv(f64::ln).sum();
 
-    let h_view = FaerArrayView::new(&stabilized);
-    let chol_faer = FaerLlt::new(h_view.as_ref(), Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
-    let mut rhs = workspace.wx.t().to_owned();
-    let mut rhs_view = array2_to_mat_mut(&mut rhs);
-    chol_faer.solve_in_place(rhs_view.as_mut());
+    let rhs = chol.solve_mat(&workspace.wx.t().to_owned());
 
     let mut hat_diag = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -4290,21 +4267,24 @@ fn ensure_positive_definite_with_ridge(
     } else {
         0.0
     };
+ 
+    if hess.cholesky(Side::Lower).is_ok() {
+        return Ok(0.0);
+    }
+ 
     if ridge > 0.0 {
         for i in 0..hess.nrows() {
             hess[[i, i]] += ridge;
         }
-    }
-
-    if hess.cholesky(Side::Lower).is_ok() {
-        if ridge > 0.0 {
+ 
+        if hess.cholesky(Side::Lower).is_ok() {
             log::debug!(
                 "{} stabilized with fixed ridge {:.1e}.",
                 label,
                 ridge
             );
+            return Ok(ridge);
         }
-        return Ok(ridge);
     }
 
     if let Ok((evals, _)) = hess.eigh(Side::Lower) {
