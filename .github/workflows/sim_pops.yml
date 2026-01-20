@@ -47,10 +47,10 @@ jobs:
 
       - name: Install PLINK2
         run: |
-          wget https://s3.amazonaws.com/plink2-assets/alpha5/plink2_linux_x86_64_20240105.zip
-          unzip plink2_linux_x86_64_20240105.zip
+          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
+          unzip plink2.zip
           sudo mv plink2 /usr/local/bin/
-          rm plink2_linux_x86_64_20240105.zip
+          rm plink2.zip
 
       - name: Install GCTB
         run: |
