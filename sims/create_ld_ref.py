@@ -15,9 +15,24 @@ from pathlib import Path
 
 def read_plink_bed(bfile):
     """Read PLINK .bed file and return genotype matrix."""
-    from pandas_plink import read_plink
-    (bim, fam, bed) = read_plink(bfile)
-    return bim, fam, bed.compute()
+    try:
+        from pandas_plink import read_plink
+        (bim, fam, bed) = read_plink(bfile)
+        return bim, fam, bed.compute()
+    except Exception as e:
+        pandas_version = getattr(pd, "__version__", "<unknown>")
+        pandas_plink_version = "<unknown>"
+        try:
+            import pandas_plink
+
+            pandas_plink_version = getattr(pandas_plink, "__version__", "<unknown>")
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Failed to read PLINK files via pandas-plink. "
+            f"pandas={pandas_version} pandas_plink={pandas_plink_version} "
+            f"bfile={bfile}. error={type(e).__name__}: {e}"
+        ) from e
 
 
 def _read_ld_matrix_from_file(path: str) -> np.ndarray:
