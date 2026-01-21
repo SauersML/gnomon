@@ -4,6 +4,10 @@ Generate PRS-CSx LD reference from PLINK training data.
 Creates the HDF5 LD blocks and SNP info files expected by PRS-CSx.
 """
 import sys
+import os
+import subprocess
+import tempfile
+import shutil
 import numpy as np
 import pandas as pd
 import h5py
@@ -15,6 +19,43 @@ def read_plink_bed(bfile):
     (bim, fam, bed) = read_plink(bfile)
     return bim, fam, bed.compute()
 
+
+def _read_ld_matrix_from_file(path: str) -> np.ndarray:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        ld = [[float(val) for val in line.strip().split()] for line in f if line.strip()]
+    return np.asarray(ld, dtype=np.float64)
+
+
+def _compute_ld_matrix_plink(bfile: str, snplist: list[str], work_dir: str) -> np.ndarray:
+    # plink/plink2 --extract expects one variant ID per line
+    snp_path = os.path.join(work_dir, "snplist.txt")
+    with open(snp_path, "w", encoding="utf-8") as f:
+        for snp in snplist:
+            f.write(f"{snp}\n")
+
+    out_prefix = os.path.join(work_dir, "ld")
+
+    plink_exe = shutil.which("plink2") or shutil.which("plink")
+    if plink_exe is None:
+        raise RuntimeError("Neither plink2 nor plink is available on PATH")
+
+    cmd = [
+        plink_exe,
+        "--bfile", bfile,
+        "--extract", snp_path,
+        "--r", "square",
+        "--out", out_prefix,
+        "--silent",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"PLINK LD computation failed: {result.stderr}")
+
+    ld_file = out_prefix + ".ld"
+    if not os.path.exists(ld_file):
+        raise RuntimeError(f"Expected PLINK LD output not found: {ld_file}")
+    return _read_ld_matrix_from_file(ld_file)
+
 def compute_ld_blocks(bim, geno, block_size=1000):
     """
     Compute LD correlation matrices in blocks.
@@ -22,24 +63,37 @@ def compute_ld_blocks(bim, geno, block_size=1000):
     """
     n_snps = geno.shape[1]
     blocks = []
+
+    ld_method = os.environ.get("PRSCSX_LD_METHOD", "numpy").strip().lower()
+    bfile_for_plink = os.environ.get("PRSCSX_LD_BFILE", "").strip()
+    block_size = int(os.environ.get("PRSCSX_LD_BLOCK_SIZE", block_size))
     
     for start in range(0, n_snps, block_size):
         end = min(start + block_size, n_snps)
-        block_geno = geno[:, start:end]
-        
-        # Standardize genotypes
-        means = np.nanmean(block_geno, axis=0)
-        stds = np.nanstd(block_geno, axis=0)
-        stds[stds == 0] = 1  # Avoid division by zero
-        
-        block_std = (block_geno - means) / stds
-        block_std = np.nan_to_num(block_std)
-        
-        # Compute correlation matrix
-        ld_matrix = np.corrcoef(block_std.T)
-        ld_matrix = np.nan_to_num(ld_matrix)
-        
         block_snps = bim['snp'].iloc[start:end].astype(str).tolist()
+        ld_matrix = None
+        if ld_method == "plink" and bfile_for_plink:
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    ld_matrix = _compute_ld_matrix_plink(bfile_for_plink, block_snps, td)
+            except Exception as e:
+                print(f"WARNING: Falling back to numpy LD for block {start}:{end} due to: {e}")
+
+        if ld_matrix is None:
+            block_geno = geno[:, start:end]
+
+            # Standardize genotypes
+            means = np.nanmean(block_geno, axis=0)
+            stds = np.nanstd(block_geno, axis=0)
+            stds[stds == 0] = 1  # Avoid division by zero
+        
+            block_std = (block_geno - means) / stds
+            block_std = np.nan_to_num(block_std)
+        
+            # Compute correlation matrix
+            ld_matrix = np.corrcoef(block_std.T)
+            ld_matrix = np.nan_to_num(ld_matrix)
+
         blocks.append((start, end, ld_matrix, block_snps))
     
     return blocks

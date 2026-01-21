@@ -185,6 +185,10 @@ jobs:
       - name: Setup for PRS-CSx
         if: matrix.method == 'PRS-CSx'
         run: |
+          export PRSCSX_LD_METHOD=plink
+          export PRSCSX_LD_BFILE=sim${{ matrix.sim }}_work/train
+          export PRSCSX_LD_BLOCK_SIZE=300
+
           # Generate LD reference from training data
           rm -rf prscsx_ref
           mkdir -p prscsx_ref
