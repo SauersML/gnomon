@@ -13,6 +13,8 @@ jobs:
   # ------------------------------------------------------------------
   simulate:
     runs-on: ubuntu-latest
+    env:
+      SIM_CACHE_VERSION: v1
     strategy:
       matrix:
         sim: [1, 2, 3] # Adjusted to match original var name if possible, or use sim_id
@@ -35,7 +37,9 @@ jobs:
             sim${{ matrix.sim }}.fam
             sim${{ matrix.sim }}_sites.npz
             sim${{ matrix.sim }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ hashFiles('sims/**') }}
+          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+          restore-keys: |
+            sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-
 
       - name: Cache status
         run: |
@@ -92,7 +96,7 @@ jobs:
             sim${{ matrix.sim }}.fam
             sim${{ matrix.sim }}_sites.npz
             sim${{ matrix.sim }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ hashFiles('sims/**') }}
+          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
 
       - name: Upload Simulation Data (Artifact Stream A)
         uses: actions/upload-artifact@v4
