@@ -55,10 +55,15 @@ def write_prscsx_reference(bim, ld_blocks, chrom, output_dir):
             blk_name = f"blk_{idx}"
             f.create_dataset(blk_name, data=ld_matrix, compression='gzip')
     
-    # Write SNP info file
+    # Write SNP info file - ensure chromosome is numeric
     snpinfo_file = output_dir / f"snpinfo_1kg_chr{chrom}"
+    
+    # Normalize chromosome encoding (remove 'chr' prefix if present)
+    chrom_values = bim['chrom'].astype(str).values
+    chrom_values = np.array([c.replace('chr', '').replace('Chr', '') for c in chrom_values])
+    
     snp_info = pd.DataFrame({
-        'CHR': bim['chrom'].values,
+        'CHR': chrom_values,
         'SNP': bim['snp'].values,
         'BP': bim['pos'].values,
         'A1': bim['a0'].values,
