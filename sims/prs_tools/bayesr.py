@@ -39,16 +39,22 @@ class BayesR:
         out_file = f"{out_prefix}.snpRes"
         if not os.path.exists(out_file):
              raise RuntimeError(f"GCTB output file not found: {out_file}")
-             
+
         # Check if file has content and expected header
         try:
             with open(out_file, 'r') as f:
                 header = f.readline()
                 if not header.strip():
                      raise RuntimeError(f"GCTB output file {out_file} is empty.")
-                if 'Effect' not in header:
-                     # GCTB 2.03+ usually has Id Name Chrom Position A1 A2 ... Effect
-                     raise RuntimeError(f"GCTB output file {out_file} missing 'Effect' column. Header: {header}")
+                cols = header.strip().split()
+                cols_l = {c.lower() for c in cols}
+                # GCTB versions/flags differ; accept a few common effect-size column names.
+                effect_candidates = ["effect", "beta", "b", "mean", "bhat"]
+                if not any(c in cols_l for c in effect_candidates):
+                     raise RuntimeError(
+                         f"GCTB output file {out_file} missing an effect column. "
+                         f"Tried={effect_candidates}. Header: {header}"
+                     )
         except Exception as e:
              raise RuntimeError(f"Validation of GCTB output failed: {e}")
              
@@ -63,11 +69,30 @@ class BayesR:
         # PLINK2 --score needs: ID, Allele, Effect
         
         # Read effect file
-        df = pd.read_csv(effect_file, delim_whitespace=True)
+        df = pd.read_csv(effect_file, sep=r'\s+')
         # Columns: Id Name Chrom Position A1 A2 PPIP PIP_0.001 ... Effect
+
+        cols_lower = {c.lower(): c for c in df.columns}
+        name_col = cols_lower.get('name') or cols_lower.get('snp') or cols_lower.get('id')
+        a1_col = cols_lower.get('a1') or cols_lower.get('allele1')
+        effect_col = (
+            cols_lower.get('effect')
+            or cols_lower.get('beta')
+            or cols_lower.get('b')
+            or cols_lower.get('mean')
+            or cols_lower.get('bhat')
+        )
+
+        if name_col is None or a1_col is None or effect_col is None:
+            head_preview = df.head(10).to_string(index=False)
+            raise RuntimeError(
+                "Could not identify required columns in BayesR .snpRes. "
+                f"Needed SNP/Name + A1 + Effect. Found columns={list(df.columns)}. "
+                f"Head:\n{head_preview}"
+            )
         
         score_file = f"{out_prefix}.score"
-        df[['Name', 'A1', 'Effect']].to_csv(score_file, sep='\t', index=False, header=False)
+        df[[name_col, a1_col, effect_col]].to_csv(score_file, sep='\t', index=False, header=False)
         
         cmd = [
             "plink2",
