@@ -176,12 +176,14 @@ jobs:
         with:
           name: model-scores-${{ matrix.sim }}-BayesR
           path: sim${{ matrix.sim }}_work/
+          merge-multiple: true
 
       - name: Download LDpred2 Scores
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim }}-LDpred2
           path: sim${{ matrix.sim }}_work/
+          merge-multiple: true
 
       - name: Calibration Analysis
         run: |
