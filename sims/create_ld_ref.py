@@ -58,9 +58,9 @@ def write_prscsx_reference(bim, ld_blocks, chrom, output_dir):
     # Write SNP info file - ensure chromosome is numeric
     snpinfo_file = output_dir / f"snpinfo_1kg_chr{chrom}"
     
-    # Normalize chromosome encoding (remove 'chr' prefix if present)
-    chrom_values = bim['chrom'].astype(str).values
-    chrom_values = np.array([c.replace('chr', '').replace('Chr', '') for c in chrom_values])
+    # Force chromosome to match the requested chromosome.
+    # This keeps snpinfo consistent with the PRS-CSx run chrom (e.g. 22).
+    chrom_values = np.full(shape=(bim.shape[0],), fill_value=str(chrom), dtype=object)
     
     snp_info = pd.DataFrame({
         'CHR': chrom_values,

@@ -37,6 +37,7 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     cmd = [
         plink_exe,
         "--vcf", vcf_numeric,
+        "--set-chr", "22",
         "--max-alleles", "2",
         "--rm-dup", "exclude-all",
         "--make-bed",
