@@ -18,10 +18,22 @@ class PRScsx:
         """
         Run GWAS using PLINK2 to get summary stats.
         """
+        # Verify phenotype has variation
+        import pandas as pd
+        pheno_df = pd.read_csv(pheno_file, sep=r'\s+', header=None, names=['FID', 'IID', 'PHENO'])
+        n_cases = (pheno_df['PHENO'] == 1).sum()
+        n_controls = (pheno_df['PHENO'] == 0).sum()
+        
+        if n_cases == 0 or n_controls == 0:
+            raise RuntimeError(f"Phenotype has no variation: {n_cases} cases, {n_controls} controls")
+        
+        print(f"GWAS phenotype: {n_cases} cases, {n_controls} controls")
+        
         cmd = [
             "plink2",
             "--bfile", bfile,
             "--pheno", pheno_file,
+            "--1",  # Phenotype is case/control coded as 0/1
             "--glm", "allow-no-covars", "hide-covar",
             "--out", out_prefix
         ]
