@@ -36,8 +36,24 @@ class BayesR:
         if result.returncode != 0:
             raise RuntimeError(f"GCTB BayesR failed:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}")
             
+        out_file = f"{out_prefix}.snpRes"
+        if not os.path.exists(out_file):
+             raise RuntimeError(f"GCTB output file not found: {out_file}")
+             
+        # Check if file has content and expected header
+        try:
+            with open(out_file, 'r') as f:
+                header = f.readline()
+                if not header.strip():
+                     raise RuntimeError(f"GCTB output file {out_file} is empty.")
+                if 'Effect' not in header:
+                     # GCTB 2.03+ usually has Id Name Chrom Position A1 A2 ... Effect
+                     raise RuntimeError(f"GCTB output file {out_file} missing 'Effect' column. Header: {header}")
+        except Exception as e:
+             raise RuntimeError(f"Validation of GCTB output failed: {e}")
+             
         print("BayesR training complete.")
-        return f"{out_prefix}.snpRes"
+        return out_file
 
     def predict(self, bfile_test, effect_file, out_prefix):
         """

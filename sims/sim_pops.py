@@ -698,6 +698,17 @@ def main() -> None:
     from plink_utils import run_plink_conversion
     run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name)
 
+    # Cleanup intermediate files to save space
+    import os
+    try:
+        if os.path.exists(f"{cfg.sim_name}.trees"):
+            os.remove(f"{cfg.sim_name}.trees")
+        if os.path.exists(f"{cfg.sim_name}.vcf"):
+            os.remove(f"{cfg.sim_name}.vcf")
+        print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf).")
+    except Exception as e:
+        print(f"WARNING: Cleanup failed: {e}")
+
 
 if __name__ == "__main__":
     main()

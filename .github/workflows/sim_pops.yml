@@ -8,164 +8,227 @@ on:
       - ".github/workflows/sim_pops.yml"
 
 jobs:
+  # ------------------------------------------------------------------
+  # JOB 1: SIMULATE & SPLIT (Generate Data)
+  # ------------------------------------------------------------------
   simulate:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        sim: [1, 2, 3]
-
+        sim: [1, 2, 3] # Adjusted to match original var name if possible, or use sim_id
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-           enable-cache: true
-
-      - name: Set up R library path
+      - name: Install dependencies
         run: |
-          mkdir -p $HOME/R/library
-          echo "R_LIBS_USER=$HOME/R/library" >> $GITHUB_ENV
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
 
-      - name: Restore R packages cache
-        id: cache-r-packages
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/R/library
-          key: ${{ runner.os }}-r-ldpred2-v2-${{ hashFiles('.github/workflows/sim_pops.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-r-ldpred2-v2-
-
-      - name: Install R and R packages
+      - name: Run Simulation ${{ matrix.sim }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y r-base r-base-dev build-essential libtirpc-dev unzip wget
-          # Check if packages are already installed (from cache)
-          Rscript -e '
-            lib_path <- Sys.getenv("R_LIBS_USER")
-            .libPaths(c(lib_path, .libPaths()))
-            
-            needed <- c("mgcv", "bigsnpr", "bigstatsr")
-            installed <- rownames(installed.packages(lib.loc = lib_path))
-            missing <- setdiff(needed, installed)
-            
-            if (length(missing) > 0) {
-              cat("Installing missing packages:", paste(missing, collapse=", "), "\n")
-              install.packages(missing, repos="https://cloud.r-project.org", lib=lib_path)
-            } else {
-              cat("All R packages already cached.\n")
-            }
-          '
+          set -e
+          echo "Running Simulation ${{ matrix.sim }}..."
+          python sims/sim_pops.py ${{ matrix.sim }}
+          
+          # sim_pops.py now deletes .trees and .vcf automatically on success
+          # Verify they are gone to save space
+          if [ -f "sim${{ matrix.sim }}.trees" ]; then
+            echo "Error: trees file was not deleted!"
+            exit 1
+          fi
 
-      - name: Save R packages cache
-        if: always() && steps.cache-r-packages.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/R/library
-          key: ${{ runner.os }}-r-ldpred2-v2-${{ hashFiles('.github/workflows/sim_pops.yml') }}
-
-      - name: Install dependencies (Python)
+      - name: Split Data (Train/Test)
         run: |
-          uv pip install --system numpy stdpopsim msprime tskit scipy scikit-learn matplotlib pandas seaborn rpy2 h5py
+          set -e
+          echo "Splitting Data for Sim ${{ matrix.sim }}..."
+          python sims/split_data.py ${{ matrix.sim }}
 
-      - name: Install PLINK2
+      - name: Upload Simulation Data (Artifact Stream A)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-data-${{ matrix.sim }}
+          path: |
+            sim${{ matrix.sim }}_work/
+            sim${{ matrix.sim }}.tsv
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # JOB 2: TRAIN MODELS (Matrix Strategy)
+  # ------------------------------------------------------------------
+  train:
+    needs: simulate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # Let other methods finish if one fails
+      matrix:
+        sim: [1, 2, 3]
+        method: [BayesR, LDpred2] # PRS-CSx disabled until ref panel solution
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Install Plink2
         run: |
           wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
           unzip plink2.zip
           sudo mv plink2 /usr/local/bin/
-          rm plink2.zip
-          plink2 --version
 
-      - name: Install GCTB
+      - name: Download Simulation Data
+        uses: actions/download-artifact@v4
+        with:
+          name: sim-data-${{ matrix.sim }}
+
+      # --- Method Specific Setup ---
+      
+      - name: Setup for BayesR
+        if: matrix.method == 'BayesR'
         run: |
+          mkdir -p gctb_bin
           wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
-          unzip gctb_2.03beta_Linux.zip
-          sudo mv gctb_2.03beta_Linux/gctb /usr/local/bin/
-          rm -rf gctb_2.03beta_Linux*
-          gctb --help || true  # gctb returns non-zero on help sometimes? Just check it runs.
+          unzip gctb_2.03beta_Linux.zip -d gctb_bin
+          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
+          chmod +x /usr/local/bin/gctb
 
-      - name: Install PRS-CSx
+      - name: Setup for LDpred2
+        if: matrix.method == 'LDpred2'
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+      
+      - name: Install R Dependencies (LDpred2)
+        if: matrix.method == 'LDpred2'
         run: |
-          git clone https://github.com/getian107/PRScsx.git
-          echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
-          ls -l PRScsx/PRScsx.py
+          sudo apt-get install -y libcurl4-openssl-dev
+          Rscript -e 'install.packages("bigsnpr", repos="https://cloud.r-project.org")'
 
-      - name: Verify Environment
+      - name: Train & Score ${{ matrix.method }}
         run: |
-          which plink2
-          which gctb
-          echo "PRSCSX_PATH=$PRSCSX_PATH"
-          python -c "import msprime, tskit, pandas; print('Python deps ok')"
-          Rscript -e 'library(bigsnpr); library(bigstatsr); cat("R packages ok\n")'
+          set -e
+          # Ensure R.utils is present for bigsnpr
+          if [ "${{ matrix.method }}" == "LDpred2" ]; then
+             Rscript -e 'if(!require("R.utils", quietly=TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")'
+          fi
+          
+          echo "Training ${{ matrix.method }} on Sim ${{ matrix.sim }}..."
+          python sims/train_model.py ${{ matrix.sim }} ${{ matrix.method }}
 
-      - name: Run simulation
-        run: |
-          python sims/sim_pops.py ${{ matrix.sim }}
-
-      - name: Run method comparison analysis
-        run: |
-          python sims/analyze_methods.py ${{ matrix.sim }}
-
-      - name: Upload outputs
+      - name: Upload Scores
         uses: actions/upload-artifact@v4
         with:
-          name: sim-${{ matrix.sim }}-outputs
-          path: |
-            sim${{ matrix.sim }}.trees
-            sim${{ matrix.sim }}.tsv
-            sim${{ matrix.sim }}.vcf
-            sim${{ matrix.sim }}.bed
-            sim${{ matrix.sim }}.bim
-            sim${{ matrix.sim }}.fam
-            sim${{ matrix.sim }}*.phen
-            sim${{ matrix.sim }}*.npz
-            sim${{ matrix.sim }}_pcs.png
-            sim${{ matrix.sim }}_comparison_*.png
-            sim${{ matrix.sim }}_metrics.csv
+          name: model-scores-${{ matrix.sim }}-${{ matrix.method }}
+          path: sim${{ matrix.sim }}_work/*.sscore
           if-no-files-found: error
 
-  # Consolidate all simulation results and generate summary
+  # ------------------------------------------------------------------
+  # JOB 3: EVALUATE & CALIBRATE
+  # ------------------------------------------------------------------
+  evaluate:
+    needs: train
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sim: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Download Simulation Data
+        uses: actions/download-artifact@v4
+        with:
+          name: sim-data-${{ matrix.sim }}
+
+      - name: Download BayesR Scores
+        uses: actions/download-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim }}-BayesR
+          path: sim${{ matrix.sim }}_work/
+
+      - name: Download LDpred2 Scores
+        uses: actions/download-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim }}-LDpred2
+          path: sim${{ matrix.sim }}_work/
+
+      - name: Calibration Analysis
+        run: |
+          set -e
+          echo "Running Evaluation for Sim ${{ matrix.sim }}..."
+          python sims/evaluate.py ${{ matrix.sim }}
+
+      - name: Upload Results (Stream B)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-results-${{ matrix.sim }}
+          path: |
+            sim${{ matrix.sim }}_metrics.csv
+            sim${{ matrix.sim }}_comparison_*.png
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # JOB 4: REPORT (Consolidate)
+  # ------------------------------------------------------------------
   report:
     runs-on: ubuntu-latest
-    needs: simulate
-    if: always()  # Run even if some simulations fail
-    
+    needs: evaluate
+    if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-      
       - name: Install dependencies
         run: |
+          pip install uv
           uv pip install --system pandas tabulate
       
-      - name: Download all artifacts
+      - name: Download all results
         uses: actions/download-artifact@v4
         with:
+          pattern: sim-results-*
           path: artifacts
+          merge-multiple: true
       
       - name: Copy artifacts to working directory
         run: |
-          find artifacts -name '*.png' -exec cp {} . \;
-          find artifacts -name '*.csv' -exec cp {} . \;
-          ls -la sim*.png sim*.csv || echo "Some files missing"
+          # Flatten artifacts if needed, but merge-multiple should handle it?
+          # If merge-multiple: true, files are in 'artifacts/' root.
+          cp artifacts/*.csv . || true
+          cp artifacts/*.png . || true
+          ls -la
       
       - name: Generate consolidated summary
         run: |
+          # Ensure generate_summary.py is robust to missing files if some jobs failed
           python sims/generate_summary.py
       
       - name: Upload summary as artifact

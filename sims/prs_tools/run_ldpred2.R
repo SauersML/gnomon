@@ -2,6 +2,9 @@ library(bigsnpr)
 library(bigstatsr)
 library(data.table)
 
+# Ensure R.utils is available for snp_asGeneticPos
+if (!require("R.utils", quietly = TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")
+
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 4) {
     stop("Usage: Rscript run_ldpred2.R <bfile_train> <pheno_file> <bfile_val> <out_prefix>")

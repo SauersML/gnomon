@@ -121,9 +121,8 @@ class PRScsx:
         ]
         
         print(f"Running PRS-CSx: {' '.join(cmd)}")
-        # Verify ref_dir exists, otherwise this will fail
-        if not os.path.exists(ref_dir):
-            print(f"WARNING: Reference directory {ref_dir} not found. PRS-CSx will fail.")
+        # We assume ref_dir exists. If not, the tool or python will raise an error.
+        # Strict fail-fast: do not check and skip.
             
         result = subprocess.run(cmd, capture_output=True, text=True)
         

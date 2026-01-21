@@ -8,3 +8,7 @@ rpy2
 tabulate
 scipy
 h5py
+msprime
+tskit
+stdpopsim
+statsmodels
