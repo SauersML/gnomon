@@ -20,8 +20,8 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
         "--max-alleles", "2",
         "--rm-dup", "exclude-all",
         "--make-bed",
-        "--allow-extra-chr",  # Allow non-standard chromosome names
-        "--chr-set", "22",  # Ensure chromosomes are numeric (remove 'chr' prefix)
+        "--allow-extra-chr",
+        "--output-chr", "26",  # Output numeric chromosomes (strips chr prefix)
         "--out", out_prefix,
         "--silent"
     ]
