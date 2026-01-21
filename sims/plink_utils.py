@@ -14,20 +14,32 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
     
+    # stdpopsim outputs "chr22" but PLINK and PRS-CSx expect "22"
+    # Preprocess VCF to strip chr prefix
+    vcf_numeric = f"{out_prefix}_numeric.vcf"
+    
+    # Use sed to replace chr22 with 22 in the VCF
+    sed_cmd = f"sed 's/^chr22/22/' {vcf_path} > {vcf_numeric}"
+    result = subprocess.run(sed_cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"VCF preprocessing failed:\n{result.stderr}")
+    
     cmd = [
         plink_exe,
-        "--vcf", vcf_path,
+        "--vcf", vcf_numeric,
         "--max-alleles", "2",
         "--rm-dup", "exclude-all",
         "--make-bed",
-        "--allow-extra-chr",
-        "--output-chr", "26",  # Output numeric chromosomes (strips chr prefix)
         "--out", out_prefix,
         "--silent"
     ]
     
     print(f"Running PLINK conversion: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    # Clean up temporary VCF
+    if os.path.exists(vcf_numeric):
+        os.remove(vcf_numeric)
     
     if result.returncode != 0:
         raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
