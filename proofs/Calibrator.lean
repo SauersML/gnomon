@@ -475,11 +475,13 @@ Normalization forces Var(P|C)=1, which removes the LD covariance term. -/
 
 theorem normalization_erases_heritability {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0)
+    (h_genic_pos : arch.V_genic c > 0)
     (h_cov_pos : arch.V_cov c > 0) :
     optimalSlopeFromVariance arch c > 1 := by
-  -- Sketch: (V_genic + V_cov)/V_genic > 1 when V_cov > 0.
-  admit
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self (ne_of_gt h_genic_pos)]
+  rw [gt_iff_lt, lt_add_iff_pos_right]
+  apply div_pos h_cov_pos h_genic_pos
 
 /-! ### Neutral Score Drift (Artifactual Mean Shift in P)
 
