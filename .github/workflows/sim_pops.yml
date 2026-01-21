@@ -128,12 +128,12 @@ jobs:
       - name: Setup for PRS-CSx
         if: matrix.method == 'PRS-CSx'
         run: |
-          # Download chr22 1KG EUR reference (small subset for simulations)
+          # Install pandas-plink for LD computation
+          pip install pandas-plink h5py
+          
+          # Generate LD reference from training data
           mkdir -p prscsx_ref
-          cd prscsx_ref
-          wget https://personal.broadinstitute.org/hhuang//public//PRS-CSx/Reference/ldblk_1kg_eur.tar.gz
-          tar -zxvf ldblk_1kg_eur.tar.gz
-          cd ..
+          python sims/create_ld_ref.py sim${{ matrix.sim }}_work/train 22 prscsx_ref
           echo "PRSCSX_REF=$PWD/prscsx_ref" >> $GITHUB_ENV
           
           # Install PRS-CSx
