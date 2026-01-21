@@ -15,8 +15,9 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
     
-    # stdpopsim outputs "chr22" but PLINK and PRS-CSx expect "22"
-    # Preprocess VCF to strip chr prefix
+    # stdpopsim outputs chr22, but our downstream tools (PLINK/PRS-CSx pipeline)
+    # assume chromosome "22". Some plink2 builds used in CI do not support
+    # flags like --set-chr, so we normalize the VCF chromosome column ourselves.
     vcf_numeric = f"{out_prefix}_numeric.vcf"
     
     chr_prefix_re = re.compile(r"^(chr)([0-9]+|[XYM]|MT)\b", flags=re.IGNORECASE)
@@ -26,18 +27,26 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
                 if line.startswith("#"):
                     fout.write(line)
                     continue
-                m = chr_prefix_re.match(line)
-                if m:
-                    fout.write(line[len(m.group(1)) :])
-                else:
+                # VCF is tab-delimited; rewrite the CHROM field.
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
                     fout.write(line)
+                    continue
+
+                chrom = parts[0]
+                m = chr_prefix_re.match(chrom)
+                if m:
+                    chrom = chrom[len(m.group(1)) :]
+
+                # Force to chr22 since our simulations are chr22-only.
+                parts[0] = "22"
+                fout.write("\t".join(parts) + "\n")
     except Exception as e:
         raise RuntimeError(f"VCF preprocessing failed: {e}")
     
     cmd = [
         plink_exe,
         "--vcf", vcf_numeric,
-        "--set-chr", "22",
         "--max-alleles", "2",
         "--rm-dup", "exclude-all",
         "--make-bed",
