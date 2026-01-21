@@ -67,19 +67,19 @@ def compute_ld_blocks(bim, geno, block_size=1000):
     ld_method = os.environ.get("PRSCSX_LD_METHOD", "numpy").strip().lower()
     bfile_for_plink = os.environ.get("PRSCSX_LD_BFILE", "").strip()
     block_size = int(os.environ.get("PRSCSX_LD_BLOCK_SIZE", block_size))
+
+    if ld_method == "plink" and not bfile_for_plink:
+        raise RuntimeError(
+            "PRSCSX_LD_METHOD=plink requires PRSCSX_LD_BFILE to be set to a PLINK --bfile prefix"
+        )
     
     for start in range(0, n_snps, block_size):
         end = min(start + block_size, n_snps)
         block_snps = bim['snp'].iloc[start:end].astype(str).tolist()
-        ld_matrix = None
-        if ld_method == "plink" and bfile_for_plink:
-            try:
-                with tempfile.TemporaryDirectory() as td:
-                    ld_matrix = _compute_ld_matrix_plink(bfile_for_plink, block_snps, td)
-            except Exception as e:
-                print(f"WARNING: Falling back to numpy LD for block {start}:{end} due to: {e}")
-
-        if ld_matrix is None:
+        if ld_method == "plink":
+            with tempfile.TemporaryDirectory() as td:
+                ld_matrix = _compute_ld_matrix_plink(bfile_for_plink, block_snps, td)
+        else:
             block_geno = geno[:, start:end]
 
             # Standardize genotypes
