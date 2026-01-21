@@ -21,7 +21,7 @@ jobs:
 
       - name: Restore simulation cache
         id: sim-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             sim${{ matrix.sim }}_work/
@@ -32,6 +32,10 @@ jobs:
             sim${{ matrix.sim }}_sites.npz
             sim${{ matrix.sim }}_pcs.png
           key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ hashFiles('sims/**') }}
+
+      - name: Cache status
+        run: |
+          echo "sim cache-hit=${{ steps.sim-cache.outputs.cache-hit }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,6 +75,20 @@ jobs:
           set -e
           echo "Splitting Data for Sim ${{ matrix.sim }}..."
           python sims/split_data.py ${{ matrix.sim }}
+
+      - name: Save simulation cache
+        if: ${{ always() && steps.sim-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sim${{ matrix.sim }}_work/
+            sim${{ matrix.sim }}.tsv
+            sim${{ matrix.sim }}.bed
+            sim${{ matrix.sim }}.bim
+            sim${{ matrix.sim }}.fam
+            sim${{ matrix.sim }}_sites.npz
+            sim${{ matrix.sim }}_pcs.png
+          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ hashFiles('sims/**') }}
 
       - name: Upload Simulation Data (Artifact Stream A)
         uses: actions/upload-artifact@v4
