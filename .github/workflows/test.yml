@@ -351,21 +351,14 @@ jobs:
         run: |
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Run nextest (3m timeout)
+      - name: Run nextest
         id: nextest
         shell: bash
         run: |
           set -euo pipefail
-          status=0
-          timeout --signal=INT --kill-after=30s 3m \
-            cargo +nightly nextest run --profile ci --release \
+          cargo +nightly nextest run --profile ci --release \
             --filter-expr "${{ matrix.filter_expr }}" \
-            2>&1 | tee cargo-test.log || status=$?
-          if [ $status -eq 124 ]; then
-            echo "timed_out=true" >> "$GITHUB_OUTPUT"
-            exit 78
-          fi
-          exit $status
+            2>&1 | tee cargo-test.log
 
   rust_tests_full_debug:
     needs: build_and_test
@@ -502,6 +495,12 @@ jobs:
         if: needs.build_and_test.outputs.artifact_available == 'true'
       - run: chmod +x target/release/gnomon
         if: needs.build_and_test.outputs.artifact_available == 'true'
+      - name: Install PLINK2
+        if: needs.build_and_test.outputs.artifact_available == 'true'
+        run: |
+          wget -q https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip
+          unzip plink2_linux_avx2_20260110.zip
+          sudo mv plink2 /usr/local/bin/
       - id: sim_test
         if: needs.build_and_test.outputs.artifact_available == 'true'
         run: python -u score/tests/sim_test.py
