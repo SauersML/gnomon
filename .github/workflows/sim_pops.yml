@@ -167,20 +167,32 @@ jobs:
           echo "R_LIBS_USER=$HOME/R/Library" >> $GITHUB_ENV
           mkdir -p "$HOME/R/Library"
 
+      - name: Install system dependencies (LDpred2)
+        if: matrix.method == 'LDpred2'
+        run: |
+          sudo apt-get install -y libcurl4-openssl-dev
+
       - name: Cache R packages (LDpred2)
         if: matrix.method == 'LDpred2'
-        uses: actions/cache@v4
+        id: rpkgs_cache
+        uses: actions/cache/restore@v4
         with:
-          path: ${{ env.R_LIBS_USER }}
-          key: rpkgs-${{ runner.os }}-r43-${{ hashFiles('.github/workflows/sim_pops.yml') }}
+          path: ~/R/Library
+          key: rpkgs-${{ runner.os }}-r43-${{ hashFiles('sims/prs_tools/run_ldpred2.R', 'sims/requirements.txt', '.github/workflows/sim_pops.yml') }}
           restore-keys: |
             rpkgs-${{ runner.os }}-r43-
       
       - name: Install R Dependencies (LDpred2)
-        if: matrix.method == 'LDpred2'
+        if: matrix.method == 'LDpred2' && steps.rpkgs_cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get install -y libcurl4-openssl-dev
           Rscript -e 'install.packages(c("bigsnpr","bigstatsr","data.table","R.utils","R.oo","R.methodsS3"), repos="https://cloud.r-project.org")'
+
+      - name: Save R packages cache (LDpred2)
+        if: matrix.method == 'LDpred2' && steps.rpkgs_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/R/Library
+          key: rpkgs-${{ runner.os }}-r43-${{ hashFiles('sims/prs_tools/run_ldpred2.R', 'sims/requirements.txt', '.github/workflows/sim_pops.yml') }}
 
       - name: Setup for PRS-CSx
         if: matrix.method == 'PRS-CSx'
