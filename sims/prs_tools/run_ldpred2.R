@@ -53,15 +53,58 @@ NCORES <- 1
 pheno <- fread(pheno_file, header=FALSE)
 y_train <- pheno$V3
 
+uniq_y <- sort(unique(y_train))
+is_binary <- length(uniq_y) <= 2 && all(uniq_y %in% c(0, 1))
+cat(paste0("  y_unique=", paste(uniq_y, collapse=","), "\n"))
+if (is_binary) {
+  y_tab <- table(y_train)
+  cat(paste0("  y_counts_0=", ifelse(!is.na(y_tab["0"]), y_tab["0"], 0), "\n"))
+  cat(paste0("  y_counts_1=", ifelse(!is.na(y_tab["1"]), y_tab["1"], 0), "\n"))
+  n0_chk <- sum(y_train == 0)
+  n1_chk <- sum(y_train == 1)
+  if (n0_chk == 0 || n1_chk == 0) {
+    stop("Binary phenotype must have both controls (0) and cases (1).")
+  }
+}
+
+n_train <- length(y_train)
+
+maf <- snp_MAF(G)
+mac <- 2 * n_train * maf
+min_mac <- as.numeric(Sys.getenv("LDPRED2_MIN_MAC", unset = "20"))
+
+keep_maf <- is.finite(maf) & maf > 0 & maf < 1
+keep_mac <- is.finite(mac) & mac >= min_mac
+ind_col_maf <- which(keep_maf & keep_mac)
+cat(paste0("  snps_total=", ncol(G), "\n"))
+cat(paste0("  snps_after_maf_mac=", length(ind_col_maf), "\n"))
+if (length(ind_col_maf) == 0) {
+  stop("No SNPs left after MAF/MAC filtering.")
+}
+
 # Run GWAS (Marginal effects)
-# We assume quantitative trait for simplicity in simulation, or binary?
-# The user's simulation is binary (0/1).
-# big_univLogReg for binary
-gwas_train <- big_univLogReg(G, y_train, covar.train = NULL, ncores = NCORES)
+if (is_binary) {
+  gwas_train <- big_univLogReg(G, y_train, ind.col = ind_col_maf, covar.train = NULL, ncores = NCORES)
+} else {
+  gwas_train <- big_univLinReg(G, y_train, ind.col = ind_col_maf, covar.train = NULL, ncores = NCORES)
+}
 chisq <- y_train # just dummy for now
 beta <- gwas_train$estim
 se <- gwas_train$std.err
 lpval <- -predict(gwas_train)
+
+ok_beta <- is.finite(beta)
+ok_se <- is.finite(se) & se > 0
+ind_col_ok <- ind_col_maf[which(ok_beta & ok_se)]
+cat(paste0("  snps_after_se_filter=", length(ind_col_ok), "\n"))
+cat(paste0("  snps_dropped_bad_beta=", sum(!ok_beta), "\n"))
+cat(paste0("  snps_dropped_bad_se=", sum(!ok_se), "\n"))
+if (length(ind_col_ok) == 0) {
+  stop("No SNPs left after filtering invalid beta/beta_se.")
+}
+
+beta <- beta[ok_beta & ok_se]
+se <- se[ok_beta & ok_se]
 
 # LD Correlation Matrix
 # Compute LD on a subset of SNPs/Indivs for speed (or full if small)
@@ -79,13 +122,19 @@ POS2 <- tryCatch({
   stop(e)
 })
 # Just use simple window
-corr <- snp_cor(G, ncores = NCORES, size = 3 / 1000) # 3 cM? or 1000 SNPs
+corr <- snp_cor(G, ind.col = ind_col_ok, ncores = NCORES, size = 3 / 1000) # 3 cM? or 1000 SNPs
 
 # LDpred2-auto
 # Run
 ldpred_auto <- snp_ldpred2_auto(
   corr, 
-  df_beta = data.frame(beta = beta, beta_se = se, n_eff = length(y_train)),
+  df_beta = data.frame(beta = beta, beta_se = se, n_eff = if (is_binary) {
+    n0 <- sum(y_train == 0)
+    n1 <- sum(y_train == 1)
+    4 / (1 / n0 + 1 / n1)
+  } else {
+    length(y_train)
+  }),
   h2_init = 0.5,
   vec_p_init = seq_log(1e-4, 0.9, length.out = 30),
   ncores = NCORES
@@ -98,8 +147,8 @@ beta_auto <- rowMeans(sapply(ldpred_auto, function(auto) auto$beta_est))
 # ID A1 Beta
 map <- obj.bigSNP.train$map
 out_df <- data.frame(
-  ID = map$marker.ID,
-  A1 = map$allele1,
+  ID = map$marker.ID[ind_col_ok],
+  A1 = map$allele1[ind_col_ok],
   Beta = beta_auto
 )
 

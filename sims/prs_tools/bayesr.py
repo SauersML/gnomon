@@ -112,6 +112,7 @@ class BayesR:
         # PLINK2 --score needs: ID, Allele, Effect
         
         # Read effect file
+        print(f"BayesR loading effects from: {effect_file}")
         df = pd.read_csv(effect_file, sep=r'\s+')
         # Columns: Id Name Chrom Position A1 A2 PPIP PIP_0.001 ... Effect
 
@@ -140,9 +141,77 @@ class BayesR:
             "BayesR scoring columns: "
             f"snp_id={name_col} allele={a1_col} effect={effect_col}"
         )
+
+        try:
+            total_rows = int(df.shape[0])
+        except Exception:
+            total_rows = None
+        if total_rows is not None:
+            missing_name = int(df[name_col].isna().sum()) if name_col in df.columns else None
+            missing_a1 = int(df[a1_col].isna().sum()) if a1_col in df.columns else None
+            missing_eff = int(df[effect_col].isna().sum()) if effect_col in df.columns else None
+            print(
+                "BayesR effects diagnostics: "
+                f"rows={total_rows} missing_name={missing_name} missing_a1={missing_a1} missing_effect={missing_eff}"
+            )
         
         score_file = f"{out_prefix}.score"
-        df[[name_col, a1_col, effect_col]].to_csv(score_file, sep='\t', index=False, header=False)
+
+        score_df = df[[name_col, a1_col, effect_col]].copy()
+        before_rows = int(score_df.shape[0])
+        score_df = score_df.dropna(subset=[name_col, a1_col, effect_col])
+        score_df[name_col] = score_df[name_col].astype(str).str.strip()
+        score_df[a1_col] = score_df[a1_col].astype(str).str.strip()
+        score_df[effect_col] = pd.to_numeric(score_df[effect_col], errors="coerce")
+        score_df = score_df.dropna(subset=[effect_col])
+        score_df = score_df[(score_df[name_col] != "") & (score_df[a1_col] != "")]
+        after_rows = int(score_df.shape[0])
+        print(f"BayesR score rows: before_filter={before_rows} after_filter={after_rows}")
+
+        if score_df.empty:
+            raise RuntimeError(
+                "BayesR produced no valid scoring rows after filtering missing/invalid values. "
+                f"Columns used: snp_id={name_col} allele={a1_col} effect={effect_col}"
+            )
+
+        score_df.to_csv(score_file, sep='\t', index=False, header=False)
+
+        try:
+            print("BayesR score preview (first 5 rows):")
+            print(score_df.head(5).to_string(index=False))
+        except Exception as e:
+            print(f"BayesR score preview unavailable: {type(e).__name__}: {e}")
+
+        try:
+            size_bytes = os.path.getsize(score_file)
+            print(f"BayesR wrote score file: {score_file} size_bytes={size_bytes}")
+        except Exception as e:
+            print(f"BayesR could not stat score file {score_file}: {type(e).__name__}: {e}")
+
+        try:
+            with open(score_file, "r", encoding="utf-8", errors="replace") as f:
+                first_line = f.readline().rstrip("\n")
+                second_line = f.readline().rstrip("\n")
+                third_line = f.readline().rstrip("\n")
+            print(f"BayesR score line1 repr={first_line!r}")
+            if second_line:
+                print(f"BayesR score line2 repr={second_line!r}")
+            if third_line:
+                print(f"BayesR score line3 repr={third_line!r}")
+            try:
+                line1_cat_a = "".join(ch if ch not in ["\t", "\n", "\r"] else {"\t": "^I", "\n": "^J", "\r": "^M"}[ch] for ch in first_line)
+                print(f"BayesR score line1 cat-A={line1_cat_a}")
+            except Exception:
+                pass
+            first_fields = first_line.split()
+            print(f"BayesR score line1 fields_count={len(first_fields)} fields={first_fields}")
+            if len(first_fields) < 3:
+                raise RuntimeError(
+                    f"Generated score file {score_file} has fewer than 3 whitespace-delimited fields on line 1: "
+                    f"fields={first_fields} raw_line={first_line!r}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"Failed validating generated score file {score_file}: {e}")
         
         cmd = [
             "plink2",
@@ -155,7 +224,36 @@ class BayesR:
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            raise RuntimeError(f"PLINK scoring failed:\n{result.stderr}")
+            try:
+                self._safe_write_text(f"{out_prefix}.plink2.stdout", result.stdout or "")
+                self._safe_write_text(f"{out_prefix}.plink2.stderr", result.stderr or "")
+            except Exception:
+                pass
+
+            try:
+                with open(score_file, "r", encoding="utf-8", errors="replace") as f:
+                    preview = [next(f, "") for _ in range(10)]
+                print("PLINK scoring failure: score file first 10 lines (repr):")
+                for i, line in enumerate(preview, start=1):
+                    print(f"  L{i}={line.rstrip(chr(10))!r}")
+                print("PLINK scoring failure: score file whitespace field counts (first 10 lines):")
+                for i, line in enumerate(preview, start=1):
+                    if not line:
+                        continue
+                    fields = line.split()
+                    print(f"  L{i} NF={len(fields)} fields={fields}")
+            except Exception as e:
+                print(f"PLINK scoring failure: could not preview score file {score_file}: {type(e).__name__}: {e}")
+
+            raise RuntimeError(
+                "PLINK scoring failed:\n"
+                f"returncode={result.returncode}\n"
+                f"STDERR:\n{result.stderr}\n\n"
+                f"STDOUT:\n{result.stdout}\n\n"
+                f"ScoreFile={score_file}\n"
+                f"PLINK2StdoutFile={out_prefix}.plink2.stdout\n"
+                f"PLINK2StderrFile={out_prefix}.plink2.stderr"
+            )
             
         # Read output scores (.sscore)
         # FID IID NMISS_ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_AVG
