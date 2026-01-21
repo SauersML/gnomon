@@ -15,13 +15,21 @@ pheno_file <- args[2]  # Expecting FID IID Pheno (no header)
 bfile_val <- args[3]   # Used for hyperparam tuning (LDpred2-auto uses it internally or we use grid)
 out_prefix <- args[4]
 
+# Avoid nested parallelism on CI runners.
+# bigsnpr/bigstatsr can use parallelism internally, and some CI environments
+# already set parallel backends, which triggers `?assert_cores`.
+options(bigstatsr.ncores = 1)
+Sys.setenv(OMP_NUM_THREADS = "1")
+Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+Sys.setenv(MKL_NUM_THREADS = "1")
+
 # Read Genotypes
 rds_train <- snp_readBed2(paste0(bfile_train, ".bed"), backingfile = tempfile())
 obj.bigSNP.train <- snp_attach(rds_train)
 G <- obj.bigSNP.train$genotypes
 CHR <- obj.bigSNP.train$map$chromosome
 POS <- obj.bigSNP.train$map$physical.pos
-NCORES <- nb_cores()
+NCORES <- 1
 
 # Read Phenotype
 pheno <- fread(pheno_file, header=FALSE)

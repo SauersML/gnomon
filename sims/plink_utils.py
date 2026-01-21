@@ -5,6 +5,7 @@ import subprocess
 import os
 import shutil
 from pathlib import Path
+import re
 
 def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     """
@@ -18,11 +19,20 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
     # Preprocess VCF to strip chr prefix
     vcf_numeric = f"{out_prefix}_numeric.vcf"
     
-    # Use sed to replace chr22 with 22 in the VCF
-    sed_cmd = f"sed 's/^chr22/22/' {vcf_path} > {vcf_numeric}"
-    result = subprocess.run(sed_cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"VCF preprocessing failed:\n{result.stderr}")
+    chr_prefix_re = re.compile(r"^(chr)([0-9]+|[XYM]|MT)\b", flags=re.IGNORECASE)
+    try:
+        with open(vcf_path, "r", encoding="utf-8") as fin, open(vcf_numeric, "w", encoding="utf-8") as fout:
+            for line in fin:
+                if line.startswith("#"):
+                    fout.write(line)
+                    continue
+                m = chr_prefix_re.match(line)
+                if m:
+                    fout.write(line[len(m.group(1)) :])
+                else:
+                    fout.write(line)
+    except Exception as e:
+        raise RuntimeError(f"VCF preprocessing failed: {e}")
     
     cmd = [
         plink_exe,

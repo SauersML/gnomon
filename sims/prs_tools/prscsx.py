@@ -110,6 +110,61 @@ class PRScsx:
         """
         # 1. Run GWAS to get summary stats
         sst_file = self._run_gwas(bfile_train, pheno_file, out_prefix)
+
+        def _head(path: str, n: int = 5) -> str:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = []
+                    for _ in range(n):
+                        line = f.readline()
+                        if not line:
+                            break
+                        lines.append(line.rstrip("\n"))
+                return "\n".join(lines)
+            except Exception as e:
+                return f"<error reading {path}: {e}>"
+
+        def _bim_chrom_counts(bim_path: str) -> str:
+            try:
+                chrom_counts = {}
+                with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        chrom = line.split()[0]
+                        chrom_counts[chrom] = chrom_counts.get(chrom, 0) + 1
+                items = sorted(chrom_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                return "\n".join([f"{c}\t{n}" for c, n in items[:20]])
+            except Exception as e:
+                return f"<error counting chromosomes in {bim_path}: {e}>"
+
+        bim_path = f"{bfile_train}.bim"
+        fam_path = f"{bfile_train}.fam"
+
+        diag_lines = []
+        diag_lines.append(f"PRS-CSx diagnostics:")
+        diag_lines.append(f"  bfile_train={bfile_train}")
+        diag_lines.append(f"  bim_path={bim_path} exists={Path(bim_path).exists()}")
+        diag_lines.append(f"  fam_path={fam_path} exists={Path(fam_path).exists()}")
+        diag_lines.append(f"  sst_file={sst_file} exists={Path(sst_file).exists()}")
+        diag_lines.append(f"  ref_dir={ref_dir} exists={Path(ref_dir).exists()}")
+        try:
+            diag_lines.append("  ref_dir listing (top 50):")
+            diag_lines.extend([f"    {p}" for p in sorted([x.name for x in Path(ref_dir).glob('*')])[:50]])
+        except Exception as e:
+            diag_lines.append(f"  ref_dir listing error: {e}")
+
+        diag_lines.append("  bim head:")
+        diag_lines.append(_head(bim_path, n=5))
+        diag_lines.append("  bim chromosome counts (top 20):")
+        diag_lines.append(_bim_chrom_counts(bim_path))
+        diag_lines.append("  fam head:")
+        diag_lines.append(_head(fam_path, n=5))
+        diag_lines.append("  sumstats head:")
+        diag_lines.append(_head(sst_file, n=5))
+
+        diag = "\n".join(diag_lines)
+        print(diag)
         
         # 2. Run PRS-CSx script
         # python PRScsx.py --ref_dir=... --bim_prefix=... --sst_file=... --n_gwas=... --pop=... --out_name=...
@@ -137,9 +192,11 @@ class PRScsx:
         # Strict fail-fast: do not check and skip.
             
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0:
-            raise RuntimeError(f"PRS-CSx failed:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}")
+            raise RuntimeError(
+                f"PRS-CSx failed:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}\n\n{diag}\n"
+            )
             
         # Output is likely {out_prefix}_pst_eff_a1_b0.5_phiauto_chr22.txt
         # We need to find the output file.
