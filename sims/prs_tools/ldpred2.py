@@ -4,10 +4,29 @@ Wrapper for LDpred2 (via R script).
 import subprocess
 import pandas as pd
 import os
+import shutil
 
 class LDpred2:
     def __init__(self, r_script_path="sims/prs_tools/run_ldpred2.R"):
         self.r_script_path = r_script_path
+
+    def _safe_write_text(self, path: str, text: str) -> None:
+        try:
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+        except Exception:
+            pass
+
+    def _rscript_diagnostics(self) -> str:
+        rscript_exe = shutil.which("Rscript") or "Rscript"
+        version = "<unavailable>"
+        try:
+            v = subprocess.run([rscript_exe, "--version"], capture_output=True, text=True)
+            version_out = (v.stdout or "") + ("\n" + v.stderr if v.stderr else "")
+            version = version_out.strip() or f"<exit={v.returncode}>"
+        except Exception as e:
+            version = f"<error: {type(e).__name__}: {e}>"
+        return f"rscript_exe={rscript_exe} rscript_version={version} cwd={os.getcwd()}"
         
     def fit(self, bfile_train, pheno_file, bfile_val, out_prefix):
         """
@@ -25,7 +44,12 @@ class LDpred2:
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            raise RuntimeError(f"LDpred2 failed:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}")
+            self._safe_write_text(f"{out_prefix}.ldpred2.cmd", " ".join(cmd) + "\n")
+            self._safe_write_text(f"{out_prefix}.ldpred2.stdout", result.stdout or "")
+            self._safe_write_text(f"{out_prefix}.ldpred2.stderr", result.stderr or "")
+            raise RuntimeError(
+                f"LDpred2 failed ({self._rscript_diagnostics()}):\n{result.stderr}\n\nSTDOUT:\n{result.stdout}"
+            )
             
         return f"{out_prefix}.scores"
 

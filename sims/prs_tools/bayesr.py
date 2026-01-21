@@ -3,6 +3,7 @@ Wrapper for GCTB BayesR.
 """
 import subprocess
 import os
+import shutil
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -10,6 +11,24 @@ import numpy as np
 class BayesR:
     def __init__(self, gctb_path="gctb"):
         self.gctb_path = gctb_path
+
+    def _gctb_diagnostics(self) -> str:
+        exe_path = shutil.which(self.gctb_path) or self.gctb_path
+        version = "<unavailable>"
+        try:
+            v = subprocess.run([exe_path, "--version"], capture_output=True, text=True)
+            version_out = (v.stdout or "") + ("\n" + v.stderr if v.stderr else "")
+            version = version_out.strip() or f"<exit={v.returncode}>"
+        except Exception as e:
+            version = f"<error: {type(e).__name__}: {e}>"
+        return f"gctb_exe={exe_path} gctb_version={version}"
+
+    def _safe_write_text(self, path: str, text: str) -> None:
+        try:
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+        except Exception:
+            pass
         
     def fit(self, bfile_train, pheno_file, out_prefix):
         """
@@ -34,6 +53,8 @@ class BayesR:
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
+            self._safe_write_text(f"{out_prefix}.gctb.stdout", result.stdout or "")
+            self._safe_write_text(f"{out_prefix}.gctb.stderr", result.stderr or "")
             raise RuntimeError(f"GCTB BayesR failed:\n{result.stderr}\n\nSTDOUT:\n{result.stdout}")
             
         out_file = f"{out_prefix}.snpRes"
@@ -49,13 +70,35 @@ class BayesR:
                 cols = header.strip().split()
                 cols_l = {c.lower() for c in cols}
                 # GCTB versions/flags differ; accept a few common effect-size column names.
-                effect_candidates = ["effect", "beta", "b", "mean", "bhat"]
+                # GCTB BayesR typically uses A1Effect for the posterior mean effect of allele A1.
+                effect_candidates = ["a1effect", "a1_effect", "effect", "beta", "b", "mean", "bhat"]
                 if not any(c in cols_l for c in effect_candidates):
+                     try:
+                         size = os.path.getsize(out_file)
+                     except Exception:
+                         size = None
+                     preview_lines = []
+                     try:
+                         preview_lines.append(header.rstrip("\n"))
+                         preview_lines.append(f.readline().rstrip("\n"))
+                     except Exception:
+                         pass
                      raise RuntimeError(
                          f"GCTB output file {out_file} missing an effect column. "
-                         f"Tried={effect_candidates}. Header: {header}"
+                         f"Tried={effect_candidates}. "
+                         f"DetectedColumns={cols}. "
+                         f"FileSizeBytes={size}. "
+                         f"HeaderPreview={preview_lines}. "
+                         f"{self._gctb_diagnostics()}"
                      )
         except Exception as e:
+             self._safe_write_text(f"{out_prefix}.gctb.stdout", result.stdout or "")
+             self._safe_write_text(f"{out_prefix}.gctb.stderr", result.stderr or "")
+             try:
+                 with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+                     self._safe_write_text(f"{out_prefix}.snpRes.head", "".join([next(f, "") for _ in range(25)]))
+             except Exception:
+                 pass
              raise RuntimeError(f"Validation of GCTB output failed: {e}")
              
         print("BayesR training complete.")
@@ -76,7 +119,9 @@ class BayesR:
         name_col = cols_lower.get('name') or cols_lower.get('snp') or cols_lower.get('id')
         a1_col = cols_lower.get('a1') or cols_lower.get('allele1')
         effect_col = (
-            cols_lower.get('effect')
+            cols_lower.get('a1effect')
+            or cols_lower.get('a1_effect')
+            or cols_lower.get('effect')
             or cols_lower.get('beta')
             or cols_lower.get('b')
             or cols_lower.get('mean')
@@ -90,6 +135,11 @@ class BayesR:
                 f"Needed SNP/Name + A1 + Effect. Found columns={list(df.columns)}. "
                 f"Head:\n{head_preview}"
             )
+
+        print(
+            "BayesR scoring columns: "
+            f"snp_id={name_col} allele={a1_col} effect={effect_col}"
+        )
         
         score_file = f"{out_prefix}.score"
         df[[name_col, a1_col, effect_col]].to_csv(score_file, sep='\t', index=False, header=False)

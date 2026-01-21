@@ -15,6 +15,24 @@ pheno_file <- args[2]  # Expecting FID IID Pheno (no header)
 bfile_val <- args[3]   # Used for hyperparam tuning (LDpred2-auto uses it internally or we use grid)
 out_prefix <- args[4]
 
+map_dir <- Sys.getenv("LDPRED2_MAP_DIR", unset = "tmp-data")
+dir.create(map_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("LDpred2 diagnostics:\n")
+cat(paste0("  cwd=", getwd(), "\n"))
+cat(paste0("  tempdir=", tempdir(), "\n"))
+cat(paste0("  args=", paste(args, collapse = " "), "\n"))
+cat(paste0("  map_dir=", map_dir, "\n"))
+cat(paste0("  map_dir exists=", dir.exists(map_dir), "\n"))
+tmp_write_ok <- FALSE
+tmp_write_err <- ""
+try({
+  file.create(file.path(map_dir, "__write_test"))
+  tmp_write_ok <- file.exists(file.path(map_dir, "__write_test"))
+  if (tmp_write_ok) file.remove(file.path(map_dir, "__write_test"))
+}, silent = TRUE)
+cat(paste0("  map_dir writeable=", tmp_write_ok, "\n"))
+
 # Avoid nested parallelism on CI runners.
 # bigsnpr/bigstatsr can use parallelism internally, and some CI environments
 # already set parallel backends, which triggers `?assert_cores`.
@@ -48,7 +66,18 @@ lpval <- -predict(gwas_train)
 # LD Correlation Matrix
 # Compute LD on a subset of SNPs/Indivs for speed (or full if small)
 # Using restricted chromosome info from map
-POS2 <- snp_asGeneticPos(CHR, POS, dir = "tmp-data") # Need map? defaulting
+POS2 <- tryCatch({
+  snp_asGeneticPos(CHR, POS, dir = map_dir)
+}, error = function(e) {
+  cat("snp_asGeneticPos failed. Diagnostics:\n")
+  cat(paste0("  map_dir=", map_dir, "\n"))
+  cat(paste0("  map_dir exists=", dir.exists(map_dir), "\n"))
+  if (dir.exists(map_dir)) {
+    cat("  map_dir listing:\n")
+    print(list.files(map_dir, all.files = TRUE))
+  }
+  stop(e)
+})
 # Just use simple window
 corr <- snp_cor(G, ncores = NCORES, size = 3 / 1000) # 3 cM? or 1000 SNPs
 

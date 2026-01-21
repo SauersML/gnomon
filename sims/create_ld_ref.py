@@ -35,9 +35,28 @@ def _compute_ld_matrix_plink(bfile: str, snplist: list[str], work_dir: str) -> n
 
     out_prefix = os.path.join(work_dir, "ld")
 
-    plink_exe = shutil.which("plink2") or shutil.which("plink")
+    plink_exe = os.environ.get("PRSCSX_PLINK_EXE", "").strip() or None
     if plink_exe is None:
-        raise RuntimeError("Neither plink2 nor plink is available on PATH")
+        plink_exe = shutil.which("plink") or shutil.which("plink2")
+    if plink_exe is None:
+        raise RuntimeError("Neither plink nor plink2 is available on PATH")
+
+    plink_version = "<unavailable>"
+    try:
+        v = subprocess.run([plink_exe, "--version"], capture_output=True, text=True)
+        version_out = (v.stdout or "") + ("\n" + v.stderr if v.stderr else "")
+        plink_version = version_out.strip() or f"<exit={v.returncode}>"
+    except Exception as e:
+        plink_version = f"<error: {type(e).__name__}: {e}>"
+
+    plink_base = os.path.basename(plink_exe).lower()
+    if "plink2" in plink_base or "plink v2" in plink_version.lower() or "plink 2" in plink_version.lower():
+        raise RuntimeError(
+            "PLINK2 is not supported for PRSCSX_LD_METHOD=plink in this repo yet. "
+            "This LD path expects PLINK 1.9 text output from '--r square' (out_prefix.ld). "
+            f"Detected exe={plink_exe} version={plink_version}. "
+            "Install/put PLINK 1.9 on PATH ahead of plink2, or set PRSCSX_PLINK_EXE to a PLINK 1.9 binary."
+        )
 
     cmd = [
         plink_exe,
@@ -49,11 +68,36 @@ def _compute_ld_matrix_plink(bfile: str, snplist: list[str], work_dir: str) -> n
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"PLINK LD computation failed: {result.stderr}")
+        try:
+            with open(os.path.join(work_dir, "plink_ld.cmd"), "w", encoding="utf-8") as f:
+                f.write(" ".join(cmd) + "\n")
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(work_dir, "plink_ld.stdout"), "w", encoding="utf-8", errors="replace") as f:
+                f.write(result.stdout or "")
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(work_dir, "plink_ld.stderr"), "w", encoding="utf-8", errors="replace") as f:
+                f.write(result.stderr or "")
+        except Exception:
+            pass
+        raise RuntimeError(
+            "PLINK LD computation failed: "
+            f"exe={plink_exe} version={plink_version}. "
+            f"bfile={bfile}. snps={len(snplist)}. "
+            f"work_dir={work_dir}. out_prefix={out_prefix}. "
+            f"stderr={result.stderr}"
+        )
 
     ld_file = out_prefix + ".ld"
     if not os.path.exists(ld_file):
-        raise RuntimeError(f"Expected PLINK LD output not found: {ld_file}")
+        raise RuntimeError(
+            "Expected PLINK LD output not found: "
+            f"{ld_file}. exe={plink_exe} version={plink_version}. "
+            f"bfile={bfile}. snps={len(snplist)}. work_dir={work_dir}."
+        )
     return _read_ld_matrix_from_file(ld_file)
 
 def compute_ld_blocks(bim, geno, block_size=1000):

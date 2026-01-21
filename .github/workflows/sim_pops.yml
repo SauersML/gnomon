@@ -185,6 +185,20 @@ jobs:
       - name: Setup for PRS-CSx
         if: matrix.method == 'PRS-CSx'
         run: |
+          set -e
+          # PRS-CSx LD reference generation uses PLINK 1.9-style '--r square' output.
+          # Install PLINK 1.9 and point PRSCSX_PLINK_EXE at it.
+          wget https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20250819.zip -O plink19.zip
+          unzip -o plink19.zip
+          sudo mv -f plink /usr/local/bin/
+          chmod +x /usr/local/bin/plink
+          rm -f plink19.zip
+          plink --version
+
+          command -v plink
+
+          export PRSCSX_PLINK_EXE=/usr/local/bin/plink
+          echo "PRSCSX_PLINK_EXE=/usr/local/bin/plink" >> $GITHUB_ENV
           export PRSCSX_LD_METHOD=plink
           export PRSCSX_LD_BFILE=sim${{ matrix.sim }}_work/train
           export PRSCSX_LD_BLOCK_SIZE=300
