@@ -19,6 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Show git revision
+        run: |
+          git rev-parse HEAD
+
       - name: Restore simulation cache
         id: sim-cache
         uses: actions/cache/restore@v4
@@ -181,8 +185,12 @@ jobs:
           pip install pandas-plink h5py
           
           # Generate LD reference from training data
+          rm -rf prscsx_ref
           mkdir -p prscsx_ref
           python sims/create_ld_ref.py sim${{ matrix.sim }}_work/train 22 prscsx_ref
+          echo "PRS-CSx ref_dir contents:" 
+          find prscsx_ref -maxdepth 3 -type f -print
+          find prscsx_ref -maxdepth 3 -type d -print
           echo "PRSCSX_REF=$PWD/prscsx_ref" >> $GITHUB_ENV
           
           # Install PRS-CSx
