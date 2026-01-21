@@ -30,6 +30,13 @@ jobs:
           pip install uv
           uv pip install --system -r sims/requirements.txt
 
+      - name: Install Plink2
+        run: |
+          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
+          unzip plink2.zip
+          sudo mv plink2 /usr/local/bin/
+          rm plink2.zip
+
       - name: Run Simulation ${{ matrix.sim }}
         run: |
           set -e
