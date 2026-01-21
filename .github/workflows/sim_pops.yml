@@ -185,9 +185,6 @@ jobs:
       - name: Setup for PRS-CSx
         if: matrix.method == 'PRS-CSx'
         run: |
-          # Install pandas-plink for LD computation
-          pip install pandas-plink h5py
-          
           # Generate LD reference from training data
           rm -rf prscsx_ref
           mkdir -p prscsx_ref
