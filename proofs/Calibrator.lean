@@ -437,8 +437,12 @@ theorem directionalLD_nonzero_implies_slope_ne_one {k : ℕ} [Fintype (Fin k)]
     (h_genic_pos : arch.V_genic c ≠ 0)
     (h_cov_ne : arch.V_cov c ≠ 0) :
     optimalSlopeFromVariance arch c ≠ 1 := by
-  -- Sketch: (V_genic + V_cov)/V_genic = 1 iff V_cov = 0.
-  admit
+  unfold optimalSlopeFromVariance totalVariance
+  intro h
+  rw [add_div, div_self h_genic_pos] at h
+  have : arch.V_cov c / arch.V_genic c = 0 := by linarith
+  simp [div_eq_zero_iff, h_genic_pos] at this
+  contradiction
 
 theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
@@ -586,8 +590,7 @@ theorem normalization_suboptimal_under_ld {k : ℕ} [Fintype (Fin k)]
     (h_genic_pos : arch.V_genic c ≠ 0)
     (h_cov_ne : arch.V_cov c ≠ 0) :
     optimalSlopeFromVariance arch c ≠ 1 := by
-  -- Sketch: normalization fixes slope=1, but LD covariance shifts optimal slope.
-  admit
+  exact directionalLD_nonzero_implies_slope_ne_one arch c h_genic_pos h_cov_ne
 
 noncomputable def expectedSquaredError {k : ℕ} [Fintype (Fin k)] (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ) : ℝ :=
   ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure
