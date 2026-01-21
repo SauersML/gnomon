@@ -76,7 +76,7 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         sim: [1, 2, 3]
-        method: [BayesR, LDpred2] # PRS-CSx disabled until ref panel solution
+        method: [BayesR, LDpred2, PRS-CSx]
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +124,21 @@ jobs:
         run: |
           sudo apt-get install -y libcurl4-openssl-dev
           Rscript -e 'install.packages("bigsnpr", repos="https://cloud.r-project.org")'
+
+      - name: Setup for PRS-CSx
+        if: matrix.method == 'PRS-CSx'
+        run: |
+          # Download chr22 1KG EUR reference (small subset for simulations)
+          mkdir -p prscsx_ref
+          cd prscsx_ref
+          wget https://personal.broadinstitute.org/hhuang//public//PRS-CSx/Reference/ldblk_1kg_eur.tar.gz
+          tar -zxvf ldblk_1kg_eur.tar.gz
+          cd ..
+          echo "PRSCSX_REF=$PWD/prscsx_ref" >> $GITHUB_ENV
+          
+          # Install PRS-CSx
+          git clone https://github.com/getian107/PRScsx.git
+          echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
 
       - name: Train & Score ${{ matrix.method }}
         run: |
@@ -182,6 +197,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim }}-LDpred2
+          path: sim${{ matrix.sim }}_work/
+          merge-multiple: true
+
+      - name: Download PRS-CSx Scores
+        uses: actions/download-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim }}-PRS-CSx
           path: sim${{ matrix.sim }}_work/
           merge-multiple: true
 

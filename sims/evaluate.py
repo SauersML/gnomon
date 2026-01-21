@@ -127,8 +127,7 @@ def main():
     # Re-order to match keep file if needed, but inner join with scores handles it.
     
     # 2. Load Scores
-    # Only load methods that are actually trained in the workflow
-    methods = ['BayesR', 'LDpred2']  # PRS-CSx disabled until ref panel available
+    methods = ['BayesR', 'LDpred2', 'PRS-CSx']
     print(f"Loading scores for: {methods}...")
     prs_scores_df = load_scores(work_dir, methods)
     
