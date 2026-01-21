@@ -65,20 +65,26 @@ class PRScsx:
         # PLINK2 cols: #CHROM POS ID REF ALT A1 TEST OBS_CT OR SE T_STAT P
         # PRS-CSx needs: SNP A1 A2 BETA P
         
+        # Keep only the additive test rows.
+        # PLINK2 emits multiple rows per variant (e.g. 'ADD', 'DOMDEV', etc.)
+        # and non-ADD rows may have missing OR/P, which breaks sumstats.
+        if 'TEST' in df.columns:
+            df = df[df['TEST'].astype(str) == 'ADD'].copy()
+
         # Ensure we have required columns
-        required = ['ID', 'A1', 'P']
+        required = ['ID', 'A1', 'P', 'REF', 'ALT']
         if not all(col in df.columns for col in required):
-             # Try mapping standard PLINK 1.9 names if PLINK 2 failed?
-             # But we used plink2.
-             raise RuntimeError(f"GWAS output missing columns. Found: {df.columns}")
+             raise RuntimeError(f"GWAS output missing columns. Found: {list(df.columns)}")
 
         # BETA/OR handling
         if 'OR' in df.columns:
-            beta = np.log(df['OR'])
+            beta = np.log(pd.to_numeric(df['OR'], errors='coerce'))
         elif 'BETA' in df.columns:
-            beta = df['BETA']
+            beta = pd.to_numeric(df['BETA'], errors='coerce')
         else:
             raise RuntimeError("No BETA or OR column in GWAS output")
+
+        pvals = pd.to_numeric(df['P'], errors='coerce')
             
         # A2 (Reference allele)
         # PLINK2 has REF and ALT.
@@ -91,14 +97,22 @@ class PRScsx:
         # If A1 == ALT, A2 = REF. If A1 == REF, A2 = ALT.
         
         a2 = np.where(df['A1'] == df['ALT'], df['REF'], df['ALT'])
-        
+
         out_df = pd.DataFrame({
             'SNP': df['ID'],
             'A1': df['A1'],
             'A2': a2,
             'BETA': beta,
-            'P': df['P']
+            'P': pvals
         })
+
+        out_df = out_df.dropna(subset=['SNP', 'A1', 'A2', 'BETA', 'P'])
+        if out_df.empty:
+            head_preview = df.head(10).to_string(index=False)
+            raise RuntimeError(
+                "GWAS produced no valid additive-effect rows for PRS-CSx sumstats. "
+                f"Input GWAS file={gwas_file}. Head:\n{head_preview}"
+            )
         
         sst_path = f"{out_prefix}.sumstats"
         out_df.to_csv(sst_path, sep='\t', index=False)

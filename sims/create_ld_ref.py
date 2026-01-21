@@ -39,7 +39,8 @@ def compute_ld_blocks(bim, geno, block_size=1000):
         ld_matrix = np.corrcoef(block_std.T)
         ld_matrix = np.nan_to_num(ld_matrix)
         
-        blocks.append((start, end, ld_matrix))
+        block_snps = bim['snp'].iloc[start:end].astype(str).tolist()
+        blocks.append((start, end, ld_matrix, block_snps))
     
     return blocks
 
@@ -47,31 +48,57 @@ def write_prscsx_reference(bim, ld_blocks, chrom, output_dir):
     """Write LD blocks and SNP info in PRS-CSx format."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Write LD blocks to HDF5
-    ld_file = output_dir / f"ldblk_1kg_chr{chrom}.hdf5"
+
+    # PRS-CSx expects:
+    #   - {ref_dir}/snpinfo_mult_1kg_hm3
+    #   - {ref_dir}/ldblk_1kg_eur/ldblk_1kg_chr{chrom}.hdf5
+    # where the hdf5 file has groups blk_1..blk_N, each containing datasets
+    # 'ldblk' and 'snplist'.
+
+    ldblk_dir = output_dir / "ldblk_1kg_eur"
+    ldblk_dir.mkdir(parents=True, exist_ok=True)
+
+    ld_file = ldblk_dir / f"ldblk_1kg_chr{chrom}.hdf5"
     with h5py.File(ld_file, 'w') as f:
-        for idx, (start, end, ld_matrix) in enumerate(ld_blocks):
-            blk_name = f"blk_{idx}"
-            f.create_dataset(blk_name, data=ld_matrix, compression='gzip')
-    
-    # Write SNP info file - ensure chromosome is numeric
-    snpinfo_file = output_dir / f"snpinfo_1kg_chr{chrom}"
-    
-    # Force chromosome to match the requested chromosome.
-    # This keeps snpinfo consistent with the PRS-CSx run chrom (e.g. 22).
-    chrom_values = np.full(shape=(bim.shape[0],), fill_value=str(chrom), dtype=object)
-    
+        for idx, (_start, _end, ld_matrix, block_snps) in enumerate(ld_blocks, start=1):
+            grp = f.create_group(f"blk_{idx}")
+            grp.create_dataset("ldblk", data=ld_matrix, compression='gzip')
+            snplist = np.asarray([s.encode("utf-8") for s in block_snps], dtype="S")
+            grp.create_dataset("snplist", data=snplist, compression='gzip')
+
+    snpinfo_file = output_dir / "snpinfo_mult_1kg_hm3"
+
+    # Force chromosome to match the requested chromosome and write the full
+    # multi-pop header expected by PRS-CSx parse_ref().
+    chrom_values = np.full(shape=(bim.shape[0],), fill_value=int(chrom), dtype=np.int64)
+    snp_values = bim['snp'].astype(str).values
+    bp_values = bim['pos'].astype(int).values
+    a1_values = bim['a0'].astype(str).values
+    a2_values = bim['a1'].astype(str).values
+
+    # Placeholder freqs/flip flags. parse_ref() only requires FRQ_*>0.
+    frq = np.full(shape=(bim.shape[0],), fill_value=0.5, dtype=np.float64)
+    flp = np.ones(shape=(bim.shape[0],), dtype=np.int64)
+
     snp_info = pd.DataFrame({
         'CHR': chrom_values,
-        'SNP': bim['snp'].values,
-        'BP': bim['pos'].values,
-        'A1': bim['a0'].values,
-        'A2': bim['a1'].values,
-        'MAF': 0.5  # Placeholder, PRS-CSx doesn't strictly require accurate MAF
+        'SNP': snp_values,
+        'BP': bp_values,
+        'A1': a1_values,
+        'A2': a2_values,
+        'FRQ_AFR': frq,
+        'FRQ_AMR': frq,
+        'FRQ_EAS': frq,
+        'FRQ_EUR': frq,
+        'FRQ_SAS': frq,
+        'FLP_AFR': flp,
+        'FLP_AMR': flp,
+        'FLP_EAS': flp,
+        'FLP_EUR': flp,
+        'FLP_SAS': flp,
     })
-    snp_info.to_csv(snpinfo_file, sep='\t', index=False, header=False)
-    
+    snp_info.to_csv(snpinfo_file, sep='\t', index=False)
+
     print(f"Created LD reference: {ld_file}")
     print(f"Created SNP info: {snpinfo_file}")
 
