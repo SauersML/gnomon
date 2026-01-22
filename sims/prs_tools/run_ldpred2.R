@@ -2,6 +2,9 @@ library(bigsnpr)
 library(bigstatsr)
 library(data.table)
 
+if (!require("bigsparser", quietly = TRUE)) install.packages("bigsparser", repos="https://cloud.r-project.org")
+library(bigsparser)
+
 # Ensure R.utils is available for snp_asGeneticPos
 if (!require("R.utils", quietly = TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")
 
@@ -122,26 +125,48 @@ POS2 <- tryCatch({
   stop(e)
 })
 # Just use simple window
-corr <- snp_cor(G, ind.col = ind_col_ok, ncores = NCORES, size = 3 / 1000) # 3 cM? or 1000 SNPs
+corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2[ind_col_ok], ncores = NCORES, size = 3 / 1000)
+
+if (!inherits(corr, "SFBM")) {
+  if (inherits(corr, "dgCMatrix") || inherits(corr, "dsCMatrix")) {
+    corr <- bigsparser::as_SFBM(corr, backingfile = tempfile(tmpdir = map_dir))
+  } else {
+    stop(paste0("Unexpected LD correlation object type: ", paste(class(corr), collapse = ",")))
+  }
+}
 
 # LDpred2-auto
 # Run
-ldpred_auto <- snp_ldpred2_auto(
-  corr, 
-  df_beta = data.frame(beta = beta, beta_se = se, n_eff = if (is_binary) {
-    n0 <- sum(y_train == 0)
-    n1 <- sum(y_train == 1)
-    4 / (1 / n0 + 1 / n1)
-  } else {
-    length(y_train)
-  }),
-  h2_init = 0.5,
-  vec_p_init = seq_log(1e-4, 0.9, length.out = 30),
-  ncores = NCORES
-)
+n_eff <- if (is_binary) {
+  n0 <- sum(y_train == 0)
+  n1 <- sum(y_train == 1)
+  4 / (1 / n0 + 1 / n1)
+} else {
+  length(y_train)
+}
+df_beta <- data.frame(beta = beta, beta_se = se, n_eff = rep(n_eff, length(beta)))
 
-# Get final beta (mean over chains)
-beta_auto <- rowMeans(sapply(ldpred_auto, function(auto) auto$beta_est))
+beta_auto <- NULL
+ldpred_auto <- tryCatch({
+  snp_ldpred2_auto(
+    corr,
+    df_beta = df_beta,
+    h2_init = 0.5,
+    vec_p_init = seq_log(1e-4, 0.9, length.out = 30),
+    ncores = NCORES
+  )
+}, error = function(e) {
+  cat("snp_ldpred2_auto failed; falling back to snp_ldpred2_inf. Error:\n")
+  cat(conditionMessage(e))
+  cat("\n")
+  NULL
+})
+
+if (!is.null(ldpred_auto)) {
+  beta_auto <- rowMeans(sapply(ldpred_auto, function(auto) auto$beta_est))
+} else {
+  beta_auto <- snp_ldpred2_inf(corr, df_beta = df_beta, h2 = 0.5)
+}
 
 # Save Betas
 # ID A1 Beta

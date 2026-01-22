@@ -256,9 +256,14 @@ class BayesR:
             )
             
         # Read output scores (.sscore)
-        # FID IID NMISS_ALLELE_CT NAMED_ALLELE_DOSAGE_SUM SCORE1_AVG
         score_path = f"{out_prefix}.sscore"
         results = pd.read_csv(score_path, sep='\t')
         
         # Return FID, IID, SCORE
-        return results[['#IID', 'SCORE1_AVG']].rename(columns={'#IID': 'IID', 'SCORE1_AVG': 'PRS'})
+        id_col = '#IID' if '#IID' in results.columns else 'IID'
+        if id_col not in results.columns or 'SCORE1_AVG' not in results.columns:
+            raise RuntimeError(
+                "PLINK2 .sscore missing expected columns. "
+                f"Path={score_path} Columns={list(results.columns)}"
+            )
+        return results[[id_col, 'SCORE1_AVG']].rename(columns={id_col: 'IID', 'SCORE1_AVG': 'PRS'})
