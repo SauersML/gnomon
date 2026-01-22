@@ -652,6 +652,27 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     with open(vcf_path, "w") as f:
         ts.write_vcf(f, individual_names=individual_names)
 
+    # --- Extract Genetic Map for Consistency ---
+    # stdpopsim/msprime used a specific map (GRCh38). We must export this so downstream tools
+    # (like LDpred2) use the EXACT same map, rather than approximating it from GRCh37.
+    map_path = f"{cfg.sim_name}.cm"
+    print(f"[{cfg.sim_name}] Writing {map_path} (Variant ID -> cM) ...")
+    
+    # contig.recombination_map is an msprime.RateMap
+    # get_cumulative_mass(x) returns mass in Morgans. Convert to cM.
+    rmap = contig.recombination_map
+    
+    with open(map_path, "w") as f:
+        for var in ts.variants():
+            pos = var.site.position
+            # SNP ID in VCF is usually just "." but we need to match what PLINK will produce.
+            # PLINK usually assigns IDs like "22:POS:REF:ALT" if missing, or we can trust the order.
+            # However, run_plink_conversion ensures we are working with the same VCF.
+            # Ideally, we map by Position.
+            cm = rmap.get_cumulative_mass(pos) * 100.0
+            # We'll write POS -> cM map.
+            f.write(f"{int(pos)}\t{cm:.6f}\n")
+
 
     print(f"[{cfg.sim_name}] Writing {tsv_path} ...")
     _write_tsv(tsv_path, header, rows)
@@ -694,9 +715,9 @@ def main() -> None:
 
     _simulate_dataset(cfg)
     
-    # Convert to PLINK format
+    # Convert to PLINK format and inject the correct genetic map
     from plink_utils import run_plink_conversion
-    run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name)
+    run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name, cm_map_path=f"{cfg.sim_name}.cm")
 
     # Cleanup intermediate files to save space
     import os
@@ -705,7 +726,9 @@ def main() -> None:
             os.remove(f"{cfg.sim_name}.trees")
         if os.path.exists(f"{cfg.sim_name}.vcf"):
             os.remove(f"{cfg.sim_name}.vcf")
-        print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf).")
+        if os.path.exists(f"{cfg.sim_name}.cm"):
+            os.remove(f"{cfg.sim_name}.cm")
+        print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf, .cm).")
     except Exception as e:
         print(f"WARNING: Cleanup failed: {e}")
 

@@ -112,20 +112,22 @@ se <- se[ok_beta & ok_se]
 # LD Correlation Matrix
 # Compute LD on a subset of SNPs/Indivs for speed (or full if small)
 # Using restricted chromosome info from map
-POS2 <- tryCatch({
-  snp_asGeneticPos(CHR, POS, dir = map_dir)
-}, error = function(e) {
-  cat("snp_asGeneticPos failed. Diagnostics:\n")
-  cat(paste0("  map_dir=", map_dir, "\n"))
-  cat(paste0("  map_dir exists=", dir.exists(map_dir), "\n"))
-  if (dir.exists(map_dir)) {
-    cat("  map_dir listing:\n")
-    print(list.files(map_dir, all.files = TRUE))
-  }
-  stop(e)
-})
+
+# We used to calculate genetic positions here using snp_asGeneticPos (GRCh37 default).
+# However, this caused crashes because our data is GRCh38, leading to NAs and dense LD matrices.
+# The upstream simulation pipeline now injects the correct GRCh38 genetic positions into the .bim file.
+# So we simply read them from the loaded object.
+POS2 <- obj.bigSNP.train$map$genetic.dist[ind_col_ok]
+
+# Verify we have valid genetic positions
+if (any(is.na(POS2))) {
+    cat("WARNING: NAs found in genetic positions from .bim file. This implies an upstream failure.\n")
+    cat("Falling back to physical positions (1Mb = 1cM approximation) as a safety net.\n")
+    POS2 <- POS[ind_col_ok] / 1000000
+}
+
 # Just use simple window
-corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2[ind_col_ok], ncores = NCORES, size = 3 / 1000)
+corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2, ncores = NCORES, size = 3 / 1000)
 
 if (!inherits(corr, "SFBM")) {
   if (inherits(corr, "dgCMatrix") || inherits(corr, "dsCMatrix")) {

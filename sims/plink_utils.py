@@ -7,10 +7,13 @@ import shutil
 from pathlib import Path
 import re
 
-def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
+def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None) -> None:
     """
     Convert VCF to PLINK binary format (.bed/.bim/.fam).
     Uses plink2.
+    
+    If cm_map_path is provided (format: BP cM per line), updates the .bim file
+    with correct genetic positions.
     """
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
@@ -65,6 +68,46 @@ def run_plink_conversion(vcf_path: str, out_prefix: str) -> None:
         raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
         
     print(f"Created PLINK files: {out_prefix}.bed/bim/fam")
+    
+    # Inject Genetic Map if provided
+    if cm_map_path and os.path.exists(cm_map_path):
+        print(f"Injecting genetic map from {cm_map_path} into {out_prefix}.bim ...")
+        
+        # Load map: POS(int) -> cM(float)
+        pos_to_cm = {}
+        with open(cm_map_path, "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    pos_to_cm[int(parts[0])] = parts[1] # Keep as string to preserve formatting if needed
+        
+        bim_path = f"{out_prefix}.bim"
+        bim_tmp = f"{out_prefix}.bim.tmp"
+        
+        updated_count = 0
+        try:
+            with open(bim_path, "r") as fin, open(bim_tmp, "w") as fout:
+                for line in fin:
+                    # BIM format: CHR SNP CM BP A1 A2
+                    cols = line.strip().split()
+                    if len(cols) < 6:
+                        fout.write(line)
+                        continue
+                        
+                    bp = int(cols[3])
+                    if bp in pos_to_cm:
+                        cols[2] = pos_to_cm[bp]
+                        updated_count += 1
+                    
+                    fout.write("\t".join(cols) + "\n")
+            
+            shutil.move(bim_tmp, bim_path)
+            print(f"Updated {updated_count} variants with genetic positions.")
+            
+        except Exception as e:
+            print(f"WARNING: Failed to update .bim file with genetic map: {e}")
+            if os.path.exists(bim_tmp):
+                os.remove(bim_tmp)
 
 def write_phenotype_file(df, out_path: str) -> None:
     """
