@@ -3844,15 +3844,29 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
-    (h_slope :
-      ∀ c : Fin k → ℝ,
-        model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
-        = scaling_func c) :
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
+    (h_bayes : ∀ p c, linearPredictor model p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  exact h_slope c
+  have h_pred_1 := h_bayes 1 c
+  have h_pred_0 := h_bayes 0 c
+  unfold dgpMultiplicativeBias at h_pred_1 h_pred_0
+  dsimp at h_pred_1 h_pred_0
+  rw [mul_one] at h_pred_1
+  rw [mul_zero] at h_pred_0
+
+  have h_decomp := linearPredictor_decomp model h_linear_basis
+  rw [h_decomp 0 c] at h_pred_0
+  rw [h_decomp 1 c] at h_pred_1
+  simp only [mul_zero, add_zero, mul_one] at h_pred_0 h_pred_1
+
+  -- h_pred_0: predictorBase model c = 0
+  -- h_pred_1: predictorBase model c + predictorSlope model c = scaling_func c
+  rw [h_pred_0, zero_add] at h_pred_1
+  unfold predictorSlope at h_pred_1
+  exact h_pred_1
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
