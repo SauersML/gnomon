@@ -46,6 +46,7 @@ class BayesR:
             "--bayes", "R",
             "--chain-length", "10000",
             "--burn-in", "2000",
+            "--thread", "4",
             "--out", out_prefix
         ]
         

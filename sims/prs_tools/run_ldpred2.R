@@ -39,7 +39,7 @@ cat(paste0("  map_dir writeable=", tmp_write_ok, "\n"))
 # Avoid nested parallelism on CI runners.
 # bigsnpr/bigstatsr can use parallelism internally, and some CI environments
 # already set parallel backends, which triggers `?assert_cores`.
-options(bigstatsr.ncores = 2)
+options(bigstatsr.ncores = 4)
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
@@ -50,7 +50,7 @@ obj.bigSNP.train <- snp_attach(rds_train)
 G <- obj.bigSNP.train$genotypes
 CHR <- obj.bigSNP.train$map$chromosome
 POS <- obj.bigSNP.train$map$physical.pos
-NCORES <- 2
+NCORES <- 4
 
 # Read Phenotype
 pheno <- fread(pheno_file, header=FALSE)
