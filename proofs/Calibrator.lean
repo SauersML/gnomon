@@ -409,9 +409,44 @@ theorem linear_noise_implies_nonlinear_slope
       (fun c => beta0 + beta1 * c) ≠
         (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
   intro beta0 beta1 h_eq
-  -- TODO: formalize the linear-vs-reciprocal contradiction (use values at c=0,1,2).
-  -- For now we allow a sketch.
-  admit
+  have h0 := congr_fun h_eq 0
+  have h1 := congr_fun h_eq 1
+  have h2 := congr_fun h_eq 2
+  unfold optimalSlopeLinearNoise at h0 h1 h2
+  simp only [mul_zero, add_zero, mul_one] at h0 h1 h2
+  field_simp [hB_pos, hB1_pos, hB2_pos] at h0 h1 h2
+  -- Eliminate sigma_g_sq (which is non-zero)
+  have h_ne_zero : sigma_g_sq ≠ 0 := ne_of_gt h_g_pos
+  -- Now we have the equation: 2 * (A / (B + D)) = A / B + A / (B + 2D)
+  have h_combine : 2 * (beta0 + beta1) = beta0 + (beta0 + 2 * beta1) := by ring
+  rw [eq_div_iff (ne_of_gt hB1_pos)] at h1
+  rw [eq_div_iff (ne_of_gt hB_pos)] at h0
+  rw [eq_div_iff (ne_of_gt hB2_pos)] at h2
+  have h1_frac : beta0 + beta1 = sigma_g_sq / (sigma_g_sq + base_error + slope_error) := by
+    rw [h1]; field_simp [hB1_pos]
+  have h0_frac : beta0 = sigma_g_sq / (sigma_g_sq + base_error) := by
+    rw [h0]; field_simp [hB_pos]
+  have h2_frac : beta0 + 2 * beta1 = sigma_g_sq / (sigma_g_sq + base_error + 2 * slope_error) := by
+    rw [h2]; field_simp [hB2_pos]
+  rw [h1_frac, h0_frac, h2_frac] at h_combine
+  rw [← mul_assoc, ← mul_add] at h_combine
+  nth_rw 1 [← mul_one sigma_g_sq] at h_combine
+  rw [← mul_div_assoc] at h_combine
+  have h_combine' : 2 / (sigma_g_sq + base_error + slope_error) =
+      1 / (sigma_g_sq + base_error) + 1 / (sigma_g_sq + base_error + 2 * slope_error) := by
+    apply (mul_right_inj' h_ne_zero).mp
+    convert h_combine using 1
+    · field_simp [hB1_pos]
+    · field_simp [hB_pos, hB2_pos]; ring
+  field_simp [hB_pos, hB1_pos, hB2_pos] at h_combine'
+  rw [← sub_eq_zero] at h_combine'
+  ring_nf at h_combine'
+  have h_slope_zero : slope_error = 0 := by
+    -- h_combine' is now -2 * slope_error ^ 2 = 0
+    have h : 2 * slope_error ^ 2 = 0 := by linarith [h_combine']
+    have h' : slope_error ^ 2 = 0 := by linarith [h]
+    exact sq_eq_zero_iff.mp h'
+  exact h_slope_ne h_slope_zero
 
 /-! ### Generalized Population Structure (No Admixture Assumption)
 
@@ -449,10 +484,15 @@ theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
     (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
     (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
+    (h_link : ∀ c, arch.selection_effect c = arch.V_cov c / arch.V_genic c)
     (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
     optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
-  -- Placeholder: selection-effect variation implies LD contribution varies, hence slope varies.
-  admit
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self h_genic_pos₁, add_div, div_self h_genic_pos₂]
+  rw [← h_link c₁, ← h_link c₂]
+  simp
+  intro h_eq
+  exact h_sel_var h_eq
 
 /-! ### LD Decay Theorem (Signal-to-Noise)
 
@@ -462,12 +502,19 @@ This is the general statement used for divergence and admixture alike. -/
 theorem ld_decay_implies_nonlinear_calibration
     (sigma_g_sq base_error slope_error : ℝ)
     (h_g_pos : 0 < sigma_g_sq)
+    (hB_pos : 0 < sigma_g_sq + base_error)
+    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
+    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
     (h_slope_ne : slope_error ≠ 0) :
     ∀ (beta0 beta1 : ℝ),
       (fun c => beta0 + beta1 * c) ≠
         (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
-  -- Reuse the linear-noise lemma (proof deferred).
-  admit
+  apply linear_noise_implies_nonlinear_slope sigma_g_sq base_error slope_error
+  exact h_g_pos
+  exact hB_pos
+  exact hB1_pos
+  exact hB2_pos
+  exact h_slope_ne
 
 /-! ### Normalization Failure under Directional LD
 
@@ -573,12 +620,20 @@ theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
 
 theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
     (mech : LDDecayMechanism k)
+    (h_surj : Function.Surjective mech.distance)
     (h_nonlin : ¬ ∃ a b, ∀ d, mech.tagging_efficiency d = a + b * d) :
     ∀ (beta0 beta1 : ℝ),
       (fun c => beta0 + beta1 * mech.distance c) ≠
         (fun c => decaySlope mech c) := by
-  -- Sketch: if decay is not linear in distance, no linear PC interaction matches it.
-  admit
+  intro beta0 beta1 h_eq
+  apply h_nonlin
+  use beta0, beta1
+  intro d
+  obtain ⟨c, hc⟩ := h_surj d
+  have h_c := congr_fun h_eq c
+  unfold decaySlope at h_c
+  rw [hc] at h_c
+  exact h_c.symm
 
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
