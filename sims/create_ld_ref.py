@@ -14,11 +14,11 @@ import h5py
 from pathlib import Path
 
 def read_plink_bed(bfile):
-    """Read PLINK .bed file and return genotype matrix."""
+    """Read PLINK .bed file and return bim, fam, and lazy bed dask array."""
     try:
         from pandas_plink import read_plink
         (bim, fam, bed) = read_plink(bfile)
-        return bim, fam, bed.compute()
+        return bim, fam, bed
     except Exception as e:
         pandas_version = getattr(pd, "__version__", "<unknown>")
         pandas_plink_version = "<unknown>"
@@ -139,7 +139,12 @@ def compute_ld_blocks(bim, geno, block_size=1000):
             with tempfile.TemporaryDirectory() as td:
                 ld_matrix = _compute_ld_matrix_plink(bfile_for_plink, block_snps, td)
         else:
-            block_geno = geno[:, start:end]
+            # Only materialize the sub-block from dask if needed
+            if hasattr(geno, "compute"):
+                # dask slicing: geno is (n_samples, n_snps)
+                block_geno = geno[:, start:end].compute()
+            else:
+                block_geno = geno[:, start:end]
 
             # Standardize genotypes
             means = np.nanmean(block_geno, axis=0)

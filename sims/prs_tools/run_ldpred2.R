@@ -39,7 +39,7 @@ cat(paste0("  map_dir writeable=", tmp_write_ok, "\n"))
 # Avoid nested parallelism on CI runners.
 # bigsnpr/bigstatsr can use parallelism internally, and some CI environments
 # already set parallel backends, which triggers `?assert_cores`.
-options(bigstatsr.ncores = 1)
+options(bigstatsr.ncores = 2)
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
@@ -50,7 +50,7 @@ obj.bigSNP.train <- snp_attach(rds_train)
 G <- obj.bigSNP.train$genotypes
 CHR <- obj.bigSNP.train$map$chromosome
 POS <- obj.bigSNP.train$map$physical.pos
-NCORES <- 1
+NCORES <- 2
 
 # Read Phenotype
 pheno <- fread(pheno_file, header=FALSE)
@@ -127,7 +127,7 @@ if (any(is.na(POS2))) {
 }
 
 # Just use simple window
-corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2, ncores = NCORES, size = 3 / 1000)
+corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2, ncores = NCORES, size = 3)
 
 if (!inherits(corr, "SFBM")) {
   if (inherits(corr, "dgCMatrix") || inherits(corr, "dsCMatrix")) {
