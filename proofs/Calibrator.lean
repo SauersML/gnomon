@@ -40,6 +40,7 @@ import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
+import Mathlib.Topology.MetricSpace.Lipschitz
 
 open scoped InnerProductSpace
 
