@@ -30,6 +30,8 @@ import Mathlib.Probability.Distributions.Gaussian.Real
 import Mathlib.Data.NNReal.Basic
 
 import Mathlib.Probability.Independence.Basic
+import Mathlib.Analysis.SpecialFunctions.ExpDeriv
+import Mathlib.Analysis.Convex.Deriv
 import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
