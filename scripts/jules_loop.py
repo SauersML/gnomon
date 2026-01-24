@@ -152,7 +152,8 @@ def call_jules(prompt, attempt=1):
         "sourceContext": {
             "source": f"sources/github/{repo}",
             "githubRepoContext": {"startingBranch": "main"}
-        }
+        },
+        "automationMode": "AUTO_CREATE_PR"
     }
 
     print("Sending payload to Jules API:")
@@ -235,7 +236,42 @@ def call_jules(prompt, attempt=1):
                         latest_changeset = art["changeSet"]
                     if "pullRequest" in art:
                         pr = art["pullRequest"]
-                        print(f"Pull Request: {pr.get('title')} - {pr.get('url')}")
+                        pr_url = pr.get('url', '')
+                        print(f"Pull Request: {pr.get('title')} - {pr_url}")
+
+                        # Add 'jules-loop' label to identify this as a Jules Loop PR
+                        if pr_url:
+                            try:
+                                # Extract PR number from URL (e.g., https://github.com/owner/repo/pull/123)
+                                pr_number = pr_url.rstrip('/').split('/')[-1]
+                                print(f"Adding 'jules-loop' label to PR #{pr_number}...")
+
+                                # Authenticate gh CLI with GITHUB_TOKEN
+                                github_token = os.environ.get("GITHUB_TOKEN")
+                                if github_token:
+                                    subprocess.run(
+                                        ['gh', 'auth', 'login', '--with-token'],
+                                        input=github_token,
+                                        check=True,
+                                        capture_output=True,
+                                        text=True
+                                    )
+
+                                # Use gh CLI to add label
+                                result = subprocess.run(
+                                    ['gh', 'pr', 'edit', pr_number, '--add-label', 'jules-loop'],
+                                    check=True,
+                                    capture_output=True,
+                                    text=True
+                                )
+                                print("✓ Label added successfully")
+                            except subprocess.CalledProcessError as e:
+                                print(f"Warning: Failed to add label to PR: {e}")
+                                print(f"stdout: {e.stdout}")
+                                print(f"stderr: {e.stderr}")
+                            except Exception as e:
+                                print(f"Warning: Failed to add label to PR: {e}")
+
                         # If Jules created a PR directly, we're done
                         return "PR_CREATED"
 

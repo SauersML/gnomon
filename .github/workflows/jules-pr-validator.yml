@@ -1,0 +1,243 @@
+name: Jules PR Validator
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  validate-jules-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check if PR is from Jules Loop
+        id: check-jules
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const isJulesPR = labels.includes('jules-loop');
+
+            console.log('PR Labels:', labels);
+            console.log('Is Jules Loop PR:', isJulesPR);
+
+            if (isJulesPR) {
+              console.log('✓ This is a Jules Loop PR - will validate');
+              core.setOutput('is_jules_pr', 'true');
+            } else {
+              console.log('→ Not a Jules Loop PR - skipping validation');
+              core.setOutput('is_jules_pr', 'false');
+            }
+
+      - name: Checkout PR
+        if: steps.check-jules.outputs.is_jules_pr == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        if: steps.check-jules.outputs.is_jules_pr == 'true'
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Validate file changes
+        if: steps.check-jules.outputs.is_jules_pr == 'true'
+        id: validate-files
+        run: |
+          echo "🔍 Checking file changes..."
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Get list of changed files with their status
+          CHANGED_FILES=$(git diff --name-status $BASE_SHA...$HEAD_SHA)
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo ""
+
+          VALIDATION_FAILED=false
+          FAILURE_REASON=""
+
+          # Check for created files (A = Added)
+          CREATED_FILES=$(echo "$CHANGED_FILES" | grep "^A" || true)
+          if [ -n "$CREATED_FILES" ]; then
+            echo "❌ FAIL: PR creates new files"
+            echo "$CREATED_FILES"
+            VALIDATION_FAILED=true
+            FAILURE_REASON="PR creates new files:\n\`\`\`\n$CREATED_FILES\n\`\`\`"
+          fi
+
+          # Check for deleted files (D = Deleted)
+          DELETED_FILES=$(echo "$CHANGED_FILES" | grep "^D" || true)
+          if [ -n "$DELETED_FILES" ]; then
+            echo "❌ FAIL: PR deletes files"
+            echo "$DELETED_FILES"
+            VALIDATION_FAILED=true
+            if [ -n "$FAILURE_REASON" ]; then
+              FAILURE_REASON="$FAILURE_REASON\n\n"
+            fi
+            FAILURE_REASON="${FAILURE_REASON}PR deletes files:\n\`\`\`\n$DELETED_FILES\n\`\`\`"
+          fi
+
+          # Check for modifications outside proofs/ directory
+          MODIFIED_FILES=$(echo "$CHANGED_FILES" | grep "^M" | awk '{print $2}' || true)
+          OUTSIDE_PROOFS=""
+
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [[ ! "$file" =~ ^proofs/ ]]; then
+              OUTSIDE_PROOFS="$OUTSIDE_PROOFS$file\n"
+            fi
+          done <<< "$MODIFIED_FILES"
+
+          if [ -n "$OUTSIDE_PROOFS" ]; then
+            echo "❌ FAIL: PR modifies files outside proofs/ directory"
+            echo -e "$OUTSIDE_PROOFS"
+            VALIDATION_FAILED=true
+            if [ -n "$FAILURE_REASON" ]; then
+              FAILURE_REASON="$FAILURE_REASON\n\n"
+            fi
+            FAILURE_REASON="${FAILURE_REASON}PR modifies files outside \`proofs/\` directory:\n\`\`\`\n$(echo -e "$OUTSIDE_PROOFS")\`\`\`"
+          fi
+
+          if [ "$VALIDATION_FAILED" = true ]; then
+            echo "validation_passed=false" >> $GITHUB_OUTPUT
+            # Escape newlines for GitHub output
+            echo "failure_reason<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$FAILURE_REASON" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "✅ File validation passed"
+            echo "validation_passed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Close PR if file validation failed
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const failureReason = `${{ steps.validate-files.outputs.failure_reason }}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ❌ Jules Loop PR Validation Failed\n\n**Reason:** File change violations detected.\n\n${failureReason}\n\n**Jules Loop Rules:**\n- ✗ Cannot create new files\n- ✗ Cannot delete files\n- ✗ Can only modify files in \`proofs/\` directory\n\nThis PR has been automatically closed.`
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              state: 'closed'
+            });
+
+            core.setFailed('PR validation failed: ' + failureReason);
+
+      # Only run Lean build if file validation passed
+      - name: Install elan
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Cache Lean toolchain
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
+
+      - name: Cache Lake dependencies
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .lake
+          key: ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain', 'lake-manifest.json') }}
+          restore-keys: |
+            ${{ runner.os }}-lake-v5-${{ hashFiles('lean-toolchain') }}-
+
+      - name: Enforce manifest integrity
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        run: git restore lake-manifest.json
+
+      - name: Fetch dependencies if needed
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        run: |
+          if [ ! -d ".lake/packages/mathlib" ]; then
+            echo "📥 Downloading mathlib cache..."
+            lake exe cache get
+            lake build
+          fi
+
+      - name: Build Lean proofs
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true'
+        id: lean-build
+        run: |
+          echo "🚀 Building Calibrator..."
+          set +e
+          lake build Calibrator > build.log 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          echo "--- Build Log (last 50 lines) ---"
+          tail -n 50 build.log
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "build_passed=true" >> $GITHUB_OUTPUT
+            echo "✅ Lean build passed"
+          else
+            echo "build_passed=false" >> $GITHUB_OUTPUT
+            echo "❌ Lean build failed"
+
+            # Extract error messages
+            ERROR_SUMMARY=$(tail -n 100 build.log | grep -E "error:|Error|FAILED" || echo "Build failed - see logs")
+            echo "error_summary<<EOF" >> $GITHUB_OUTPUT
+            echo "$ERROR_SUMMARY" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Close PR if Lean build failed
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const errorSummary = `${{ steps.lean-build.outputs.error_summary }}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ❌ Jules Loop PR Validation Failed\n\n**Reason:** Lean proof build failed.\n\n### Build Errors:\n\`\`\`\n${errorSummary}\n\`\`\`\n\n**Jules Loop Rules:**\n- ✓ File changes valid (only modified files in \`proofs/\`)\n- ✗ Lean build must pass\n\nThis PR has been automatically closed.`
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              state: 'closed'
+            });
+
+            core.setFailed('Lean build failed');
+
+      - name: PR validation passed
+        if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ✅ Jules Loop PR Validation Passed\n\n**All checks passed:**\n- ✓ No files created or deleted\n- ✓ Only modified files in \`proofs/\` directory\n- ✓ Lean build passed\n\nThis PR is ready for review!`
+            });

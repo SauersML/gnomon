@@ -101,10 +101,12 @@ esac
 log_success "Detected: ${BOLD}${OS}/${ARCH}${RESET}"
 log_info "Target release asset: ${BOLD}${TARGET_ASSET}${RESET}"
 
-# --- 2. Find Latest Release ---
-log_header "Checking Latest Release"
+# --- 2. Find Latest Binary Release ---
+log_header "Checking Latest Binary Release"
 
-API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+# Fetch all releases to find the most recent one with binary assets
+# This skips model-only releases (e.g., models-v1) automatically
+API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
 
 CURL_ARGS=(-sL)
 if [ -n "$GITHUB_TOKEN" ]; then
@@ -122,11 +124,12 @@ DOWNLOAD_URL=""
 for ((i=1; i<=MAX_RETRIES; i++)); do
     # Only print "Fetching..." on first attempt or every 5th retry to reduce log noise
     if [ $i -eq 1 ] || [ $((i % 5)) -eq 0 ]; then
-        log_info "Fetching metadata from GitHub (Attempt $i/$MAX_RETRIES)..."
+        log_info "Fetching releases from GitHub (Attempt $i/$MAX_RETRIES)..."
     fi
-    
+
     RESPONSE=$(curl "${CURL_ARGS[@]}" "${API_URL}")
-    
+
+    # Find the first release that contains the target asset
     DOWNLOAD_URL=$(echo "$RESPONSE" | \
         grep "browser_download_url.*${TARGET_ASSET}" | \
         cut -d '"' -f 4 | \
@@ -142,7 +145,7 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
 done
 
 if [ -z "$DOWNLOAD_URL" ]; then
-    log_error "Could not find a download URL for ${TARGET_ASSET} in the latest release."
+    log_error "Could not find a download URL for ${TARGET_ASSET} in any release."
     log_error "GitHub API Response Preview:"
     echo "$RESPONSE" | head -n 20
     log_error "..."
@@ -150,7 +153,7 @@ if [ -z "$DOWNLOAD_URL" ]; then
     exit 1
 fi
 
-log_success "Found latest release asset."
+log_success "Found latest binary release."
 
 # --- 3. Download & Install ---
 log_header "Installing gnomon"
