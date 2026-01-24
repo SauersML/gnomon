@@ -4052,20 +4052,148 @@ noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin
   Metric.infDist c supp
 
 theorem extrapolation_risk {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
-    (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ) (c_new : Fin k → ℝ)
+    (dgp : DataGeneratingProcess k) (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
-    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_lip_spline : ∃ K, ∀ i, LipschitzWith K (splineBasis.b i))
+    (h_lip_dgp : ∃ L, LipschitzWith L (fun c => dgp.trueExpectation 0 c)) :
   ∃ (f : ℝ → ℝ), Monotone f ∧
+      ∀ (c_new : Fin k → ℝ),
       |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new -
         dgp.trueExpectation 0 c_new| ≤
     f (dist_to_support c_new {c | ∃ i, c = data.c i}) := by
-  let err : ℝ := |predict (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) 0 c_new -
-    dgp.trueExpectation 0 c_new|
-  refine ⟨fun _ => err, ?_, ?_⟩
-  · intro a b h_ab
-    exact le_rfl
-  · simpa [err]
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  -- 1. Establish that the predictor is Lipschitz.
+  obtain ⟨K, _h_lip_K⟩ := h_lip_spline
+  obtain ⟨L, h_lip_L⟩ := h_lip_dgp
+
+  -- The predictor `pred(c) = predict model 0 c` is Lipschitz because it is a linear combination
+  -- of Lipschitz basis functions (splines) with finite coefficients.
+  have h_lip_pred : ∃ L_model, LipschitzWith L_model (fun c => predict model 0 c) := by
+    have h_fit_link : model.link = .identity := rfl
+    have h_pred_eq : ∀ c, predict model 0 c = linearPredictor model 0 c := by
+      intro c; unfold predict; rw [h_fit_link]; rfl
+
+    -- Projections are Lipschitz with constant 1 (under L2 norm)
+    have h_proj : ∀ l, LipschitzWith 1 (fun (c : Fin k → ℝ) => c l) := fun l => LipschitzWith.eval l
+
+    -- Helper for spline terms: coeff * spline(c l)
+    have h_lip_term : ∀ l j coeff, ∃ K_term, LipschitzWith K_term (fun c => coeff * splineBasis.b j (c l)) := by
+      intro l j coeff
+      obtain ⟨K_spline, h_spline⟩ := h_lip_spline
+      -- comp: b j ∘ (c l) is Lipschitz with K_spline * 1
+      have h_comp : LipschitzWith (K_spline * 1) (fun c => splineBasis.b j (c l)) :=
+        LipschitzWith.comp (h_spline j) (h_proj l)
+      -- const_mul: coeff * ... is Lipschitz with ‖coeff‖ * K
+      use ‖coeff‖₊ * (K_spline * 1)
+      exact LipschitzWith.const_mul coeff h_comp
+
+    -- 1. Baseline effect: γ₀₀ + ∑ l, ∑ j, f₀ₗ l j * b j (c l)
+    have h_lip_base : ∃ L_base, LipschitzWith L_base (fun c => model.γ₀₀ + ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (c l)) := by
+      have h_sum : ∃ L_sum, LipschitzWith L_sum (fun c => ∑ l, evalSmooth model.pcSplineBasis (model.f₀ₗ l) (c l)) := by
+        refine ⟨_, LipschitzWith.finset_sum Finset.univ (fun l _ => ?_)⟩
+        unfold evalSmooth
+        refine LipschitzWith.finset_sum Finset.univ (fun j _ => ?_)
+        obtain ⟨K, hK⟩ := h_lip_term l j (model.f₀ₗ l j)
+        exact hK
+      obtain ⟨L_sum, h_sum⟩ := h_sum
+      use 0 + L_sum
+      exact LipschitzWith.add (LipschitzWith.const model.γ₀₀) h_sum
+
+    -- 2. PGS related effects (at pgs=0): ∑ m, (γₘ₀ m + ∑ l, ...) * B_m(0)
+    have h_lip_pgs : ∃ L_pgs, LipschitzWith L_pgs (fun c =>
+        ∑ m,
+          let pgs_basis_val := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ 0
+          let pgs_coeff := model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (c l)
+          pgs_coeff * pgs_basis_val) := by
+      refine ⟨_, LipschitzWith.finset_sum Finset.univ (fun m _ => ?_)⟩
+      dsimp
+      let B_m := model.pgsBasis.B ⟨m.val + 1, by linarith [m.isLt]⟩ 0
+      have h_sum_inner : ∃ L_in, LipschitzWith L_in (fun c => ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (c l)) := by
+         refine ⟨_, LipschitzWith.finset_sum Finset.univ (fun l _ => ?_)⟩
+         unfold evalSmooth
+         refine LipschitzWith.finset_sum Finset.univ (fun j _ => ?_)
+         obtain ⟨K, hK⟩ := h_lip_term l j (model.fₘₗ m l j)
+         exact hK
+      obtain ⟨L_in, h_in⟩ := h_sum_inner
+      have h_add : LipschitzWith L_in (fun c => model.γₘ₀ m + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ m l) (c l)) := by
+        convert LipschitzWith.add (LipschitzWith.const (model.γₘ₀ m)) h_in
+        simp only [zero_add]
+      exact LipschitzWith.mul_const h_add B_m
+
+    obtain ⟨L_base, h_base⟩ := h_lip_base
+    obtain ⟨L_pgs, h_pgs⟩ := h_lip_pgs
+    use L_base + L_pgs
+    convert LipschitzWith.add h_base h_pgs using 1
+    ext c
+    rw [h_pred_eq, linearPredictor]
+    rfl
+
+  obtain ⟨L_model, h_lip_model⟩ := h_lip_pred
+
+  -- 2. Define the difference function `diff(c) = predict(c) - true(c)`.
+  let diff := fun c => predict model 0 c - dgp.trueExpectation 0 c
+  have h_lip_diff : LipschitzWith (L_model + L) diff := by
+    apply LipschitzWith.sub h_lip_model h_lip_L
+
+  -- 3. Define the bound `f`.
+  -- S is the support (training data c values).
+  let S := {c | ∃ i, c = data.c i}
+  haveI : Nonempty (Fin n) := Fin.pos_iff_nonempty.mp h_n_pos
+  -- Max error on support exists because S is finite and non-empty.
+  let max_err : ℝ := (Finset.univ.image (fun i => |diff (data.c i)|)).max' (by
+    simp only [Finset.univ_nonempty, Finset.image_nonempty])
+
+  let f : ℝ → ℝ := fun d => max_err + (L_model + L) * d
+
+  use f
+  constructor
+  · -- Monotone
+    intro x y hxy
+    dsimp [f]
+    gcongr
+    -- Lipschitz constants are non-negative
+    have h_nonneg : 0 ≤ L_model + L := add_nonneg h_lip_model.nonneg h_lip_L.nonneg
+    exact h_nonneg
+  · -- Bound
+    intro c_new
+    dsimp [f]
+    -- Bound using Lipschitz property and triangle inequality via closest point s ∈ S
+    let K_sum := L_model + L
+    have h_bound : ∀ s ∈ S, |diff c_new| ≤ |diff s| + K_sum * dist c_new s := by
+      intro s hs
+      -- |diff(c)| - |diff(s)| ≤ |diff(c) - diff(s)| ≤ K * dist(c, s)
+      have h1 : |diff c_new| - |diff s| ≤ |diff c_new - diff s| := abs_sub_abs_le_abs_sub _ _
+      have h2 : dist (diff c_new) (diff s) ≤ K_sum * dist c_new s := h_lip_diff c_new s
+      simp [dist] at h2
+      linarith
+
+    -- S is finite, so infDist is attained at some s ∈ S
+    have hS_finite : S.Finite := Set.toFinite (Set.range data.c)
+    have hS_nonempty : S.Nonempty := Set.range_nonempty data.c
+    obtain ⟨s, hs, h_dist_eq⟩ := hS_finite.exists_min (fun s => dist c_new s) hS_nonempty
+
+    -- dist_to_support c_new S = dist c_new s
+    rw [dist_to_support]
+    have h_inf_eq : Metric.infDist c_new S = dist c_new s := by
+      apply le_antisymm
+      · apply Metric.le_infDist_of_forall_dist_le
+        intro z hz
+        exact h_dist_eq z hz
+      · exact Metric.infDist_le_dist_of_mem hs
+    rw [h_inf_eq]
+
+    -- Use h_bound with this s
+    have h_le := h_bound s hs
+    -- |diff s| ≤ max_err
+    have h_max : |diff s| ≤ max_err := by
+      obtain ⟨i, hi⟩ := hs
+      rw [hi]
+      apply Finset.le_max'
+      simp only [Finset.mem_image, Finset.mem_univ, true_and]
+      use i
+    linarith
 
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
