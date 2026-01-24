@@ -21,17 +21,36 @@ from methods import (
 from metrics import compute_all_metrics, compute_calibration_curve
 
 def load_scores(work_dir, methods):
+    """Load available scores, skip missing methods gracefully."""
     scores_dict = {}
+    missing_methods = []
+
     for method in methods:
         score_file = work_dir / f"{method}.sscore"
         if not score_file.exists():
-            raise FileNotFoundError(f"CRITICAL: Missing score file for {method} at {score_file}. Did the training job fail?")
-        
-        df = pd.read_csv(score_file, sep='\t')
-        # Expect IID, PRS
-        df['IID'] = df['IID'].astype(str)
-        scores_dict[method] = df.set_index('IID')['PRS']
-        
+            print(f"WARNING: Missing score file for {method} at {score_file}")
+            print(f"    Training job likely failed. Skipping {method}.")
+            missing_methods.append(method)
+            continue
+
+        try:
+            df = pd.read_csv(score_file, sep='\t')
+            # Expect IID, PRS
+            df['IID'] = df['IID'].astype(str)
+            scores_dict[method] = df.set_index('IID')['PRS']
+            print(f"Loaded {method} scores")
+        except Exception as e:
+            print(f"WARNING: Failed to load {method} scores: {e}")
+            missing_methods.append(method)
+
+    if not scores_dict:
+        raise FileNotFoundError(f"CRITICAL: No score files found! All methods failed: {methods}")
+
+    if missing_methods:
+        print(f"\nEvaluation will proceed with {len(scores_dict)} of {len(methods)} methods")
+        print(f"   Available: {list(scores_dict.keys())}")
+        print(f"   Missing: {missing_methods}\n")
+
     return pd.DataFrame(scores_dict)
 
 def plot_roc_curves(methods_results, sim_id):
@@ -127,7 +146,9 @@ def main():
     # Re-order to match keep file if needed, but inner join with scores handles it.
     
     # 2. Load Scores
-    methods = ['BayesR', 'LDpred2', 'PRS-CSx']
+    default_methods = ['BayesR', 'LDpred2', 'PRS-CSx']
+    available_methods = sorted(p.stem for p in work_dir.glob("*.sscore"))
+    methods = available_methods if available_methods else default_methods
     print(f"Loading scores for: {methods}...")
     prs_scores_df = load_scores(work_dir, methods)
     
