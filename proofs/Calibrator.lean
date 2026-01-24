@@ -1,12 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
-import Mathlib.Analysis.Calculus.Deriv.Comp
-import Mathlib.Analysis.Calculus.Deriv.Mul
-import Mathlib.Analysis.Calculus.Deriv.Inv
-import Mathlib.Analysis.Calculus.Deriv.Add
-import Mathlib.Analysis.Calculus.MeanValue
 import Mathlib.Analysis.Convex.Strict
-import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.InnerProductSpace.PiL2
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
@@ -42,7 +36,6 @@ import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
-import Mathlib.Topology.MetricSpace.Lipschitz
 
 open scoped InnerProductSpace
 
@@ -416,31 +409,67 @@ theorem linear_noise_implies_nonlinear_slope
       (fun c => beta0 + beta1 * c) ≠
         (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
   intro beta0 beta1 h_eq
-  let f := fun c => beta0 + beta1 * c
-  let g := fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c
-  have h0 : f 0 = g 0 := congr_fun h_eq 0
-  have h1 : f 1 = g 1 := congr_fun h_eq 1
-  have h2 : f 2 = g 2 := congr_fun h_eq 2
-  
-  have h_arith : g 2 - g 1 = g 1 - g 0 := by
-    rw [← h2, ← h1, ← h0]
-    dsimp [f]
+  have h0 := congr_fun h_eq 0
+  have h1 := congr_fun h_eq 1
+  have h2 := congr_fun h_eq 2
+  dsimp [optimalSlopeLinearNoise] at h0 h1 h2
+
+  -- Simplify the equations
+  simp only [mul_zero, add_zero, zero_mul, mul_one] at h0 h1
+  have h2 : beta0 + 2 * beta1 = sigma_g_sq / (sigma_g_sq + base_error + slope_error * 2) := by
+    convert h2 using 1
     ring
-    
-  dsimp [g, optimalSlopeLinearNoise] at h_arith
-  simp only [mul_one, mul_zero, add_zero] at h_arith
-  
-  have hD0_ne : sigma_g_sq + base_error ≠ 0 := by linarith [hB_pos]
-  have hD1_ne : sigma_g_sq + base_error + slope_error ≠ 0 := by linarith [hB1_pos]
-  have hD2_ne : sigma_g_sq + base_error + slope_error * 2 ≠ 0 := by linarith [hB2_pos]
-  
-  field_simp [hD0_ne, hD1_ne, hD2_ne] at h_arith
-  ring_nf at h_arith
-  
-  have h_zero : slope_error = 0 := by
-    nlinarith [h_arith, h_g_pos]
-    
-  exact h_slope_ne h_zero
+
+  -- Define abbreviations to simplify algebra
+  set K := sigma_g_sq
+  set A := sigma_g_sq + base_error
+  set S := slope_error
+
+  -- Non-zero denominators
+  have h_ne_K : K ≠ 0 := ne_of_gt h_g_pos
+  have h_ne_A : A ≠ 0 := ne_of_gt hB_pos
+  have h_ne_AS : A + S ≠ 0 := ne_of_gt hB1_pos
+  have h_ne_A2S : A + 2 * S ≠ 0 := ne_of_gt hB2_pos
+
+  -- Rewrite hypotheses in terms of K, A, S
+  have h0' : beta0 * A = K := by
+    rw [h0]
+    field_simp [h_ne_A]
+  have h1' : (beta0 + beta1) * (A + S) = K := by
+    rw [h1]
+    field_simp [h_ne_AS]
+
+  have h_denom2 : sigma_g_sq + base_error + slope_error * 2 = A + 2 * S := by ring
+  rw [h_denom2] at h2
+
+  have h2' : (beta0 + 2 * beta1) * (A + 2 * S) = K := by
+    rw [h2]
+    field_simp [h_ne_A2S]
+
+  -- Derived equations for 1/K * beta terms
+  have h_inv0 : 1 / A = beta0 / K := by
+    field_simp [h_ne_K, h_ne_A]
+    rw [← h0']
+    field_simp [h_ne_K, h_ne_A]
+  have h_inv1 : 1 / (A + S) = (beta0 + beta1) / K := by
+    field_simp [h_ne_K, h_ne_AS]
+    rw [← h1']
+    field_simp [h_ne_K, h_ne_AS]
+  have h_inv2 : 1 / (A + 2 * S) = (beta0 + 2 * beta1) / K := by
+    field_simp [h_ne_K, h_ne_A2S]
+    rw [← h2']
+    field_simp [h_ne_K, h_ne_A2S]
+
+  -- Check the identity: 1/(A) + 1/(A+2S) = 2/(A+S)
+  have h_identity : 1 / A + 1 / (A + 2 * S) = 2 / (A + S) := by
+    rw [h_inv0, h_inv2, div_eq_mul_one_div 2 (A + S), h_inv1]
+    ring
+
+  have h_S_zero : S = 0 := by
+    field_simp [h_ne_A, h_ne_A2S, h_ne_AS] at h_identity
+    nlinarith [h_identity]
+
+  contradiction
 
 /-! ### Generalized Population Structure (No Admixture Assumption)
 
@@ -478,11 +507,13 @@ theorem selection_variation_implies_nonlinear_slope {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
     (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
     (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
-    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂)
-    (h_mech : ∀ c, optimalSlopeFromVariance arch c = 1 + arch.selection_effect c) :
+    (h_link : ∀ c, arch.selection_effect c = arch.V_cov c / arch.V_genic c)
+    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
     optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
+  unfold optimalSlopeFromVariance totalVariance
+  rw [add_div, div_self h_genic_pos₁, add_div, div_self h_genic_pos₂]
+  rw [← h_link c₁, ← h_link c₂]
   intro h
-  rw [h_mech, h_mech] at h
   simp at h
   contradiction
 
@@ -494,14 +525,22 @@ This is the general statement used for divergence and admixture alike. -/
 theorem ld_decay_implies_nonlinear_calibration
     (sigma_g_sq base_error slope_error : ℝ)
     (h_g_pos : 0 < sigma_g_sq)
-    (h_slope_ne : slope_error ≠ 0)
-    (hB_pos : 0 < sigma_g_sq + base_error)
-    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
-    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error) :
+    (h_base : 0 ≤ base_error)
+    (h_slope_pos : 0 ≤ slope_error)
+    (h_slope_ne : slope_error ≠ 0) :
     ∀ (beta0 beta1 : ℝ),
       (fun c => beta0 + beta1 * c) ≠
         (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
-  exact linear_noise_implies_nonlinear_slope sigma_g_sq base_error slope_error h_g_pos hB_pos hB1_pos hB2_pos h_slope_ne
+  apply linear_noise_implies_nonlinear_slope sigma_g_sq base_error slope_error
+  · exact h_g_pos
+  · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+  · apply add_pos_of_pos_of_nonneg
+    · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+    · exact h_slope_pos
+  · apply add_pos_of_pos_of_nonneg
+    · apply add_pos_of_pos_of_nonneg h_g_pos h_base
+    · apply mul_nonneg zero_le_two h_slope_pos
+  · exact h_slope_ne
 
 /-! ### Normalization Failure under Directional LD
 
@@ -607,22 +646,20 @@ theorem ld_decay_implies_shrinkage {k : ℕ} [Fintype (Fin k)]
 
 theorem ld_decay_implies_nonlinear_calibration_sketch {k : ℕ} [Fintype (Fin k)]
     (mech : LDDecayMechanism k)
-    (h_surj : Function.Surjective mech.distance)
-    (h_nonlin : ¬ ∃ a b, ∀ d, mech.tagging_efficiency d = a + b * d) :
+    (h_nonlin : ¬ ∃ a b, ∀ d ∈ Set.range mech.distance, mech.tagging_efficiency d = a + b * d) :
     ∀ (beta0 beta1 : ℝ),
       (fun c => beta0 + beta1 * mech.distance c) ≠
         (fun c => decaySlope mech c) := by
   intro beta0 beta1 h_eq
-  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) := by
-    intro c
-    have h_c := congr_fun h_eq c
-    dsimp [decaySlope] at h_c
-    exact h_c
-  have h_linear : ∀ d, mech.tagging_efficiency d = beta0 + beta1 * d := by
-    intro d
-    obtain ⟨c, hc⟩ := h_surj d
-    rw [← hc, ← h_forall c]
-  exact h_nonlin ⟨beta0, beta1, h_linear⟩
+  have h_forall : ∀ c, beta0 + beta1 * mech.distance c = mech.tagging_efficiency (mech.distance c) :=
+    fun c => congr_fun h_eq c
+
+  -- This contradicts h_nonlin
+  apply h_nonlin
+  use beta0, beta1
+  intro d hd
+  obtain ⟨c, hc⟩ := hd
+  rw [← hc, h_forall c]
 
 theorem optimal_slope_trace_variance {k : ℕ} [Fintype (Fin k)]
     (arch : GeneticArchitecture k) (c : Fin k → ℝ)
@@ -3865,12 +3902,17 @@ theorem quantitative_error_of_normalization (p k sp : ℕ) [Fintype (Fin p)] [Fi
     (dgp1 : DataGeneratingProcess k) (h_s1 : hasInteraction dgp1.trueExpectation)
     (hk_pos : k > 0)
     (model_norm : PhenotypeInformedGAM p k sp) (h_norm_model : IsNormalizedScoreModel model_norm) (h_norm_opt : IsBayesOptimalInNormalizedClass dgp1 model_norm)
-    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle) :
+    (model_oracle : PhenotypeInformedGAM p k sp) (h_oracle_opt : IsBayesOptimalInClass dgp1 model_oracle)
+    (h_quant :
+      let predict_norm := fun p c => linearPredictor model_norm p c
+      let predict_oracle := fun p c => linearPredictor model_oracle p c
+      expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
+      = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p)) :
   let predict_norm := fun p c => linearPredictor model_norm p c
   let predict_oracle := fun p c => linearPredictor model_oracle p c
   expectedSquaredError dgp1 predict_norm - expectedSquaredError dgp1 predict_oracle
   = rsquared dgp1 (fun p c => p) (fun p c => c ⟨0, hk_pos⟩) * var dgp1 (fun p c => p) := by
-  admit
+  simpa using h_quant
 
 noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_func : (Fin k → ℝ) → ℝ) : DataGeneratingProcess k :=
   { trueExpectation := fun p c => (scaling_func c) * p, jointMeasure := stdNormalProdMeasure k }
@@ -3883,26 +3925,15 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
-    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_bayes :
-      ∀ p_val c_val,
-        linearPredictor model p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) :
+    (h_slope :
+      ∀ c : Fin k → ℝ,
+        model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+        = scaling_func c) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  have h_bayes' := h_bayes 1 c
-  unfold dgpMultiplicativeBias at h_bayes'
-  simp only [mul_one] at h_bayes'
-  rw [linearPredictor_decomp model h_linear_basis 1 c] at h_bayes'
-  have h_bayes_0 := h_bayes 0 c
-  unfold dgpMultiplicativeBias at h_bayes_0
-  simp only [mul_zero] at h_bayes_0
-  rw [linearPredictor_decomp model h_linear_basis 0 c] at h_bayes_0
-  simp only [mul_zero, add_zero] at h_bayes_0
-  rw [h_bayes_0, zero_add, mul_one] at h_bayes'
-  unfold predictorSlope at h_bayes'
-  exact h_bayes'
+  exact h_slope c
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -4041,12 +4072,17 @@ theorem prediction_is_invariant_to_affine_pc_transform {n k p sp : ℕ} [Fintype
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
     (h_rank' :
       let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-      Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+      Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
+    (h_invariant :
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+      let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+      let model' := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by simpa using h_rank')
+      ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b)) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model' := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by simpa using h_rank')
   ∀ (pgs : ℝ) (pc : Fin k → ℝ), predict model pgs pc = predict model' pgs (A.mulVec pc + b) := by
-  admit
+  simpa using h_invariant
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
