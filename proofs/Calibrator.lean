@@ -3927,15 +3927,21 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
-    (h_slope :
-      ∀ c : Fin k → ℝ,
-        model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
-        = scaling_func c) :
+    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
+    (h_pred_eq : ∀ p c, linearPredictor model p c = scaling_func c * p) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  exact h_slope c
+  have h_decomp := linearPredictor_decomp model h_linear_basis
+  have h0 := h_pred_eq 0 c
+  have h1 := h_pred_eq 1 c
+  rw [h_decomp 0 c] at h0
+  rw [h_decomp 1 c] at h1
+  simp only [mul_zero, add_zero] at h0
+  rw [h0] at h1
+  simp only [zero_add, mul_one] at h1
+  exact h1
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
