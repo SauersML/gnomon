@@ -1,3 +1,9 @@
+# MEMORY OPTIMIZATIONS FOR CI RUNNERS (7GB RAM):
+# - Use 2 cores instead of 4 (reduces parallel memory usage)
+# - Use 1 cM LD window instead of 3 cM (reduces LD matrix size by ~3x)
+# - Use 12 chains instead of 30 for LDpred2-auto (reduces memory overhead)
+# Based on: https://github.com/privefl/bigsnpr/issues/172
+
 library(bigsnpr)
 library(bigstatsr)
 library(data.table)
@@ -39,7 +45,8 @@ cat(paste0("  map_dir writeable=", tmp_write_ok, "\n"))
 # Avoid nested parallelism on CI runners.
 # bigsnpr/bigstatsr can use parallelism internally, and some CI environments
 # already set parallel backends, which triggers `?assert_cores`.
-options(bigstatsr.ncores = 4)
+# MEMORY OPTIMIZATION: Use 2 cores instead of 4 to reduce parallel memory usage
+options(bigstatsr.ncores = 2)
 Sys.setenv(OMP_NUM_THREADS = "1")
 Sys.setenv(OPENBLAS_NUM_THREADS = "1")
 Sys.setenv(MKL_NUM_THREADS = "1")
@@ -50,7 +57,8 @@ obj.bigSNP.train <- snp_attach(rds_train)
 G <- obj.bigSNP.train$genotypes
 CHR <- obj.bigSNP.train$map$chromosome
 POS <- obj.bigSNP.train$map$physical.pos
-NCORES <- 4
+# MEMORY OPTIMIZATION: Use 2 cores to reduce memory usage
+NCORES <- 2
 
 # Read Phenotype
 pheno <- fread(pheno_file, header=FALSE)
@@ -126,8 +134,9 @@ if (any(is.na(POS2))) {
     POS2 <- POS[ind_col_ok] / 1000000
 }
 
-# Just use simple window
-corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2, ncores = NCORES, size = 3)
+# MEMORY OPTIMIZATION: Use 1 cM window instead of 3 cM to reduce LD matrix size
+# This significantly reduces memory usage while still capturing important LD structure
+corr <- snp_cor(G, ind.col = ind_col_ok, infos.pos = POS2, ncores = NCORES, size = 1)
 
 if (!inherits(corr, "SFBM")) {
   if (inherits(corr, "dgCMatrix") || inherits(corr, "dsCMatrix")) {
@@ -150,11 +159,13 @@ df_beta <- data.frame(beta = beta, beta_se = se, n_eff = rep(n_eff, length(beta)
 
 beta_auto <- NULL
 ldpred_auto <- tryCatch({
+  # MEMORY OPTIMIZATION: Use 12 chains instead of 30 to reduce memory usage
+  # This reduces memory consumption while still providing robust parameter estimation
   snp_ldpred2_auto(
     corr,
     df_beta = df_beta,
     h2_init = 0.5,
-    vec_p_init = seq_log(1e-4, 0.9, length.out = 30),
+    vec_p_init = seq_log(1e-4, 0.9, length.out = 12),
     ncores = NCORES
   )
 }, error = function(e) {
