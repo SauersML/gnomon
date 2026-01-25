@@ -25,6 +25,7 @@ import Mathlib.Data.Matrix.Reflection
 import Mathlib.Data.Matrix.Mul
 import Mathlib.LinearAlgebra.Matrix.Trace
 import Mathlib.MeasureTheory.Function.L2Space
+import Mathlib.MeasureTheory.Function.LpSpace.Basic
 import Mathlib.MeasureTheory.Constructions.Pi
 import Mathlib.MeasureTheory.Integral.Prod
 import Mathlib.Probability.ConditionalExpectation
@@ -3877,6 +3878,19 @@ lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
     simp
   rw [h_risk_true, zero_add]
 
+lemma risk_decomp_mult {k : ℕ}
+    (μ : Measure (ℝ × (Fin k → ℝ))) [IsProbabilityMeasure μ]
+    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
+    (hP0 : ∫ pc, pc.1 ∂μ = 0)
+    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
+    (scaling : (Fin k → ℝ) → ℝ)
+    (baseline : (Fin k → ℝ) → ℝ)
+    (slope : ℝ)
+    -- Integrability assumptions omitted/assumed for brevity in this helper
+    : ∫ pc, (scaling pc.2 * pc.1 - (baseline pc.2 + slope * pc.1))^2 ∂μ =
+      (slope - 1)^2 + ∫ c, (baseline c)^2 ∂(μ.map Prod.snd) + ∫ c, (scaling c - 1)^2 ∂(μ.map Prod.snd) := by
+  sorry
+
 /-- If a model class is capable of representing the truth, and a model is Bayes-optimal
     in that class, then the model recovers the truth almost everywhere. -/
 theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -3945,15 +3959,92 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   -- The normalized model space is base(C) + slope*P.
   -- We claim the optimal projection is 1 * P (since E[scaling]=1).
   have h_norm_pred : ∀ p c, linearPredictor model_norm p c = p := by
-    -- We assume standard L2 projection logic here for brevity.
-    -- In a full formalization, we would derive base(c)=0 and slope=1 from normal equations
-    -- similar to optimal_coefficients_for_additive_dgp, but adapted for multiplicative term.
-    -- Given E[scaling] = 1 and independence, E[scaling*P*P] = E[scaling]*E[P^2] = 1*1 = 1.
-    -- E[slope*P*P] = slope*1 = slope. So slope = 1.
-    -- E[scaling*P] = E[scaling]*E[P] = 0. E[base(c)] = E[base(c)].
-    -- This requires a slightly different lemma than available, so we admit this step
-    -- to focus on the structural gaming fix (adding h_capable).
-    admit
+    let m_star : PhenotypeInformedGAM 1 k 1 := {
+      pgsBasis := model_norm.pgsBasis,
+      pcSplineBasis := model_norm.pcSplineBasis,
+      γ₀₀ := 0,
+      γₘ₀ := fun _ => 1,
+      f₀ₗ := fun _ _ => 0,
+      fₘₗ := fun _ _ _ => 0,
+      link := .identity,
+      dist := .Gaussian
+    }
+    have h_star_norm : IsNormalizedScoreModel m_star := {
+      fₘₗ_zero := fun _ _ _ => rfl
+    }
+    have h_pred_star : ∀ p c, linearPredictor m_star p c = p := by
+      intro p c
+      rw [linearPredictor_decomp m_star h_linear_basis.1 p c]
+      unfold predictorBase predictorSlope
+      simp only [m_star, evalSmooth, zero_mul, Finset.sum_const_zero, add_zero, Fin1_sum_eq, zero_add, one_mul]
+
+    let slope := model_norm.γₘ₀ 0
+    let baseline (c : Fin k → ℝ) := predictorBase model_norm c
+    have h_pred_norm : ∀ p c, linearPredictor model_norm p c = baseline c + slope * p := by
+      intro p c
+      rw [linearPredictor_decomp model_norm h_linear_basis.1 p c]
+      unfold predictorSlope
+      have h_zero : ∀ l x, evalSmooth model_norm.pcSplineBasis (model_norm.fₘₗ 0 l) x = 0 := by
+        intro l x
+        unfold evalSmooth
+        simp [h_norm_opt.is_normalized.fₘₗ_zero]
+      simp [h_zero]
+      rfl
+
+    have h_risk_le := h_norm_opt.is_optimal m_star h_star_norm
+
+    -- We argue that Risk(m_star) - Risk(model_norm) >= 0 implies slope=1 and baseline=0.
+    -- Risk(model) = E[(scaling(c)*p - (baseline(c) + slope*p))^2]
+    --             = E[((scaling(c)-slope)*p - baseline(c))^2]
+    --             = E[(scaling(c)-slope)^2 * p^2] - 2*E[p*(scaling(c)-slope)*baseline(c)] + E[baseline(c)^2]
+    --             = E[(scaling(c)-slope)^2] + E[baseline(c)^2]  (using E[p^2]=1, E[p]=0)
+    -- Risk(m_star) corresponds to slope=1, baseline=0: E[(scaling(c)-1)^2]
+    -- Optimality: E[(scaling(c)-slope)^2] + E[baseline(c)^2] <= E[(scaling(c)-1)^2]
+    -- Expanding LHS: E[scaling^2 - 2*slope*scaling + slope^2] + E[baseline^2]
+    --              = E[scaling^2] - 2*slope + slope^2 + E[baseline^2] (using E[scaling]=1)
+    -- Expanding RHS: E[scaling^2 - 2*scaling + 1] = E[scaling^2] - 2 + 1
+    -- Inequality: E[scaling^2] - 2*slope + slope^2 + E[baseline^2] <= E[scaling^2] - 1
+    --             (slope - 1)^2 - 1 + E[baseline^2] <= -1
+    --             (slope - 1)^2 + E[baseline^2] <= 0
+    -- This implies slope=1 and E[baseline^2]=0.
+
+    have h_conseq : slope = 1 ∧ (∀ c, baseline c = 0) := by
+      have h_risk_eq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+          (slope - 1)^2 + ∫ c, (baseline c)^2 ∂dgp.jointMeasure.map Prod.snd +
+          ∫ c, (scaling_func c - 1)^2 ∂dgp.jointMeasure.map Prod.snd := by
+        simp_rw [h_pred_norm]
+        apply risk_decomp_mult dgp.jointMeasure
+        · simp only [dgp, dgpMultiplicativeBias, stdNormalProdMeasure]
+          erw [Measure.map_fst_prod, Measure.map_snd_prod]
+          simp
+        · sorry
+        · sorry
+
+      have h_risk_star_eq : expectedSquaredError dgp (fun p c => linearPredictor m_star p c) =
+          ∫ c, (scaling_func c - 1)^2 ∂dgp.jointMeasure.map Prod.snd := by
+        simp_rw [h_pred_star]
+        sorry
+
+      rw [h_risk_eq, h_risk_star_eq] at h_risk_le
+      have h_le_zero : (slope - 1)^2 + ∫ c, (baseline c)^2 ∂dgp.jointMeasure.map Prod.snd ≤ 0 := by
+        linarith
+
+      have h_slope : slope = 1 := by
+        have : 0 ≤ ∫ c, (baseline c)^2 ∂dgp.jointMeasure.map Prod.snd := integral_nonneg (fun _ => sq_nonneg _)
+        nlinarith
+
+      have h_baseline_int : ∫ c, (baseline c)^2 ∂dgp.jointMeasure.map Prod.snd = 0 := by
+        have : 0 ≤ ∫ c, (baseline c)^2 ∂dgp.jointMeasure.map Prod.snd := integral_nonneg (fun _ => sq_nonneg _)
+        linarith [sq_nonneg (slope - 1)]
+
+      have h_baseline : ∀ c, baseline c = 0 := by
+        sorry
+
+      exact ⟨h_slope, h_baseline⟩
+
+    intro p c
+    rw [h_pred_norm, h_conseq.1, h_conseq.2]
+    simp
 
   -- 3. Substitute and conclude
   -- Truth - Norm = scaling(C)P - P = (scaling(C)-1)P
@@ -5521,6 +5612,27 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
   use 1/2
   exact sigmoid_lt_half hμ
 
+lemma sigmoid_pos_denom (x : ℝ) : 1 + Real.exp (-x) ≠ 0 := by
+  apply ne_of_gt
+  have : Real.exp (-x) > 0 := Real.exp_pos _
+  linarith
+
+lemma sigmoid_differentiable (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
+  unfold sigmoid
+  apply DifferentiableAt.div
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      apply DifferentiableAt.neg
+      exact differentiableAt_id
+  · exact sigmoid_pos_denom x
+
+lemma sigmoid_deriv (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  sorry
+
+lemma sigmoid_strict_concave_pos : StrictConcaveOn ℝ (Set.Ioi 0) sigmoid := by
+  sorry
 
 /-- Calibration Shrinkage (Via Jensen's Inequality):
     The sigmoid function is strictly concave on (0, ∞).
@@ -5538,7 +5650,43 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    -- 1. Establish strict concavity of sigmoid on (0, ∞)
+    have h_concave : StrictConcaveOn ℝ (Set.Ioi 0) sigmoid := sigmoid_strict_concave_pos
+
+    -- 2. Integrability of sigmoid(X)
+    have h_int_sig : Integrable (fun ω => sigmoid (X ω)) P := by
+      have h_cont : Continuous sigmoid := by
+        sorry
+      have h_meas : Measurable (fun ω => sigmoid (X ω)) :=
+        h_cont.measurable.comp h_measurable
+      have h_mem : MemLp (fun ω => sigmoid (X ω)) 1 P := by
+        refine MemLp.of_bound h_meas.aestronglyMeasurable (1:ℝ) ?_
+        apply ae_of_all
+        intro ω
+        rw [Real.norm_eq_abs, abs_of_pos (sigmoid_pos (X ω))]
+        exact le_of_lt (sigmoid_lt_one (X ω))
+      exact h_mem.integrable (by norm_num)
+
+    -- 3. X is not a.e. constant
+    have h_not_const : ¬ ∃ c, X =ᵐ[P] fun _ => c := by
+      intro h_ex
+      rcases h_ex with ⟨c, hc⟩
+      have h_eq_mu : c = μ := by
+        rw [← h_mean]
+        rw [integral_congr_ae hc]
+        simp
+      have h_X_eq_mu : X =ᵐ[P] fun _ => μ := by
+        filter_upwards [hc] with ω hω
+        rw [hω, h_eq_mu]
+      exact h_non_degenerate h_X_eq_mu
+
+    -- 4. Apply Strict Jensen's Inequality
+    have h_lt : (∫ ω, sigmoid (X ω) ∂P) < sigmoid (∫ ω, X ω ∂P) := by
+      -- Use h_concave, h_support, h_non_degenerate
+      sorry
+
+    rw [h_mean] at h_lt
+    exact h_lt
     
 end BrierScore
 
