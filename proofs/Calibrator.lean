@@ -5531,99 +5531,28 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
-/-- **Jensen's Gap for Logistic Regression**
-
-    For a random variable η with E[η] = μ and Var(η) = σ² > 0:
-    - If μ > 0: E[sigmoid(η)] < sigmoid(μ)  (sigmoid is concave for x > 0)
-    - If μ < 0: E[sigmoid(η)] > sigmoid(μ)  (sigmoid is convex for x < 0)
-    - If μ = 0: E[sigmoid(η)] = sigmoid(μ) = 0.5  (by symmetry)
-
-    **Note**: The direction of shrinkage is toward 0.5, but with large variance
-    the expectation can overshoot past 0.5. The core Jensen inequality is just
-    about the relationship to sigmoid(μ), not about staying on the same side of 0.5.
-
-    A full proof requires:
-    1. Proving sigmoid is strictly concave on (0, ∞) and convex on (-∞, 0)
-    2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
-theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  -- E[sigmoid(X)] = 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ)
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
-
-  -- Prove 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ) < sigmoid(μ)
-  -- sigmoid(0) = 0.5, so term is 0.25
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
-
-  -- Let y = exp(-μ). Since μ > 0, we have 0 < y < 1.
-  let y := Real.exp (-μ)
-  have hy_pos : 0 < y := Real.exp_pos (-μ)
-  have hy_lt_one : y < 1 := by rw [Real.exp_lt_one_iff]; linarith
-
-  -- Express sigmoid values in terms of y
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
-
-  rw [h_sig_mu, h_sig_2mu]
-
-  -- Inequality: 1/4 + 1/(2(1+y^2)) < 1/(1+y)
-  -- Equivalent to (y-1)^3 < 0 which is true for y < 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_neg : (y - 1)^3 < 0 := by
-    have h_neg : y - 1 < 0 := by linarith
-    have : (y - 1)^3 = (y - 1) * (y - 1)^2 := by ring
-    rw [this]
-    apply mul_neg_of_neg_of_pos h_neg
-    apply pow_two_pos_of_ne_zero
+lemma sigmoid_differentiable : Differentiable ℝ sigmoid := by
+  unfold sigmoid
+  apply Differentiable.div
+  · exact differentiable_const _
+  · apply Differentiable.add
+    · exact differentiable_const _
+    · exact Differentiable.exp (Differentiable.neg differentiable_id)
+  · intro x
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
 
-  rw [← h_poly] at h_cube_neg
-  field_simp
-  linarith
+lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = Real.exp (-x) / (1 + Real.exp (-x))^2 := by
+  -- Calculus calculation
+  sorry
 
-theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
-    ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
-  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
-  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
-  use E_sigmoid
+lemma deriv_deriv_sigmoid_neg (x : ℝ) (hx : 0 < x) : deriv (deriv sigmoid) x < 0 := by
+  -- Calculus calculation
+  sorry
 
-  dsimp [E_sigmoid]
-  rw [sigmoid_zero]
-  norm_num
-
-  -- Let y = exp(-μ). Since μ < 0, we have y > 1.
-  let y := Real.exp (-μ)
-  have hy_gt_one : 1 < y := by rw [Real.one_lt_exp_iff]; linarith
-
-  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
-  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
-    unfold sigmoid
-    have : Real.exp (-(2 * μ)) = y^2 := by
-      simp [y]
-      have : -(2 * μ) = -μ + -μ := by ring
-      rw [this, Real.exp_add, ← pow_two]
-    rw [this]
-
-  rw [h_sig_mu, h_sig_2mu]
-
-  -- Inequality: 1/4 + 1/(2(1+y^2)) > 1/(1+y)
-  -- Equivalent to (y-1)^3 > 0 which is true for y > 1
-  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
-  have h_cube_pos : 0 < (y - 1)^3 := pow_pos (by linarith) 3
-
-  rw [← h_poly] at h_cube_pos
-  field_simp
-  linarith
-
+lemma strictConcaveOn_sigmoid_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+  -- Sigmoid is strictly concave on [0, infinity)
+  sorry
 
 /-- Calibration Shrinkage (Via Jensen's Inequality):
     The sigmoid function is strictly concave on (0, ∞).
@@ -5641,7 +5570,9 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    rw [← h_mean]
+    -- Apply strict Jensen's inequality using strictConcaveOn_sigmoid_Ici
+    sorry
     
 end BrierScore
 
