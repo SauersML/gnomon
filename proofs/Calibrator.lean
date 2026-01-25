@@ -32,6 +32,8 @@ import Mathlib.Probability.ConditionalProbability
 import Mathlib.Probability.Distributions.Gaussian.Real
 import Mathlib.Data.NNReal.Basic
 
+import Mathlib.LinearAlgebra.Matrix.Determinant.Basic
+import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 import Mathlib.Analysis.Convex.Deriv
@@ -5529,37 +5531,18 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
-    (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
-    (h_measurable : Measurable X) (h_integrable : Integrable X P)
-    (h_mean : ∫ ω, X ω ∂P = μ)
-    (h_support : ∀ᵐ ω ∂P, X ω > 0)
-    (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
-    let E_sigmoid := ∫ ω, sigmoid (X ω) ∂P
-    E_sigmoid < sigmoid μ := by
-  let E_sigmoid := ∫ ω, sigmoid (X ω) ∂P
-  
-  -- 1. Strict Concavity of Sigmoid on (0, ∞)
-  -- sigmoid''(x) = sigmoid(x)(1-sigmoid(x))(1-2sigmoid(x))
-  -- For x > 0: sigmoid(x) > 0.5.
-  -- Thus (1 - 2*sigmoid(x)) < 0.
-  -- So sigmoid''(x) < 0.
-  -- Strict concavity holds.
-  have h_concave : ConcaveOn ℝ (Set.Ioi 0) sigmoid := by
-    sorry -- Proof of sigmoid concavity via second derivative
-
-  -- 2. Strict Jensen's Inequality
-  -- If f is strictly concave and X is non-degenerate, E[f(X)] < f(E[X]).
-  have h_jensen : E_sigmoid < sigmoid μ := by
-       -- Requires strict Jensen from Mathlib
-       -- e.g. concave_integral_lt_of_concaveOn_of_nontrivial
-       sorry
-       
-  exact h_jensen
-
+  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+      (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
+      (h_measurable : Measurable X) (h_integrable : Integrable X P)
+      (h_mean : ∫ ω, X ω ∂P = μ)
+      (h_support : ∀ᵐ ω ∂P, X ω > 0)
+      (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
+      (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
+          sorry
+    
 end BrierScore
 
-/- section GradientDescentVerification
+section GradientDescentVerification
 
 open Matrix
 
@@ -5567,7 +5550,7 @@ variable {n p k : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)]
 
 -- 1. Model Functions
 noncomputable def S_lambda_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) : Matrix (Fin p) (Fin p) ℝ :=
-  ∑ i, Real.exp (rho i) • S_basis i
+  ∑ i, (Real.exp (rho i) • S_basis i)
 
 noncomputable def L_pen_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) (beta : Matrix (Fin p) (Fin 1) ℝ) : ℝ :=
   - (log_lik beta) + 0.5 * trace (beta.transpose * (S_lambda_fn S_basis rho) * beta)
@@ -5578,7 +5561,7 @@ noncomputable def Hessian_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X
 noncomputable def LAML_fn (log_lik : Matrix (Fin p) (Fin 1) ℝ → ℝ) (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) : ℝ :=
   let b := beta_hat rho
   let H := Hessian_fn S_basis X W rho b
-  L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (Matrix.det H) - 0.5 * Real.log (Matrix.det (S_lambda_fn S_basis rho))
+  L_pen_fn log_lik S_basis rho b + 0.5 * Real.log (H.det) - 0.5 * Real.log ((S_lambda_fn S_basis rho).det)
 
 -- 2. Rust Code Components
 noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : Matrix (Fin p) (Fin 1) ℝ :=
@@ -5586,7 +5569,7 @@ noncomputable def rust_delta_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ)
   let H := Hessian_fn S_basis X W rho b
   let lambda := Real.exp (rho i)
   let dS := lambda • S_basis i
-  - (Matrix.inv H) * (dS * b)
+  (-H⁻¹) * (dS * b)
 
 noncomputable def rust_correction_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (X : Matrix (Fin n) (Fin p) ℝ) (W : Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin n) (Fin n) ℝ) (beta_hat : (Fin k → ℝ) → Matrix (Fin p) (Fin 1) ℝ) (grad_op : (Matrix (Fin p) (Fin 1) ℝ → ℝ) → Matrix (Fin p) (Fin 1) ℝ → Matrix (Fin p) (Fin 1) ℝ) (rho : Fin k → ℝ) (i : Fin k) : ℝ :=
   let b := beta_hat rho
@@ -5601,8 +5584,8 @@ noncomputable def rust_direct_gradient_fn (S_basis : Fin k → Matrix (Fin p) (F
   let lambda := Real.exp (rho i)
   let Si := S_basis i
   0.5 * lambda * trace (b.transpose * Si * b) +
-  0.5 * lambda * trace (Matrix.inv H * Si) -
-  0.5 * lambda * trace (Matrix.inv S * Si)
+  0.5 * lambda * trace (H⁻¹ * Si) -
+  0.5 * lambda * trace (S⁻¹ * Si)
 
 -- 3. Verification Theorem
 theorem laml_gradient_is_exact 
@@ -5623,5 +5606,3 @@ by
 end GradientDescentVerification
 
 end Calibrator
-
--/
