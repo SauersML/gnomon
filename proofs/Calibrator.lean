@@ -46,6 +46,7 @@ import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
+import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
 
@@ -4029,6 +4030,7 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
+set_option maxHeartbeats 1000000 in
 /-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
@@ -4039,7 +4041,13 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
        (∀ p c, linearPredictor m p c = dgp_latent.to_dgp.trueExpectation p c) ∧
        (m.pgsBasis = model.pgsBasis) ∧ (m.pcSplineBasis = model.pcSplineBasis))
     -- We need continuity to go from a.e. to everywhere.
-    (h_continuous_noise : Continuous dgp_latent.noise_variance_given_pc) :
+    (h_continuous_noise : Continuous dgp_latent.noise_variance_given_pc)
+    -- Additional hypotheses to strengthen the proof
+    (h_measure_pos : Measure.IsOpenPosMeasure dgp_latent.to_dgp.jointMeasure)
+    (h_integrable_sq : Integrable (fun pc => (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) dgp_latent.to_dgp.jointMeasure)
+    (h_denom_ne_zero : ∀ c, dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c ≠ 0)
+    (h_pgs_cont : ∀ i, Continuous (model.pgsBasis.B i))
+    (h_spline_cont : ∀ i, Continuous (model.pcSplineBasis.b i)) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
@@ -4053,7 +4061,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   -- We assume standard Gaussian measure supports the whole space.
   have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
       (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp_latent.to_dgp.jointMeasure] 0 := by
-    apply (integral_eq_zero_iff_of_nonneg _ (by sorry)).mp h_risk_zero
+    apply (integral_eq_zero_iff_of_nonneg _ h_integrable_sq).mp h_risk_zero
     exact fun _ => sq_nonneg _
 
   have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure,
@@ -4064,9 +4072,51 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
   -- 3. Use continuity to show equality holds everywhere (skipping full topological proof for now)
   have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val := by
+    -- We prove equality as functions pc -> ℝ
+    have h_eq_fun : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
+                    (fun pc => dgp_latent.to_dgp.trueExpectation pc.1 pc.2) := by
+      have h_ae_symm : (fun pc => linearPredictor model pc.1 pc.2) =ᵐ[dgp_latent.to_dgp.jointMeasure] (fun pc => dgp_latent.to_dgp.trueExpectation pc.1 pc.2) := by
+        filter_upwards [h_ae_eq] with x hx
+        exact hx.symm
+      -- Helper lemma for evalSmooth continuity with model.pcSplineBasis
+      have h_evalSmooth_cont : ∀ (coeffs : SmoothFunction sp),
+          Continuous (fun x => evalSmooth model.pcSplineBasis coeffs x) := by
+        intro coeffs
+        dsimp only [evalSmooth]
+        refine continuous_finset_sum _ (fun i _ => ?_)
+        apply Continuous.mul continuous_const (h_spline_cont i)
+
+      refine Measure.eq_of_ae_eq h_ae_symm ?_ ?_
+      · -- Continuity of linearPredictor
+        simp only [linearPredictor]
+        apply Continuous.add
+        · -- baseline_effect
+          apply Continuous.add
+          · exact continuous_const
+          · refine continuous_finset_sum _ (fun l _ => ?_)
+            apply Continuous.comp (h_evalSmooth_cont _)
+            exact (continuous_apply l).comp continuous_snd
+        · -- pgs_related_effects
+          refine continuous_finset_sum _ (fun m _ => ?_)
+          apply Continuous.mul
+          · -- pgs_coeff
+            apply Continuous.add
+            · exact continuous_const
+            · refine continuous_finset_sum _ (fun l _ => ?_)
+              apply Continuous.comp (h_evalSmooth_cont _)
+              exact (continuous_apply l).comp continuous_snd
+          · -- pgs_basis_val
+            apply Continuous.comp (h_pgs_cont _) continuous_fst
+      · -- Continuity of trueExpectation
+        rw [dgp_latent.is_latent]
+        refine Continuous.mul ?_ continuous_fst
+        refine Continuous.div continuous_const ?_ ?_
+        · refine Continuous.add continuous_const ?_
+          exact Continuous.comp h_continuous_noise continuous_snd
+        · intro x
+          exact h_denom_ne_zero x.2
     intro p c
-    -- In a full proof: use Continuous.eq_of_ae_eq
-    sorry
+    exact congr_fun h_eq_fun (p, c)
 
   -- 4. Algebraic Extraction (same as original derivation)
   -- The remainder of the proof identifies the coefficients from the function equality.
