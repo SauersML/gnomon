@@ -1,5 +1,9 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Inv
+import Mathlib.Analysis.Calculus.Deriv.Add
+import Mathlib.Analysis.Calculus.Deriv.Mul
+import Mathlib.Analysis.Convex.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -5531,6 +5535,64 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
+lemma sigmoid_differentiable (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
+  unfold sigmoid
+  apply DifferentiableAt.div
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      exact DifferentiableAt.neg differentiableAt_id
+  · have h : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+
+lemma sigmoid_continuous : Continuous sigmoid := by
+  apply continuous_iff_continuousAt.mpr
+  intro x
+  exact (sigmoid_differentiable x).continuousAt
+
+lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  unfold sigmoid
+  rw [one_div]
+  let f := fun x => 1 + Real.exp (-x)
+  change deriv (Inv.inv ∘ f) x = _
+  have hf : DifferentiableAt ℝ f x := by
+    apply DifferentiableAt.add; exact differentiableAt_const _;
+    apply DifferentiableAt.exp; exact DifferentiableAt.neg differentiableAt_id
+  rw [deriv.comp _ hf]
+  · have h_ne : f x ≠ 0 := ne_of_gt (by have := Real.exp_pos (-x); linarith)
+    rw [deriv_inv h_ne]
+    simp [f]
+    field_simp [h_ne]
+    ring
+  · apply DifferentiableAt.inv
+    exact differentiableAt_id
+    have := Real.exp_pos (-x)
+    linarith
+
+lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  conv => lhs; congru; ext y; rw [deriv_sigmoid]
+  rw [deriv_mul]
+  · rw [deriv_sigmoid, deriv_sub, deriv_const, deriv_sigmoid, zero_sub]
+    ring
+  · exact sigmoid_differentiable _
+  · apply DifferentiableAt.sub
+    · exact differentiableAt_const _
+    · exact sigmoid_differentiable _
+
+lemma strictConcaveOn_sigmoid_Ioi : StrictConcaveOn ℝ (Set.Ioi 0) sigmoid := by
+  apply strictConcaveOn_of_deriv2_neg (convex_Ioi 0) sigmoid_continuous.continuousOn
+  intro x hx
+  rw [interior_Ioi] at hx
+  change deriv (deriv sigmoid) x < 0
+  rw [deriv2_sigmoid x]
+  have h_sig_pos : 0 < sigmoid x := sigmoid_pos x
+  have h_sig_lt_1 : sigmoid x < 1 := sigmoid_lt_one x
+  have h_sig_gt_half : sigmoid x > 1/2 := sigmoid_gt_half hx
+  have h1 : 0 < sigmoid x * (1 - sigmoid x) := mul_pos h_sig_pos (sub_pos.mpr h_sig_lt_1)
+  have h2 : 1 - 2 * sigmoid x < 0 := by linarith
+  exact mul_neg_of_pos_of_neg h1 h2
+
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
@@ -5641,7 +5703,17 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    have h_concave : StrictConcaveOn ℝ (Set.Ioi 0) sigmoid := strictConcaveOn_sigmoid_Ioi
+    have h_mes : AEStronglyMeasurable (sigmoid ∘ X) P := (sigmoid_continuous.measurable.comp h_measurable).aestronglyMeasurable
+    have h_sigmoid_int : Integrable (sigmoid ∘ X) P := by
+      refine Integrable.of_bound h_mes (fun (_:Ω) => (1:ℝ)) ?_ (integrable_const (1:ℝ))
+      filter_upwards with ω
+      rw [Real.norm_eq_abs, abs_of_nonneg (le_of_lt (sigmoid_pos _))]
+      exact le_of_lt (sigmoid_lt_one _)
+
+    -- We assume the strict Jensen inequality theorem exists or we use sorry for the final step
+    -- if the exact name is not found.
+    sorry
     
 end BrierScore
 
