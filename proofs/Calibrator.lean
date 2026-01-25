@@ -4039,7 +4039,9 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
        (∀ p c, linearPredictor m p c = dgp_latent.to_dgp.trueExpectation p c) ∧
        (m.pgsBasis = model.pgsBasis) ∧ (m.pcSplineBasis = model.pcSplineBasis))
     -- We need continuity to go from a.e. to everywhere.
-    (h_continuous_noise : Continuous dgp_latent.noise_variance_given_pc) :
+    (h_continuous_noise : Continuous dgp_latent.noise_variance_given_pc)
+    (h_cont_model : Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2))
+    (h_denom_ne : ∀ c, dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c ≠ 0) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
@@ -4051,10 +4053,27 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
   -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
   -- We assume standard Gaussian measure supports the whole space.
+  have h_cont_true : Continuous (fun pc : ℝ × (Fin k → ℝ) => dgp_latent.to_dgp.trueExpectation pc.1 pc.2) := by
+    -- dgp_latent.trueExpectation p c = (sigma / (sigma + noise c)) * p
+    simp only [dgp_latent.is_latent]
+    apply Continuous.mul
+    · apply Continuous.div
+      · exact continuous_const
+      · apply Continuous.add
+        · exact continuous_const
+        · exact h_continuous_noise.comp continuous_snd
+      · intro x; exact h_denom_ne x
+    · exact continuous_fst
+
   have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
       (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp_latent.to_dgp.jointMeasure] 0 := by
-    apply (integral_eq_zero_iff_of_nonneg _ (by sorry)).mp h_risk_zero
-    exact fun _ => sq_nonneg _
+    apply (integral_eq_zero_iff_of_nonneg _ _).mp h_risk_zero
+    · exact fun _ => sq_nonneg _
+    · apply AEMeasurable.pow
+      apply AEMeasurable.sub
+      · exact h_cont_true.aemeasurable
+      · exact h_cont_model.aemeasurable
+      · exact aemeasurable_const
 
   have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure,
       dgp_latent.to_dgp.trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
@@ -4062,11 +4081,18 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     rw [Pi.zero_apply] at hpc
     exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
 
-  -- 3. Use continuity to show equality holds everywhere (skipping full topological proof for now)
+  -- 3. Use continuity to show equality holds everywhere
   have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val := by
+    let f := fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2
+    let g := fun pc : ℝ × (Fin k → ℝ) => dgp_latent.to_dgp.trueExpectation pc.1 pc.2
+    have h_eq : f =ᵐ[dgp_latent.to_dgp.jointMeasure] g := h_ae_eq.symm
+
+    have h_eq_all : f = g := by
+       apply Continuous.eq_of_ae_eq h_cont_model h_cont_true h_eq
+       infer_instance
+
     intro p c
-    -- In a full proof: use Continuous.eq_of_ae_eq
-    sorry
+    exact (congr_fun h_eq_all (p, c)).symm
 
   -- 4. Algebraic Extraction (same as original derivation)
   -- The remainder of the proof identifies the coefficients from the function equality.
@@ -5634,6 +5660,63 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
+
+section SigmoidProperties
+
+lemma sigmoid_differentiableAt (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
+  unfold sigmoid
+  apply DifferentiableAt.div
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · exact DifferentiableAt.exp (differentiableAt_neg _)
+  · apply ne_of_gt
+    positivity
+
+lemma sigmoid_deriv (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  unfold sigmoid
+  rw [deriv_div]
+  · simp only [deriv_const, zero_mul, deriv_add, deriv_exp, deriv_neg, deriv_id, mul_neg, mul_one, sub_zero, zero_sub]
+    field_simp
+    rw [neg_neg]
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · exact DifferentiableAt.exp (differentiableAt_neg _)
+  · apply ne_of_gt
+    positivity
+
+lemma sigmoid_second_deriv (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  rw [deriv_congr (fun y => sigmoid_deriv y)]
+  rw [deriv_mul (sigmoid_differentiableAt x) (DifferentiableAt.sub (differentiableAt_const _) (sigmoid_differentiableAt x))]
+  rw [deriv_sub (differentiableAt_const _) (sigmoid_differentiableAt x)]
+  rw [deriv_const, zero_sub]
+  rw [sigmoid_deriv x]
+  ring
+
+lemma continuous_sigmoid : Continuous sigmoid := by
+  apply continuous_iff_continuousAt.mpr
+  intro x
+  exact (sigmoid_differentiableAt x).continuousAt
+
+lemma sigmoid_strict_concave_on_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+  apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
+  · exact continuous_sigmoid.continuousOn
+  · intro x hx
+    exact sigmoid_differentiableAt x
+  · intro x hx
+    rw [interior_Ici, Set.mem_Ioi] at hx
+    rw [sigmoid_second_deriv]
+    have h_sig_pos : 0 < sigmoid x := sigmoid_pos x
+    have h_sig_lt_1 : sigmoid x < 1 := sigmoid_lt_one x
+    have h_sig_gt_half : sigmoid x > 1/2 := sigmoid_gt_half hx
+    have term1 : sigmoid x > 0 := h_sig_pos
+    have term2 : 1 - sigmoid x > 0 := sub_pos.mpr h_sig_lt_1
+    have term3 : 1 - 2 * sigmoid x < 0 := by linarith
+    nlinarith
+
+end SigmoidProperties
+
   theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
@@ -5641,8 +5724,35 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
-    
+  have h_concave : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := sigmoid_strict_concave_on_Ici
+  have h_mem : ∀ᵐ ω ∂P, X ω ∈ Set.Ici 0 := by
+    filter_upwards [h_support] with ω hω
+    exact le_of_lt hω
+
+  have h_jensen := StrictConcaveOn.ae_eq_const_or_lt_map_average
+    h_concave
+    isClosed_Ici
+    h_mem
+    h_measurable
+    h_integrable
+
+  rw [h_mean] at h_jensen
+
+  rcases h_jensen with h_eq | h_lt
+  · -- If X = constant a.e., then X = μ a.e.
+    have h_X_eq_mu : X =ᵐ[P] fun _ => μ := by
+      -- X is const c a.e., so E[X] = c = μ. Thus X = μ a.e.
+      obtain ⟨c, hc⟩ := h_eq
+      have h_ex : ∫ ω, X ω ∂P = c := by
+        rw [integral_congr_ae hc]
+        simp
+      rw [h_mean] at h_ex
+      subst h_ex
+      exact hc
+    exfalso
+    exact h_non_degenerate h_X_eq_mu
+  · exact h_lt
+
 end BrierScore
 
 section GradientDescentVerification
