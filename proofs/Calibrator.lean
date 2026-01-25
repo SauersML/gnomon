@@ -2,7 +2,9 @@ import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
+import Mathlib.Analysis.Convex.Integral
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
+import Mathlib.Analysis.Convex.SpecificFunctions.Deriv
 import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.InnerProductSpace.PiL2
 import Mathlib.Analysis.InnerProductSpace.Projection.Basic
@@ -3945,15 +3947,62 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   -- The normalized model space is base(C) + slope*P.
   -- We claim the optimal projection is 1 * P (since E[scaling]=1).
   have h_norm_pred : ∀ p c, linearPredictor model_norm p c = p := by
-    -- We assume standard L2 projection logic here for brevity.
-    -- In a full formalization, we would derive base(c)=0 and slope=1 from normal equations
-    -- similar to optimal_coefficients_for_additive_dgp, but adapted for multiplicative term.
-    -- Given E[scaling] = 1 and independence, E[scaling*P*P] = E[scaling]*E[P^2] = 1*1 = 1.
-    -- E[slope*P*P] = slope*1 = slope. So slope = 1.
-    -- E[scaling*P] = E[scaling]*E[P] = 0. E[base(c)] = E[base(c)].
-    -- This requires a slightly different lemma than available, so we admit this step
-    -- to focus on the structural gaming fix (adding h_capable).
-    admit
+    -- 1. Construct the candidate model m_star (slope=1, baseline=0) which predicts `p`
+    let m_star_params : ParamVec 1 k 1 := fun x =>
+      match x with
+      | .pgsCoeff 0 => 1
+      | _ => 0
+    let m_star := unpackParams model_norm.pgsBasis model_norm.pcSplineBasis m_star_params
+
+    -- Verify m_star is in Normalized Class
+    have h_star_norm : IsNormalizedScoreModel m_star := by
+      constructor
+      intro i l s
+      simp only [m_star, unpackParams, m_star_params]
+
+    -- Verify m_star predictor is `p`
+    have h_star_pred : ∀ p_val c_val, linearPredictor m_star p_val c_val = p_val := by
+      intro p_val c_val
+      unfold linearPredictor evalSmooth
+      simp only [m_star, unpackParams, m_star_params]
+      rw [Fin1_sum_eq]
+      simp only [Fin.mk_zero, add_zero, mul_zero, zero_add, zero_mul, Finset.sum_const_zero,
+        ParamIx.pgsCoeff]
+      -- Match the basis term manually
+      have h1 : model_norm.pgsBasis.B ⟨1, by norm_num⟩ = id := h_linear_basis.1
+      -- Force the index to reduce
+      sorry
+
+    -- 2. Identify model_norm parameters
+    -- model_norm has form: base(c) + slope * p
+    have h_decomp : ∀ p c, linearPredictor model_norm p c = predictorBase model_norm c + predictorSlope model_norm c * p :=
+      linearPredictor_decomp model_norm h_linear_basis.1
+    let slope := predictorSlope model_norm 0
+    let base := predictorBase model_norm
+
+    have h_slope_const : ∀ c, predictorSlope model_norm c = slope := by
+       intro c
+       unfold slope predictorSlope
+       have h_fml_zero := h_norm_opt.is_normalized.fₘₗ_zero 0
+       simp [h_fml_zero, evalSmooth, Finset.sum_const_zero]
+
+    -- 3. Optimality implies slope=1 and base=0
+    have h_risk_ineq : expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor model_norm p c) ≤
+                       expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor m_star p c) :=
+      h_norm_opt.is_optimal m_star h_star_norm
+
+    have h_slope_eq_1 : slope = 1 := by
+      sorry -- Omitted integral calculation
+
+    have h_base_zero : ∀ c, base c = 0 := by
+      sorry -- Omitted integral calculation
+
+    intro p c
+    rw [h_decomp]
+    dsimp only [slope, base] at h_slope_eq_1 h_base_zero h_slope_const
+    -- Ensure terms match for rewriting
+    rw [h_slope_const c, h_slope_eq_1, h_base_zero c]
+    ring
 
   -- 3. Substitute and conclude
   -- Truth - Norm = scaling(C)P - P = (scaling(C)-1)P
@@ -5538,7 +5587,77 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+  -- 1. Sigmoid is strictly concave on (0, ∞)
+  have continuous_sigmoid : Continuous sigmoid := by
+    unfold sigmoid
+    apply continuous_iff_continuousAt.mpr
+    intro x
+    apply ContinuousAt.div
+    · exact continuousAt_const
+    · apply ContinuousAt.add
+      · exact continuousAt_const
+      · exact (Continuous.comp Real.continuous_exp continuous_neg).continuousAt
+    · apply ne_of_gt
+      have : Real.exp (-x) > 0 := Real.exp_pos _
+      linarith
+
+  -- We need StrictConcaveOn for a closed set to use the integral theorem.
+  have h_concave_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+    apply strictConcaveOn_of_deriv2_neg (convex_Ici 0) continuous_sigmoid.continuousOn
+    intro x hx
+    rw [interior_Ici] at hx
+    simp [Set.mem_Ioi] at hx
+
+    let ex := Real.exp (-x)
+    have hex : 0 < ex := Real.exp_pos (-x)
+    have hex_lt_1 : ex < 1 := Real.exp_lt_one_iff.mpr (neg_lt_zero.mpr hx)
+    have hden : 1 + ex ≠ 0 := ne_of_gt (by linarith)
+
+    -- We assume the calculus calculation that the second derivative is:
+    -- ex * (ex - 1) / (1 + ex)^3
+    have h_calc : deriv (deriv sigmoid) x = (ex * (ex - 1)) / (1 + ex)^3 := by
+       -- This derivative calculation is standard but verbose in Lean.
+       sorry
+
+    change deriv (deriv sigmoid) x < 0
+    rw [h_calc]
+    apply div_neg_of_neg_of_pos
+    · apply mul_neg_of_pos_of_neg hex
+      linarith
+    · apply pow_pos (by linarith) 3
+
+  -- 2. Integrability of sigmoid(X)
+  have h_sigmoid_int : Integrable (fun ω => sigmoid (X ω)) P := by
+    haveI : IsFiniteMeasure P := inferInstance
+    apply Integrable.of_bound (Measurable.aestronglyMeasurable (continuous_sigmoid.measurable.comp h_measurable)) (1 : ℝ)
+    filter_upwards with ω
+    simp only [Real.norm_eq_abs]
+    dsimp
+    rw [abs_of_pos (sigmoid_pos _)]
+    exact le_of_lt (sigmoid_lt_one _)
+
+  -- 3. Apply Jensen's Inequality for strictly concave functions
+  have h_support_Ici : ∀ᵐ ω ∂P, X ω ∈ Set.Ici 0 := by
+    filter_upwards [h_support] with ω hω
+    exact le_of_lt hω
+
+  have h_result := StrictConcaveOn.ae_eq_const_or_lt_map_average h_concave_Ici
+    continuous_sigmoid.continuousOn
+    isClosed_Ici
+    h_support_Ici
+    h_integrable
+    h_sigmoid_int
+
+  simp only [average_eq_integral] at h_result
+  rw [h_mean] at h_result
+  cases h_result with
+  | inl h_eq =>
+      -- Contradiction with non-degenerate
+      exfalso
+      apply h_non_degenerate
+      exact h_eq
+  | inr h_lt =>
+      exact h_lt
     
 end BrierScore
 
