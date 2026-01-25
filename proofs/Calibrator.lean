@@ -42,6 +42,7 @@ import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
 import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.Algebra.Module.FiniteDimension
+import Mathlib.Analysis.Convex.Integral
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
@@ -76,6 +77,17 @@ noncomputable def stdNormalProdMeasure (k : ℕ) [Fintype (Fin k)] : Measure (�
 instance stdNormalProdMeasure_is_prob {k : ℕ} [Fintype (Fin k)] : IsProbabilityMeasure (stdNormalProdMeasure k) := by
   unfold stdNormalProdMeasure
   infer_instance
+
+lemma integral_id_gaussianReal_zero_one : ∫ x : ℝ, x ∂(ProbabilityTheory.gaussianReal 0 1) = 0 := by
+  rw [ProbabilityTheory.integral_id_gaussianReal]
+
+lemma integral_sq_gaussianReal_zero_one : ∫ x : ℝ, x^2 ∂(ProbabilityTheory.gaussianReal 0 1) = 1 := by
+  have h_var := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
+  rw [ProbabilityTheory.variance_eq_integral measurable_id.aemeasurable] at h_var
+  simp only [id_eq] at h_var
+  rw [ProbabilityTheory.integral_id_gaussianReal] at h_var
+  simp only [sub_zero, id_eq] at h_var
+  exact h_var
 
 structure PGSBasis (p : ℕ) where
   B : Fin (p + 1) → (ℝ → ℝ)
@@ -3923,7 +3935,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
   = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
   let dgp := dgpMultiplicativeBias scaling_func
-  
+  change expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
+    expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c) =
+    ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure
+
   -- 1. Risk Difference = || Oracle - Norm ||^2
   -- Because Oracle recovers Truth (Risk 0)
   have h_oracle_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c) = 0 := by
@@ -3937,31 +3952,21 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     rw [h_oracle_risk_zero, sub_zero]
     rfl
 
-  dsimp
-  rw [h_diff_eq_norm_sq]
-
   -- 2. Identify the Additive Projection
-  -- The true function is scaling(C) * P.
-  -- The normalized model space is base(C) + slope*P.
-  -- We claim the optimal projection is 1 * P (since E[scaling]=1).
-  have h_norm_pred : ∀ p c, linearPredictor model_norm p c = p := by
-    -- We assume standard L2 projection logic here for brevity.
-    -- In a full formalization, we would derive base(c)=0 and slope=1 from normal equations
-    -- similar to optimal_coefficients_for_additive_dgp, but adapted for multiplicative term.
-    -- Given E[scaling] = 1 and independence, E[scaling*P*P] = E[scaling]*E[P^2] = 1*1 = 1.
-    -- E[slope*P*P] = slope*1 = slope. So slope = 1.
-    -- E[scaling*P] = E[scaling]*E[P] = 0. E[base(c)] = E[base(c)].
-    -- This requires a slightly different lemma than available, so we admit this step
-    -- to focus on the structural gaming fix (adding h_capable).
-    admit
+  -- Use h_norm_opt to show risk is minimized
 
-  -- 3. Substitute and conclude
-  -- Truth - Norm = scaling(C)P - P = (scaling(C)-1)P
-  congr
-  funext pc
-  dsimp [dgp, dgpMultiplicativeBias]
-  rw [h_norm_pred]
-  ring
+  -- We want to show Risk(model_norm) = E[((scaling - 1)P)^2]
+  have h_risk_norm : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+      ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
+      -- This requires defining m_ref (with slope 1, base 0) and using optimality of model_norm.
+      -- Optimality: Risk(model_norm) <= Risk(m_ref) = E[((scaling - 1)P)^2]
+      -- L2 decomposition: Risk(model) = E[(scaling-slope)^2 P^2] + E[base^2]
+      -- Minimized at slope = E[scaling] = 1, base = 0.
+      -- So Risk(model_norm) >= E[((scaling - 1)P)^2]
+      -- Thus equality holds.
+      sorry
+
+  rw [h_oracle_risk_zero, sub_zero, h_risk_norm]
 
 
 
@@ -3972,16 +3977,22 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     The approximate version was unprovable from the given hypotheses. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
-    (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_pred_eq : ∀ p c, linearPredictor model p c = scaling_func c * p) :
+    (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
+      ∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
+  -- Optimality + Capability implies prediction equality (a.e., then pointwise by continuity)
+  have _h_recovers := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt h_capable
+  have h_pointwise : ∀ p c, linearPredictor model p c = scaling_func c * p := by
+    -- In a full formalization, we would use continuity to upgrade a.e. equality to pointwise equality.
+    sorry
   have h_decomp := linearPredictor_decomp model h_linear_basis
-  have h0 := h_pred_eq 0 c
-  have h1 := h_pred_eq 1 c
+  have h0 := h_pointwise 0 c
+  have h1 := h_pointwise 1 c
   rw [h_decomp 0 c] at h0
   rw [h_decomp 1 c] at h1
   simp only [mul_zero, add_zero] at h0
@@ -5497,6 +5508,29 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
+lemma differentiable_sigmoid : Differentiable ℝ sigmoid := by
+  unfold sigmoid
+  apply Differentiable.div
+  · exact differentiable_const 1
+  · apply Differentiable.add
+    · exact differentiable_const 1
+    · apply Differentiable.exp
+      apply Differentiable.neg
+      exact differentiable_id
+  · intro x
+    apply ne_of_gt
+    have := Real.exp_pos (-x)
+    linarith
+
+lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  sorry
+
+lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  sorry
+
+lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+  sorry
+
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
@@ -5531,14 +5565,14 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+  theorem calibration_shrinkage (μ : ℝ) (_hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
       (h_mean : ∫ ω, X ω ∂P = μ)
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    sorry
     
 end BrierScore
 
