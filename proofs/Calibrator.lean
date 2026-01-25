@@ -5513,13 +5513,82 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
     2. Measure-theoretic integration showing E[f(X)] < f(E[X]) for concave f -/
 theorem jensen_sigmoid_positive (μ : ℝ) (hμ : μ > 0) :
     ∃ E_sigmoid : ℝ, E_sigmoid < sigmoid μ := by
-  use 1/2
-  exact sigmoid_gt_half hμ
+  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
+  -- E[sigmoid(X)] = 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ)
+  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
+  use E_sigmoid
+
+  -- Prove 0.5 * sigmoid(0) + 0.5 * sigmoid(2μ) < sigmoid(μ)
+  -- sigmoid(0) = 0.5, so term is 0.25
+  dsimp [E_sigmoid]
+  rw [sigmoid_zero]
+  norm_num
+
+  -- Let y = exp(-μ). Since μ > 0, we have 0 < y < 1.
+  let y := Real.exp (-μ)
+  have hy_pos : 0 < y := Real.exp_pos (-μ)
+  have hy_lt_one : y < 1 := by rw [Real.exp_lt_one_iff]; linarith
+
+  -- Express sigmoid values in terms of y
+  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
+  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
+    unfold sigmoid
+    have : Real.exp (-(2 * μ)) = y^2 := by
+      simp [y]
+      have : -(2 * μ) = -μ + -μ := by ring
+      rw [this, Real.exp_add, ← pow_two]
+    rw [this]
+
+  rw [h_sig_mu, h_sig_2mu]
+
+  -- Inequality: 1/4 + 1/(2(1+y^2)) < 1/(1+y)
+  -- Equivalent to (y-1)^3 < 0 which is true for y < 1
+  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
+  have h_cube_neg : (y - 1)^3 < 0 := by
+    have h_neg : y - 1 < 0 := by linarith
+    have : (y - 1)^3 = (y - 1) * (y - 1)^2 := by ring
+    rw [this]
+    apply mul_neg_of_neg_of_pos h_neg
+    apply pow_two_pos_of_ne_zero
+    linarith
+
+  rw [← h_poly] at h_cube_neg
+  field_simp
+  linarith
 
 theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ∃ E_sigmoid : ℝ, E_sigmoid > sigmoid μ := by
-  use 1/2
-  exact sigmoid_lt_half hμ
+  -- Construct a 2-point distribution X with mean μ: P(X=0)=0.5, P(X=2μ)=0.5
+  let E_sigmoid := 0.5 * sigmoid 0 + 0.5 * sigmoid (2 * μ)
+  use E_sigmoid
+
+  dsimp [E_sigmoid]
+  rw [sigmoid_zero]
+  norm_num
+
+  -- Let y = exp(-μ). Since μ < 0, we have y > 1.
+  let y := Real.exp (-μ)
+  have hy_gt_one : 1 < y := by rw [Real.one_lt_exp_iff]; linarith
+
+  have h_sig_mu : sigmoid μ = 1 / (1 + y) := by unfold sigmoid; rfl
+  have h_sig_2mu : sigmoid (2 * μ) = 1 / (1 + y^2) := by
+    unfold sigmoid
+    have : Real.exp (-(2 * μ)) = y^2 := by
+      simp [y]
+      have : -(2 * μ) = -μ + -μ := by ring
+      rw [this, Real.exp_add, ← pow_two]
+    rw [this]
+
+  rw [h_sig_mu, h_sig_2mu]
+
+  -- Inequality: 1/4 + 1/(2(1+y^2)) > 1/(1+y)
+  -- Equivalent to (y-1)^3 > 0 which is true for y > 1
+  have h_poly : (y^2 + 3) * (1 + y) - 4 * (1 + y^2) = (y - 1)^3 := by ring
+  have h_cube_pos : 0 < (y - 1)^3 := pow_pos (by linarith) 3
+
+  rw [← h_poly] at h_cube_pos
+  field_simp
+  linarith
 
 
 /-- Calibration Shrinkage (Via Jensen's Inequality):
