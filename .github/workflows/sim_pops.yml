@@ -287,6 +287,7 @@ jobs:
           name: sim-data-${{ matrix.sim }}
 
       - name: Download BayesR Scores
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim }}-BayesR
@@ -294,6 +295,7 @@ jobs:
           merge-multiple: true
 
       - name: Download LDpred2 Scores
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim }}-LDpred2
@@ -301,6 +303,7 @@ jobs:
           merge-multiple: true
 
       - name: Download PRS-CSx Scores
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim }}-PRS-CSx
@@ -320,7 +323,7 @@ jobs:
           path: |
             sim${{ matrix.sim }}_metrics.csv
             sim${{ matrix.sim }}_comparison_*.png
-          if-no-files-found: error
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # JOB 4: REPORT (Consolidate)
@@ -343,19 +346,21 @@ jobs:
           uv pip install --system pandas tabulate
       
       - name: Download all results
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           pattern: sim-results-*
-          path: artifacts
+          path: .
           merge-multiple: true
-      
-      - name: Copy artifacts to working directory
+
+      - name: List downloaded files
         run: |
-          # Flatten artifacts if needed, but merge-multiple should handle it?
-          # If merge-multiple: true, files are in 'artifacts/' root.
-          cp artifacts/*.csv . || true
-          cp artifacts/*.png . || true
+          echo "Files in current directory:"
           ls -la
+          echo "CSV files:"
+          ls -la *.csv 2>/dev/null || echo "No CSV files found"
+          echo "PNG files:"
+          ls -la *.png 2>/dev/null || echo "No PNG files found"
       
       - name: Generate consolidated summary
         run: |

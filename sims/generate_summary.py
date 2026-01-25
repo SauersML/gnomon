@@ -56,7 +56,22 @@ def generate_summary_report():
     lines.append("| **Sim 2** | Ancestry-dependent accuracy (attenuation + noise) | Can GAM capture non-linear calibration? |")
     lines.append("| **Sim 3** | Imbalanced populations (EUR majority) | Does ancestry-aware calibration help underrepresented groups? |")
     lines.append("")
-    
+
+    # Check if any results exist
+    has_results = False
+    for sim_id in [1, 2, 3]:
+        if Path(f"sim{sim_id}_metrics.csv").exists():
+            has_results = True
+            break
+
+    if not has_results:
+        lines.append("## ⚠️ No Results Available")
+        lines.append("")
+        lines.append("No simulation results were found. This may indicate that some or all evaluation jobs failed.")
+        lines.append("")
+        lines.append("Please check the workflow logs for errors in the `train` and `evaluate` jobs.")
+        lines.append("")
+
     # Process each simulation
     for sim_id in [1, 2, 3]:
         lines.append(f"---")
@@ -119,7 +134,11 @@ def generate_summary_report():
     content = '\n'.join(lines)
     with open(summary_file, 'w') as f:
         f.write(content)
-    
+
+    # Also write to summary.md for artifact upload
+    with open('summary.md', 'w') as f:
+        f.write(content)
+
     print(f"✅ Summary report written to {summary_file}")
     print(f"   Report size: {len(content)} bytes (within 1MB limit)")
 
