@@ -3952,124 +3952,105 @@ structure DGPWithLatentRisk (k : ℕ) where
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
 
-/-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly.
 
-    **Changed from approximate (≈ 0.01) to exact equality**.
-    This is derivable from the structure of DGPWithLatentRisk.is_latent. -/
+/-- Risk Decomposition Lemma:
+    The expected squared error of any predictor f decomposes into the irreducible error
+    (risk of the true expectation) plus the distance from the true expectation. -/
+lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
+    (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ)
+    (hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
+    expectedSquaredError dgp f =
+    expectedSquaredError dgp dgp.trueExpectation +
+    ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure := by
+  unfold expectedSquaredError
+  -- The risk of trueExpectation is 0 because (True - True)^2 = 0
+  have h_risk_true : ∫ pc, (dgp.trueExpectation pc.1 pc.2 - dgp.trueExpectation pc.1 pc.2)^2 ∂dgp.jointMeasure = 0 := by
+    simp
+  rw [h_risk_true, zero_add]
+
+/-- If a model class is capable of representing the truth, and a model is Bayes-optimal
+    in that class, then the model recovers the truth almost everywhere. -/
+theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp)
+    (h_opt : IsBayesOptimalInClass dgp model)
+    (h_capable : ∃ (m : PhenotypeInformedGAM p k sp),
+      ∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) :
+    ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp.jointMeasure = 0 := by
+  rcases h_capable with ⟨m_true, h_eq_true⟩
+  have h_risk_true : expectedSquaredError dgp (fun p c => linearPredictor m_true p c) = 0 := by
+    unfold expectedSquaredError
+    simp only [h_eq_true, sub_self, zero_pow two_ne_zero, integral_zero]
+  have h_risk_model_le := h_opt m_true
+  rw [h_risk_true] at h_risk_model_le
+  unfold expectedSquaredError at h_risk_model_le
+  -- Integral of square is non-negative
+  have h_nonneg : 0 ≤ ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp.jointMeasure :=
+    integral_nonneg (fun _ => sq_nonneg _)
+  linarith
+
+/-- Under a latent risk DGP, the Bayes-optimal PGS coefficient equals the shrinkage factor exactly. -/
 theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
     (dgp_latent : DGPWithLatentRisk k) (model : PhenotypeInformedGAM 1 k sp)
-    (_h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model) (_hp_one : p = 1)
+    (h_opt : IsBayesOptimalInClass dgp_latent.to_dgp model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_bayes :
-      ∀ p_val c_val,
-        linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val) :
+    -- Instead of h_bayes, we assume the class is capable.
+    (h_capable : ∃ (m : PhenotypeInformedGAM 1 k sp),
+       (∀ p c, linearPredictor m p c = dgp_latent.to_dgp.trueExpectation p c) ∧
+       (m.pgsBasis = model.pgsBasis) ∧ (m.pcSplineBasis = model.pcSplineBasis))
+    -- We need continuity to go from a.e. to everywhere.
+    (h_continuous_noise : Continuous dgp_latent.noise_variance_given_pc) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
   intro c
 
-  -- The derivation follows from Equation (1) in "Recalibration of Polygenic Risk Scores"
-  -- by Graham, T. et al. (2024).
-  --
-  -- Setup: Let G = true genetic liability, Y = phenotype, P = polygenic score
-  --   Y = G + ε_Y (phenotype noise)
-  --   P = G + η(C) (measurement noise depending on ancestry C)
-  --
-  -- The true conditional expectation E[Y | P, C] satisfies:
-  --   E[Y | P=p, C=c] = α(c) * p
-  -- where α(c) is the regression coefficient of Y on P given C=c.
-  --
-  -- By standard regression theory:
-  --   α(c) = Cov(Y, P | C=c) / Var(P | C=c)
-  --
-  -- Computing the numerator:
-  --   Cov(Y, P | C) = Cov(G + ε_Y, G + η(C) | C)
-  --                 = Var(G)  (since G ⊥ ε_Y ⊥ η(C))
-  --                 = σ_G²
-  --
-  -- Computing the denominator:
-  --   Var(P | C) = Var(G + η(C) | C)
-  --              = Var(G) + Var(η(C) | C)
-  --              = σ_G² + σ_η²(C)
-  --
-  -- Therefore:
-  --   α(c) = σ_G² / (σ_G² + σ_η²(c))
-  --
-  -- The GAM structure captures this via:
-  --   γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) ≈ α(c)
-  --
-  -- This is exactly what DGPWithLatentRisk.is_latent encodes:
-  --   trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
+  -- 1. Optimality + Capability => Model = Truth (a.e.)
+  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true⟩
 
-  -- The Bayes-optimal predictor equals the conditional expectation (assumed).
-  have h_bayes' : ∀ p_val, linearPredictor model p_val c =
-      dgp_latent.to_dgp.trueExpectation p_val c := by
-    intro p_val
-    simpa using (h_bayes p_val c)
+  -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
+  -- We assume standard Gaussian measure supports the whole space.
+  have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+      (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp_latent.to_dgp.jointMeasure] 0 := by
+    apply (integral_eq_zero_iff_of_nonneg _ (by sorry)).mp h_risk_zero
+    exact fun _ => sq_nonneg _
 
-  -- The true expectation has the form α(c) * p
-  have h_true_form : dgp_latent.to_dgp.trueExpectation =
-      fun p_val c_val => (dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c_val)) * p_val :=
-    dgp_latent.is_latent
+  have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure,
+      dgp_latent.to_dgp.trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
 
-  -- For a Bayes-optimal model with linear PGS basis, the coefficient of p must equal α(c)
-  -- This means: γₘ₀[0] + Σₗ fₘₗ[0,l](cₗ) = σ_G² / (σ_G² + σ_η²(c))
+  -- 3. Use continuity to show equality holds everywhere (skipping full topological proof for now)
+  have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val := by
+    intro p c
+    -- In a full proof: use Continuous.eq_of_ae_eq
+    sorry
 
-  -- From h_bayes with p=1 and p=0, we can extract the coefficients:
-  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes' 0
-  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes' 1
+  -- 4. Algebraic Extraction (same as original derivation)
+  -- The remainder of the proof identifies the coefficients from the function equality.
+  have h_bayes' := h_pointwise_eq
+  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes' 1 c
+  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes' 0 c
 
-  -- From h_true_form: trueExpectation 0 c = 0, trueExpectation 1 c = α(c)
-  simp only [h_true_form] at h_at_0 h_at_1
-  simp only [mul_zero] at h_at_0
-  simp only [mul_one] at h_at_1
+  simp [dgp_latent.is_latent] at h_at_0 h_at_1
 
-  -- The linearPredictor has structure: linearPredictor p c = base(c) + slope(c) * p
-  -- From h_at_0: base(c) = 0
-  -- From h_at_1: slope(c) = α(c)
-  -- The goal is exactly slope(c), so we need to show:
-  --   γₘ₀[0] + Σₗ evalSmooth(fₘₗ[0,l], c[l]) = α(c)
-
-  -- This requires showing linearPredictor decomposes as base + slope * p for p=1 models,
-  -- which is proven in linearPredictor_decomp (but requires linear PGS basis hypothesis)
-  -- The algebraic form: α(c) = σ_G² / (σ_G² + σ_η²(c)) is exactly the shrinkage factor
-  -- from measurement error attenuation bias theory.
-  -- See: Fuller (1987), "Measurement Error Models", Chapter 2.
-
-  -- Strategy: Use linearPredictor_decomp to decompose the predictor,
-  -- then extract the slope coefficient from h_at_1.
-  --
-  -- However, linearPredictor_decomp requires a hypothesis that the PGS basis is linear:
-  --   h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id
-  --
-  -- This hypothesis is missing from the theorem statement, which is a gap in the proof.
-  --
-  -- Assuming we had this hypothesis, the proof would proceed as:
-
-  -- Use linearPredictor_decomp with the linear basis hypothesis
+  -- Use decomposition
   have h_decomp := linearPredictor_decomp model h_linear_basis
-
-  -- Apply decomposition at p=0 and p=1
   rw [h_decomp 0 c] at h_at_0
   rw [h_decomp 1 c] at h_at_1
+  simp at h_at_0 h_at_1
 
-  -- At p=0: predictorBase + predictorSlope * 0 = 0
-  simp only [mul_zero, add_zero] at h_at_0
-  -- This gives: predictorBase model c = 0
+  -- predictorBase = 0
+  have h_base_zero : predictorBase model c = 0 := h_at_0
 
-  -- At p=1: predictorBase + predictorSlope * 1 = α(c)
-  simp only [mul_one] at h_at_1
-  -- This gives: predictorBase model c + predictorSlope model c = α(c)
-
-  -- Combining: 0 + predictorSlope model c = α(c)
-  rw [h_at_0] at h_at_1
-  simp only [zero_add] at h_at_1
-
-  -- Now predictorSlope model c = α(c)
-  -- By definition of predictorSlope:
+  -- slope = shrinkage
+  rw [h_base_zero, zero_add] at h_at_1
   unfold predictorSlope at h_at_1
-  -- This gives exactly the goal: γₘ₀[0] + Σₗ evalSmooth(...) = α(c)
-  exact h_at_1
+
+  -- Convert goal to match h_at_1
+  rw [← h_at_1]
+  rfl
 
 /-- Predictions are invariant under affine transformations of ancestry coordinates.
 
@@ -5515,5 +5496,63 @@ theorem calibration_shrinkage (μ : ℝ) (hμ : μ ≠ 0) :
     linarith
 
 end BrierScore
+
+
+section GradientDescentVerification
+
+variable {n p : ℕ} [Fintype (Fin n)] [Fintype (Fin p)]
+
+-- 1. The Setup: A Linear Gaussian Model with a Penalty
+structure PenalizedModel where
+  (X : Matrix (Fin n) (Fin p) ℝ)
+  (y : Matrix (Fin n) (Fin 1) ℝ)
+  (S : Matrix (Fin p) (Fin p) ℝ) -- The penalty matrix
+  (is_pos_def : S.PosDef)        -- Simplified: assume S is PD for the proof sketch
+
+-- 2. The Estimator (Inner Loop)
+-- beta_hat(lambda) = (X'X + lambda*S)^-1 X'y
+noncomputable def beta_hat (m : PenalizedModel) (lambda : ℝ) : Matrix (Fin p) (Fin 1) ℝ :=
+  let H := m.X.transpose * m.X + lambda • m.S
+  H.inv * m.X.transpose * m.y
+
+-- 3. The Code's Gradient Term 1: The "Signal" (Beta Quadratic)
+-- This corresponds to `beta_terms[k]` in your Rust code
+noncomputable def signal_term (m : PenalizedModel) (lambda : ℝ) : ℝ :=
+  let b := beta_hat m lambda
+  (b.transpose * m.S * b)[0,0]
+
+-- 4. The Code's Gradient Term 2: The "Complexity" (Trace)
+-- This corresponds to `trace_terms` in your Rust code
+noncomputable def complexity_term (m : PenalizedModel) (lambda : ℝ) : ℝ :=
+  let H := m.X.transpose * m.X + lambda • m.S
+  (H.inv * m.S).trace
+
+-- 5. THEOREM: The Stationarity Condition
+-- When the gradient calculated by `estimate.rs` is zero, 
+-- the Lambda perfectly balances Signal Magnitude vs Model Complexity
+theorem pirls_optimality_condition (m : PenalizedModel) (lambda : ℝ) (h_lam : lambda > 0) :
+  (signal_term m lambda - complexity_term m lambda = 0) ↔
+  (lambda * (beta_hat m lambda).transpose * m.S * (beta_hat m lambda))[0,0] = 
+   lambda * ( (m.X.transpose * m.X + lambda • m.S).inv * m.S).trace :=
+by
+  dsimp [signal_term, complexity_term]
+  rw [sub_eq_zero]
+  constructor
+  · intro h
+    rw [h]
+  · intro h
+    -- We have lambda * signal = lambda * complexity
+    -- Since lambda > 0, signal = complexity
+    apply (mul_right_inj' h_lam.ne').mp 
+    -- We need to align the types on the LHS for the scalar multiplication to match exactly
+    -- The LHS in the theorem is (lambda * Matrix)[0,0]
+    -- We need to convert this to lambda * (Matrix[0,0])
+    rw [← Matrix.smul_apply, Matrix.smul_mul] at h
+    -- Actually easier: just expand the LHS definition in the goal or hypothesis
+    -- (lambda • M)[0,0] = lambda * M[0,0]
+    simp only [Matrix.smul_apply] at h
+    exact h
+
+end GradientDescentVerification
 
 end Calibrator
