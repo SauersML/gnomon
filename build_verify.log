@@ -1,0 +1,845 @@
+✖ [3219/3220] Building Calibrator (70s)
+trace: .> LEAN_PATH=/app/.lake/packages/Cli/.lake/build/lib/lean:/app/.lake/packages/batteries/.lake/build/lib/lean:/app/.lake/packages/Qq/.lake/build/lib/lean:/app/.lake/packages/aesop/.lake/build/lib/lean:/app/.lake/packages/proofwidgets/.lake/build/lib/lean:/app/.lake/packages/importGraph/.lake/build/lib/lean:/app/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/app/.lake/packages/plausible/.lake/build/lib/lean:/app/.lake/packages/mathlib/.lake/build/lib/lean:/app/.lake/build/lib/lean /home/jules/.elan/toolchains/leanprover--lean4---v4.26.0/bin/lean /app/proofs/Calibrator.lean -o /app/.lake/build/lib/lean/Calibrator.olean -i /app/.lake/build/lib/lean/Calibrator.ilean -c /app/.lake/build/ir/Calibrator.c --setup /app/.lake/build/ir/Calibrator.setup.json --json
+warning: proofs/Calibrator.lean:428:33: This simp argument is unused:
+  zero_mul
+
+Hint: Omit it from the simp argument list.
+  simp only [mul_zero, add_zero, z̵e̵r̵o̵_̵m̵u̵l̵,̵ ̵mul_one] at h0 h1
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1186:29: This simp argument is unused:
+  ha_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha̵_̵d̵e̵f̵,̵ ̵h̵b_def] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1186:37: This simp argument is unused:
+  hb_def
+
+Hint: Omit it from the simp argument list.
+  simp only [model', ha_def,̵ ̵h̵b̵_̵d̵e̵f̵] at h
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1187:32: 'ring' tactic does nothing
+
+Note: This linter can be disabled with `set_option linter.unusedTactic false`
+warning: proofs/Calibrator.lean:1187:32: this tactic is never executed
+
+Note: This linter can be disabled with `set_option linter.unreachableTactic false`
+warning: proofs/Calibrator.lean:1486:3: unused variable `h_indep`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:1487:3: unused variable `h_true_fn`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:1497:78: unused variable `h_norm`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:1696:34: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1699:34: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1740:28: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1745:35: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1733:66: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1736:44: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1752:30: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1757:30: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1768:68: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1771:46: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1790:30: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1794:31: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1801:32: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1805:32: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1813:32: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1819:30: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1824:32: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1829:33: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1835:37: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1841:30: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1846:37: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:1776:56: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIx.equivSum, mul_assoc, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1848:79: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵add_mul, mul_add,
+  ̲  ̲ ̲ ̲ ̲ ̲mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1849:6: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        a̵d̵d̵_̵mul,̵ ̵m̵u̵l̵_add, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1849:34: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        add_mul, mul_add, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1849:49: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [linearPredictor, evalSmooth, Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul,
+        add_mul, mul_add, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1850:29: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_c̵o̵m̵m̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1850:39: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:1850:54: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hsum_pc, hsum_int, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2015:4: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2025:31: Try `simp at this` instead of `simpa using this`
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2039:38: This simp argument is unused:
+  norm_norm
+
+Hint: Omit it from the simp argument list.
+  simp [u, norm_smul, norm_inv, n̵o̵r̵m̵_̵n̵o̵r̵m̵,̵ ̵hnorm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2220:20: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2222:20: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2176:66: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2177:22: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2177:32: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2177:47: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, a̵d̵d̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2177:68: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2177:83: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2187:14: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2187:63: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2187:78: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2188:46: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2188:61: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2207:37: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct, pow_two,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2211:28: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2380:20: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2382:20: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2337:66: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2338:22: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2338:32: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc, mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2338:47: This simp argument is unused:
+  add_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, a̵d̵d̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_comm, mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2338:68: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2338:83: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                        add_comm, add_left_comm, add_assoc, mul_comm, mul_left_comm,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2348:14: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2348:63: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2348:78: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2349:46: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2349:61: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [hSi, s, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2367:37: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct, pow_two,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2371:28: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [dotProduct,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2424:44: This simp argument is unused:
+  Pi.sub_apply
+
+Hint: Omit it from the simp argument list.
+  simp [pointwiseNLL, hm.dist_gaussian, P̵i̵.̵s̵u̵b̵_̵a̵p̵p̵l̵y̵,̵ ̵h_lin, X]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2429:8: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2429:57: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2429:72: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2440:41: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2490:52: This simp argument is unused:
+  Finset.sum_add_distrib
+
+Hint: Omit it from the simp argument list.
+  simp [g, ParamIxSum, hsum_pc, hsum_int,̵ ̵F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵a̵d̵d̵_̵d̵i̵s̵t̵r̵i̵b̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2676:73: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2775:10: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:2632:54: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm, add_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2633:10: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg, a̵d̵d̵_̵c̵o̵m̵m̵,̵ ̵add_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2633:20: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲a̵d̵d̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2637:30: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2637:45: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, mul_left_comm, mul_c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2709:62: This simp argument is unused:
+  Finset.sum_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵m̵u̵l̵,̵ ̵sub_eq_add_neg, add_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲add_left_comm, add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2710:18: This simp argument is unused:
+  add_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                    add_c̵o̵m̵m̵,̵ ̵a̵d̵d̵_̵left_comm, add_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2710:28: This simp argument is unused:
+  add_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, Finset.sum_mul, sub_eq_add_neg,
+                    add_comm, add_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵ad̵d̵_̵a̵ssoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2714:61: This simp argument is unused:
+  Matrix.mulVec_sub
+
+Hint: Omit it from the simp argument list.
+  simp [Matrix.mulVec_add, Matrix.mulVec_smul, M̵a̵t̵r̵i̵x̵.̵m̵u̵l̵V̵e̵c̵_̵s̵u̵b̵,̵ ̵Matrix.mulVec_neg, Pi.add_apply,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Pi.sub_apply, Pi.neg_apply, Pi.smul_apply, smul_eq_mul, mul_add, add_mul,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲sub_eq_add_neg, hb']
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2719:38: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:2884:15: unused variable `hlam`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:2884:32: unused variable `hS_posDef`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:3202:58: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:3203:57: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:3247:18: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:3300:18: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:3249:40: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm, mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3249:51: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, mul_assoc, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3249:66: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.mul_sum, mul_assoc, mul_left_comm,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3281:64: This simp argument is unused:
+  mul_add
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, m̵u̵l̵_̵a̵d̵d̵,̵ ̵add_mul, mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3281:73: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, a̵d̵d̵_̵m̵u̵l̵,̵ ̵mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3281:82: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3281:93: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3281:108: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3334:64: This simp argument is unused:
+  mul_add
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, m̵u̵l̵_̵a̵d̵d̵,̵ ̵add_mul, mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3334:73: This simp argument is unused:
+  add_mul
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, a̵d̵d̵_̵m̵u̵l̵,̵ ̵mul_assoc, mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3334:82: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, m̵u̵l̵_̵a̵s̵s̵o̵c̵,̵ ̵mul_left_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3334:93: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_comm]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3334:108: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [Finset.sum_add_distrib, Finset.mul_sum, mul_add, add_mul, mul_assoc,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵c̵o̵m̵m̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3356:10: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3356:59: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3356:74: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3357:33: This simp argument is unused:
+  mul_comm
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_c̵o̵m̵m̵,̵ ̵m̵u̵l_̵l̵eft_comm, mul_assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3357:43: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc, mul_self_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3357:58: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [s, hmul, mul_comm, mul_left_comm, mul_a̵ss̵o̵c̵,̵ ̵m̵u̵l̵_̵s̵elf_nonneg]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3380:10: This simp argument is unused:
+  Finset.sum_ite_eq'
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵i̵t̵e̵_̵e̵q̵'̵,̵ ̵Finset.sum_ite_eq, mul_comm,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲mul_left_comm, mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3380:59: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵mul_assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3380:74: This simp argument is unused:
+  mul_assoc
+
+Hint: Omit it from the simp argument list.
+  simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply, Finset.sum_ite_eq',
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲ ̲Finset.sum_ite_eq, mul_comm, m̵u̵l̵_̵l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵a̵s̵s̵o̵c̵]̵m̲u̲l̲_̲l̲e̲f̲t̲_̲c̲o̲m̲m̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3391:43: This simp argument is unused:
+  mul_left_comm
+
+Hint: Omit it from the simp argument list.
+  simp [h_diag, pow_two, mul_comm, mul_l̵e̵f̵t̵_̵c̵o̵m̵m̵,̵ ̵m̵u̵l̵_̵assoc]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3440:50: This simp argument is unused:
+  Finset.sum_add_distrib
+
+Hint: Omit it from the simp argument list.
+  simp [ParamIxSum, g, hsum_pc, hsum_int,̵ ̵F̵i̵n̵s̵e̵t̵.̵s̵u̵m̵_̵a̵d̵d̵_̵d̵i̵s̵t̵r̵i̵b̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:3870:5: unused variable `hf_int`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:3909:8: declaration uses 'sorry'
+warning: proofs/Calibrator.lean:4033:8: declaration uses 'sorry'
+error: proofs/Calibrator.lean:4119:24: No applicable extensionality theorem found for type
+  Type
+
+Note: Extensionality theorems can be registered by marking them with the `[ext]` attribute
+error: proofs/Calibrator.lean:4120:22: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis))
+in the target expression
+  Module.finrank ℝ ↥(LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) =
+    Fintype.card (ParamIx p k sp)
+
+Ω : Type u_1
+inst✝⁵ : MeasureSpace Ω
+ℙ : Measure Ω
+inst✝⁴ : IsProbabilityMeasure ℙ
+p✝ k✝ sp✝ n✝ n k p sp : ℕ
+inst✝³ : Fintype (Fin n)
+inst✝² : Fintype (Fin k)
+inst✝¹ : Fintype (Fin p)
+inst✝ : Fintype (Fin sp)
+A : Matrix (Fin k) (Fin k) ℝ
+_hA : IsUnit A.det
+b : Fin k → ℝ
+data : RealizedData n k
+lambda : ℝ
+pgsBasis : PGSBasis p
+splineBasis : SplineBasis sp
+h_n_pos : n > 0
+h_lambda_nonneg : 0 ≤ lambda
+h_rank :
+  Module.finrank ℝ ↥(LinearMap.range (designMatrix data pgsBasis splineBasis).mulVecLin) = Fintype.card (ParamIx p k sp)
+h_range_eq :
+  let data' := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b };
+  LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) =
+    LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))
+data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+model : PhenotypeInformedGAM p k sp := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+h_eq_map : ∀ (M : Matrix (Fin n) (ParamIx p k sp) ℝ), LinearMap.range (Matrix.toLin' M) = LinearMap.range M.mulVecLin
+⊢ Module.finrank ℝ ↥(LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) =
+    Fintype.card (ParamIx p k sp)
+warning: proofs/Calibrator.lean:4201:44: unused variable `h_opt1`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:5071:10: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:5090:14: try 'simp' instead of 'simpa'
+
+Note: This linter can be disabled with `set_option linter.unnecessarySimpa false`
+warning: proofs/Calibrator.lean:5057:8: This simp argument is unused:
+  Matrix.diagonal_apply
+
+Hint: Omit it from the simp argument list.
+  simp ̵[̵M̵a̵t̵r̵i̵x̵.̵d̵i̵a̵g̵o̵n̵a̵l̵_̵a̵p̵p̵l̵y̵]̵
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:5126:31: This simp argument is unused:
+  Matrix.transpose_apply
+
+Hint: Omit it from the simp argument list.
+  simp only [Matrix.mul_apply, M̵a̵t̵r̵i̵x̵.̵t̵r̵a̵n̵s̵p̵o̵s̵e̵_̵a̵p̵p̵l̵y̵,̵ ̵sumToZeroConstraint]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+warning: proofs/Calibrator.lean:5126:55: This simp argument is unused:
+  sumToZeroConstraint
+
+Hint: Omit it from the simp argument list.
+  simp only [Matrix.mul_apply, Matrix.transpose_apply,̵ ̵s̵u̵m̵T̵o̵Z̵e̵r̵o̵C̵o̵n̵s̵t̵r̵a̵i̵n̵t̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+error: proofs/Calibrator.lean:5652:5: unknown tactic
+error: proofs/Calibrator.lean:5648:41: don't know how to synthesize placeholder for argument `f'`
+context:
+x : ℝ
+f : ℝ → ℝ := ⋯
+hf : ∀ (x : ℝ), f x ≠ 0
+⊢ ℝ
+error: proofs/Calibrator.lean:5642:89: unsolved goals
+x : ℝ
+f : ℝ → ℝ := fun x => 1 + Real.exp (-x)
+hf : ∀ (x : ℝ), f x ≠ 0
+⊢ HasDerivAt (fun x => 1 / (1 + Real.exp (-x))) (1 / (1 + Real.exp (-x)) * (1 - 1 / (1 + Real.exp (-x)))) x
+error: proofs/Calibrator.lean:5661:2: Tactic `apply` failed: could not unify the conclusion of `@HasDerivAt.mul`
+  HasDerivAt (?c * ?d) (?c' * ?d ?x + ?c ?x * ?d') ?x
+with the goal
+  HasDerivAt (fun x => sigmoid x * (1 - sigmoid x)) (sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x)) x
+
+Note: The full type of `@HasDerivAt.mul` is
+  ∀ {𝕜 : Type ?u.359159} [inst : NontriviallyNormedField 𝕜] {x : 𝕜} {𝔸 : Type ?u.359158} [inst_1 : NormedRing 𝔸]
+    [inst_2 : NormedAlgebra 𝕜 𝔸] {c d : 𝕜 → 𝔸} {c' d' : 𝔸},
+    HasDerivAt c c' x → HasDerivAt d d' x → HasDerivAt (c * d) (c' * d x + c x * d') x
+
+x : ℝ
+⊢ HasDerivAt (fun x => sigmoid x * (1 - sigmoid x)) (sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x)) x
+error: proofs/Calibrator.lean:5668:38: Application type mismatch: The argument
+  convex_Ioi
+has type
+  ∀ (r : ?m.20), Convex ?m.19 (Set.Ioi r)
+but is expected to have type
+  Convex ℝ ?m.18
+in the application
+  @strictConcaveOn_of_deriv2_neg ?m.18 convex_Ioi
+error: proofs/Calibrator.lean:5671:4: `fun_prop` was unable to prove `Continuous fun x => 1 / (1 + Real.exp (-x))`
+
+Issues:
+  Failed to prove necessary assumption `∀ (x : ℝ), x ≠ 0` when applying theorem `Continuous.div₀`.
+  Failed to prove necessary assumption `∀ (x : ℝ), 1 + Real.exp (-x) ≠ 0` when applying theorem `Continuous.div₀`.
+error: proofs/Calibrator.lean:5673:4: Type mismatch
+  sigmoid_hasDerivAt x
+has type
+  HasDerivAt sigmoid (sigmoid x * (1 - sigmoid x)) x
+but is expected to have type
+  deriv^[2] sigmoid x < 0
+error: proofs/Calibrator.lean:5674:2: No goals to be solved
+error: proofs/Calibrator.lean:5694:24: Unknown constant `StrictConcaveOn.integral_lt_map`
+error: proofs/Calibrator.lean:5695:2: No goals to be solved
+warning: proofs/Calibrator.lean:5743:229: unused variable `log_lik`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: proofs/Calibrator.lean:5754:8: declaration uses 'sorry'
+error: Lean exited with code 1
+Some required targets logged failures:
+- Calibrator
+error: build failed

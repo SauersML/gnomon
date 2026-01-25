@@ -5634,6 +5634,23 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
+lemma sigmoid_hasDerivAt (x : ℝ) : HasDerivAt sigmoid (sigmoid x * (1 - sigmoid x)) x := by
+  sorry
+
+lemma sigmoid_deriv (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
+  sorry
+
+lemma sigmoid_twice_differentiable (x : ℝ) :
+    HasDerivAt (fun x => sigmoid x * (1 - sigmoid x))
+      (sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x)) x := by
+  sorry
+
+lemma sigmoid_deriv2 (x : ℝ) : deriv^[2] sigmoid x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  sorry
+
+lemma strictConcaveOn_sigmoid_pos : StrictConcaveOn ℝ (Set.Ioi 0) sigmoid := by
+  sorry
+
   theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
@@ -5641,7 +5658,11 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+  rw [← h_mean]
+  have h_le : (∫ ω, sigmoid (X ω) ∂P) ≤ sigmoid (∫ ω, X ω ∂P) := by
+    sorry
+  apply lt_of_le_of_ne h_le
+  sorry
     
 end BrierScore
 
