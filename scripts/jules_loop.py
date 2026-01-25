@@ -293,19 +293,29 @@ def call_jules(prompt, attempt=1):
 def validate_patch(patch):
     """
     Validates the patch to ensure it doesn't:
-    1. Delete theorems
-    2. Only delete lines (zero additions)
-    
+    1. Create new files
+    2. Delete theorems
+    3. Only delete lines (zero additions)
+
     Returns (is_valid, reason) tuple.
     """
     print("\n--- Validating Patch ---")
-    
+
     # Check if patch only has deletions (no additions)
     additions = 0
     deletions = 0
     deleted_theorem_lines = []
-    
-    for line in patch.split('\n'):
+    new_files = []
+
+    lines = patch.split('\n')
+    for i, line in enumerate(lines):
+        # Detect new file creation (diff shows "new file mode" or "/dev/null" in --- line)
+        if line.startswith('--- /dev/null'):
+            # Next line should be +++ b/filename
+            if i + 1 < len(lines) and lines[i + 1].startswith('+++ b/'):
+                filename = lines[i + 1][6:]  # Remove '+++ b/'
+                new_files.append(filename)
+
         # Count additions and deletions
         if line.startswith('+') and not line.startswith('+++'):
             additions += 1
@@ -314,9 +324,16 @@ def validate_patch(patch):
             # Check if a theorem is being deleted
             if 'theorem ' in line:
                 deleted_theorem_lines.append(line)
-    
+
     print(f"Patch stats: +{additions} -{deletions}")
-    
+
+    # Rule 0: Reject if creating new files
+    if new_files:
+        print(f"\n🚫 REJECTED: Patch creates {len(new_files)} new file(s):")
+        for filename in new_files:
+            print(f"  {filename}")
+        return False, "Patch creates new files (not allowed)"
+
     # Rule 1: Reject if deleting theorems
     if deleted_theorem_lines:
         print(f"\n🚫 REJECTED: Patch deletes {len(deleted_theorem_lines)} theorem(s):")
@@ -325,12 +342,12 @@ def validate_patch(patch):
         if len(deleted_theorem_lines) > 5:
             print(f"  ... and {len(deleted_theorem_lines) - 5} more")
         return False, "Patch deletes theorems"
-    
+
     # Rule 2: Reject if only deletions (no additions)
     if deletions > 0 and additions == 0:
         print(f"\n🚫 REJECTED: Patch only deletes lines (0 additions, {deletions} deletions)")
         return False, "Patch only deletes lines with zero additions"
-    
+
     print("✅ Patch validation passed")
     return True, ""
 
@@ -346,6 +363,7 @@ def main():
         "- DO NOT modify version specifiers in 'lakefile.lean' (e.g., mathlib version).\n"
         "- Focus ONLY on proofs/*.lean files for improvements.\n"
         "- Always try to improve something--commit and finish. No further instruction will be given.\n"
+        "- CRITICAL: DO NOT create new files. ONLY edit existing files.\n"
         "- CRITICAL: DO NOT delete theorems. DO NOT submit patches that only delete lines.\n"
     )
 
