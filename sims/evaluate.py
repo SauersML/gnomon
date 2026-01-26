@@ -16,8 +16,15 @@ sys.path.append(str(Path(__file__).parent))
 
 from methods import (
     RawPGSMethod,
-    GAMMethod,
+    LinearInteractionMethod,
 )
+
+try:
+    from methods.gam_mgcv import GAMMethod
+    _GAM_AVAILABLE = True
+except Exception as e:
+    print(f"WARNING: GAM (mgcv) unavailable: {e}")
+    _GAM_AVAILABLE = False
 from metrics import compute_all_metrics, compute_calibration_curve
 
 def load_scores(work_dir, methods):
@@ -167,8 +174,10 @@ def main():
     results = {}
     calibration_methods = [
         RawPGSMethod(),
-        GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True)
+        LinearInteractionMethod(),
     ]
+    if _GAM_AVAILABLE:
+        calibration_methods.append(GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True))
     
     for prs_name in prs_scores_df.columns:
         P_raw = analysis_df[prs_name].values
