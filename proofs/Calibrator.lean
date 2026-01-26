@@ -1,7 +1,9 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
+import Mathlib.Analysis.Convex.Integral
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
 import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.InnerProductSpace.PiL2
@@ -5616,6 +5618,77 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
+/-- Derivative of sigmoid: σ'(x) = e^(-x) / (1 + e^(-x))^2 -/
+lemma sigmoid_hasDerivAt (x : ℝ) :
+    HasDerivAt sigmoid (Real.exp (-x) / (1 + Real.exp (-x)) ^ 2) x := by
+  unfold sigmoid
+  have h1 : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos _
+    linarith
+  have h2 : HasDerivAt (fun x => 1 + Real.exp (-x)) (-Real.exp (-x)) x := by
+    apply HasDerivAt.const_add
+    convert (Real.hasDerivAt_exp (-x)).comp x (hasDerivAt_neg x) using 1
+    simp
+  convert (h2.inv h1).const_mul 1 using 1; ring
+
+lemma continuous_sigmoid : Continuous sigmoid := by
+  unfold sigmoid
+  apply continuous_const.div
+  · fun_prop
+  · intro x
+    nlinarith [Real.exp_pos (-x)]
+
+lemma sigmoid_deriv (x : ℝ) : deriv sigmoid x = Real.exp (-x) / (1 + Real.exp (-x)) ^ 2 :=
+  (sigmoid_hasDerivAt x).deriv
+
+/-- Second derivative of sigmoid: σ''(x) = e^(-x)(e^(-x) - 1) / (1 + e^(-x))^3 -/
+lemma sigmoid_deriv2 (x : ℝ) :
+    deriv (deriv sigmoid) x = (Real.exp (-x) * (Real.exp (-x) - 1)) / (1 + Real.exp (-x)) ^ 3 := by
+  have h_deriv : deriv sigmoid = fun x => Real.exp (-x) / (1 + Real.exp (-x)) ^ 2 := by
+    ext x; exact sigmoid_deriv x
+  rw [h_deriv]
+  set u := Real.exp (-x)
+  have hu : HasDerivAt (fun x => Real.exp (-x)) (-u) x := by
+    simpa using (Real.hasDerivAt_exp (-x)).comp x (hasDerivAt_neg x)
+  have h_denom : 1 + u ≠ 0 := ne_of_gt (by have := Real.exp_pos (-x); linarith)
+  have h_denom2 : (1 + u)^2 ≠ 0 := pow_ne_zero 2 h_denom
+
+  -- We need derivative of u / (1+u)^2
+  have h_denom_deriv : HasDerivAt (fun x => (1 + Real.exp (-x))^2) (2 * (1 + u) * (-u)) x := by
+    convert HasDerivAt.pow (HasDerivAt.const_add 1 hu) 2 using 1
+    simp [u]
+
+  have h_quot : HasDerivAt (fun x => Real.exp (-x) / (1 + Real.exp (-x))^2)
+      (((-u) * (1 + u)^2 - u * (2 * (1 + u) * (-u))) / ((1 + u)^2)^2) x := by
+    exact HasDerivAt.div hu h_denom_deriv h_denom2
+
+  rw [h_quot.deriv]
+  -- Algebra simplification
+  field_simp [h_denom]
+  ring
+
+lemma sigmoid_deriv2_neg_on_Ioi {x : ℝ} (hx : x ∈ Set.Ioi 0) :
+    deriv (deriv sigmoid) x < 0 := by
+  rw [sigmoid_deriv2]
+  have hexp : Real.exp (-x) < 1 := by
+    rw [Real.exp_lt_one_iff]
+    simp at hx; linarith
+  have hexp_pos : 0 < Real.exp (-x) := Real.exp_pos _
+  have h_num_neg : Real.exp (-x) * (Real.exp (-x) - 1) < 0 := by
+    apply mul_neg_of_pos_of_neg hexp_pos (by linarith)
+  have h_denom_pos : 0 < (1 + Real.exp (-x)) ^ 3 := by
+    apply pow_pos
+    linarith
+  exact div_neg_of_neg_of_pos h_num_neg h_denom_pos
+
+theorem strictConcaveOn_Ici_sigmoid : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+  apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
+  · exact continuous_sigmoid.continuousOn
+  · intro x hx
+    rw [interior_Ici] at hx
+    exact sigmoid_deriv2_neg_on_Ioi hx
+
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
@@ -5719,14 +5792,38 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+  theorem calibration_shrinkage (μ : ℝ) (_hμ_pos : μ > 0)
       (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
       (h_measurable : Measurable X) (h_integrable : Integrable X P)
       (h_mean : ∫ ω, X ω ∂P = μ)
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    -- Jensen's inequality for strictly concave function
+    have h_jensen := StrictConcaveOn.ae_eq_const_or_lt_map_average
+      strictConcaveOn_Ici_sigmoid
+      continuous_sigmoid.continuousOn
+      isClosed_Ici
+      (by filter_upwards [h_support] with ω hω using le_of_lt hω)
+      h_integrable
+      (by
+        apply Integrable.of_bound (continuous_sigmoid.measurable.comp h_measurable).aestronglyMeasurable (1:ℝ)
+        filter_upwards
+        intro a
+        dsimp
+        rw [abs_of_pos (sigmoid_pos (X a))]
+        exact le_of_lt (sigmoid_lt_one (X a)))
+
+    -- For probability measure, average = integral
+    have h_avg_eq : ∀ f : Ω → ℝ, ⨍ ω, f ω ∂P = ∫ ω, f ω ∂P := by
+      intro f
+      simp [average_eq_integral, MeasureTheory.measure_univ]
+
+    rw [h_avg_eq, h_avg_eq, h_mean] at h_jensen
+
+    apply h_jensen.resolve_left
+    intro h_const
+    exact h_non_degenerate h_const
     
 end BrierScore
 
