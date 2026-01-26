@@ -18,7 +18,6 @@ env:
   OPENBLAS_NUM_THREADS: 4
   VECLIB_MAXIMUM_THREADS: 4
   NUMEXPR_NUM_THREADS: 4
-  DEFAULT_METHODS: "[\"BayesR\"]"
 
 jobs:
   # ------------------------------------------------------------------
@@ -131,7 +130,7 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         sim: [1, 2, 3]
-        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || env.DEFAULT_METHODS) }}
+        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
     steps:
       - uses: actions/checkout@v4
 
