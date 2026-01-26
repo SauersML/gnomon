@@ -4189,6 +4189,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (data : RealizedData n k) (lambda : ℝ)
     (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
     (h_n_pos : n > 0) (h_lambda_nonneg : 0 ≤ lambda)
+    (h_lambda_zero : lambda = 0)
     (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp))
     (h_range_eq :
       let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
@@ -4197,7 +4198,6 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
       -- Rank is dimension of range. If ranges equal, ranks equal.
-      -- We assume standard linear algebra equates rank and dimension of range.
       sorry 
   )
   ∀ (i : Fin n),
@@ -4207,22 +4207,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let X := designMatrix data pgsBasis splineBasis
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let X' := designMatrix data' pgsBasis splineBasis
-  
-  -- The linear predictor vector on training data is exactly Proj_RowSpace(X) y?
-  -- No, Proj_ColSpace(X) y if rows are samples.
-  -- Here `designMatrix` is n x dim. So rows are samples. Use `toLin'`.
-  
   -- For OLS (lambda = 0), the prediction represents the orthogonal projection of y
   -- onto the column space (range) of the design matrix.
-  -- Since h_range_eq asserts the column spaces are identical:
-  -- Range(X) = Range(X')
-  -- Therefore Proj_Range(X) y = Proj_Range(X') y.
-  
-  -- Note: If lambda > 0 (Ridge), the penalty structure ||beta||^2 interacts with the basis.
-  -- Unless the basis transform is unitary, predictions will differ.
-  -- The theorem holds strictly for OLS or invariant penalties.
-  -- We assume implicitly the context allows for this invariance (e.g. OLS).
-  
+  -- Range(X) = Range(X') => Proj_Range(X) y = Proj_Range(X') y.
   sorry
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
@@ -5616,6 +5603,21 @@ theorem sigmoid_monotone : StrictMono sigmoid := by
   have h1 : Real.exp (-y) < Real.exp (-x) := Real.exp_strictMono (by linarith : -y < -x)
   linarith
 
+lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
+  unfold sigmoid
+  apply DifferentiableAt.div
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      exact differentiableAt_id.neg
+  · apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+
+lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+  sorry
+
 /-- **Jensen's Gap for Logistic Regression**
 
     For a random variable η with E[η] = μ and Var(η) = σ² > 0:
@@ -5726,7 +5728,7 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    sorry
     
 end BrierScore
 
