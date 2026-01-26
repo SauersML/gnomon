@@ -37,6 +37,7 @@ import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 import Mathlib.Analysis.Convex.Deriv
+import Mathlib.Analysis.Convex.Integral
 import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
@@ -5615,8 +5616,49 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
 
+lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  have h_diff : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  unfold sigmoid
+  rw [deriv_div]
+  · simp only [deriv_const, zero_mul, deriv_add, deriv_exp, deriv_neg, deriv_id, mul_neg, mul_one,
+      sub_neg_eq_add, zero_add]
+    set e := Real.exp (-x)
+    field_simp
+    ring
+  · exact differentiableAt_const 1
+  · apply DifferentiableAt.add
+    · exact differentiableAt_const 1
+    · apply DifferentiableAt.exp
+      exact differentiableAt_id.neg
+  · apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+
+lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  have h_diff : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  have h_eq : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := funext deriv_sigmoid
+  rw [h_eq]
+  rw [deriv_mul h_diff (differentiableAt_const 1 |>.sub h_diff)]
+  rw [deriv_sub_const, deriv_const_sub, deriv_sigmoid x]
+  ring
+
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
-  sorry
+  apply strictConcaveOn_of_deriv2_neg' (convex_Ici 0)
+  · intro x _
+    exact (differentiable_sigmoid x).continuousAt.continuousWithinAt
+  · intro x _
+    exact (differentiable_sigmoid x).differentiableWithinAt
+  · intro x hx
+    simp only [interior_Ici, Set.mem_Ioi] at hx
+    rw [deriv2_sigmoid]
+    have h_sig_pos : 0 < sigmoid x := sigmoid_pos x
+    have h_sig_lt_one : sigmoid x < 1 := sigmoid_lt_one x
+    have h_sig_gt_half : 1/2 < sigmoid x := sigmoid_gt_half hx
+    have h1 : 0 < 1 - sigmoid x := by linarith
+    have h2 : 1 - 2 * sigmoid x < 0 := by linarith
+    apply mul_neg_of_pos_of_neg
+    · apply mul_pos h_sig_pos h1
+    · exact h2
 
 /-- **Jensen's Gap for Logistic Regression**
 
@@ -5728,7 +5770,21 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-    sorry
+    have h_concave : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := sigmoid_strictConcaveOn_Ici
+    have h_mem : ∀ᵐ ω ∂P, X ω ∈ Set.Ici 0 := by
+      filter_upwards [h_support] with ω hω
+      apply le_of_lt hω
+    have h_ae_meas : AEStronglyMeasurable X P := h_measurable.aestronglyMeasurable
+    have h_result := StrictConcaveOn.ae_eq_const_or_lt_map_average
+      h_concave
+      h_mem
+      h_ae_meas
+      h_integrable
+    rw [h_mean] at h_result
+    rcases h_result with h_eq | h_lt
+    · exfalso
+      exact h_non_degenerate h_eq
+    · exact h_lt
     
 end BrierScore
 
