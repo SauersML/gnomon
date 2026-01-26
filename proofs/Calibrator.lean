@@ -3924,7 +3924,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
   = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
   let dgp := dgpMultiplicativeBias scaling_func
-  
+
   -- 1. Risk Difference = || Oracle - Norm ||^2
   -- Because Oracle recovers Truth (Risk 0)
   have h_oracle_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c) = 0 := by
@@ -3986,13 +3986,68 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Normalize the risk star hypothesis to use standard measure
     dsimp [dgpMultiplicativeBias] at h_risk_star
 
+    let μ := stdNormalProdMeasure k
+
     -- Orthogonality Condition: Cross term vanishes
     have h_orth : ∫ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) ∂stdNormalProdMeasure k = 0 := by
-      -- E[(S-1)p * (p - pred)] = E[(S-1)p^2] - E[(S-1)p*pred]
-      -- E[(S-1)p^2] = E[S-1]E[p^2] = 0 * 1 = 0
-      -- E[(S-1)p*pred] = 0 as pred is additive f(c) + g(p).
-      -- Proof relies on independence and centered moments.
-      admit
+      -- Decompose linearPredictor m
+      have h_decomp : ∀ p c, linearPredictor m p c = predictorBase m c + predictorSlope m c * p :=
+        linearPredictor_decomp m h_linear_basis
+
+      -- m is normalized => slope is constant
+      have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+        intro c
+        unfold predictorSlope
+        simp [hm_norm.fₘₗ_zero]
+
+      let β := m.γₘ₀ 0
+
+      -- Rewrite integrand
+      have h_eq : ∀ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) =
+          (scaling_func pc.2 - 1) * (1 - β) * pc.1 ^ 2 - (scaling_func pc.2 - 1) * predictorBase m pc.2 * pc.1 := by
+        intro pc
+        rw [h_decomp, h_slope_const]
+        ring
+
+      rw [integral_congr_ae (ae_of_all _ h_eq)]
+
+      have h_term1_int : Integrable (fun pc => (scaling_func pc.2 - 1) * (1 - β) * pc.1 ^ 2) μ := by
+        apply Integrable.mul_const
+        -- S*p^2 is integrable by independence, S in L2, p^2 in L1.
+        -- We assume integrability here to proceed with the algebraic proof
+        sorry
+
+      have h_term2_int : Integrable (fun pc => (scaling_func pc.2 - 1) * predictorBase m pc.2 * pc.1) μ := by
+        sorry
+
+      rw [integral_sub h_term1_int h_term2_int]
+
+      -- First term
+      have h_term1 : ∫ pc, (scaling_func pc.2 - 1) * (1 - β) * pc.1 ^ 2 ∂μ = 0 := by
+        rw [integral_mul_const]
+        -- ∫ (S-1)p^2 = ∫ (S-1) * ∫ p^2
+        rw [MeasureTheory.integral_prod_mul measurable_snd measurable_fst] -- assume measurability
+        · -- ∫ p^2 = 1
+          have h_p2_eq_1 : ∫ p, p^2 ∂(ProbabilityTheory.gaussianReal 0 1) = 1 := by
+            simp [ProbabilityTheory.integral_gaussianReal_sq_sub_mean, ProbabilityTheory.variance_gaussianReal]
+          -- ∫ S-1 = ∫ S - 1 = 1 - 1 = 0
+          have h_S_sub_1 : ∫ c, scaling_func c - 1 ∂(μ.map Prod.snd) = 0 := by
+            rw [integral_sub h_scaling_sq_int.pow_half (integrable_const 1)]
+            rw [h_mean_1]
+            simp
+          simp [h_p2_eq_1, h_S_sub_1]
+        · sorry -- integrability of factors
+
+      -- Second term
+      have h_term2 : ∫ pc, (scaling_func pc.2 - 1) * predictorBase m pc.2 * pc.1 ∂μ = 0 := by
+        rw [MeasureTheory.integral_prod_mul measurable_snd measurable_fst]
+        · -- ∫ p = 0
+          have h_p_eq_0 : ∫ p, p ∂(ProbabilityTheory.gaussianReal 0 1) = 0 := by
+            simp [ProbabilityTheory.integral_gaussianReal_sub_mean]
+          simp [h_p_eq_0]
+        · sorry
+
+      rw [h_term1, h_term2, sub_zero]
 
     -- Decomposition
     have h_decomp :
@@ -4006,10 +4061,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       · apply integral_congr_ae
         filter_upwards with pc
         ring
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
+      · sorry -- Integrability
+      · sorry -- Integrability
+      · sorry -- Integrability
+      · sorry -- Integrability
 
     unfold expectedSquaredError
     dsimp [dgpMultiplicativeBias]
@@ -5726,7 +5781,46 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+    -- 1. Prove sigmoid is strictly concave on [0, ∞)
+    have h_concave : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
+      sorry -- Requires calculus: sigmoid'' < 0 on (0, infty) implies strict concavity
+
+    -- 2. Continuity
+    have h_cont : ContinuousOn sigmoid (Set.Ici 0) := by
+      unfold sigmoid
+      apply Continuous.continuousOn
+      apply Continuous.div continuous_const ?_ (fun x => by have := Real.exp_pos (-x); linarith)
+      apply Continuous.add continuous_const
+      apply Continuous.comp Real.continuous_exp continuous_neg
+
+    -- 3. Support condition
+    have h_mem : ∀ᵐ ω ∂P, X ω ∈ Set.Ici 0 := by
+      filter_upwards [h_support] with ω h
+      exact le_of_lt h
+
+    -- 4. Apply Jensen's inequality for strictly concave functions
+    have h_jensen := StrictConcaveOn.ae_eq_const_or_lt_map_average
+      h_concave
+      h_cont
+      isClosed_Ici
+      h_mem
+      h_measurable.aestronglyMeasurable
+      h_integrable
+
+    -- 5. Substitute mean
+    rw [h_mean] at h_jensen
+
+    -- 6. Use non-degeneracy to rule out equality
+    cases h_jensen with
+    | inl h_eq =>
+      exfalso
+      apply h_non_degenerate
+      -- h_eq is X = const a.e.
+      -- const must be mean μ
+      -- So X = μ a.e.
+      sorry
+    | inr h_lt =>
+      exact h_lt
     
 end BrierScore
 
