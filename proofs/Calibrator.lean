@@ -37,6 +37,7 @@ import Mathlib.LinearAlgebra.Matrix.NonsingularInverse
 import Mathlib.Probability.Independence.Basic
 import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 import Mathlib.Analysis.Convex.Deriv
+import Mathlib.Analysis.Convex.Integral
 import Mathlib.Probability.Independence.Integration
 import Mathlib.Probability.Moments.Variance
 import Mathlib.Probability.Notation
