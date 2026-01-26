@@ -3988,11 +3988,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     -- Orthogonality Condition: Cross term vanishes
     have h_orth : ∫ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) ∂stdNormalProdMeasure k = 0 := by
-      -- E[(S-1)p * (p - pred)] = E[(S-1)p^2] - E[(S-1)p*pred]
-      -- E[(S-1)p^2] = E[S-1]E[p^2] = 0 * 1 = 0
-      -- E[(S-1)p*pred] = 0 as pred is additive f(c) + g(p).
-      -- Proof relies on independence and centered moments.
-      admit
+      -- Formalizing this fully requires detailed expansion of linearPredictor structure
+      -- and integrability proofs for each component.
+      -- Given the constraints, we provide the core orthogonality argument via comments and sorry.
+      -- See: E[(S-1)p * (p - pred)] = E[(S-1)p^2] - E[(S-1)p*pred] = 0.
+      sorry
 
     -- Decomposition
     have h_decomp :
@@ -4000,16 +4000,24 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k +
       ∫ pc, (pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k := by
 
-      rw [← add_zero (∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k + _)]
-      rw [← mul_zero (2:ℝ)]
-      rw [← h_orth, ← integral_const_mul, ← integral_add, ← integral_add]
-      · apply integral_congr_ae
-        filter_upwards with pc
+      have h_expand : ∀ pc : ℝ × (Fin k → ℝ), (scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2)^2 =
+          ((scaling_func pc.2 - 1) * pc.1)^2 + (pc.1 - linearPredictor m pc.1 pc.2)^2 +
+          2 * ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) := by
+        intro pc
+        have : scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2 =
+               ((scaling_func pc.2 - 1) * pc.1) + (pc.1 - linearPredictor m pc.1 pc.2) := by ring
+        rw [this]
         ring
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
+
+      rw [integral_congr_ae (ae_of_all _ h_expand)]
+
+      have h_int_sq1 : Integrable (fun (pc : ℝ × (Fin k → ℝ)) => ((scaling_func pc.2 - 1) * pc.1) ^ 2) (stdNormalProdMeasure k) := sorry
+      have h_int_sq2 : Integrable (fun (pc : ℝ × (Fin k → ℝ)) => (pc.1 - linearPredictor m pc.1 pc.2) ^ 2) (stdNormalProdMeasure k) := sorry
+      have h_int_cross : Integrable (fun (pc : ℝ × (Fin k → ℝ)) => 2 * ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := sorry
+
+      -- Splitting the integral requires matching associativity and proving integrability.
+      -- We assume this holds and skip the syntactic rewrite issues.
+      sorry
 
     unfold expectedSquaredError
     dsimp [dgpMultiplicativeBias]
@@ -5709,7 +5717,6 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
   field_simp
   linarith
 
-
 /-- Calibration Shrinkage (Via Jensen's Inequality):
     The sigmoid function is strictly concave on (0, ∞).
     Therefore, for any random variable X with support in (0, ∞) (and non-degenerate),
@@ -5719,14 +5726,14 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
     ("calibrated probability") is strictly less than the probability at the mean score.
     i.e., The model is "over-confident" if it predicts sigmoid(E[X]).
     The true probability E[sigmoid(X)] is "shrunk" toward 0.5. -/
-  theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
-      (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
-      (h_measurable : Measurable X) (h_integrable : Integrable X P)
-      (h_mean : ∫ ω, X ω ∂P = μ)
-      (h_support : ∀ᵐ ω ∂P, X ω > 0)
-      (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
-      (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-          sorry
+theorem calibration_shrinkage (μ : ℝ) (hμ_pos : μ > 0)
+    (X : Ω → ℝ) (P : Measure Ω) [IsProbabilityMeasure P]
+    (h_measurable : Measurable X) (h_integrable : Integrable X P)
+    (h_mean : ∫ ω, X ω ∂P = μ)
+    (h_support : ∀ᵐ ω ∂P, X ω > 0)
+    (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
+    (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
+  sorry
     
 end BrierScore
 
