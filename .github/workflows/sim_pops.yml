@@ -24,7 +24,7 @@ jobs:
   # JOB 1: SIMULATE & SPLIT (Generate Data)
   # ------------------------------------------------------------------
   simulate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       SIM_CACHE_VERSION: v2
     strategy:
@@ -128,7 +128,7 @@ jobs:
   # ------------------------------------------------------------------
   train:
     needs: simulate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
@@ -185,7 +185,7 @@ jobs:
         if: matrix.method == 'LDpred2'
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.3.3'
+          r-version: '4.4.2'
 
       - name: Set R library path (for caching)
         if: matrix.method == 'LDpred2'
@@ -258,7 +258,7 @@ jobs:
         if: matrix.method == 'MUSSEL'
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.3.3'
+          r-version: '4.4.2'
 
       - name: Install MUSSEL R dependencies
         if: matrix.method == 'MUSSEL'
@@ -330,7 +330,7 @@ jobs:
   evaluate:
     needs: [simulate, train]
     if: ${{ always() && needs.simulate.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         sim_name: [confounding, portability, sample_imbalance]
@@ -340,7 +340,7 @@ jobs:
       - name: Set up R for GAM
         uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.3.3'
+          r-version: '4.4.2'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -416,7 +416,7 @@ jobs:
   # JOB 4: REPORT (Consolidate)
   # ------------------------------------------------------------------
   report:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: evaluate
     if: always()
     steps:
