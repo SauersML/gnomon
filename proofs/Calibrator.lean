@@ -4303,12 +4303,103 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [← Matrix.rank_eq_finrank_range_toLin', h_range_eq.symm, Matrix.rank_eq_finrank_range_toLin']
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  -- Main proof: Both predictions are orthogonal projections of y onto the same subspace.
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let β := packParams model
+  let β' := packParams model_prime
+
+  have h_model_class : InModelClass model pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+  have h_model_prime_class : InModelClass model_prime pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+
+  -- Rewrite linear predictors as matrix-vector products
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_model_class]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_model_prime_class]
+
+  -- Show Xβ = X'β'
+  -- Key idea: fit minimizes ‖y - Xβ‖². Since Xβ ∈ Range(X), Xβ is the orthogonal projection of y onto Range(X).
+  -- Same for X'β'. Since Range(X) = Range(X') and y is same, projections are equal.
+
+  -- Helper: empirical loss proportional to squared distance
+  have h_loss_eq_dist : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis) (D : RealizedData n k),
+      let XM := designMatrix D pgsBasis splineBasis
+      empiricalLoss m D lambda = (1 / n : ℝ) * (dist D.y (XM.mulVec (packParams m))) ^ 2 := by
+    intro m hm D XM
+    simp only [empiricalLoss, h_lambda_zero, add_zero, pointwiseNLL, hm.dist_gaussian]
+    rw [dist_eq_norm, norm_sq_eq_inner]
+    simp only [inner_self_eq_l2norm_sq, Real.inner_self_eq_norm_mul_norm, Real.norm_eq_abs, abs_pow]
+    unfold l2norm_sq
+    congr 2
+    refine Finset.sum_congr rfl ?_
+    intro j _
+    rw [linearPredictor_eq_designMatrix_mulVec D pgsBasis splineBasis m hm]
+    rfl
+
+  -- Define subspaces
+  let S := LinearMap.range (Matrix.toLin' X)
+  let S' := LinearMap.range (Matrix.toLin' X')
+  have hS_closed : IsClosed (S : Set (Fin n → ℝ)) := Submodule.closed_of_finiteDimensional _
+  have hS'_closed : IsClosed (S' : Set (Fin n → ℝ)) := Submodule.closed_of_finiteDimensional _
+
+  -- Show Xβ is projection on S
+  have h_proj : X.mulVec β = orthogonalProjection S data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_isMinOn hS_closed (LinearMap.mem_range_self _ _)
+    intro v hv
+    obtain ⟨b, hb⟩ := (LinearMap.mem_range (f := Matrix.toLin' X)).mp hv
+    let m := unpackParams pgsBasis splineBasis b
+    have hm : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_min := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm
+    simp only [h_loss_eq_dist model h_model_class data, h_loss_eq_dist m hm data] at h_min
+    rw [unpack_pack_eq m pgsBasis splineBasis hm] at h_min
+    rw [hb] at h_min
+    rw [← Matrix.toLin'_apply] at h_min
+    rw [← Matrix.toLin'_apply] at h_min
+    have hn_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    have h_scale_pos : (0 : ℝ) < 1 / n := one_div_pos.mpr hn_pos_real
+    rw [mul_le_mul_left h_scale_pos] at h_min
+    rw [dist_comm] at h_min
+    rw [dist_comm data.y v]
+    apply le_of_sq_le_sq (dist_nonneg) h_min
+
+  -- Show X'β' is projection on S'
+  have h_proj' : X'.mulVec β' = orthogonalProjection S' data'.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_isMinOn hS'_closed (LinearMap.mem_range_self _ _)
+    intro v hv
+    obtain ⟨b, hb⟩ := (LinearMap.mem_range (f := Matrix.toLin' X')).mp hv
+    let m := unpackParams pgsBasis splineBasis b
+    have hm : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    -- We need rank proof for model_prime which we just proved in let definition
+    have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+      rw [← Matrix.rank_eq_finrank_range_toLin', h_range_eq.symm, Matrix.rank_eq_finrank_range_toLin', h_rank]
+    have h_min := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm
+    simp only [h_loss_eq_dist model_prime h_model_prime_class data', h_loss_eq_dist m hm data'] at h_min
+    rw [unpack_pack_eq m pgsBasis splineBasis hm] at h_min
+    rw [hb] at h_min
+    rw [← Matrix.toLin'_apply] at h_min
+    rw [← Matrix.toLin'_apply] at h_min
+    have hn_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    have h_scale_pos : (0 : ℝ) < 1 / n := one_div_pos.mpr hn_pos_real
+    rw [mul_le_mul_left h_scale_pos] at h_min
+    rw [dist_comm] at h_min
+    rw [dist_comm data'.y v]
+    apply le_of_sq_le_sq (dist_nonneg) h_min
+
+  -- Conclusion
+  have h_eq : X.mulVec β = X'.mulVec β' := by
+    rw [h_proj, h_proj', h_range_eq]
+    -- data'.y = data.y by definition
+    rfl
+
+  exact congr_fun h_eq i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -5714,10 +5805,26 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  unfold sigmoid
+  have h_denom : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x :=
+    differentiableAt_id.neg.exp.add_const 1
+  rw [inv_eq_one_div, deriv_one_div h_diff h_denom]
+  rw [deriv_add_const, deriv_exp_neg]
+  field_simp
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_diff : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  rw [deriv_sigmoid]
+  rw [deriv_mul h_diff (differentiableAt_const 1 |>.sub h_diff)]
+  rw [deriv_sub_const, deriv_const_sub]
+  rw [deriv_sigmoid]
+  ring
+  exact h_diff
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
