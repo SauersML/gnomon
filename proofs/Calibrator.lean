@@ -4033,7 +4033,15 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         Integrable f μP → Integrable g μC →
         Integrable (fun pc : ℝ × (Fin k → ℝ) => f pc.1 * g pc.2) (μP.prod μC) := by
       intro f g hf hg
-      admit -- Standard measure theory
+      have h_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => f pc.1 * g pc.2) (μP.prod μC) :=
+        (hf.aestronglyMeasurable.comp_fst).mul (hg.aestronglyMeasurable.comp_snd)
+      rw [MeasureTheory.integrable_prod_iff h_meas]
+      constructor
+      · filter_upwards with c
+        exact hg.const_mul (f c)
+      · simp only [norm_mul]
+        simp_rw [MeasureTheory.integral_const_mul]
+        exact hf.norm.mul_const _
 
     -- Orthogonality Condition: Cross term vanishes
     have h_orth : ∫ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) ∂stdNormalProdMeasure k = 0 := by
