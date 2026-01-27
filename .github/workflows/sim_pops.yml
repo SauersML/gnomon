@@ -147,6 +147,7 @@ jobs:
         run: |
           pip install uv
           uv pip install --system -r sims/requirements.txt
+          uv pip install --system pgscatalog-calc
 
       - name: Install Plink2
         run: |
@@ -346,6 +347,7 @@ jobs:
           pip install uv
           uv pip install --system -r sims/requirements.txt
           uv pip install --system rpy2
+          uv pip install --system pgscatalog-calc
 
       - name: Install R GAM package
         run: |
@@ -423,6 +425,7 @@ jobs:
         run: |
           pip install uv
           uv pip install --system pandas tabulate
+          uv pip install --system pgscatalog-calc
       
       - name: Download all results
         continue-on-error: true
