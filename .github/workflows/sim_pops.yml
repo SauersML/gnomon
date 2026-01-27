@@ -6,7 +6,7 @@ on:
       methods:
         description: "JSON array of methods to train (e.g. [\"BayesR\",\"BayesR-Mix\",\"LDpred2\",\"PRS-CSx\",\"MUSSEL\"])"
         required: false
-        default: "[\"BayesR\"]"
+        default: "[\"BayesR\",\"BayesR-Mix\",\"MUSSEL\"]"
   push:
     paths:
       - "sims/**"
@@ -129,7 +129,7 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
+        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix","MUSSEL"]') }}
         sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
