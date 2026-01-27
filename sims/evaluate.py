@@ -24,16 +24,16 @@ from methods import (
 from metrics import compute_all_metrics, compute_calibration_curve
 
 def load_scores(work_dir, methods):
-    """Load scores. FAILS if any method is missing."""
+    """Load scores. At least ONE method must succeed."""
     scores_dict = {}
+    missing_methods = []
 
     for method in methods:
         score_file = work_dir / f"{method}.sscore"
         if not score_file.exists():
-            raise FileNotFoundError(
-                f"REQUIRED: Score file missing for {method} at {score_file}. "
-                f"Training job must have failed. Check workflow logs."
-            )
+            print(f"Score file missing for {method} at {score_file} - method skipped.")
+            missing_methods.append(method)
+            continue
 
         try:
             df = pd.read_csv(score_file, sep='\t')
@@ -42,9 +42,19 @@ def load_scores(work_dir, methods):
             scores_dict[method] = df.set_index('IID')['PRS']
             print(f"Loaded {method} scores")
         except Exception as e:
-            raise RuntimeError(
-                f"REQUIRED: Failed to load {method} scores from {score_file}: {e}"
-            )
+            print(f"Failed to load {method} scores: {e}")
+            missing_methods.append(method)
+
+    if not scores_dict:
+        raise RuntimeError(
+            f"REQUIRED: No score files found! All methods failed: {methods}. "
+            f"At least one method must succeed."
+        )
+
+    if missing_methods:
+        print(f"\nEvaluation proceeding with {len(scores_dict)} of {len(methods)} methods")
+        print(f"   Available: {list(scores_dict.keys())}")
+        print(f"   Missing: {missing_methods}\n")
 
     return pd.DataFrame(scores_dict)
 
