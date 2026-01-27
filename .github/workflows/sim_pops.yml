@@ -159,6 +159,7 @@ jobs:
         with:
           name: sim-data-${{ matrix.sim_name }}
           path: .
+          path: .
 
       # --- Method Specific Setup ---
 
