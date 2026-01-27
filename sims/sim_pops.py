@@ -64,10 +64,10 @@ class SimulationConfig:
 GENOME = GenomeSpec()
 
 SIM_CONFIGS: Dict[int, SimulationConfig] = {
-    # Simulation 1: signal preservation when mean liability shifts with ancestry (PC)
+    # Simulation 1: Ancestry confounding - signal preservation when mean liability shifts with ancestry (PC)
     1: SimulationConfig(
         sim_id=1,
-        sim_name="sim1",
+        sim_name="confounding",
         seed=101,
         samples={"AFR": 800, "EUR": 800, "ASIA": 800, "ADMIX": 800},
         genome=GENOME,
@@ -76,11 +76,11 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
         sites=SiteSelectionSpec(maf_min_causal=0.01),
         msprime_recent_gens=50,
     ),
-    # Simulation 2: ancestry-dependent PGS reliability (attenuation + heteroskedastic noise),
-    # with NO ancestry-dependent shift in liability (Y depends on G only + noise).
+    # Simulation 2: PGS portability - ancestry-dependent PGS reliability (attenuation + heteroskedastic noise),
+    # with NO ancestry-dependent shift in liability (Y depends on G only + noise). Balanced samples.
     2: SimulationConfig(
         sim_id=2,
-        sim_name="sim2",
+        sim_name="portability",
         seed=202,
         samples={"AFR": 800, "EUR": 800, "ASIA": 800, "ADMIX": 800},
         genome=GENOME,
@@ -89,10 +89,10 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
         sites=SiteSelectionSpec(maf_min_causal=0.01),
         msprime_recent_gens=50,
     ),
-    # Simulation 3: underrepresented population accuracy (imbalanced ancestry distribution).
+    # Simulation 3: Sample imbalance - underrepresented population accuracy (imbalanced ancestry distribution, EUR majority).
     3: SimulationConfig(
         sim_id=3,
-        sim_name="sim3",
+        sim_name="sample_imbalance",
         seed=303,
         samples={"AFR": 150, "EUR": 2400, "ASIA": 150, "ADMIX": 150},
         genome=GENOME,

@@ -26,10 +26,17 @@ jobs:
   simulate:
     runs-on: ubuntu-latest
     env:
-      SIM_CACHE_VERSION: v1
+      SIM_CACHE_VERSION: v2
     strategy:
       matrix:
-        sim: [1, 2, 3] # Adjusted to match original var name if possible, or use sim_id
+        sim: [1, 2, 3]
+        include:
+          - sim: 1
+            sim_name: confounding
+          - sim: 2
+            sim_name: portability
+          - sim: 3
+            sim_name: sample_imbalance
     steps:
       - uses: actions/checkout@v4
 
@@ -42,20 +49,20 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            sim${{ matrix.sim }}_work/
-            sim${{ matrix.sim }}.tsv
-            sim${{ matrix.sim }}.bed
-            sim${{ matrix.sim }}.bim
-            sim${{ matrix.sim }}.fam
-            sim${{ matrix.sim }}_sites.npz
-            sim${{ matrix.sim }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+            ${{ matrix.sim_name }}_work/
+            ${{ matrix.sim_name }}.tsv
+            ${{ matrix.sim_name }}.bed
+            ${{ matrix.sim_name }}.bim
+            ${{ matrix.sim_name }}.fam
+            ${{ matrix.sim_name }}_sites.npz
+            ${{ matrix.sim_name }}_pcs.png
+          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
           restore-keys: |
-            sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-
+            sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-
 
       - name: Cache status
         run: |
-          echo "sim cache-hit=${{ steps.sim-cache.outputs.cache-hit }}"
+          echo "sim cache-hit=${{ steps.sim-cache.outputs.cache-hit }} for ${{ matrix.sim_name }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -75,16 +82,16 @@ jobs:
           sudo mv plink2 /usr/local/bin/
           rm plink2.zip
 
-      - name: Run Simulation ${{ matrix.sim }}
+      - name: Run Simulation ${{ matrix.sim }} (${{ matrix.sim_name }})
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "Running Simulation ${{ matrix.sim }}..."
+          echo "Running Simulation ${{ matrix.sim }} (${{ matrix.sim_name }})..."
           python sims/sim_pops.py ${{ matrix.sim }}
-          
+
           # sim_pops.py now deletes .trees and .vcf automatically on success
           # Verify they are gone to save space
-          if [ -f "sim${{ matrix.sim }}.trees" ]; then
+          if [ -f "${{ matrix.sim_name }}.trees" ]; then
             echo "Error: trees file was not deleted!"
             exit 1
           fi
@@ -93,7 +100,7 @@ jobs:
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "Splitting Data for Sim ${{ matrix.sim }}..."
+          echo "Splitting Data for ${{ matrix.sim_name }}..."
           python sims/split_data.py ${{ matrix.sim }}
 
       - name: Save simulation cache
@@ -101,22 +108,22 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            sim${{ matrix.sim }}_work/
-            sim${{ matrix.sim }}.tsv
-            sim${{ matrix.sim }}.bed
-            sim${{ matrix.sim }}.bim
-            sim${{ matrix.sim }}.fam
-            sim${{ matrix.sim }}_sites.npz
-            sim${{ matrix.sim }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+            ${{ matrix.sim_name }}_work/
+            ${{ matrix.sim_name }}.tsv
+            ${{ matrix.sim_name }}.bed
+            ${{ matrix.sim_name }}.bim
+            ${{ matrix.sim_name }}.fam
+            ${{ matrix.sim_name }}_sites.npz
+            ${{ matrix.sim_name }}_pcs.png
+          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
 
       - name: Upload Simulation Data (Artifact Stream A)
         uses: actions/upload-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim }}
+          name: sim-data-${{ matrix.sim_name }}
           path: |
-            sim${{ matrix.sim }}_work/
-            sim${{ matrix.sim }}.tsv
+            ${{ matrix.sim_name }}_work/
+            ${{ matrix.sim_name }}.tsv
           if-no-files-found: error
           retention-days: 1
 
@@ -131,6 +138,13 @@ jobs:
       matrix:
         sim: [1, 2, 3]
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
+        include:
+          - sim: 1
+            sim_name: confounding
+          - sim: 2
+            sim_name: portability
+          - sim: 3
+            sim_name: sample_imbalance
     steps:
       - uses: actions/checkout@v4
 
@@ -154,7 +168,7 @@ jobs:
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim }}
+          name: sim-data-${{ matrix.sim_name }}
 
       # --- Method Specific Setup ---
       
@@ -224,14 +238,14 @@ jobs:
           export PRSCSX_PLINK_EXE=/usr/local/bin/plink
           echo "PRSCSX_PLINK_EXE=/usr/local/bin/plink" >> $GITHUB_ENV
           export PRSCSX_LD_METHOD=plink
-          export PRSCSX_LD_BFILE=sim${{ matrix.sim }}_work/train
+          export PRSCSX_LD_BFILE=${{ matrix.sim_name }}_work/train
           export PRSCSX_LD_BLOCK_SIZE=300
 
           # Generate LD reference from training data
           rm -rf prscsx_ref
           mkdir -p prscsx_ref
-          python sims/create_ld_ref.py sim${{ matrix.sim }}_work/train 22 prscsx_ref
-          echo "PRS-CSx ref_dir contents:" 
+          python sims/create_ld_ref.py ${{ matrix.sim_name }}_work/train 22 prscsx_ref
+          echo "PRS-CSx ref_dir contents:"
           find prscsx_ref -maxdepth 3 -type f -print
           find prscsx_ref -maxdepth 3 -type d -print
           echo "PRSCSX_REF=$PWD/prscsx_ref" >> $GITHUB_ENV
@@ -247,8 +261,8 @@ jobs:
           if [ "${{ matrix.method }}" == "LDpred2" ]; then
              Rscript -e 'if(!require("R.utils", quietly=TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")'
           fi
-          
-          echo "Training ${{ matrix.method }} on Sim ${{ matrix.sim }}..."
+
+          echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }} (sim ${{ matrix.sim }})..."
           python sims/train_model.py ${{ matrix.sim }} ${{ matrix.method }}
 
       - name: Save R cache (LDpred2)
@@ -259,8 +273,8 @@ jobs:
       - name: Upload Scores
         uses: actions/upload-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim }}-${{ matrix.method }}
-          path: sim${{ matrix.sim }}_work/*.sscore
+          name: model-scores-${{ matrix.sim_name }}-${{ matrix.method }}
+          path: ${{ matrix.sim_name }}_work/*.sscore
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -273,6 +287,13 @@ jobs:
     strategy:
       matrix:
         sim: [1, 2, 3]
+        include:
+          - sim: 1
+            sim_name: confounding
+          - sim: 2
+            sim_name: portability
+          - sim: 3
+            sim_name: sample_imbalance
     steps:
       - uses: actions/checkout@v4
 
@@ -300,29 +321,29 @@ jobs:
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim }}
+          name: sim-data-${{ matrix.sim_name }}
 
       - name: Download BayesR Scores
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim }}-BayesR
-          path: sim${{ matrix.sim }}_work/
+          name: model-scores-${{ matrix.sim_name }}-BayesR
+          path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
       - name: Download LDpred2 Scores
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim }}-LDpred2
-          path: sim${{ matrix.sim }}_work/
+          name: model-scores-${{ matrix.sim_name }}-LDpred2
+          path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
       - name: Download PRS-CSx Scores
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim }}-PRS-CSx
+          name: model-scores-${{ matrix.sim_name }}-PRS-CSx
           path: sim${{ matrix.sim }}_work/
           merge-multiple: true
 

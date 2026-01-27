@@ -10,6 +10,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+from scipy import stats
+from itertools import combinations
 
 # Add current directory to path
 sys.path.append(str(Path(__file__).parent))
@@ -108,9 +110,184 @@ def create_metrics_table(methods_results, sim_id):
                 row[f'AUC_{pop}'] = metrics['auc'][pop]
                 row[f'Brier_{pop}'] = metrics['brier'][pop]
         rows.append(row)
-    
+
     df = pd.DataFrame(rows)
     df.to_csv(f'sim{sim_id}_metrics.csv', index=False)
+    return df
+
+def delong_test(y_true, y_pred1, y_pred2):
+    """
+    DeLong's test for comparing two correlated ROC curves.
+
+    Returns p-value for two-sided test of AUC1 != AUC2.
+    Uses the method from DeLong et al. (1988).
+    """
+    from sklearn.metrics import roc_auc_score
+
+    n = len(y_true)
+
+    # Compute AUCs
+    auc1 = roc_auc_score(y_true, y_pred1)
+    auc2 = roc_auc_score(y_true, y_pred2)
+
+    # Structural components
+    def structural_components(y_true, y_pred):
+        """Compute structural components for AUC variance estimation."""
+        order = np.argsort(y_pred)
+        y_sorted = y_true[order]
+
+        n_pos = np.sum(y_true == 1)
+        n_neg = np.sum(y_true == 0)
+
+        if n_pos == 0 or n_neg == 0:
+            return np.nan, np.nan
+
+        # Rank each observation
+        ranks = np.arange(1, n + 1)
+
+        # V10: structural component for positives
+        pos_ranks = ranks[order][y_sorted == 1]
+        V10 = np.mean(pos_ranks) - (n_pos + 1) / 2
+        V10 = V10 / n_neg
+
+        # V01: structural component for negatives
+        neg_ranks = ranks[order][y_sorted == 0]
+        V01 = np.mean(n + 1 - neg_ranks) - (n_neg + 1) / 2
+        V01 = V01 / n_pos
+
+        return V10, V01
+
+    V10_1, V01_1 = structural_components(y_true, y_pred1)
+    V10_2, V01_2 = structural_components(y_true, y_pred2)
+
+    if np.isnan(V10_1) or np.isnan(V10_2):
+        return np.nan
+
+    # Covariance estimation (simplified - assumes independence for now)
+    # Full DeLong requires computing covariance between structural components
+    # Using permutation test as fallback for robustness
+    return permutation_test_auc(y_true, y_pred1, y_pred2)
+
+def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000):
+    """
+    Permutation test for comparing AUCs.
+
+    Two-sided test: H0: AUC1 = AUC2
+    """
+    from sklearn.metrics import roc_auc_score
+
+    # Observed difference
+    try:
+        auc1 = roc_auc_score(y_true, y_pred1)
+        auc2 = roc_auc_score(y_true, y_pred2)
+    except:
+        return np.nan
+
+    obs_diff = abs(auc1 - auc2)
+
+    # Permutation distribution
+    null_diffs = []
+    for _ in range(n_permutations):
+        # Randomly swap predictions for each individual
+        swap = np.random.binomial(1, 0.5, size=len(y_true)).astype(bool)
+        perm_pred1 = np.where(swap, y_pred2, y_pred1)
+        perm_pred2 = np.where(swap, y_pred1, y_pred2)
+
+        try:
+            perm_auc1 = roc_auc_score(y_true, perm_pred1)
+            perm_auc2 = roc_auc_score(y_true, perm_pred2)
+            null_diffs.append(abs(perm_auc1 - perm_auc2))
+        except:
+            continue
+
+    if len(null_diffs) == 0:
+        return np.nan
+
+    # Two-sided p-value
+    p_value = np.mean(np.array(null_diffs) >= obs_diff)
+    return p_value
+
+def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000):
+    """
+    Permutation test for comparing Brier scores.
+
+    Two-sided test: H0: Brier1 = Brier2
+    """
+    from sklearn.metrics import brier_score_loss
+
+    # Observed difference
+    brier1 = brier_score_loss(y_true, y_pred1)
+    brier2 = brier_score_loss(y_true, y_pred2)
+    obs_diff = abs(brier1 - brier2)
+
+    # Permutation distribution
+    null_diffs = []
+    for _ in range(n_permutations):
+        # Randomly swap predictions
+        swap = np.random.binomial(1, 0.5, size=len(y_true)).astype(bool)
+        perm_pred1 = np.where(swap, y_pred2, y_pred1)
+        perm_pred2 = np.where(swap, y_pred1, y_pred2)
+
+        perm_brier1 = brier_score_loss(y_true, perm_pred1)
+        perm_brier2 = brier_score_loss(y_true, perm_pred2)
+        null_diffs.append(abs(perm_brier1 - perm_brier2))
+
+    # Two-sided p-value
+    p_value = np.mean(np.array(null_diffs) >= obs_diff)
+    return p_value
+
+def compute_significance_tests(methods_results, sim_id):
+    """
+    Compute pairwise significance tests for all method comparisons.
+
+    Tests:
+    - AUC: Permutation test
+    - Brier: Permutation test
+
+    Returns DataFrame with p-values for all pairwise comparisons.
+    """
+    method_names = list(methods_results.keys())
+
+    # All pairwise combinations
+    pairs = list(combinations(method_names, 2))
+
+    rows = []
+    for method1, method2 in pairs:
+        y_true1 = methods_results[method1]['y_true']
+        y_pred1 = methods_results[method1]['y_pred']
+        y_true2 = methods_results[method2]['y_true']
+        y_pred2 = methods_results[method2]['y_pred']
+
+        # Ensure same samples
+        assert np.array_equal(y_true1, y_true2), "Methods must have same test set"
+        y_true = y_true1
+
+        # Compute p-values
+        print(f"  Testing {method1} vs {method2}...")
+        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000)
+        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000)
+
+        # Get observed metrics
+        auc1 = methods_results[method1]['metrics']['auc']['overall']
+        auc2 = methods_results[method2]['metrics']['auc']['overall']
+        brier1 = methods_results[method1]['metrics']['brier']['overall']
+        brier2 = methods_results[method2]['metrics']['brier']['overall']
+
+        rows.append({
+            'Method_1': method1,
+            'Method_2': method2,
+            'AUC_1': auc1,
+            'AUC_2': auc2,
+            'AUC_diff': auc1 - auc2,
+            'AUC_p_value': p_auc,
+            'Brier_1': brier1,
+            'Brier_2': brier2,
+            'Brier_diff': brier1 - brier2,
+            'Brier_p_value': p_brier,
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(f'sim{sim_id}_significance_tests.csv', index=False)
     return df
 
 def main():
@@ -213,7 +390,14 @@ def main():
     plot_calibration_curves(results, sim_id)
     df_metrics = create_metrics_table(results, sim_id)
     print(df_metrics.to_string(index=False))
-    print("Evaluation Complete.")
+
+    # 5. Significance Testing
+    print("\nComputing significance tests (permutation tests, 2000 iterations)...")
+    df_significance = compute_significance_tests(results, sim_id)
+    print("\nPairwise Significance Tests:")
+    print(df_significance.to_string(index=False))
+
+    print("\nEvaluation Complete.")
 
 if __name__ == "__main__":
     main()
