@@ -138,37 +138,96 @@ class MUSSEL:
         if not glm_files:
             raise RuntimeError(f"MUSSEL: no GWAS output found for {out_prefix}")
 
+        def _glm_rank(p: Path) -> int:
+            name = p.name.lower()
+            if "glm.logistic" in name:
+                return 0
+            if "glm.firth" in name:
+                return 1
+            if "glm.linear" in name:
+                return 2
+            return 3
+
+        glm_files = sorted(glm_files, key=_glm_rank)
         gwas_file = glm_files[0]
         df = pd.read_csv(gwas_file, sep="\t")
         if "TEST" in df.columns:
             df = df[df["TEST"].astype(str) == "ADD"].copy()
 
-        required = ["#CHROM", "POS", "ID", "A1", "REF", "ALT"]
-        if not all(c in df.columns for c in required):
-            raise RuntimeError(f"MUSSEL: GWAS output missing columns. Found: {list(df.columns)}")
+        head_preview = df.head(3).to_string(index=False)
 
-        if "BETA" in df.columns:
-            beta = pd.to_numeric(df["BETA"], errors="coerce")
-        elif "OR" in df.columns:
-            beta = np.log(pd.to_numeric(df["OR"], errors="coerce"))
+        cols_upper = {c.upper(): c for c in df.columns}
+
+        def _find_col(candidates):
+            for cand in candidates:
+                key = cand.upper()
+                if key in cols_upper:
+                    return cols_upper[key]
+            return None
+
+        def _find_col_prefix(prefixes):
+            for key, orig in cols_upper.items():
+                for p in prefixes:
+                    if key.startswith(p):
+                        return orig
+            return None
+
+        chrom_col = _find_col(["#CHROM", "CHROM"])
+        pos_col = _find_col(["POS", "BP"])
+        id_col = _find_col(["ID", "SNP", "RSID"])
+        a1_col = _find_col(["A1", "ALT1"])
+        ref_col = _find_col(["REF", "A0"])
+        alt_col = _find_col(["ALT", "ALT1"])
+        a2_col = _find_col(["A2"])
+
+        if not all([chrom_col, pos_col, id_col, a1_col]):
+            raise RuntimeError(
+                "MUSSEL: GWAS output missing required columns for CHROM/POS/ID/A1. "
+                f"File={gwas_file} Columns={list(df.columns)} Head:\n{head_preview}"
+            )
+
+        beta_col = _find_col(["BETA"]) or _find_col_prefix(["BETA"])
+        or_col = _find_col(["OR"]) or _find_col_prefix(["OR"])
+        if beta_col is not None:
+            beta = pd.to_numeric(df[beta_col], errors="coerce")
+        elif or_col is not None:
+            beta = np.log(pd.to_numeric(df[or_col], errors="coerce"))
         else:
-            raise RuntimeError("MUSSEL: GWAS output missing BETA/OR.")
+            raise RuntimeError(
+                f"MUSSEL: GWAS output missing BETA/OR columns. File={gwas_file} Columns={list(df.columns)}"
+            )
 
-        se_col = None
-        for cand in ["SE", "LOG(OR)_SE", "LOGOR_SE", "SE_LOGOR", "SE_BETA"]:
-            if cand in df.columns:
-                se_col = cand
-                break
+        se_col = _find_col(["SE", "LOG(OR)_SE", "LOGOR_SE", "SE_LOGOR", "SE_BETA"])
+        if se_col is None:
+            # Try generic *_SE columns
+            for key, orig in cols_upper.items():
+                if key.endswith("_SE"):
+                    se_col = orig
+                    break
         if se_col is not None:
             beta_se = pd.to_numeric(df[se_col], errors="coerce")
-        elif "T_STAT" in df.columns:
-            # Fallback: SE = beta / z if T_STAT provided
-            tstat = pd.to_numeric(df["T_STAT"], errors="coerce")
-            beta_se = pd.to_numeric(beta, errors="coerce") / tstat.replace(0, np.nan)
         else:
-            raise RuntimeError("MUSSEL: GWAS output missing SE (no SE or T_STAT columns).")
+            tstat_col = _find_col(["T_STAT", "Z_STAT", "Z_OR_STAT", "Z_F_STAT"])
+            if tstat_col is None:
+                tstat_col = _find_col_prefix(["Z_"])
+            if tstat_col is None:
+                raise RuntimeError(
+                    "MUSSEL: GWAS output missing SE (no SE or T_STAT columns). "
+                    f"File={gwas_file} Columns={list(df.columns)} Head:\n{head_preview}"
+                )
+            # Fallback: SE = beta / z if test-stat provided
+            tstat = pd.to_numeric(df[tstat_col], errors="coerce")
+            beta_se = pd.to_numeric(beta, errors="coerce") / tstat.replace(0, np.nan)
 
-        a0 = np.where(df["A1"] == df["ALT"], df["REF"], df["ALT"])
+        if a2_col is not None:
+            a0 = df[a2_col]
+        elif ref_col is not None and alt_col is not None:
+            a0 = np.where(df[a1_col] == df[alt_col], df[ref_col], df[alt_col])
+        else:
+            raise RuntimeError(
+                "MUSSEL: GWAS output missing REF/ALT (or A2) to construct a0. "
+                f"File={gwas_file} Columns={list(df.columns)} Head:\n{head_preview}"
+            )
 
         if n_eff_override is not None:
             n_eff = np.full(len(df), n_eff_override, dtype=float)
@@ -176,11 +235,11 @@ class MUSSEL:
             n_eff = pd.to_numeric(df.get("OBS_CT", np.nan), errors="coerce")
 
         out_df = pd.DataFrame({
-            "rsid": df["ID"],
-            "chr": df["#CHROM"],
-            "pos": df["POS"],
+            "rsid": df[id_col],
+            "chr": df[chrom_col],
+            "pos": df[pos_col],
             "a0": a0,
-            "a1": df["A1"],
+            "a1": df[a1_col],
             "beta": beta,
             "beta_se": beta_se,
             "n_eff": n_eff,
