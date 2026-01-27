@@ -294,15 +294,17 @@ def compute_significance_tests(methods_results, sim_id):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python evaluate.py <sim_id>")
+        print("Usage: python evaluate.py <sim_name|sim_id>")
         sys.exit(1)
         
     sim_arg = sys.argv[1]
     try:
         sim_id = int(sim_arg)
     except ValueError:
-        sim_id = sim_arg
-    work_dir = Path(f"sim{sim_id}_work")
+        sim_id = None
+
+    sim_prefix = f"sim{sim_id}" if sim_id is not None else sim_arg
+    work_dir = Path(f"{sim_prefix}_work")
     
     # 1. Load Data
     # We need phenotypes and population labels. Best source is the test metadata from split_data?
@@ -319,7 +321,7 @@ def main():
     test_ids = pd.read_csv(kfile, sep='\t', header=None, names=['FID', 'IID'])
     test_iids = test_ids['IID'].astype(str).tolist()
     
-    tsv_path = f"sim{sim_id}.tsv"
+    tsv_path = f"{sim_prefix}.tsv"
     full_df = pd.read_csv(tsv_path, sep='\t')
     full_df['individual_id'] = full_df['individual_id'].astype(str)
     
