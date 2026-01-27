@@ -275,10 +275,12 @@ jobs:
         run: |
           cat > /tmp/mussel_pkg_scan.R <<'RSCRIPT'
           files <- Sys.glob("MUSSEL/R/*.R")
+          files <- files[file.exists(files)]
           if (length(files) == 0) {
-            quit(status = 1)
+            message("No MUSSEL R scripts found to scan; skipping auto-install.")
+            quit(status = 0)
           }
-          txt <- paste(readLines(files, warn = FALSE), collapse = "\n")
+          txt <- paste(unlist(lapply(files, readLines, warn = FALSE)), collapse = "\n")
           m <- gregexpr("(?:library|require)\\(([^)]+)\\)", txt, perl = TRUE)
           hits <- regmatches(txt, m)[[1]]
           pkgs <- unique(gsub(".*\\(([^)]+)\\).*", "\\1", hits))
