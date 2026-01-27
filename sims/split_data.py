@@ -11,6 +11,27 @@ import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 
+SIM_NAME_MAP = {
+    1: "confounding",
+    2: "portability",
+    3: "sample_imbalance",
+}
+
+
+def _resolve_sim_prefix(sim_id: int) -> str:
+    candidates = [f"sim{sim_id}"]
+    sim_name = SIM_NAME_MAP.get(sim_id)
+    if sim_name:
+        candidates.append(sim_name)
+
+    for prefix in candidates:
+        if os.path.exists(f"{prefix}.tsv"):
+            return prefix
+
+    raise FileNotFoundError(
+        f"Simulation TSV not found. Tried: {[f'{c}.tsv' for c in candidates]}"
+    )
+
 def setup_directories(sim_id):
     """Create work directories."""
     work_dir = Path(f"sim{sim_id}_work")
@@ -24,13 +45,12 @@ def split_data(sim_id, work_dir):
     Split PLINK data into Training (EUR) and Test (All).
     """
     # Load info from TSV to identify IDs
-    tsv_path = f"sim{sim_id}.tsv"
-    if not os.path.exists(tsv_path):
-        raise FileNotFoundError(f"Simulation TSV not found at {tsv_path}")
+    sim_prefix = _resolve_sim_prefix(sim_id)
+    tsv_path = f"{sim_prefix}.tsv"
         
     df = pd.read_csv(tsv_path, sep='\t')
 
-    bfile_orig = f"sim{sim_id}" # sim_pops.py produces sim{id}.bed/bim/fam
+    bfile_orig = sim_prefix  # sim_pops.py produces {sim_name}.bed/bim/fam
     fam_path = f"{bfile_orig}.fam"
     bim_path = f"{bfile_orig}.bim"
     bed_path = f"{bfile_orig}.bed"
