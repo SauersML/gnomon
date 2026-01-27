@@ -263,7 +263,11 @@ jobs:
       - name: Install MUSSEL R dependencies
         if: matrix.method == 'MUSSEL'
         run: |
-          Rscript -e 'install.packages(c("RISCA","optparse","bigreadr","bigsnpr","bigstatsr","bigparallelr","bigmemory","stringr","caret","Rcpp","RcppArmadillo","RcppTN","inline","doMC","foreach","doParallel","data.table","readr","MASS","reshape","parallel","devtools","genio","dplyr","pryr","Matrix","lavaan","xtable","SuperLearner","glmnet","R.utils","R.oo","R.methodsS3","mvnfast","gdata","pROC","corpcor","DescTools"), repos="https://cloud.r-project.org", dependencies=TRUE)'
+          Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
+          Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
+          Rscript -e 'pkgs <- c("optparse","bigreadr","bigsnpr","bigstatsr","bigparallelr","bigmemory","stringr","caret","Rcpp","RcppArmadillo","RcppTN","inline","doMC","foreach","doParallel","data.table","readr","MASS","reshape","parallel","devtools","genio","dplyr","pryr","Matrix","lavaan","xtable","SuperLearner","glmnet","R.utils","R.oo","R.methodsS3","mvnfast","gdata","pROC","corpcor","DescTools","rms"); install.packages(pkgs, repos="https://cloud.r-project.org", dependencies=TRUE); missing <- pkgs[!sapply(pkgs, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing CRAN packages: ", paste(missing, collapse=", ")); quit(status=1)}'
+          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")} if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")} if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
+          Rscript -e 'bioc <- c("snpStats","genefilter","sva"); missing <- bioc[!sapply(bioc, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing Bioconductor packages: ", paste(missing, collapse=", ")); quit(status=1)}'
 
       - name: Clone MUSSEL repo
         if: matrix.method == 'MUSSEL'
@@ -426,6 +430,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install uv
+          uv pip install --system -r sims/requirements.txt
           uv pip install --system pandas tabulate
           uv pip install --system pgscatalog-calc
       
