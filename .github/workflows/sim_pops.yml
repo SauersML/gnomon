@@ -171,6 +171,16 @@ jobs:
           name: sim-data-${{ matrix.sim_name }}
           path: .
 
+      - name: Normalize sim output names
+        run: |
+          set -e
+          if [ ! -d "sim${{ matrix.sim }}_work" ] && [ -d "${{ matrix.sim_name }}_work" ]; then
+            mv "${{ matrix.sim_name }}_work" "sim${{ matrix.sim }}_work"
+          fi
+          if [ ! -f "sim${{ matrix.sim }}.tsv" ] && [ -f "${{ matrix.sim_name }}.tsv" ]; then
+            cp "${{ matrix.sim_name }}.tsv" "sim${{ matrix.sim }}.tsv"
+          fi
+
       # --- Method Specific Setup ---
 
       - name: Setup for BayesR
