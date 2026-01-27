@@ -450,9 +450,16 @@ jobs:
         run: |
           # Ensure generate_summary.py is robust to missing files if some jobs failed
           python sims/generate_summary.py
-      
+
+      - name: Aggregate metrics & p-values
+        run: |
+          python sims/aggregate_results.py
+
       - name: Upload summary as artifact
         uses: actions/upload-artifact@v4
         with:
           name: consolidated-summary
-          path: summary.md
+          path: |
+            summary.md
+            all_methods_metrics.tsv
+            all_methods_pvalues.png

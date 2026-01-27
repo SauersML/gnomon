@@ -2,7 +2,7 @@
 Generate GitHub Actions Summary report combining all simulation results.
 
 Writes markdown to $GITHUB_STEP_SUMMARY for display in GitHub Actions UI.
-Uses artifact download links instead of base64 to avoid size limits.
+Renders plots inline when the PNG files are available in the workspace.
 """
 import sys
 import os
@@ -18,13 +18,6 @@ def generate_summary_report():
     if not summary_file:
         print("$GITHUB_STEP_SUMMARY not set, writing to summary.md instead")
         summary_file = 'summary.md'
-    
-    # Get workflow run info for artifact links
-    github_server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
-    github_repo = os.environ.get('GITHUB_REPOSITORY', 'SauersML/gnomon')
-    github_run_id = os.environ.get('GITHUB_RUN_ID', '')
-    
-    artifact_base = f"{github_server}/{github_repo}/actions/runs/{github_run_id}"
     
     lines = []
     
@@ -57,10 +50,12 @@ def generate_summary_report():
     lines.append("| **Sim 3** | Imbalanced populations (EUR majority) | Does ancestry-aware calibration help underrepresented groups? |")
     lines.append("")
 
+    sim_names = ["confounding", "portability", "sample_imbalance"]
+
     # Check if any results exist
     has_results = False
-    for sim_id in [1, 2, 3]:
-        if Path(f"sim{sim_id}_metrics.csv").exists():
+    for sim_name in sim_names:
+        if Path(f"{sim_name}_metrics.csv").exists():
             has_results = True
             break
 
@@ -73,22 +68,22 @@ def generate_summary_report():
         lines.append("")
 
     # Process each simulation
-    for sim_id in [1, 2, 3]:
+    for sim_name in sim_names:
         lines.append(f"---")
         lines.append("")
-        lines.append(f"## Simulation {sim_id} Results")
+        lines.append(f"## Simulation {sim_name} Results")
         lines.append("")
         
-        # Link to PC plot
-        pc_plot = Path(f"sim{sim_id}_pcs.png")
+        # Population structure plot (if available in this job's workspace)
+        pc_plot = Path(f"{sim_name}_pcs.png")
         if pc_plot.exists():
             lines.append("### Population Structure")
             lines.append("")
-            lines.append(f"📊 [View PC Plot](../../actions/runs/{github_run_id}#artifacts) - Download `sim-{sim_id}-outputs` artifact")
+            lines.append(f"![Simulation {sim_name} PC Plot]({pc_plot.as_posix()})")
             lines.append("")
         
         # Add metrics table
-        metrics_file = Path(f"sim{sim_id}_metrics.csv")
+        metrics_file = Path(f"{sim_name}_metrics.csv")
         if metrics_file.exists():
             lines.append("### Performance Metrics")
             lines.append("")
@@ -105,13 +100,21 @@ def generate_summary_report():
             lines.append(f"**🏆 Best Overall AUC:** {best_method} ({best_auc:.3f})")
             lines.append("")
         
-        # Link to plots
+        # Plots rendered inline if present
         lines.append("### Visualizations")
         lines.append("")
-        lines.append(f"- 📈 [ROC Curves](../../actions/runs/{github_run_id}#artifacts)")
-        lines.append(f"- 📉 [Calibration Curves](../../actions/runs/{github_run_id}#artifacts)")
-        lines.append("")
-        lines.append(f"*Download `sim-{sim_id}-outputs` artifact to view plots*")
+        roc_plot = Path(f"{sim_name}_comparison_roc.png")
+        cal_plot = Path(f"{sim_name}_comparison_calibration.png")
+        if roc_plot.exists():
+            lines.append(f"![Simulation {sim_name} ROC Curves]({roc_plot.as_posix()})")
+            lines.append("")
+        else:
+            lines.append(f"- 📈 ROC Curves: missing (`{roc_plot.name}` not found)")
+        if cal_plot.exists():
+            lines.append(f"![Simulation {sim_name} Calibration Curves]({cal_plot.as_posix()})")
+            lines.append("")
+        else:
+            lines.append(f"- 📉 Calibration Curves: missing (`{cal_plot.name}` not found)")
         lines.append("")
     
     # Summary conclusions
@@ -122,10 +125,6 @@ def generate_summary_report():
     lines.append("- **Simulation 1**: Tests whether phenotype-agnostic normalization removes true ancestry-associated genetic signal")
     lines.append("- **Simulation 2**: Demonstrates need for non-linear calibration when PGS accuracy varies with ancestry")
     lines.append("- **Simulation 3**: Evaluates performance in underrepresented populations with imbalanced training data")
-    lines.append("")
-    lines.append("## 📦 Download Results")
-    lines.append("")
-    lines.append(f"All plots and data files are available in the [workflow artifacts]({artifact_base}#artifacts).")
     lines.append("")
     lines.append("*Generated automatically by GitHub Actions*")
     lines.append("")
