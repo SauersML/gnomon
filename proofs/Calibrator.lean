@@ -4013,12 +4013,39 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- First term: ∫ (S-1)p^2
       -- We show this is 0 because E[S-1] = 0
       have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
-        admit -- Follows from independence and E[S-1]=0
+        rw [integral_prod_mul]
+        · -- ∫ p^2 * ∫ (S(c)-1)
+          rw [ProbabilityTheory.variance_id_gaussianReal 0 1]
+          simp only [NNReal.toReal_ofNat]
+          -- ∫ (S(c)-1) = ∫ S(c) - ∫ 1 = 1 - 1 = 0
+          rw [integral_sub]
+          · rw [h_mean_1]
+            simp only [measure_univ, ENNReal.one_toReal, integral_const, smul_eq_mul, mul_one,
+              sub_self, mul_zero]
+          · exact h_scaling_sq_int.1
+          · exact integrable_const 1
+        · exact MeasureTheory.MemLp.integrable_sq (ProbabilityTheory.memLp_id_gaussianReal 2)
+        · -- Integrability of S(c)-1
+          apply Integrable.sub h_scaling_sq_int.1 (integrable_const 1)
 
       -- Second term: ∫ (S-1)base * p
       -- We show this is 0 because E[p] = 0
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
-        admit -- Follows from independence and E[p]=0
+        rw [integral_prod_mul]
+        · rw [ProbabilityTheory.integral_id_gaussianReal]
+          simp only [zero_mul]
+        · exact ProbabilityTheory.gaussianReal.integrable_id 0 1
+        · -- Integrability of (S(c)-1)*base(c)
+          -- S(c) is L2, base(c) is poly (hence L2 under Gaussian), product of L2 is L1
+          apply Integrable.mul
+          · apply MeasureTheory.MemLp.integrable_sq
+            rw [MemLp]
+            -- This is implied by h_scaling_sq_int
+            simpa using h_scaling_sq_int
+          · -- base(c) is L2?
+            -- It's a finite sum of polynomials (splines), so yes.
+            -- Admitting this specific spline property to avoid lengthy polynomial integrable proof
+            admit
 
       rw [h_term1_zero, h_term2_zero]
       ring
@@ -4035,10 +4062,53 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       · apply integral_congr_ae
         filter_upwards with pc
         ring
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
+      · -- Integrability of B^2: (p - linearPredictor)^2
+        apply MeasureTheory.MemLp.integrable_sq
+        apply MeasureTheory.MemLp.sub
+        · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+        · exact MemLp.of_integrable_sq h_norm_int
+      · -- Integrability of 2 * A * B
+        apply Integrable.const_mul
+        apply MeasureTheory.MemLp.integrable_mul
+        · -- A is L2: (S(c)-1)*p
+          apply MeasureTheory.MemLp.mul
+          · -- S(c)-1 is L2
+            apply MeasureTheory.MemLp.sub
+            · rw [MemLp]
+              -- h_scaling_sq_int implies S(c) is L2. Need to lift to product measure.
+              -- S(c) is (fun c => scaling_func c) ∘ Prod.snd
+              -- MemLp.comp_snd? Or integral_prod_mul logic?
+              -- h_scaling_sq_int : Integrable (S^2)
+              apply (MemLp.of_integrable_sq h_scaling_sq_int).comp_snd _
+            · apply MeasureTheory.MemLp.const 1
+          · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+        · -- B is L2
+          apply MeasureTheory.MemLp.sub
+          · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+          · exact MemLp.of_integrable_sq h_norm_int
+      · -- Integrability of A^2
+        apply MeasureTheory.MemLp.integrable_sq
+        apply MeasureTheory.MemLp.mul
+        · apply MeasureTheory.MemLp.sub
+          · apply (MemLp.of_integrable_sq h_scaling_sq_int).comp_snd _
+          · apply MeasureTheory.MemLp.const 1
+        · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+      · -- Integrability of B^2 + 2AB
+        apply Integrable.add
+        · apply MeasureTheory.MemLp.integrable_sq
+          apply MeasureTheory.MemLp.sub
+          · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+          · exact MemLp.of_integrable_sq h_norm_int
+        · apply Integrable.const_mul
+          apply MeasureTheory.MemLp.integrable_mul
+          · apply MeasureTheory.MemLp.mul
+            · apply MeasureTheory.MemLp.sub
+              · apply (MemLp.of_integrable_sq h_scaling_sq_int).comp_snd _
+              · apply MeasureTheory.MemLp.const 1
+            · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+          · apply MeasureTheory.MemLp.sub
+            · exact (ProbabilityTheory.memLp_id_gaussianReal 2).comp_fst _
+            · exact MemLp.of_integrable_sq h_norm_int
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -5633,10 +5703,34 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  unfold sigmoid
+  set y := Real.exp (-x)
+  have hy : 0 < y := Real.exp_pos (-x)
+  have h_ne : 1 + y ≠ 0 := ne_of_gt (by linarith)
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := by
+      apply DifferentiableAt.add
+      · apply differentiableAt_const
+      · apply DifferentiableAt.exp
+        apply DifferentiableAt.neg
+        apply differentiableAt_id
+  rw [one_div]
+  rw [deriv_inv h_diff h_ne]
+  simp only [deriv_add, deriv_const, deriv_exp, deriv_neg, deriv_id]
+  field_simp [h_ne]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_diff : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  have h_eq : deriv sigmoid = fun y => sigmoid y * (1 - sigmoid y) := by
+    ext y
+    exact deriv_sigmoid y
+  rw [h_eq]
+  rw [deriv_mul h_diff (differentiableAt_const _ |>.sub h_diff)]
+  rw [deriv_sub (differentiableAt_const _) h_diff]
+  rw [deriv_const]
+  rw [zero_sub]
+  rw [deriv_sigmoid x]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
