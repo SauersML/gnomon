@@ -271,13 +271,14 @@ def _compute_pcs_from_sites(
     b_idx: np.ndarray,
     pca_site_ids: List[int],
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+    n_components: int = 20,
+) -> List[np.ndarray]:
     """
-    Compute PC1 and PC2 from diploid dosages at a subset of sites using scikit-learn PCA.
+    Compute PCs from diploid dosages at a subset of sites using scikit-learn PCA.
     This avoids building a genotype matrix over all chr22 variants.
 
     Returns
-      pc1, pc2 : standardized arrays (mean 0, sd 1)
+      List of PC arrays (length n_components), each standardized (mean 0, sd 1)
     """
     n_ind = a_idx.shape[0]
     n_feat = len(pca_site_ids)
@@ -312,15 +313,15 @@ def _compute_pcs_from_sites(
     scaler = StandardScaler(with_mean=True, with_std=True)
     Xz = scaler.fit_transform(X)
 
-    pca = PCA(n_components=5, svd_solver="randomized", random_state=seed)
+    pca = PCA(n_components=n_components, svd_solver="randomized", random_state=seed)
     pcs = pca.fit_transform(Xz).astype(np.float64)
 
     # Standardize PC axes to make downstream functions stable.
     pc_scaler = StandardScaler(with_mean=True, with_std=True)
     pcs_z = pc_scaler.fit_transform(pcs)
-    
-    # Return all 5 PCs as a list/tuple of arrays
-    return [pcs_z[:, k].astype(np.float64) for k in range(5)]
+
+    # Return all PCs as a list of arrays
+    return [pcs_z[:, k].astype(np.float64) for k in range(n_components)]
 
 
 def _make_genetic_component(
@@ -483,8 +484,9 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     )
 
     # --- Compute PCs ---
-    print(f"[{cfg.sim_name}] Computing PCs with scikit-learn PCA (features={len(pca_site_ids)}) ...")
-    pcs = _compute_pcs_from_sites(ts, a_idx, b_idx, pca_site_ids, seed=cfg.seed + 23)
+    N_PCS = 20  # Compute 20 PCs for use as BayesR covariates
+    print(f"[{cfg.sim_name}] Computing {N_PCS} PCs with scikit-learn PCA (features={len(pca_site_ids)}) ...")
+    pcs = _compute_pcs_from_sites(ts, a_idx, b_idx, pca_site_ids, seed=cfg.seed + 23, n_components=N_PCS)
     pc1 = pcs[0] # Keep pc1 handy for simulation logic
 
     # --- Compute true genetic component ---
@@ -574,16 +576,13 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         raise RuntimeError("Simulation id must be 1, 2, or 3.")
 
     # --- Build TSV table ---
+    pc_cols = [f"pc{i+1}" for i in range(N_PCS)]
     header = [
         "individual_id",
         "tskit_individual_id",
         "pop_index",
         "pop_label",
-        "pc1",
-        "pc2",
-        "pc3",
-        "pc4",
-        "pc5",
+    ] + pc_cols + [
         "G_true",
         "P_observed",
         "y",
@@ -607,16 +606,13 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     rows: List[List[object]] = []
     for i in range(n_ind):
         pop_label = pop_labels[i]
+        pc_values = [float(pcs[k][i]) for k in range(N_PCS)]
         base = [
             f"ind_{i+1}",  # Match VCF sample ID format (1-indexed with prefix)
             int(ts_ind_id[i]),
             int(pop_idx[i]),
             pop_label,
-            float(pcs[0][i]), # pc1
-            float(pcs[1][i]), # pc2
-            float(pcs[2][i]), # pc3
-            float(pcs[3][i]), # pc4
-            float(pcs[4][i]), # pc5
+        ] + pc_values + [
             float(G_true[i]),
             float(P_obs[i]),
             int(y[i]),
@@ -721,16 +717,14 @@ def main() -> None:
 
     # Cleanup intermediate files to save space
     import os
-    try:
-        if os.path.exists(f"{cfg.sim_name}.trees"):
-            os.remove(f"{cfg.sim_name}.trees")
-        if os.path.exists(f"{cfg.sim_name}.vcf"):
-            os.remove(f"{cfg.sim_name}.vcf")
-        if os.path.exists(f"{cfg.sim_name}.cm"):
-            os.remove(f"{cfg.sim_name}.cm")
-        print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf, .cm).")
-    except Exception as e:
-        print(f"WARNING: Cleanup failed: {e}")
+    # Clean up large intermediate files (fail hard if deletion fails)
+    if os.path.exists(f"{cfg.sim_name}.trees"):
+        os.remove(f"{cfg.sim_name}.trees")
+    if os.path.exists(f"{cfg.sim_name}.vcf"):
+        os.remove(f"{cfg.sim_name}.vcf")
+    if os.path.exists(f"{cfg.sim_name}.cm"):
+        os.remove(f"{cfg.sim_name}.cm")
+    print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf, .cm).")
 
 
 if __name__ == "__main__":

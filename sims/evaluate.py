@@ -24,17 +24,16 @@ from methods import (
 from metrics import compute_all_metrics, compute_calibration_curve
 
 def load_scores(work_dir, methods):
-    """Load available scores, skip missing methods gracefully."""
+    """Load scores. FAILS if any method is missing."""
     scores_dict = {}
-    missing_methods = []
 
     for method in methods:
         score_file = work_dir / f"{method}.sscore"
         if not score_file.exists():
-            print(f"WARNING: Missing score file for {method} at {score_file}")
-            print(f"    Training job likely failed. Skipping {method}.")
-            missing_methods.append(method)
-            continue
+            raise FileNotFoundError(
+                f"REQUIRED: Score file missing for {method} at {score_file}. "
+                f"Training job must have failed. Check workflow logs."
+            )
 
         try:
             df = pd.read_csv(score_file, sep='\t')
@@ -43,16 +42,9 @@ def load_scores(work_dir, methods):
             scores_dict[method] = df.set_index('IID')['PRS']
             print(f"Loaded {method} scores")
         except Exception as e:
-            print(f"WARNING: Failed to load {method} scores: {e}")
-            missing_methods.append(method)
-
-    if not scores_dict:
-        raise FileNotFoundError(f"CRITICAL: No score files found! All methods failed: {methods}")
-
-    if missing_methods:
-        print(f"\nEvaluation will proceed with {len(scores_dict)} of {len(methods)} methods")
-        print(f"   Available: {list(scores_dict.keys())}")
-        print(f"   Missing: {missing_methods}\n")
+            raise RuntimeError(
+                f"REQUIRED: Failed to load {method} scores from {score_file}: {e}"
+            )
 
     return pd.DataFrame(scores_dict)
 
@@ -353,8 +345,10 @@ def main():
         P_raw = analysis_df[prs_name].values
         # Standardize
         if np.std(P_raw) == 0:
-            print(f"WARNING: {prs_name} has zero variance. Skipping.")
-            continue
+            raise RuntimeError(
+                f"REQUIRED: {prs_name} has zero variance. "
+                f"This indicates a critical failure in PGS calculation. Cannot proceed."
+            )
         P_raw = (P_raw - np.mean(P_raw)) / np.std(P_raw)
         
         for cal_method in calibration_methods:

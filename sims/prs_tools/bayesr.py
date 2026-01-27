@@ -30,25 +30,34 @@ class BayesR:
         except Exception:
             pass
         
-    def fit(self, bfile_train, pheno_file, out_prefix):
+    def fit(self, bfile_train, pheno_file, out_prefix, covar_file):
         """
         Run GCTB BayesR on training data.
-        
+
         Args:
             bfile_train: Path prefix to training PLINK files
             pheno_file: Path to phenotype file (FID IID Pheno)
             out_prefix: Output prefix for GCTB results
+            covar_file: REQUIRED path to covariate file (FID IID PC1 PC2 ...)
         """
+        if covar_file is None:
+            raise ValueError("BayesR requires covar_file (cannot be None). Pass path to .covar file with PCs.")
+        if not os.path.exists(covar_file):
+            raise FileNotFoundError(f"BayesR covariate file does not exist: {covar_file}")
+
         cmd = [
             self.gctb_path,
             "--bfile", bfile_train,
             "--pheno", pheno_file,
             "--bayes", "R",
+            "--covar", covar_file,
             "--chain-length", "10000",
             "--burn-in", "2000",
             "--thread", "4",
             "--out", out_prefix
         ]
+
+        print(f"BayesR using covariates from: {covar_file}")
         
         print(f"Running BayesR: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)

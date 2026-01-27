@@ -103,11 +103,14 @@ def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None
             
             shutil.move(bim_tmp, bim_path)
             print(f"Updated {updated_count} variants with genetic positions.")
-            
+
         except Exception as e:
-            print(f"WARNING: Failed to update .bim file with genetic map: {e}")
             if os.path.exists(bim_tmp):
                 os.remove(bim_tmp)
+            raise RuntimeError(
+                f"REQUIRED: Failed to update .bim file with genetic map: {e}. "
+                f"Genetic positions are critical for LD-aware methods."
+            )
 
 def write_phenotype_file(df, out_path: str) -> None:
     """

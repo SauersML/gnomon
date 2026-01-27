@@ -149,7 +149,7 @@ def split_data(sim_id, work_dir):
             "y": df.loc[train_idx, "y"].to_numpy(),
         }
     ).to_csv(work_dir / "train.phen", sep=' ', index=False, header=False)
-    
+
     pd.DataFrame(
         {
             "FID": [iid_to_fid[i] for i in test_iid],
@@ -157,7 +157,31 @@ def split_data(sim_id, work_dir):
             "y": df.loc[test_idx, "y"].to_numpy(),
         }
     ).to_csv(work_dir / "test.phen", sep=' ', index=False, header=False)
-    
+
+    # Write covariate files (FID IID PC1 PC2 ... PC20) for BayesR
+    # Detect number of PCs dynamically from column names
+    pc_cols = [c for c in df.columns if c.startswith('pc') and c[2:].isdigit()]
+    pc_cols_sorted = sorted(pc_cols, key=lambda x: int(x[2:]))  # Sort pc1, pc2, ..., pc20
+
+    if len(pc_cols_sorted) == 0:
+        raise RuntimeError(
+            f"REQUIRED: No PC columns found in {tsv_path}. "
+            "Expected columns like pc1, pc2, ..., pcN. "
+            "Simulation must compute PCs before splitting data."
+        )
+
+    train_covar_data = {"FID": [iid_to_fid[i] for i in train_iid], "IID": train_iid}
+    for pc_col in pc_cols_sorted:
+        train_covar_data[pc_col] = df.loc[train_idx, pc_col].to_numpy()
+    pd.DataFrame(train_covar_data).to_csv(work_dir / "train.covar", sep=' ', index=False, header=False)
+
+    test_covar_data = {"FID": [iid_to_fid[i] for i in test_iid], "IID": test_iid}
+    for pc_col in pc_cols_sorted:
+        test_covar_data[pc_col] = df.loc[test_idx, pc_col].to_numpy()
+    pd.DataFrame(test_covar_data).to_csv(work_dir / "test.covar", sep=' ', index=False, header=False)
+
+    print(f"Created covariate files with {len(pc_cols_sorted)} PCs: {pc_cols_sorted}")
+
     print(f"Split complete. Train: {n_train_out}, Test: {n_test_out}")
     print(f"Outputs in {work_dir}")
 

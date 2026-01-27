@@ -32,7 +32,10 @@ def train_and_score(sim_id, method_name):
     
     if method_name == 'BayesR':
         br = BayesR()
-        eff_file = br.fit(str(train_prefix), str(pheno_file), str(work_dir / "bayesr"))
+        covar_file = work_dir / "train.covar"
+        if not covar_file.exists():
+            raise FileNotFoundError(f"REQUIRED: Covariate file missing: {covar_file}. BayesR requires PC covariates.")
+        eff_file = br.fit(str(train_prefix), str(pheno_file), str(work_dir / "bayesr"), covar_file=str(covar_file))
         res = br.predict(str(test_prefix), eff_file, str(work_dir / "bayesr_pred"))
         scores = res
         
