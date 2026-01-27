@@ -262,7 +262,7 @@ jobs:
       - name: Install MUSSEL R dependencies
         if: matrix.method == 'MUSSEL'
         run: |
-          Rscript -e 'install.packages(c("bigstatsr","bigsnpr","data.table","R.utils","R.oo","R.methodsS3","doParallel","foreach","SuperLearner","glmnet"), repos="https://cloud.r-project.org")'
+          Rscript -e 'install.packages(c("optparse","bigstatsr","bigsnpr","data.table","R.utils","R.oo","R.methodsS3","doParallel","foreach","SuperLearner","glmnet"), repos="https://cloud.r-project.org")'
 
       - name: Clone MUSSEL repo
         if: matrix.method == 'MUSSEL'
