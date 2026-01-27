@@ -269,6 +269,25 @@ jobs:
         run: |
           git clone https://github.com/Jin93/MUSSEL.git
 
+      - name: Install MUSSEL R packages (auto-detect)
+        if: matrix.method == 'MUSSEL'
+        run: |
+          Rscript -e 'files <- Sys.glob("MUSSEL/R/*.R"); if(length(files)==0) quit(status=1); \
+            txt <- paste(readLines(files, warn=FALSE), collapse="\\n"); \
+            m <- gregexpr("(?:library|require)\\(([^)]+)\\)", txt, perl=TRUE); \
+            hits <- regmatches(txt, m)[[1]]; \
+            pkgs <- unique(gsub(".*\\(([^)]+)\\).*","\\1", hits)); \
+            pkgs <- gsub("[\"\\' ]","", pkgs); \
+            pkgs <- pkgs[nzchar(pkgs)]; \
+            base <- c("stats","utils","methods","base","grDevices","graphics"); \
+            pkgs <- setdiff(pkgs, base); \
+            if(length(pkgs)>0){ \
+              cat("Installing MUSSEL packages:", paste(pkgs, collapse=", "), "\\n"); \
+              install.packages(pkgs, repos="https://cloud.r-project.org"); \
+            } else { \
+              cat("No additional MUSSEL packages detected.\\n"); \
+            }'
+
       - name: Train & Score ${{ matrix.method }}
         run: |
           set -e
