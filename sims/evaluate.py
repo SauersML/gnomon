@@ -20,6 +20,7 @@ from methods import (
     RawPGSMethod,
     GAMMethod,
     LinearInteractionMethod,
+    NormalizationMethod,
 )
 from metrics import compute_all_metrics, compute_calibration_curve
 
@@ -358,6 +359,7 @@ def main():
     calibration_methods = [
         RawPGSMethod(),
         LinearInteractionMethod(),
+        NormalizationMethod(n_pcs=5),
         GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True),
     ]
     
@@ -380,7 +382,11 @@ def main():
                 # Stratify by pop to ensure diversity in both
                 idx_cal, idx_val = train_test_split(np.arange(len(y_test)), test_size=0.5, random_state=42, stratify=pop_test)
                 
+                if isinstance(cal_method, NormalizationMethod):
+                    cal_method.set_pop_labels(pop_test[idx_cal])
                 cal_method.fit(P_raw[idx_cal], PC_test[idx_cal], y_test[idx_cal])
+                if isinstance(cal_method, NormalizationMethod):
+                    cal_method.set_pop_labels(pop_test[idx_val])
                 y_prob = cal_method.predict_proba(P_raw[idx_val], PC_test[idx_val])
                 
                 metrics = compute_all_metrics(y_test[idx_val], y_prob, pop_test[idx_val])

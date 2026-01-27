@@ -11,3 +11,4 @@ tskit<1.0
 stdpopsim
 statsmodels
 pandas-plink
+pgscatalog-calc
