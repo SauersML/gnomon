@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       methods:
-        description: "JSON array of methods to train (e.g. [\"BayesR\",\"LDpred2\",\"PRS-CSx\"])"
+        description: "JSON array of methods to train (e.g. [\"BayesR\",\"BayesR-Mix\",\"LDpred2\",\"PRS-CSx\",\"MUSSEL\"])"
         required: false
         default: "[\"BayesR\"]"
   push:
@@ -169,11 +169,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: sim-data-${{ matrix.sim_name }}
+          path: .
 
       # --- Method Specific Setup ---
-      
+
       - name: Setup for BayesR
         if: matrix.method == 'BayesR'
+        run: |
+          mkdir -p gctb_bin
+          wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
+          unzip gctb_2.03beta_Linux.zip -d gctb_bin
+          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
+          chmod +x /usr/local/bin/gctb
+
+      - name: Setup for BayesR-Mix
+        if: matrix.method == 'BayesR-Mix'
         run: |
           mkdir -p gctb_bin
           wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
@@ -253,6 +263,22 @@ jobs:
           # Install PRS-CSx
           git clone https://github.com/getian107/PRScsx.git
           echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
+
+      - name: Setup for MUSSEL
+        if: matrix.method == 'MUSSEL'
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3.3'
+
+      - name: Install MUSSEL R dependencies
+        if: matrix.method == 'MUSSEL'
+        run: |
+          Rscript -e 'install.packages(c("bigstatsr","bigsnpr","data.table","R.utils","R.oo","R.methodsS3","doParallel","foreach","SuperLearner","glmnet"), repos="https://cloud.r-project.org")'
+
+      - name: Clone MUSSEL repo
+        if: matrix.method == 'MUSSEL'
+        run: |
+          git clone https://github.com/Jin93/MUSSEL.git
 
       - name: Train & Score ${{ matrix.method }}
         run: |
@@ -344,7 +370,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: model-scores-${{ matrix.sim_name }}-PRS-CSx
-          path: sim${{ matrix.sim }}_work/
+          path: ${{ matrix.sim_name }}_work/
+          merge-multiple: true
+
+      - name: Download BayesR-Mix Scores
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: model-scores-${{ matrix.sim_name }}-BayesR-Mix
+          path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
       - name: Calibration Analysis
