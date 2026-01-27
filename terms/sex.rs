@@ -295,6 +295,7 @@ fn sex_label(sex: InferredSex) -> &'static str {
     match sex {
         InferredSex::Male => "male",
         InferredSex::Female => "female",
+        InferredSex::Indeterminate => "indeterminate",
     }
 }
 
