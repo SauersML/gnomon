@@ -11,18 +11,11 @@ import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 
-SIM_NAME_MAP = {
-    1: "confounding",
-    2: "portability",
-    3: "sample_imbalance",
-}
-
-
-def _resolve_sim_prefix(sim_id: int) -> str:
-    candidates = [f"sim{sim_id}"]
-    sim_name = SIM_NAME_MAP.get(sim_id)
-    if sim_name:
-        candidates.append(sim_name)
+def _resolve_sim_prefix(sim_arg: str) -> str:
+    sim_arg = str(sim_arg).strip()
+    candidates = [sim_arg]
+    if sim_arg.isdigit():
+        candidates.append(f"sim{sim_arg}")
 
     for prefix in candidates:
         if os.path.exists(f"{prefix}.tsv"):
@@ -32,20 +25,20 @@ def _resolve_sim_prefix(sim_id: int) -> str:
         f"Simulation TSV not found. Tried: {[f'{c}.tsv' for c in candidates]}"
     )
 
-def setup_directories(sim_id):
+def setup_directories(sim_arg):
     """Create work directories."""
-    work_dir = Path(f"sim{sim_id}_work")
+    work_dir = Path(f"{sim_arg}_work")
     if work_dir.exists():
         shutil.rmtree(work_dir)
     work_dir.mkdir()
     return work_dir
 
-def split_data(sim_id, work_dir):
+def split_data(sim_arg, work_dir):
     """
     Split PLINK data into Training (EUR) and Test (All).
     """
     # Load info from TSV to identify IDs
-    sim_prefix = _resolve_sim_prefix(sim_id)
+    sim_prefix = _resolve_sim_prefix(sim_arg)
     tsv_path = f"{sim_prefix}.tsv"
         
     df = pd.read_csv(tsv_path, sep='\t')
@@ -207,12 +200,12 @@ def split_data(sim_id, work_dir):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python split_data.py <sim_id>")
+        print("Usage: python split_data.py <sim_name|sim_id>")
         sys.exit(1)
     
-    sim_id = int(sys.argv[1])
-    work_dir = setup_directories(sim_id)
-    split_data(sim_id, work_dir)
+    sim_arg = sys.argv[1]
+    work_dir = setup_directories(sim_arg)
+    split_data(sim_arg, work_dir)
 
 if __name__ == "__main__":
     main()

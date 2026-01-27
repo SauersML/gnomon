@@ -700,14 +700,14 @@ def main() -> None:
         raise SystemExit("Provide exactly one argument: 1, 2, or 3.")
 
     which = sys.argv[1].strip().lower()
-    if which in ("1", "sim1"):
+    if which in ("1", "sim1", "confounding"):
         cfg = SIM_CONFIGS[1]
-    elif which in ("2", "sim2"):
+    elif which in ("2", "sim2", "portability"):
         cfg = SIM_CONFIGS[2]
-    elif which in ("3", "sim3"):
+    elif which in ("3", "sim3", "sample_imbalance"):
         cfg = SIM_CONFIGS[3]
     else:
-        raise SystemExit("Unknown simulation. Use 1, 2, or 3.")
+        raise SystemExit("Unknown simulation. Use 1, 2, 3, or the full sim name.")
 
     _simulate_dataset(cfg)
     

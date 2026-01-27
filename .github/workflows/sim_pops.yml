@@ -29,14 +29,7 @@ jobs:
       SIM_CACHE_VERSION: v2
     strategy:
       matrix:
-        sim: [1, 2, 3]
-        include:
-          - sim: 1
-            sim_name: confounding
-          - sim: 2
-            sim_name: portability
-          - sim: 3
-            sim_name: sample_imbalance
+        sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -82,12 +75,12 @@ jobs:
           sudo mv plink2 /usr/local/bin/
           rm plink2.zip
 
-      - name: Run Simulation ${{ matrix.sim }} (${{ matrix.sim_name }})
+      - name: Run Simulation ${{ matrix.sim_name }}
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "Running Simulation ${{ matrix.sim }} (${{ matrix.sim_name }})..."
-          python sims/sim_pops.py ${{ matrix.sim }}
+          echo "Running Simulation ${{ matrix.sim_name }}..."
+          python sims/sim_pops.py ${{ matrix.sim_name }}
 
           # sim_pops.py now deletes .trees and .vcf automatically on success
           # Verify they are gone to save space
@@ -101,7 +94,7 @@ jobs:
         run: |
           set -e
           echo "Splitting Data for ${{ matrix.sim_name }}..."
-          python sims/split_data.py ${{ matrix.sim }}
+          python sims/split_data.py ${{ matrix.sim_name }}
 
       - name: Save simulation cache
         if: ${{ always() && steps.sim-cache.outputs.cache-hit != 'true' }}
@@ -136,15 +129,8 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        sim: [1, 2, 3]
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        include:
-          - sim: 1
-            sim_name: confounding
-          - sim: 2
-            sim_name: portability
-          - sim: 3
-            sim_name: sample_imbalance
+        sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -288,7 +274,7 @@ jobs:
              Rscript -e 'if(!require("R.utils", quietly=TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")'
           fi
 
-          echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }} (sim ${{ matrix.sim }})..."
+          echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }}..."
           python sims/train_model.py ${{ matrix.sim_name }} ${{ matrix.method }}
 
       - name: Save R cache (LDpred2)
@@ -312,14 +298,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        sim: [1, 2, 3]
-        include:
-          - sim: 1
-            sim_name: confounding
-          - sim: 2
-            sim_name: portability
-          - sim: 3
-            sim_name: sample_imbalance
+        sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -384,16 +363,16 @@ jobs:
       - name: Calibration Analysis
         run: |
           set -e
-          echo "Running Evaluation for Sim ${{ matrix.sim }}..."
-          python sims/evaluate.py ${{ matrix.sim }}
+          echo "Running Evaluation for Sim ${{ matrix.sim_name }}..."
+          python sims/evaluate.py ${{ matrix.sim_name }}
 
       - name: Upload Results (Stream B)
         uses: actions/upload-artifact@v4
         with:
-          name: sim-results-${{ matrix.sim }}
+          name: sim-results-${{ matrix.sim_name }}
           path: |
-            sim${{ matrix.sim }}_metrics.csv
-            sim${{ matrix.sim }}_comparison_*.png
+            ${{ matrix.sim_name }}_metrics.csv
+            ${{ matrix.sim_name }}_comparison_*.png
           if-no-files-found: warn
 
   # ------------------------------------------------------------------
