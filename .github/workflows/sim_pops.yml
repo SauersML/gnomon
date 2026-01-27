@@ -291,7 +291,7 @@ jobs:
           } else {
             cat("No additional MUSSEL packages detected.\n")
           }
-RSCRIPT
+          RSCRIPT
           Rscript /tmp/mussel_pkg_scan.R
 
       - name: Train & Score ${{ matrix.method }}
