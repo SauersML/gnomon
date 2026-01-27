@@ -171,16 +171,6 @@ jobs:
           name: sim-data-${{ matrix.sim_name }}
           path: .
 
-      - name: Normalize sim output names
-        run: |
-          set -e
-          if [ ! -d "sim${{ matrix.sim }}_work" ] && [ -d "${{ matrix.sim_name }}_work" ]; then
-            mv "${{ matrix.sim_name }}_work" "sim${{ matrix.sim }}_work"
-          fi
-          if [ ! -f "sim${{ matrix.sim }}.tsv" ] && [ -f "${{ matrix.sim_name }}.tsv" ]; then
-            cp "${{ matrix.sim_name }}.tsv" "sim${{ matrix.sim }}.tsv"
-          fi
-
       # --- Method Specific Setup ---
 
       - name: Setup for BayesR
@@ -299,7 +289,7 @@ jobs:
           fi
 
           echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }} (sim ${{ matrix.sim }})..."
-          python sims/train_model.py ${{ matrix.sim }} ${{ matrix.method }}
+          python sims/train_model.py ${{ matrix.sim_name }} ${{ matrix.method }}
 
       - name: Save R cache (LDpred2)
         if: ${{ always() && matrix.method == 'LDpred2' }}
