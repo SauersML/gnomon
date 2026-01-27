@@ -4002,23 +4002,63 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         intro pc; ring
 
       simp_rw [h_integrand]
-      rw [integral_sub (by admit) (by admit)]
+
+      -- We need to prove integrability to use integral_sub
+      -- 1. Integrability of p^2 (Gaussian moment)
+      have h_p2_int : Integrable (fun p => p^2) (ProbabilityTheory.gaussianReal 0 1) := by
+        have h := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) 2
+        exact (memLp_two_iff_integrable_sq (μ := ProbabilityTheory.gaussianReal 0 1) (f := id)).mp h
+
+      -- 2. Integrability of p (Gaussian mean)
+      have h_p_int : Integrable (fun p => p) (ProbabilityTheory.gaussianReal 0 1) := by
+        have h := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) 1
+        exact MemLp.integrable h
+
+      -- 3. Integrability of S - 1
+      have h_S_memL2 : MemLp scaling_func 2 ((stdNormalProdMeasure k).map Prod.snd) :=
+        memLp_two_iff_integrable_sq.mpr h_scaling_sq_int
+      have h_S_int : Integrable scaling_func ((stdNormalProdMeasure k).map Prod.snd) :=
+        MemLp.integrable (MemLp.mono (by norm_num) h_S_memL2)
+      have h_S_sub_1_int : Integrable (fun c => scaling_func c - 1) ((stdNormalProdMeasure k).map Prod.snd) :=
+        Integrable.sub h_S_int (integrable_const 1)
+
+      -- 4. Measure decomposition
+      have h_meas_eq : stdNormalProdMeasure k = (ProbabilityTheory.gaussianReal 0 1).prod ((stdNormalProdMeasure k).map Prod.snd) := by
+        unfold stdNormalProdMeasure
+        simp only [Measure.map_snd_prod, Measure.prob_coe_univ, one_smul]
+
+      -- 5. Integrability of terms
+      have h_t1_int : Integrable (fun z : ℝ × (Fin k → ℝ) => z.1^2 * (scaling_func z.2 - 1)) (stdNormalProdMeasure k) := by
+        rw [h_meas_eq]
+        apply MeasureTheory.Integrable.prod_mul h_p2_int h_S_sub_1_int
+
+      -- We admit integrability of the second term involving predictorBase for now, as establishing L2 bounds for splines is verbose
+      -- but the orthogonality argument holds regardless.
+      have h_t2_int : Integrable (fun z : ℝ × (Fin k → ℝ) => z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2)) (stdNormalProdMeasure k) := by
+        admit
+
+      rw [integral_sub (h_t1_int.const_mul _) h_t2_int]
 
       -- Factor out constant
-      have h_const_factor : ∫ (z : ℝ × (Fin k → ℝ)), (1 - m.γₘ₀ 0) * (z.1 ^ 2 * (scaling_func z.2 - 1)) ∂stdNormalProdMeasure k =
-                            (1 - m.γₘ₀ 0) * ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k := by
-        admit -- Linearity
-      rw [h_const_factor]
+      rw [integral_const_mul]
 
       -- First term: ∫ (S-1)p^2
-      -- We show this is 0 because E[S-1] = 0
       have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
-        admit -- Follows from independence and E[S-1]=0
+        rw [h_meas_eq, MeasureTheory.integral_prod_mul h_p2_int h_S_sub_1_int]
+        have h_var : ∫ p, p^2 ∂ProbabilityTheory.gaussianReal 0 1 = 1 := by
+          simpa using ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
+        rw [h_var]
+        have h_mean_S : ∫ c, scaling_func c ∂((stdNormalProdMeasure k).map Prod.snd) = 1 := h_mean_1
+        rw [integral_sub h_S_int (integrable_const 1)]
+        rw [h_mean_S, integral_const, Measure.prob_coe_univ, one_mul, sub_self, mul_zero]
 
       -- Second term: ∫ (S-1)base * p
-      -- We show this is 0 because E[p] = 0
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
-        admit -- Follows from independence and E[p]=0
+        rw [h_meas_eq, MeasureTheory.integral_prod_mul h_p_int]
+        · have h_mean_p : ∫ p, p ∂ProbabilityTheory.gaussianReal 0 1 = 0 := by
+            simpa using ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+          rw [h_mean_p, zero_mul]
+        · admit -- Integrability of (S-1)*base on C
 
       rw [h_term1_zero, h_term2_zero]
       ring
@@ -5633,10 +5673,26 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := by
+    fun_prop
+  have h_ne_zero : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+  unfold sigmoid
+  rw [one_div]
+  rw [deriv_inv h_diff h_ne_zero]
+  rw [deriv_add_const, deriv_exp, deriv_neg, deriv_id]
+  field_simp [h_ne_zero]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_diff_sig : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  rw [deriv_eq_deriv_of_eventuallyEq_nhds (eventually_of_forall deriv_sigmoid)]
+  rw [deriv_mul h_diff_sig ((differentiableAt_const 1).sub h_diff_sig)]
+  rw [deriv_sub (differentiableAt_const 1) h_diff_sig]
+  rw [deriv_const, zero_sub, deriv_sigmoid x]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
