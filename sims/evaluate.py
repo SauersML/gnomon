@@ -297,7 +297,11 @@ def main():
         print("Usage: python evaluate.py <sim_id>")
         sys.exit(1)
         
-    sim_id = int(sys.argv[1])
+    sim_arg = sys.argv[1]
+    try:
+        sim_id = int(sim_arg)
+    except ValueError:
+        sim_id = sim_arg
     work_dir = Path(f"sim{sim_id}_work")
     
     # 1. Load Data
