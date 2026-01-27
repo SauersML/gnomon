@@ -5633,10 +5633,31 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  have h_denom : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x :=
+    (differentiableAt_const _).add differentiableAt_id.neg.exp
+  unfold sigmoid
+  convert deriv_div (differentiableAt_const _) h_diff h_denom
+  simp only [deriv_const, zero_mul, sub_zero, mul_one]
+  rw [deriv_add (differentiableAt_const _) differentiableAt_id.neg.exp]
+  rw [deriv_const, zero_add, deriv_exp differentiableAt_id.neg]
+  rw [deriv_neg differentiableAt_id, deriv_id]
+  field_simp [h_denom]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_deriv : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := by
+    ext y
+    exact deriv_sigmoid y
+  rw [h_deriv]
+  rw [deriv_mul (differentiable_sigmoid x) ((differentiableAt_const _).sub (differentiable_sigmoid x))]
+  rw [deriv_sub (differentiableAt_const _) (differentiable_sigmoid x)]
+  rw [deriv_const, zero_sub]
+  rw [deriv_sigmoid x]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
