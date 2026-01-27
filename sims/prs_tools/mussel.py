@@ -154,10 +154,19 @@ class MUSSEL:
         else:
             raise RuntimeError("MUSSEL: GWAS output missing BETA/OR.")
 
-        if "SE" in df.columns:
-            beta_se = pd.to_numeric(df["SE"], errors="coerce")
+        se_col = None
+        for cand in ["SE", "LOG(OR)_SE", "LOGOR_SE", "SE_LOGOR", "SE_BETA"]:
+            if cand in df.columns:
+                se_col = cand
+                break
+        if se_col is not None:
+            beta_se = pd.to_numeric(df[se_col], errors="coerce")
+        elif "T_STAT" in df.columns:
+            # Fallback: SE = beta / z if T_STAT provided
+            tstat = pd.to_numeric(df["T_STAT"], errors="coerce")
+            beta_se = pd.to_numeric(beta, errors="coerce") / tstat.replace(0, np.nan)
         else:
-            raise RuntimeError("MUSSEL: GWAS output missing SE.")
+            raise RuntimeError("MUSSEL: GWAS output missing SE (no SE or T_STAT columns).")
 
         a0 = np.where(df["A1"] == df["ALT"], df["REF"], df["ALT"])
 
