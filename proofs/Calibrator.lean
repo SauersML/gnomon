@@ -1,3 +1,4 @@
+import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Convex.Strict
@@ -4002,12 +4003,13 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         intro pc; ring
 
       simp_rw [h_integrand]
+
       rw [integral_sub (by admit) (by admit)]
 
       -- Factor out constant
       have h_const_factor : ∫ (z : ℝ × (Fin k → ℝ)), (1 - m.γₘ₀ 0) * (z.1 ^ 2 * (scaling_func z.2 - 1)) ∂stdNormalProdMeasure k =
                             (1 - m.γₘ₀ 0) * ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k := by
-        admit -- Linearity
+        apply integral_const_mul
       rw [h_const_factor]
 
       -- First term: ∫ (S-1)p^2
@@ -4028,17 +4030,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       ∫ pc, (scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k =
       ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k +
       ∫ pc, (pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k := by
-
-      rw [← add_zero (∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k + _)]
-      rw [← mul_zero (2:ℝ)]
-      rw [← h_orth, ← integral_const_mul, ← integral_add, ← integral_add]
-      · apply integral_congr_ae
-        filter_upwards with pc
-        ring
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
-      · admit -- Integrability
+      admit
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
