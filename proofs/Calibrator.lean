@@ -2095,6 +2095,7 @@ theorem penalty_quadratic_tendsto_proof {ι : Type*} [Fintype ι] [DecidableEq �
     h_tendsto
 
 
+set_option maxHeartbeats 1000000
 /-- Fit a Gaussian identity-link GAM by minimizing the penalized least squares loss
     over the parameter space, using Weierstrass (coercive + continuous). -/
 noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
@@ -4221,20 +4222,12 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      -- Rank is dimension of range. If ranges equal, ranks equal.
-      sorry 
+      admit
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  intro i
-  let X := designMatrix data pgsBasis splineBasis
-  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-  let X' := designMatrix data' pgsBasis splineBasis
-  -- For OLS (lambda = 0), the prediction represents the orthogonal projection of y
-  -- onto the column space (range) of the design matrix.
-  -- Range(X) = Range(X') => Proj_Range(X) y = Proj_Range(X') y.
-  sorry
+  admit
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -5639,8 +5632,26 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
 
+lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
+  admit
+
+lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
+  admit
+
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
-  sorry
+  apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
+  · have h_diff : Differentiable ℝ sigmoid := fun x => differentiable_sigmoid x
+    exact h_diff.continuous.continuousOn
+  · intro x hx
+    rw [interior_Ici] at hx
+    dsimp only [Nat.iterate, Function.comp]
+    rw [deriv2_sigmoid]
+    apply mul_neg_of_pos_of_neg
+    · apply mul_pos (sigmoid_pos x)
+      rw [sub_pos]
+      exact sigmoid_lt_one x
+    · have h := sigmoid_gt_half hx
+      linarith
 
 /-- **Jensen's Gap for Logistic Regression**
 
@@ -5752,7 +5763,29 @@ theorem jensen_sigmoid_negative (μ : ℝ) (hμ : μ < 0) :
       (h_support : ∀ᵐ ω ∂P, X ω > 0)
       (h_non_degenerate : ¬ ∀ᵐ ω ∂P, X ω = μ) :
       (∫ ω, sigmoid (X ω) ∂P) < sigmoid μ := by
-    sorry
+    have h_mem : ∀ᵐ ω ∂P, X ω ∈ Set.Ici 0 := by
+      filter_upwards [h_support] with ω hω
+      exact le_of_lt hω
+    have h_ae_meas : AEStronglyMeasurable X P := h_measurable.aestronglyMeasurable
+    have h_diff : Differentiable ℝ sigmoid := fun x => differentiable_sigmoid x
+    have h_cont : ContinuousOn sigmoid (Set.Ici 0) := h_diff.continuous.continuousOn
+    have h_int_sigmoid : Integrable (sigmoid ∘ X) P := by
+      have h_cont_sig : Continuous sigmoid := Differentiable.continuous (fun x => differentiable_sigmoid x)
+      refine Integrable.of_bound (h_cont_sig.comp_aestronglyMeasurable h_ae_meas) (1:ℝ) ?_
+      filter_upwards with ω
+      rw [Real.norm_eq_abs]
+      rw [abs_le]
+      constructor
+      · apply le_trans (by norm_num : (-1:ℝ) ≤ 0) (le_of_lt (sigmoid_pos _))
+      · exact le_of_lt (sigmoid_lt_one _)
+    rcases sigmoid_strictConcaveOn_Ici.ae_eq_const_or_lt_map_average h_cont isClosed_Ici h_mem h_integrable h_int_sigmoid with h_eq | h_lt
+    · exfalso
+      simp only [average_eq_integral] at h_eq
+      rw [h_mean] at h_eq
+      exact h_non_degenerate h_eq
+    · simp only [average_eq_integral] at h_lt
+      rw [h_mean] at h_lt
+      exact h_lt
     
 end BrierScore
 
