@@ -181,7 +181,7 @@ class MUSSEL:
         out_df.to_csv(sst_path, sep="\t", index=False)
         return sst_path
 
-    def fit(self, sim_id, out_prefix):
+    def fit(self, sim_id=None, sim_prefix=None, out_prefix=None):
         """
         Prepare MUSSEL inputs from sim{sim_id} and run the MUSSEL pipeline.
         Returns a model directory (PATH_out).
@@ -193,8 +193,18 @@ class MUSSEL:
         if not ldref_dir:
             raise RuntimeError("LD reference directory is required for MUSSEL.")
 
-        bfile_full = f"sim{sim_id}"
-        tsv_path = f"sim{sim_id}.tsv"
+        if sim_prefix:
+            prefix = sim_prefix
+        elif sim_id is not None:
+            prefix = f"sim{sim_id}"
+        else:
+            raise RuntimeError("MUSSEL requires sim_prefix or sim_id.")
+
+        if out_prefix is None:
+            raise RuntimeError("MUSSEL requires out_prefix.")
+
+        bfile_full = prefix
+        tsv_path = f"{prefix}.tsv"
         if not Path(f"{bfile_full}.bed").exists():
             raise RuntimeError(f"MUSSEL: full bfile not found: {bfile_full}.bed")
         if not Path(tsv_path).exists():

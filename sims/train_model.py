@@ -117,9 +117,8 @@ def train_and_score(sim_arg, method_name):
     elif method_name == 'MUSSEL':
         mussel = MUSSEL()
         sim_id = int(sim_arg) if str(sim_arg).isdigit() else None
-        if sim_id is None:
-            raise RuntimeError("MUSSEL currently requires a numeric sim id (1/2/3).")
-        path_out = mussel.fit(sim_id=sim_id, out_prefix=str(work_dir / "mussel"))
+        sim_prefix = sim_prefix
+        path_out = mussel.fit(sim_id=sim_id, sim_prefix=sim_prefix, out_prefix=str(work_dir / "mussel"))
         res = mussel.predict(path_out, str(work_dir / "mussel_pred"))
         scores = res
 
