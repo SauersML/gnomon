@@ -334,7 +334,11 @@ def main():
     # 2. Load Scores
     default_methods = ['BayesR', 'LDpred2', 'PRS-CSx']
     available_methods = sorted(p.stem for p in work_dir.glob("*.sscore"))
-    methods = available_methods if available_methods else default_methods
+    # Only evaluate known high-level methods; ignore intermediate artifacts.
+    known_methods = {'BayesR', 'BayesR-Mix', 'LDpred2', 'PRS-CSx', 'MUSSEL'}
+    methods = [m for m in available_methods if m in known_methods]
+    if not methods:
+        methods = default_methods
     print(f"Loading scores for: {methods}...")
     prs_scores_df = load_scores(work_dir, methods)
     
