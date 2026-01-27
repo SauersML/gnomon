@@ -117,6 +117,9 @@ jobs:
           path: |
             ${{ matrix.sim_name }}_work/
             ${{ matrix.sim_name }}.tsv
+            ${{ matrix.sim_name }}.bed
+            ${{ matrix.sim_name }}.bim
+            ${{ matrix.sim_name }}.fam
           if-no-files-found: error
           retention-days: 1
 
