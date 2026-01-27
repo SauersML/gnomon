@@ -260,25 +260,24 @@ jobs:
         with:
           r-version: '4.4.2'
 
-      - name: Install MUSSEL R dependencies
-        if: matrix.method == 'MUSSEL'
-        run: |
-          Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
-          Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
-          Rscript -e 'pkgs <- c("optparse","bigreadr","bigsnpr","bigstatsr","bigparallelr","bigmemory","stringr","caret","Rcpp","RcppArmadillo","RcppTN","inline","doMC","foreach","doParallel","data.table","readr","MASS","reshape","parallel","devtools","genio","dplyr","pryr","Matrix","lavaan","xtable","SuperLearner","glmnet","R.utils","R.oo","R.methodsS3","mvnfast","gdata","pROC","corpcor","DescTools","rstantools","rms"); install.packages(pkgs, repos="https://cloud.r-project.org", dependencies=c("Depends","Imports","LinkingTo")); missing <- pkgs[!sapply(pkgs, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing CRAN packages: ", paste(missing, collapse=", ")); quit(status=1)}'
-          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")} if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")} if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
-          Rscript -e 'bioc <- c("snpStats","genefilter","sva"); missing <- bioc[!sapply(bioc, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing Bioconductor packages: ", paste(missing, collapse=", ")); quit(status=1)}'
-
       - name: Clone MUSSEL repo
         if: matrix.method == 'MUSSEL'
         run: |
           git clone https://github.com/Jin93/MUSSEL.git
 
-      - name: Install MUSSEL R packages (auto-detect)
+      - name: Patch MUSSEL scripts to drop optional devtools
         if: matrix.method == 'MUSSEL'
         run: |
+          perl -pi -e 's/^.*library\\(devtools\\).*\\n//g; s/^.*suppressMessages\\(library\\(devtools\\)\\).*\\n//g' MUSSEL/R/*.R
+
+      - name: Install MUSSEL R dependencies (auto-detect)
+        if: matrix.method == 'MUSSEL'
+        run: |
+          Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
+          Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
+          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")} if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")} if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
           cat > /tmp/mussel_pkg_scan.R <<'RSCRIPT'
-          files <- Sys.glob("MUSSEL/R/*.R")
+          files <- c("MUSSEL/R/MUSS_jobs.R", "MUSSEL/R/MUSSEL.R")
           files <- files[file.exists(files)]
           if (length(files) == 0) {
             message("No MUSSEL R scripts found to scan; skipping auto-install.")
@@ -294,12 +293,13 @@ jobs:
           pkgs <- setdiff(pkgs, base)
           if (length(pkgs) > 0) {
             cat("Installing MUSSEL packages:", paste(pkgs, collapse = ", "), "\n")
-            install.packages(pkgs, repos = "https://cloud.r-project.org")
+            install.packages(pkgs, repos = "https://cloud.r-project.org", dependencies = c("Depends", "Imports", "LinkingTo"))
           } else {
             cat("No additional MUSSEL packages detected.\n")
           }
           RSCRIPT
           Rscript /tmp/mussel_pkg_scan.R
+          Rscript -e 'bioc <- c("snpStats","genefilter","sva"); missing <- bioc[!sapply(bioc, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing Bioconductor packages: ", paste(missing, collapse=", ")); quit(status=1)}'
 
       - name: Train & Score ${{ matrix.method }}
         run: |
