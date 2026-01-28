@@ -4087,10 +4087,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
-         rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := by admit -- Gaussian mean
-         rw [h_mean_P]
-         ring
+         have h_mean_P : ∫ x, x ∂μP = 0 := by
+           rw [ProbabilityTheory.integral_id_gaussianReal]
+         admit
 
       rw [h_term1_zero, h_term2_zero]
       simp
