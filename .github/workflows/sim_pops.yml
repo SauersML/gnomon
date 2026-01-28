@@ -271,11 +271,19 @@ jobs:
         run: |
           git clone https://github.com/Jin93/MUSSEL.git
 
+      - name: Remove unused devtools dependency (MUSSEL)
+        if: matrix.method == 'MUSSEL'
+        run: |
+          # MUSSEL scripts don't use devtools; drop the hard dependency to avoid install failures.
+          sed -i '/devtools/d' MUSSEL/R/*.R
+          if grep -R -n "devtools" MUSSEL/R; then
+            echo "devtools still referenced in MUSSEL scripts after patch." >&2
+            exit 1
+          fi
+
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
         run: |
-          Rscript -e 'install.packages("devtools", repos="https://cloud.r-project.org", dependencies=c("Depends","Imports","LinkingTo"))'
-          Rscript -e 'if (!requireNamespace("devtools", quietly=TRUE)) {message("Missing devtools after install"); quit(status=1)}'
           Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
           Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
           Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")}'
