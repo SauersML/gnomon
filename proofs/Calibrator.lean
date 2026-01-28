@@ -3990,10 +3990,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      apply MemLp.integrable_pow
+      apply ProbabilityTheory.memLp_id_gaussianReal (n : ℝ≥0)
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4076,7 +4077,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
-        have h_var : ∫ x, x^2 ∂μP = 1 := by admit -- Gaussian variance
+        have h_var : ∫ x, x^2 ∂μP = 1 := by
+          rw [← ProbabilityTheory.variance_eq_integral_sq_sub_integral_sq (fun x => x) μP]
+          · rw [ProbabilityTheory.integral_id_gaussianReal]
+            simp only [sub_zero]
+            rw [ProbabilityTheory.variance_id_gaussianReal]
+          · exact h_gauss_moments 2
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4088,7 +4094,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
          rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := by admit -- Gaussian mean
+         have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
          rw [h_mean_P]
          ring
 
@@ -5722,10 +5728,27 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  unfold sigmoid
+  convert deriv_div (differentiableAt_const (1:ℝ) (x := x)) ?_ ?_ using 1
+  · simp only [deriv_add, deriv_const, deriv_exp, deriv_neg, deriv_id, mul_neg, mul_one, zero_mul, sub_zero, zero_sub, neg_mul]
+    have h_pos : 0 < 1 + Real.exp (-x) := by
+      have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+      linarith
+    field_simp
+    ring
+  · apply DifferentiableAt.add (differentiableAt_const _)
+    apply DifferentiableAt.exp
+    exact DifferentiableAt.neg differentiableAt_id
+  · have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_deriv : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := funext deriv_sigmoid
+  rw [h_deriv]
+  simp only [deriv_mul, deriv_sub, deriv_const, deriv_sigmoid]
+  ring
+  · exact differentiable_sigmoid x
+  · apply DifferentiableAt.sub (differentiableAt_const _) (differentiable_sigmoid x)
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
