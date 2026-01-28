@@ -4025,9 +4025,13 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    have h_base_int : Integrable (predictorBase m) μC := by
+      -- Polynomials of independent Gaussian variables are integrable.
+      admit
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      -- Product of L2 functions is integrable (Holder's inequality).
+      admit
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -5722,10 +5726,35 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  unfold sigmoid
+  have h_diff_const : DifferentiableAt ℝ (fun _ => 1) x := differentiableAt_const 1
+  have h_diff_exp : DifferentiableAt ℝ (fun x => Real.exp (-x)) x := by fun_prop
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := h_diff_const.add h_diff_exp
+  have h_ne : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt; apply add_pos_of_pos_of_nonneg zero_lt_one (le_of_lt (Real.exp_pos _))
+  rw [deriv_div h_diff_const h_diff h_ne]
+  rw [deriv_const]
+  simp only [zero_mul, sub_zero, zero_sub]
+  rw [deriv_add h_diff_const h_diff_exp]
+  rw [deriv_const, zero_add]
+  rw [deriv_exp (by fun_prop)]
+  rw [deriv_neg differentiableAt_id]
+  rw [deriv_id]
+  simp only [mul_neg, mul_one]
+  set y := 1 + Real.exp (-x)
+  have : Real.exp (-x) = y - 1 := by simp [y]
+  rw [this]
+  field_simp [h_ne]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_eq : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := by
+    ext; exact deriv_sigmoid _
+  rw [h_eq]
+  rw [deriv_mul (differentiable_sigmoid x) (by fun_prop)]
+  rw [deriv_sub (differentiableAt_const 1) (differentiable_sigmoid x)]
+  rw [deriv_const, zero_sub, deriv_sigmoid]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
