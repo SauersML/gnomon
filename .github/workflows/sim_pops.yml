@@ -266,21 +266,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
-      - name: Clone MUSSEL repo
-        if: matrix.method == 'MUSSEL'
-        run: |
-          git clone https://github.com/Jin93/MUSSEL.git
-
-      - name: Patch MUSSEL scripts to drop optional devtools
-        if: matrix.method == 'MUSSEL'
-        run: |
-          # Strip any devtools usage to avoid heavy dependency chain
-          perl -pi -e 's/^.*devtools.*\\n//g' MUSSEL/R/*.R
-          if grep -R -n "devtools" MUSSEL/R; then
-            echo "devtools still referenced in MUSSEL scripts after patch." >&2
-            exit 1
-          fi
-
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
         run: |
