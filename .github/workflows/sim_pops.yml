@@ -275,7 +275,13 @@ jobs:
         if: matrix.method == 'MUSSEL'
         run: |
           # MUSSEL scripts don't use devtools; drop the hard dependency to avoid install failures.
-          sed -i '/devtools/d' MUSSEL/R/*.R
+          python - <<'PY'
+          from pathlib import Path
+          for path in Path("MUSSEL/R").glob("*.R"):
+              lines = path.read_text().splitlines()
+              kept = [ln for ln in lines if "devtools" not in ln]
+              path.write_text("\n".join(kept) + "\n")
+          PY
           if grep -R -n "devtools" MUSSEL/R; then
             echo "devtools still referenced in MUSSEL scripts after patch." >&2
             exit 1
