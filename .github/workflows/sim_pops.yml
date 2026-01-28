@@ -275,6 +275,7 @@ jobs:
         if: matrix.method == 'MUSSEL'
         run: |
           Rscript -e 'install.packages("devtools", repos="https://cloud.r-project.org", dependencies=c("Depends","Imports","LinkingTo"))'
+          Rscript -e 'if (!requireNamespace("devtools", quietly=TRUE)) {message("Missing devtools after install"); quit(status=1)}'
           Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
           Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
           Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")}'
