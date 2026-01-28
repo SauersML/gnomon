@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -3990,14 +3991,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments
+    -- Helper for moments (admitted for now to unblock)
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      -- Gaussian moments exist for all n. We use MemLp for all p.
-      -- Since id ∈ Lp for all p, id^n ∈ L1 (by choosing p=n).
-      -- MemLp id n implies Integrable (id^n).
-      -- Proof sketch: apply MemLp.integrable_pow
-      admit
+      admit -- Standard Gaussian moments exist
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4081,7 +4078,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- variance id = E[id^2] - (E[id])^2 = 1. E[id] = 0. So E[id^2] = 1.
+          -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
+          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
           admit
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
@@ -4094,7 +4092,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
          rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal
+         have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
          rw [h_mean_P]
          ring
 
@@ -5728,7 +5726,6 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  unfold sigmoid
   have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := by
     apply DifferentiableAt.add
     · exact differentiableAt_const _
@@ -5738,29 +5735,29 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     apply ne_of_gt
     have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
-  convert deriv_div (differentiableAt_const (1:ℝ)) h_diff h_ne using 1
-  rw [deriv_const, zero_mul, zero_sub, one_mul]
-  have h_deriv_denom : deriv (fun x => 1 + Real.exp (-x)) x = -Real.exp (-x) := by
-    simp only [deriv_const_add']
-    have h_eq : (fun x => Real.exp (-x)) = Real.exp ∘ Neg.neg := rfl
-    rw [h_eq]
-    rw [deriv_comp x (h := Neg.neg) (h₂ := Real.exp) Real.differentiableAt_exp differentiableAt_id.neg]
-    simp
-  rw [h_deriv_denom]
+  unfold sigmoid
+  simp only [one_div]
+  apply HasDerivAt.deriv
+  convert HasDerivAt.inv (c := fun x => 1 + Real.exp (-x)) (by
+      apply HasDerivAt.add
+      · apply hasDerivAt_const
+      · apply HasDerivAt.exp
+        apply HasDerivAt.neg
+        apply hasDerivAt_id
+    ) h_ne using 1
   field_simp [h_ne]
   ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
   have h_eq : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := by
-    funext y
-    exact deriv_sigmoid y
+    ext y; rw [deriv_sigmoid]
   rw [h_eq]
-  change deriv (sigmoid * ((fun _ => 1) - sigmoid)) x = _
-  rw [deriv_mul (differentiable_sigmoid x) (DifferentiableAt.sub (differentiableAt_const _) (differentiable_sigmoid x))]
-  rw [deriv_sub (differentiableAt_const _) (differentiable_sigmoid x)]
-  rw [deriv_const, zero_sub, deriv_sigmoid]
-  dsimp
-  ring
+  apply HasDerivAt.deriv
+  have h_has_deriv_sig : HasDerivAt sigmoid (sigmoid x * (1 - sigmoid x)) x := by
+    rw [← deriv_sigmoid]
+    exact DifferentiableAt.hasDerivAt (differentiable_sigmoid x)
+  convert HasDerivAt.mul h_has_deriv_sig (HasDerivAt.sub (hasDerivAt_const x (1:ℝ)) h_has_deriv_sig) using 1
+  simp; ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
