@@ -274,7 +274,12 @@ jobs:
       - name: Patch MUSSEL scripts to drop optional devtools
         if: matrix.method == 'MUSSEL'
         run: |
-          perl -pi -e 's/^.*library\\(devtools\\).*\\n//g; s/^.*suppressMessages\\(library\\(devtools\\)\\).*\\n//g' MUSSEL/R/*.R
+          # Strip any devtools usage to avoid heavy dependency chain
+          perl -pi -e 's/^.*devtools.*\\n//g' MUSSEL/R/*.R
+          if rg -n "devtools" MUSSEL/R; then
+            echo "devtools still referenced in MUSSEL scripts after patch." >&2
+            exit 1
+          fi
 
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
