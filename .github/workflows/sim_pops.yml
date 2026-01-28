@@ -264,7 +264,7 @@ jobs:
         if: matrix.method == 'MUSSEL'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev libssh2-1-dev pkg-config
 
       - name: Clone MUSSEL repo
         if: matrix.method == 'MUSSEL'
@@ -274,7 +274,8 @@ jobs:
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
         run: |
-          Rscript -e 'install.packages("devtools", repos="https://cloud.r-project.org", dependencies=c("Depends","Imports","LinkingTo"))'
+          Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
+          Rscript -e 'pak::pkg_install("devtools")'
           Rscript -e 'if (!requireNamespace("devtools", quietly=TRUE)) {message("Missing devtools after install"); quit(status=1)}'
           Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
           Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
