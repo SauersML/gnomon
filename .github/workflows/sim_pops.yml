@@ -266,6 +266,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
+      - name: Clone MUSSEL repo
+        if: matrix.method == 'MUSSEL'
+        run: |
+          git clone https://github.com/Jin93/MUSSEL.git
+
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
         run: |
