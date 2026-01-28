@@ -3993,7 +3993,22 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Helper for moments (admitted for now to unblock)
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      cases n with
+      | zero =>
+        simp only [pow_zero]
+        exact integrable_const 1
+      | succ n =>
+        let p : ℝ≥0 := n.succ
+        have hp : p ≠ 0 := Nat.cast_ne_zero.mpr (Nat.succ_ne_zero n)
+        have h_mem := memLp_id_gaussianReal p
+        convert (h_mem.pow n.succ).integrable
+        · simp [p]
+          have : (n.succ : ℝ≥0∞) / n.succ = 1 := by
+             rw [ENNReal.div_self]
+             · simp [p]; exact hp
+             · simp
+          rw [this]
+        · ext x; simp
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4076,7 +4091,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
-        have h_var : ∫ x, x^2 ∂μP = 1 := by admit -- Gaussian variance
+        have h_var : ∫ x, x^2 ∂μP = 1 := by
+          have h_v := variance_id_gaussianReal (μ := 0) (v := 1)
+          rw [variance_eq_integral_sq_sub_integral_sq (h_gauss_moments 1).aestronglyMeasurable (h_gauss_moments 2)] at h_v
+          rw [integral_id_gaussianReal, sub_zero] at h_v
+          exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4088,7 +4107,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
          rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := by admit -- Gaussian mean
+         have h_mean_P : ∫ x, x ∂μP = 0 := by
+           rw [integral_id_gaussianReal]
          rw [h_mean_P]
          ring
 
@@ -5722,10 +5742,35 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  unfold sigmoid
+  have h_denom_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := by
+    apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      exact differentiableAt_id.neg
+  have h_denom_ne : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    have : Real.exp (-x) > 0 := Real.exp_pos (-x)
+    linarith
+  rw [deriv_one_div h_denom_diff h_denom_ne]
+  rw [deriv_add (differentiableAt_const _) (differentiableAt_exp.comp (differentiableAt_id.neg))]
+  rw [deriv_const, zero_add]
+  rw [deriv_exp (differentiableAt_id.neg)]
+  rw [deriv_neg, deriv_id]
+  field_simp [h_denom_ne]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  have h_deriv_eq : deriv sigmoid = fun x => sigmoid x * (1 - sigmoid x) := funext deriv_sigmoid
+  rw [h_deriv_eq]
+  have h_diff_sig : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  have h_diff_one_sub : DifferentiableAt ℝ (fun x => 1 - sigmoid x) x :=
+    (differentiableAt_const 1).sub h_diff_sig
+  rw [deriv_mul h_diff_sig h_diff_one_sub]
+  rw [deriv_sub (differentiableAt_const 1) h_diff_sig]
+  rw [deriv_const, zero_sub]
+  rw [deriv_sigmoid x]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
