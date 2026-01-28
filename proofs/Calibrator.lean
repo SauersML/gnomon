@@ -3998,16 +3998,14 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         simp only [pow_zero]
         exact integrable_const 1
       | succ n =>
-        let p : ℝ≥0 := (n.succ : ℕ)
-        have hp : p ≠ 0 := Nat.cast_ne_zero.mpr (Nat.succ_ne_zero n)
-        have h_mem := memLp_id_gaussianReal p
+        have h_mem := ProbabilityTheory.memLp_id_gaussianReal (p := (n.succ : ℝ≥0∞))
         convert (h_mem.pow n.succ).integrable
-        · simp [p]
+        · simp only [ENNReal.rpow_nat_cast]
           have : (n.succ : ℝ≥0∞) / n.succ = 1 := by
              rw [ENNReal.div_self]
-             · simp [p]; exact hp
-             · simp
-          rw [this]
+             · exact ENNReal.natCast_ne_zero.mpr (Nat.succ_ne_zero n)
+             · exact ENNReal.natCast_ne_top _
+          rw [this, ENNReal.rpow_one]
         · ext x; simp
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
@@ -5839,7 +5837,7 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
   rw [one_div]
-  rw [deriv_inv h_denom_diff h_denom_ne]
+  rw [deriv_inv' h_denom_diff h_denom_ne]
   rw [deriv_add (differentiableAt_const _) (differentiableAt_exp.comp (differentiableAt_id.neg))]
   rw [deriv_const, zero_add]
   rw [deriv_exp (differentiableAt_id.neg)]
@@ -5853,7 +5851,10 @@ lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigm
   have h_diff_sig : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
   have h_diff_one_sub : DifferentiableAt ℝ (fun x => 1 - sigmoid x) x :=
     (differentiableAt_const 1).sub h_diff_sig
-  simp only [deriv_mul h_diff_sig h_diff_one_sub, deriv_sub (differentiableAt_const 1) h_diff_sig, deriv_const, zero_sub, deriv_sigmoid x]
+  rw [deriv_mul h_diff_sig h_diff_one_sub]
+  rw [deriv_sub (differentiableAt_const 1) h_diff_sig]
+  rw [deriv_const, zero_sub]
+  rw [deriv_sigmoid x]
   ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
