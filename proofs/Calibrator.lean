@@ -3998,7 +3998,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         simp only [pow_zero]
         exact integrable_const 1
       | succ n =>
-        let p : ℝ≥0 := n.succ
+        let p : ℝ≥0 := (n.succ : ℕ)
         have hp : p ≠ 0 := Nat.cast_ne_zero.mpr (Nat.succ_ne_zero n)
         have h_mem := memLp_id_gaussianReal p
         convert (h_mem.pow n.succ).integrable
@@ -5752,7 +5752,8 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     apply ne_of_gt
     have : Real.exp (-x) > 0 := Real.exp_pos (-x)
     linarith
-  rw [deriv_one_div h_denom_diff h_denom_ne]
+  rw [inv_eq_one_div]
+  rw [deriv_inv h_denom_diff h_denom_ne]
   rw [deriv_add (differentiableAt_const _) (differentiableAt_exp.comp (differentiableAt_id.neg))]
   rw [deriv_const, zero_add]
   rw [deriv_exp (differentiableAt_id.neg)]
