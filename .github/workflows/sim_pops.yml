@@ -260,6 +260,12 @@ jobs:
         with:
           r-version: '4.4.2'
 
+      - name: Install system dependencies (MUSSEL)
+        if: matrix.method == 'MUSSEL'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
       - name: Clone MUSSEL repo
         if: matrix.method == 'MUSSEL'
         run: |
@@ -275,7 +281,9 @@ jobs:
         run: |
           Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
           Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
-          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")} if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")} if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
+          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")}'
+          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")}'
+          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
           cat > /tmp/mussel_pkg_scan.R <<'RSCRIPT'
           files <- c("MUSSEL/R/MUSS_jobs.R", "MUSSEL/R/MUSSEL.R")
           files <- files[file.exists(files)]
