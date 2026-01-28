@@ -276,7 +276,7 @@ jobs:
         run: |
           # Strip any devtools usage to avoid heavy dependency chain
           perl -pi -e 's/^.*devtools.*\\n//g' MUSSEL/R/*.R
-          if rg -n "devtools" MUSSEL/R; then
+          if grep -R -n "devtools" MUSSEL/R; then
             echo "devtools still referenced in MUSSEL scripts after patch." >&2
             exit 1
           fi
