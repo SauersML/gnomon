@@ -292,7 +292,7 @@ jobs:
                           out.append("}")
                           injected = True
                   if injected:
-                      path.write_text(\"\\n\".join(out) + \"\\n\")
+                      path.write_text("\n".join(out) + "\n")
           PY
 
       - name: Install MUSSEL R dependencies (auto-detect)
