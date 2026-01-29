@@ -1,5 +1,6 @@
 import Mathlib.Tactic
 import Mathlib.Analysis.Calculus.Deriv.Basic
+import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
 import Mathlib.Analysis.Convex.Jensen
 import Mathlib.Analysis.Convex.SpecificFunctions.Basic
@@ -3990,10 +3991,32 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      cases n with
+      | zero =>
+        simp only [pow_zero, integrable_const]
+      | succ n =>
+        let p : ℝ≥0 := ⟨(n.succ : ℝ), by norm_num⟩
+        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal p
+        have h_pow : MemLp (fun x => |x| ^ (n.succ : ℝ)) 1 μP := by
+          let r := (n.succ : ℝ)
+          have hr : 0 < r := by norm_num
+          have h_mem_rpow := MemLp.norm_rpow h_mem r hr
+          -- p / r = 1
+          have h_idx : (p : ℝ≥0∞) / ENNReal.ofReal r = 1 := by
+             simp [p, r]
+             rw [ENNReal.ofReal_coe_nnreal]
+             rw [ENNReal.div_self]
+             · simp; norm_num
+             · simp; norm_num
+          rwa [h_idx] at h_mem_rpow
+        rw [integrable_iff_integrable_norm]
+        apply (MemLp.integrable one_le_one h_pow).congr
+        filter_upwards with x
+        simp only [Real.norm_eq_abs, abs_pow]
+        norm_cast
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4025,9 +4048,76 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    have h_base_memLp : MemLp (predictorBase m) 2 μC := by
+      -- Base = Pred - Slope*P.
+      -- Pred is L2 (h_norm_int). Slope*P is L2.
+      have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+        rw [memLp_two_iff_integrable_sq]
+        · exact h_norm_int
+        · admit -- measurability
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+      have h_slope_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => m.γₘ₀ 0 * pc.1) 2 (stdNormalProdMeasure k) := by
+        -- Constant * P. P is L2.
+        have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+           unfold stdNormalProdMeasure
+           have h_gauss_2 := h_gauss_moments 2
+           rw [memLp_two_iff_integrable_sq]
+           · -- ∫ p^2
+             refine MeasureTheory.Integrable.congr ?_ (ae_of_all _ (fun pc => (by ring : (pc.1 : ℝ)^2 = pc.1^2)))
+             rw [MeasureTheory.integral_prod_mul (fun x => x^2) (fun _ => 1)]
+             · simp; exact h_gauss_2
+             · exact h_gauss_2
+             · exact integrable_const 1
+           · exact measurable_fst.aemeasurable
+        exact h_P_L2.const_mul _
+
+      -- Base (lifted) = Pred - Slope*P
+      let base_lift := fun pc : ℝ × (Fin k → ℝ) => predictorBase m pc.2
+      have h_decomp : ∀ pc, linearPredictor m pc.1 pc.2 = base_lift pc + m.γₘ₀ 0 * pc.1 := by
+        intro pc
+        rw [linearPredictor_decomp m h_linear_basis.1]
+        -- Slope is constant for normalized model
+        have h_slope : predictorSlope m pc.2 = m.γₘ₀ 0 := by
+           unfold predictorSlope
+           simp [evalSmooth, hm_norm.fₘₗ_zero]
+        rw [h_slope]
+        rfl
+
+      have h_base_lift_L2 : MemLp base_lift 2 (stdNormalProdMeasure k) := by
+        have h_eq : base_lift = fun pc => linearPredictor m pc.1 pc.2 - m.γₘ₀ 0 * pc.1 := by
+           ext pc
+           rw [h_decomp pc]
+           ring
+        rw [h_eq]
+        exact h_pred_L2.sub h_slope_P_L2
+
+      -- Now descend to μC.
+      -- ||base_lift||_2^2 = ∫ (Base c)^2 dμ = ∫ (Base c)^2 dμC * ∫ 1 dμP = ||Base||_2^2
+      rw [memLp_two_iff_integrable_sq] at h_base_lift_L2 ⊢
+      · -- Lift integral is same as marginal integral
+        unfold stdNormalProdMeasure at h_base_lift_L2
+        rw [MeasureTheory.integral_prod_mul (fun _ => 1) (fun c => (predictorBase m c)^2)] at h_base_lift_L2
+        · simp at h_base_lift_L2; exact h_base_lift_L2
+        · exact integrable_const 1
+        · -- Need integrability of Base^2?
+          -- We know product 1 * Base^2 is integrable (h_base_lift_L2).
+          -- So Base^2 is integrable.
+          rw [memLp_two_iff_integrable_sq] at h_base_lift_L2
+          exact h_base_lift_L2.2
+          admit
+      · admit -- measurability
+      · admit -- measurability
+
+    have h_base_int : Integrable (predictorBase m) μC := by
+      apply MemLp.integrable one_le_two h_base_memLp
+
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      have h_Sm1_memLp : MemLp (fun c => scaling_func c - 1) 2 μC := by
+         have h_S_memLp : MemLp scaling_func 2 μC := by
+            rw [memLp_two_iff_integrable_sq h_scaling_meas']
+            exact h_scaling_sq_int'
+         exact h_S_memLp.sub (MemLp.const 1)
+      exact MemLp.integrable_mul h_Sm1_memLp h_base_memLp
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4121,13 +4211,72 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
          ring
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+        -- (P - Pred)^2.
+        -- P is L2. Pred is L2. Diff is L2. Square is L1.
+        have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+           unfold stdNormalProdMeasure
+           rw [memLp_two_iff_integrable_sq measurable_fst.aemeasurable]
+           -- Integral of p^2 against product measure
+           convert h_gauss_moments 2 using 1
+           -- need to show integral matches
+           rw [MeasureTheory.integral_prod_mul (fun x => x^2) (fun _ => 1)]
+           · simp
+           · exact h_gauss_moments 2
+           · exact integrable_const 1
+        have h_pred_L2 : MemLp (fun pc => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+           rw [memLp_two_iff_integrable_sq]
+           · exact h_norm_int
+           · admit -- measurability
+        have h_diff_L2 := h_P_L2.sub h_pred_L2
+        rw [← memLp_two_iff_integrable_sq] at h_diff_L2
+        · exact h_diff_L2.2
+        · admit -- measurability
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
+      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+        -- Product of (S-1)P and (P-Pred).
+        have h_Sm1P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) := by
+           rw [memLp_two_iff_integrable_sq]
+           · unfold stdNormalProdMeasure
+             rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => (scaling_func c - 1)^2)]
+             · apply Integrable.mul_const
+               exact h_gauss_moments 2
+             · exact h_gauss_moments 2
+             · -- (S-1)^2 is integrable
+               have h_Sm1_L2 : MemLp (fun c => scaling_func c - 1) 2 μC := by
+                  have h_S : MemLp scaling_func 2 μC := by rw [memLp_two_iff_integrable_sq h_scaling_meas']; exact h_scaling_sq_int'
+                  exact h_S.sub (MemLp.const 1)
+               rw [memLp_two_iff_integrable_sq] at h_Sm1_L2
+               exact h_Sm1_L2.2
+               exact h_Sm1_L2.1
+           · admit -- measurability
 
-      -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
+        have h_diff_L2 : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+           have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+              unfold stdNormalProdMeasure
+              rw [memLp_two_iff_integrable_sq measurable_fst.aemeasurable]
+              convert h_gauss_moments 2 using 1
+              rw [MeasureTheory.integral_prod_mul (fun x => x^2) (fun _ => 1)]
+              · simp
+              · exact h_gauss_moments 2
+              · exact integrable_const 1
+           have h_pred_L2 : MemLp (fun pc => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+              rw [memLp_two_iff_integrable_sq]
+              · exact h_norm_int
+              · admit -- measurability
+           exact h_P_L2.sub h_pred_L2
+
+        exact MemLp.integrable_mul h_Sm1P_L2 h_diff_L2
+
+      -- Combine integrals
+      rw [integral_add]
+      · rw [integral_add]
+        · rw [integral_mul_left]
+          simp
+        · exact h_A_sq_int
+        · exact h_B_sq_int
+      · exact h_A_sq_int.add h_B_sq_int
+      · exact h_cross_int.const_mul 2
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -5722,10 +5871,52 @@ lemma differentiable_sigmoid (x : ℝ) : DifferentiableAt ℝ sigmoid x := by
     linarith
 
 lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) := by
-  admit
+  have h1 : 1 + Real.exp (-x) ≠ 0 := by
+    apply ne_of_gt
+    apply add_pos_of_pos_of_nonneg zero_lt_one
+    apply le_of_lt (Real.exp_pos _)
+
+  have h_diff : DifferentiableAt ℝ (fun x => 1 + Real.exp (-x)) x := by
+    apply DifferentiableAt.add
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      exact differentiableAt_neg (differentiableAt_id)
+
+  rw [sigmoid]
+  rw [one_div]
+  rw [deriv_inv'' h_diff h1]
+  rw [deriv_add]
+  · rw [deriv_const, zero_add]
+    rw [deriv_exp]
+    · rw [deriv_neg, deriv_id]
+      simp only [mul_neg, mul_one]
+      -- Goal: - - exp(-x) / (1+exp(-x))^2 = ...
+      have h_rhs : (1 + Real.exp (-x))⁻¹ * (1 - (1 + Real.exp (-x))⁻¹) =
+                    Real.exp (-x) * ((1 + Real.exp (-x)) ^ 2)⁻¹ := by
+            field_simp [h1]
+            ring
+      rw [h_rhs]
+      field_simp [h1]
+      ring
+    · exact differentiableAt_neg (differentiableAt_id)
+  · exact differentiableAt_const _
+  · apply DifferentiableAt.exp
+    exact differentiableAt_neg (differentiableAt_id)
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  admit
+  rw [deriv_sigmoid]
+  have h_diff_sig : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
+  have h_diff_one_minus : DifferentiableAt ℝ (fun x => 1 - sigmoid x) x := by
+    apply DifferentiableAt.sub
+    · exact differentiableAt_const _
+    · exact h_diff_sig
+  rw [deriv_mul h_diff_sig h_diff_one_minus]
+  rw [deriv_sub]
+  · rw [deriv_const, zero_sub]
+    rw [deriv_sigmoid]
+    ring
+  · exact differentiableAt_const _
+  · exact h_diff_sig
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
