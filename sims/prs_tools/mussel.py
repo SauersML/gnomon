@@ -456,7 +456,6 @@ class MUSSEL:
                 "--PATH_package", self.mussel_path,
                 "--PATH_out", str(path_out),
                 "--PATH_plink", str(path_plink),
-                "--FILE_sst", sst_arg,
                 "--pop", pop_arg,
                 "--target_pop", target_pop,
                 "--chrom", chrom_arg,
