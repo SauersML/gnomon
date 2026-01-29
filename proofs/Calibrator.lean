@@ -3998,14 +3998,20 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       cases n with
       | zero => simp [pow_zero, integrable_const]
       | succ n =>
-        have h_meas : AEStronglyMeasurable (fun x : ℝ => x ^ n.succ) μP :=
-          (MeasureTheory.Measurable.pow measurable_id n.succ).aestronglyMeasurable
-        rw [← memLp_one_iff_integrable]
-        convert (MemLp.norm_rpow (f := id) (r := n.succ) (p := 1) measurable_id.aestronglyMeasurable).mpr ?_
-        · ext x; simp [Real.norm_eq_abs, abs_pow]
-        · simp only [one_mul]
-          apply ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0∞)
-          exact ENNReal.coe_ne_top
+        rw [integrable_iff_integrable_norm]
+        have h_abs_eq : (fun x => ‖x ^ n.succ‖) = (fun x => |x| ^ n.succ) := by
+          ext; simp [Real.norm_eq_abs, abs_pow]
+        rw [h_abs_eq]
+        have h_mem : MemLp id (n.succ : ℝ≥0∞) μP :=
+          ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0∞)
+        have h_mem_pow : MemLp (fun x => |x| ^ n.succ) 1 μP := by
+          have h_rpow := MemLp.norm_rpow h_mem (n.succ : ℝ) (by exact_mod_cast Nat.succ_pos n)
+          convert h_rpow using 2
+          simp only [ENNReal.coe_natCast]
+          rw [ENNReal.div_self]
+          · simp only [ENNReal.coe_natCast, ne_eq, Nat.cast_eq_zero, Nat.succ_ne_zero, not_false_eq_true]
+          · simp only [ENNReal.coe_natCast, ne_eq, ENNReal.natCast_ne_top, not_false_eq_true]
+        exact MemLp.integrable one_le_one h_mem_pow
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -5864,10 +5870,11 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     · exact differentiableAt_const _
     · apply DifferentiableAt.exp
       exact DifferentiableAt.neg (differentiableAt_id)
-  rw [deriv_div (differentiableAt_const _) h_diff_denom h_denom]
-  simp only [deriv_const, deriv_add, deriv_exp, deriv_neg, deriv_id, zero_mul, zero_sub, mul_neg, mul_one]
+  rw [deriv_inv h_diff_denom h_denom]
+  simp only [deriv_add, deriv_const, deriv_exp, deriv_neg, deriv_id, zero_add, mul_neg, mul_one]
   rw [neg_neg]
-  field_simp
+  -- Goal: exp(-x) / (1 + exp(-x))^2 = (1 / (1 + exp(-x))) * (1 - 1 / (1 + exp(-x)))
+  field_simp [h_denom]
   ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
@@ -5876,11 +5883,9 @@ lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigm
     ext y
     rw [deriv_sigmoid]
   rw [h_eq]
-  rw [deriv_mul h_diff (DifferentiableAt.const_sub h_diff _)]
-  rw [deriv_sub, deriv_const, zero_sub, deriv_sigmoid]
+  rw [deriv_mul h_diff (DifferentiableAt.const_sub h_diff (1:ℝ))]
+  rw [deriv_sub (differentiableAt_const _) h_diff, deriv_const, zero_sub, deriv_sigmoid]
   ring
-  · exact differentiableAt_const _
-  · exact h_diff
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
