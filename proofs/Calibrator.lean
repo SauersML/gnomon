@@ -3998,10 +3998,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       cases n with
       | zero => simp [pow_zero, integrable_const]
       | succ n =>
-        rw [integrable_iff_integrable_norm]
-        have h_abs_eq : (fun x => ‖x ^ n.succ‖) = (fun x => |x| ^ n.succ) := by
-          ext; simp [Real.norm_eq_abs, abs_pow]
-        rw [h_abs_eq]
         have h_mem : MemLp id (n.succ : ℝ≥0∞) μP :=
           ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0∞)
         have h_mem_pow : MemLp (fun x => |x| ^ n.succ) 1 μP := by
@@ -4011,6 +4007,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           rw [ENNReal.div_self]
           · simp only [ENNReal.coe_natCast, ne_eq, Nat.cast_eq_zero, Nat.succ_ne_zero, not_false_eq_true]
           · simp only [ENNReal.coe_natCast, ne_eq, ENNReal.natCast_ne_top, not_false_eq_true]
+        rw [integrable_norm_iff (measurable_id.pow n.succ).aestronglyMeasurable]
+        have h_abs_eq : (fun x => ‖x ^ n.succ‖) = (fun x => |x| ^ n.succ) := by
+          ext; simp [Real.norm_eq_abs, abs_pow]
+        rw [h_abs_eq]
         exact MemLp.integrable one_le_one h_mem_pow
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
@@ -5870,7 +5870,8 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     · exact differentiableAt_const _
     · apply DifferentiableAt.exp
       exact DifferentiableAt.neg (differentiableAt_id)
-  rw [deriv_inv h_diff_denom h_denom]
+  simp only [sigmoid]
+  rw [deriv_inv'' h_diff_denom h_denom]
   simp only [deriv_add, deriv_const, deriv_exp, deriv_neg, deriv_id, zero_add, mul_neg, mul_one]
   rw [neg_neg]
   -- Goal: exp(-x) / (1 + exp(-x))^2 = (1 / (1 + exp(-x))) * (1 - 1 / (1 + exp(-x)))
@@ -5883,8 +5884,8 @@ lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigm
     ext y
     rw [deriv_sigmoid]
   rw [h_eq]
-  rw [deriv_mul h_diff (DifferentiableAt.const_sub h_diff (1:ℝ))]
-  rw [deriv_sub (differentiableAt_const _) h_diff, deriv_const, zero_sub, deriv_sigmoid]
+  simp only [deriv_mul h_diff (DifferentiableAt.const_sub h_diff (1:ℝ))]
+  simp only [deriv_sub (differentiableAt_const _) h_diff, deriv_const, zero_sub, deriv_sigmoid]
   ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
