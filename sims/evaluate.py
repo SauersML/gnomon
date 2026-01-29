@@ -59,7 +59,7 @@ def load_scores(work_dir, methods):
 
     return pd.DataFrame(scores_dict)
 
-def plot_roc_curves(methods_results, sim_id):
+def plot_roc_curves(methods_results, sim_label):
     """Plot ROC curves."""
     from sklearn.metrics import roc_curve
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -73,13 +73,13 @@ def plot_roc_curves(methods_results, sim_id):
         ax.plot(fpr, tpr, label=f"{method_name} (AUC={auc:.3f})", color=color, linewidth=2)
     
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Random')
-    ax.set_title(f'ROC Curves - Simulation {sim_id}', fontsize=14, fontweight='bold')
+    ax.set_title(f'ROC Curves - Simulation {sim_label}', fontsize=14, fontweight='bold')
     ax.legend(loc='lower right')
     ax.grid(True, alpha=0.3)
-    plt.savefig(f'sim{sim_id}_comparison_roc.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{sim_label}_comparison_roc.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-def plot_calibration_curves(methods_results, sim_id):
+def plot_calibration_curves(methods_results, sim_label):
     """Plot calibration curves."""
     fig, ax = plt.subplots(figsize=(10, 8))
     colors = plt.cm.tab10(np.linspace(0, 1, len(methods_results)))
@@ -92,13 +92,13 @@ def plot_calibration_curves(methods_results, sim_id):
         ax.plot(predicted[mask], observed[mask], 'o-', label=method_name, color=color, linewidth=2)
     
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_title(f'Calibration Curves - Simulation {sim_id}', fontsize=14, fontweight='bold')
+    ax.set_title(f'Calibration Curves - Simulation {sim_label}', fontsize=14, fontweight='bold')
     ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
-    plt.savefig(f'sim{sim_id}_comparison_calibration.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'{sim_label}_comparison_calibration.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-def create_metrics_table(methods_results, sim_id):
+def create_metrics_table(methods_results, sim_label):
     """Create metrics table."""
     rows = []
     for method_name, result in methods_results.items():
@@ -115,7 +115,7 @@ def create_metrics_table(methods_results, sim_id):
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    df.to_csv(f'sim{sim_id}_metrics.csv', index=False)
+    df.to_csv(f'{sim_label}_metrics.csv', index=False)
     return df
 
 def delong_test(y_true, y_pred1, y_pred2):
@@ -239,7 +239,7 @@ def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def compute_significance_tests(methods_results, sim_id):
+def compute_significance_tests(methods_results, sim_label):
     """
     Compute pairwise significance tests for all method comparisons.
 
@@ -290,7 +290,7 @@ def compute_significance_tests(methods_results, sim_id):
         })
 
     df = pd.DataFrame(rows)
-    df.to_csv(f'sim{sim_id}_significance_tests.csv', index=False)
+    df.to_csv(f'{sim_label}_significance_tests.csv', index=False)
     return df
 
 def main():
@@ -336,7 +336,7 @@ def main():
     default_methods = ['BayesR', 'LDpred2', 'PRS-CSx']
     available_methods = sorted(p.stem for p in work_dir.glob("*.sscore"))
     # Only evaluate known high-level methods; ignore intermediate artifacts.
-    known_methods = {'BayesR', 'BayesR-Mix', 'LDpred2', 'PRS-CSx', 'MUSSEL'}
+    known_methods = {'BayesR', 'BayesR-Mix', 'LDpred2', 'PRS-CSx'}
     methods = [m for m in available_methods if m in known_methods]
     if not methods:
         methods = default_methods
@@ -406,14 +406,14 @@ def main():
         
     # 4. Plots and Table
     print("Generating plots and tables...")
-    plot_roc_curves(results, sim_id)
-    plot_calibration_curves(results, sim_id)
-    df_metrics = create_metrics_table(results, sim_id)
+    plot_roc_curves(results, sim_prefix)
+    plot_calibration_curves(results, sim_prefix)
+    df_metrics = create_metrics_table(results, sim_prefix)
     print(df_metrics.to_string(index=False))
 
     # 5. Significance Testing
     print("\nComputing significance tests (permutation tests, 2000 iterations)...")
-    df_significance = compute_significance_tests(results, sim_id)
+    df_significance = compute_significance_tests(results, sim_prefix)
     print("\nPairwise Significance Tests:")
     print(df_significance.to_string(index=False))
 

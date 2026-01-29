@@ -12,7 +12,7 @@ from pathlib import Path
 # Add current directory to path to allow imports
 sys.path.append(str(Path(__file__).parent))
 
-from prs_tools import BayesR, LDpred2, PRScsx, BayesRMix, MUSSEL
+from prs_tools import BayesR, LDpred2, PRScsx, BayesRMix
 
 SIM_NAME_MAP = {
     1: "confounding",
@@ -112,14 +112,6 @@ def train_and_score(sim_arg, method_name):
         eff_file = cs.fit(str(train_prefix), str(pheno_file), str(work_dir / "prscsx"),
                           ref_dir=ref_path_env)
         res = cs.predict(str(test_prefix), eff_file, str(work_dir / "prscsx_pred"))
-        scores = res
-
-    elif method_name == 'MUSSEL':
-        mussel = MUSSEL()
-        sim_id = int(sim_arg) if str(sim_arg).isdigit() else None
-        sim_prefix = sim_prefix
-        path_out = mussel.fit(sim_id=sim_id, sim_prefix=sim_prefix, out_prefix=str(work_dir / "mussel"))
-        res = mussel.predict(path_out, str(work_dir / "mussel_pred"))
         scores = res
 
     else:

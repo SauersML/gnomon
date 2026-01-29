@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       methods:
-        description: "JSON array of methods to train (e.g. [\"BayesR\",\"BayesR-Mix\",\"LDpred2\",\"PRS-CSx\",\"MUSSEL\"])"
+        description: "JSON array of methods to train (e.g. [\"BayesR\",\"BayesR-Mix\",\"LDpred2\",\"PRS-CSx\"])"
         required: false
-        default: "[\"BayesR\",\"BayesR-Mix\",\"MUSSEL\"]"
+        default: "[\"BayesR\",\"BayesR-Mix\"]"
   push:
     paths:
       - "sims/**"
@@ -132,7 +132,7 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix","MUSSEL"]') }}
+        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]') }}
         sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
@@ -253,102 +253,6 @@ jobs:
           # Install PRS-CSx
           git clone https://github.com/getian107/PRScsx.git
           echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
-
-      - name: Setup for MUSSEL
-        if: matrix.method == 'MUSSEL'
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.4.2'
-
-      - name: Install system dependencies (MUSSEL)
-        if: matrix.method == 'MUSSEL'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev libgit2-dev libssh2-1-dev pkg-config \
-            libharfbuzz-dev libfribidi-dev libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev libfontconfig1-dev
-
-      - name: Clone MUSSEL repo
-        if: matrix.method == 'MUSSEL'
-        run: |
-          git clone https://github.com/Jin93/MUSSEL.git
-          if [ -f MUSSEL/R/source-functions.R ] && [ ! -f MUSSEL/R/MUSS-functions.R ]; then
-            cp MUSSEL/R/source-functions.R MUSSEL/R/MUSS-functions.R
-          fi
-          python - <<'PY'
-          from pathlib import Path
-          path = Path("MUSSEL/R/MUSSEL.R")
-          if path.exists():
-              txt = path.read_text()
-              if "is.null(dim(outputstatus))" not in txt:
-                  needle = "outputstatus = sapply(1:K"
-                  lines = txt.splitlines()
-                  out = []
-                  injected = False
-                  for line in lines:
-                      out.append(line)
-                      if line.strip().startswith(needle):
-                          out.append("if (is.null(dim(outputstatus))) {")
-                          out.append("  outputstatus <- matrix(outputstatus, nrow = K)")
-                          out.append("}")
-                          injected = True
-                  if injected:
-                      path.write_text("\n".join(out) + "\n")
-              txt = path.read_text()
-              if "settings_files <-" not in txt:
-                  old = "settings <- bigreadr::fread2(paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom/settings_',chrs[length(chrs)],\".txt\"));"
-                  if old in txt:
-                      new = "\n".join([
-                          "settings_files <- list.files(paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom'),",
-                          "  pattern='settings_.*\\\\.txt$', full.names=TRUE)",
-                          "if (length(settings_files) == 0) {",
-                          "  stop('No settings_*.txt found in MUSS_beta_in_all_settings_bychrom')",
-                          "}",
-                          "settings_file <- settings_files[1]",
-                          "candidate <- paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom/settings_',chrs[length(chrs)],'.txt')",
-                          "if (file.exists(candidate)) {",
-                          "  settings_file <- candidate",
-                          "}",
-                          "settings <- bigreadr::fread2(settings_file);",
-                      ])
-                      txt = txt.replace(old, new)
-                      path.write_text(txt)
-          PY
-
-      - name: Install MUSSEL R dependencies (auto-detect)
-        if: matrix.method == 'MUSSEL'
-        run: |
-          Rscript -e 'install.packages("pak", repos="https://cloud.r-project.org")'
-          Rscript -e 'pak::pkg_install("devtools")'
-          Rscript -e 'if (!requireNamespace("devtools", quietly=TRUE)) {message("Missing devtools after install"); quit(status=1)}'
-          Rscript -e 'install.packages("BiocManager", repos="https://cloud.r-project.org")'
-          Rscript -e 'BiocManager::install(c("snpStats","genefilter","sva"), ask=FALSE, update=FALSE)'
-          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("RISCA", repos="https://cloud.r-project.org")}'
-          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {install.packages("remotes", repos="https://cloud.r-project.org"); remotes::install_github("foucher-y/RISCA")}'
-          Rscript -e 'if (!requireNamespace("RISCA", quietly=TRUE)) {message("Missing RISCA"); quit(status=1)}'
-          cat > /tmp/mussel_pkg_scan.R <<'RSCRIPT'
-          files <- c("MUSSEL/R/MUSS_jobs.R", "MUSSEL/R/MUSSEL.R")
-          files <- files[file.exists(files)]
-          if (length(files) == 0) {
-            message("No MUSSEL R scripts found to scan; skipping auto-install.")
-            quit(status = 0)
-          }
-          txt <- paste(unlist(lapply(files, readLines, warn = FALSE)), collapse = "\n")
-          m <- gregexpr("(?:library|require)\\(([^)]+)\\)", txt, perl = TRUE)
-          hits <- regmatches(txt, m)[[1]]
-          pkgs <- unique(gsub(".*\\(([^)]+)\\).*", "\\1", hits))
-          pkgs <- gsub("[\"' ]", "", pkgs)
-          pkgs <- pkgs[nzchar(pkgs)]
-          base <- c("stats", "utils", "methods", "base", "grDevices", "graphics")
-          pkgs <- setdiff(pkgs, base)
-          if (length(pkgs) > 0) {
-            cat("Installing MUSSEL packages:", paste(pkgs, collapse = ", "), "\n")
-            install.packages(pkgs, repos = "https://cloud.r-project.org", dependencies = c("Depends", "Imports", "LinkingTo"))
-          } else {
-            cat("No additional MUSSEL packages detected.\n")
-          }
-          RSCRIPT
-          Rscript /tmp/mussel_pkg_scan.R
-          Rscript -e 'bioc <- c("snpStats","genefilter","sva"); missing <- bioc[!sapply(bioc, requireNamespace, quietly=TRUE)]; if (length(missing)) {message("Missing Bioconductor packages: ", paste(missing, collapse=", ")); quit(status=1)}'
 
       - name: Train & Score ${{ matrix.method }}
         run: |
