@@ -4317,12 +4317,160 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank, Matrix.rank, h_range_eq] at h_rank
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  classical
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  -- 1. Identify predictions as vectors in the column space
+  let pred_vec := X.mulVec (packParams model)
+  let pred_vec' := X'.mulVec (packParams model_prime)
+
+  have h_pred_eq : (fun i => linearPredictor model (data.p i) (data.c i)) = pred_vec := by
+    funext i
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+    rfl
+
+  have h_pred_prime_eq : (fun i => linearPredictor model_prime (data'.p i) (data'.c i)) = pred_vec' := by
+    funext i
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+    rfl
+
+  -- 2. Show that fit minimizes distance to y in the column space
+  have h_min : ∀ v ∈ LinearMap.range (Matrix.toLin' X), dist data.y pred_vec ≤ dist data.y v := by
+    intro v hv
+    obtain ⟨β, hβ⟩ := (Matrix.mem_range_toLin' X v).mp hv
+    let m_test := unpackParams pgsBasis splineBasis β
+    have hm_test : InModelClass m_test pgsBasis splineBasis := by constructor <;> rfl
+    have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_test hm_test
+
+    -- Convert empirical loss to distance
+    rw [h_lambda_zero] at h_loss
+    unfold empiricalLoss at h_loss
+    simp only [add_zero, mul_zero] at h_loss
+
+    have h_loss_model : (1 / n : ℝ) * (∑ i, pointwiseNLL model.dist (data.y i) (linearPredictor model (data.p i) (data.c i))) = (1 / n : ℝ) * (dist data.y pred_vec)^2 := by
+       rw [dist_eq_norm]
+       have h_dist_sq : (norm (data.y - pred_vec))^2 = ∑ i, (data.y i - pred_vec i)^2 := by
+          simp [l2norm_sq, Real.norm_eq_abs, ← sq_abs, Pi.sub_apply]
+       rw [h_dist_sq]
+       congr 1
+       refine Finset.sum_congr rfl (fun i _ => ?_)
+       simp [pointwiseNLL, model.dist, h_pred_eq]
+       -- model.dist is Gaussian because fit uses unpackParams which sets it to Gaussian
+       have h_dist_gauss : model.dist = DistributionFamily.Gaussian := rfl
+       rw [h_dist_gauss]
+       rfl
+
+    have h_loss_test : (1 / n : ℝ) * (∑ i, pointwiseNLL m_test.dist (data.y i) (linearPredictor m_test (data.p i) (data.c i))) = (1 / n : ℝ) * (dist data.y v)^2 := by
+       rw [dist_eq_norm]
+       have h_dist_sq : (norm (data.y - v))^2 = ∑ i, (data.y i - v i)^2 := by
+          simp [l2norm_sq, Real.norm_eq_abs, ← sq_abs, Pi.sub_apply]
+       rw [h_dist_sq]
+       congr 1
+       refine Finset.sum_congr rfl (fun i _ => ?_)
+       simp [pointwiseNLL, m_test, hm_test.dist_gaussian]
+       rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m_test hm_test]
+       have h_pack : packParams m_test = β := by
+         ext j
+         cases j <;> rfl
+       rw [h_pack, ← hβ]
+       rfl
+
+    -- Inequality logic
+    rw [h_loss_model, h_loss_test] at h_loss
+    have h_n_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    have h_inv_n_pos : (0 : ℝ) < 1 / n := one_div_pos.mpr h_n_pos_real
+    rw [mul_le_mul_left h_inv_n_pos] at h_loss
+    exact Real.le_sqrt_of_sq_le h_loss
+
+  have h_min' : ∀ v ∈ LinearMap.range (Matrix.toLin' X'), dist data.y pred_vec' ≤ dist data.y v := by
+    intro v hv
+    obtain ⟨β, hβ⟩ := (Matrix.mem_range_toLin' X' v).mp hv
+    let m_test := unpackParams pgsBasis splineBasis β
+    have hm_test : InModelClass m_test pgsBasis splineBasis := by constructor <;> rfl
+    -- fit for prime uses data' and corresponding rank proof
+    have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+      rw [Matrix.rank, Matrix.rank, h_range_eq] at h_rank
+      exact h_rank
+    have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m_test hm_test
+
+    rw [h_lambda_zero] at h_loss
+    unfold empiricalLoss at h_loss
+    simp only [add_zero, mul_zero] at h_loss
+
+    -- Note: fit minimizes wrt data'.y which is data.y
+    have h_loss_model : (1 / n : ℝ) * (∑ i, pointwiseNLL model_prime.dist (data'.y i) (linearPredictor model_prime (data'.p i) (data'.c i))) = (1 / n : ℝ) * (dist data.y pred_vec')^2 := by
+       rw [dist_eq_norm]
+       have h_dist_sq : (norm (data.y - pred_vec'))^2 = ∑ i, (data.y i - pred_vec' i)^2 := by
+          simp [l2norm_sq, Real.norm_eq_abs, ← sq_abs, Pi.sub_apply]
+       rw [h_dist_sq]
+       congr 1
+       refine Finset.sum_congr rfl (fun i _ => ?_)
+       simp [pointwiseNLL, model_prime.dist, h_pred_prime_eq]
+       have h_dist_gauss : model_prime.dist = DistributionFamily.Gaussian := rfl
+       rw [h_dist_gauss]
+       rfl
+
+    have h_loss_test : (1 / n : ℝ) * (∑ i, pointwiseNLL m_test.dist (data'.y i) (linearPredictor m_test (data'.p i) (data'.c i))) = (1 / n : ℝ) * (dist data.y v)^2 := by
+       rw [dist_eq_norm]
+       have h_dist_sq : (norm (data.y - v))^2 = ∑ i, (data.y i - v i)^2 := by
+          simp [l2norm_sq, Real.norm_eq_abs, ← sq_abs, Pi.sub_apply]
+       rw [h_dist_sq]
+       congr 1
+       refine Finset.sum_congr rfl (fun i _ => ?_)
+       simp [pointwiseNLL, m_test, hm_test.dist_gaussian]
+       rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m_test hm_test]
+       have h_pack : packParams m_test = β := by
+         ext j
+         cases j <;> rfl
+       rw [h_pack, ← hβ]
+       rfl
+
+    rw [h_loss_model, h_loss_test] at h_loss
+    have h_n_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    have h_inv_n_pos : (0 : ℝ) < 1 / n := one_div_pos.mpr h_n_pos_real
+    rw [mul_le_mul_left h_inv_n_pos] at h_loss
+    exact Real.le_sqrt_of_sq_le h_loss
+
+  -- 3. Identify as Orthogonal Projection
+  -- Need to show pred_vec is in the range
+  have h_in_range : pred_vec ∈ LinearMap.range (Matrix.toLin' X) := by
+    apply (Matrix.mem_range_toLin' X pred_vec).mpr
+    use (packParams model); rfl
+
+  have h_in_range' : pred_vec' ∈ LinearMap.range (Matrix.toLin' X') := by
+    apply (Matrix.mem_range_toLin' X' pred_vec').mpr
+    use (packParams model_prime); rfl
+
+  -- Subspaces must be closed convex nonempty for orthogonal projection
+  haveI : CompleteSpace (LinearMap.range (Matrix.toLin' X)) := FiniteDimensional.complete (LinearMap.range (Matrix.toLin' X))
+  haveI : CompleteSpace (LinearMap.range (Matrix.toLin' X')) := FiniteDimensional.complete (LinearMap.range (Matrix.toLin' X'))
+
+  have h_proj : pred_vec = orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le h_in_range h_min
+
+  have h_proj' : pred_vec' = orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le h_in_range' h_min'
+
+  -- 4. Equality of Projections
+  rw [h_range_eq] at h_proj
+  rw [h_proj, h_proj'] at h_pred_eq h_pred_prime_eq
+
+  have h_eq_proj : orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y =
+                   orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data.y := by
+    congr
+    exact h_range_eq
+
+  intro i
+  rw [h_pred_eq, h_pred_prime_eq, h_eq_proj]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
