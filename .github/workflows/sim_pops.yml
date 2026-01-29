@@ -274,6 +274,26 @@ jobs:
           if [ -f MUSSEL/R/source-functions.R ] && [ ! -f MUSSEL/R/MUSS-functions.R ]; then
             cp MUSSEL/R/source-functions.R MUSSEL/R/MUSS-functions.R
           fi
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("MUSSEL/R/MUSSEL.R")
+          if path.exists():
+              txt = path.read_text()
+              if "is.null(dim(outputstatus))" not in txt:
+                  needle = "outputstatus = sapply(1:K"
+                  lines = txt.splitlines()
+                  out = []
+                  injected = False
+                  for line in lines:
+                      out.append(line)
+                      if line.strip().startswith(needle):
+                          out.append("if (is.null(dim(outputstatus))) {")
+                          out.append("  outputstatus <- matrix(outputstatus, nrow = K)")
+                          out.append("}")
+                          injected = True
+                  if injected:
+                      path.write_text(\"\\n\".join(out) + \"\\n\")
+          PY
 
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
