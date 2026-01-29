@@ -3998,7 +3998,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         simp only [pow_zero, integrable_const]
       | succ n =>
         have h_mem := ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0) (μ := 0) (v := 1)
-        apply MemLp.integrable one_le_one
+        apply MemLp.integrable (le_refl (1:ℝ≥0∞))
         convert h_mem.norm_rpow (n.succ : ℝ≥0) (by norm_num) (by norm_num) using 1
         ext x
         simp [Real.norm_eq_abs, abs_pow]
@@ -4050,7 +4050,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (μP.prod μC) := by
          have h_int_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1^2) (μP.prod μC) := by
             apply Integrable.comp_fst h_p2_int
-         rw [memLp_two_iff_integrable_sq measurable_fst.aemeasurable]
+         rw [memLp_two_iff_integrable_sq measurable_fst.aestronglyMeasurable]
          exact h_int_sq
 
       have h_Base_prod_L2 : MemLp (fun pc => predictorBase m pc.2) 2 (μP.prod μC) := by
@@ -4067,11 +4067,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_int_prod := h_Base_prod_L2.integrable_sq
       rw [MeasureTheory.integrable_prod_iff] at h_int_prod
       · rcases h_int_prod with ⟨_, h_int⟩
-        have h_eq : ∀ᵐ c ∂μC, (∫ p, (predictorBase m c)^2 ∂μP) = (predictorBase m c)^2 := by
+        have h_eq : (fun c => ∫ p, ‖predictorBase m c‖ ^ 2 ∂μP) =ᵐ[μC] (fun c => ‖predictorBase m c‖ ^ 2) := by
            filter_upwards with c
            rw [integral_const]
            simp
-        rw [memLp_two_iff_integrable_sq]
+        rw [memLp_two_iff_integrable_sq_norm]
         · exact h_int.congr h_eq
         · admit -- Measurability
       · admit -- Measurability
@@ -4080,12 +4080,13 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         MemLp.integrable one_le_two h_Base_memLp2
 
     have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
-        apply MemLp.integrable_mul (p := 2) (q := 2) (hpq := by norm_num)
+        apply MemLp.integrable_mul (p := 2) (q := 2)
         · apply MemLp.sub
-          · rw [memLp_two_iff_integrable_sq h_scaling_meas'.aemeasurable]
+          · rw [memLp_two_iff_integrable_sq h_scaling_meas'.aestronglyMeasurable]
             exact h_scaling_sq_int'
           · apply MemLp.const 1; infer_instance
         · exact h_Base_memLp2
+        · norm_num
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4191,7 +4192,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          · admit -- Measurability
 
       have h_P_memLp2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
-         rw [memLp_two_iff_integrable_sq measurable_fst.aemeasurable]
+         rw [memLp_two_iff_integrable_sq measurable_fst.aestronglyMeasurable]
          unfold stdNormalProdMeasure
          refine h_prod_int (h_gauss_moments 2) (integrable_const 1)
 
@@ -4213,7 +4214,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          exact h_A_sq_int
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) :=
-         MemLp.integrable_mul (p := 2) (q := 2) (hpq := by norm_num) h_A_memLp2 h_diff_memLp2
+         MemLp.integrable_mul (p := 2) (q := 2) h_A_memLp2 h_diff_memLp2 (by norm_num)
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
       rw [← integral_add (h_A_sq_int.add h_B_sq_int) (h_cross_int.neg.const_mul 2)]
