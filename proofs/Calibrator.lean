@@ -5880,43 +5880,54 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
     apply DifferentiableAt.add
     · exact differentiableAt_const _
     · apply DifferentiableAt.exp
-      exact differentiableAt_neg (differentiableAt_id)
+      exact DifferentiableAt.neg (differentiableAt_id)
 
   rw [sigmoid]
+  -- deriv (fun x => (1 + exp(-x))⁻¹) x
+  -- Use a helper calculation for the derivative of the denominator
+  have h_deriv_denom : deriv (fun x => 1 + Real.exp (-x)) x = - Real.exp (-x) := by
+    rw [deriv_add]
+    · rw [deriv_const, zero_add]
+      rw [deriv_exp (DifferentiableAt.neg differentiableAt_id)]
+      rw [deriv_neg differentiableAt_id]
+      rw [deriv_id]
+      ring
+    · exact differentiableAt_const _
+    · apply DifferentiableAt.exp
+      exact DifferentiableAt.neg (differentiableAt_id)
+
   rw [one_div]
   rw [deriv_inv'' h_diff h1]
-  rw [deriv_add]
-  · rw [deriv_const, zero_add]
-    rw [deriv_exp]
-    · rw [deriv_neg, deriv_id]
-      simp only [mul_neg, mul_one]
-      -- Goal: - - exp(-x) / (1+exp(-x))^2 = ...
-      have h_rhs : (1 + Real.exp (-x))⁻¹ * (1 - (1 + Real.exp (-x))⁻¹) =
-                    Real.exp (-x) * ((1 + Real.exp (-x)) ^ 2)⁻¹ := by
-            field_simp [h1]
-            ring
-      rw [h_rhs]
-      field_simp [h1]
-      ring
-    · exact differentiableAt_neg (differentiableAt_id)
-  · exact differentiableAt_const _
-  · apply DifferentiableAt.exp
-    exact differentiableAt_neg (differentiableAt_id)
+  rw [h_deriv_denom]
+
+  -- Algebra to match sigmoid(x) * (1 - sigmoid(x))
+  rw [sigmoid]
+  field_simp [h1]
+  ring
 
 lemma deriv2_sigmoid (x : ℝ) : deriv (deriv sigmoid) x = sigmoid x * (1 - sigmoid x) * (1 - 2 * sigmoid x) := by
-  rw [deriv_sigmoid]
+  -- We need to differentiate f(x) = sigmoid(x) * (1 - sigmoid(x))
+  -- Let's define the RHS function explicitly to avoid pattern matching issues in `rw`
+  let f := fun x => sigmoid x * (1 - sigmoid x)
+  have h_eq : deriv sigmoid = f := by
+    funext y
+    exact deriv_sigmoid y
+
+  rw [h_eq]
+  -- Now computing deriv f x
+  dsimp [f]
+
   have h_diff_sig : DifferentiableAt ℝ sigmoid x := differentiable_sigmoid x
   have h_diff_one_minus : DifferentiableAt ℝ (fun x => 1 - sigmoid x) x := by
     apply DifferentiableAt.sub
     · exact differentiableAt_const _
     · exact h_diff_sig
+
   rw [deriv_mul h_diff_sig h_diff_one_minus]
-  rw [deriv_sub]
-  · rw [deriv_const, zero_sub]
-    rw [deriv_sigmoid]
-    ring
-  · exact differentiableAt_const _
-  · exact h_diff_sig
+  rw [deriv_sub (differentiableAt_const _) h_diff_sig]
+  rw [deriv_const, zero_sub]
+  rw [deriv_sigmoid]
+  ring
 
 lemma sigmoid_strictConcaveOn_Ici : StrictConcaveOn ℝ (Set.Ici 0) sigmoid := by
   apply strictConcaveOn_of_deriv2_neg (convex_Ici 0)
