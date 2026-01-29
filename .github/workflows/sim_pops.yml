@@ -271,6 +271,9 @@ jobs:
         if: matrix.method == 'MUSSEL'
         run: |
           git clone https://github.com/Jin93/MUSSEL.git
+          if [ -f MUSSEL/R/source-functions.R ] && [ ! -f MUSSEL/R/MUSS-functions.R ]; then
+            cp MUSSEL/R/source-functions.R MUSSEL/R/MUSS-functions.R
+          fi
 
       - name: Install MUSSEL R dependencies (auto-detect)
         if: matrix.method == 'MUSSEL'
