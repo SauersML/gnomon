@@ -3996,7 +3996,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       cases n with
       | zero => simp; exact integrable_const 1
       | succ n =>
-        have h_mem : MemLp id (n.succ : ℝ≥0∞) μP := ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0∞)
+        have h_mem : MemLp id (n.succ : ℝ≥0) μP := ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0)
         have h_pow := h_mem.norm_rpow (n.succ : ℝ) (by simp; norm_num)
         rw [ENNReal.ofReal_natCast, ENNReal.div_self] at h_pow
         · rw [memLp_one_iff_integrable] at h_pow
@@ -4123,10 +4123,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          rw [← ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ := 0) (v := 1)]
-          · simp
-          · simp
-          · simp
+          have h_mean : ∫ x, x ∂μP = 0 := integral_id_gaussianReal
+          have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal 2
+          have h_var_eq : Var[id; μP] = 1 := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
+          rw [variance_eq_sub h_mem2] at h_var_eq
+          rw [h_mean, zero_pow two_ne_zero, sub_zero] at h_var_eq
+          exact h_var_eq
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4412,23 +4414,24 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     (h_range_eq :
       let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
       LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) = LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) :
-  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let data_affine : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
-  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin', h_range_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin']
+  let model_prime := fit p k sp n data_affine lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      dsimp [Matrix.rank, LinearMap.rank]
+      dsimp [Matrix.rank, LinearMap.rank] at h_rank
+      rw [← h_range_eq]
       exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
-      linearPredictor model_prime (data'.p i) (data'.c i) := by
+      linearPredictor model_prime (data_affine.p i) (data_affine.c i) := by
   intro i
   let X := designMatrix data pgsBasis splineBasis
-  let X' := designMatrix data' pgsBasis splineBasis
+  let X' := designMatrix data_affine pgsBasis splineBasis
   have h_pred : linearPredictor model (data.p i) (data.c i) = (X.mulVec (packParams model)) i :=
     linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl) i
-  have h_pred' : linearPredictor model_prime (data'.p i) (data'.c i) = (X'.mulVec (packParams model_prime)) i :=
-    linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl) i
+  have h_pred' : linearPredictor model_prime (data_affine.p i) (data_affine.c i) = (X'.mulVec (packParams model_prime)) i :=
+    linearPredictor_eq_designMatrix_mulVec data_affine pgsBasis splineBasis model_prime (by constructor <;> rfl) i
   rw [h_pred, h_pred']
 
   let V : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X)
@@ -4473,17 +4476,19 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       let m := unpackParams pgsBasis splineBasis beta
       have hm : InModelClass m pgsBasis splineBasis := by constructor <;> rfl
       have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
-        rw [Matrix.rank_eq_finrank_range_toLin', h_range_eq, ← Matrix.rank_eq_finrank_range_toLin']
+        dsimp [Matrix.rank, LinearMap.rank]
+        dsimp [Matrix.rank, LinearMap.rank] at h_rank
+        rw [← h_range_eq]
         exact h_rank
-      have h_min := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm
+      have h_min := fit_minimizes_loss p k sp n data_affine lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm
       unfold empiricalLoss at h_min
       rw [h_lambda_zero] at h_min
       simp only [add_zero] at h_min
       have h_norm : ∀ m', InModelClass m' pgsBasis splineBasis →
-          (∑ i, pointwiseNLL m'.dist (data'.y i) (linearPredictor m' (data'.p i) (data'.c i))) = ‖data'.y - designMatrix data' pgsBasis splineBasis *ᵥ (packParams m')‖^2 := by
+          (∑ i, pointwiseNLL m'.dist (data_affine.y i) (linearPredictor m' (data_affine.p i) (data_affine.c i))) = ‖data_affine.y - designMatrix data_affine pgsBasis splineBasis *ᵥ (packParams m')‖^2 := by
         intro m' hm'
         rcases hm' with ⟨_, _, _, h_dist⟩
-        simp [pointwiseNLL, h_dist, linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m' hm']
+        simp [pointwiseNLL, h_dist, linearPredictor_eq_designMatrix_mulVec data_affine pgsBasis splineBasis m' hm']
         simp [l2norm_sq, ← sq_norm_eq_sum_sq]
         rfl
       rw [h_norm model_prime (by constructor <;> rfl), h_norm m hm] at h_min
