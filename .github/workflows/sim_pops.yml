@@ -293,6 +293,25 @@ jobs:
                           injected = True
                   if injected:
                       path.write_text("\n".join(out) + "\n")
+              txt = path.read_text()
+              if "settings_files <-" not in txt:
+                  old = "settings <- bigreadr::fread2(paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom/settings_',chrs[length(chrs)],\".txt\"));"
+                  if old in txt:
+                      new = "\n".join([
+                          "settings_files <- list.files(paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom'),",
+                          "  pattern='settings_.*\\\\.txt$', full.names=TRUE)",
+                          "if (length(settings_files) == 0) {",
+                          "  stop('No settings_*.txt found in MUSS_beta_in_all_settings_bychrom')",
+                          "}",
+                          "settings_file <- settings_files[1]",
+                          "candidate <- paste0(opt$PATH_out,'/tmp/MUSS_beta_in_all_settings_bychrom/settings_',chrs[length(chrs)],'.txt')",
+                          "if (file.exists(candidate)) {",
+                          "  settings_file <- candidate",
+                          "}",
+                          "settings <- bigreadr::fread2(settings_file);",
+                      ])
+                      txt = txt.replace(old, new)
+                      path.write_text(txt)
           PY
 
       - name: Install MUSSEL R dependencies (auto-detect)
