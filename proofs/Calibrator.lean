@@ -4317,8 +4317,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      dsimp [Matrix.rank, Matrix.toLin'] at h_rank ⊢
-      dsimp [Matrix.toLin'] at h_range_eq
+      unfold Matrix.rank at h_rank ⊢
+      dsimp only [Matrix.toLin'] at h_range_eq
       rw [← h_range_eq]
       exact h_rank
   )
