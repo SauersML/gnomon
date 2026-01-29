@@ -3998,7 +3998,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         simp only [pow_zero, integrable_const]
       | succ n =>
         have h_mem := ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0) (μ := 0) (v := 1)
-        apply MemLp.integrable (le_refl (1:ℝ≥0∞))
+        have h_one_le : 1 ≤ (n.succ : ℝ≥0∞) := by
+          norm_cast
+          exact Nat.succ_pos n
+        apply MemLp.integrable h_one_le
         convert h_mem.norm_rpow (n.succ : ℝ≥0) (by norm_num) (by norm_num) using 1
         ext x
         simp [Real.norm_eq_abs, abs_pow]
@@ -5831,7 +5834,8 @@ lemma deriv_sigmoid (x : ℝ) : deriv sigmoid x = sigmoid x * (1 - sigmoid x) :=
   rw [deriv_div (differentiableAt_const _) h_diff h_ne]
   simp only [deriv_const, zero_mul, deriv_add, deriv_exp, deriv_neg, deriv_id, mul_neg, mul_one, neg_neg,
     sub_zero, zero_add, neg_mul, one_mul]
-  rw [inv_eq_one_div]
+  field_simp
+  rw [pow_two]
   field_simp
   ring
 
