@@ -3999,12 +3999,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       | zero => simp [pow_zero, integrable_const]
       | succ n =>
         have h_meas : AEStronglyMeasurable (fun x : ℝ => x ^ n.succ) μP :=
-          (measurable_id.pow n.succ).aestronglyMeasurable
-        rw [← memLp_one_iff_integrable h_meas]
+          (MeasureTheory.Measurable.pow measurable_id n.succ).aestronglyMeasurable
+        rw [← memLp_one_iff_integrable]
         convert (MemLp.norm_rpow (f := id) (r := n.succ) (p := 1) measurable_id.aestronglyMeasurable).mpr ?_
         · ext x; simp [Real.norm_eq_abs, abs_pow]
         · simp only [one_mul]
-          apply ProbabilityTheory.memLp_id_gaussianReal'
+          apply ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0∞)
           exact ENNReal.coe_ne_top
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
@@ -4046,7 +4046,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       rw [h_prod] at h_int
       have h_inner : ∀ c, ∫ p, (linearPredictor m p c)^2 ∂μP = (predictorBase m c)^2 + (predictorSlope m c)^2 := by
         intro c
-        rw [linearPredictor_decomp m h_linear_basis.1]
+        simp_rw [linearPredictor_decomp m h_linear_basis.1]
         have h_eq : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 =
             (predictorBase m c)^2 + (predictorSlope m c)^2 * p^2 + 2 * (predictorBase m c * predictorSlope m c) * p := by
           intro p; ring
@@ -4056,10 +4056,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           · rw [integral_const, measure_univ, one_mul]
             rw [integral_mul_const]
             have h_var : ∫ x, x^2 ∂μP = 1 := by
-              have h := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
-              rw [ProbabilityTheory.variance_eq_integral_sq_sub_integral_sq measurable_id'.aemeasurable (h_gauss_moments 2)] at h
-              simp at h
-              exact h
+               -- ∫ x^2 = Var(X) + (E[X])^2 = 1 + 0 = 1
+               have h_mean_sq : ∫ x, (x - 0)^2 ∂μP = 1 :=
+                 ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ := 0) (v := 1)
+               simp only [sub_zero] at h_mean_sq
+               exact h_mean_sq
             rw [h_var]
             simp
           · simp only [integral_mul_const]
@@ -4081,7 +4082,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC := by
       refine h_model_L2_decomp.mono ?_ ?_
-      · rw [← h_map]; exact h_base_meas.sq
+      · rw [← h_map]; exact h_base_meas.pow 2
       · filter_upwards; intro c; nlinarith [sq_nonneg (predictorSlope m c)]
 
     have h_base_memLp : MemLp (predictorBase m) 2 μC := by
@@ -4214,7 +4215,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
               · rw [← h_map] at h_slope_meas
                 exact h_slope_meas.comp_snd
               · exact measurable_fst.aestronglyMeasurable
-        apply MemLp.integrable_sq_sub h_p_L2 h_lin_L2
+        have h_diff_mem : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
+          h_p_L2.sub h_lin_L2
+        rw [← memLp_two_iff_integrable_sq h_diff_mem.aestronglyMeasurable]
+        exact h_diff_mem
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
         apply MemLp.integrable_mul
