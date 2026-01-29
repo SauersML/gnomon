@@ -444,7 +444,7 @@ class MUSSEL:
                 str(Path(self.mussel_path) / "R/MUSS_jobs.R"),
                 *base_args,
                 "--LDpred2_params", ldpred2_params,
-                "--chrom", chrom_arg,
+                "--chrom", "1-22",
                 "--bfile_tuning", bfile_tuning_arg,
                 "--NCORES", str(ncores_muss),
             ])
