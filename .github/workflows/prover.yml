@@ -286,14 +286,9 @@ jobs:
             });
 
             core.setFailed('Lean Prover CI failed for PR that modifies proofs/.');
-          echo " FINAL VALIDATION"
-          echo "================================================="
-          # This is the definitive check. If the .olean file exists,
-          # the build was truly successful.
-          if [ -f ".lake/build/lib/lean/Calibrator.olean" ]; then
-            echo "✅ SUCCESS: .lake/build/lib/lean/Calibrator.olean was created."
-          else
-            echo "❌ FAILURE: .lake/build/lib/lean/Calibrator.olean was NOT found."
-            exit 1
-          fi
-          echo "================================================="
+            if [ -f ".lake/build/lib/lean/Calibrator.olean" ]; then
+              echo "✅ SUCCESS: .lake/build/lib/lean/Calibrator.olean was created."
+            else
+              echo "❌ FAILURE: .lake/build/lib/lean/Calibrator.olean was NOT found."
+              exit 1
+            fi
