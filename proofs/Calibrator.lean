@@ -51,6 +51,7 @@ import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
+open InnerProductSpace
 
 open MeasureTheory
 
@@ -4054,9 +4055,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         -- Integrate term by term
         rw [integral_add]
         · rw [integral_add]
-          · simp [integral_const]
-            have h_mu_univ : μP Set.univ = 1 := MeasureTheory.ProbabilityMeasure.measure_univ
-            rw [h_mu_univ]; simp
+          · simp only [integral_const, measure_univ, ENNReal.one_toReal, one_mul]
           · exact (h_p_int).const_mul _
         · apply Integrable.add
           · exact integrable_const _
@@ -4139,7 +4138,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         exact hf.mul_const (g c)
       · simp only [norm_mul]
         simp_rw [MeasureTheory.integral_mul_const]
-        exact hg.norm.const_mul _
+        -- The integral of |f p| is a constant relative to c
+        let C := ∫ p, ‖f p‖ ∂μP
+        exact hg.norm.const_mul C
 
     -- Orthogonality Condition: Cross term vanishes
     have h_orth : ∫ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) ∂stdNormalProdMeasure k = 0 := by
@@ -4240,11 +4241,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           -- 2 p pred <= p^2 + pred^2
           apply Integrable.mono (h_p2.add h_pred2)
           · -- Measurability
-            apply AEStronglyMeasurable.const_mul
-            apply AEStronglyMeasurable.mul
-            · exact (Continuous.aestronglyMeasurable continuous_fst)
-            · -- linearPredictor is continuous
-              apply Continuous.aestronglyMeasurable
+            -- Explicitly construct measurability from continuity to avoid unification issues
+            have h_pred_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) := by
               apply Continuous.add
               · -- base
                 apply Continuous.comp
@@ -4270,14 +4268,23 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                       · exact (h_spline_cont i).comp continuous_snd
                   · exact continuous_snd
                 · exact continuous_fst
-          · filter_upwards with pc
-            simp
-            intro
-            have : 2 * |pc.1 * linearPredictor m pc.1 pc.2| ≤ pc.1^2 + (linearPredictor m pc.1 pc.2)^2 :=
-              two_mul_le_add_sq pc.1 (linearPredictor m pc.1 pc.2)
-            rw [abs_mul]
-            exact this
-        have h_expand : ∀ pc, (pc.1 - linearPredictor m pc.1 pc.2)^2 = pc.1^2 - 2 * pc.1 * linearPredictor m pc.1 pc.2 + (linearPredictor m pc.1 pc.2)^2 := by
+
+            apply AEStronglyMeasurable.const_mul
+            apply AEStronglyMeasurable.mul
+            · exact Continuous.aestronglyMeasurable continuous_fst
+            · exact Continuous.aestronglyMeasurable h_pred_cont
+          · filter_upwards with (pc : ℝ × (Fin k → ℝ))
+            simp only [mul_assoc]
+            have h_ineq : 2 * |pc.1 * linearPredictor m pc.1 pc.2| ≤ pc.1^2 + (linearPredictor m pc.1 pc.2)^2 := by
+               -- Use two_mul_le_add_sq on absolute values
+               have h := two_mul_le_add_sq (|pc.1|) (|linearPredictor m pc.1 pc.2|)
+               rw [sq_abs, sq_abs] at h
+               rw [abs_mul]
+               exact h
+            rw [abs_mul, mul_assoc]
+            convert h_ineq
+            rw [abs_of_nonneg (by norm_num : (0:ℝ) ≤ 2)]
+        have h_expand : ∀ pc : ℝ × (Fin k → ℝ), (pc.1 - linearPredictor m pc.1 pc.2)^2 = pc.1^2 - 2 * pc.1 * linearPredictor m pc.1 pc.2 + (linearPredictor m pc.1 pc.2)^2 := by
           intro pc; ring
         rw [MeasureTheory.integrable_congr (ae_of_all _ h_expand)]
         exact (h_p2.sub h_cross).add h_pred2
@@ -4348,7 +4355,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           exact MemLp.integrable_mul h_Sm1_p_L2 h_pred_L2
 
         apply Integrable.sub
-        · have h_eq : (fun pc => (scaling_func pc.2 - 1) * pc.1 * pc.1) = (fun pc => (scaling_func pc.2 - 1) * pc.1^2) := by
+        · have h_eq : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1 * pc.1) = (fun pc => (scaling_func pc.2 - 1) * pc.1^2) := by
              intro pc; ring
           rw [integrable_congr (ae_of_all _ h_eq)]
           exact h_term1
@@ -4571,6 +4578,12 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     -- 2. Characterize as orthogonal projections
     let V := LinearMap.range (Matrix.toLin' X)
     let V' := LinearMap.range (Matrix.toLin' X')
+
+    haveI : FiniteDimensional ℝ V := Module.Finite.range (Matrix.toLin' X)
+    haveI : CompleteSpace V := FiniteDimensional.complete ℝ V
+
+    haveI : FiniteDimensional ℝ V' := Module.Finite.range (Matrix.toLin' X')
+    haveI : CompleteSpace V' := FiniteDimensional.complete ℝ V'
 
     have h_proj : X.mulVec (packParams model) = orthogonalProjection V data.y := by
       apply Eq.symm; apply orthogonalProjection_eq_of_dist_le
