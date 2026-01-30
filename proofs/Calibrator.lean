@@ -4315,12 +4315,131 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      let X := designMatrix data pgsBasis splineBasis
+      let X' := designMatrix data' pgsBasis splineBasis
+      have h_rank_eq : X.rank = X'.rank := by
+        rw [Matrix.rank_eq_finrank_range_toLin', Matrix.rank_eq_finrank_range_toLin']
+        rw [h_range_eq]
+      rw [← h_rank_eq]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  classical
+  intro i
+  rw [h_lambda_zero] at model model_prime
+
+  -- Identify design matrices
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  -- Identify parameter vectors
+  let beta := packParams model
+  let beta' := packParams model_prime
+
+  -- Predictions as vectors
+  let pred := X.mulVec beta
+  let pred' := X'.mulVec beta'
+
+  -- Define the column space K. Since ranges are equal, we can use one definition.
+  let K := LinearMap.range (Matrix.toLin' X)
+  have hK_eq : K = LinearMap.range (Matrix.toLin' X') := h_range_eq
+
+  -- 1. Show pred is the orthogonal projection of y onto K
+  have h_pred_is_proj : pred = orthogonalProjection K data.y := by
+    -- fit minimizes loss. With lambda=0, loss is proportional to squared distance.
+    have h_opt := fit_minimizes_loss p k sp n data 0 pgsBasis splineBasis h_n_pos (le_refl _) h_rank model
+    have h_in_class : InModelClass model pgsBasis splineBasis := by
+      constructor <;> rfl
+    specialize h_opt h_in_class
+    unfold empiricalLoss gaussianPenalizedLoss l2norm_sq at h_opt
+    simp only [h_lambda_zero, zero_mul, add_zero] at h_opt
+
+    -- Convert to standard distance minimization on the subspace K
+    apply orthogonalProjection_eq_of_dist_le
+    · -- pred is in K
+      exact LinearMap.mem_range_self (Matrix.toLin' X) beta
+    · -- pred minimizes distance
+      intro w hw
+      -- w is in range of X, so w = X * b for some b
+      obtain ⟨b, hb⟩ := (LinearMap.mem_range (Matrix.toLin' X)).mp hw
+      let m_b := unpackParams pgsBasis splineBasis b
+      have h_loss_le := h_opt m_b (by constructor <;> rfl)
+
+      -- Convert loss inequality to dist inequality
+      -- loss(beta) <= loss(b)
+      -- (1/n) * ||y - X beta||^2 <= (1/n) * ||y - X b||^2
+      -- ||y - pred|| <= ||y - w||
+      have h_dist_sq :
+          (∑ i, (data.y i - X.mulVec beta i) ^ 2) = dist data.y pred ^ 2 := by
+        simp [dist, l2norm_sq, Real.dist_eq, SqDist.sqDist]
+        rfl
+      have h_dist_sq_b :
+          (∑ i, (data.y i - X.mulVec b i) ^ 2) = dist data.y w ^ 2 := by
+        rw [← hb]
+        simp [dist, l2norm_sq, Real.dist_eq, SqDist.sqDist]
+        rfl
+
+      rw [h_dist_sq, h_dist_sq_b] at h_loss_le
+      simp [packParams, unpackParams] at h_loss_le
+      rw [unpack_pack_eq] at h_loss_le
+      · have h_n_pos_real : (0:ℝ) < n := by exact_mod_cast h_n_pos
+        have h_sq_le : dist data.y pred ^ 2 ≤ dist data.y w ^ 2 := by
+          nlinarith [h_loss_le]
+        exact dist_le_of_sq_le_sq (dist_nonneg _ _) (dist_nonneg _ _) h_sq_le
+      · constructor <;> rfl
+
+  -- 2. Show pred' is the orthogonal projection of y onto K' (which equals K)
+  have h_pred'_is_proj : pred' = orthogonalProjection K data.y := by
+    -- Note: data'.y = data.y
+    have h_opt := fit_minimizes_loss p k sp n data' 0 pgsBasis splineBasis h_n_pos (le_refl _) (by
+      rw [Matrix.rank_eq_finrank_range_toLin', Matrix.rank_eq_finrank_range_toLin']
+      rw [h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin']
+      exact h_rank
+    ) model_prime
+    have h_in_class : InModelClass model_prime pgsBasis splineBasis := by
+      constructor <;> rfl
+    specialize h_opt h_in_class
+    unfold empiricalLoss gaussianPenalizedLoss l2norm_sq at h_opt
+    simp only [h_lambda_zero, zero_mul, add_zero] at h_opt
+
+    rw [hK_eq]
+    apply orthogonalProjection_eq_of_dist_le
+    · exact LinearMap.mem_range_self (Matrix.toLin' X') beta'
+    · intro w hw
+      obtain ⟨b, hb⟩ := (LinearMap.mem_range (Matrix.toLin' X')).mp hw
+      let m_b := unpackParams pgsBasis splineBasis b
+      have h_loss_le := h_opt m_b (by constructor <;> rfl)
+
+      have h_dist_sq :
+          (∑ i, (data'.y i - X'.mulVec beta' i) ^ 2) = dist data.y pred' ^ 2 := by
+        simp [dist, l2norm_sq, Real.dist_eq, SqDist.sqDist]
+        rfl
+      have h_dist_sq_b :
+          (∑ i, (data'.y i - X'.mulVec b i) ^ 2) = dist data.y w ^ 2 := by
+        rw [← hb]
+        simp [dist, l2norm_sq, Real.dist_eq, SqDist.sqDist]
+        rfl
+
+      rw [h_dist_sq, h_dist_sq_b] at h_loss_le
+      simp [packParams, unpackParams] at h_loss_le
+      rw [unpack_pack_eq] at h_loss_le
+      · have h_n_pos_real : (0:ℝ) < n := by exact_mod_cast h_n_pos
+        have h_sq_le : dist data.y pred' ^ 2 ≤ dist data.y w ^ 2 := by
+          nlinarith [h_loss_le]
+        exact dist_le_of_sq_le_sq (dist_nonneg _ _) (dist_nonneg _ _) h_sq_le
+      · constructor <;> rfl
+
+  -- 3. Conclusion
+  have h_vec_eq : pred = pred' := by rw [h_pred_is_proj, h_pred'_is_proj]
+
+  -- Translate back to linearPredictor
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+
+  exact congr_fun h_vec_eq i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
