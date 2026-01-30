@@ -133,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        method: ${{ fromJSON(env.TRAIN_METHODS) }}
+        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]') }}
         sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
