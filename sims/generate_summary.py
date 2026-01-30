@@ -105,6 +105,7 @@ def generate_summary_report():
         lines.append("")
         roc_plot = Path(f"{sim_name}_comparison_roc.png")
         cal_plot = Path(f"{sim_name}_comparison_calibration.png")
+        auc_plot = Path(f"{sim_name}_comparison_auc.png")
         if roc_plot.exists():
             lines.append(f"![Simulation {sim_name} ROC Curves]({roc_plot.as_posix()})")
             lines.append("")
@@ -115,6 +116,11 @@ def generate_summary_report():
             lines.append("")
         else:
             lines.append(f"- 📉 Calibration Curves: missing (`{cal_plot.name}` not found)")
+        if auc_plot.exists():
+            lines.append(f"![Simulation {sim_name} AUC Summary]({auc_plot.as_posix()})")
+            lines.append("")
+        else:
+            lines.append(f"- 📊 AUC Summary: missing (`{auc_plot.name}` not found)")
         lines.append("")
     
     # Summary conclusions

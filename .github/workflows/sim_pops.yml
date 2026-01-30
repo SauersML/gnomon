@@ -18,6 +18,7 @@ env:
   OPENBLAS_NUM_THREADS: 4
   VECLIB_MAXIMUM_THREADS: 4
   NUMEXPR_NUM_THREADS: 4
+  TRAIN_METHODS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]' }}
 
 jobs:
   # ------------------------------------------------------------------
@@ -132,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]') }}
+        method: ${{ fromJSON(env.TRAIN_METHODS) }}
         sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
@@ -319,6 +320,7 @@ jobs:
           path: .
 
       - name: Download BayesR Scores
+        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'BayesR') }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -327,6 +329,7 @@ jobs:
           merge-multiple: true
 
       - name: Download LDpred2 Scores
+        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'LDpred2') }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -335,6 +338,7 @@ jobs:
           merge-multiple: true
 
       - name: Download PRS-CSx Scores
+        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'PRS-CSx') }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -343,6 +347,7 @@ jobs:
           merge-multiple: true
 
       - name: Download BayesR-Mix Scores
+        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'BayesR-Mix') }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:

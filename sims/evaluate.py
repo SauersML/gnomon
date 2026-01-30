@@ -118,6 +118,59 @@ def create_metrics_table(methods_results, sim_label):
     df.to_csv(f'{sim_label}_metrics.csv', index=False)
     return df
 
+def plot_auc_summary(methods_results, pvals_df, sim_label):
+    """Plot AUC summary with p-values vs best method."""
+    if not methods_results:
+        return
+
+    auc_rows = []
+    for method_name, result in methods_results.items():
+        auc_rows.append((method_name, result["metrics"]["auc"]["overall"]))
+
+    auc_df = pd.DataFrame(auc_rows, columns=["Method", "AUC"]).sort_values("AUC", ascending=False)
+    best_method = auc_df.iloc[0]["Method"]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(auc_df) * 0.6)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(auc_df)))
+    ax.bar(auc_df["Method"], auc_df["AUC"], color=colors, edgecolor="black", linewidth=0.5)
+
+    max_auc = auc_df["AUC"].max() if not auc_df.empty else 1.0
+    y_offset = max(0.01, max_auc * 0.02)
+
+    for i, (method, auc) in enumerate(auc_df.values):
+        ax.text(i, auc + y_offset, f"{auc:.3f}", ha="center", va="bottom", fontsize=9)
+
+        if pvals_df is not None and method != best_method:
+            p_row = pvals_df[
+                ((pvals_df["Method_1"] == best_method) & (pvals_df["Method_2"] == method)) |
+                ((pvals_df["Method_2"] == best_method) & (pvals_df["Method_1"] == method))
+            ]
+            if not p_row.empty:
+                pval = p_row.iloc[0]["AUC_p_value"]
+                if pd.notna(pval):
+                    ax.text(
+                        i,
+                        auc + y_offset * 2.5,
+                        f"p={pval:.3g}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                        fontweight="bold" if pval < 0.05 else "normal",
+                    )
+
+    ax.set_ylim(0, min(1.0, max_auc + y_offset * 6))
+    ax.set_ylabel("AUC (overall)")
+    ax.set_title(
+        f"AUC Summary - Simulation {sim_label} (p-values vs {best_method})",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(f"{sim_label}_comparison_auc.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 def delong_test(y_true, y_pred1, y_pred2):
     """
     DeLong's test for comparing two correlated ROC curves.
@@ -404,18 +457,19 @@ def main():
     if not results:
         raise RuntimeError("No results generated!")
         
-    # 4. Plots and Table
-    print("Generating plots and tables...")
-    plot_roc_curves(results, sim_prefix)
-    plot_calibration_curves(results, sim_prefix)
-    df_metrics = create_metrics_table(results, sim_prefix)
-    print(df_metrics.to_string(index=False))
-
-    # 5. Significance Testing
+    # 4. Significance Testing
     print("\nComputing significance tests (permutation tests, 2000 iterations)...")
     df_significance = compute_significance_tests(results, sim_prefix)
     print("\nPairwise Significance Tests:")
     print(df_significance.to_string(index=False))
+
+    # 5. Plots and Table
+    print("Generating plots and tables...")
+    plot_roc_curves(results, sim_prefix)
+    plot_calibration_curves(results, sim_prefix)
+    plot_auc_summary(results, df_significance, sim_prefix)
+    df_metrics = create_metrics_table(results, sim_prefix)
+    print(df_metrics.to_string(index=False))
 
     print("\nEvaluation Complete.")
 
