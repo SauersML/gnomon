@@ -4233,8 +4233,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
         -- (p - pred)^2 = p^2 - 2 p pred + pred^2
-        have h_p2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1^2) (stdNormalProdMeasure k) :=
-           h_prod_int (h_gauss_moments 2) (integrable_const 1)
+        have h_p2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1^2) (stdNormalProdMeasure k) := by
+           refine (h_prod_int (h_gauss_moments 2) (integrable_const 1)).congr (ae_of_all _ (fun pc => by ring))
         have h_pred2 : Integrable (fun pc => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
         have h_cross : Integrable (fun pc : ℝ × (Fin k → ℝ) => 2 * pc.1 * linearPredictor m pc.1 pc.2) (stdNormalProdMeasure k) := by
           -- 2 p pred <= p^2 + pred^2
@@ -4557,9 +4557,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-    -- Locally define data' to be accessible in the proof body
-    let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-    intro i
+    intro data' model model_prime i
     -- 1. Identify fitted values as X * beta
     let X := designMatrix data pgsBasis splineBasis
     let X' := designMatrix data' pgsBasis splineBasis
@@ -4587,6 +4585,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
         simp [h_lambda_zero, pointwiseNLL, hm_w.dist_gaussian] at h_loss
         rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)] at h_loss
         rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m_w hm_w] at h_loss
+        -- The use of 'model' in 'linearPredictor' requires 'model' to be available.
+        -- 'model' is defined in the theorem signature as a let-binding.
+        -- We can just ensure we reference the 'model' variable correctly.
         simp [packParams, unpackParams] at h_loss
         have h_beta_eq : packParams m_w = β := by ext j; cases j <;> rfl
         rw [h_beta_eq] at h_loss
