@@ -3994,7 +3994,26 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Helper for moments (admitted for now to unblock)
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      cases n with
+      | zero =>
+        simp only [pow_zero]
+        exact integrable_const 1
+      | succ n =>
+        let p : NNReal := n.succ
+        have h_mem := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) p
+        have h_p_pos : 0 < p := by
+          rw [← NNReal.coe_pos, NNReal.coe_natCast]
+          exact Nat.cast_pos.mpr (Nat.succ_pos n)
+        have h_pow := MemLp.norm_rpow h_mem (ENNReal.coe_ne_zero.mpr (ne_of_gt h_p_pos)) ENNReal.coe_ne_top
+        have h_abs : Integrable (fun x => |x| ^ (n.succ : ℝ)) μP := by
+          rw [memLp_one_iff_integrable] at h_pow
+          convert h_pow
+        apply Integrable.mono h_abs ((continuous_pow n.succ).aestronglyMeasurable)
+        filter_upwards
+        intro x
+        simp only [Real.norm_eq_abs, abs_pow]
+        rw [abs_of_nonneg (Real.rpow_nonneg (abs_nonneg x) _)]
+        rw [Real.rpow_natCast]
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
