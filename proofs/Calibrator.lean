@@ -4318,8 +4318,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       let X := designMatrix data pgsBasis splineBasis
       let X' := designMatrix data' pgsBasis splineBasis
       have h_rank_eq : X.rank = X'.rank := by
-        rw [Matrix.rank_eq_finrank_range_toLin', Matrix.rank_eq_finrank_range_toLin']
-        rw [h_range_eq]
+        -- Matrix.rank is finrank of range of mulVecLin (which is toLin')
+        simp only [Matrix.rank, h_range_eq]
       rw [← h_rank_eq]
       exact h_rank
   )
@@ -4328,7 +4328,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       linearPredictor model_prime (data'.p i) (data'.c i) := by
   classical
   intro i
-  rw [h_lambda_zero] at model model_prime
+  simp only [h_lambda_zero] at model model_prime
 
   -- Identify design matrices
   let X := designMatrix data pgsBasis splineBasis
