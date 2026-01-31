@@ -4027,22 +4027,29 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      simp only [integrable_iff_integrable_norm, norm_pow, Real.norm_eq_abs]
       cases n with
       | zero =>
         simp [pow_zero, integrable_const]
       | succ n =>
-        have h_mem : MemLp id (n.succ : ℝ≥0) μP :=
-          ProbabilityTheory.memLp_id_gaussianReal (n.succ : ℝ≥0)
+        -- Use MemLp id p to show Integrable (|x|^p)
+        let p : ℝ≥0 := n.succ
+        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal p
+        -- |x|^(n+1) is in L1
         have h_pow : MemLp (fun x => |x| ^ (n.succ : ℝ)) 1 μP := by
           convert h_mem.norm_rpow (n.succ : ℝ) using 1
           · norm_num
           · field_simp
-        rw [← memLp_one_iff_integrable]
-        convert h_pow using 2
+        -- Convert L1 membership to integrability of |x|^(n+1)
+        have h_abs_int : Integrable (fun x => |x| ^ (n.succ : ℝ)) μP :=
+          (memLp_one_iff_integrable).mp h_pow
+        -- Show Integrable (x^(n+1))
+        apply (integrable_norm_iff (measurable_id.pow_const (n + 1)).aestronglyMeasurable).mp
+        convert h_abs_int using 1
+        ext x
+        simp only [norm_pow, Real.norm_eq_abs]
         rw [Real.rpow_natCast]
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
@@ -4115,12 +4122,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                apply Continuous.comp (h_evalSmooth_cont _)
                exact continuous_apply l
       have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC := by
-        refine Integrable.mono h_sum_int ?_ ?_
-          · exact h_base_cont.aestronglyMeasurable.pow 2
-        · filter_upwards with c; apply h_le
-      rw [memLp_two_iff_integrable_sq]
-      · exact h_base_sq_int
-        · exact h_base_cont.aestronglyMeasurable
+        refine Integrable.mono h_sum_int (h_base_cont.aestronglyMeasurable.pow 2) ?_
+        filter_upwards with c
+        simp only [norm_pow, Real.norm_eq_abs, sq_abs]
+        apply h_le
+      exact (memLp_two_iff_integrable_sq h_base_cont.aestronglyMeasurable).mpr h_base_sq_int
 
     have h_base_int : Integrable (predictorBase m) μC :=
       MemLp.integrable one_le_two h_base_L2
@@ -4177,11 +4183,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
           -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          rw [ProbabilityTheory.variance_def]
-          · rw [ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1),
+          rw [ProbabilityTheory.variance_eq_integral_sq_sub_sq_integral (h_gauss_moments 2)]
+          rw [ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1),
                 ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)]
-            simp
-          · exact (h_gauss_moments 2)
+          simp
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4228,7 +4233,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       have h_A_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) := by
         unfold stdNormalProdMeasure
-        rw [memLp_two_iff_integrable_sq ?_]
+        rw [memLp_two_iff_integrable_sq]
         · rw [h_prod]
           refine h_prod_int (h_gauss_moments 2) _
           convert (memLp_two_iff_integrable_sq h_Sm1_L2.aestronglyMeasurable).mp h_Sm1_L2
@@ -4245,13 +4250,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_B_L2 : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
         unfold stdNormalProdMeasure
         have h_p_L2_prod : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (μP.prod μC) := by
-          rw [memLp_map_measure_iff measurable_fst]
-          · rw [Measure.map_fst_prod]
-            · exact ProbabilityTheory.memLp_id_gaussianReal 2
-            · exact inferInstance
-          · infer_instance
+        rw [memLp_map_measure_iff (AEStronglyMeasurable.id _)]
+        rw [Measure.map_fst_prod]
+        · exact ProbabilityTheory.memLp_id_gaussianReal 2
+        · exact inferInstance
         have h_pred_L2_prod : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (μP.prod μC) := by
-          rw [memLp_two_iff_integrable_sq ?_]
+          rw [memLp_two_iff_integrable_sq]
           · exact h_norm_sq_int_prod
           · rw [← h_prod]; exact h_norm_meas
         rw [h_prod]
