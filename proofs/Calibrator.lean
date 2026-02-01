@@ -3993,12 +3993,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      have h_mem : MemLp id (n : ℝ≥0) μP := ProbabilityTheory.memLp_id_gaussianReal (n : ℝ≥0)
-      rw [← integrable_norm_iff]
-      have h_eq : (fun x => |x ^ n|) = (fun x => |id x| ^ n) := by
-        ext x; simp [abs_pow]
-      rw [h_eq]
-      exact (h_mem.norm_rpow n (by norm_num)).integrable one_le_one
+      cases n with
+      | zero => simp; exact integrable_const 1
+      | succ n =>
+        have h_mem : MemLp id (n.succ : NNReal) μP := ProbabilityTheory.memLp_id_gaussianReal (n.succ : NNReal)
+        rw [← integrable_norm_iff]
+        have h_eq : (fun x => |x ^ n.succ|) = (fun x => |id x| ^ (n.succ : ℝ)) := by
+          ext x; simp [abs_pow, Real.rpow_natCast]
+        rw [h_eq]
+        refine (h_mem.norm_rpow (n.succ : ℝ) ?_).integrable (le_refl 1)
+        norm_cast; exact Nat.succ_ne_zero n
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4041,50 +4045,58 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- L2 integrability of predictor implies L2 integrability of base
       -- ∫ (base + slope*p)^2 d(P,C) = ∫ (base^2 + slope^2*p^2 + 2*base*slope*p) dP dC
       -- = ∫ (base^2 + slope^2*1 + 0) dC = ∫ base^2 + ∫ slope^2
-      have h_int_expand : ∫ pc : ℝ × (Fin k → ℝ), (linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k =
-          ∫ c, (predictorBase m c)^2 + (predictorSlope m c)^2 ∂μC := by
-        unfold stdNormalProdMeasure
-        rw [MeasureTheory.integral_prod]
-        · apply MeasureTheory.integral_congr_ae
-          filter_upwards with c
-          simp only [linearPredictor_decomp m h_linear_basis']
-          have h_quad : ∫ p, (predictorBase m c + predictorSlope m c * p)^2 ∂μP =
-              (predictorBase m c)^2 + (predictorSlope m c)^2 := by
-            have h_expand : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 =
-                (predictorBase m c)^2 + (predictorSlope m c)^2 * p^2 + 2 * predictorBase m c * predictorSlope m c * p := by
-              intro p; ring
-            simp_rw [h_expand]
-            rw [MeasureTheory.integral_add, MeasureTheory.integral_add]
-            · rw [MeasureTheory.integral_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_const_mul]
-              have h_mean_P : ∫ p, p ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-              have h_var_P : ∫ p, p^2 ∂μP = 1 := ProbabilityTheory.integral_sq_id_gaussianReal (μ := 0) (v := 1)
-              rw [h_mean_P, h_var_P]
-              simp
-            · exact (h_p2_int.const_mul _).add (h_p_int.const_mul _)
-            · exact h_p2_int.const_mul _
-            · exact h_p_int.const_mul _
-            · exact (integrable_const _).add ((h_p2_int.const_mul _).add (h_p_int.const_mul _))
-            · exact integrable_const _
-          exact h_quad
-        · -- Integrability check for Fubini
-          exact h_norm_int.aestronglyMeasurable
-      -- If ∫ (base^2 + slope^2) < ∞, then ∫ base^2 < ∞
-      have h_finite : ∫ c, (predictorBase m c)^2 + (predictorSlope m c)^2 ∂μC < ∞ := by
-        rw [← h_int_expand]
-        exact h_norm_int.hasFiniteIntegral
-      refine ⟨?_, ?_⟩
-      · apply Continuous.aestronglyMeasurable
-        -- predictorBase is continuous (sum of smooth functions)
-        unfold predictorBase
-        fun_prop
-      · simp only [ENNReal.rpow_two]
-        apply lt_of_le_of_lt _ h_finite
-        apply ENNReal.lintegral_le_lintegral_of_le_coe
+
+      -- 1. Use Fubini to show c -> ∫ p, pred^2 dp is integrable
+      have h_inner_int : Integrable (fun c => ∫ p, (linearPredictor m p c)^2 ∂μP) μC := by
+        -- Use integral_prod_left. stdNormalProdMeasure is μP.prod μC.
+        -- integral_prod_left integrates the *left* variable (p) to give function of right (c).
+        rw [h_prod] at h_norm_int'
+        exact MeasureTheory.Integrable.integral_prod_left h_norm_int'
+
+      -- 2. Show inner integral is base^2 + slope^2
+      have h_inner_eq : ∀ᵐ c ∂μC, ∫ p, (linearPredictor m p c)^2 ∂μP =
+          (predictorBase m c)^2 + (predictorSlope m c)^2 := by
         filter_upwards with c
-        simp only [NNReal.coe_add, NNReal.coe_pow, coe_nnnorm, Real.norm_eq_abs]
-        gcongr
-        · exact le_abs_self _
-        · exact sq_nonneg _
+        simp only [linearPredictor_decomp m h_linear_basis']
+        have h_expand : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 =
+            (predictorBase m c)^2 + (predictorSlope m c)^2 * p^2 + 2 * predictorBase m c * predictorSlope m c * p := by
+          intro p; ring
+        rw [integral_congr_ae (ae_of_all _ h_expand)]
+        rw [integral_add, integral_add]
+        · rw [integral_const, integral_const_mul, integral_const_mul]
+          have h_mean_P : ∫ p, p ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+          have h_var_P : ∫ p, p^2 ∂μP = 1 := by
+            -- Use variance property
+            have h_var := ProbabilityTheory.variance_id_gaussianReal 0 1
+            rw [ProbabilityTheory.variance_def' h_p_int h_p2_int] at h_var
+            rw [h_mean_P] at h_var
+            simp at h_var
+            exact h_var
+          rw [h_mean_P, h_var_P]
+          simp
+        · exact (h_p2_int.const_mul _).add (h_p_int.const_mul _)
+        · exact h_p2_int.const_mul _
+        · exact h_p_int.const_mul _
+        · exact (integrable_const _).add ((h_p2_int.const_mul _).add (h_p_int.const_mul _))
+        · exact integrable_const _
+
+      -- 3. Conclude Integrable (base^2)
+      have h_sum_int : Integrable (fun c => (predictorBase m c)^2 + (predictorSlope m c)^2) μC :=
+        h_inner_int.congr h_inner_eq
+
+      have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC := by
+        refine Integrable.mono h_sum_int ?_ ?_
+        · apply Continuous.aestronglyMeasurable
+          unfold predictorBase evalSmooth; fun_prop
+        · filter_upwards with c
+          simp only [Real.norm_eq_abs, sq_abs]
+          linarith [sq_nonneg (predictorSlope m c)]
+
+      -- 4. Convert to MemLp
+      rw [memLp_two_iff_integrable_sq]
+      · exact h_base_sq_int
+      · apply Continuous.aestronglyMeasurable
+        unfold predictorBase evalSmooth; fun_prop
 
     have h_base_int : Integrable (predictorBase m) μC := h_base_L2.integrable one_le_two
 
@@ -4144,7 +4156,13 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
-        have h_var : ∫ x, x^2 ∂μP = 1 := ProbabilityTheory.integral_sq_id_gaussianReal (μ := 0) (v := 1)
+        have h_var : ∫ x, x^2 ∂μP = 1 := by
+          have h_var := ProbabilityTheory.variance_id_gaussianReal 0 1
+          rw [ProbabilityTheory.variance_def' h_p_int h_p2_int] at h_var
+          have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+          rw [h_mean] at h_var
+          simp at h_var
+          exact h_var
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4204,14 +4222,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           intro c; unfold predictorSlope; simp [evalSmooth]; simp [hm_norm.fₘₗ_zero 0]
         simp_rw [h_slope_const]
         -- Integrable ((const) * p - base)^2
-        -- = const^2 * p^2 + base^2 - 2*const*p*base
         apply Integrable.add
         · apply Integrable.sub
           · exact h_p2_int.comp_fst.const_mul _ -- Integrable p^2 over product measure
           · have h_base_L2_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (predictorBase m pc.2)^2) (μP.prod μC) := by
-               refine (h_prod_int (integrable_const 1) ?_)
-               rw [← memLp_two_iff_integrable_sq h_base_L2.aestronglyMeasurable]
-               exact h_base_L2
+               have h_sq : Integrable (fun c => (predictorBase m c)^2) μC := (memLp_two_iff_integrable_sq h_base_L2.aestronglyMeasurable).mp h_base_L2
+               exact MeasureTheory.Integrable.comp_snd h_sq
             exact h_base_L2_sq
         · -- 2 * const * p * base
           refine (h_prod_int h_p_int h_base_int).const_mul _
