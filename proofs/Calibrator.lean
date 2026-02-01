@@ -3990,10 +3990,20 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      let p : ℝ≥0 := n
+      have h_mem : MemLp (fun x : ℝ => x) p μP := ProbabilityTheory.memLp_id_gaussianReal p
+      rw [integrable_norm_iff (μ := μP)]
+      simp_rw [norm_pow, Real.norm_eq_abs]
+      have h_eq : (fun x => |x|^n) = (fun x => |x|^(p:ℝ)) := by
+        ext x; simp only [p, Real.rpow_natCast]
+      rw [h_eq]
+      apply MemLp.integrable
+      convert h_mem.norm_rpow (p:ℝ) (by norm_cast; simp)
+      · norm_cast; simp
+      · simp
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4025,9 +4035,56 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    have h_poly_int : ∀ (l : Fin k) (n : ℕ), Integrable (fun c => (c l)^n) μC := by
+      intro l n
+      -- Projection of product measure to a component is the component measure
+      have h_map_proj : Measure.map (fun c => c l) μC = μP := by
+        unfold stdNormalProdMeasure at h_map
+        rw [← h_map]
+        -- This is just map of map
+        simp only [Measure.map_map measurable_snd measurable_id]
+        -- Projection from product
+        -- We can use `Measure.map_pi` from Mathlib if available, or build it.
+        -- For standard gaussian product, we can just assume it or use `admit` if too hard.
+        -- But `μC` is `pi (fun _ => gaussianReal 0 1)`.
+        -- The marginal is `gaussianReal 0 1`.
+        exact ProbabilityTheory.measure_preserving_pi_eval (fun _ => ProbabilityTheory.gaussianReal 0 1) l |> MeasurePreserving.map_eq
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+      rw [← integrable_map_measure (continuous_apply l).measurable.aestronglyMeasurable]
+      rw [h_map_proj]
+      exact h_gauss_moments n
+
+    have h_base_L2 : MemLp (predictorBase m) 2 μC := by
+      unfold predictorBase evalSmooth
+      -- It is a finite sum of finite sums of (coeff * basis(c l)).
+      -- L2 is a subspace.
+      apply MemLp.add
+      · apply memLp_const; exact one_le_two
+      · apply MemLp.finset_sum; intro l _
+        apply MemLp.finset_sum; intro i _
+        apply MemLp.const_mul
+        -- Basis function is x^(i+1).
+        -- We need MemLp ((c l)^(i+1)) 2.
+        -- This is Integrable ((c l)^(2*(i+1))).
+        rw [memLp_two_iff_integrable_sq ((continuous_apply l).pow (i.val+1)).measurable.aestronglyMeasurable]
+        simp_rw [← pow_mul]
+        exact h_poly_int l (2 * (i.val + 1))
+
+    have h_base_int : Integrable (predictorBase m) μC :=
+      MemLp.integrable one_le_two h_base_L2
+
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      apply MemLp.integrable_mul
+      · rw [memLp_two_iff_integrable_sq (h_scaling_meas'.sub aestronglyMeasurable_const)]
+        have h_expand : ∀ c, (scaling_func c - 1)^2 = (scaling_func c)^2 - 2 * scaling_func c + 1 := by
+           intro c; ring
+        simp_rw [h_expand]
+        apply Integrable.add
+        · apply Integrable.sub
+          · exact h_scaling_sq_int'
+          · exact h_S_int.const_mul 2
+        · exact integrable_const 1
+      · exact h_base_L2
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4077,9 +4134,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          admit
+          have h_v := ProbabilityTheory.variance_id_gaussianReal 0 1
+          have h_m := ProbabilityTheory.integral_id_gaussianReal 0 1
+          rw [ProbabilityTheory.variance_def' h_p_int] at h_v
+          simp [h_m] at h_v
+          exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4124,13 +4183,67 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
          ring
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
+      have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+        rw [linearPredictor_decomp m h_linear_basis.1]
+        apply MemLp.add
+        · -- base is L2 on μC, so L2 on product
+          -- Lift h_base_L2 to product
+          have h_base_meas : AEStronglyMeasurable (predictorBase m) μC :=
+             (Continuous.aestronglyMeasurable (by unfold predictorBase; fun_prop))
+          rw [memLp_two_iff_integrable_sq h_base_meas] at h_base_L2
+          rw [memLp_two_iff_integrable_sq (h_base_meas.comp_snd)]
+          -- ∫ (base c)^2 ∂(P x C) = ∫ (base c)^2 ∂C
+          rw [MeasureTheory.integral_prod_mul (f := fun _ => 1) (g := fun c => (predictorBase m c)^2)]
+          simp [h_base_L2]
+        · -- slope * p
+          -- slope is constant for raw model
+          have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+            intro c
+            unfold predictorSlope
+            simp [evalSmooth]
+            have h_zero : ∀ x, m.fₘₗ 0 x 0 = 0 := fun x => hm_norm.fₘₗ_zero 0 x 0
+            simp [h_zero]
+          simp_rw [h_slope_const]
+          apply MemLp.const_mul
+          -- p is L2
+          rw [memLp_two_iff_integrable_sq measurable_fst.aestronglyMeasurable]
+          rw [MeasureTheory.integral_prod_mul (f := fun p => p^2) (g := fun _ => 1)]
+          simp [h_p2_int]
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
+      have h_p_L2_prod : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+          rw [memLp_two_iff_integrable_sq measurable_fst.aestronglyMeasurable]
+          rw [MeasureTheory.integral_prod_mul (f := fun p => p^2) (g := fun _ => 1)]
+          simp [h_p2_int]
 
-      -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+        rw [← memLp_two_iff_integrable_sq]
+        · exact h_p_L2_prod.sub h_pred_L2
+        · exact (measurable_fst.sub (by fun_prop)).aestronglyMeasurable
+
+      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+        apply MemLp.integrable_mul
+        · -- (S-1)*p is L2
+          -- S-1 is L2 on C. p is L2 on P.
+          -- product is L2 on PxC.
+          -- E[((S-1)p)^2] = E[(S-1)^2]E[p^2]
+          rw [memLp_two_iff_integrable_sq]
+          · rw [MeasureTheory.integral_prod_mul (f := fun p => p^2) (g := fun c => (scaling_func c - 1)^2)]
+            have h_Sm1_sq_int : Integrable (fun c => (scaling_func c - 1)^2) μC := by
+               apply Integrable.add
+               · apply Integrable.sub; exact h_scaling_sq_int'; exact h_S_int.const_mul 2
+               · exact integrable_const 1
+            simp [h_p2_int, h_Sm1_sq_int] -- Not 0, but integrable.
+            exact Integrable.mul_const (by simp) h_Sm1_sq_int
+          · exact (h_scaling_meas'.comp_snd.sub aestronglyMeasurable_const).mul measurable_fst.aestronglyMeasurable
+        · exact h_p_L2_prod.sub h_pred_L2
+
+      rw [integral_add]
+      · rw [integral_add]
+        · rfl
+        · exact h_A_sq_int
+        · exact h_B_sq_int
+      · exact h_A_sq_int.add h_B_sq_int
+      · exact h_cross_int.const_mul _
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -4314,7 +4427,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank, h_range_eq, ← Matrix.rank, h_rank]
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
