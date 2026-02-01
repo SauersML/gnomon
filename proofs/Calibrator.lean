@@ -3995,13 +3995,13 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       intro n
       rcases n.eq_zero_or_pos with rfl | h_pos
       · simp; exact integrable_const 1
-      · have h_mem : MemLp (id : ℝ → ℝ) (n : ℝ≥0) μP := ProbabilityTheory.memLp_id_gaussianReal (n : ℝ≥0)
+      · have h_mem : MemLp (id : ℝ → ℝ) (n : NNReal) μP := ProbabilityTheory.memLp_id_gaussianReal (n : NNReal)
         have h_pow : MemLp (fun x => |x| ^ (n : ℝ)) 1 μP := by
           convert h_mem.norm_rpow n (by exact_mod_cast h_pos) using 1
-        rw [integrable_iff_integrable_norm]
-        have : (fun x => |x ^ n|) = (fun x => |x| ^ (n : ℝ)) := by
+        rw [integrable_norm_iff (measurable_id.pow_const n).aestronglyMeasurable]
+        have : (fun x => ‖x ^ n‖) = (fun x => |x| ^ (n : ℝ)) := by
           ext x
-          rw [abs_pow, Real.rpow_natCast]
+          simp [Real.norm_eq_abs, abs_pow, Real.rpow_natCast]
         rw [this]
         exact h_pow.integrable one_le_one
 
@@ -4089,9 +4089,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h_var : ∫ x, x^2 ∂μP = 1 := by
           -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
           have h_v : variance id μP = 1 := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
-          rw [ProbabilityTheory.variance_def] at h_v
+          have h_mem : MemLp id 2 μP := (memLp_two_iff_integrable_sq measurable_id.aestronglyMeasurable).mpr (h_gauss_moments 2)
+          rw [ProbabilityTheory.variance_eq_sub h_mem] at h_v
           rw [ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)] at h_v
-          simp only [sub_zero, id_eq] at h_v
+          simp only [sub_zero, id_eq, sq, one_pow, sub_zero] at h_v
           exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
@@ -4327,9 +4328,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin']
+      unfold Matrix.rank
       rw [← h_range_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin']
+      unfold Matrix.rank at h_rank
       exact h_rank
   )
   ∀ (i : Fin n),
