@@ -4314,12 +4314,115 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin', ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin', h_rank]
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  classical
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let y := data.y
+  let β := packParams model
+  let β' := packParams model_prime
+
+  -- 1. Identify predictions as Xβ and X'β'
+  have h_pred : ∀ i, linearPredictor model (data.p i) (data.c i) = (X.mulVec β) i :=
+     linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)
+  have h_pred' : ∀ i, linearPredictor model_prime (data'.p i) (data'.c i) = (X'.mulVec β') i :=
+     linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)
+
+  -- 2. Define the subspace W = Range(X) = Range(X')
+  let W : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X)
+  have hW_eq : W = LinearMap.range (Matrix.toLin' X') := h_range_eq
+  haveI : CompleteSpace W := FiniteDimensional.complete ℝ W
+
+  -- 3. Show Xβ is the orthogonal projection of y onto W
+  have h_proj : (X.mulVec β) = (orthogonalProjection W y : Fin n → ℝ) := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · exact LinearMap.mem_range_self _ _
+    · intro v hv
+      obtain ⟨b, hb⟩ := (Matrix.mem_range_toLin' _ _).mp hv
+      let m_comp := unpackParams pgsBasis splineBasis b
+      have hm_class : InModelClass m_comp pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+      have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_comp hm_class
+
+      have h_loss_eq : ∀ m, InModelClass m pgsBasis splineBasis →
+          empiricalLoss m data lambda = (1 / (n : ℝ)) * l2norm_sq (y - X.mulVec (packParams m)) := by
+        intro m hm
+        simp [empiricalLoss, gaussianPenalizedLoss, h_lambda_zero, l2norm_sq,
+          linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm]
+        congr 1; ext i
+        simp [pointwiseNLL, hm.dist_gaussian]
+
+      rw [h_loss_eq model ⟨rfl, rfl, rfl, rfl⟩, h_loss_eq m_comp hm_class] at h_loss_le
+
+      have h_pack_unpack : packParams m_comp = b := by
+        ext i
+        cases i <;> simp [packParams, unpackParams, m_comp]
+
+      rw [h_pack_unpack] at h_loss_le
+      simp [l2norm_sq, dist_eq_norm] at h_loss_le ⊢
+
+      have hn_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+      rw [mul_le_mul_left hn_pos] at h_loss_le
+
+      rw [← hb] at h_loss_le
+      have h_sq_le : ‖y - X.mulVec β‖^2 ≤ ‖y - v‖^2 := by
+         simpa [l2norm_sq, PiLp.norm_eq_of_L2] using h_loss_le
+
+      exact nonneg_le_nonneg_of_sq_le_sq (norm_nonneg _) h_sq_le
+
+  -- 4. Show X'β' is the orthogonal projection of y onto W (using X' range)
+  have h_proj' : (X'.mulVec β') = (orthogonalProjection (LinearMap.range (Matrix.toLin' X')) y : Fin n → ℝ) := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · exact LinearMap.mem_range_self _ _
+    · intro v hv
+      obtain ⟨b, hb⟩ := (Matrix.mem_range_toLin' _ _).mp hv
+      let m_comp := unpackParams pgsBasis splineBasis b
+      have hm_class : InModelClass m_comp pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+
+      have h_loss_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+          rw [Matrix.rank_eq_finrank_range_toLin', ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin', h_rank]
+        ) m_comp hm_class
+
+      have h_loss_eq : ∀ m, InModelClass m pgsBasis splineBasis →
+          empiricalLoss m data' lambda = (1 / (n : ℝ)) * l2norm_sq (y - X'.mulVec (packParams m)) := by
+        intro m hm
+        simp [empiricalLoss, gaussianPenalizedLoss, h_lambda_zero, l2norm_sq,
+          linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm]
+        congr 1; ext i
+        simp [pointwiseNLL, hm.dist_gaussian]
+
+      rw [h_loss_eq model_prime ⟨rfl, rfl, rfl, rfl⟩, h_loss_eq m_comp hm_class] at h_loss_le
+
+      have h_pack_unpack : packParams m_comp = b := by
+        ext i
+        cases i <;> simp [packParams, unpackParams, m_comp]
+
+      rw [h_pack_unpack] at h_loss_le
+      simp [l2norm_sq, dist_eq_norm] at h_loss_le ⊢
+
+      have hn_pos : 0 < (1 / (n : ℝ)) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+      rw [mul_le_mul_left hn_pos] at h_loss_le
+
+      rw [← hb] at h_loss_le
+      have h_sq_le : ‖y - X'.mulVec β'‖^2 ≤ ‖y - v‖^2 := by
+         simpa [l2norm_sq, PiLp.norm_eq_of_L2] using h_loss_le
+
+      exact nonneg_le_nonneg_of_sq_le_sq (norm_nonneg _) h_sq_le
+
+  -- 5. Combine
+  have h_proj_eq : X.mulVec β = X'.mulVec β' := by
+    rw [h_proj]
+    rw [h_proj']
+    congr 1
+    exact hW_eq
+
+  intro i
+  rw [h_pred, h_pred', h_proj_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
