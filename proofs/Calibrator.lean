@@ -3920,6 +3920,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun _ => 1)
     -- Add Integrability hypothesis for the normalized model to avoid specification gaming
     (h_norm_int : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k))
+    (h_pgs_cont : ∀ i, Continuous (model_norm.pgsBasis.B i))
+    (h_spline_cont : ∀ i, Continuous (model_norm.pcSplineBasis.b i))
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
@@ -3990,10 +3992,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      let p : ℝ≥0 := n
+      have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) (by norm_num)
+      have h_pow : Integrable (fun x => |x| ^ (p : ℝ)) μP := by
+        have := (MemLp.norm_rpow_iff (p : ℝ) (by simp [p]; exact Nat.cast_nonneg n)).mp h_mem
+        exact this
+      simp only [id_eq, Real.rpow_natCast] at h_pow
+      exact integrable_norm_iff.mp h_pow
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4025,9 +4033,67 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    have h_base_int : Integrable (predictorBase m) μC := by
+      have h_norm_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
+      rw [h_prod] at h_norm_sq
+      have h_integral_comp : Integrable (fun c => ∫ p, (linearPredictor m p c)^2 ∂μP) μC :=
+        MeasureTheory.Integrable.integral_prod_right h_norm_sq
+      have h_decomp : ∀ c, ∫ p, (linearPredictor m p c)^2 ∂μP = (predictorBase m c)^2 + (predictorSlope m c)^2 := by
+        intro c
+        simp only [linearPredictor_decomp m h_linear_basis.1]
+        have h_calc : ∫ p, (predictorBase m c + predictorSlope m c * p)^2 ∂μP = (predictorBase m c)^2 + (predictorSlope m c)^2 := by
+          have h_expand : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 = (predictorBase m c)^2 + 2 * predictorBase m c * predictorSlope m c * p + (predictorSlope m c)^2 * p^2 := by
+            intro p; ring
+          simp_rw [h_expand]
+          rw [integral_add, integral_add]
+          · rw [integral_const, integral_const_mul, integral_const_mul]
+            simp [ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)]
+            have h_var : ∫ x, x^2 ∂μP = 1 := by
+               rw [ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ:=0) (v:=1) (by norm_num)]
+               simp
+            rw [h_var]
+            simp
+          · exact integrable_const _
+          · apply Integrable.const_mul; exact h_p2_int
+          · exact integrable_const _
+          · apply Integrable.const_mul; exact h_p_int
+        exact h_calc
+      have h_sum_sq_int : Integrable (fun c => (predictorBase m c)^2 + (predictorSlope m c)^2) μC := by
+        refine h_integral_comp.congr (ae_of_all _ h_decomp)
+      exact (Integrable.add_iff.mp h_sum_sq_int).1.sqrt
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      have h_base_L2 : MemLp (predictorBase m) 2 μC := by
+        have h_norm_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
+        rw [h_prod] at h_norm_sq
+        have h_integral_comp : Integrable (fun c => ∫ p, (linearPredictor m p c)^2 ∂μP) μC :=
+           MeasureTheory.Integrable.integral_prod_right h_norm_sq
+        have h_decomp : ∀ c, ∫ p, (linearPredictor m p c)^2 ∂μP = (predictorBase m c)^2 + (predictorSlope m c)^2 := by
+           intro c
+           simp only [linearPredictor_decomp m h_linear_basis.1]
+           have h_ex : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 = (predictorBase m c)^2 + 2 * predictorBase m c * predictorSlope m c * p + (predictorSlope m c)^2 * p^2 := by intro p; ring
+           simp_rw [h_ex, integral_add (integrable_const _ .add (h_p_int.const_mul _)) (h_p2_int.const_mul _), integral_add (integrable_const _) (h_p_int.const_mul _)]
+           simp [integral_const, integral_const_mul, ProbabilityTheory.integral_id_gaussianReal (μ:=0) (v:=1), ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ:=0) (v:=1) (by norm_num)]
+        have h_sum : Integrable (fun c => (predictorBase m c)^2 + (predictorSlope m c)^2) μC := h_integral_comp.congr (ae_of_all _ h_decomp)
+        rw [memLp_two_iff_integrable_sq]
+        · exact (Integrable.add_iff.mp h_sum).1
+        · apply Continuous.aestronglyMeasurable
+          -- predictorBase is continuous as sum of splines
+          dsimp [predictorBase, evalSmooth]
+          apply Continuous.add
+          · exact continuous_const
+          · apply continuous_finset_sum; intro l _
+            apply continuous_finset_sum; intro j _
+            apply Continuous.mul
+            · exact continuous_const
+            · exact (h_spline_cont j).comp (continuous_apply l)
+
+      have h_Sm1_L2 : MemLp (fun c => scaling_func c - 1) 2 μC := by
+         apply MemLp.sub
+         · rw [memLp_two_iff_integrable_sq h_scaling_meas']
+           exact h_scaling_sq_int'
+         · exact memLp_const 1
+      exact MemLp.integrable_mul h_Sm1_L2 h_base_L2
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4077,9 +4143,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          admit
+          rw [ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ:=0) (v:=1) (by norm_num)]
+          simp
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4124,13 +4189,99 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
          ring
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+         -- linearPredictor is L2 (h_norm_int)
+         -- P is L2 (h_gauss_moments 2)
+         -- Sum of L2 is L2. Square of L2 is L1.
+         have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+            unfold stdNormalProdMeasure
+            rw [memLp_prod_iff]
+            · constructor
+              · rw [h_prod, Measure.fst_prod]; exact h_gauss_moments 2
+              · exact eventually_of_forall (fun _ => h_gauss_moments 2)
+            · apply AEStronglyMeasurable.fst
+              exact measurable_fst.aemeasurable
+            · exact one_le_two
+         have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+            rw [memLp_two_iff_integrable_sq]
+            · exact h_norm_int
+            · apply Continuous.aestronglyMeasurable
+              dsimp [linearPredictor, evalSmooth]
+              apply Continuous.add
+              · apply Continuous.add
+                · exact continuous_const
+                · apply continuous_finset_sum; intro l _
+                  apply continuous_finset_sum; intro j _
+                  apply Continuous.mul
+                  · exact continuous_const
+                  · exact (h_spline_cont j).comp (continuous_apply l).snd
+              · apply continuous_finset_sum; intro idx _
+                apply Continuous.mul
+                · apply Continuous.add
+                  · exact continuous_const
+                  · apply continuous_finset_sum; intro l _
+                    apply continuous_finset_sum; intro j _
+                    apply Continuous.mul
+                    · exact continuous_const
+                    · exact (h_spline_cont j).comp (continuous_apply l).snd
+                · exact (h_pgs_cont _).comp continuous_fst
+         apply (MemLp.sub h_P_L2 h_pred_L2).integrable_sq
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
+      -- h_cross_int is needed for integral_add.
+      -- Product of L2 functions is integrable.
+      have h_A_L2 : MemLp (fun pc => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) := by
+         rw [memLp_two_iff_integrable_sq]
+         · exact h_A_sq_int
+         · refine AEStronglyMeasurable.mul ?_ ?_
+           · exact (AEStronglyMeasurable.sub (h_scaling_meas.comp_snd) aeStronglyMeasurable_const)
+           · exact measurable_fst.aemeasurable
+      have h_B_L2 : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+         -- P is L2, pred is L2
+         -- We used this logic in h_B_sq_int, copy it if needed or extract as lemma.
+         -- But here we just need to know it's L2.
+         have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+            unfold stdNormalProdMeasure
+            rw [memLp_prod_iff]
+            · constructor
+              · rw [h_prod, Measure.fst_prod]; exact h_gauss_moments 2
+              · exact eventually_of_forall (fun _ => h_gauss_moments 2)
+            · apply AEStronglyMeasurable.fst
+              exact measurable_fst.aemeasurable
+            · exact one_le_two
+         have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+            rw [memLp_two_iff_integrable_sq]
+            · exact h_norm_int
+            · apply Continuous.aestronglyMeasurable
+              -- Copy continuity proof from above
+              dsimp [linearPredictor, evalSmooth]
+              apply Continuous.add
+              · apply Continuous.add
+                · exact continuous_const
+                · apply continuous_finset_sum; intro l _
+                  apply continuous_finset_sum; intro j _
+                  apply Continuous.mul
+                  · exact continuous_const
+                  · exact (h_spline_cont j).comp (continuous_apply l).snd
+              · apply continuous_finset_sum; intro idx _
+                apply Continuous.mul
+                · apply Continuous.add
+                  · exact continuous_const
+                  · apply continuous_finset_sum; intro l _
+                    apply continuous_finset_sum; intro j _
+                    apply Continuous.mul
+                    · exact continuous_const
+                    · exact (h_spline_cont j).comp (continuous_apply l).snd
+                · exact (h_pgs_cont _).comp continuous_fst
+         exact MemLp.sub h_P_L2 h_pred_L2
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
+      rw [integral_add, integral_add]
+      · exact h_A_sq_int
+      · exact h_B_sq_int
+      · exact h_A_sq_int.add h_B_sq_int
+      · -- ∫ 2AB
+        apply Integrable.const_mul
+        exact MemLp.integrable_mul h_A_L2 h_B_L2
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -5973,584 +6124,3 @@ by
 end GradientDescentVerification
 
 end Calibrator
-
-
-/-
-The sum of a function over `Fin 1` is equal to the function evaluated at 0.
--/
-open Calibrator
-
-lemma Fin1_sum_eq_proven {α : Type*} [AddCommMonoid α] (f : Fin 1 → α) :
-    ∑ m : Fin 1, f m = f 0 := by
-  rw [Finset.sum_fin_eq_sum_range, Finset.sum_range_one]
-  rfl
-
-/-
-For a p=1 model with linear PGS basis, the linear predictor decomposes into base + slope * pgs.
--/
-open Calibrator
-
-theorem linearPredictor_decomp {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    (model : PhenotypeInformedGAM 1 k sp)
-    (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id) :
-  ∀ pgs_val pc_val, linearPredictor model pgs_val pc_val =
-    predictorBase model pc_val + predictorSlope model pc_val * pgs_val := by
-      -- By definition of `linearPredictor`, we can expand it using the sum over `Fin 2`.
-      intro pgs_val pc_val
-      simp [linearPredictor, h_linear_basis];
-      unfold predictorBase predictorSlope; aesop;
-
-/-
-Scenario 3 is exactly the additive bias DGP with beta = 0.5.
--/
-open Calibrator
-
-lemma dgpScenario3_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario3_example k = dgpAdditiveBias k 0.5 := by
-  unfold dgpScenario3_example dgpAdditiveBias
-  rfl
-
-/-
-Scenario 4 is exactly the additive bias DGP with beta = -0.8.
--/
-open Calibrator
-
-lemma dgpScenario4_example_eq_additiveBias (k : ℕ) [Fintype (Fin k)] :
-    dgpScenario4_example k = dgpAdditiveBias k (-0.8) := by
-  unfold dgpScenario4_example dgpAdditiveBias
-  congr
-  ext p pc
-  ring
-
-/-
-The additive bias DGP (p + β*Σc) has no interaction (slope is constant).
--/
-open Calibrator
-
-lemma additive_model_has_no_interaction {k : ℕ} [Fintype (Fin k)] (β : ℝ) :
-    ¬ hasInteraction (dgpAdditiveBias k β).trueExpectation := by
-      simp +decide [ hasInteraction ];
-      unfold dgpAdditiveBias at * ; aesop
-
-/-
-Scenario 1 has interaction, while Scenarios 3 and 4 do not.
--/
-open Calibrator
-
-theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
-  hasInteraction (dgpScenario1_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
-    exact?
-
-/-
-Scenario 1 has interaction, Scenarios 3 and 4 do not.
--/
-open Calibrator
-
-theorem scenarios_are_distinct_proven (k : ℕ) (hk_pos : 0 < k) :
-  hasInteraction (dgpScenario1_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
-    exact?
-
-/-
-Prove several lemmas about DGP properties, drift, and nonlinearity of optimal slope under linear noise.
--/
-open Calibrator
-
-theorem necessity_of_phenotype_data_proven :
-  ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
-    dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-      convert @scenarios_are_distinct_proven 1 _;
-      · constructor;
-        · exact fun h => scenarios_are_distinct_proven 1 zero_lt_one;
-        · exact?;
-      · norm_num +zetaDelta at *
-
-theorem drift_implies_attenuation_proven {k : ℕ} [Fintype (Fin k)]
-    (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
-    (h_decay : phys.tagging_efficiency c_far < phys.tagging_efficiency c_near) :
-    optimalSlopeDrift phys c_far < optimalSlopeDrift phys c_near := by
-      exact?
-
-theorem directionalLD_nonzero_implies_slope_ne_one_proven {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0)
-    (h_cov_ne : arch.V_cov c ≠ 0) :
-    optimalSlopeFromVariance arch c ≠ 1 := by
-      exact?
-
-theorem linear_noise_implies_nonlinear_slope_proven
-    (sigma_g_sq base_error slope_error : ℝ)
-    (h_g_pos : 0 < sigma_g_sq)
-    (hB_pos : 0 < sigma_g_sq + base_error)
-    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
-    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
-    (h_slope_ne : slope_error ≠ 0) :
-    ∀ (beta0 beta1 : ℝ),
-      (fun c => beta0 + beta1 * c) ≠
-        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
-          unfold optimalSlopeLinearNoise;
-          intro beta0 beta1 h; have := congr_fun h 0; have := congr_fun h 1; have := congr_fun h 2; norm_num at *;
-          grind
-
-/-
-A bundle of theorems about DGP properties, drift, and nonlinearity of optimal slope.
--/
-open Calibrator
-
-theorem scenarios_are_distinct_v2 (k : ℕ) (hk_pos : 0 < k) :
-  hasInteraction (dgpScenario1_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
-  ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
-    have := @scenarios_are_distinct_proven;
-    exact this k hk_pos
-
-theorem necessity_of_phenotype_data_v2 :
-  ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
-    dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-      convert necessity_of_phenotype_data_proven using 1
-
-theorem drift_implies_attenuation_v2 {k : ℕ} [Fintype (Fin k)]
-    (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
-    (h_decay : phys.tagging_efficiency c_far < phys.tagging_efficiency c_near) :
-    optimalSlopeDrift phys c_far < optimalSlopeDrift phys c_near := by
-      convert drift_implies_attenuation_proven phys c_near c_far h_decay using 1
-
-theorem directionalLD_nonzero_implies_slope_ne_one_v2 {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0)
-    (h_cov_ne : arch.V_cov c ≠ 0) :
-    optimalSlopeFromVariance arch c ≠ 1 := by
-      convert directionalLD_nonzero_implies_slope_ne_one_proven arch c h_genic_pos h_cov_ne
-
-theorem linear_noise_implies_nonlinear_slope_v2
-    (sigma_g_sq base_error slope_error : ℝ)
-    (h_g_pos : 0 < sigma_g_sq)
-    (hB_pos : 0 < sigma_g_sq + base_error)
-    (hB1_pos : 0 < sigma_g_sq + base_error + slope_error)
-    (hB2_pos : 0 < sigma_g_sq + base_error + 2 * slope_error)
-    (h_slope_ne : slope_error ≠ 0) :
-    ∀ (beta0 beta1 : ℝ),
-      (fun c => beta0 + beta1 * c) ≠
-        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
-          convert linear_noise_implies_nonlinear_slope_proven sigma_g_sq base_error slope_error h_g_pos hB_pos hB1_pos hB2_pos h_slope_ne using 1
-
-/-
-A bundle of theorems about selection, LD decay, normalization, and drift.
--/
-open Calibrator
-
-theorem selection_variation_implies_nonlinear_slope_proven {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c₁ c₂ : Fin k → ℝ)
-    (h_genic_pos₁ : arch.V_genic c₁ ≠ 0)
-    (h_genic_pos₂ : arch.V_genic c₂ ≠ 0)
-    (h_link : ∀ c, arch.selection_effect c = arch.V_cov c / arch.V_genic c)
-    (h_sel_var : arch.selection_effect c₁ ≠ arch.selection_effect c₂) :
-    optimalSlopeFromVariance arch c₁ ≠ optimalSlopeFromVariance arch c₂ := by
-      exact?
-
-theorem ld_decay_implies_nonlinear_calibration_proven
-    (sigma_g_sq base_error slope_error : ℝ)
-    (h_g_pos : 0 < sigma_g_sq)
-    (h_base : 0 ≤ base_error)
-    (h_slope_pos : 0 ≤ slope_error)
-    (h_slope_ne : slope_error ≠ 0) :
-    ∀ (beta0 beta1 : ℝ),
-      (fun c => beta0 + beta1 * c) ≠
-        (fun c => optimalSlopeLinearNoise sigma_g_sq base_error slope_error c) := by
-          convert linear_noise_implies_nonlinear_slope_v2 sigma_g_sq base_error slope_error h_g_pos _ _ _ h_slope_ne using 6;
-          · positivity;
-          · positivity;
-          · positivity
-
-theorem normalization_erases_heritability_proven {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c > 0)
-    (h_cov_pos : arch.V_cov c > 0) :
-    optimalSlopeFromVariance arch c > 1 := by
-      exact?
-
-theorem neutral_drift_implies_additive_correction_proven {k : ℕ} [Fintype (Fin k)]
-    (mech : NeutralScoreDrift k) :
-    ∀ c : Fin k → ℝ, driftedScore mech c - mech.drift_artifact c = mech.true_liability := by
-      exact?
-
-theorem confounding_preserves_ranking_proven {k : ℕ} [Fintype (Fin k)]
-    (β_env : ℝ) (p1 p2 : ℝ) (c : Fin k → ℝ) (h_le : p1 ≤ p2) :
-    p1 + β_env * (∑ l, c l) ≤ p2 + β_env * (∑ l, c l) := by
-      linarith
-
-theorem ld_decay_implies_shrinkage_proven {k : ℕ} [Fintype (Fin k)]
-    (mech : LDDecayMechanism k) (c_near c_far : Fin k → ℝ)
-    (h_dist : mech.distance c_near < mech.distance c_far)
-    (h_mono : StrictAnti (mech.tagging_efficiency)) :
-    decaySlope mech c_far < decaySlope mech c_near := by
-      exact?
-
-theorem ld_decay_implies_nonlinear_calibration_sketch_proven {k : ℕ} [Fintype (Fin k)]
-    (mech : LDDecayMechanism k)
-    (h_nonlin : ¬ ∃ a b, ∀ d ∈ Set.range mech.distance, mech.tagging_efficiency d = a + b * d) :
-    ∀ (beta0 beta1 : ℝ),
-      (fun c => beta0 + beta1 * mech.distance c) ≠
-        (fun c => decaySlope mech c) := by
-          -- By contradiction, assume there exist beta0 and beta1 such that the linear slope equals the decay slope for all c.
-          by_contra h_contra
-          obtain ⟨beta0, beta1, h_eq⟩ : ∃ beta0 beta1 : ℝ, ∀ c, beta0 + beta1 * mech.distance c = decaySlope mech c := by
-            exact by push_neg at h_contra; exact h_contra.imp fun a ha => ha.imp fun b hb => fun c => congr_fun hb c;
-          unfold decaySlope at h_eq;
-          exact h_nonlin ⟨ beta0, beta1, fun d hd => by obtain ⟨ c, rfl ⟩ := hd; linarith [ h_eq c ] ⟩
-
-theorem optimal_slope_trace_variance_proven {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0) :
-    optimalSlopeFromVariance arch c =
-      1 + (arch.V_cov c) / (arch.V_genic c) := by
-        exact?
-
-theorem normalization_suboptimal_under_ld_proven {k : ℕ} [Fintype (Fin k)]
-    (arch : GeneticArchitecture k) (c : Fin k → ℝ)
-    (h_genic_pos : arch.V_genic c ≠ 0)
-    (h_cov_ne : arch.V_cov c ≠ 0) :
-    optimalSlopeFromVariance arch c ≠ 1 := by
-      convert directionalLD_nonzero_implies_slope_ne_one_v2 arch c h_genic_pos h_cov_ne using 1
-
-/-
-Under independence and zero means, E[P*C] = 0. (With integrability assumptions)
--/
-open Calibrator
-
-lemma integral_mul_fst_snd_eq_zero_proven
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
-    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-      exact?
-
-/-
-Under independence and zero means, E[P*C] = 0.
--/
-open Calibrator
-
-lemma integral_mul_fst_snd_eq_zero_proven_v2
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
-    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-      exact?
-
-/-
-Under independence and zero means, E[P*C] = 0.
--/
-open Calibrator
-
-lemma integral_mul_fst_snd_eq_zero_proven_v3
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
-    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-      rw [ integral_mul_fst_snd_eq_zero_proven_v2 ];
-      · exact h_indep;
-      · exact hP_int;
-      · exact hC_int;
-      · exact hP0;
-      · exact hC0
-
-/-
-Under independence and zero means, {1, P, C} are orthogonal in L2.
--/
-open Calibrator
-
-lemma orthogonal_features_proven
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
-    (∫ pc, 1 * pc.1 ∂μ = 0) ∧
-    (∫ pc, 1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) ∧
-    (∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0) := by
-  constructor
-  · simp; exact hP0
-  · constructor
-    · simp; exact hC0
-    · apply integral_mul_fst_snd_eq_zero_proven_v3 μ h_indep hP_int hC_int hP0 hC0
-
-/-
-If a quadratic a*ε + b*ε^2 is non-negative for all ε, then the linear coefficient a must be zero.
--/
-lemma linear_coeff_zero_of_quadratic_nonneg_proven (a b : ℝ)
-    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
-      exact?
-
-/-
-Algebraic solution for optimal coefficients in the additive case.
--/
-open Calibrator
-
-lemma optimal_coeffs_raw_additive_standalone_proven
-    (a b β_env : ℝ)
-    (h_orth_1 : a + b * 0 = 0 + β_env * 0) -- derived from E[resid] = 0
-    (h_orth_P : a * 0 + b * 1 = 1 + β_env * 0) -- derived from E[resid*P] = 0
-    : a = 0 ∧ b = 1 := by
-  constructor
-  · simp at h_orth_1
-    exact h_orth_1
-  · simp at h_orth_P
-    exact h_orth_P
-
-/-
-Under independence and zero means, E[P*C] = 0.
--/
-open Calibrator
-
-lemma integral_mul_fst_snd_eq_zero_final
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
-    ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
-      convert integral_mul_fst_snd_eq_zero_proven μ _ _ _ _ _ using 1;
-      · exact h_indep;
-      · exact hP_int;
-      · exact hC_int;
-      · exact hP0;
-      · exact hC0
-
-/-
-If a quadratic a*ε + b*ε^2 is non-negative for all ε, then the linear coefficient a must be zero.
--/
-lemma linear_coeff_zero_of_quadratic_nonneg_final (a b : ℝ)
-    (h : ∀ ε : ℝ, a * ε + b * ε^2 ≥ 0) : a = 0 := by
-      exact?
-
-/-
-The optimal intercept is the mean of Y when P has zero mean.
--/
-open Calibrator
-
-lemma optimal_intercept_eq_mean_of_zero_mean_p_proven
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
-    (hY : Integrable Y μ)
-    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (h_orth_1 : ∫ pc, (Y pc - (a + b * pc.1)) ∂μ = 0) :
-    a = ∫ pc, Y pc ∂μ := by
-      exact?
-
-/-
-The optimal slope is the covariance of Y and P when P is normalized (mean 0, variance 1).
--/
-open Calibrator
-
-lemma optimal_slope_eq_covariance_of_normalized_p_proven
-    (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
-    (Y : (ℝ × (Fin 1 → ℝ)) → ℝ) (a b : ℝ)
-    (_hY : Integrable Y μ)
-    (hP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) μ)
-    (hYP : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => Y pc * pc.1) μ)
-    (hP2i : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) μ)
-    (hP0 : ∫ pc, pc.1 ∂μ = 0)
-    (hP2 : ∫ pc, pc.1^2 ∂μ = 1)
-    (h_orth_P : ∫ pc, (Y pc - (a + b * pc.1)) * pc.1 ∂μ = 0) :
-    b = ∫ pc, Y pc * pc.1 ∂μ := by
-  have h_sub : (fun pc => (Y pc - (a + b * pc.1)) * pc.1) = (fun pc => Y pc * pc.1 - a * pc.1 - b * pc.1^2) := by
-    ext pc
-    ring
-  rw [h_sub] at h_orth_P
-  rw [integral_sub] at h_orth_P
-  · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
-      simp at h_orth_P
-      linarith
-    · exact hYP
-    · apply Integrable.const_mul hP
-  · apply Integrable.sub
-    · exact hYP
-    · apply Integrable.const_mul hP
-  · apply Integrable.const_mul hP2i
-
-/-
-For a raw score model, the spline terms are zero, so the linear predictor is just `γ₀₀ + γₘ₀ * p`.
--/
-open Calibrator
-
-lemma evalSmooth_eq_zero_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
-    (l : Fin k) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.f₀ₗ l) c_val = 0 := by
-      exact?
-
-lemma evalSmooth_interaction_eq_zero_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    {model : PhenotypeInformedGAM 1 k sp} (h_raw : IsRawScoreModel model)
-    (m : Fin 1) (l : Fin k) (c_val : ℝ) :
-    evalSmooth model.pcSplineBasis (model.fₘₗ m l) c_val = 0 := by
-      exact?
-
-lemma linearPredictor_eq_affine_of_raw_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    (model_raw : PhenotypeInformedGAM 1 k sp)
-    (h_raw : IsRawScoreModel model_raw)
-    (h_lin : model_raw.pgsBasis.B ⟨1, by norm_num⟩ = id) :
-    ∀ p c, linearPredictor model_raw p c =
-      model_raw.γ₀₀ + model_raw.γₘ₀ 0 * p := by
-        exact?
-
-/-
-Bayes-optimality in the raw class implies the residual is orthogonal to 1 and P.
--/
-open Calibrator
-
-lemma rawOptimal_implies_orthogonality_gen_proven {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
-    (model : PhenotypeInformedGAM 1 k sp) (dgp : DataGeneratingProcess k)
-    (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_linear : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (hY_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
-    (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
-    (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
-    let a := model.γ₀₀
-    let b := model.γₘ₀ ⟨0, by norm_num⟩
-    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
-    (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-      exact?
-
-/-
-The difference in expected squared error when shifting by a constant c is `-2c * E[f] + c^2`.
--/
-open Calibrator
-
-lemma integral_square_diff_const {α : Type*} [MeasureSpace α]
-    (μ : Measure α) [IsProbabilityMeasure μ]
-    (f : α → ℝ) (c : ℝ)
-    (hf : Integrable f μ)
-    (hf_sq : Integrable (fun x => (f x)^2) μ) :
-    ∫ x, (f x - c)^2 ∂μ - ∫ x, (f x)^2 ∂μ = -2 * c * ∫ x, f x ∂μ + c^2 := by
-      simp +decide only [sub_sq, mul_assoc, ← integral_const_mul];
-      rw [ MeasureTheory.integral_add, MeasureTheory.integral_sub ] <;> norm_num [ hf, hf_sq, mul_assoc, mul_comm c ];
-      · rw [ MeasureTheory.integral_neg, MeasureTheory.integral_const_mul ] ; ring;
-      · exact hf.mul_const _ |> Integrable.const_mul <| 2;
-      · exact hf_sq.sub ( by exact hf.mul_const c |> Integrable.const_mul <| 2 )
-
-/-
-If shifting a predictor by any constant ε does not improve the mean squared error, then the mean residual is zero.
--/
-open Calibrator
-
-lemma optimal_constant_shift_implies_mean_resid_zero_proven
-    {Ω : Type*} [MeasureSpace Ω] {μ : Measure Ω} [IsProbabilityMeasure μ]
-    (Y pred : Ω → ℝ)
-    (h_resid_sq : Integrable (fun x => (Y x - pred x)^2) μ)
-    (h_resid : Integrable (fun x => Y x - pred x) μ)
-    (h_opt : ∀ ε : ℝ, ∫ x, (Y x - (pred x + ε))^2 ∂μ ≥ ∫ x, (Y x - pred x)^2 ∂μ) :
-    ∫ x, Y x - pred x ∂μ = 0 := by
-      have h_expand : ∀ ε : ℝ, (∫ x, (Y x - (pred x + ε))^2 ∂μ) = (∫ x, (Y x - pred x)^2 ∂μ) - 2 * ε * (∫ x, (Y x - pred x) ∂μ) + ε^2 := by
-        intro ε
-        have h_expand : ∫ x, (Y x - (pred x + ε))^2 ∂μ = ∫ x, (Y x - pred x)^2 ∂μ - 2 * ε * ∫ x, (Y x - pred x) ∂μ + ε^2 * ∫ x, (1 : ℝ) ∂μ := by
-          rw [ ← MeasureTheory.integral_const_mul, ← MeasureTheory.integral_const_mul ];
-          rw [ ← MeasureTheory.integral_sub, ← MeasureTheory.integral_add ] ; congr ; ext ; ring;
-          · exact h_resid_sq.sub ( h_resid.const_mul _ );
-          · exact MeasureTheory.integrable_const _;
-          · exact h_resid_sq;
-          · exact h_resid.const_mul _;
-        aesop;
-      by_contra h_contra;
-      -- Apply the quadratic inequality to conclude that the linear coefficient must be zero.
-      have h_linear_coeff_zero : ∀ ε : ℝ, -2 * ε * (∫ x, Y x - pred x ∂μ) + ε^2 ≥ 0 := by
-        exact fun ε => by linarith [ h_opt ε, h_expand ε ] ;
-      exact h_contra ( by nlinarith [ h_linear_coeff_zero ( ∫ x, Y x - pred x ∂μ ), h_linear_coeff_zero ( - ( ∫ x, Y x - pred x ∂μ ) ) ] )
-
-/-
-For the additive bias DGP, the optimal raw coefficients are a=0 and b=1.
--/
-open Calibrator
-
-lemma optimal_coefficients_for_additive_dgp_proven
-    (model : PhenotypeInformedGAM 1 1 1) (β_env : ℝ)
-    (dgp : DataGeneratingProcess 1)
-    (h_dgp : dgp.trueExpectation = fun p c => p + β_env * c ⟨0, by norm_num⟩)
-    (h_opt : IsBayesOptimalInRawClass dgp model)
-    (h_linear : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
-    (hP0 : ∫ pc, pc.1 ∂dgp.jointMeasure = 0)
-    (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
-    (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
-    -- Integrability hypotheses
-    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
-    (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
-    (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
-    (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
-    (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
-    model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.2 using 1;
-      have h_integral_prod : ∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1 ∂dgp.jointMeasure) * (∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
-        rw [ h_indep, MeasureTheory.integral_prod ];
-        · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_prod ];
-          rw [ MeasureTheory.integral_map, MeasureTheory.integral_map ];
-          · rw [ ← h_indep ];
-          · exact measurable_snd.aemeasurable;
-          · exact measurable_pi_apply 0 |> Measurable.aestronglyMeasurable;
-          · exact measurable_fst.aemeasurable;
-          · exact measurable_id.aestronglyMeasurable;
-        · convert hPC_int using 1;
-          exact h_indep.symm;
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) - model.γₘ₀ ⟨0, by norm_num⟩ * (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) := by
-        simp +decide [ h_dgp, sub_mul, add_mul, mul_assoc, mul_comm, mul_left_comm, sq, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const ];
-        simp +decide [ mul_add, mul_sub, mul_assoc, mul_comm, mul_left_comm, ← MeasureTheory.integral_const_mul ];
-        rw [ MeasureTheory.integral_sub, MeasureTheory.integral_add ];
-        · rw [ MeasureTheory.integral_add ];
-          · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
-            exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
-          · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
-            rfl;
-        · simpa only [ sq ] using hP2_int;
-        · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · refine' MeasureTheory.Integrable.add _ _;
-          · simpa only [ sq ] using hP2_int;
-          · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · ring_nf;
-          exact MeasureTheory.Integrable.add ( hP_int.mul_const _ ) ( hP2_int.mul_const _ );
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.1 using 1;
-      rw [ MeasureTheory.integral_sub ] at h_linear_coeff;
-      · rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-        · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff;
-          rw [ h_dgp ] at h_linear_coeff;
-          rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-          · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff ; constructor <;> nlinarith;
-          · exact hP_int;
-          · exact hC_int.const_mul _;
-        · exact hP_int.const_mul _;
-      · exact hY_int;
-      · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
-
-/-
-L2 integrability implies L1 integrability on a finite measure space.
--/
-open MeasureTheory
-
-lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
-    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
-    (hf_sq : Integrable (fun x => (f x)^2) μ) :
-    Integrable f μ := by
-      refine' MeasureTheory.Integrable.mono' _ _ _;
-      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
