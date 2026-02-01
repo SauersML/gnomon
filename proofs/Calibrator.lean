@@ -3993,6 +3993,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
+      -- Use integrability of polynomials against Gaussian
       let p : ℝ≥0 := n
       have h_mem : MemLp (fun x : ℝ => x) p μP := ProbabilityTheory.memLp_id_gaussianReal p
       rw [integrable_norm_iff (μ := μP)]
@@ -4044,15 +4045,25 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         -- This is just map of map
         simp only [Measure.map_map measurable_snd measurable_id]
         -- Projection from product
-        -- We can use `Measure.map_pi` from Mathlib if available, or build it.
-        -- For standard gaussian product, we can just assume it or use `admit` if too hard.
-        -- But `μC` is `pi (fun _ => gaussianReal 0 1)`.
-        -- The marginal is `gaussianReal 0 1`.
         exact ProbabilityTheory.measure_preserving_pi_eval (fun _ => ProbabilityTheory.gaussianReal 0 1) l |> MeasurePreserving.map_eq
 
       rw [← integrable_map_measure (continuous_apply l).measurable.aestronglyMeasurable]
       rw [h_map_proj]
       exact h_gauss_moments n
+
+    -- Manual continuity proof for predictorBase to ensure measurability
+    have h_base_cont : Continuous (predictorBase m) := by
+      unfold predictorBase evalSmooth
+      apply Continuous.add
+      · exact continuous_const
+      · refine continuous_finset_sum _ (fun l _ => ?_)
+        refine continuous_finset_sum _ (fun i _ => ?_)
+        apply Continuous.mul continuous_const
+        -- basis is power
+        apply Continuous.comp (continuous_pow _) (continuous_apply l)
+
+    have h_base_meas : AEStronglyMeasurable (predictorBase m) μC :=
+      h_base_cont.aestronglyMeasurable
 
     have h_base_L2 : MemLp (predictorBase m) 2 μC := by
       unfold predictorBase evalSmooth
@@ -4066,9 +4077,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         -- Basis function is x^(i+1).
         -- We need MemLp ((c l)^(i+1)) 2.
         -- This is Integrable ((c l)^(2*(i+1))).
-        rw [memLp_two_iff_integrable_sq ((continuous_apply l).pow (i.val+1)).measurable.aestronglyMeasurable]
-        simp_rw [← pow_mul]
-        exact h_poly_int l (2 * (i.val + 1))
+        rw [memLp_two_iff_integrable_sq]
+        · simp_rw [← pow_mul]
+          exact h_poly_int l (2 * (i.val + 1))
+        · apply Continuous.aestronglyMeasurable
+          apply Continuous.pow
+          apply continuous_apply
 
     have h_base_int : Integrable (predictorBase m) μC :=
       MemLp.integrable one_le_two h_base_L2
@@ -4136,7 +4150,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h_var : ∫ x, x^2 ∂μP = 1 := by
           have h_v := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
           have h_m := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          rw [ProbabilityTheory.variance_def' h_p_int] at h_v
+          rw [ProbabilityTheory.variance_eq_sub h_p_int] at h_v
           simp [h_m] at h_v
           exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
@@ -4197,7 +4211,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           apply Integrable.add
           · -- predictorBase is L2
             have h_base_meas : AEStronglyMeasurable (predictorBase m) μC :=
-               (Continuous.aestronglyMeasurable (by unfold predictorBase; fun_prop))
+               h_base_cont.aestronglyMeasurable
             rw [memLp_two_iff_integrable_sq h_base_meas] at h_base_L2
             rw [MeasureTheory.integrable_prod_iff (h_base_meas.comp_snd)]
             constructor
@@ -4217,6 +4231,23 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
             · filter_upwards with c; exact h_p_int
             · simp; exact h_p_int
 
+      -- Explicitly prove measurability for MemLp
+      have h_pred_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) (stdNormalProdMeasure k) := by
+         apply Continuous.aestronglyMeasurable
+         -- Prove continuity of linearPredictor
+         unfold linearPredictor
+         apply Continuous.add
+         · -- base
+           apply Continuous.comp h_base_cont continuous_snd
+         · -- slope * p
+           apply Continuous.mul
+           · -- slope (constant)
+             simp only [evalSmooth, Finset.sum_const_zero]
+             apply Continuous.add <;> simp
+             · exact continuous_const
+             · exact continuous_const
+           · exact continuous_fst
+
       have h_p_L2_prod : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
           rw [memLp_two_iff_integrable_sq measurable_fst.aestronglyMeasurable]
           rw [MeasureTheory.integral_prod_mul (f := fun p => p^2) (g := fun _ => 1)]
@@ -4227,8 +4258,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · exact h_p_L2_prod.sub h_pred_L2
         · apply AEStronglyMeasurable.sub
           · exact measurable_fst.aestronglyMeasurable
-          · apply Continuous.aestronglyMeasurable
-            fun_prop
+          · exact h_pred_meas
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
         have h_Sm1_p_L2 : MemLp (fun pc => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) := by
