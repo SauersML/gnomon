@@ -3998,15 +3998,15 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       | zero =>
         simp only [pow_zero, integrable_const]
       | succ n' =>
-        let n_nn : ℝ≥0 := n'.succ
+        let n_nn : ℝ≥0 := (n' + 1 : ℕ)
         have h_mem := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) (p := n_nn)
-        have h_rpow : MemLp (fun x => |x| ^ (n'.succ : ℝ)) 1 μP := by
-          have h_cast : (n'.succ : ℝ≥0∞) / ENNReal.ofReal (n'.succ : ℝ) = 1 := by
+        have h_rpow : MemLp (fun x => |x| ^ (n' + 1 : ℝ)) 1 μP := by
+          have h_cast : ((n' + 1 : ℕ) : ℝ≥0∞) / ENNReal.ofReal (n' + 1 : ℕ) = 1 := by
              rw [ENNReal.ofReal_natCast]
              exact ENNReal.div_self (ENNReal.natCast_ne_zero.mpr (Nat.succ_ne_zero n')) ENNReal.natCast_ne_top
-          convert MemLp.norm_rpow h_mem (n'.succ : ℝ) (Nat.cast_pos.mpr (Nat.succ_pos n'))
+          convert MemLp.norm_rpow h_mem (n' + 1 : ℝ) (Nat.cast_pos.mpr (Nat.succ_pos n'))
           exact h_cast.symm
-        have h_integrable_norm : Integrable (fun x => |x| ^ n'.succ) μP := by
+        have h_integrable_norm : Integrable (fun x => |x| ^ (n' + 1)) μP := by
           have h := MemLp.integrable one_le_one h_rpow
           convert h
           ext x
