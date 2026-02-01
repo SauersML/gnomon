@@ -4000,7 +4000,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       · let n_real : ℝ := n
         let n_nn : NNReal := n
         have h_mem : MemLp id n_nn μP := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) n_nn
-        rw [← memLp_one_iff_integrable]
         have h_pow := h_mem.norm_rpow (by exact Nat.cast_ne_zero.mpr (ne_of_gt hn_pos)) ENNReal.coe_ne_top
         let f := fun x : ℝ => x ^ n
         have h_meas : AEStronglyMeasurable f μP :=
@@ -4049,7 +4048,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_mean_p : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
 
-    have h_pred_int : Integrable (linearPredictor m) (μP.prod μC) := by
+    have h_pred_int : Integrable (fun pc => linearPredictor m pc.1 pc.2) (μP.prod μC) := by
       rw [h_prod] at h_norm_meas h_norm_int
       have h_L2 : MemLp (fun pc => linearPredictor model_norm pc.1 pc.2) 2 (μP.prod μC) := by
         rw [memLp_two_iff_integrable_sq h_norm_meas]
@@ -4088,6 +4087,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           rw [memLp_two_iff_integrable_sq (measurable_id.aestronglyMeasurable)]
           exact h_p2_int
         rw [ProbabilityTheory.variance_eq_sub h_mem_2] at h_var
+        simp only [id_eq, integral_id] at h_var
         rw [h_mean_p] at h_var
         simp at h_var
         exact h_var
