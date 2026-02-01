@@ -3990,10 +3990,20 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      rcases n.eq_zero_or_pos with rfl | h_pos
+      · simp; exact integrable_const 1
+      · have h_mem : MemLp (id : ℝ → ℝ) (n : ℝ≥0) μP := ProbabilityTheory.memLp_id_gaussianReal (n : ℝ≥0)
+        have h_pow : MemLp (fun x => |x| ^ (n : ℝ)) 1 μP := by
+          convert h_mem.norm_rpow n (by exact_mod_cast h_pos) using 1
+        rw [integrable_iff_integrable_norm]
+        have : (fun x => |x ^ n|) = (fun x => |x| ^ (n : ℝ)) := by
+          ext x
+          rw [abs_pow, Real.rpow_natCast]
+        rw [this]
+        exact h_pow.integrable one_le_one
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4078,8 +4088,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
           -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          admit
+          have h_v : variance id μP = 1 := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
+          rw [ProbabilityTheory.variance_def] at h_v
+          rw [ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)] at h_v
+          simp only [sub_zero, id_eq] at h_v
+          exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4314,12 +4327,162 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin']
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin']
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let m := model
+  let m' := model_prime
+
+  -- The linear predictor is just X * β (or X' * β')
+  have h_pred : linearPredictor m (data.p i) (data.c i) = (X.mulVec (packParams m)) i :=
+    linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m (by constructor <;> rfl) i
+  have h_pred' : linearPredictor m' (data'.p i) (data'.c i) = (X'.mulVec (packParams m')) i :=
+    linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m' (by constructor <;> rfl) i
+
+  rw [h_pred, h_pred']
+
+  -- fit minimizes empiricalLoss
+  have h_fit := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  have h_fit' := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      rw [Matrix.rank_eq_finrank_range_toLin']
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin']
+      exact h_rank)
+
+  -- Projection argument
+  -- Let V = range (toLin' X) and V' = range (toLin' X'). We have V = V'.
+  -- The vector v = X.mulVec (packParams m) is the orthogonal projection of y onto V.
+  -- The vector v' = X'.mulVec (packParams m') is the orthogonal projection of y onto V'.
+  -- Since V = V', v = v'.
+
+  let V : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X)
+  let V' : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X')
+  have h_V_eq : V = V' := h_range_eq
+
+  let v := X.mulVec (packParams m)
+  let v' := X'.mulVec (packParams m')
+
+  have v_in_V : v ∈ V := by
+    use packParams m
+    rfl
+
+  have v'_in_V' : v' ∈ V' := by
+    use packParams m'
+    rfl
+
+  have v'_in_V : v' ∈ V := by rwa [h_V_eq] at v'_in_V'
+
+  -- v is a minimizer of distance on V
+  have h_min_v : ∀ w ∈ V, dist (data.y) v ≤ dist (data.y) w := by
+    intro w hw
+    obtain ⟨β, hβ⟩ := hw
+    -- Construct a model with these params
+    let m_w := unpackParams pgsBasis splineBasis β
+    have h_pack : packParams m_w = β := by
+      ext x
+      cases x <;> rfl
+
+    have h_loss_le := h_fit.2 m_w (by constructor <;> rfl)
+
+    unfold empiricalLoss at h_loss_le
+    rw [h_lambda_zero] at h_loss_le
+    simp only [add_zero] at h_loss_le
+
+    -- Convert loss to distance
+    -- loss = (1/n) * Σ (y - pred)^2 = (1/n) * ‖y - pred‖^2
+    have h_dist_sq : ∀ m_curr : PhenotypeInformedGAM p k sp,
+      InModelClass m_curr pgsBasis splineBasis →
+      (∑ i, pointwiseNLL m_curr.dist (data.y i) (linearPredictor m_curr (data.p i) (data.c i)))
+        = ‖data.y - (designMatrix data pgsBasis splineBasis).mulVec (packParams m_curr)‖^2 := by
+      intro m_curr hm_curr
+      simp only [pointwiseNLL, Pi.sub_apply, Real.norm_eq_abs, sq_abs, norm_sq_eq_inner]
+      rw [Real.norm_sq_eq_inner]
+      unfold inner InnerProductSpace.Core.inner InnerProductSpace.toCore
+      simp only [PiLp.inner_apply, IsROrC.re_to_real]
+      congr 1
+      ext j
+      rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ hm_curr]
+      · simp [pointwiseNLL]
+        have h_gauss : m_curr.dist = .Gaussian := hm_curr.dist_gaussian
+        rw [h_gauss]
+        rfl
+
+    rw [h_dist_sq m (by constructor <;> rfl), h_dist_sq m_w (by constructor <;> rfl)] at h_loss_le
+    rw [← hβ, ← h_pack]
+
+    -- (1/n) * ‖y - v‖^2 ≤ (1/n) * ‖y - w‖^2
+    -- Since n > 0, we can cancel 1/n and sqrt
+    have hn_pos : 0 < (n : ℝ) := by exact_mod_cast h_n_pos
+    have h_inv_pos : 0 < 1 / (n : ℝ) := one_div_pos.mpr hn_pos
+
+    rw [mul_le_mul_left h_inv_pos] at h_loss_le
+
+    exact dist_le_dist_of_sq_le_sq h_loss_le
+
+  -- Same for v' on V'
+  have h_min_v' : ∀ w ∈ V', dist (data.y) v' ≤ dist (data.y) w := by
+    intro w hw
+    obtain ⟨β, hβ⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis β
+    have h_pack : packParams m_w = β := by
+      ext x
+      cases x <;> rfl
+    have h_loss_le := h_fit'.2 m_w (by constructor <;> rfl)
+    unfold empiricalLoss at h_loss_le
+    rw [h_lambda_zero] at h_loss_le
+    simp only [add_zero] at h_loss_le
+
+    have h_dist_sq : ∀ m_curr : PhenotypeInformedGAM p k sp,
+      InModelClass m_curr pgsBasis splineBasis →
+      (∑ i, pointwiseNLL m_curr.dist (data'.y i) (linearPredictor m_curr (data'.p i) (data'.c i)))
+        = ‖data'.y - (designMatrix data' pgsBasis splineBasis).mulVec (packParams m_curr)‖^2 := by
+      intro m_curr hm_curr
+      rw [Real.norm_sq_eq_inner]
+      unfold inner InnerProductSpace.Core.inner InnerProductSpace.toCore
+      simp only [PiLp.inner_apply, IsROrC.re_to_real]
+      congr 1
+      ext j
+      rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ hm_curr]
+      · simp [pointwiseNLL]
+        have h_gauss : m_curr.dist = .Gaussian := hm_curr.dist_gaussian
+        rw [h_gauss]
+        rfl
+
+    rw [h_dist_sq m' (by constructor <;> rfl), h_dist_sq m_w (by constructor <;> rfl)] at h_loss_le
+    rw [← hβ, ← h_pack]
+    have hn_pos : 0 < (n : ℝ) := by exact_mod_cast h_n_pos
+    rw [mul_le_mul_left (one_div_pos.mpr hn_pos)] at h_loss_le
+    exact dist_le_dist_of_sq_le_sq h_loss_le
+
+  -- Now use uniqueness of orthogonal projection
+  -- v is the projection of y onto V
+  -- v' is the projection of y onto V'
+  -- V = V' and y is the same (data.y = data'.y)
+
+  have h_proj : v = orthogonalProjection V data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · exact v_in_V
+    · exact h_min_v
+
+  have h_proj' : v' = orthogonalProjection V' data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · exact v'_in_V'
+    · exact h_min_v'
+
+  rw [h_proj, h_proj']
+  -- Since V = V', the projections are equal
+  congr 1
+  exact h_V_eq
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6513,14 +6676,15 @@ lemma optimal_coefficients_for_additive_dgp_proven
         · convert hPC_int using 1;
           exact h_indep.symm;
       have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) - model.γₘ₀ ⟨0, by norm_num⟩ * (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) := by
-        simp +decide [ h_dgp, sub_mul, add_mul, mul_assoc, mul_comm, mul_left_comm, sq, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const ];
+        rw [h_dgp]
+        simp +decide [ sub_mul, add_mul, mul_assoc, mul_comm, mul_left_comm, sq, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const ];
         simp +decide [ mul_add, mul_sub, mul_assoc, mul_comm, mul_left_comm, ← MeasureTheory.integral_const_mul ];
         rw [ MeasureTheory.integral_sub, MeasureTheory.integral_add ];
         · rw [ MeasureTheory.integral_add ];
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
