@@ -4314,11 +4314,19 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [← Matrix.rank_eq_finrank_span_cols]
+      rw [← Matrix.range_toLin']
+      rw [← h_range_eq]
+      rw [Matrix.range_toLin']
+      rw [Matrix.rank_eq_finrank_span_cols]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
+  -- Proof of rank equality is done in model_prime definition.
+  -- Main proof of prediction invariance requires showing fit minimizes L2 loss on the same subspace.
+  -- Due to resource constraints, we keep this part admitted for now, but the rank precondition is proven.
   admit
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
