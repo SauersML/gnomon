@@ -3999,7 +3999,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       · simp [hn, integrable_const]
       · have hn_pos : 0 < (n : ℝ) := by norm_cast; exact Nat.pos_of_ne_zero hn
         let p : NNReal := ⟨(n : ℝ), le_of_lt hn_pos⟩
-        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) (by norm_num)
+        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal ⟨(n : ℝ), le_of_lt hn_pos⟩
         have h_mem_pow := h_mem.norm_rpow (n : ℝ) hn_pos
         rw [Real.div_self (ne_of_gt hn_pos)] at h_mem_pow
         simp only [id_eq, Real.rpow_natCast] at h_mem_pow
@@ -4050,16 +4050,17 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           simp_rw [h_expand]
           rw [integral_add, integral_add]
           · rw [integral_const, integral_const_mul, integral_const_mul]
-            simp only [ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)]
+            -- Use exact names and arguments for gaussian integrals
+            have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal 0 1 (by norm_num)
             have h_var : ∫ x, x^2 ∂μP = 1 := by
-               have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+               -- Use variance definition directly
+               have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal ⟨2, by norm_num⟩
                have h_v := ProbabilityTheory.variance_id_gaussianReal 0 1 (by norm_num)
-               have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal 2
                rw [ProbabilityTheory.variance_eq_sub h_mem2] at h_v
                rw [h_mean] at h_v
                simp only [sub_zero, zero_pow two_ne_zero] at h_v
                exact h_v
-            rw [h_var]
+            rw [h_mean, h_var]
             simp
           · exact integrable_const _
           · apply Integrable.const_mul; exact h_gauss_moments 2
@@ -4070,7 +4071,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         refine h_integral_comp.congr (ae_of_all _ h_decomp)
       have h_sq_nonneg_base : ∀ c, 0 ≤ (predictorBase m c)^2 := fun c => sq_nonneg _
       have h_sq_nonneg_slope : ∀ c, 0 ≤ (predictorSlope m c)^2 := fun c => sq_nonneg _
-      exact (MeasureTheory.Integrable.add_iff_of_nonneg (ae_of_all _ h_sq_nonneg_base) (ae_of_all _ h_sq_nonneg_slope)).mp h_sum_sq_int |>.1.sqrt
+      -- Use correct name for integrable_add_iff_of_nonneg
+      exact (MeasureTheory.integrable_add_iff_of_nonneg (ae_of_all _ h_sq_nonneg_base) (ae_of_all _ h_sq_nonneg_slope)).mp h_sum_sq_int |>.1.sqrt
 
     have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
       have h_base_L2 : MemLp (predictorBase m) 2 μC := by
@@ -4082,13 +4084,27 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
            intro c
            simp only [linearPredictor_decomp m h_linear_basis.1]
            have h_ex : ∀ p, (predictorBase m c + predictorSlope m c * p)^2 = (predictorBase m c)^2 + 2 * predictorBase m c * predictorSlope m c * p + (predictorSlope m c)^2 * p^2 := by intro p; ring
-           simp_rw [h_ex, integral_add (integrable_const _ .add (h_p_int.const_mul _)) (h_p2_int.const_mul _), integral_add (integrable_const _) (h_p_int.const_mul _)]
-           simp [integral_const, integral_const_mul, ProbabilityTheory.integral_id_gaussianReal (μ:=0) (v:=1), ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ:=0) (v:=1) (by norm_num)]
+           -- Fix: use `integrable_add` sequence properly
+           simp_rw [h_ex]
+           rw [integral_add, integral_add]
+           · simp only [integral_const, integral_const_mul]
+             rw [ProbabilityTheory.integral_id_gaussianReal 0 1 (by norm_num)]
+             have h_var : ∫ x, x^2 ∂μP = 1 := by
+                 have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal ⟨2, by norm_num⟩
+                 have h_v := ProbabilityTheory.variance_id_gaussianReal 0 1 (by norm_num)
+                 rw [ProbabilityTheory.variance_eq_sub h_mem2] at h_v
+                 rw [ProbabilityTheory.integral_id_gaussianReal 0 1 (by norm_num)] at h_v
+                 simp at h_v; exact h_v
+             rw [h_var]; simp
+           · exact integrable_const _
+           · apply Integrable.const_mul; exact h_gauss_moments 2
+           · exact integrable_const _
+           · apply Integrable.const_mul; exact h_p_int
+
         have h_sum : Integrable (fun c => (predictorBase m c)^2 + (predictorSlope m c)^2) μC := h_integral_comp.congr (ae_of_all _ h_decomp)
         rw [memLp_two_iff_integrable_sq]
-        · exact (Integrable.add_iff.mp h_sum).1
+        · exact (MeasureTheory.integrable_add_iff_of_nonneg (ae_of_all _ (fun _ => sq_nonneg _)) (ae_of_all _ (fun _ => sq_nonneg _))).mp h_sum |>.1
         · apply Continuous.aestronglyMeasurable
-          -- predictorBase is continuous as sum of splines
           dsimp [predictorBase, evalSmooth]
           apply Continuous.add
           · exact continuous_const
@@ -4153,13 +4169,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-           have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+           have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal ⟨2, by norm_num⟩
            have h_v := ProbabilityTheory.variance_id_gaussianReal 0 1 (by norm_num)
-           have h_mem2 : MemLp id 2 μP := ProbabilityTheory.memLp_id_gaussianReal 2
            rw [ProbabilityTheory.variance_eq_sub h_mem2] at h_v
-           rw [h_mean] at h_v
-           simp only [sub_zero, zero_pow two_ne_zero] at h_v
-           exact h_v
+           rw [ProbabilityTheory.integral_id_gaussianReal 0 1 (by norm_num)] at h_v
+           simp at h_v; exact h_v
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4171,8 +4185,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
          rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-         rw [h_mean_P]
+         rw [ProbabilityTheory.integral_id_gaussianReal 0 1 (by norm_num)]
          ring
 
       rw [h_term1_zero, h_term2_zero]
@@ -4250,9 +4263,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
              exact (AEStronglyMeasurable.sub (h_scaling_meas.comp_snd) aestronglyMeasurable_const)
            · exact measurable_fst.aestronglyMeasurable
       have h_B_L2 : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
-         -- P is L2, pred is L2
-         -- We used this logic in h_B_sq_int, copy it if needed or extract as lemma.
-         -- But here we just need to know it's L2.
          have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
             unfold stdNormalProdMeasure
             rw [← memLp_map_measure_iff measurable_fst.aemeasurable]
@@ -4264,7 +4274,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
             rw [memLp_two_iff_integrable_sq]
             · exact h_norm_int
             · apply Continuous.aestronglyMeasurable
-              -- Copy continuity proof from above
               dsimp [linearPredictor, evalSmooth]
               apply Continuous.add
               · apply Continuous.add
