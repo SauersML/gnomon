@@ -6041,7 +6041,7 @@ theorem scenarios_are_distinct (k : ℕ) (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1_example k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
-    exact?
+    exact Calibrator.scenarios_are_distinct k hk_pos
 
 /-
 Scenario 1 has interaction, Scenarios 3 and 4 do not.
@@ -6052,7 +6052,7 @@ theorem scenarios_are_distinct_proven (k : ℕ) (hk_pos : 0 < k) :
   hasInteraction (dgpScenario1_example k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario3_example k).trueExpectation ∧
   ¬ hasInteraction (dgpScenario4_example k).trueExpectation := by
-    exact?
+    exact Calibrator.scenarios_are_distinct k hk_pos
 
 /-
 Prove several lemmas about DGP properties, drift, and nonlinearity of optimal slope under linear noise.
@@ -6062,11 +6062,7 @@ open Calibrator
 theorem necessity_of_phenotype_data_proven :
   ∃ (dgp_A dgp_B : DataGeneratingProcess 1),
     dgp_A.jointMeasure = dgp_B.jointMeasure ∧ hasInteraction dgp_A.trueExpectation ∧ ¬ hasInteraction dgp_B.trueExpectation := by
-      convert @scenarios_are_distinct_proven 1 _;
-      · constructor;
-        · exact fun h => scenarios_are_distinct_proven 1 zero_lt_one;
-        · exact?;
-      · norm_num +zetaDelta at *
+  exact Calibrator.necessity_of_phenotype_data
 
 theorem drift_implies_attenuation_proven {k : ℕ} [Fintype (Fin k)]
     (phys : DriftPhysics k) (c_near c_far : Fin k → ℝ)
