@@ -3995,13 +3995,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      let p : ℝ≥0 := n
-      have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) (by norm_num)
-      have h_pow : Integrable (fun x => |x| ^ (p : ℝ)) μP := by
-        have := (MemLp.norm_rpow_iff (p : ℝ) (by simp [p]; exact Nat.cast_nonneg n)).mp h_mem
-        exact this
-      simp only [id_eq, Real.rpow_natCast] at h_pow
-      exact integrable_norm_iff.mp h_pow
+      by_cases hn : n = 0
+      · simp [hn, integrable_const]
+      · have hn_pos : 0 < (n : ℝ) := by norm_cast; exact Nat.pos_of_ne_zero hn
+        let p : NNReal := ⟨(n : ℝ), le_of_lt hn_pos⟩
+        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal (μ := 0) (v := 1) (by norm_num)
+        have h_mem_pow := h_mem.norm_rpow (n : ℝ) hn_pos
+        rw [Real.div_self (ne_of_gt hn_pos)] at h_mem_pow
+        simp only [id_eq, Real.rpow_natCast] at h_mem_pow
+        rw [memLp_one_iff_integrable] at h_mem_pow
+        exact (integrable_norm_iff (measurable_id.pow_const n).aemeasurable).mp h_mem_pow
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4049,8 +4052,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           · rw [integral_const, integral_const_mul, integral_const_mul]
             simp [ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)]
             have h_var : ∫ x, x^2 ∂μP = 1 := by
-               rw [ProbabilityTheory.integral_sq_sub_mean_gaussianReal (μ:=0) (v:=1) (by norm_num)]
-               simp
+               have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+               have h_v := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1) (by norm_num)
+               rw [ProbabilityTheory.variance_eq_sub (h_gauss_moments 2) (h_gauss_moments 1)] at h_v
+               rw [h_mean] at h_v
+               simp at h_v
+               exact h_v
             rw [h_var]
             simp
           · exact integrable_const _
@@ -4195,13 +4202,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          -- Sum of L2 is L2. Square of L2 is L1.
          have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
             unfold stdNormalProdMeasure
-            rw [memLp_prod_iff]
-            · constructor
-              · rw [h_prod, Measure.fst_prod]; exact h_gauss_moments 2
-              · exact eventually_of_forall (fun _ => h_gauss_moments 2)
-            · apply AEStronglyMeasurable.fst
-              exact measurable_fst.aemeasurable
-            · exact one_le_two
+            rw [h_prod]
+            rw [← memLp_map_measure_iff measurable_fst.aemeasurable]
+            rw [Measure.map_fst_prod]
+            · rw [memLp_two_iff_integrable_sq measurable_id.aemeasurable]
+              exact h_gauss_moments 2
+            · infer_instance
          have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
             rw [memLp_two_iff_integrable_sq]
             · exact h_norm_int
@@ -4214,7 +4220,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                   apply continuous_finset_sum; intro j _
                   apply Continuous.mul
                   · exact continuous_const
-                  · exact (h_spline_cont j).comp (continuous_apply l).snd
+                  · exact Continuous.comp (h_spline_cont j) (Continuous.comp (continuous_apply l) continuous_snd)
               · apply continuous_finset_sum; intro idx _
                 apply Continuous.mul
                 · apply Continuous.add
@@ -4223,7 +4229,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                     apply continuous_finset_sum; intro j _
                     apply Continuous.mul
                     · exact continuous_const
-                    · exact (h_spline_cont j).comp (continuous_apply l).snd
+                    · exact Continuous.comp (h_spline_cont j) (Continuous.comp (continuous_apply l) continuous_snd)
                 · exact (h_pgs_cont _).comp continuous_fst
          apply (MemLp.sub h_P_L2 h_pred_L2).integrable_sq
 
@@ -4233,7 +4239,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          rw [memLp_two_iff_integrable_sq]
          · exact h_A_sq_int
          · refine AEStronglyMeasurable.mul ?_ ?_
-           · exact (AEStronglyMeasurable.sub (h_scaling_meas.comp_snd) aeStronglyMeasurable_const)
+           · exact (AEStronglyMeasurable.sub (h_scaling_meas.comp_snd) aestronglyMeasurable_const)
            · exact measurable_fst.aemeasurable
       have h_B_L2 : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
          -- P is L2, pred is L2
@@ -4241,13 +4247,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          -- But here we just need to know it's L2.
          have h_P_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
             unfold stdNormalProdMeasure
-            rw [memLp_prod_iff]
-            · constructor
-              · rw [h_prod, Measure.fst_prod]; exact h_gauss_moments 2
-              · exact eventually_of_forall (fun _ => h_gauss_moments 2)
-            · apply AEStronglyMeasurable.fst
-              exact measurable_fst.aemeasurable
-            · exact one_le_two
+            rw [h_prod]
+            rw [← memLp_map_measure_iff measurable_fst.aemeasurable]
+            rw [Measure.map_fst_prod]
+            · rw [memLp_two_iff_integrable_sq measurable_id.aemeasurable]
+              exact h_gauss_moments 2
+            · infer_instance
          have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
             rw [memLp_two_iff_integrable_sq]
             · exact h_norm_int
@@ -4261,7 +4266,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                   apply continuous_finset_sum; intro j _
                   apply Continuous.mul
                   · exact continuous_const
-                  · exact (h_spline_cont j).comp (continuous_apply l).snd
+                  · exact Continuous.comp (h_spline_cont j) (Continuous.comp (continuous_apply l) continuous_snd)
               · apply continuous_finset_sum; intro idx _
                 apply Continuous.mul
                 · apply Continuous.add
@@ -4270,7 +4275,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
                     apply continuous_finset_sum; intro j _
                     apply Continuous.mul
                     · exact continuous_const
-                    · exact (h_spline_cont j).comp (continuous_apply l).snd
+                    · exact Continuous.comp (h_spline_cont j) (Continuous.comp (continuous_apply l) continuous_snd)
                 · exact (h_pgs_cont _).comp continuous_fst
          exact MemLp.sub h_P_L2 h_pred_L2
 
