@@ -4007,14 +4007,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         rw [← integrable_norm_iff h_meas]
         simp only [norm_pow, Real.norm_eq_abs]
         rw [← memLp_one_iff_integrable]
-        convert h_pow using 2
-        · ext x
-          simp only [f, n_real, id_eq, Real.norm_eq_abs, Real.rpow_natCast]
-        · simp only [n_real, n_nn, Nat.abs_cast, ENNReal.ofReal_natCast, ENNReal.coe_natCast]
-          rw [ENNReal.div_self]
-          · simp only [ne_eq, Nat.cast_eq_zero]
-            exact Nat.cast_ne_zero.mpr (ne_of_gt hn_pos)
-          · exact ENNReal.coe_ne_top
+        refine h_pow.congr (ae_of_all _ (fun x => ?_))
+        simp only [f, n_real, id_eq, Real.norm_eq_abs, Real.rpow_natCast]
+        simp only [n_real, n_nn, Nat.abs_cast]
+        rw [abs_pow]
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4087,14 +4083,17 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           rw [memLp_two_iff_integrable_sq (measurable_id.aestronglyMeasurable)]
           exact h_p2_int
         rw [ProbabilityTheory.variance_eq_sub h_mem_2] at h_var
-        simp only [id_eq, integral_id] at h_var
+        dsimp only [id] at h_var
         rw [h_mean_p] at h_var
         simp at h_var
         exact h_var
 
       have h_inner_int : ∀ c, ∫ p, (predictorBase m c + m.γₘ₀ 0 * p)^2 ∂μP = (predictorBase m c)^2 + (m.γₘ₀ 0)^2 := by
         intro c
-        simp only [add_sq, mul_pow]
+        have h_expand : ∀ p, (predictorBase m c + m.γₘ₀ 0 * p)^2 = (predictorBase m c)^2 + 2 * predictorBase m c * (m.γₘ₀ 0 * p) + (m.γₘ₀ 0)^2 * p^2 := by
+          intro p; ring
+        rw [integral_congr_ae (ae_of_all _ h_expand)]
+
         have h_A : Integrable (fun p => (predictorBase m c)^2) μP := integrable_const _
         have h_B : Integrable (fun p => 2 * predictorBase m c * (m.γₘ₀ 0 * p)) μP := by
           refine (h_p_int.const_mul (2 * predictorBase m c * m.γₘ₀ 0)).congr (ae_of_all _ (fun p => by ring))
@@ -4103,9 +4102,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
         rw [integral_add (h_A.add h_B) h_C, integral_add h_A h_B]
 
-        -- Handle constant integral explicitly
         rw [integral_const]
-        simp only [measure_univ, ENNReal.one_toReal, mul_one]
+        have : (μP Set.univ).toReal = 1 := by
+          rw [measure_univ]; norm_num
+        rw [this, mul_one]
 
         have h_int_B : ∫ p, 2 * predictorBase m c * (m.γₘ₀ 0 * p) ∂μP = 0 := by
            rw [integral_const_mul, integral_const_mul, h_mean_p]; ring
