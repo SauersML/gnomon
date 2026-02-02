@@ -4297,7 +4297,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
 
   rw [h0, zero_add] at h1
   unfold predictorSlope at h1
-  exact h1.symm
+  exact h1
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
