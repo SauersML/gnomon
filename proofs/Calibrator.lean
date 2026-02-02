@@ -4453,11 +4453,16 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      -- Explicitly construct the rank equality to help type class inference
-      have h1 : Matrix.rank (designMatrix data pgsBasis splineBasis) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis))) :=
-        Matrix.rank_eq_finrank_range_toLin
-      have h2 : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) :=
-        Matrix.rank_eq_finrank_range_toLin
+      -- Explicitly construct the rank equality using the canonical basis
+      let v1 := Pi.basisFun ℝ (Fin n)
+      let v2 := Pi.basisFun ℝ (ParamIx p k sp)
+      have h1 : Matrix.rank (designMatrix data pgsBasis splineBasis) = Module.finrank ℝ (LinearMap.range (Matrix.toLin v2 v1 (designMatrix data pgsBasis splineBasis))) :=
+        Matrix.rank_eq_finrank_range_toLin (designMatrix data pgsBasis splineBasis) v1 v2
+      have h2 : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Module.finrank ℝ (LinearMap.range (Matrix.toLin v2 v1 (designMatrix data' pgsBasis splineBasis))) :=
+        Matrix.rank_eq_finrank_range_toLin (designMatrix data' pgsBasis splineBasis) v1 v2
+      -- Use that toLin' is toLin with canonical bases
+      rw [← Matrix.toLin_eq_toLin'] at h1
+      rw [← Matrix.toLin_eq_toLin'] at h2
       rw [h1] at h_rank
       rw [h_range_eq] at h_rank
       rw [← h2] at h_rank
