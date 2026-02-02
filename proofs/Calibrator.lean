@@ -2697,7 +2697,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hsum' :
           a * b * (∑ i, (r₁ i - r₂ i) ^ 2) =
             ∑ i, a * b * (r₁ i - r₂ i) ^ 2 := by
-        simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+        simp [Finset.mul_sum]
       have hsum'' :
           a * b * (∑ i, (r₁ - r₂) i ^ 2) =
             a * b * (∑ i, (r₁ i - r₂ i) ^ 2) := by
@@ -3307,9 +3307,9 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   intro j _
                   ring
               _ = ∑ j, a * (c₁ j * splineBasis.b j x) + ∑ j, b * (c₂ j * splineBasis.b j x) := by
-                  simpa [Finset.sum_add_distrib]
+                  simp [Finset.sum_add_distrib]
               _ = a * ∑ j, c₁ j * splineBasis.b j x + b * ∑ j, c₂ j * splineBasis.b j x := by
-                  simp [Finset.mul_sum, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.mul_sum]
 
           have h₁ : ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) = 0 := by
             simpa [β₁, packParams, hm₁.1.spline_match] using hm₁.2.1 l
@@ -5353,7 +5353,7 @@ theorem sum_to_zero_after_projection
 
   -- Step 2: Use diagonal form of W to simplify
   rw [hW_diag]
-  simp [Matrix.diagonal_apply]
+  simp
 
   -- Step 3: Swap the order of summation
   -- Σᵢ (Σⱼ aᵢⱼ * βⱼ) * wᵢ = Σⱼ βⱼ * (Σᵢ aᵢⱼ * wᵢ)
@@ -5422,7 +5422,7 @@ theorem sum_to_zero_after_projection
   -- Need to show the sum forms are equal
 
   -- Expand both sides more carefully
-  simp only [Matrix.mul_apply, Matrix.transpose_apply, sumToZeroConstraint]
+  simp only [Matrix.mul_apply]
   -- LHS: Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ
   -- RHS: Σₖ (Σᵢ (B*Z)ᵢⱼ * Wᵢₖ) * 1
 
@@ -6705,7 +6705,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
         convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.2 using 1;
       have h_integral_prod : ∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1 ∂dgp.jointMeasure) * (∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
         rw [ h_indep, MeasureTheory.integral_prod ];
-        · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_prod ];
+        · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul ];
           rw [ MeasureTheory.integral_map, MeasureTheory.integral_map ];
           · rw [ ← h_indep ];
           · exact measurable_snd.aemeasurable;
