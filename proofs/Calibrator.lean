@@ -4080,10 +4080,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
             simp at h_var_def
             rw [← h_var_def]
             exact h_var
-          · exact (integrable_const _).mul h_p_int
-          · exact (integrable_const _).mul h_p2_int
-        · exact (integrable_const _).add ((integrable_const _).mul h_p_int)
-        · exact (integrable_const _).mul h_p2_int
+          · exact h_p_int.const_mul _
+          · exact h_p2_int.const_mul _
+        · exact (integrable_const _).add (h_p_int.const_mul _)
+        · exact h_p2_int.const_mul _
 
       refine h_inner_int.mono ?_ ?_
       · apply Continuous.aestronglyMeasurable
@@ -4098,7 +4098,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           exact (h_spline_cont j).comp (continuous_apply l)
       · filter_upwards with c
         rw [h_decomp_sq c]
-        exact le_add_of_nonneg_right (sq_nonneg _)
+        intro h_eq
+        exact le_add_of_nonneg_right (sq_nonneg (predictorSlope m c))
 
     have h_base_int : Integrable (predictorBase m) μC := by
       have h_base_cont : Continuous (predictorBase m) := by
@@ -4225,6 +4226,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          ring
 
       have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+         -- Explicitly provide the measure to comp_fst to allow proper type checking
          refine ((MeasureTheory.Integrable.comp_fst h_p2_int (ν := μC)).add h_norm_int).mono' ?_ ?_
          · exact h_norm_int.aestronglyMeasurable.sub (h_p_int.comp_fst.aestronglyMeasurable) |>.pow 2
          · filter_upwards with pc
@@ -4284,6 +4286,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   unfold expectedSquaredError at h_opt_risk h_risk_star
   rw [h_opt_risk]
   exact h_risk_star
+
 
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
     the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
