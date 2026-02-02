@@ -57,6 +57,66 @@ namespace Calibrator
 
 /-!
 =================================================================
+## Part 0: Gaussian Measure Integrability
+=================================================================
+
+For any natural number n, the function x^n is integrable with respect to the
+standard Gaussian measure. This is foundational for all L² projection arguments.
+-/
+
+/-- The standard Gaussian measure μ = N(0,1). -/
+noncomputable def stdGaussianMeasure : MeasureTheory.Measure Real := ProbabilityTheory.gaussianReal 0 1
+
+/-- Polynomial function x^n. -/
+def poly_n (n : Nat) (x : Real) : Real := x ^ n
+
+/-- For any natural number n, x^n is integrable with respect to the standard Gaussian measure.
+    This follows from the finiteness of Gaussian moments. -/
+theorem integrable_poly_n (n : Nat) : MeasureTheory.Integrable (poly_n n) stdGaussianMeasure := by
+  have h_gauss_integral : ∀ n : ℕ, MeasureTheory.IntegrableOn (fun x : ℝ => x^n * Real.exp (-x^2 / 2)) (Set.univ : Set ℝ) := by
+    intro n
+    have := @integrable_rpow_mul_exp_neg_mul_sq
+    simpa [ div_eq_inv_mul ] using @this ( 1 / 2 ) ( by norm_num ) n ( by linarith )
+  unfold poly_n
+  unfold stdGaussianMeasure
+  simp_all +decide [ mul_comm, ProbabilityTheory.gaussianReal ]
+  refine' MeasureTheory.Integrable.mono' _ _ _
+  refine' fun x => |x ^ n|
+  · refine' MeasureTheory.Integrable.abs _
+    rw [ MeasureTheory.integrable_withDensity_iff ]
+    · convert h_gauss_integral n |> fun h => h.div_const ( Real.sqrt ( 2 * Real.pi ) ) using 2 ; norm_num [ ProbabilityTheory.gaussianPDF ] ; ring
+      norm_num [ ProbabilityTheory.gaussianPDFReal ] ; ring
+      rw [ ENNReal.toReal_ofReal ( Real.exp_nonneg _ ) ]
+    · fun_prop
+    · simp [ProbabilityTheory.gaussianPDF]
+  · exact Continuous.aestronglyMeasurable ( by continuity )
+  · exact Filter.Eventually.of_forall fun x => Real.norm_eq_abs _ ▸ le_rfl
+
+/-- x^2 is integrable with respect to the standard Gaussian measure. -/
+theorem integrable_sq_gaussian : MeasureTheory.Integrable (fun x => x ^ 2) stdGaussianMeasure := by
+  apply integrable_poly_n 2
+
+/-- x is integrable with respect to the standard Gaussian measure. -/
+theorem integrable_id_gaussian : MeasureTheory.Integrable (fun x => x) stdGaussianMeasure := by
+  have h := integrable_poly_n 1
+  unfold poly_n at h
+  simp only [pow_one] at h
+  exact h
+
+/-- x^4 is integrable with respect to the standard Gaussian measure (useful for variance calculations). -/
+theorem integrable_pow4_gaussian : MeasureTheory.Integrable (fun x => x ^ 4) stdGaussianMeasure := by
+  apply integrable_poly_n 4
+
+/-- If f is integrable on μ and g is integrable on ν, then f(x) * g(y) is integrable on μ.prod ν.
+    This is essential for Fubini-type arguments on product measures. -/
+theorem integrable_prod_mul {X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y]
+    {μ : Measure X} {ν : Measure Y} [SigmaFinite μ] [SigmaFinite ν]
+    (f : X → ℝ) (g : Y → ℝ) (hf : Integrable f μ) (hg : Integrable g ν) :
+    Integrable (fun p : X × Y => f p.1 * g p.2) (μ.prod ν) := by
+  exact hf.prod_mul hg
+
+/-!
+=================================================================
 ## Part 1: Definitions
 =================================================================
 -/
@@ -5914,6 +5974,85 @@ section GradientDescentVerification
 open Matrix
 
 variable {n p k : ℕ} [Fintype (Fin n)] [Fintype (Fin p)] [Fintype (Fin k)]
+
+/-!
+### Matrix Calculus: Log-Determinant Derivatives
+
+We define `H(rho) = A + exp(rho) * B` and prove that the derivative of `log(det(H(rho)))`
+with respect to `rho` is `exp(rho) * trace(H(rho)⁻¹ * B)`. This uses Jacobi's formula
+for the derivative of the determinant.
+-/
+
+variable {m : Type*} [Fintype m] [DecidableEq m]
+
+/-- Matrix function H(ρ) = A + exp(ρ) * B. -/
+noncomputable def H_matrix (A B : Matrix m m ℝ) (rho : ℝ) : Matrix m m ℝ := A + Real.exp rho • B
+
+/-- The log-determinant function f(ρ) = log(det(H(ρ))). -/
+noncomputable def log_det_H (A B : Matrix m m ℝ) (rho : ℝ) := Real.log (H_matrix A B rho).det
+
+/-- The derivative of log(det(H(ρ))) = log(det(A + exp(ρ)B)) with respect to ρ
+    is exp(ρ) * trace(H(ρ)⁻¹ * B). This is derived using Jacobi's formula. -/
+theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
+    (_hA : A.PosDef) (_hB : B.IsSymm)
+    (rho : ℝ) (h_inv : (H_matrix A B rho).det ≠ 0) :
+    deriv (log_det_H A B) rho = Real.exp rho * ((H_matrix A B rho)⁻¹ * B).trace := by
+  have h_det : deriv (fun rho => Real.log (Matrix.det (A + Real.exp rho • B))) rho = Real.exp rho * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) := by
+    have h_det_step1 : deriv (fun rho => Matrix.det (A + Real.exp rho • B)) rho = Matrix.det (A + Real.exp rho • B) * Matrix.trace ((A + Real.exp rho • B)⁻¹ * B) * Real.exp rho := by
+      have h_jacobi : deriv (fun rho => Matrix.det (A + Real.exp rho • B)) rho = Matrix.trace (Matrix.adjugate (A + Real.exp rho • B) * deriv (fun rho => A + Real.exp rho • B) rho) := by
+        have h_jacobi : ∀ (M : ℝ → Matrix m m ℝ), DifferentiableAt ℝ M rho → deriv (fun rho => Matrix.det (M rho)) rho = Matrix.trace (Matrix.adjugate (M rho) * deriv M rho) := by
+          intro M hM_diff
+          have h_jacobi : deriv (fun rho => Matrix.det (M rho)) rho = ∑ i, ∑ j, (Matrix.adjugate (M rho)) i j * deriv (fun rho => (M rho) j i) rho := by
+            simp +decide [ Matrix.det_apply', Matrix.adjugate_apply, Matrix.mul_apply ]
+            have h_jacobi : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
+              have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
+                intro σ
+                have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
+                  exact?
+                apply h_prod_rule
+                intro i
+                exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
+              have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
+                have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
+                  intro σ
+                  have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
+                    intro i
+                    exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
+                  exact?
+                norm_num [ h_diff ]
+              simpa only [ h_jacobi ] using h_deriv_sum
+            simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
+            simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
+            rw [ Finset.sum_comm ]
+            refine' Finset.sum_congr rfl fun i hi => _
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
+            intro j hj; simp +decide [ Pi.single_apply, hj ]
+            rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
+            exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
+          rw [ h_jacobi, Matrix.trace ]
+          rw [ deriv_pi ]
+          · simp +decide [ Matrix.mul_apply, Finset.mul_sum _ _ _ ]
+            refine' Finset.sum_congr rfl fun i _ => Finset.sum_congr rfl fun j _ => _
+            rw [ deriv_pi ]
+            intro i; exact (by
+            exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff j ) i ) differentiableAt_id)
+          · exact fun i => DifferentiableAt.comp rho ( differentiableAt_pi.1 hM_diff i ) differentiableAt_id
+        apply h_jacobi
+        exact differentiableAt_pi.2 fun i => differentiableAt_pi.2 fun j => DifferentiableAt.add ( differentiableAt_const _ ) ( DifferentiableAt.smul ( Real.differentiableAt_exp ) ( differentiableAt_const _ ) )
+      simp_all +decide [ Matrix.inv_def, mul_assoc, mul_left_comm, mul_comm, Matrix.trace_mul_comm ( Matrix.adjugate _ ) ]
+      rw [ show deriv ( fun rho => A + Real.exp rho • B ) rho = Real.exp rho • B from ?_ ]
+      · by_cases h : Matrix.det ( A + Real.exp rho • B ) = 0 <;> simp_all +decide [ Matrix.trace_smul, mul_assoc, mul_comm, mul_left_comm ]
+        exact False.elim <| h_inv h
+      · rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
+        ext i; rw [ deriv_pi ] <;> norm_num [ Real.differentiableAt_exp, mul_comm ]
+    by_cases h_det : DifferentiableAt ℝ ( fun rho => Matrix.det ( A + Real.exp rho • B ) ) rho <;> simp_all +decide [ Real.exp_ne_zero, mul_assoc, mul_comm, mul_left_comm ]
+    · convert HasDerivAt.deriv ( HasDerivAt.log ( h_det.hasDerivAt ) h_inv ) using 1 ; ring!
+      exact eq_div_of_mul_eq ( by aesop ) ( by linear_combination' h_det_step1.symm )
+    · contrapose! h_det
+      simp +decide [ Matrix.det_apply' ]
+      fun_prop (disch := norm_num)
+  exact h_det
 
 -- 1. Model Functions
 noncomputable def S_lambda_fn (S_basis : Fin k → Matrix (Fin p) (Fin p) ℝ) (rho : Fin k → ℝ) : Matrix (Fin p) (Fin p) ℝ :=
