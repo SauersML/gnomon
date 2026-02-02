@@ -1580,7 +1580,7 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (_hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
     (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
-    (_hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
@@ -4056,7 +4056,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       convert integrable_poly_n n
       simp [poly_n, stdGaussianMeasure]
 
-    have h_p_int : Integrable (fun p : ℝ => p) μP := by
+    _h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
         simp at h
         exact h
@@ -4099,7 +4099,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       · exact Measurable.aestronglyMeasurable (measurable_pow_const n)
       · infer_instance
 
-    have h_base_int : Integrable (predictorBase m) μC := by
+    _h_base_int : Integrable (predictorBase m) μC := by
       unfold predictorBase evalSmooth
       apply Integrable.add
       · exact integrable_const _
@@ -4137,7 +4137,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · exact memLp_const 1
       · exact h_base_L2
 
-    have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
+    _h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
         Integrable (fun pc : ℝ × (Fin k → ℝ) => f pc.1 * g pc.2) (μP.prod μC) := by
       intro f g hf hg
@@ -6617,8 +6617,8 @@ open Calibrator
 lemma integral_mul_fst_snd_eq_zero_proven
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (_hP_int : Integrable (fun pc => pc.1) μ)
+    (_hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
     ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
@@ -6884,8 +6884,8 @@ lemma optimal_coefficients_for_additive_dgp_proven
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
     -- Integrability hypotheses
-    (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
+    (hP_integrable : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
+    (hC_integrable : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
@@ -6893,7 +6893,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
       have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.2 using 1;
+        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_integrable hP2_int hYP_int h_resid_sq_int |>.2 using 1;
       have h_integral_prod : ∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1 ∂dgp.jointMeasure) * (∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
         rw [ h_indep, MeasureTheory.integral_prod ];
         · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_prod ];
@@ -6912,7 +6912,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
         · rw [ MeasureTheory.integral_add ];
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
-          · exact hP_int.mul_const _;
+          · exact hP_integrable.mul_const _;
           · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
             rfl;
         · simpa only [ sq ] using hP2_int;
@@ -6921,20 +6921,20 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simpa only [ sq ] using hP2_int;
           · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
         · ring_nf;
-          exact MeasureTheory.Integrable.add ( hP_int.mul_const _ ) ( hP2_int.mul_const _ );
+          exact MeasureTheory.Integrable.add ( hP_integrable.mul_const _ ) ( hP2_int.mul_const _ );
       have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.1 using 1;
+        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_integrable hP2_int hYP_int h_resid_sq_int |>.1 using 1;
       rw [ MeasureTheory.integral_sub ] at h_linear_coeff;
       · rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
         · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff;
           rw [ h_dgp ] at h_linear_coeff;
           rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
           · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff ; constructor <;> nlinarith;
-          · exact hP_int;
-          · exact hC_int.const_mul _;
-        · exact hP_int.const_mul _;
+          · exact hP_integrable;
+          · exact hC_integrable.const_mul _;
+        · exact hP_integrable.const_mul _;
       · exact hY_int;
-      · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
+      · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_integrable _ )
 
 /-
 L2 integrability implies L1 integrability on a finite measure space.
