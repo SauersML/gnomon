@@ -4193,7 +4193,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
           have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
           have h_var_eq := ProbabilityTheory.variance_id_gaussianReal (μ := 0) (v := 1)
-          rw [ProbabilityTheory.variance_def' (ProbabilityTheory.memLp_id_gaussianReal 2)] at h_var_eq
+          rw [ProbabilityTheory.variance_eq_sub (ProbabilityTheory.memLp_id_gaussianReal 2)] at h_var_eq
           rw [h_mean] at h_var_eq
           simp at h_var_eq
           exact h_var_eq
@@ -4255,17 +4255,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h_pred_memLp : MemLp (fun pc => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
           (memLp_two_iff_integrable_sq h_pred_meas).mpr h_pred_sq_int
 
-        exact ((memLp_two_iff_integrable_sq (h_p_memLp.sub h_pred_memLp).aestronglyMeasurable).mp (h_p_memLp.sub h_pred_memLp)).2
+        exact ((memLp_two_iff_integrable_sq (h_p_memLp.sub h_pred_memLp).aestronglyMeasurable).mp (h_p_memLp.sub h_pred_memLp))
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
         have h_A_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1) (stdNormalProdMeasure k) := by
            unfold stdNormalProdMeasure
            apply AEStronglyMeasurable.mul
-           · apply AEStronglyMeasurable.comp_measurable
-             · apply AEStronglyMeasurable.sub
-               · exact h_scaling_meas
-               · exact aestronglyMeasurable_const
-             · exact measurable_snd
+           · refine AEStronglyMeasurable.comp_measurable ?_ measurable_snd
+             apply AEStronglyMeasurable.sub
+             · exact AEStronglyMeasurable.comp_measurable h_scaling_meas measurable_snd
+             · exact aestronglyMeasurable_const
            · exact measurable_fst.aestronglyMeasurable
         have h_B_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => pc.1 - linearPredictor m pc.1 pc.2) (stdNormalProdMeasure k) :=
            measurable_fst.aestronglyMeasurable.sub h_pred_meas
@@ -4277,14 +4276,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         exact MemLp.integrable_mul h_A_memLp h_B_memLp
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      rw [← integral_add]
-      · rw [← integral_add]
-        · refine integral_congr_ae (ae_of_all _ (fun pc => ?_))
-          ring
-        · exact h_A_sq_int
-        · exact h_B_sq_int
-      · exact h_A_sq_int.add h_B_sq_int
-      · exact h_cross_int.const_mul 2
+      rw [← integral_add h_A_sq_int h_B_sq_int]
+      rw [← integral_add (h_A_sq_int.add h_B_sq_int) (h_cross_int.const_mul 2)]
+      refine integral_congr_ae (ae_of_all _ (fun pc => ?_))
+      ring
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -4567,7 +4562,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   have h_v_opt : ∀ w ∈ W, dist y v ≤ dist y w := by
     intro w hw
     rcases hw with ⟨β, hβ⟩
-    have h_ineq := h_min.2 (unpackParams pgsBasis splineBasis β) ⟨rfl, rfl, rfl, rfl⟩
+    have h_model_class : InModelClass (unpackParams pgsBasis splineBasis β) pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_ineq := h_min (unpackParams pgsBasis splineBasis β) h_model_class
     simp only [h_lambda_zero, empiricalLoss, gaussianPenalizedLoss, mul_zero, add_zero, sub_zero] at h_ineq
     have h_pack_unpack : packParams (unpackParams pgsBasis splineBasis β) = β := by
       ext i; cases i <;> rfl
@@ -4575,12 +4571,13 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     rw [h_loss_eq_dist (packParams model), h_loss_eq_dist β] at h_ineq
     rw [mul_le_mul_left hn_inv_pos, sq_le_sq] at h_ineq
     rw [← hβ]
-    exact h_ineq.2
+    exact h_ineq
   have h_v_opt' : ∀ w ∈ W, dist y v' ≤ dist y w := by
     intro w hw
     rw [← hW] at hw
     rcases hw with ⟨β', hβ'⟩
-    have h_ineq := h_min'.2 (unpackParams pgsBasis splineBasis β') ⟨rfl, rfl, rfl, rfl⟩
+    have h_model_class : InModelClass (unpackParams pgsBasis splineBasis β') pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_ineq := h_min' (unpackParams pgsBasis splineBasis β') h_model_class
     simp only [h_lambda_zero, empiricalLoss, gaussianPenalizedLoss, mul_zero, add_zero, sub_zero] at h_ineq
     have h_pack_unpack : packParams (unpackParams pgsBasis splineBasis β') = β' := by
       ext i; cases i <;> rfl
@@ -4588,17 +4585,18 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     rw [h_loss_eq_dist' (packParams model_prime), h_loss_eq_dist' β'] at h_ineq
     rw [mul_le_mul_left hn_inv_pos, sq_le_sq] at h_ineq
     rw [← hβ']
-    exact h_ineq.2
-  haveI : CompleteSpace W := Submodule.complete_of_finiteDimensional _
-  let P := orthogonalProjection W
-  have h_proj_le : dist y (P y) ≤ dist y v := dist_orthogonalProjection_le_dist (v : Fin n → ℝ)
+    exact h_ineq
+  haveI : FiniteDimensional ℝ W := Module.Finite.range (Matrix.toLin' X)
+  haveI : CompleteSpace W := FiniteDimensional.complete ℝ W
+  let P := InnerProductSpace.orthogonalProjection W
+  have h_proj_le : dist y (P y) ≤ dist y v := InnerProductSpace.dist_orthogonalProjection_le_dist (v : Fin n → ℝ)
   have h_v_le : dist y v ≤ dist y (P y) := h_v_opt (P y) (P y).2
   have h_dist_eq : dist y v = dist y (P y) := le_antisymm h_v_le h_proj_le
-  have h_eq_v : v = P y := eq_orthogonalProjection_of_dist_eq hv h_dist_eq
-  have h_proj_le' : dist y (P y) ≤ dist y v' := dist_orthogonalProjection_le_dist (v' : Fin n → ℝ)
+  have h_eq_v : v = P y := InnerProductSpace.eq_orthogonalProjection_of_dist_eq hv h_dist_eq
+  have h_proj_le' : dist y (P y) ≤ dist y v' := InnerProductSpace.dist_orthogonalProjection_le_dist (v' : Fin n → ℝ)
   have h_v_le' : dist y v' ≤ dist y (P y) := h_v_opt' (P y) (P y).2
   have h_dist_eq' : dist y v' = dist y (P y) := le_antisymm h_v_le' h_proj_le'
-  have h_eq_v' : v' = P y := eq_orthogonalProjection_of_dist_eq hv' h_dist_eq'
+  have h_eq_v' : v' = P y := InnerProductSpace.eq_orthogonalProjection_of_dist_eq hv' h_dist_eq'
   have h_eq : v = v' := by rw [h_eq_v, h_eq_v']
   have h_lin_model : linearPredictor model (data.p i) (data.c i) = v i := by
     rw [linearPredictor_eq_designMatrix_mulVec]
