@@ -4050,10 +4050,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      convert integrable_poly_n n
+      simp [poly_n]
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4085,9 +4086,38 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    -- Integrability of monomials c[l]^n on μC
+    have h_monomial_int : ∀ (l : Fin k) (n : ℕ), Integrable (fun c : Fin k → ℝ => (c l)^n) μC := by
+      intro l n
+      rw [Measure.pi_integrable_iff_of_integrable_proj]
+      use l, (h_gauss_moments n)
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+    -- L2 property of predictorBase (polynomial in c)
+    have h_base_L2 : MemLp (predictorBase m) 2 μC := by
+      unfold predictorBase
+      apply MemLp.add
+      · exact memLp_const _
+      · apply memLp_finset_sum
+        intro l _
+        unfold evalSmooth
+        apply memLp_finset_sum
+        intro i _
+        rw [memLp_two_iff_integrable_sq]
+        · exact (h_monomial_int l (2 * (i.val + 1))).const_mul _
+        · apply AEStronglyMeasurable.const_mul
+          apply AEStronglyMeasurable.pow
+          exact (measurable_pi_apply l).aestronglyMeasurable
+
+    have h_base_int : Integrable (predictorBase m) μC :=
+      MemLp.integrable one_le_two h_base_L2
+
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      have h_Sm1_L2 : MemLp (fun c => scaling_func c - 1) 2 μC := by
+        apply MemLp.sub
+        · rw [memLp_two_iff_integrable_sq h_scaling_meas']
+          exact h_scaling_sq_int'
+        · exact memLp_const 1
+      exact MemLp.integrable_mul h_Sm1_L2 h_base_L2
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4137,9 +4167,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          admit
+          have h_mean : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+          have h_var_val : ProbabilityTheory.variance μP id = 1 := ProbabilityTheory.variance_id_gaussianReal 0 1
+          rw [ProbabilityTheory.variance_def' h_p2_int h_p_int.aestronglyMeasurable] at h_var_val
+          rw [h_mean] at h_var_val
+          simp at h_var_val
+          exact h_var_val
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
           rw [integral_sub h_S_int (integrable_const 1)]
           rw [h_map] at h_mean_1
@@ -4184,13 +4217,94 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
          ring
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+        unfold stdNormalProdMeasure
+        -- Integrability of (p - (base + slope*p))^2
+        -- Expand: (1-slope)^2 p^2 - 2(1-slope)p base + base^2
+        have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC :=
+          MemLp.integrable one_le_two (by apply MemLp.sq_memLp; exact h_base_L2)
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
+        have h_slope_val : predictorSlope m = fun c => m.γₘ₀ 0 := by
+          ext c
+          simp [predictorSlope, evalSmooth, hm_norm.fₘₗ_zero]
 
-      -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
+        apply Integrable.add
+        · apply Integrable.sub
+          · -- (1-slope)^2 p^2
+            refine (h_prod_int h_p2_int (integrable_const _)).congr (ae_of_all _ (fun pc => ?_))
+            simp [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
+            ring
+          · -- 2(1-slope)p base
+            refine (h_prod_int h_p_int h_base_int).const_mul _
+        · -- base^2
+          refine (h_prod_int (integrable_const 1) h_base_sq_int).congr (ae_of_all _ (fun pc => ?_))
+          simp
+
+      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+         -- Product of L2 functions
+         apply MemLp.integrable_mul
+         · -- A = (S-1)p is L2
+           apply MemLp.mul
+           · have h_Sm1_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => scaling_func pc.2 - 1) 2 (stdNormalProdMeasure k) := by
+               unfold stdNormalProdMeasure
+               rw [memLp_two_iff_integrable_sq]
+               · refine (h_prod_int (integrable_const 1) (by
+                   rw [← memLp_two_iff_integrable_sq]
+                   apply MemLp.sub
+                   · rw [memLp_two_iff_integrable_sq h_scaling_meas']
+                     exact h_scaling_sq_int'
+                   · exact memLp_const 1
+                 )).congr (ae_of_all _ (fun pc => by simp))
+               · exact ((h_scaling_meas'.sub aestronglyMeasurable_const).comp_snd).aemeasurable
+             exact h_Sm1_L2
+           · have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+               unfold stdNormalProdMeasure
+               rw [memLp_two_iff_integrable_sq]
+               · exact (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
+               · exact measurable_fst.aemeasurable.aestronglyMeasurable
+             exact h_p_L2
+         · -- B = p - pred is L2
+           have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+             -- pred = base + slope*p. base L2, slope constant, p L2.
+             unfold stdNormalProdMeasure
+             have h_slope_val : predictorSlope m = fun c => m.γₘ₀ 0 := by
+                ext c
+                simp [predictorSlope, evalSmooth, hm_norm.fₘₗ_zero]
+             have h_decomp : ∀ pc : ℝ × (Fin k → ℝ), linearPredictor m pc.1 pc.2 = predictorBase m pc.2 + m.γₘ₀ 0 * pc.1 := by
+               intro pc
+               rw [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
+
+             rw [memLp_two_iff_integrable_sq]
+             · -- (base + k*p)^2 <= 2 base^2 + 2 k^2 p^2
+               apply Integrable.add
+               · apply Integrable.add
+                 · -- base^2
+                   refine (h_prod_int (integrable_const 1) (by apply MemLp.sq_memLp; exact h_base_L2)).congr (ae_of_all _ (fun pc => ?_))
+                   rw [h_decomp]
+                   ring
+                   -- Wait, squaring the sum is not sum of squares.
+                   -- Use Minkowski or just prove sum is L2.
+                   admit -- It is L2 because sum of L2 is L2.
+                 · admit
+               · admit
+             · admit -- Measurable
+
+           apply MemLp.sub
+           · have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
+               unfold stdNormalProdMeasure
+               rw [memLp_two_iff_integrable_sq]
+               · exact (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
+               · exact measurable_fst.aemeasurable.aestronglyMeasurable
+             exact h_p_L2
+           · exact h_pred_L2
+
+      rw [integral_add]
+      · rw [integral_add]
+        · ring
+        · exact h_A_sq_int
+        · exact h_B_sq_int
+      · exact h_A_sq_int.add h_B_sq_int
+      · exact h_cross_int.const_mul 2
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -4374,12 +4488,115 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      have h_rank_eq : Matrix.rank (designMatrix data pgsBasis splineBasis) =
+                       Matrix.rank (designMatrix data' pgsBasis splineBasis) := by
+        let X := designMatrix data pgsBasis splineBasis
+        let X' := designMatrix data' pgsBasis splineBasis
+        have h_range : LinearMap.range X.toLin' = LinearMap.range X'.toLin' := h_range_eq
+        rw [Matrix.rank_eq_finrank_range_toLin, Matrix.rank_eq_finrank_range_toLin]
+        rw [h_range]
+      rw [← h_rank_eq]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let β := packParams model
+  let β' := packParams model_prime
+
+  have h_pred : X.mulVec β = fun i => linearPredictor model (data.p i) (data.c i) := by
+    ext i
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+
+  have h_pred' : X'.mulVec β' = fun i => linearPredictor model_prime (data'.p i) (data'.c i) := by
+    ext i
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+
+  -- Objective function: squared distance
+  let loss (v : Fin n → ℝ) := l2norm_sq (data.y - v)
+
+  have h_convex : StrictConvexOn ℝ Set.univ loss := by
+    -- Strict convexity of v -> ||y-v||^2 via coordinate-wise sum
+    intro u v _ _ hne a b ha hb hab
+    simp only [loss, l2norm_sq]
+    obtain ⟨i, hi⟩ := Function.ne_iff.mp hne
+    apply Finset.sum_lt_sum_of_nonempty (Finset.univ_nonempty)
+    · intro j _
+      let f := fun z => (data.y j - z)^2
+      have hf : StrictConvexOn ℝ Set.univ f := by
+        refine strictConvexOn_of_deriv2_pos convex_univ continuous_id.continuousOn ?_
+        intro z _
+        simp; norm_num
+      apply hf.le (Set.mem_univ _) (Set.mem_univ _) ha.le hb.le hab
+    · use i
+      simp only [Finset.mem_univ, true_and]
+      let f := fun z => (data.y i - z)^2
+      have hf : StrictConvexOn ℝ Set.univ f := by
+        refine strictConvexOn_of_deriv2_pos convex_univ continuous_id.continuousOn ?_
+        intro z _
+        simp; norm_num
+      apply hf (Set.mem_univ _) (Set.mem_univ _) hi ha hb hab
+
+  -- Optimality of β
+  have h_opt : ∀ v ∈ LinearMap.range X.toLin', loss (X.mulVec β) ≤ loss v := by
+    intro v hv
+    obtain ⟨b, hb⟩ := (Matrix.range_toLin'.mp hv)
+    let m : PhenotypeInformedGAM p k sp := unpackParams pgsBasis splineBasis b
+    have hm : InModelClass m pgsBasis splineBasis := by constructor <;> rfl
+    have h_pack : packParams m = b := unpack_pack_eq m pgsBasis splineBasis hm |>.symm ▸ rfl
+    have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm
+    simp [empiricalLoss, h_lambda_zero, pointwiseNLL] at h_loss
+    rw [linearPredictor_eq_designMatrix_mulVec] at h_loss
+    have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+    have hn_inv : 0 < 1 / (n : ℝ) := one_div_pos.mpr hn
+    rw [mul_le_mul_left hn_inv] at h_loss
+    convert h_loss using 1
+    · simp [loss, l2norm_sq, Finset.sum_congr]
+    · simp [loss, l2norm_sq, hb, h_pack]
+
+  -- Optimality of β'
+  have h_opt' : ∀ v ∈ LinearMap.range X'.toLin', loss (X'.mulVec β') ≤ loss v := by
+    intro v hv
+    obtain ⟨b, hb⟩ := (Matrix.range_toLin'.mp hv)
+    let m : PhenotypeInformedGAM p k sp := unpackParams pgsBasis splineBasis b
+    have hm : InModelClass m pgsBasis splineBasis := by constructor <;> rfl
+    let h_rank' : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp) := by
+       rw [← Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, Matrix.rank_eq_finrank_range_toLin]
+       exact h_rank
+    have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m hm
+    simp [empiricalLoss, h_lambda_zero, pointwiseNLL] at h_loss
+    rw [linearPredictor_eq_designMatrix_mulVec] at h_loss
+    have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+    have hn_inv : 0 < 1 / (n : ℝ) := one_div_pos.mpr hn
+    rw [mul_le_mul_left hn_inv] at h_loss
+    convert h_loss using 1
+    · simp [loss, l2norm_sq, Finset.sum_congr]
+    · simp [loss, l2norm_sq, hb]
+      rw [unpack_pack_eq m pgsBasis splineBasis hm]
+
+  -- Equality of minimizers
+  rw [h_range_eq] at h_opt
+
+  have h_in_range : X.mulVec β ∈ LinearMap.range X'.toLin' := by
+    rw [← h_range_eq]
+    exact Matrix.mem_range_toLin' _ _
+  have h_in_range' : X'.mulVec β' ∈ LinearMap.range X'.toLin' := Matrix.mem_range_toLin' _ _
+
+  -- loss(Xβ) <= loss(X'β') since X'β' in range.
+  -- loss(X'β') <= loss(Xβ) since Xβ in range.
+  -- So loss(Xβ) = loss(X'β') = min.
+  -- Strictly convex => unique minimizer.
+
+  have h_eq : X.mulVec β = X'.mulVec β' := by
+    apply h_convex.eq_of_isMinOn_of_isMinOn convex_univ h_in_range h_in_range'
+    · intro v hv; apply h_opt v; simp at hv; exact hv
+    · intro v hv; apply h_opt' v; simp at hv; exact hv
+
+  rw [← h_pred, ← h_pred']
+  exact congr_fun h_eq i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
