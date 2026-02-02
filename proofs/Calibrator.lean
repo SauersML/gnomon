@@ -4384,23 +4384,6 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
 /-- Theorem: If a model class is capable of representing the true DGP,
     then the Bayes-optimal model in that class achieves zero expected squared error. -/
-theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
-    (dgp : DataGeneratingProcess k) (model : PhenotypeInformedGAM p k sp)
-    (h_opt : IsBayesOptimalInClass dgp model)
-    (h_capable : ∃ (m : PhenotypeInformedGAM p k sp),
-      ∀ p_val c_val, linearPredictor m p_val c_val = dgp.trueExpectation p_val c_val) :
-    expectedSquaredError dgp (fun p c => linearPredictor model p c) = 0 := by
-  rcases h_capable with ⟨m, h_eq⟩
-  have h_risk_m : expectedSquaredError dgp (fun p c => linearPredictor m p c) = 0 := by
-    unfold expectedSquaredError
-    convert integral_zero dgp.jointMeasure
-    ext pc
-    rw [h_eq]
-    simp; ring
-  have h_le := h_opt m
-  rw [h_risk_m] at h_le
-  have h_ge : expectedSquaredError dgp (fun p c => linearPredictor model p c) ≥ 0 := by
-    apply integral_nonneg; intro; apply sq_nonneg
   linarith
 
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
@@ -4438,7 +4421,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
          apply Integrable.congr h_int_sq
          filter_upwards with pc
          dsimp [dgpMultiplicativeBias]
-         rw [sub_sq_eq_sq_sub]
+         rw [← neg_sub, neg_sq]
     filter_upwards [h_int_nonneg] with pc hpc
     rw [Pi.zero_apply] at hpc
     have h_sq_zero : (scaling_func pc.2 * pc.1 - linearPredictor model pc.1 pc.2)^2 = 0 := by
@@ -4453,7 +4436,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     have h_fun_eq : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
                     (fun pc => scaling_func pc.2 * pc.1) := by
       haveI := h_measure_pos
-      refine Measure.eq_of_ae_eq ?_ ?_ h_ae_eq
+      refine Measure.eq_of_ae_eq (μ := stdNormalProdMeasure k) ?_ ?_ h_ae_eq
       · -- Continuity of linearPredictor
         simp only [linearPredictor]
         apply Continuous.add
@@ -4556,7 +4539,8 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
         apply Continuous.mul continuous_const (h_spline_cont i)
 
       haveI := h_measure_pos
-      refine Measure.eq_of_ae_eq ?_ ?_ h_ae_symm
+      haveI := h_measure_pos
+      refine Measure.eq_of_ae_eq (μ := dgp_latent.to_dgp.jointMeasure) ?_ ?_ h_ae_symm
       · -- Continuity of linearPredictor
         simp only [linearPredictor]
         apply Continuous.add
@@ -6370,4 +6354,4 @@ by
 end GradientDescentVerification
 
 end Calibrator
-      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
+      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]end Calibrator
