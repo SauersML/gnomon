@@ -4241,31 +4241,101 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          ring
 
       have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
-        unfold dgpMultiplicativeBias at h_norm_int
         have h_pred_sq_int : Integrable (fun pc => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
         have h_p_sq_int : Integrable (fun pc => pc.1^2) (stdNormalProdMeasure k) := by
           unfold stdNormalProdMeasure
           refine (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
 
-        have h_p_memLp : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) :=
-          memLp_two_iff_integrable_sq.mpr h_p_sq_int
-        have h_pred_memLp : MemLp (fun pc => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
-          memLp_two_iff_integrable_sq.mpr h_pred_sq_int
+        have h_p_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => pc.1) (stdNormalProdMeasure k) :=
+          continuous_fst.aestronglyMeasurable
+        have h_pred_meas : AEStronglyMeasurable (fun pc => linearPredictor m pc.1 pc.2) (stdNormalProdMeasure k) := by
+           unfold linearPredictor evalSmooth
+           apply Continuous.aestronglyMeasurable
+           apply Continuous.add
+           · apply Continuous.add
+             · exact continuous_const
+             · apply continuous_finset_sum
+               intro l _
+               apply continuous_finset_sum
+               intro j _
+               apply Continuous.mul
+               · exact continuous_const
+               · apply Continuous.comp (h_spline_cont j)
+                 exact (continuous_apply l).comp continuous_snd
+           · apply continuous_finset_sum
+             intro i _
+             apply Continuous.mul
+             · apply Continuous.add
+               · exact continuous_const
+               · apply continuous_finset_sum
+                 intro l _
+                 apply continuous_finset_sum
+                 intro j _
+                 apply Continuous.mul
+                 · exact continuous_const
+                 · apply Continuous.comp (h_spline_cont j)
+                   exact (continuous_apply l).comp continuous_snd
+             · apply Continuous.comp (h_pgs_cont _) continuous_fst
 
-        exact memLp_two_iff_integrable_sq.mp (h_p_memLp.sub h_pred_memLp)
+        have h_p_memLp : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) :=
+          (memLp_two_iff_integrable_sq h_p_meas).mpr h_p_sq_int
+        have h_pred_memLp : MemLp (fun pc => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
+          (memLp_two_iff_integrable_sq h_pred_meas).mpr h_pred_sq_int
+
+        exact ((memLp_two_iff_integrable_sq (h_p_memLp.sub h_pred_memLp).aestronglyMeasurable).mp (h_p_memLp.sub h_pred_memLp)).2
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+        have h_A_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - 1) * pc.1) (stdNormalProdMeasure k) := by
+           unfold stdNormalProdMeasure
+           apply AEStronglyMeasurable.mul
+           · apply AEStronglyMeasurable.comp_measurable
+             · apply AEStronglyMeasurable.sub
+               · exact _h_deriv.continuous.aestronglyMeasurable
+               · exact aestronglyMeasurable_const
+             · exact measurable_snd
+           · exact continuous_fst.aestronglyMeasurable
+        have h_B_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => pc.1 - linearPredictor m pc.1 pc.2) (stdNormalProdMeasure k) := by
+           apply AEStronglyMeasurable.sub
+           · exact continuous_fst.aestronglyMeasurable
+           · unfold linearPredictor evalSmooth
+             apply Continuous.aestronglyMeasurable
+             apply Continuous.add
+             · apply Continuous.add
+               · exact continuous_const
+               · apply continuous_finset_sum
+                 intro l _
+                 apply continuous_finset_sum
+                 intro j _
+                 apply Continuous.mul
+                 · exact continuous_const
+                 · apply Continuous.comp (h_spline_cont j)
+                   exact (continuous_apply l).comp continuous_snd
+             · apply continuous_finset_sum
+               intro i _
+               apply Continuous.mul
+               · apply Continuous.add
+                 · exact continuous_const
+                 · apply continuous_finset_sum
+                   intro l _
+                   apply continuous_finset_sum
+                   intro j _
+                   apply Continuous.mul
+                   · exact continuous_const
+                   · apply Continuous.comp (h_spline_cont j)
+                     exact (continuous_apply l).comp continuous_snd
+               · apply Continuous.comp (h_pgs_cont _) continuous_fst
+
         have h_A_memLp : MemLp (fun pc => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) :=
-          memLp_two_iff_integrable_sq.mpr h_A_sq_int
+          (memLp_two_iff_integrable_sq h_A_meas).mpr h_A_sq_int
         have h_B_memLp : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
-          memLp_two_iff_integrable_sq.mpr h_B_sq_int
+          (memLp_two_iff_integrable_sq h_B_meas).mpr h_B_sq_int
         exact MemLp.integrable_mul h_A_memLp h_B_memLp
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral
-      rw [integral_add]
-      · rw [integral_add]
-        · rfl
+      rw [← integral_add]
+      · rw [← integral_add]
+        · refine integral_congr_ae (ae_of_all _ (fun pc => ?_))
+          ring
         · exact h_A_sq_int
         · exact h_B_sq_int
       · exact h_A_sq_int.add h_B_sq_int
