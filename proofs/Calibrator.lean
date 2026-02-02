@@ -4221,11 +4221,79 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_pred_eq : ∀ p c, linearPredictor model p c = scaling_func c * p) :
+    (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
+       (∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) ∧
+       (m.pgsBasis = model.pgsBasis) ∧ (m.pcSplineBasis = model.pcSplineBasis))
+    (h_measure_pos : Measure.IsOpenPosMeasure (stdNormalProdMeasure k))
+    (h_pgs_cont : ∀ i, Continuous (model.pgsBasis.B i))
+    (h_spline_cont : ∀ i, Continuous (model.pcSplineBasis.b i))
+    (h_integrable_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) =>
+      ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) (stdNormalProdMeasure k)) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
+  -- 1. Optimality + Capability => Model = Truth (a.e.)
+  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model _h_opt ⟨m_true, h_eq_true⟩
+
+  -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
+  have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+      ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[(stdNormalProdMeasure k)] 0 := by
+    apply (integral_eq_zero_iff_of_nonneg _ h_integrable_sq).mp h_risk_zero
+    exact fun _ => sq_nonneg _
+
+  have h_ae_eq : ∀ᵐ pc ∂(stdNormalProdMeasure k),
+      (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
+
+  -- 3. Use continuity to show equality holds everywhere
+  have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val := by
+    -- We prove equality as functions pc -> ℝ
+    have h_eq_fun : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
+                    (fun pc => (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2) := by
+      have h_ae_symm : (fun pc => linearPredictor model pc.1 pc.2) =ᵐ[(stdNormalProdMeasure k)] (fun pc => (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2) := by
+        filter_upwards [h_ae_eq] with x hx
+        exact hx.symm
+      -- Helper lemma for evalSmooth continuity with model.pcSplineBasis
+      have h_evalSmooth_cont : ∀ (coeffs : SmoothFunction 1),
+          Continuous (fun x => evalSmooth model.pcSplineBasis coeffs x) := by
+        intro coeffs
+        dsimp only [evalSmooth]
+        refine continuous_finset_sum _ (fun i _ => ?_)
+        apply Continuous.mul continuous_const (h_spline_cont i)
+
+      refine Measure.eq_of_ae_eq h_ae_symm ?_ ?_
+      · -- Continuity of linearPredictor
+        simp only [linearPredictor]
+        apply Continuous.add
+        · -- baseline_effect
+          apply Continuous.add
+          · exact continuous_const
+          · refine continuous_finset_sum _ (fun l _ => ?_)
+            apply Continuous.comp (h_evalSmooth_cont _)
+            exact (continuous_apply l).comp continuous_snd
+        · -- pgs_related_effects
+          refine continuous_finset_sum _ (fun m _ => ?_)
+          apply Continuous.mul
+          · -- pgs_coeff
+            apply Continuous.add
+            · exact continuous_const
+            · refine continuous_finset_sum _ (fun l _ => ?_)
+              apply Continuous.comp (h_evalSmooth_cont _)
+              exact (continuous_apply l).comp continuous_snd
+          · -- pgs_basis_val
+            apply Continuous.comp (h_pgs_cont _) continuous_fst
+      · -- Continuity of trueExpectation
+        refine Continuous.mul ?_ continuous_fst
+        exact Continuous.comp _h_deriv.continuous continuous_snd
+
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
   intro c
+  have h_pred_eq := h_pointwise_eq
   have h_decomp := linearPredictor_decomp model h_linear_basis
   have h0 := h_pred_eq 0 c
   have h1 := h_pred_eq 1 c
@@ -4234,6 +4302,8 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
   simp only [mul_zero, add_zero] at h0
   rw [h0] at h1
   simp only [zero_add, mul_one] at h1
+  unfold dgpMultiplicativeBias at h1
+  simp at h1
   exact h1
 
 structure DGPWithLatentRisk (k : ℕ) where
