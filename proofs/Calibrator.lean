@@ -4385,18 +4385,18 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-    rw [Matrix.rank_eq_finrank_range_toLin']
+    rw [Matrix.rank_eq_finrank_range_toLin _ (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
     rw [← h_range_eq]
-    rw [← Matrix.rank_eq_finrank_range_toLin']
+    rw [← Matrix.rank_eq_finrank_range_toLin _ (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
     exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  intro i
+  intro data' model model_prime i
   -- 1. Setup Euclidean Space and Projections
   let E := EuclideanSpace ℝ (Fin n)
-  let toE : (Fin n → ℝ) ≃L[ℝ] E := PiLp.equiv 2 (fun _ : Fin n => ℝ)
+  let toE : (Fin n → ℝ) ≃L[ℝ] E := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm.toContinuousLinearEquiv
 
   let X := designMatrix data pgsBasis splineBasis
   let X' := designMatrix data' pgsBasis splineBasis
