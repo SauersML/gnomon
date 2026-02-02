@@ -4271,29 +4271,38 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         rw [← memLp_two_iff_integrable_sq]
         · exact h_B_L2
         · apply AEStronglyMeasurable.sub
-          · exact measurable_fst.aemeasurable
+          · exact Measurable.aestronglyMeasurable measurable_fst
           · exact (Continuous.aestronglyMeasurable (by continuity))
 
       have h_A_L2 : MemLp (fun pc => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) := by
+        rw [h_prod]
         rw [memLp_two_iff_integrable_sq]
-        · exact h_A_sq_int
+        · rw [← h_prod]; exact h_A_sq_int
         · apply AEStronglyMeasurable.mul
           · apply AEStronglyMeasurable.comp_snd
             apply AEStronglyMeasurable.sub
             · exact h_scaling_meas'
             · exact aestronglyMeasurable_const
-            · exact measurable_snd.aemeasurable
-          · exact measurable_fst.aemeasurable
+          · exact Measurable.aestronglyMeasurable measurable_fst
 
       have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
         apply MemLp.integrable_mul
-        · exact h_A_L2
+        · rw [h_prod] at h_A_L2; exact h_A_L2
         · exact h_B_L2
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
+      have h_expand_sq : ∀ pc, (scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2)^2 =
+          ((scaling_func pc.2 - 1) * pc.1)^2 + (pc.1 - linearPredictor m pc.1 pc.2)^2 +
+          2 * ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) := by
+        intro pc
+        ring_nf
+        ring
+
+      rw [integral_congr_ae (ae_of_all _ h_expand_sq)]
       rw [integral_add]
       · rw [integral_add]
-        · rw [h_orth]
+        · rw [integral_mul_left]
+          rw [h_orth]
           simp
         · exact h_A_sq_int
         · exact h_B_sq_int
