@@ -4374,13 +4374,15 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin, h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+      rw [Matrix.rank_eq_finrank_range_toLin]
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin]
       exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  intro i
+  intro data' model model_prime i
   -- 1. Identify predictions as design matrix multiplication
   rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
   rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
