@@ -50,6 +50,7 @@ import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
+open InnerProductSpace
 
 open MeasureTheory
 
@@ -4396,9 +4397,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   suffices v = v' by rw [this]
 
   -- 2. Show v is the orthogonal projection of y onto range(X)
-  have h_proj : v = InnerProductSpace.orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y := by
+  have h_proj : v = orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y := by
     apply Eq.symm
-    apply InnerProductSpace.orthogonalProjection_eq_of_dist_le
+    apply orthogonalProjection_eq_of_dist_le
     · rw [LinearMap.mem_range]
       use packParams model
       rfl
@@ -4447,9 +4448,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       exact h_min
 
   -- 3. Show v' is the orthogonal projection of y onto range(X')
-  have h_proj' : v' = InnerProductSpace.orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data.y := by
+  have h_proj' : v' = orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data.y := by
     apply Eq.symm
-    apply InnerProductSpace.orthogonalProjection_eq_of_dist_le
+    apply orthogonalProjection_eq_of_dist_le
     · rw [LinearMap.mem_range]
       use packParams model_prime
       rfl
