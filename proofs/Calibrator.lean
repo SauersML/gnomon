@@ -4403,35 +4403,44 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   -- 1. Optimality + Capability => Risk = 0
-  have h_risk_zero : expectedSquaredError (dgpMultiplicativeBias scaling_func) (linearPredictor model) = 0 := by
-    rcases h_capable with ⟨m, h_eq, h_pgs, h_spline⟩
+  have h_risk_zero : ∫ pc, ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂(stdNormalProdMeasure k) = 0 := by
+    rcases h_capable with ⟨m, h_eq, _⟩
     apply optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt
     use m
-    constructor
-    · constructor; exact h_pgs; exact h_spline; rfl; rfl -- InModelClass
-    · unfold expectedSquaredError
-      simp_rw [h_eq]
-      unfold dgpMultiplicativeBias
-      simp only [sub_self, sq, integral_zero]
+    intro p c
+    rw [h_eq]
+    rfl
 
-  -- 2. Risk 0 => AE Equality
-  have h_ae_eq : linearPredictor model =ᵐ[(dgpMultiplicativeBias scaling_func).jointMeasure] (fun p c => scaling_func c * p) := by
-    apply (integral_eq_zero_iff_of_nonneg _ h_int_sq).mp h_risk_zero
-    exact fun _ => sq_nonneg _
+  -- 2. AE Equality on Product Space
+  have h_ae_eq : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =ᵐ[stdNormalProdMeasure k] (fun pc => scaling_func pc.2 * pc.1) := by
+    have h_int_nonneg : (fun pc : ℝ × (Fin k → ℝ) => ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[stdNormalProdMeasure k] 0 := by
+       apply (integral_eq_zero_iff_of_nonneg _ ?_).mp h_risk_zero
+       · exact fun _ => sq_nonneg _
+       · -- integrability of difference squared
+         -- We have h_int_sq which is (model - truth)^2.
+         -- (truth - model)^2 is the same.
+         convert h_int_sq using 4
+         ring
+    filter_upwards [h_int_nonneg] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    have h_sq_zero : (scaling_func pc.2 * pc.1 - linearPredictor model pc.1 pc.2)^2 = 0 := by
+      convert hpc using 1
+      dsimp [dgpMultiplicativeBias]
+      ring
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp h_sq_zero) |>.symm
 
-  -- 3. Continuity => Equality
+  -- 3. Equality everywhere via continuity
   have h_eq : ∀ p c, linearPredictor model p c = scaling_func c * p := by
     -- Proof of function equality from AE equality + continuity
     have h_fun_eq : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
                     (fun pc => scaling_func pc.2 * pc.1) := by
-      refine Measure.eq_of_ae_eq h_measure_pos ?_ ?_ ?_
-      · -- Continuity of linearPredictor (proven in shrinkage_effect, copy?)
+      refine Measure.eq_of_ae_eq h_measure_pos ?_ ?_ h_ae_eq
+      · -- Continuity of linearPredictor
         simp only [linearPredictor]
         apply Continuous.add
         · apply Continuous.add
           · exact continuous_const
           · refine continuous_finset_sum _ (fun l _ => ?_)
-            -- evalSmooth continuity
             dsimp [evalSmooth]
             refine continuous_finset_sum _ (fun s _ => ?_)
             apply Continuous.mul continuous_const
@@ -4446,10 +4455,8 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
               apply Continuous.mul continuous_const
               exact Continuous.comp (h_spline_cont s) (Continuous.comp (continuous_apply l) continuous_snd)
           · exact Continuous.comp (h_pgs_cont _) continuous_fst
-      · -- Continuity of scaling_func * p
+      · -- Continuity of RHS
         exact Continuous.mul (Continuous.comp h_cont continuous_snd) continuous_fst
-      · -- Transform h_ae_eq to match types
-        exact h_ae_eq
     intro p c
     exact congr_fun h_fun_eq (p, c)
 
