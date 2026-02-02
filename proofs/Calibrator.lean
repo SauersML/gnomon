@@ -4374,12 +4374,134 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin, h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  -- 1. Identify predictions as design matrix multiplication
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  let v := X.mulVec (packParams model)
+  let v' := X'.mulVec (packParams model_prime)
+
+  suffices v = v' by rw [this]
+
+  -- 2. Show v is the orthogonal projection of y onto range(X)
+  have h_proj : v = orthogonalProjection (LinearMap.range (Matrix.toLin' X)) data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [LinearMap.mem_range]
+      use packParams model
+      rfl
+    · intro u hu
+      rw [LinearMap.mem_range] at hu
+      rcases hu with ⟨beta, rfl⟩
+      -- Use the fact that 'fit' minimizes the loss
+      have h_min := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+      -- Construct a model corresponding to beta
+      let m := unpackParams pgsBasis splineBasis beta
+      have hm : InModelClass m pgsBasis splineBasis := by constructor <;> rfl
+      specialize h_min m hm
+
+      -- Simplify loss for lambda=0 and Gaussian
+      rw [h_lambda_zero] at h_min ⊢
+      simp only [empiricalLoss, add_zero, zero_mul] at h_min
+
+      -- Relate loss to dist
+      have h_loss_eq_dist : ∀ m' : PhenotypeInformedGAM p k sp, InModelClass m' pgsBasis splineBasis →
+          empiricalLoss m' data 0 = (1 / n : ℝ) * (dist data.y (designMatrix data pgsBasis splineBasis *ᵥ packParams m')) ^ 2 := by
+        intro m' hm'
+        simp only [empiricalLoss, add_zero, zero_mul]
+        rw [dist_eq_norm, norm_sq_eq_inner]
+        simp only [real_inner_self_eq_norm_sq]
+        have h_sum : (∑ i, pointwiseNLL m'.dist (data.y i) (linearPredictor m' (data.p i) (data.c i))) =
+                     dist data.y (designMatrix data pgsBasis splineBasis *ᵥ packParams m') ^ 2 := by
+           simp only [pointwiseNLL, hm'.dist_gaussian, dist_eq_norm, Real.norm_eq_abs, norm_eq_sqrt_inner_self]
+           rw [Real.sq_sqrt (inner_self_nonneg _)]
+           simp [inner, dotProduct]
+           refine Finset.sum_congr rfl ?_
+           intro i _
+           rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m' hm']
+           rw [Pi.sub_apply]
+           rfl
+        rw [h_sum]
+
+      rw [h_loss_eq_dist model (by constructor <;> rfl)] at h_min
+      rw [h_loss_eq_dist m hm] at h_min
+
+      -- Remove (1/n) factor
+      have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+      have h_factor_pos : 0 < (1 / n : ℝ) := one_div_pos.mpr hn
+      rw [mul_le_mul_left h_factor_pos] at h_min
+
+      rw [unpack_pack_eq m pgsBasis splineBasis hm] at h_min
+      exact h_min
+
+  -- 3. Show v' is the orthogonal projection of y onto range(X')
+  have h_proj' : v' = orthogonalProjection (LinearMap.range (Matrix.toLin' X')) data.y := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · rw [LinearMap.mem_range]
+      use packParams model_prime
+      rfl
+    · intro u hu
+      rw [LinearMap.mem_range] at hu
+      rcases hu with ⟨beta, rfl⟩
+
+      have h_rank_prime : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+         rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+         exact h_rank
+
+      have h_min := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime
+
+      let m := unpackParams pgsBasis splineBasis beta
+      have hm : InModelClass m pgsBasis splineBasis := by constructor <;> rfl
+      specialize h_min m hm
+
+      rw [h_lambda_zero] at h_min ⊢
+      simp only [empiricalLoss, add_zero, zero_mul] at h_min
+
+      have h_loss_eq_dist : ∀ m' : PhenotypeInformedGAM p k sp, InModelClass m' pgsBasis splineBasis →
+          empiricalLoss m' data' 0 = (1 / n : ℝ) * (dist data'.y (designMatrix data' pgsBasis splineBasis *ᵥ packParams m')) ^ 2 := by
+        intro m' hm'
+        simp only [empiricalLoss, add_zero, zero_mul]
+        rw [dist_eq_norm, norm_sq_eq_inner]
+        simp only [real_inner_self_eq_norm_sq]
+        have h_sum : (∑ i, pointwiseNLL m'.dist (data'.y i) (linearPredictor m' (data'.p i) (data'.c i))) =
+                     dist data'.y (designMatrix data' pgsBasis splineBasis *ᵥ packParams m') ^ 2 := by
+           simp only [pointwiseNLL, hm'.dist_gaussian, dist_eq_norm, Real.norm_eq_abs, norm_eq_sqrt_inner_self]
+           rw [Real.sq_sqrt (inner_self_nonneg _)]
+           simp [inner, dotProduct]
+           refine Finset.sum_congr rfl ?_
+           intro i _
+           rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m' hm']
+           rw [Pi.sub_apply]
+           rfl
+        rw [h_sum]
+
+      rw [h_loss_eq_dist model_prime (by constructor <;> rfl)] at h_min
+      rw [h_loss_eq_dist m hm] at h_min
+
+      have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+      have h_factor_pos : 0 < (1 / n : ℝ) := one_div_pos.mpr hn
+      rw [mul_le_mul_left h_factor_pos] at h_min
+
+      rw [unpack_pack_eq m pgsBasis splineBasis hm] at h_min
+      exact h_min
+
+  -- 4. range(X) = range(X') => projections are equal
+  rw [h_range_eq] at h_proj
+  have h_y_eq : data.y = data'.y := rfl
+  rw [h_y_eq] at h_proj
+
+  rw [h_proj, h_proj']
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
