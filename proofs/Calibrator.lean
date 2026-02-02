@@ -4203,101 +4203,75 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       rw [← h_orth, ← integral_const_mul]
 
       -- Define integrability of the squares
-      have h_A_sq_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1)^2) (stdNormalProdMeasure k) := by
-         unfold stdNormalProdMeasure
-         have h_g_int : Integrable (fun c => (scaling_func c - 1)^2) μC := by
-            have h_expand : ∀ c, (scaling_func c - 1)^2 = (scaling_func c)^2 - 2 * scaling_func c + 1 := by
-               intro c; ring
-            rw [MeasureTheory.integrable_congr (ae_of_all _ h_expand)]
-            apply Integrable.add
-            · apply Integrable.sub
-              · exact h_scaling_sq_int'
-              · exact h_S_int.const_mul 2
-            · exact integrable_const 1
-         refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
-         ring
-
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+      -- L2 proofs for components
+      have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
         unfold stdNormalProdMeasure
-        -- Integrability of (p - (base + slope*p))^2
-        -- Expand: (1-slope)^2 p^2 - 2(1-slope)p base + base^2
-        have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC :=
-          MemLp.integrable one_le_two (by apply MemLp.sq_memLp; exact h_base_L2)
+        rw [memLp_two_iff_integrable_sq]
+        · refine (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
+        · exact measurable_fst.aemeasurable.aestronglyMeasurable
 
+      have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
+        unfold stdNormalProdMeasure
         have h_slope_val : predictorSlope m = fun c => m.γₘ₀ 0 := by
           ext c
           simp [predictorSlope, evalSmooth, hm_norm.fₘₗ_zero]
 
-        apply Integrable.add
-        · apply Integrable.sub
-          · -- (1-slope)^2 p^2
-            refine (h_prod_int h_p2_int (integrable_const _)).congr (ae_of_all _ (fun pc => ?_))
-            simp [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
-            ring
-          · -- 2(1-slope)p base
-            refine (h_prod_int h_p_int h_base_int).const_mul _
-        · -- base^2
-          refine (h_prod_int (integrable_const 1) h_base_sq_int).congr (ae_of_all _ (fun pc => ?_))
-          simp
+        -- Decompose: pred = base + slope * p
+        have h_decomp : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) =
+                        (fun pc => predictorBase m pc.2) + (fun pc => m.γₘ₀ 0 * pc.1) := by
+          ext pc
+          rw [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
+          rfl
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
-         -- Product of L2 functions
-         apply MemLp.integrable_mul
-         · -- A = (S-1)p is L2
-           apply MemLp.mul
-           · have h_Sm1_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => scaling_func pc.2 - 1) 2 (stdNormalProdMeasure k) := by
-               unfold stdNormalProdMeasure
-               rw [memLp_two_iff_integrable_sq]
-               · refine (h_prod_int (integrable_const 1) (by
-                   rw [← memLp_two_iff_integrable_sq]
-                   apply MemLp.sub
-                   · rw [memLp_two_iff_integrable_sq h_scaling_meas']
-                     exact h_scaling_sq_int'
-                   · exact memLp_const 1
-                 )).congr (ae_of_all _ (fun pc => by simp))
-               · exact ((h_scaling_meas'.sub aestronglyMeasurable_const).comp_snd).aemeasurable
-             exact h_Sm1_L2
-           · have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
-               unfold stdNormalProdMeasure
-               rw [memLp_two_iff_integrable_sq]
-               · exact (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
-               · exact measurable_fst.aemeasurable.aestronglyMeasurable
-             exact h_p_L2
-         · -- B = p - pred is L2
-           have h_pred_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) := by
-             -- pred = base + slope*p. base L2, slope constant, p L2.
-             unfold stdNormalProdMeasure
-             have h_slope_val : predictorSlope m = fun c => m.γₘ₀ 0 := by
-                ext c
-                simp [predictorSlope, evalSmooth, hm_norm.fₘₗ_zero]
-             have h_decomp : ∀ pc : ℝ × (Fin k → ℝ), linearPredictor m pc.1 pc.2 = predictorBase m pc.2 + m.γₘ₀ 0 * pc.1 := by
-               intro pc
-               rw [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
+        rw [h_decomp]
+        apply MemLp.add
+        · -- Base depends only on C and is L2 on C
+          have h_base_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => predictorBase m pc.2) (μP.prod μC) :=
+            h_base_L2.aestronglyMeasurable.comp_snd
+          have h_base_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (predictorBase m pc.2)^2) (μP.prod μC) := by
+            refine h_prod_int (integrable_const 1) _
+            apply MemLp.sq_memLp h_base_L2
+          rw [memLp_two_iff_integrable_sq h_base_meas]
+          exact h_base_sq
+        · -- Slope term is constant * p
+          exact h_p_L2.const_mul _
 
-             rw [memLp_two_iff_integrable_sq]
-             · -- (base + k*p)^2 <= 2 base^2 + 2 k^2 p^2
-               apply Integrable.add
-               · apply Integrable.add
-                 · -- base^2
-                   refine (h_prod_int (integrable_const 1) (by apply MemLp.sq_memLp; exact h_base_L2)).congr (ae_of_all _ (fun pc => ?_))
-                   rw [h_decomp]
-                   ring
-                   -- Wait, squaring the sum is not sum of squares.
-                   -- Use Minkowski or just prove sum is L2.
-                   admit -- It is L2 because sum of L2 is L2.
-                 · admit
-               · admit
-             · admit -- Measurable
+      have h_Sm1_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => scaling_func pc.2 - 1) 2 (stdNormalProdMeasure k) := by
+        unfold stdNormalProdMeasure
+        have h_Sm1_C_L2 : MemLp (fun c => scaling_func c - 1) 2 μC := by
+          apply MemLp.sub
+          · rw [memLp_two_iff_integrable_sq h_scaling_meas']
+            exact h_scaling_sq_int'
+          · exact memLp_const 1
 
-           apply MemLp.sub
-           · have h_p_L2 : MemLp (fun pc : ℝ × (Fin k → ℝ) => pc.1) 2 (stdNormalProdMeasure k) := by
-               unfold stdNormalProdMeasure
-               rw [memLp_two_iff_integrable_sq]
-               · exact (h_prod_int h_p2_int (integrable_const 1)).congr (ae_of_all _ (fun pc => by simp))
-               · exact measurable_fst.aemeasurable.aestronglyMeasurable
-             exact h_p_L2
-           · exact h_pred_L2
+        have h_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => scaling_func pc.2 - 1) (μP.prod μC) :=
+          h_Sm1_C_L2.aestronglyMeasurable.comp_snd
+        rw [memLp_two_iff_integrable_sq h_meas]
+        refine (h_prod_int (integrable_const 1) (by apply MemLp.sq_memLp h_Sm1_C_L2)).congr (ae_of_all _ (fun pc => by simp))
 
+      -- Term A = ((S-1)p)^2
+      have h_A_memLp : MemLp (fun pc => (scaling_func pc.2 - 1) * pc.1) 2 (stdNormalProdMeasure k) :=
+        h_Sm1_L2.mul h_p_L2
+      have h_A_sq_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1)^2) (stdNormalProdMeasure k) :=
+        MemLp.integrable one_le_two (MemLp.sq_memLp h_A_memLp)
+
+      -- Term B = (p - pred)^2
+      have h_B_memLp : MemLp (fun pc => pc.1 - linearPredictor m pc.1 pc.2) 2 (stdNormalProdMeasure k) :=
+        h_p_L2.sub h_pred_L2
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) :=
+        MemLp.integrable one_le_two (MemLp.sq_memLp h_B_memLp)
+
+      -- Cross term integrability
+      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) :=
+        MemLp.integrable_mul h_A_memLp h_B_memLp
+
+      -- Algebraic expansion
+      have h_alg : ∀ pc, (scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2)^2 =
+          ((scaling_func pc.2 - 1) * pc.1)^2 + (pc.1 - linearPredictor m pc.1 pc.2)^2 +
+          2 * ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) := by
+        intro pc; ring_nf
+
+      rw [MeasureTheory.integral_congr (ae_of_all _ h_alg)]
       rw [integral_add]
       · rw [integral_add]
         · ring
@@ -4491,8 +4465,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       have h_rank_eq : Matrix.rank (designMatrix data pgsBasis splineBasis) =
                        Matrix.rank (designMatrix data' pgsBasis splineBasis) := by
         let X := designMatrix data pgsBasis splineBasis
+        let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
         let X' := designMatrix data' pgsBasis splineBasis
-        have h_range : LinearMap.range X.toLin' = LinearMap.range X'.toLin' := h_range_eq
+        have h_range : LinearMap.range (Matrix.toLin' X) = LinearMap.range (Matrix.toLin' X') := h_range_eq
         rw [Matrix.rank_eq_finrank_range_toLin, Matrix.rank_eq_finrank_range_toLin]
         rw [h_range]
       rw [← h_rank_eq]
