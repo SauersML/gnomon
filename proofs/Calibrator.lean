@@ -4050,10 +4050,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      apply integrable_poly_n
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4076,18 +4075,64 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       rw [← h_map]
       exact h_scaling_sq_int
 
-    have h_S_int : Integrable scaling_func μC := by
-        have : MemLp scaling_func 2 μC := by
-          rw [memLp_two_iff_integrable_sq h_scaling_meas']
-          exact h_scaling_sq_int'
-        exact MemLp.integrable one_le_two this
+    have h_scaling_L2 : MemLp scaling_func 2 μC := by
+      rw [memLp_two_iff_integrable_sq h_scaling_meas']
+      exact h_scaling_sq_int'
 
-    have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
-        h_S_int.sub (integrable_const 1)
+    have h_Sm1_L2 : MemLp (fun c => scaling_func c - 1) 2 μC := by
+      apply MemLp.sub h_scaling_L2
+      apply MemLp.const 1
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    -- Prove base is L2 (needed for h_base_int and h_Sm1_base_int)
+    have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC := by
+      have h_f_sq_int : Integrable (fun pc => (linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := h_norm_int
+      unfold stdNormalProdMeasure at h_f_sq_int
+      have h_outer : Integrable (fun c => ∫ p, (linearPredictor m p c)^2 ∂μP) μC :=
+        MeasureTheory.Integrable.integral_prod_right h_f_sq_int
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+      have h_slope_val : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+        intro c
+        unfold predictorSlope
+        simp [evalSmooth, hm_norm.fₘₗ_zero]
+
+      have h_decomp_pred : ∀ c, ∀ p, linearPredictor m p c = predictorBase m c + m.γₘ₀ 0 * p := by
+        intro c p
+        rw [linearPredictor_decomp m h_linear_basis.1, h_slope_val]
+
+      have h_inner : ∀ c, ∫ p, (linearPredictor m p c)^2 ∂μP = (predictorBase m c)^2 + (m.γₘ₀ 0)^2 := by
+        intro c
+        simp only [h_decomp_pred c]
+        have h_p2 : ∫ x, x^2 ∂μP = 1 := by
+          have h_mem : MemLp (fun x => x) 2 μP := by apply MemLp.of_integrable; exact h_p_int
+          rw [ProbabilityTheory.variance_id_gaussianReal 0 1 (by simp)]
+          simp [ProbabilityTheory.variance_def' h_mem, ProbabilityTheory.integral_id_gaussianReal]
+        have h_p : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
+        have h_const : ∫ x, (1:ℝ) ∂μP = 1 := by simp
+        rw [integral_add]
+        · rw [integral_add]
+          · simp [pow_two, integral_mul_left, h_const]
+          · simp [mul_assoc, integral_mul_left, h_p]
+          · apply Integrable.const_mul h_p_int
+        · apply Integrable.add
+          · apply Integrable.const_mul (integrable_const 1)
+          · apply Integrable.const_mul h_p_int
+        · apply Integrable.const_mul h_p2_int
+
+      apply Integrable.mono' (g := fun c => (predictorBase m c)^2 + (m.γₘ₀ 0)^2)
+      · refine h_outer.congr (ae_of_all _ h_inner)
+      · exact measurable_predictorBase.pow 2
+      · filter_upwards with c
+        simp; exact sq_nonneg _
+
+    have h_base_L2 : MemLp (predictorBase m) 2 μC := by
+      rw [memLp_two_iff_integrable_sq measurable_predictorBase.aestronglyMeasurable]
+      exact h_base_sq_int
+
+    have h_base_int : Integrable (predictorBase m) μC := by
+      exact MemLp.integrable one_le_two h_base_L2
+
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      exact MemLp.integrable one_le_two (h_Sm1_L2.mul h_base_L2)
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4137,16 +4182,18 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         unfold stdNormalProdMeasure
         rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
         have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- E[X^2] = Var(X) + E[X]^2. For N(0,1), Var=1, E=0.
-          have h_mean := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
-          admit
+          have h_mem : MemLp (fun x => x) 2 μP := by apply MemLp.of_integrable; exact h_p_int
+          rw [ProbabilityTheory.variance_id_gaussianReal 0 1 (by simp)]
+          simp [ProbabilityTheory.variance_def' h_mem, ProbabilityTheory.integral_id_gaussianReal]
         have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
+          have h_S_int : Integrable scaling_func μC := MemLp.integrable one_le_two h_scaling_L2
           rw [integral_sub h_S_int (integrable_const 1)]
-          rw [h_map] at h_mean_1
           rw [h_mean_1]
           simp
         rw [h_var, h_mean_S]
         ring
+        · exact h_gauss_moments 2
+        · exact MemLp.integrable one_le_two h_Sm1_L2
 
       have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
          unfold stdNormalProdMeasure
@@ -4154,6 +4201,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal (μ := 0) (v := 1)
          rw [h_mean_P]
          ring
+         · exact h_p_int
+         · exact h_Sm1_base_int
 
       rw [h_term1_zero, h_term2_zero]
       simp
@@ -4184,13 +4233,37 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
          refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
          ring
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
+      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+        unfold stdNormalProdMeasure
+        have h_term_sq : Integrable (fun pc : ℝ × (Fin k → ℝ) => (pc.1 - (predictorBase m pc.2 + m.γₘ₀ 0 * pc.1))^2) (μP.prod μC) := by
+          -- (P - (Base + slope*P))^2 = ((1-slope)*P - Base)^2 = (1-slope)^2 P^2 - 2(1-slope)Base P + Base^2
+          apply Integrable.add
+          · apply Integrable.sub
+            · refine (h_prod_int h_p2_int (integrable_const _)).const_mul _
+            · refine (h_prod_int h_p_int h_base_int).const_mul _
+          · refine (h_prod_int (integrable_const 1) h_base_sq_int).congr _
+            intro x; simp
+        refine h_term_sq.congr (ae_of_all _ ?_)
+        intro pc
+        simp only [linearPredictor_decomp m h_linear_basis.1]
+        have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+          intro c
+          unfold predictorSlope
+          simp [evalSmooth, hm_norm.fₘₗ_zero]
+        rw [h_slope_const]
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
+      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+        exact Integrable.mul_L2 h_A_sq_int h_B_sq_int
 
       -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
+      rw [integral_add]
+      · rw [integral_add]
+        · rw [integral_mul_left]
+          ring
+        · exact h_A_sq_int
+        · exact h_cross_int.const_mul 2
+      · exact h_A_sq_int.add (h_cross_int.const_mul 2)
+      · exact h_B_sq_int
 
     unfold expectedSquaredError
     dsimp [dgp] -- unfold the let binding for dgp
@@ -4444,12 +4517,90 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin]
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+    intro i
+    let X := designMatrix data pgsBasis splineBasis
+    let X' := designMatrix data' pgsBasis splineBasis
+
+    have h_pred : (fun i => linearPredictor model (data.p i) (data.c i)) = X.mulVec (packParams model) := by
+      ext j; apply linearPredictor_eq_designMatrix_mulVec; constructor <;> rfl
+
+    have h_pred' : (fun i => linearPredictor model_prime (data'.p i) (data'.c i)) = X'.mulVec (packParams model_prime) := by
+      ext j; apply linearPredictor_eq_designMatrix_mulVec; constructor <;> rfl
+
+    let y := data.y
+    let v := X.mulVec (packParams model)
+    let v' := X'.mulVec (packParams model_prime)
+
+    have hv_eq : v = v' := by
+      -- Both v and v' are the orthogonal projection of y onto W = range X = range X'
+      let W := LinearMap.range (Matrix.toLin' X)
+      have hW : W = LinearMap.range (Matrix.toLin' X') := h_range_eq
+
+      have h_is_proj : ∀ (U : Matrix (Fin n) (ParamIx p k sp) ℝ) (u : ParamVec p k sp)
+          (h_min : ∀ u', (1 / (n : ℝ)) * l2norm_sq (y - U.mulVec u) ≤ (1 / (n : ℝ)) * l2norm_sq (y - U.mulVec u')),
+          U.mulVec u = InnerProductSpace.orthogonalProjection (LinearMap.range (Matrix.toLin' U)) y := by
+        intro U u h_min
+        let W_U := LinearMap.range (Matrix.toLin' U)
+        let v_u := U.mulVec u
+        have h_mem : v_u ∈ W_U := by use u; rfl
+        apply (InnerProductSpace.orthogonalProjection_eq_of_dist_le W_U h_mem).mpr
+        intro w hw
+        obtain ⟨u_w, hu_w⟩ := hw
+        have h_loss := h_min u_w
+        have hn_pos : 0 < (n : ℝ) := Nat.cast_pos.mpr h_n_pos
+        have h_scale : 0 < 1 / (n : ℝ) := one_div_pos.mpr hn_pos
+        rw [mul_le_mul_left h_scale] at h_loss
+        rw [← hu_w]
+        simpa [dist_eq_norm, l2norm_sq] using h_loss
+
+      -- Let's assume the minimization property holds directly
+      have h_model_min : ∀ u', (1 / (n : ℝ)) * l2norm_sq (y - X.mulVec (packParams model)) ≤ (1 / (n : ℝ)) * l2norm_sq (y - X.mulVec u') := by
+        intro u'
+        let m' := unpackParams pgsBasis splineBasis u'
+        have hm' : InModelClass m' pgsBasis splineBasis := by constructor <;> rfl
+        have h_opt := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos (le_of_eq h_lambda_zero.symm) h_rank m' hm'
+        rw [h_lambda_zero] at h_opt
+        unfold empiricalLoss pointwiseNLL at h_opt
+        simp only [hm'.dist_gaussian, zero_mul, add_zero] at h_opt
+        convert h_opt
+        · unfold l2norm_sq; congr 1; refine Finset.sum_congr rfl fun i _ => ?_
+          congr 1; rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ (by constructor <;> rfl)]
+        · unfold l2norm_sq; congr 1; refine Finset.sum_congr rfl fun i _ => ?_
+          congr 1; rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ hm']
+
+      have h_model_prime_min : ∀ u', (1 / (n : ℝ)) * l2norm_sq (y - X'.mulVec (packParams model_prime)) ≤ (1 / (n : ℝ)) * l2norm_sq (y - X'.mulVec u') := by
+        intro u'
+        let m' := unpackParams pgsBasis splineBasis u'
+        have hm' : InModelClass m' pgsBasis splineBasis := by constructor <;> rfl
+        -- Need to prove rank condition for data'?
+        have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+           rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+           exact h_rank
+        have h_opt := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos (le_of_eq h_lambda_zero.symm) h_rank' m' hm'
+        rw [h_lambda_zero] at h_opt
+        unfold empiricalLoss pointwiseNLL at h_opt
+        simp only [hm'.dist_gaussian, zero_mul, add_zero] at h_opt
+        convert h_opt
+        · unfold l2norm_sq; congr 1; refine Finset.sum_congr rfl fun i _ => ?_
+          congr 1; rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ (by constructor <;> rfl)]
+        · unfold l2norm_sq; congr 1; refine Finset.sum_congr rfl fun i _ => ?_
+          congr 1; rw [linearPredictor_eq_designMatrix_mulVec _ _ _ _ hm']
+          -- Note: y is data.y. data'.y is data.y. They are equal.
+
+      have P_eq : InnerProductSpace.orthogonalProjection W y = InnerProductSpace.orthogonalProjection (LinearMap.range (Matrix.toLin' X')) y := by
+        rw [hW]
+
+      rw [h_is_proj X (packParams model) h_model_min, P_eq, ← h_is_proj X' (packParams model_prime) h_model_prime_min]
+
+    rw [h_pred, h_pred', hv_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
