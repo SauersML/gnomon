@@ -4393,7 +4393,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  intro data' model model_prime i
+  intro i
   -- 1. Setup Euclidean Space and Projections
   let E := EuclideanSpace ℝ (Fin n)
   let toE : (Fin n → ℝ) ≃L[ℝ] E := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm.toContinuousLinearEquiv
@@ -4405,9 +4405,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let R := LinearMap.range (Matrix.toLin' X)
 
   -- Range in Euclidean space (W = W' because ranges are equal)
+  -- Use explicit complete space instance for W
   let W : Submodule ℝ E := R.map toE.toLinearMap
-  have hW_closed : Submodule.Closed W :=
-    FiniteDimensional.complete ℝ W
+  have hW_closed : CompleteSpace W := FiniteDimensional.complete ℝ W
 
   let y_e := toE data.y
   let β := packParams model
@@ -4416,6 +4416,26 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let y_hat' := X'.mulVec β'
   let y_hat_e := toE y_hat
   let y_hat'_e := toE y_hat'
+
+  -- Helper lemma for uniqueness of distance minimizer in a subspace
+  have h_uniq_proj : ∀ (K : Submodule ℝ E) [CompleteSpace K] (z : E) (k : E),
+      k ∈ K → dist z k ≤ dist z (K.starProjection z) → k = K.starProjection z := by
+    intro K _ z k hk h_le
+    have h_orth : z - K.starProjection z ∈ Kᗮ := K.sub_starProjection_mem_orthogonal z
+    have h_split : z - k = (z - K.starProjection z) + (K.starProjection z - k) := by
+      rw [sub_add_sub_cancel]
+    have h_pythag : ‖z - k‖^2 = ‖z - K.starProjection z‖^2 + ‖K.starProjection z - k‖^2 := by
+      rw [h_split, norm_add_sq_eq_norm_sq_add_norm_sq_of_inner_eq_zero]
+      rw [real_inner_comm]
+      apply h_orth
+      apply K.sub_mem (K.starProjection_apply_mem z) hk
+    have h_le_sq : ‖z - k‖^2 ≤ ‖z - K.starProjection z‖^2 := by
+      rw [dist_eq_norm, dist_eq_norm] at h_le
+      exact sq_le_sq' (norm_nonneg _) h_le
+    rw [h_pythag] at h_le_sq
+    have h_norm_zero : ‖K.starProjection z - k‖^2 ≤ 0 := by linarith
+    have h_zero : K.starProjection z - k = 0 := norm_eq_zero.mp (pow_eq_zero (le_antisymm h_norm_zero (sq_nonneg _)))
+    exact eq_of_sub_eq_zero h_zero |>.symm
 
   -- Define model class certificates for later use
   have h_model_in_class : InModelClass model pgsBasis splineBasis :=
@@ -4427,18 +4447,21 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       exact h_rank)
 
   -- 2. Prove y_hat_e is the orthogonal projection of y_e onto W
-  have h_proj : y_hat_e = orthogonalProjection W y_e := by
+  have h_proj : y_hat_e = W.starProjection y_e := by
     apply Eq.symm
-    apply orthogonalProjection_eq_of_dist_le
-    · -- y_hat is in Range(X)
+    apply h_uniq_proj W y_e y_hat_e
+    · -- y_hat is in Range(X) -> W
       simp only [y_hat_e, W, R]
       apply Submodule.mem_map_of_mem
       rw [Matrix.range_toLin'_iff_exists_mulVec_eq_range]
       use β
     · -- y_hat minimizes distance (RSS)
-      intro v_e hv_e
-      -- Map v_e back to standard space v
-      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp hv_e
+      -- Use W.starProjection_minimal for the lower bound
+      rw [W.starProjection_minimal]
+      apply le_ciInf
+      intro w
+      -- Map w back to standard space v
+      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp w.2
       rw [← hv_eq]
       -- v is in Range(X), so v = X*b
       obtain ⟨b, hb⟩ := (Matrix.range_toLin'_iff_exists_mulVec_eq_range X v).mp hv_R
@@ -4479,20 +4502,24 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       simpa using h_le
 
   -- 3. Prove y_hat'_e is ALSO the orthogonal projection of y_e onto W
-  have h_proj' : y_hat'_e = orthogonalProjection W y_e := by
+  have h_proj' : y_hat'_e = W.starProjection y_e := by
     apply Eq.symm
-    apply orthogonalProjection_eq_of_dist_le
+    apply h_uniq_proj W y_e y_hat'_e
     · -- y_hat' is in Range(X') = Range(X) = W
       simp only [y_hat'_e, W, R]
       apply Submodule.mem_map_of_mem
+      change LinearMap.range (Matrix.toLin (Pi.basisFun ℝ _) (Pi.basisFun ℝ _) X) = _ at h_range_eq
       rw [h_range_eq] -- Critical step: ranges are equal
       rw [Matrix.range_toLin'_iff_exists_mulVec_eq_range]
       use β'
     · -- y_hat' minimizes distance (RSS) for data' (but y is same)
-      intro v_e hv_e
-      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp hv_e
+      rw [W.starProjection_minimal]
+      apply le_ciInf
+      intro w
+      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp w.2
       rw [← hv_eq]
       -- v is in Range(X) = Range(X'), so v = X'*b
+      change LinearMap.range (Matrix.toLin (Pi.basisFun ℝ _) (Pi.basisFun ℝ _) X) = _ at h_range_eq
       have hv_R' : v ∈ LinearMap.range (Matrix.toLin' X') := by rw [← h_range_eq]; exact hv_R
       obtain ⟨b, hb⟩ := (Matrix.range_toLin'_iff_exists_mulVec_eq_range X' v).mp hv_R'
 
@@ -4500,7 +4527,10 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       have h_comp_class : InModelClass m_comp pgsBasis splineBasis := by constructor <;> rfl
 
       have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
-        rw [Matrix.rank_eq_finrank_range_toLin', h_range_eq, ← Matrix.rank_eq_finrank_range_toLin']
+        rw [Matrix.rank_eq_finrank_range_toLin _ (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
+        change LinearMap.range (Matrix.toLin (Pi.basisFun ℝ _) (Pi.basisFun ℝ _) X) = _ at h_range_eq
+        rw [h_range_eq]
+        rw [← Matrix.rank_eq_finrank_range_toLin _ (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
         exact h_rank
 
       have h_model_class' : InModelClass model_prime pgsBasis splineBasis :=
