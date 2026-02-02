@@ -2569,6 +2569,17 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
     simpa [h_emp_fit, h_emp, h_pack_fit] using h_min'
   simpa [m_fit] using h_min''
 
+/-- The fitted model belongs to the class of GAMs (identity link, Gaussian noise). -/
+lemma fit_in_model_class {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    InModelClass (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) pgsBasis splineBasis := by
+  unfold fit unpackParams
+  constructor <;> rfl
+
 
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
@@ -4374,12 +4385,163 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+    rw [Matrix.rank_eq_finrank_range_toLin']
+    rw [← h_range_eq]
+    rw [← Matrix.rank_eq_finrank_range_toLin']
+    exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  -- 1. Setup Euclidean Space and Projections
+  let E := EuclideanSpace ℝ (Fin n)
+  let toE : (Fin n → ℝ) ≃L[ℝ] E := PiLp.equiv 2 (fun _ : Fin n => ℝ)
+
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  -- Ranges in standard space
+  let R := LinearMap.range (Matrix.toLin' X)
+
+  -- Range in Euclidean space (W = W' because ranges are equal)
+  let W : Submodule ℝ E := R.map toE.toLinearMap
+  have hW_closed : Submodule.Closed W :=
+    FiniteDimensional.complete ℝ W
+
+  let y_e := toE data.y
+  let β := packParams model
+  let β' := packParams model_prime
+  let y_hat := X.mulVec β
+  let y_hat' := X'.mulVec β'
+  let y_hat_e := toE y_hat
+  let y_hat'_e := toE y_hat'
+
+  -- Define model class certificates for later use
+  have h_model_in_class : InModelClass model pgsBasis splineBasis :=
+    fit_in_model_class data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+
+  have h_model_prime_in_class : InModelClass model_prime pgsBasis splineBasis :=
+    fit_in_model_class data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      rw [Matrix.rank_eq_finrank_range_toLin', h_range_eq, ← Matrix.rank_eq_finrank_range_toLin']
+      exact h_rank)
+
+  -- 2. Prove y_hat_e is the orthogonal projection of y_e onto W
+  have h_proj : y_hat_e = orthogonalProjection W y_e := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · -- y_hat is in Range(X)
+      simp only [y_hat_e, W, R]
+      apply Submodule.mem_map_of_mem
+      rw [Matrix.range_toLin'_iff_exists_mulVec_eq_range]
+      use β
+    · -- y_hat minimizes distance (RSS)
+      intro v_e hv_e
+      -- Map v_e back to standard space v
+      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp hv_e
+      rw [← hv_eq]
+      -- v is in Range(X), so v = X*b
+      obtain ⟨b, hb⟩ := (Matrix.range_toLin'_iff_exists_mulVec_eq_range X v).mp hv_R
+
+      -- Construct comparison model
+      let m_comp := unpackParams pgsBasis splineBasis b
+      have h_comp_class : InModelClass m_comp pgsBasis splineBasis := by constructor <;> rfl
+
+      -- model minimizes empiricalLoss
+      have h_model_class : InModelClass model pgsBasis splineBasis :=
+        fit_in_model_class data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+      have h_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_comp h_comp_class
+
+      -- Convert loss to distance
+      rw [h_lambda_zero] at h_le
+      simp only [add_zero] at h_le
+      rw [mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos) : 0 < 1 / (n:ℝ))] at h_le
+
+      -- Helper: sum of squares is dist squared in E
+      have h_dist_eq : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+          (∑ i : Fin n, pointwiseNLL m.dist (data.y i) (linearPredictor m (data.p i) (data.c i))) =
+          dist y_e (toE ((designMatrix data pgsBasis splineBasis).mulVec (packParams m))) ^ 2 := by
+        intro m hm
+        rw [dist_eq_norm, ← toE.map_sub, PiLp.norm_eq_of_nat two_ne_zero]
+        simp only [Real.norm_eq_abs, sq_abs]
+        have h_pow : (2:ℝ).toNNReal = 2 := by simp
+        rw [h_pow]
+        simp only [Real.rpow_two, NNReal.coe_ofNat]
+        rw [Real.sq_sqrt (Finset.sum_nonneg fun _ _ => sq_nonneg _)]
+        apply Finset.sum_congr rfl
+        intro j _
+        simp [pointwiseNLL, hm.dist_gaussian, linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm, y_e, toE, PiLp.equiv]
+        rfl
+
+      rw [h_dist_eq model h_model_class, h_dist_eq m_comp h_comp_class] at h_le
+      simp only [y_hat_e, y_hat, β, m_comp, unpack_pack_eq _ _ _ h_comp_class, hb] at h_le
+      rw [← hb, ← hv_eq]
+      simpa using h_le
+
+  -- 3. Prove y_hat'_e is ALSO the orthogonal projection of y_e onto W
+  have h_proj' : y_hat'_e = orthogonalProjection W y_e := by
+    apply Eq.symm
+    apply orthogonalProjection_eq_of_dist_le
+    · -- y_hat' is in Range(X') = Range(X) = W
+      simp only [y_hat'_e, W, R]
+      apply Submodule.mem_map_of_mem
+      rw [h_range_eq] -- Critical step: ranges are equal
+      rw [Matrix.range_toLin'_iff_exists_mulVec_eq_range]
+      use β'
+    · -- y_hat' minimizes distance (RSS) for data' (but y is same)
+      intro v_e hv_e
+      obtain ⟨v, hv_R, hv_eq⟩ := Submodule.mem_map.mp hv_e
+      rw [← hv_eq]
+      -- v is in Range(X) = Range(X'), so v = X'*b
+      have hv_R' : v ∈ LinearMap.range (Matrix.toLin' X') := by rw [← h_range_eq]; exact hv_R
+      obtain ⟨b, hb⟩ := (Matrix.range_toLin'_iff_exists_mulVec_eq_range X' v).mp hv_R'
+
+      let m_comp := unpackParams pgsBasis splineBasis b
+      have h_comp_class : InModelClass m_comp pgsBasis splineBasis := by constructor <;> rfl
+
+      have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+        rw [Matrix.rank_eq_finrank_range_toLin', h_range_eq, ← Matrix.rank_eq_finrank_range_toLin']
+        exact h_rank
+
+      have h_model_class' : InModelClass model_prime pgsBasis splineBasis :=
+        fit_in_model_class data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank'
+
+      have h_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank' m_comp h_comp_class
+
+      rw [h_lambda_zero] at h_le
+      simp only [add_zero, mul_le_mul_left (one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos) : 0 < 1 / (n:ℝ))] at h_le
+
+      have h_dist_eq : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+          (∑ i : Fin n, pointwiseNLL m.dist (data'.y i) (linearPredictor m (data'.p i) (data'.c i))) =
+          dist y_e (toE ((designMatrix data' pgsBasis splineBasis).mulVec (packParams m))) ^ 2 := by
+        intro m hm
+        rw [dist_eq_norm, ← toE.map_sub, PiLp.norm_eq_of_nat two_ne_zero]
+        simp only [Real.norm_eq_abs, sq_abs]
+        have h_pow : (2:ℝ).toNNReal = 2 := by simp
+        rw [h_pow]
+        simp only [Real.rpow_two, NNReal.coe_ofNat]
+        rw [Real.sq_sqrt (Finset.sum_nonneg fun _ _ => sq_nonneg _)]
+        apply Finset.sum_congr rfl
+        intro j _
+        -- Note: data'.y = data.y = y_e (in vector form)
+        simp [pointwiseNLL, hm.dist_gaussian, linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm, y_e, toE, PiLp.equiv]
+        rfl
+
+      rw [h_dist_eq model_prime h_model_class', h_dist_eq m_comp h_comp_class] at h_le
+      simp only [y_hat'_e, y_hat', β', m_comp, unpack_pack_eq _ _ _ h_comp_class, hb] at h_le
+      rw [← hb, ← hv_eq]
+      simpa using h_le
+
+  -- 4. Conclusion
+  have h_eq_vec : y_hat = y_hat' := by
+    apply toE.injective
+    rw [h_proj, h_proj']
+
+  -- Evaluate at i
+  have h1 := linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_model_in_class i
+  have h2 := linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_model_prime_in_class i
+  rw [h1, h2]
+  exact congr_fun h_eq_vec i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
