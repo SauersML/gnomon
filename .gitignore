@@ -27,3 +27,4 @@ build.log
 
 # Temporary tools
 gh_*/
+.lake/
