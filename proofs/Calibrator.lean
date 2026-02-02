@@ -4361,6 +4361,102 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     We formalize "flexible enough" as the condition that the design matrix column space
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
+set_option maxHeartbeats 2000000 in
+theorem fit_eq_projection {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    let model := fit p k sp n data 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank
+    let X := designMatrix data pgsBasis splineBasis
+    let K := LinearMap.range (Matrix.toLin' X)
+    X.mulVec (packParams model) = K.starProjection data.y := by
+  intro model X K
+  -- 1. Interpret model as minimizer
+  have h_min := fit_minimizes_loss p k sp n data 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank
+
+  let v := X.mulVec (packParams model)
+  have hv_mem : v ∈ K := by
+    rw [LinearMap.mem_range]
+    use packParams model
+    rfl
+
+  apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero hv_mem
+  intro w hw
+  -- w in K means w = X * delta
+  obtain ⟨delta, h_delta⟩ := LinearMap.mem_range.mp hw
+  rw [← h_delta]
+
+  let β := packParams model
+
+  -- Variational argument: loss(β + ε*delta) ≥ loss(β)
+  have h_quad : ∀ ε : ℝ,
+      (1 / (n : ℝ)) * (real_inner (data.y - v) (data.y - v) - 2 * ε * real_inner (data.y - v) (X.mulVec delta) + ε^2 * real_inner (X.mulVec delta) (X.mulVec delta)) ≥ (1 / (n : ℝ)) * real_inner (data.y - v) (data.y - v) := by
+    intro ε
+    let m_eps := unpackParams pgsBasis splineBasis (β + ε • delta)
+    have hm_eps : InModelClass m_eps pgsBasis splineBasis := by constructor <;> rfl
+    have h_loss_le := h_min.2 m_eps hm_eps
+
+    -- Expand empiricalLoss to norm squared
+    have h_loss_def : ∀ m : PhenotypeInformedGAM p k sp, InModelClass m pgsBasis splineBasis →
+        empiricalLoss m data 0 = (1 / (n : ℝ)) * ‖data.y - X.mulVec (packParams m)‖^2 := by
+      intro m hm
+      unfold empiricalLoss pointwiseNLL l2norm_sq
+      simp only [hm.dist_gaussian, add_zero, mul_zero, Finset.sum_add_distrib]
+      congr 1
+      -- Use linear predictor equality
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm]
+      -- l2norm_sq vs norm squared
+      -- l2norm_sq v = sum v_i^2 = ||v||^2
+      -- We need to prove this equality if they differ definitionally
+      -- But norm in PiLp 2 is L2 norm.
+      rw [norm_eq_sqrt_inner (data.y - X.mulVec (packParams m))]
+      simp only [Real.sq_sqrt (inner_self_nonneg _)]
+      rfl
+
+    rw [h_loss_def model (by constructor <;> rfl)] at h_loss_le
+    rw [h_loss_def m_eps hm_eps] at h_loss_le
+
+    -- Simplify packParams m_eps
+    have h_pack : packParams m_eps = β + ε • delta := by
+      ext i; cases i <;> rfl
+
+    rw [h_pack] at h_loss_le
+
+    -- Algebraic expansion using inner product space properties
+    let r := data.y - X.mulVec β
+    let d := X.mulVec delta
+    have h_vec : data.y - X.mulVec (β + ε • delta) = r - ε • d := by
+      simp only [r, d, Matrix.mulVec_add, Matrix.mulVec_smul]
+      ext i; simp; ring
+
+    rw [h_vec] at h_loss_le
+
+    -- Expand ||r - εd||^2 = ||r||^2 - 2ε<r,d> + ε^2||d||^2
+    rw [norm_sub_pow_two_real] at h_loss_le
+    -- h_loss_le : ... * (||r||^2 - 2ε<r,d> + ...) >= ... * ||r||^2
+    -- Rewrite norm^2 as inner
+    simp_rw [norm_sq_eq_inner] at h_loss_le ⊢
+    exact h_loss_le
+
+  -- Use linear_coeff_zero_of_quadratic_nonneg
+  have h_inner_zero : -2 * real_inner (data.y - v) (X.mulVec delta) = 0 := by
+    apply linear_coeff_zero_of_quadratic_nonneg (-2 * real_inner (data.y - v) (X.mulVec delta)) (real_inner (X.mulVec delta) (X.mulVec delta))
+    intro ε
+    have h := h_quad ε
+    have h_n_inv_pos : 0 < 1 / (n : ℝ) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+    rw [mul_le_mul_left h_n_inv_pos] at h
+    -- h: ||r||^2 - 2... >= ||r||^2
+    -- Subtract ||r||^2
+    simp only [v, β] at h
+    simp only [le_add_iff_nonneg_right] at h
+    -- h : -2 * ε * <r,d> + ε^2 * <d,d> >= 0
+    -- This matches form a*ε + b*ε^2 >= 0
+    convert h using 1
+    ring
+
+  linarith
+
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
@@ -4374,12 +4470,55 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      let X := designMatrix data pgsBasis splineBasis
+      let X' := designMatrix data' pgsBasis splineBasis
+      rw [Matrix.rank_eq_finrank_range_toLin X (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)] at h_rank
+      rw [Matrix.rank_eq_finrank_range_toLin X' (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
+      rw [← h_range_eq]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  let K := LinearMap.range (Matrix.toLin' X)
+  let K' := LinearMap.range (Matrix.toLin' X')
+  have hK : K = K' := h_range_eq
+
+  let v := X.mulVec (packParams model)
+  let v' := X'.mulVec (packParams model_prime)
+
+  have hv_proj : v = K.starProjection data.y := by
+    have h_model_eq : model = fit p k sp n data 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank := by
+      subst h_lambda_zero
+      rfl
+    rw [h_model_eq]
+    exact fit_eq_projection data pgsBasis splineBasis h_n_pos h_rank
+
+  have hv_proj' : v' = K'.starProjection data'.y := by
+    have h_rank' : Matrix.rank X' = Fintype.card (ParamIx p k sp) := by
+      rw [Matrix.rank_eq_finrank_range_toLin X' (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin X (Pi.basisFun ℝ _) (Pi.basisFun ℝ _)]
+      exact h_rank
+    have h_model_prime_eq : model_prime = fit p k sp n data' 0 pgsBasis splineBasis h_n_pos (le_refl 0) h_rank' := by
+      subst h_lambda_zero
+      rfl
+    rw [h_model_prime_eq]
+    exact fit_eq_projection data' pgsBasis splineBasis h_n_pos h_rank'
+
+  have hy_eq : data.y = data'.y := rfl
+  have h_proj_eq : K.starProjection data.y = K'.starProjection data.y := by
+    apply Submodule.eq_starProjection_of_eq_submodule hK
+
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+
+  change v i = v' i
+  rw [hv_proj, hv_proj', hy_eq, h_proj_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
