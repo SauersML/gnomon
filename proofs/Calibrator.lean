@@ -4373,12 +4373,12 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) = LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
-  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      have h1 := Matrix.rank_eq_finrank_range_toLin (designMatrix data' pgsBasis splineBasis)
-      have h2 := Matrix.rank_eq_finrank_range_toLin (designMatrix data pgsBasis splineBasis)
-      rw [h1, ← h_range_eq, ← h2]
-      exact h_rank
-  )
+  have h_rank_prime : Matrix.rank (designMatrix data' pgsBasis splineBasis) = Fintype.card (ParamIx p k sp) := by
+    have h1 := Matrix.rank_eq_finrank_range_toLin (designMatrix data' pgsBasis splineBasis)
+    have h2 := Matrix.rank_eq_finrank_range_toLin (designMatrix data pgsBasis splineBasis)
+    rw [h1, ← h_range_eq, ← h2]
+    exact h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
@@ -4450,12 +4450,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     obtain ⟨beta, hbeta⟩ := hw
     let m_w := unpackParams pgsBasis splineBasis beta
     have hm_w_cls : InModelClass m_w pgsBasis splineBasis := by constructor <;> rfl
-    have h_fit := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin]
-      rw [← h_range_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin]
-      exact h_rank
-    ) m_w hm_w_cls
+    have h_fit := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank_prime m_w hm_w_cls
     rw [h_lambda_zero] at h_fit
     rw [h_loss_eq data' (fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg _) (by constructor <;> rfl)] at h_fit
     rw [h_loss_eq data' m_w hm_w_cls] at h_fit
