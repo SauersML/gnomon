@@ -4374,12 +4374,144 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin]
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  funext i
+  let v := fun i => linearPredictor model (data.p i) (data.c i)
+  let v' := fun i => linearPredictor model_prime (data'.p i) (data'.c i)
+
+  -- The empirical loss with lambda=0 corresponds to the squared Euclidean distance.
+  let loss := fun (u : Fin n → ℝ) => (1 / (n : ℝ)) * l2norm_sq (data.y - u)
+
+  -- Identify range subspaces
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let S := LinearMap.range (Matrix.toLin' X)
+  let S' := LinearMap.range (Matrix.toLin' X')
+  have hS : S = S' := h_range_eq
+
+  -- Identify predictions as elements of the subspace
+  have hv_in : v ∈ S := by
+    rw [LinearMap.mem_range]
+    use (packParams model)
+    ext i
+    simp [v, Matrix.toLin'_apply]
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (by constructor <;> rfl)]
+    rfl
+
+  have hv'_in : v' ∈ S' := by
+    rw [LinearMap.mem_range]
+    use (packParams model_prime)
+    ext i
+    simp [v', Matrix.toLin'_apply]
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (by constructor <;> rfl)]
+    rfl
+
+  -- Loss equivalence lemma
+  have h_loss_eq : ∀ (data_ : RealizedData n k) (m : PhenotypeInformedGAM p k sp), InModelClass m pgsBasis splineBasis →
+      empiricalLoss m data_ 0 = (1 / (n : ℝ)) * l2norm_sq (data_.y - (fun i => linearPredictor m (data_.p i) (data_.c i))) := by
+    intro data_ m hm
+    unfold empiricalLoss
+    simp [l2norm_sq, pointwiseNLL, hm.dist_gaussian, -sub_eq_add_neg]
+
+  -- Optimality
+  have h_opt : ∀ w ∈ S, loss v ≤ loss w := by
+    intro w hw
+    rw [LinearMap.mem_range] at hw
+    obtain ⟨beta, hbeta⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis beta
+    have hm_w_cls : InModelClass m_w pgsBasis splineBasis := by constructor <;> rfl
+    have h_fit := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m_w hm_w_cls
+    rw [h_lambda_zero] at h_fit
+    rw [h_loss_eq data (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) (by constructor <;> rfl)] at h_fit
+    rw [h_loss_eq data m_w hm_w_cls] at h_fit
+    -- LHS of h_fit is loss (pred model). v is pred model.
+    -- RHS of h_fit is loss (pred m_w).
+    -- We need to show pred m_w = w.
+    -- pred m_w = X * packParams m_w = X * beta = w.
+    have h_pred_w : (fun i => linearPredictor m_w (data.p i) (data.c i)) = w := by
+      funext i
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m_w hm_w_cls]
+      simp only [m_w, X, Matrix.toLin'_apply] at hbeta
+      rw [← hbeta]
+      rfl
+    rw [h_pred_w] at h_fit
+    exact h_fit
+
+  have h_opt' : ∀ w ∈ S', loss v' ≤ loss w := by
+    intro w hw
+    rw [LinearMap.mem_range] at hw
+    obtain ⟨beta, hbeta⟩ := hw
+    let m_w := unpackParams pgsBasis splineBasis beta
+    have hm_w_cls : InModelClass m_w pgsBasis splineBasis := by constructor <;> rfl
+    have h_fit := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      rw [Matrix.rank_eq_finrank_range_toLin]
+      rw [← h_range_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
+    ) m_w hm_w_cls
+    rw [h_lambda_zero] at h_fit
+    rw [h_loss_eq data' (fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg _) (by constructor <;> rfl)] at h_fit
+    rw [h_loss_eq data' m_w hm_w_cls] at h_fit
+    have h_pred_w : (fun i => linearPredictor m_w (data'.p i) (data'.c i)) = w := by
+      funext i
+      rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m_w hm_w_cls]
+      simp only [m_w, X', Matrix.toLin'_apply] at hbeta
+      rw [← hbeta]
+      rfl
+    rw [h_pred_w] at h_fit
+    exact h_fit
+
+  -- Strict Convexity of Loss
+  have h_strict : StrictConvexOn ℝ Set.univ loss := by
+    intro u _ v _ hne a b ha hb hab
+    dsimp [loss, l2norm_sq]
+    apply mul_lt_mul_of_pos_left _ (by norm_num [h_n_pos] : 0 < 1/(n:ℝ))
+    obtain ⟨i, hi⟩ := Function.ne_iff.mp hne
+    let f := fun j x => (data.y j - x)^2
+    have h_cvx : ∀ j, ConvexOn ℝ Set.univ (fun u : Fin n → ℝ => f j (u j)) := by
+      intro j
+      intro x _ y _ a b ha hb hab
+      have : data.y j - (a * x j + b * y j) = a * (data.y j - x j) + b * (data.y j - y j) := by
+        rw [hab]
+        ring
+      dsimp [f]
+      rw [this]
+      apply le_trans ((convexOn_pow 2).le trivial trivial ha hb hab)
+      rfl
+    have h_strict_i : StrictConvexOn ℝ Set.univ (fun u : Fin n → ℝ => f i (u i)) := by
+      intro x _ y _ hxy a b ha hb hab
+      have : data.y i - (a * x i + b * y i) = a * (data.y i - x i) + b * (data.y i - y i) := by
+        rw [hab]
+        ring
+      dsimp [f]
+      rw [this]
+      apply (strictConvexOn_pow 2 two_ne_zero).lt trivial trivial _ ha hb hab
+      simp [hi] at hxy ⊢
+      exact hxy
+
+    rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ i)]
+    rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ i)]
+    rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ i)]
+    apply add_lt_add_of_lt_of_le
+    · exact h_strict_i u trivial v trivial hi ha hb hab
+    · apply convexOn_sum
+      · intro j _; exact h_cvx j
+      · exact trivial
+      · exact trivial
+      · exact ha
+      · exact hb
+      · exact hab
+
+  -- Uniqueness
+  rw [hS] at hv_in h_opt
+  apply h_strict.eq_of_isMinOn_of_isMinOn (Submodule.convex S) hv_in hv'_in h_opt h_opt'
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
