@@ -4444,12 +4444,164 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  -- Define design matrices and predictions
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let pred := X.mulVec (packParams model)
+  let pred' := X'.mulVec (packParams model_prime)
+
+  -- Relate linearPredictor to pred/pred'
+  have h_pred : ∀ i, linearPredictor model (data.p i) (data.c i) = pred i := by
+    intro i
+    rw [linearPredictor_eq_designMatrix_mulVec]
+    · rfl
+    · constructor <;> rfl
+  have h_pred' : ∀ i, linearPredictor model_prime (data'.p i) (data'.c i) = pred' i := by
+    intro i
+    rw [linearPredictor_eq_designMatrix_mulVec]
+    · rfl
+    · constructor <;> rfl
+
+  -- Show predictions are equal by uniqueness of projection
+  have h_eq : pred = pred' := by
+    -- Both minimize distance to y on the same range
+    let range_X := LinearMap.range (Matrix.toLin' X)
+    let range_X' := LinearMap.range (Matrix.toLin' X')
+    have h_range_eq_set : (Set.range (Matrix.mulVec X)) = (Set.range (Matrix.mulVec X')) := by
+       -- Convert LinearMap.range to Set.range
+       have h1 : range_X = range_X' := h_range_eq
+       simp only [LinearMap.range_eq_map, Submodule.map_top, Submodule.mem_map, Submodule.mem_top,
+         exists_true_left, Set.mem_range] at h1 ⊢
+       ext v
+       constructor
+       · intro hv
+         rw [← Matrix.range_mulVec_eq_range_toLin'] at h1
+         rw [Matrix.range_mulVec_eq_range_toLin']
+         exact h1 ▸ hv
+       · intro hv
+         rw [← Matrix.range_mulVec_eq_range_toLin'] at h1
+         rw [Matrix.range_mulVec_eq_range_toLin']
+         exact h1.symm ▸ hv
+
+    -- Define the objective function f(v) = ||y - v||^2
+    let f : (Fin n → ℝ) → ℝ := fun v => l2norm_sq (data.y - v)
+
+    -- Show strict convexity of f
+    have h_strict_convex : StrictConvexOn ℝ Set.univ f := by
+      intro x _ y _ hxy a b ha hb hab
+      unfold l2norm_sq
+      rw [Finset.sum_add_distrib]
+      rw [← Finset.mul_sum, ← Finset.mul_sum]
+      apply Finset.sum_lt_sum
+      · intro i _
+        have h_lin : data.y i - (a * x i + b * y i) = a * (data.y i - x i) + b * (data.y i - y i) := by
+           have h_one : a + b = 1 := hab
+           calc data.y i - (a * x i + b * y i)
+             _ = (a + b) * data.y i - a * x i - b * y i := by rw [h_one, one_mul]; ring
+             _ = a * (data.y i - x i) + b * (data.y i - y i) := by ring
+        rw [h_lin]
+        apply convexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) ha hb hab
+      · obtain ⟨i, hi_ne⟩ := Function.ne_iff.mp hxy
+        use i, Finset.mem_univ i
+        have h_lin : data.y i - (a * x i + b * y i) = a * (data.y i - x i) + b * (data.y i - y i) := by
+           have h_one : a + b = 1 := hab
+           calc data.y i - (a * x i + b * y i)
+             _ = (a + b) * data.y i - a * x i - b * y i := by rw [h_one, one_mul]; ring
+             _ = a * (data.y i - x i) + b * (data.y i - y i) := by ring
+        rw [h_lin]
+        apply strictConvexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) _ ha hb hab
+        intro h
+        apply hi_ne
+        linarith
+
+    -- Show pred and pred' are minimizers on the range
+    have h_min_pred : IsMinOn f (Set.range (Matrix.mulVec X)) pred := by
+      intro v hv
+      obtain ⟨beta, hbeta⟩ := hv
+      rw [← hbeta]
+      have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+      let m_beta := unpackParams pgsBasis splineBasis beta
+      have h_in_class : InModelClass m_beta pgsBasis splineBasis := by constructor <;> rfl
+      specialize h_loss m_beta h_in_class
+      unfold empiricalLoss at h_loss
+      rw [h_lambda_zero] at h_loss
+      simp only [mul_zero, add_zero] at h_loss
+      have h_f_val : f (X.mulVec beta) = n * empiricalLoss m_beta data lambda := by
+        unfold f l2norm_sq empiricalLoss
+        rw [h_lambda_zero]
+        simp only [mul_zero, add_zero]
+        rw [linearPredictor_eq_designMatrix_mulVec]
+        · have h_pack : packParams m_beta = beta := unpack_pack_eq _ _ _ h_in_class ▸ rfl
+          rw [h_pack]
+          field_simp
+          ring
+        · exact h_in_class
+
+      have h_f_pred : f pred = n * empiricalLoss model data lambda := by
+        unfold f l2norm_sq empiricalLoss
+        rw [h_lambda_zero]
+        simp only [mul_zero, add_zero]
+        rw [linearPredictor_eq_designMatrix_mulVec]
+        · field_simp; ring
+        · constructor <;> rfl
+
+      rw [h_f_val, h_f_pred]
+      gcongr
+      exact h_loss
+
+    have h_min_pred' : IsMinOn f (Set.range (Matrix.mulVec X')) pred' := by
+      intro v hv
+      obtain ⟨beta, hbeta⟩ := hv
+      rw [← hbeta]
+      have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+         rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+         exact h_rank
+      )
+      let m_beta := unpackParams pgsBasis splineBasis beta
+      have h_in_class : InModelClass m_beta pgsBasis splineBasis := by constructor <;> rfl
+      specialize h_loss m_beta h_in_class
+      unfold empiricalLoss at h_loss
+      rw [h_lambda_zero] at h_loss
+      simp only [mul_zero, add_zero] at h_loss
+      have h_f_val : f (X'.mulVec beta) = n * empiricalLoss m_beta data' lambda := by
+        unfold f l2norm_sq empiricalLoss
+        rw [h_lambda_zero]
+        simp only [mul_zero, add_zero]
+        rw [linearPredictor_eq_designMatrix_mulVec]
+        · have h_pack : packParams m_beta = beta := unpack_pack_eq _ _ _ h_in_class ▸ rfl
+          rw [h_pack]
+          simp [data']
+          field_simp; ring
+        · exact h_in_class
+
+      have h_f_pred : f pred' = n * empiricalLoss model_prime data' lambda := by
+        unfold f l2norm_sq empiricalLoss
+        rw [h_lambda_zero]
+        simp only [mul_zero, add_zero]
+        rw [linearPredictor_eq_designMatrix_mulVec]
+        · simp [data']; field_simp; ring
+        · constructor <;> rfl
+
+      rw [h_f_val, h_f_pred]
+      gcongr
+      exact h_loss
+
+    -- Convexity of Range(X)
+    have h_convex : Convex ℝ (Set.range (Matrix.mulVec X)) := by
+       rw [Matrix.range_mulVec_eq_range_toLin']
+       exact Submodule.convex _
+
+    -- Uniqueness
+    rw [h_range_eq_set] at h_min_pred
+    exact (h_strict_convex.subset (Set.subset_univ _)).isUnique_minimizer h_convex h_min_pred h_min_pred'
+
+  rw [h_pred, h_pred', h_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
