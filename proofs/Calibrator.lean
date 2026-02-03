@@ -4429,13 +4429,11 @@ set_option maxHeartbeats 2000000 in
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
 
-lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
-    (A B : Matrix (Fin n) (Fin m) ℝ)
+lemma rank_eq_of_range_eq {ι₁ ι₂ : Type*} [Fintype ι₁] [Fintype ι₂] [DecidableEq ι₁] [DecidableEq ι₂]
+    (A B : Matrix ι₁ ι₂ ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
-  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
-  change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
+  dsimp [Matrix.rank, LinearMap.rank]
   rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
@@ -4462,7 +4460,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
   classical
-  intro i
+  intro data' model model_prime i
   rw [h_lambda_zero] at model model_prime
 
   let X := designMatrix data pgsBasis splineBasis
