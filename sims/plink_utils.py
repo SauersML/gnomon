@@ -4,6 +4,7 @@ Helper functions for managing PLINK and external tools integration.
 import subprocess
 import os
 import shutil
+import tempfile
 from pathlib import Path
 import re
 
@@ -21,7 +22,8 @@ def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None
     # stdpopsim outputs chr22, but our downstream tools (PLINK/PRS-CSx pipeline)
     # assume chromosome "22". Some plink2 builds used in CI do not support
     # flags like --set-chr, so we normalize the VCF chromosome column ourselves.
-    vcf_numeric = f"{out_prefix}_numeric.vcf"
+    temp_dir = tempfile.mkdtemp(prefix="plink_vcf_")
+    vcf_numeric = str(Path(temp_dir) / f"{Path(out_prefix).name}_numeric.vcf")
     
     chr_prefix_re = re.compile(r"^(chr)([0-9]+|[XYM]|MT)\b", flags=re.IGNORECASE)
     try:
@@ -46,26 +48,27 @@ def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None
                 fout.write("\t".join(parts) + "\n")
     except Exception as e:
         raise RuntimeError(f"VCF preprocessing failed: {e}")
-    
-    cmd = [
-        plink_exe,
-        "--vcf", vcf_numeric,
-        "--max-alleles", "2",
-        "--rm-dup", "exclude-all",
-        "--make-bed",
-        "--out", out_prefix,
-        "--silent"
-    ]
-    
-    print(f"Running PLINK conversion: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    # Clean up temporary VCF
-    if os.path.exists(vcf_numeric):
-        os.remove(vcf_numeric)
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
+
+    try:
+        cmd = [
+            plink_exe,
+            "--vcf", vcf_numeric,
+            "--max-alleles", "2",
+            "--rm-dup", "exclude-all",
+            "--make-bed",
+            "--out", out_prefix,
+            "--silent"
+        ]
+
+        print(f"Running PLINK conversion: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"PLINK conversion failed:\n{result.stderr}")
+    finally:
+        if os.path.exists(vcf_numeric):
+            os.remove(vcf_numeric)
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
         
     print(f"Created PLINK files: {out_prefix}.bed/bim/fam")
     

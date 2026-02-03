@@ -103,7 +103,6 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
     ),
 }
 
-
 # --------------------------------------------------------------------
 # Core helpers (tskit-idiomatic, but memory-safe for full chr22)
 # --------------------------------------------------------------------
