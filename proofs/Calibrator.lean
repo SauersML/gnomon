@@ -1628,9 +1628,9 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
     intro x
     let c : Fin k → ℝ := fun j => if j = l then x else 0
     have h_eq := h_slope_const c (fun _ => 0)
-    have h_sum_c : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
+    have h_sum_c' : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
       classical
-      have h_sum_c' :
+      have h_sum_c'' :
           (Finset.sum (s:=Finset.univ)
             (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) : ℝ) =
             evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
@@ -1641,6 +1641,8 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
           simp [h_cj, h_S_zero_at_zero]
         · intro h_not_mem
           exfalso; exact h_not_mem (Finset.mem_univ l)
+      simpa using h_sum_c''
+    have h_sum_c : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
       simpa [c] using h_sum_c'
     have h_sum_0 : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 = 0 := by
       classical
@@ -4429,11 +4431,13 @@ set_option maxHeartbeats 2000000 in
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
 
-lemma rank_eq_of_range_eq {ι₁ ι₂ : Type*} [Fintype ι₁] [Fintype ι₂] [DecidableEq ι₁] [DecidableEq ι₂]
-    (A B : Matrix ι₁ ι₂ ℝ)
+lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [DecidableEq m]
+    (A B : Matrix n m ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  dsimp [Matrix.rank, LinearMap.rank]
+  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ n) (Pi.basisFun ℝ m)]
+  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ n) (Pi.basisFun ℝ m)]
+  change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
@@ -4461,7 +4465,18 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       linearPredictor model_prime (data'.p i) (data'.c i) := by
   classical
   intro i
-  rw [h_lambda_zero] at model model_prime
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun j => A.mulVec (data.c j) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      let X := designMatrix data pgsBasis splineBasis
+      let X' := designMatrix data' pgsBasis splineBasis
+      have h_rank_eq : X.rank = X'.rank := by
+        exact rank_eq_of_range_eq X X' h_range_eq
+      rw [← h_rank_eq]
+      exact h_rank
+  )
+  -- Re-express the goal using the local definitions.
+  simp [data', model, model_prime, h_lambda_zero]
 
   let X := designMatrix data pgsBasis splineBasis
   let X' := designMatrix data' pgsBasis splineBasis
