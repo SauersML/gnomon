@@ -49,6 +49,9 @@ import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 import Mathlib.Analysis.SpecialFunctions.Pow.Real
+import Mathlib.Algebra.Polynomial.Basic
+import Mathlib.Algebra.Polynomial.Eval.Defs
+import Mathlib.Algebra.Polynomial.Roots
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -1380,7 +1383,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
@@ -1413,12 +1416,79 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  -- Solve for a
+  have ha : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure :=
+    optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth_1
+
+  have hY_val : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
+    simp_rw [h_dgp]
+    have h_add : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure :=
+      hP_int.add (hC_int.const_mul _)
+    rw [integral_add hP_int (hC_int.const_mul _)]
+    rw [integral_const_mul, hP0, hC0]
+    ring
+
+  rw [hY_val] at ha
+
+  -- Solve for b
+  have hb : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure :=
+    optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  have hYP_val : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
+    simp_rw [h_dgp]
+    have h_distrib : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 = pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc; ring
+    simp_rw [h_distrib]
+    have h_prod_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure :=
+      hPC_int
+    have h_term2_int : Integrable (fun pc => β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1)) dgp.jointMeasure :=
+      h_prod_int.const_mul β_env
+    rw [integral_add hP2_int h_term2_int]
+    rw [integral_const_mul, hP2]
+    have h_cov_zero : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+      have hPC_eq_CP : ∀ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 = pc.1 * pc.2 ⟨0, by norm_num⟩ := by intro pc; rw [mul_comm]
+      simp_rw [hPC_eq_CP]
+      exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+    rw [h_cov_zero]
+    ring
+
+  rw [hYP_val] at hb
+  exact ⟨ha, hb⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
-  admit
+  intro h_zero
+  let P : Polynomial ℝ := ∑ i : Fin n, Polynomial.monomial (i.val + 1) (coeffs i)
+  have h_eval : ∀ x, P.eval x = 0 := by
+    intro x
+    simp only [P, Polynomial.eval_finset_sum, Polynomial.eval_monomial]
+    exact h_zero x
+  have h_P_zero : P = 0 := by
+    apply Polynomial.funext
+    intro x
+    rw [h_eval x, Polynomial.eval_zero]
+  intro j
+  have h_coeff : P.coeff (j.val + 1) = 0 := by
+    rw [h_P_zero, Polynomial.coeff_zero]
+  rw [← h_coeff]
+  simp only [P, Polynomial.finset_sum_coeff]
+  rw [Finset.sum_eq_single j]
+  · rw [Polynomial.coeff_monomial_same]
+  · intro b _ h_ne
+    rw [Polynomial.coeff_monomial_of_ne]
+    · intro h_eq
+      apply h_ne
+      apply Fin.eq_of_val_eq
+      simp at h_eq
+      exact h_eq.symm
+  · intro h_not_mem
+    exact (h_not_mem (Finset.mem_univ j)).elim
 
 
 theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
