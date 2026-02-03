@@ -4454,6 +4454,18 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
+  -- Bring variables into scope for the tactic block
+  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
+  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      rw [Matrix.rank_eq_finrank_range_toLin]
+      have h_eq := h_range_eq.symm
+      dsimp only at h_eq
+      rw [h_eq]
+      rw [← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
+  )
+
   -- Define design matrices and predictions
   let X := designMatrix data pgsBasis splineBasis
   let X' := designMatrix data' pgsBasis splineBasis
