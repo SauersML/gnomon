@@ -198,6 +198,12 @@ jobs:
       - name: Validate build outputs
         run: |
           echo "================================================="
+          if [ -f ".lake/build/lib/lean/Calibrator.olean" ]; then
+            echo "✅ SUCCESS: .lake/build/lib/lean/Calibrator.olean was created."
+          else
+            echo "❌ FAILURE: .lake/build/lib/lean/Calibrator.olean was NOT found."
+            exit 1
+          fi
 
   auto-close-failed-proof-pr:
     runs-on: ubuntu-latest
@@ -286,9 +292,3 @@ jobs:
             });
 
             core.setFailed('Lean Prover CI failed for PR that modifies proofs/.');
-            if [ -f ".lake/build/lib/lean/Calibrator.olean" ]; then
-              echo "✅ SUCCESS: .lake/build/lib/lean/Calibrator.olean was created."
-            else
-              echo "❌ FAILURE: .lake/build/lib/lean/Calibrator.olean was NOT found."
-              exit 1
-            fi
