@@ -3,6 +3,7 @@
 Evaluate PRS models: Calibration, AUC, and Plots.
 Usage: python evaluate.py <sim_name>
 """
+import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,6 +11,7 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 from scipy import stats
 from itertools import combinations
+import multiprocessing as mp
 
 # Add current directory to path
 sys.path.append(str(Path(__file__).parent))
@@ -22,6 +24,9 @@ from methods import (
     NormalizationMethod,
 )
 from metrics import compute_all_metrics, compute_calibration_curve
+
+N_PERMUTATIONS = 1000
+MAX_WORKERS = 8
 
 def load_scores(work_dir, methods):
     """Load scores. At least ONE method must succeed."""
@@ -291,77 +296,98 @@ def delong_test(y_true, y_pred1, y_pred2):
     # Covariance estimation (simplified - assumes independence for now)
     # Full DeLong requires computing covariance between structural components
     # Using permutation test as fallback for robustness
-    return permutation_test_auc(y_true, y_pred1, y_pred2)
+    p_auc, _ = permutation_test_auc_brier(y_true, y_pred1, y_pred2)
+    return p_auc
 
-def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=1000):
-    """
-    Permutation test for comparing AUCs.
-
-    Two-sided test: H0: AUC1 = AUC2
-    """
-    from sklearn.metrics import roc_auc_score
-
-    # Observed difference
-    try:
-        auc1 = roc_auc_score(y_true, y_pred1)
-        auc2 = roc_auc_score(y_true, y_pred2)
-    except:
+def fast_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    n = y_true.size
+    if n == 0:
         return np.nan
+    y_true_int = y_true.astype(np.int8, copy=False)
+    n_pos = int(y_true_int.sum())
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    order = np.argsort(y_score, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(1, n + 1, dtype=np.float64)
+    sum_ranks_pos = ranks[y_true_int == 1].sum()
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
-    obs_diff = abs(auc1 - auc2)
+def _permute_chunk(args):
+    y_true, base, diff, n_iters, seed = args
+    rng = np.random.default_rng(seed)
+    n = y_true.size
+    y_true_f = y_true.astype(np.float64, copy=False)
+    auc_diffs = np.empty(n_iters, dtype=np.float64)
+    brier_diffs = np.empty(n_iters, dtype=np.float64)
+    for i in range(n_iters):
+        swap = rng.integers(0, 2, size=n, dtype=np.int8)
+        perm_pred1 = base + swap * diff
+        perm_pred2 = base + (1 - swap) * diff
 
-    # Permutation distribution
-    null_diffs = []
-    for _ in range(n_permutations):
-        # Randomly swap predictions for each individual
-        swap = np.random.binomial(1, 0.5, size=len(y_true)).astype(bool)
-        perm_pred1 = np.where(swap, y_pred2, y_pred1)
-        perm_pred2 = np.where(swap, y_pred1, y_pred2)
+        auc1 = fast_auc(y_true, perm_pred1)
+        auc2 = fast_auc(y_true, perm_pred2)
+        auc_diffs[i] = abs(auc1 - auc2)
+
+        brier1 = np.mean((y_true_f - perm_pred1) ** 2)
+        brier2 = np.mean((y_true_f - perm_pred2) ** 2)
+        brier_diffs[i] = abs(brier1 - brier2)
+
+    return auc_diffs, brier_diffs
+
+def permutation_test_auc_brier(y_true, y_pred1, y_pred2, n_permutations=N_PERMUTATIONS):
+    """
+    Joint permutation test for AUC and Brier using matched-pairs swapping.
+    Returns (p_auc, p_brier).
+    """
+    y_true = np.asarray(y_true)
+    y_pred1 = np.asarray(y_pred1)
+    y_pred2 = np.asarray(y_pred2)
+
+    auc1 = fast_auc(y_true, y_pred1)
+    auc2 = fast_auc(y_true, y_pred2)
+    obs_auc_diff = abs(auc1 - auc2)
+
+    brier1 = np.mean((y_true - y_pred1) ** 2)
+    brier2 = np.mean((y_true - y_pred2) ** 2)
+    obs_brier_diff = abs(brier1 - brier2)
+
+    base = y_pred2
+    diff = y_pred1 - y_pred2
+
+    n = y_true.size
+    use_parallel = n_permutations >= 200 and n >= 1000
+    if use_parallel:
+        workers = min(MAX_WORKERS, max(1, mp.cpu_count() or 1))
+        chunk = (n_permutations + workers - 1) // workers
+        seeds = np.random.SeedSequence(42).spawn(workers)
+        args = []
+        for i in range(workers):
+            start = i * chunk
+            end = min(n_permutations, start + chunk)
+            if start >= end:
+                break
+            args.append((y_true, base, diff, end - start, seeds[i].entropy))
 
         try:
-            perm_auc1 = roc_auc_score(y_true, perm_pred1)
-            perm_auc2 = roc_auc_score(y_true, perm_pred2)
-            null_diffs.append(abs(perm_auc1 - perm_auc2))
-        except:
-            continue
+            ctx = mp.get_context("fork")
+        except ValueError:
+            ctx = mp.get_context("spawn")
 
-    if len(null_diffs) == 0:
-        return np.nan
+        with ctx.Pool(processes=len(args)) as pool:
+            results = pool.map(_permute_chunk, args)
 
-    # Two-sided p-value
-    p_value = np.mean(np.array(null_diffs) >= obs_diff)
-    return p_value
+        auc_diffs = np.concatenate([r[0] for r in results])
+        brier_diffs = np.concatenate([r[1] for r in results])
+    else:
+        auc_diffs, brier_diffs = _permute_chunk((y_true, base, diff, n_permutations, 42))
 
-def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=1000):
-    """
-    Permutation test for comparing Brier scores.
+    p_auc = np.mean(auc_diffs >= obs_auc_diff) if auc_diffs.size else np.nan
+    p_brier = np.mean(brier_diffs >= obs_brier_diff) if brier_diffs.size else np.nan
+    return p_auc, p_brier
 
-    Two-sided test: H0: Brier1 = Brier2
-    """
-    from sklearn.metrics import brier_score_loss
-
-    # Observed difference
-    brier1 = brier_score_loss(y_true, y_pred1)
-    brier2 = brier_score_loss(y_true, y_pred2)
-    obs_diff = abs(brier1 - brier2)
-
-    # Permutation distribution
-    null_diffs = []
-    for _ in range(n_permutations):
-        # Randomly swap predictions
-        swap = np.random.binomial(1, 0.5, size=len(y_true)).astype(bool)
-        perm_pred1 = np.where(swap, y_pred2, y_pred1)
-        perm_pred2 = np.where(swap, y_pred1, y_pred2)
-
-        perm_brier1 = brier_score_loss(y_true, perm_pred1)
-        perm_brier2 = brier_score_loss(y_true, perm_pred2)
-        null_diffs.append(abs(perm_brier1 - perm_brier2))
-
-    # Two-sided p-value
-    p_value = np.mean(np.array(null_diffs) >= obs_diff)
-    return p_value
-
-def compute_significance_tests(methods_results, sim_label, n_permutations=1000):
+def compute_significance_tests(methods_results, sim_label):
     """
     Compute pairwise significance tests for all method comparisons.
 
@@ -389,8 +415,7 @@ def compute_significance_tests(methods_results, sim_label, n_permutations=1000):
 
         # Compute p-values
         print(f"  Testing {method1} vs {method2}...")
-        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
-        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
+        p_auc, p_brier = permutation_test_auc_brier(y_true, y_pred1, y_pred2, n_permutations=N_PERMUTATIONS)
 
         # Get observed metrics
         auc1 = methods_results[method1]['metrics']['auc']['overall']
@@ -424,12 +449,6 @@ def main():
         "--enable-gnomon",
         action="store_true",
         help="Include GAM-gnomon in calibration methods",
-    )
-    parser.add_argument(
-        "--permutations",
-        type=int,
-        default=1000,
-        help="Number of permutations for significance tests",
     )
     args = parser.parse_args()
 
@@ -562,8 +581,8 @@ def main():
         raise RuntimeError("No results generated!")
         
     # 4. Significance Testing
-    print(f"\nComputing significance tests (permutation tests, {args.permutations} iterations)...")
-    df_significance = compute_significance_tests(results, sim_prefix, n_permutations=args.permutations)
+    print(f"\nComputing significance tests (permutation tests, {N_PERMUTATIONS} iterations)...")
+    df_significance = compute_significance_tests(results, sim_prefix)
     print("\nPairwise Significance Tests:")
     print(df_significance.to_string(index=False))
 

@@ -1554,7 +1554,7 @@ lemma polynomial_spline_coeffs_unique {n : ℕ} [Fintype (Fin n)] (coeffs : Fin 
         have h_zero : (if (j.val + 1) = (i.val + 1) then coeffs j else 0) = 0 := by
           by_cases hji : (j.val + 1) = (i.val + 1)
           · exact (h_ne' hji).elim
-          · simp [hji]
+          · exact if_neg hji
         exact h_zero
       · intro h_not_mem
         exfalso; exact h_not_mem (Finset.mem_univ i)
@@ -1633,20 +1633,22 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
       have h_sum_c' :
           (Finset.sum (s:=Finset.univ)
             (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) : ℝ) =
-            evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
-        refine Finset.sum_eq_single l ?_ ?_
+            evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
+        refine (Finset.sum_eq_single (s:=Finset.univ)
+          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) l ?_ ?_)
         · intro j _ h_ne
           have h_cj : c j = 0 := by simp [c, h_ne]
           simp [h_cj, h_S_zero_at_zero]
         · intro h_not_mem
           exfalso; exact h_not_mem (Finset.mem_univ l)
-      simpa using h_sum_c'
+      simpa [c] using h_sum_c'
     have h_sum_0 : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 = 0 := by
       classical
       have h_sum_0' :
           (Finset.sum (s:=Finset.univ)
             (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) : ℝ) = 0 := by
-        refine Finset.sum_eq_zero ?_
+        refine (Finset.sum_eq_zero (s:=Finset.univ)
+          (f:=fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) ?_)
         intro j _
         simpa using h_S_zero_at_zero j
       simpa using h_sum_0'
