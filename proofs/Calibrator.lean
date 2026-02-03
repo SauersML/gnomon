@@ -1380,7 +1380,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  apply rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
@@ -1413,7 +1413,66 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  -- Obtain orthogonality conditions
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  -- Define coefficients a and b
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  -- Solve for a using the first normal equation: E[Y - (a + bP)] = 0
+  -- E[Y] - a - bE[P] = 0
+  -- E[P + βC] - a - b(0) = 0
+  -- 0 + β(0) - a = 0  => a = 0
+  have ha : a = 0 := by
+    -- Expand Y in the integral
+    simp only [h_dgp] at h_orth_1
+    -- E[P + βC - a - bP] = 0
+    -- E[P] + βE[C] - E[a] - bE[P] = 0
+    rw [integral_sub, integral_sub, integral_add] at h_orth_1
+    · simp [hP0, hC0, integral_const] at h_orth_1
+      linarith
+    -- Integrability checks for the rewrites
+    · exact hP_int.add (hC_int.const_mul β_env)
+    · exact integrable_const a
+    · exact (hP_int.add (hC_int.const_mul β_env)).sub (integrable_const a)
+    · exact hP_int.const_mul b
+    · exact hP_int
+    · exact hC_int.const_mul β_env
+
+  -- Solve for b using the second normal equation: E[(Y - (a + bP))P] = 0
+  -- E[(P + βC - a - bP)P] = 0
+  -- E[P² + βCP - aP - bP²] = 0
+  -- E[P²] + βE[CP] - aE[P] - bE[P²] = 0
+  -- 1 + 0 - 0 - b(1) = 0 => 1 - b = 0 => b = 1
+  have hb : b = 1 := by
+    simp only [h_dgp] at h_orth_P
+    have h_integrand : ∀ pc : ℝ × (Fin 1 → ℝ),
+        (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) * pc.1 =
+        pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) - a * pc.1 - b * pc.1^2 := by
+      intro pc; ring
+
+    rw [integral_congr_ae (ae_of_all _ h_integrand)] at h_orth_P
+    rw [integral_sub, integral_sub, integral_add] at h_orth_P
+
+    -- E[P*C] = 0 by independence
+    have hPC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+       rw [integral_mul_comm]
+       exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+
+    simp [hP2, hPC0, hP0, integral_const_mul] at h_orth_P
+    linarith
+
+    -- Integrability checks
+    · exact hP2_int.add (hPC_int.const_mul β_env)
+    · exact hP_int.const_mul a
+    · exact (hP2_int.add (hPC_int.const_mul β_env)).sub (hP_int.const_mul a)
+    · exact hP2_int.const_mul b
+    · exact hP2_int
+    · exact hPC_int.const_mul β_env
+
+  exact ⟨ha, hb⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
@@ -3996,7 +4055,7 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  admit
+  simp [Matrix.rank, h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
