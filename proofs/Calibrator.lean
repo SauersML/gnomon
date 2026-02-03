@@ -4473,8 +4473,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     let f := fun j => ((data.y - (a • u + b • v)) j)^2
     let g := fun j => a * ((data.y - u) j)^2 + b * ((data.y - v) j)^2
     calc
-      ∑ j, f j = f i + ∑ j in Finset.univ.erase i, f j := Finset.add_sum_erase (Finset.mem_univ i) _
-      _ < g i + ∑ j in Finset.univ.erase i, g j := by
+      ∑ j, f j = f i + ∑ j ∈ Finset.univ.erase i, f j := Finset.add_sum_erase (Finset.mem_univ i) _
+      _ < g i + ∑ j ∈ Finset.univ.erase i, g j := by
         apply add_lt_add_of_lt_of_le h_strict_i
         apply Finset.sum_le_sum
         intro j _; exact h_convex_j j
