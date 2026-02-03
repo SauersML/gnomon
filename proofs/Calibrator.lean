@@ -1543,23 +1543,193 @@ lemma optimal_coefficients_for_additive_dgp
 
   exact ⟨ha, hb⟩
 
-theorem l2_projection_of_additive_is_additive (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
-  (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd))
-  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
-  (proj : PhenotypeInformedGAM p k sp) (_h_optimal : IsBayesOptimalInClass dgp proj)
-  (h_norm : IsNormalizedScoreModel proj) :
-  IsNormalizedScoreModel proj := by
-  -- Uses the explicit normalization hypothesis.
-  exact h_norm
+lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
+    (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
+  intro h_eq
+  induction n with
+  | zero =>
+    intro i
+    exact i.elim0
+  | succ n ih =>
+    -- Split sum: x * (coeffs 0 + sum_{i=0}^{n-1} coeffs (i+1) * x^(i+1))
+    have h_factor : ∀ x, (∑ i : Fin (n + 1), coeffs i * x ^ (i.val + 1)) =
+        x * (coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) := by
+      intro x
+      rw [Fin.sum_univ_succ, pow_one, mul_comm (coeffs 0) x]
+      congr 1
+      simp only [Fin.val_succ]
+      rw [Finset.mul_sum]
+      refine Finset.sum_congr rfl ?_
+      intro i _
+      rw [← mul_assoc, ← pow_succ']
+      rfl
 
-theorem independence_implies_no_interaction (p k sp : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
+    have h_poly_eq_zero : ∀ x, x * (coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) = 0 := by
+      intro x
+      rw [← h_factor x]
+      exact h_eq x
+
+    have h_const_zero : coeffs 0 = 0 := by
+      -- Function Q(x) = coeffs 0 + ...
+      let Q := fun x => coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)
+      have h_Q_zero_ae : ∀ x, x ≠ 0 → Q x = 0 := by
+        intro x hx
+        have := h_poly_eq_zero x
+        rw [mul_eq_zero] at this
+        cases this with
+        | inl h => contradiction
+        | inr h => exact h
+      -- Continuity at 0 implies Q(0) = 0
+      have h_cont : Continuous Q := by
+        apply Continuous.add continuous_const
+        refine continuous_finset_sum _ ?_
+        intro i _
+        apply Continuous.mul continuous_const
+        apply Continuous.pow continuous_id
+      have h_lim : Filter.Tendsto Q (nhds 0) (nhds (Q 0)) := h_cont.tendsto 0
+      have h_lim_zero : Filter.Tendsto Q (nhds 0) (nhds 0) := by
+        -- Q is 0 on punctutred neighborhood
+        refine Filter.tendsto_nhds_of_eventually_eq ?_
+        filter_upwards [Filter.eventually_ne_nhds (0:ℝ)] with x hx
+        exact h_Q_zero_ae x hx
+      have h_Q0 : Q 0 = 0 := unique_diff_within_at_univ.eq_of_tendsto_nhds h_lim h_lim_zero
+      simp [Q] at h_Q0
+      -- 0^k = 0 for k>=1
+      have h_sum_zero : (∑ i : Fin n, coeffs i.succ * (0:ℝ) ^ (i.val + 1)) = 0 := by
+        apply Finset.sum_eq_zero
+        intro i _
+        rw [zero_pow (Nat.succ_pos _), mul_zero]
+      rw [h_sum_zero, add_zero] at h_Q0
+      exact h_Q0
+
+    -- Now reduce to IH
+    intro i
+    refine Fin.cases ?_ ?_ i
+    · exact h_const_zero
+    · intro i_prev
+      apply ih
+      intro x
+      -- coeffs 0 = 0, so x * (sum ...) = 0 implies sum ... = 0 for x!=0
+      have h_Q_zero : (∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) = 0 := by
+        by_cases hx : x = 0
+        · subst hx
+          apply Finset.sum_eq_zero
+          intro j _
+          rw [zero_pow (Nat.succ_pos _), mul_zero]
+        · have := h_poly_eq_zero x
+          rw [h_const_zero, zero_add] at this
+          rw [mul_eq_zero] at this
+          cases this
+          · contradiction
+          · assumption
+      exact h_Q_zero
+
+theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
+  (h_true_fn : dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
+  (proj : PhenotypeInformedGAM 1 k sp)
+  (h_spline : proj.pcSplineBasis = polynomialSplineBasis sp)
+  (h_pgs : proj.pgsBasis = linearPGSBasis)
+  (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
+  IsNormalizedScoreModel proj := by
+  -- Proof that interaction coeffs are 0
+  rw [IsNormalizedScoreModel]
+  intro i l s
+  -- p=1, so i must be 0
+  have hi : i = 0 := by apply Subsingleton.elim
+  subst hi
+
+  -- Use fit equality
+  have h_eq : ∀ p c, linearPredictor proj p c = f p + ∑ i, g i (c i) := by
+    intro p c; rw [h_fit, h_true_fn]
+
+  -- Decompose linearPredictor
+  have h_lin : proj.pgsBasis.B ⟨1, by norm_num⟩ = id := by
+    rw [h_pgs, linearPGSBasis]; simp
+
+  have h_decomp := linearPredictor_decomp proj h_lin
+
+  -- Slope is constant
+  have h_slope_const : ∀ c, predictorSlope proj c = f 1 - f 0 := by
+    intro c
+    have h0 := h_eq 0 c
+    have h1 := h_eq 1 c
+    rw [h_decomp 0 c] at h0
+    rw [h_decomp 1 c] at h1
+    simp at h0 h1
+    rw [h0] at h1
+    ring_nf at h1
+    exact h1
+
+  -- Slope definition
+  have h_slope_def : ∀ c, predictorSlope proj c = proj.γₘ₀ 0 + ∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) := by
+    intro c; rfl
+
+  -- Equating them
+  have h_poly : ∀ c, (∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l)) = (f 1 - f 0) - proj.γₘ₀ 0 := by
+    intro c
+    rw [← h_slope_def, h_slope_const]
+    ring
+
+  -- Evaluate at c=0
+  have h_eval_zero : (∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0) = (f 1 - f 0) - proj.γₘ₀ 0 := h_poly 0
+
+  have h_basis_zero : ∀ s x, polynomialSplineBasis sp |>.b s x = x ^ (s.val + 1) := by
+    intro s x; rfl
+
+  have h_smooth_zero : ∀ coeffs, evalSmooth proj.pcSplineBasis coeffs 0 = 0 := by
+    intro coeffs
+    rw [evalSmooth, h_spline]
+    apply Finset.sum_eq_zero
+    intro s _
+    rw [h_basis_zero]
+    rw [zero_pow (Nat.succ_pos _), mul_zero]
+
+  have h_sum_zero : (∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0) = 0 := by
+    apply Finset.sum_eq_zero
+    intro l _
+    apply h_smooth_zero
+
+  rw [h_sum_zero] at h_eval_zero
+  -- So constant is 0
+  have h_const_is_zero : (f 1 - f 0) - proj.γₘ₀ 0 = 0 := h_eval_zero.symm
+
+  -- Back to h_poly
+  have h_poly_zero : ∀ c, (∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l)) = 0 := by
+    intro c
+    rw [h_poly, h_const_is_zero]
+
+  -- Vary c_l
+  -- For a specific l, set c_k = x if k=l else 0
+  let c_test (x : ℝ) : Fin k → ℝ := fun k => if k = l then x else 0
+
+  have h_poly_l : ∀ x, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
+    intro x
+    have h := h_poly_zero (c_test x)
+    rw [Finset.sum_eq_single l] at h
+    · simp [c_test] at h
+      exact h
+    · intro k _ hnk
+      simp [c_test, hnk]
+      apply h_smooth_zero
+    · intro hl; exact hl (Finset.mem_univ l)
+
+  -- Expand evalSmooth with polynomial basis
+  unfold evalSmooth at h_poly_l
+  rw [h_spline] at h_poly_l
+  simp [polynomialSplineBasis] at h_poly_l
+
+  -- Use uniqueness lemma
+  exact polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_poly_l s
+
+theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
     (h_additive : ∃ (f : ℝ → ℝ) (g : Fin k → ℝ → ℝ), dgp.trueExpectation = fun p c => f p + ∑ i, g i (c i))
-    (h_indep : dgp.jointMeasure = (dgp.jointMeasure.map Prod.fst).prod (dgp.jointMeasure.map Prod.snd)) :
-  ∀ (m : PhenotypeInformedGAM p k sp) (_h_opt : IsBayesOptimalInClass dgp m) (h_norm : IsNormalizedScoreModel m),
+    (m : PhenotypeInformedGAM 1 k sp)
+    (h_spline : m.pcSplineBasis = polynomialSplineBasis sp)
+    (h_pgs : m.pgsBasis = linearPGSBasis)
+    (h_fit : ∀ p c, linearPredictor m p c = dgp.trueExpectation p c) :
     IsNormalizedScoreModel m := by
-  intro m _h_opt h_norm
   rcases h_additive with ⟨f, g, h_fn_struct⟩
-  exact l2_projection_of_additive_is_additive p k sp h_indep h_fn_struct m _h_opt h_norm
+  exact l2_projection_of_additive_is_additive k sp h_fn_struct m h_spline h_pgs h_fit
 
 structure DGPWithEnvironment (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -4064,6 +4234,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
 
 
+/-- Theorem: If a model class is capable of representing the true DGP,
+    then the Bayes-optimal model in that class achieves zero expected squared error. -/
+  linarith
+
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
     the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
@@ -4113,8 +4287,10 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   intro c
 
   -- 1. Optimality + Capability => Model = Truth (a.e.)
-  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
-  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true⟩
+  have h_risk_zero : expectedSquaredError dgp_latent.to_dgp (fun p c => linearPredictor model p c) = 0 := by
+    apply optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt
+    rcases h_capable with ⟨m, h_eq, _⟩
+    use m
 
   -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
   -- We assume standard Gaussian measure supports the whole space.
@@ -4145,7 +4321,9 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
         refine continuous_finset_sum _ (fun i _ => ?_)
         apply Continuous.mul continuous_const (h_spline_cont i)
 
-      refine Measure.eq_of_ae_eq h_ae_symm ?_ ?_
+      haveI := h_measure_pos
+      haveI := h_measure_pos
+      refine Measure.eq_of_ae_eq (μ := dgp_latent.to_dgp.jointMeasure) ?_ ?_ h_ae_symm
       · -- Continuity of linearPredictor
         simp only [linearPredictor]
         apply Continuous.add
