@@ -49,6 +49,9 @@ import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 import Mathlib.Analysis.SpecialFunctions.Pow.Real
+import Mathlib.Algebra.Polynomial.Basic
+import Mathlib.Algebra.Polynomial.Eval.Defs
+import Mathlib.Algebra.Polynomial.Roots
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -1413,7 +1416,61 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h1, hP⟩ := h_orth
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+  rw [h_dgp] at h1 hP
+  -- Simplify h1: E[P + βC - a - bP] = 0
+  have h1_simp : a = 0 := by
+    have h_integrand : ∀ pc : ℝ × (Fin 1 → ℝ),
+      (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ - (a + b * pc.1)) =
+      pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ - a - b * pc.1 := by
+      intro pc; ring
+    simp_rw [h_integrand] at h1
+    rw [integral_sub] at h1
+    · rw [integral_sub] at h1
+      · rw [integral_add] at h1
+        · simp only [hP0, hC0, mul_zero, add_zero, integral_const, MeasureTheory.integral_const_mul] at h1
+          -- h1: (0 + β*0) - ∫ a - ∫ bP = 0
+          -- 0 - a*vol - b*0 = 0 -> -a = 0 -> a = 0
+          have h_vol : (dgp.jointMeasure.real Set.univ) = 1 := by
+            simp only [MeasureTheory.Measure.real, MeasureTheory.measure_univ]
+            exact ENNReal.toReal_one
+          simp [h_vol, hP0] at h1
+          linarith
+        · exact hP_int
+        · exact hC_int.const_mul _
+      · apply Integrable.add hP_int (hC_int.const_mul _)
+      · exact integrable_const a
+    · apply Integrable.sub (Integrable.add hP_int (hC_int.const_mul _)) (integrable_const a)
+    · exact hP_int.const_mul b
+
+  -- Simplify hP: E[(P + βC - a - bP)P] = 0
+  have hP_simp : b = 1 := by
+    rw [h1_simp] at hP
+    -- E[(P + βC - bP)P] = E[P^2 + βCP - bP^2] = E[P^2] + β E[CP] - b E[P^2] = 1 + 0 - b = 0 -> b = 1
+    have h_integrand : ∀ pc : ℝ × (Fin 1 → ℝ),
+      (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ - (0 + b * pc.1)) * pc.1 =
+      pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) - b * pc.1^2 := by
+      intro pc; ring
+    simp_rw [h_integrand] at hP
+    rw [integral_sub] at hP
+    · rw [integral_add] at hP
+      · simp only [integral_const_mul, hP2] at hP
+        -- 1 + β * E[CP] - b * 1 = 0
+        -- Need E[CP] = 0.
+        have hCP0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+           simp only [mul_comm]
+           exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+        rw [hCP0] at hP
+        linarith
+      · exact hP2_int
+      · exact hPC_int.const_mul _
+    · apply Integrable.add hP2_int (hPC_int.const_mul _)
+    · exact hP2_int.const_mul _
+
+  exact ⟨h1_simp, hP_simp⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
@@ -3996,7 +4053,17 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  admit
+  dsimp [Matrix.rank]
+  have hA : Matrix.toLin' A = Matrix.mulVecLin A := by
+    apply LinearMap.ext
+    intro v
+    rw [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  have hB : Matrix.toLin' B = Matrix.mulVecLin B := by
+    apply LinearMap.ext
+    intro v
+    rw [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  rw [← hA, ← hB]
+  rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
