@@ -4152,8 +4152,8 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n))]
-  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n))]
+  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
+  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
   rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
