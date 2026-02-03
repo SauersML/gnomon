@@ -56,6 +56,14 @@ def split_data(sim_arg, work_dir):
     if sim_name == "confounding":
         # Train on all ancestries, 80/20 split overall.
         train_idx, test_idx = train_test_split(df.index.to_numpy(), test_size=0.2, random_state=42)
+    elif sim_name.startswith("divergence_g") or sim_name.startswith("bottleneck_g"):
+        # Train on POP0, test on POP1.
+        train_idx = df[df["pop_label"] == "POP0"].index.to_numpy()
+        test_idx = df[df["pop_label"] == "POP1"].index.to_numpy()
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            raise RuntimeError(
+                f"Expected POP0/POP1 in {sim_name}.tsv for divergence/bottleneck splits."
+            )
     else:
         # Portability: train EUR only; test = 20% EUR + all non-EUR.
         train_mask = df['pop_label'] == 'EUR'
