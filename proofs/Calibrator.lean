@@ -4203,6 +4203,12 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     We formalize "flexible enough" as the condition that the design matrix column space
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
+lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
+    (A B : Matrix (Fin n) (Fin m) ℝ)
+    (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
+    Matrix.rank A = Matrix.rank B := by
+  rw [Matrix.rank_eq_finrank_range_toLin, Matrix.rank_eq_finrank_range_toLin, h]
+
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
