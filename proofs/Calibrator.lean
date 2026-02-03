@@ -1409,19 +1409,82 @@ lemma optimal_coefficients_for_additive_dgp
     (hP2 : ∫ pc, pc.1^2 ∂dgp.jointMeasure = 1)
     -- Integrability hypotheses
     (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp.jointMeasure)
-    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
+    (_hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+  -- 1. Optimality implies a = E[Y]
+  have ha : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure := by
+    apply optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth.1
+  -- 2. Optimality implies b = E[YP]
+  have hb : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure := by
+    apply optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth.2
+  -- 3. Calculate E[Y] = E[P] + βE[C] = 0
+  have h_EY : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
+    rw [h_dgp]
+    have h_add : (∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) =
+                 (∫ pc, pc.1 ∂dgp.jointMeasure) + (∫ pc, β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
+      refine integral_add hP_int ?_
+      exact Integrable.const_mul _hC_int _
+    rw [h_add, hP0, integral_const_mul, hC0]
+    ring
+  -- 4. Calculate E[YP] = E[P^2] + βE[PC] = 1
+  have h_EYP : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
+    rw [h_dgp]
+    have h_expand : (fun pc : ℝ × (Fin 1 → ℝ) => (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1) =
+                    (fun pc => pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1)) := by
+      funext pc; ring
+    rw [integral_congr_ae (ae_of_all _ h_expand)]
+    have h_add : (∫ pc, pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) =
+                 (∫ pc, pc.1^2 ∂dgp.jointMeasure) + (∫ pc, β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) := by
+      refine integral_add hP2_int ?_
+      apply Integrable.const_mul
+      -- E[PC] is integrable? Need hPC_int but terms are swapped.
+      -- hPC_int is for C*P.
+      convert hPC_int using 1; funext pc; ring
+    rw [h_add, hP2]
+    have hPC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+      rw [integral_mul_comm]
+      exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+    rw [integral_const_mul, hPC0]
+    ring
+  exact ⟨by rw [ha, h_EY], by rw [hb, h_EYP]⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
-  admit
+  intro h_zero
+  let p : Polynomial ℝ := ∑ i, Polynomial.C (coeffs i) * Polynomial.X ^ (i.val + 1)
+  have h_eval : ∀ x, p.eval x = 0 := by
+    intro x
+    simp [p, Polynomial.eval_finset_sum]
+    convert h_zero x using 1
+    apply Finset.sum_congr rfl
+    intro i _
+    simp
+  have h_p_zero : p = 0 := Polynomial.funext h_eval
+  intro i
+  -- Extract coefficient of X^(i.val + 1)
+  have h_coeff := Polynomial.coeff_eq_zero_of_eq_zero h_p_zero (i.val + 1)
+  simp [p, Polynomial.coeff_sum] at h_coeff
+  -- The sum ∑ j, coeff (C (coeffs j) * X^(j+1)) (i+1)
+  -- The term j is non-zero only if j+1 = i+1 <=> j = i.
+  -- So sum collapses to coeffs i.
+  rw [Finset.sum_eq_single i] at h_coeff
+  · simpa using h_coeff
+  · intro j _ h_ne
+    simp [Polynomial.coeff_C_mul, Polynomial.coeff_X_pow]
+    split_ifs with h_eq
+    · exfalso; apply h_ne; apply Fin.eq_of_val_eq; linarith
+    · rfl
+  · intro h_not_mem
+    exfalso; exact h_not_mem (Finset.mem_univ i)
 
 
 theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
@@ -1431,7 +1494,97 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
-  admit
+  -- Use decomposition
+  have h_lin : proj.pgsBasis.B 1 = id := by rw [h_pgs]; rfl
+  have h_pred : ∀ p c, linearPredictor proj p c = predictorBase proj c + predictorSlope proj c * p :=
+    linearPredictor_decomp proj h_lin
+
+  -- Show slope is constant
+  have h_slope_const : ∀ c1 c2, predictorSlope proj c1 = predictorSlope proj c2 := by
+    intros c1 c2
+    -- Evaluate fit at p=0 and p=1
+    have h0_1 : linearPredictor proj 0 c1 = f 0 + ∑ i, g i (c1 i) := by
+      rw [h_fit, h_true_fn]; simp
+    have h1_1 : linearPredictor proj 1 c1 = f 1 + ∑ i, g i (c1 i) := by
+      rw [h_fit, h_true_fn]; simp
+    have h0_2 : linearPredictor proj 0 c2 = f 0 + ∑ i, g i (c2 i) := by
+      rw [h_fit, h_true_fn]; simp
+    have h1_2 : linearPredictor proj 1 c2 = f 1 + ∑ i, g i (c2 i) := by
+      rw [h_fit, h_true_fn]; simp
+
+    -- linearPredictor form
+    have hl0_1 : linearPredictor proj 0 c1 = predictorBase proj c1 := by rw [h_pred]; simp
+    have hl1_1 : linearPredictor proj 1 c1 = predictorBase proj c1 + predictorSlope proj c1 := by rw [h_pred]; simp
+    have hl0_2 : linearPredictor proj 0 c2 = predictorBase proj c2 := by rw [h_pred]; simp
+    have hl1_2 : linearPredictor proj 1 c2 = predictorBase proj c2 + predictorSlope proj c2 := by rw [h_pred]; simp
+
+    -- Subtract to isolate slope
+    have hs1 : predictorSlope proj c1 = (f 1 - f 0) := by
+      rw [← hl1_1, ← hl0_1, h1_1, h0_1]; ring
+    have hs2 : predictorSlope proj c2 = (f 1 - f 0) := by
+      rw [← hl1_2, ← hl0_2, h1_2, h0_2]; ring
+    rw [hs1, hs2]
+
+  -- Expand slope definition
+  -- predictorSlope = γₘ₀ 0 + ∑ l, evalSmooth ...
+  unfold predictorSlope at h_slope_const
+
+  -- We want to prove fₘₗ 0 l s = 0 for all l s
+  constructor
+  intro i l s
+  -- p=1 implies i=0
+  have hi : i = 0 := by apply Subsingleton.elim
+  subst hi
+
+  -- Use h_slope_const with carefully chosen c
+  -- Let S_l(x) = evalSmooth ... (x)
+  -- Slope(c) = γ + ∑_j S_j(c_j)
+  -- Slope(0) = γ + ∑_j S_j(0)
+  -- S_j(0) = 0 because polynomialSplineBasis uses x^(k+1) (no constant term)
+
+  have h_S_zero_at_zero : ∀ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0 = 0 := by
+    intro l
+    rw [h_spline, evalSmooth, polynomialSplineBasis]
+    simp [pow_succ]
+
+  have h_slope_zero : proj.γₘ₀ 0 = predictorSlope proj 0 := by
+    unfold predictorSlope
+    simp [h_S_zero_at_zero]
+
+  -- Now show S_l(x) = 0 for any x
+  have h_Sl_zero : ∀ x, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
+    intro x
+    let c_single : Fin k → ℝ := fun j => if j = l then x else 0
+    have h_eq : predictorSlope proj c_single = predictorSlope proj 0 := h_slope_const _ _
+    unfold predictorSlope at h_eq
+    rw [h_slope_zero] at h_eq
+    simp at h_eq
+    -- ∑_j S_j(c_single j) = 0
+    -- S_l(x) + ∑_{j≠l} S_j(0) = 0
+    -- S_l(x) + 0 = 0
+    have h_sum : (∑ j : Fin k, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c_single j)) =
+                 evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
+      rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ l)]
+      have h_term_l : evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c_single l) =
+                      evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
+        simp [c_single]
+      rw [h_term_l]
+      have h_rest : (∑ x_1 ∈ Finset.univ \ {l}, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 x_1) (c_single x_1)) = 0 := by
+        apply Finset.sum_eq_zero
+        intro j hj
+        have h_neq : j ≠ l := by
+          simp at hj; exact hj.2
+        have hc : c_single j = 0 := by simp [c_single, h_neq]
+        rw [hc, h_S_zero_at_zero]
+      rw [h_rest, add_zero]
+    rw [h_sum] at h_eq
+    exact h_eq
+
+  -- Now use uniqueness
+  rw [h_spline, evalSmooth] at h_Sl_zero
+  -- h_Sl_zero : ∀ x, ∑ s, coeff s * x^(s+1) = 0
+  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_Sl_zero s
+  exact h_poly
 
 
 theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
@@ -3999,7 +4152,9 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  admit
+  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n))]
+  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n))]
+  rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
