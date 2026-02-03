@@ -2,6 +2,10 @@ name: Run two-pop divergence & bottleneck sims
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "sims/**"
+      - ".github/workflows/two_pop_sims.yml"
 
 env:
   OMP_NUM_THREADS: 4
