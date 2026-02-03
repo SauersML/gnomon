@@ -3995,7 +3995,22 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       cases n with
       | zero =>
         simp only [pow_zero, integrable_const]
-      | succ n => admit
+      | succ n =>
+        let p : NNReal := n.succ
+        have h_mem : MemLp id p μP := ProbabilityTheory.memLp_id_gaussianReal p
+        have hp_pos : (p : ENNReal) ≠ 0 := by simp [p]
+        have hp_top : (p : ENNReal) ≠ ⊤ := by simp [p]
+        have h_rpow := h_mem.norm_rpow hp_pos hp_top
+        have h_int_abs : Integrable (fun x => |x| ^ n.succ) μP := by
+          apply MemLp.integrable (le_refl 1)
+          convert h_rpow using 1
+          funext x
+          dsimp
+          simp only [Real.norm_eq_abs, p, ENNReal.toReal_natCast, NNReal.coe_natCast]
+          rw [Real.rpow_natCast]
+        apply h_int_abs.mono ((continuous_pow n.succ).measurable.aestronglyMeasurable)
+        filter_upwards with x
+        simp only [Real.norm_eq_abs, abs_pow, abs_abs, le_refl]
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4135,12 +4150,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     · exact h_norm_opt.is_optimal model_star h_star_in_class
     · exact h_risk_lower_bound
 
-  -- Final assembly of the equality
-  -- We have Risk(Norm) = Risk(Star) from h_opt_risk
-  -- We have Risk(Star) = Integral from h_risk_star
-  -- We have Goal: Risk(Norm) (unfolded) = Integral
-  -- This follows by transitivity and unfolding
-  all_goals sorry
+  change expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) = _
+  rw [h_opt_risk, h_risk_star]
+  rfl
 
 
 
