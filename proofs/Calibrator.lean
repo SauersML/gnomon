@@ -4229,7 +4229,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           intro p c
           rw [linearPredictor_decomp m h_linear_basis.1, h_slope_eq c]
           ring
-        rw [MeasureTheory.integrable_congr (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+        rw [MeasureTheory.integrable_congr (ae_of_all _ (fun (pc : ℝ × (Fin k → ℝ)) => h_eq pc.1 pc.2))]
         -- ((1-γ)p - base)^2 = (1-γ)^2 p^2 - 2(1-γ)p base + base^2
         apply Integrable.add
         · apply Integrable.sub
@@ -4246,7 +4246,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           intro p c
           rw [linearPredictor_decomp m h_linear_basis.1, h_slope_eq c]
           ring
-        rw [MeasureTheory.integrable_congr (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+        rw [MeasureTheory.integrable_congr (ae_of_all _ (fun (pc : ℝ × (Fin k → ℝ)) => h_eq pc.1 pc.2))]
         apply Integrable.sub
         · -- (S-1)(1-γ)p^2
           refine (h_prod_int h_p2_int h_Sm1_int).const_mul _
@@ -4518,7 +4518,11 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       -- h_range_eq says range(toLin(designMatrix data)) = range(toLin(designMatrix data'))
       -- where data' in h_range_eq is definitionally equal to data' in the context
       -- We perform a direct match using the hypothesis
-      have h_rng : LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis)) =
+      -- To avoid "Unknown identifier" issues with let-bound variables in types,
+      -- we substitute the definition of data' explicitly or rely on dsimp.
+      dsimp [data']
+      dsimp [data'] at h_range_eq
+      have h_rng : LinearMap.range (Matrix.toLin' (designMatrix { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b } pgsBasis splineBasis)) =
                    LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) := by
         exact h_range_eq.symm
       rw [h_rng]
