@@ -1,0 +1,28 @@
+CMD: /Users/user/.local/bin/plink2 --bfile divergence_g20 --keep divergence_g20_work/test.keep --make-bed --out divergence_g20_work/test
+RETURN_CODE: 0
+STDOUT:
+PLINK v2.0.0-a.6.8 M1 (22 Jan 2025)                cog-genomics.org/plink/2.0/
+(C) 2005-2025 Shaun Purcell, Christopher Chang   GNU General Public License v3
+Logging to divergence_g20_work/test.log.
+Options in effect:
+  --bfile divergence_g20
+  --keep divergence_g20_work/test.keep
+  --make-bed
+  --out divergence_g20_work/test
+
+Start time: Tue Feb  3 12:13:36 2026
+8192 MiB RAM detected; reserving 4096 MiB for main workspace.
+Using up to 8 compute threads.
+2000 samples (0 females, 0 males, 2000 ambiguous; 2000 founders) loaded from
+divergence_g20.fam.
+18904 variants loaded from divergence_g20.bim.
+Note: No phenotype data present.
+--keep: 1000 samples remaining.
+1000 samples (0 females, 0 males, 1000 ambiguous; 1000 founders) remaining
+after main filters.
+Writing divergence_g20_work/test.fam ... done.
+Writing divergence_g20_work/test.bim ... done.
+Writing divergence_g20_work/test.bed ... 0%done.
+End time: Tue Feb  3 12:13:36 2026
+
+STDERR:

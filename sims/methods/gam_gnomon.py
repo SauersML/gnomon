@@ -62,7 +62,7 @@ class GnomonGAMMethod(PGSMethod):
         self._model_path: Optional[Path] = None
 
     def _write_training_tsv(self, path: Path, P: np.ndarray, PC: np.ndarray, y: np.ndarray) -> None:
-        n_pcs_actual = min(self.n_pcs, PC.shape[1])
+        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
         data = {
             "phenotype": y.astype(float),
             "score": P.astype(float),
@@ -73,7 +73,7 @@ class GnomonGAMMethod(PGSMethod):
         pd.DataFrame(data).to_csv(path, sep="\t", index=False)
 
     def _write_prediction_tsv(self, path: Path, P: np.ndarray, PC: np.ndarray) -> None:
-        n_pcs_actual = min(self.n_pcs, PC.shape[1])
+        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
         data = {
             "sample_id": np.arange(1, len(P) + 1),
             "score": P.astype(float),
@@ -83,24 +83,70 @@ class GnomonGAMMethod(PGSMethod):
             data[f"PC{i+1}"] = PC[:, i].astype(float)
         pd.DataFrame(data).to_csv(path, sep="\t", index=False)
 
+    @staticmethod
+    def _estimate_num_coeffs(
+        n_pcs: int,
+        pgs_knots: int,
+        pgs_degree: int,
+        pc_knots: int,
+        pc_degree: int,
+    ) -> int:
+        pgs_basis_coeffs = pgs_knots + pgs_degree + 1
+        pgs_main_coeffs = pgs_basis_coeffs - 1
+        sex_main_coeffs = 1
+        pc_basis_coeffs = pc_knots + pc_degree + 1
+        pc_main_coeffs = n_pcs * (pc_basis_coeffs - 1)
+        interaction_coeffs = n_pcs * (pgs_basis_coeffs - 1) * (pc_basis_coeffs - 1)
+        sex_pgs_interaction_coeffs = pgs_main_coeffs if sex_main_coeffs > 0 else 0
+        return (
+            1
+            + sex_main_coeffs
+            + pgs_main_coeffs
+            + sex_pgs_interaction_coeffs
+            + pc_main_coeffs
+            + interaction_coeffs
+        )
+
     def fit(self, P: np.ndarray, PC: np.ndarray, y: np.ndarray) -> "GnomonGAMMethod":
         work_dir = Path(tempfile.mkdtemp(prefix="gnomon_gam_"))
         self._work_dir = work_dir
         train_path = work_dir / "train.tsv"
         self._write_training_tsv(train_path, P, PC, y)
 
+        n_samples = len(y)
+        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
+        pgs_knots = self.pgs_knots
+        pc_knots = self.pc_knots
+        coeffs = self._estimate_num_coeffs(
+            n_pcs_actual, pgs_knots, self.pgs_degree, pc_knots, self.pc_degree
+        )
+        if coeffs > n_samples:
+            while coeffs > n_samples and (pgs_knots > 1 or pc_knots > 1):
+                if pc_knots > 1:
+                    pc_knots -= 1
+                elif pgs_knots > 1:
+                    pgs_knots -= 1
+                coeffs = self._estimate_num_coeffs(
+                    n_pcs_actual, pgs_knots, self.pgs_degree, pc_knots, self.pc_degree
+                )
+            print(
+                "GnomonGAMMethod: reducing knots to avoid over-parameterized model "
+                f"(coeffs={coeffs}, samples={n_samples}). "
+                f"pgs_knots={pgs_knots}, pc_knots={pc_knots}"
+            )
+
         cmd = [
             self.gnomon_exe,
             "train",
             str(train_path),
             "--num-pcs",
-            str(min(self.n_pcs, PC.shape[1])),
+            str(n_pcs_actual),
             "--pgs-knots",
-            str(self.pgs_knots),
+            str(pgs_knots),
             "--pgs-degree",
             str(self.pgs_degree),
             "--pc-knots",
-            str(self.pc_knots),
+            str(pc_knots),
             "--pc-degree",
             str(self.pc_degree),
             "--penalty-order",

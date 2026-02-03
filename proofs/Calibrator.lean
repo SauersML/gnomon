@@ -1542,7 +1542,7 @@ lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
   have h_coeff' : p.coeff (i.val + 1) = coeffs i := by
     classical
     have h_sum :
-        (∑ j in Finset.univ, if (j.val + 1) = (i.val + 1) then coeffs j else 0) =
+        Finset.sum Finset.univ (fun j => if (j.val + 1) = (i.val + 1) then coeffs j else 0) =
           if (i.val + 1) = (i.val + 1) then coeffs i else 0 := by
       refine Finset.sum_eq_single i ?_ ?_
       · intro j _ h_ne
@@ -1550,12 +1550,17 @@ lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
           intro h
           apply h_ne
           apply Fin.eq_of_val_eq
-          exact Nat.succ_inj h
-        simp [h_ne']
+          exact (Nat.succ_inj_iff).1 h
+        have h_zero : (if (j.val + 1) = (i.val + 1) then coeffs j else 0) = 0 := by
+          by_cases hji : (j.val + 1) = (i.val + 1)
+          · exfalso
+            exact h_ne' hji
+          · simp [hji]
+        simpa using h_zero
       · intro h_not_mem
         exfalso; exact h_not_mem (Finset.mem_univ i)
     have h_sum' :
-        (∑ j in Finset.univ, if (j.val + 1) = (i.val + 1) then coeffs j else 0) = coeffs i := by
+        Finset.sum Finset.univ (fun j => if (j.val + 1) = (i.val + 1) then coeffs j else 0) = coeffs i := by
       simpa using h_sum
     simpa [p, Polynomial.coeff_sum, Polynomial.coeff_monomial] using h_sum'
   exact by
@@ -1614,6 +1619,9 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   intro i l s
   have hi : i = 0 := by apply Subsingleton.elim
   subst hi
+  classical
+  let instFin : Fintype (Fin sp) := Fin.fintype sp
+  haveI := instFin
 
   have h_S_zero_at_zero : ∀ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) 0 = 0 := by
     intro l
@@ -1627,7 +1635,7 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
     have h_sum_c : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j) = evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
       classical
       have h_sum_c' :
-          Finset.sum Finset.univ (fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) =
+          Finset.sum (β:=ℝ) Finset.univ (fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) (c j)) =
             evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
         refine Finset.sum_eq_single l ?_ ?_
         · intro j _ h_ne
@@ -1639,7 +1647,7 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
     have h_sum_0 : ∑ j, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0 = 0 := by
       classical
       have h_sum_0' :
-          Finset.sum Finset.univ (fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) = 0 := by
+          Finset.sum (β:=ℝ) Finset.univ (fun j => evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 j) 0) = 0 := by
         refine Finset.sum_eq_zero ?_
         intro j _
         simpa using h_S_zero_at_zero j
@@ -1652,7 +1660,7 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
       simpa [h_spline, evalSmooth, polynomialSplineBasis] using h_eq'
     exact h_eq''
 
-  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) (by simpa using h_Sl_zero) s
+  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_Sl_zero s
   exact h_poly
 
 
@@ -4282,7 +4290,11 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
   rw [h_pred0, zero_add, h_true_1, mul_one] at h_pred
 
   unfold predictorSlope at h_pred
-  exact h_pred
+  have h_pred' :
+      model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
+        = scaling_func c := by
+    simpa using h_pred
+  exact h_pred'
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k

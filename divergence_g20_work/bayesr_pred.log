@@ -1,0 +1,22 @@
+PLINK v2.0.0-a.6.8 M1 (22 Jan 2025)
+Options in effect:
+  --bfile divergence_g20_work/test
+  --out divergence_g20_work/bayesr_pred
+  --score divergence_g20_work/bayesr_pred.score 1 2 3
+
+Hostname: infra04-wg368.wireless.umn.edu
+Working directory: /Users/user/gnomon
+Start time: Tue Feb  3 12:20:21 2026
+
+Random number seed: 1770142821
+8192 MiB RAM detected; reserving 4096 MiB for main workspace.
+Using up to 8 compute threads.
+1000 samples (0 females, 0 males, 1000 ambiguous; 1000 founders) loaded from
+divergence_g20_work/test.fam.
+18904 variants loaded from divergence_g20_work/test.bim.
+Note: No phenotype data present.
+Calculating allele frequencies... done.
+--score: 16169 variants processed.
+--score: Results written to divergence_g20_work/bayesr_pred.sscore .
+
+End time: Tue Feb  3 12:20:21 2026

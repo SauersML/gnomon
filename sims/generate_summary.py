@@ -105,6 +105,7 @@ def generate_summary_report():
         roc_plot = Path(f"{sim_name}_comparison_roc.png")
         cal_plot = Path(f"{sim_name}_comparison_calibration.png")
         auc_plot = Path(f"{sim_name}_comparison_auc.png")
+        brier_plot = Path(f"{sim_name}_comparison_brier.png")
         if roc_plot.exists():
             lines.append(f"![Simulation {sim_name} ROC Curves]({roc_plot.as_posix()})")
             lines.append("")
@@ -120,6 +121,11 @@ def generate_summary_report():
             lines.append("")
         else:
             lines.append(f"- 📊 AUC Summary: missing (`{auc_plot.name}` not found)")
+        if brier_plot.exists():
+            lines.append(f"![Simulation {sim_name} Brier Summary]({brier_plot.as_posix()})")
+            lines.append("")
+        else:
+            lines.append(f"- 📊 Brier Summary: missing (`{brier_plot.name}` not found)")
         lines.append("")
     
     # Summary conclusions

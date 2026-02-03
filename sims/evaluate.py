@@ -99,6 +99,24 @@ def plot_calibration_curves(methods_results, sim_label):
     plt.savefig(f'{sim_label}_comparison_calibration.png', dpi=150, bbox_inches='tight')
     plt.close()
 
+def plot_pcs(pc1, pc2, pop_labels, sim_label):
+    """Plot PC1 vs PC2 colored by population."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    unique_pops = sorted(set(pop_labels))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_pops)))
+
+    for pop, color in zip(unique_pops, colors):
+        mask = pop_labels == pop
+        ax.scatter(pc1[mask], pc2[mask], s=12, alpha=0.7, label=str(pop), color=color)
+
+    ax.set_xlabel("PC1", fontsize=12, fontweight='bold')
+    ax.set_ylabel("PC2", fontsize=12, fontweight='bold')
+    ax.set_title("Population Structure (PC1 vs PC2)", fontsize=14, fontweight='bold')
+    ax.legend(loc="best", fontsize=9, frameon=False)
+    ax.grid(True, alpha=0.2)
+    plt.savefig(f"{sim_label}_pcs.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 def create_metrics_table(methods_results, sim_label):
     """Create metrics table."""
     rows = []
@@ -172,6 +190,58 @@ def plot_auc_summary(methods_results, pvals_df, sim_label):
     plt.savefig(f"{sim_label}_comparison_auc.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+def plot_brier_summary(methods_results, pvals_df, sim_label):
+    """Plot Brier summary with p-values vs best (lowest) method."""
+    if not methods_results:
+        return
+
+    brier_rows = []
+    for method_name, result in methods_results.items():
+        brier_rows.append((method_name, result["metrics"]["brier"]["overall"]))
+
+    brier_df = pd.DataFrame(brier_rows, columns=["Method", "Brier"]).sort_values("Brier", ascending=True)
+    best_method = brier_df.iloc[0]["Method"]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(brier_df) * 0.6)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(brier_df)))
+    ax.bar(brier_df["Method"], brier_df["Brier"], color=colors, edgecolor="black", linewidth=0.5)
+
+    min_brier = brier_df["Brier"].min() if not brier_df.empty else 0.0
+    y_offset = max(0.001, min_brier * 0.02)
+
+    for i, (method, brier) in enumerate(brier_df.values):
+        ax.text(i, brier + y_offset, f"{brier:.3f}", ha="center", va="bottom", fontsize=9)
+
+        if pvals_df is not None and method != best_method:
+            p_row = pvals_df[
+                ((pvals_df["Method_1"] == best_method) & (pvals_df["Method_2"] == method)) |
+                ((pvals_df["Method_2"] == best_method) & (pvals_df["Method_1"] == method))
+            ]
+            if not p_row.empty:
+                pval = p_row.iloc[0]["Brier_p_value"]
+                if pd.notna(pval):
+                    ax.text(
+                        i,
+                        brier + y_offset * 2.5,
+                        f"p={pval:.3g}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                        fontweight="bold" if pval < 0.05 else "normal",
+                    )
+
+    ax.set_ylabel("Brier (overall)")
+    ax.set_title(
+        f"Brier Summary - Simulation {sim_label} (p-values vs {best_method})",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(f"{sim_label}_comparison_brier.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 def delong_test(y_true, y_pred1, y_pred2):
     """
     DeLong's test for comparing two correlated ROC curves.
@@ -225,7 +295,7 @@ def delong_test(y_true, y_pred1, y_pred2):
     # Using permutation test as fallback for robustness
     return permutation_test_auc(y_true, y_pred1, y_pred2)
 
-def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000):
+def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=500):
     """
     Permutation test for comparing AUCs.
 
@@ -264,7 +334,7 @@ def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000):
+def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=500):
     """
     Permutation test for comparing Brier scores.
 
@@ -303,11 +373,17 @@ def compute_significance_tests(methods_results, sim_label):
 
     Returns DataFrame with p-values for all pairwise comparisons.
     """
+    if os.environ.get("SKIP_SIGNIFICANCE", "").strip().lower() in {"1", "true", "yes"}:
+        df = pd.DataFrame()
+        df.to_csv(f"{sim_label}_significance_tests.csv", index=False)
+        return df
+
     method_names = list(methods_results.keys())
 
     # All pairwise combinations
     pairs = list(combinations(method_names, 2))
 
+    n_permutations = int(os.environ.get("SIGNIF_PERMUTATIONS", "500"))
     rows = []
     for method1, method2 in pairs:
         y_true1 = methods_results[method1]['y_true']
@@ -321,8 +397,8 @@ def compute_significance_tests(methods_results, sim_label):
 
         # Compute p-values
         print(f"  Testing {method1} vs {method2}...")
-        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000)
-        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000)
+        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
+        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
 
         # Get observed metrics
         auc1 = methods_results[method1]['metrics']['auc']['overall']
@@ -373,6 +449,14 @@ def main():
     tsv_path = f"{sim_prefix}.tsv"
     full_df = pd.read_csv(tsv_path, sep='\t')
     full_df['individual_id'] = full_df['individual_id'].astype(str)
+
+    if {"pc1", "pc2", "pop_label"}.issubset(full_df.columns):
+        plot_pcs(
+            full_df["pc1"].to_numpy(),
+            full_df["pc2"].to_numpy(),
+            full_df["pop_label"].to_numpy(),
+            sim_prefix,
+        )
     
     # Filter to test set
     test_metadata = full_df[full_df['individual_id'].isin(test_iids)].copy()
@@ -416,7 +500,20 @@ def main():
         )
     except FileNotFoundError as e:
         print(f"Skipping Gnomon GAM: {e}")
-    
+
+    def _method_label(method) -> str:
+        if isinstance(method, GAMMethod):
+            return "GAM-mgcv"
+        if isinstance(method, GnomonGAMMethod):
+            return "GAM-gnomon"
+        if isinstance(method, RawPGSMethod):
+            return "Raw"
+        if isinstance(method, LinearInteractionMethod):
+            return "Linear"
+        if isinstance(method, NormalizationMethod):
+            return "Normalization"
+        return method.name
+
     for prs_name in prs_scores_df.columns:
         P_raw = analysis_df[prs_name].values
         # Standardize
@@ -428,7 +525,7 @@ def main():
         P_raw = (P_raw - np.mean(P_raw)) / np.std(P_raw)
         
         for cal_method in calibration_methods:
-            name = f"{prs_name} + {cal_method.name.split(' ')[0]}"
+            name = f"{prs_name} + {_method_label(cal_method)}"
             print(f"Evaluating: {name}...")
             
             try:
@@ -469,6 +566,7 @@ def main():
     plot_roc_curves(results, sim_prefix)
     plot_calibration_curves(results, sim_prefix)
     plot_auc_summary(results, df_significance, sim_prefix)
+    plot_brier_summary(results, df_significance, sim_prefix)
     df_metrics = create_metrics_table(results, sim_prefix)
     print(df_metrics.to_string(index=False))
 
