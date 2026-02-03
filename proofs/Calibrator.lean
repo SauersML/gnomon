@@ -49,6 +49,9 @@ import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 import Mathlib.Analysis.SpecialFunctions.Pow.Real
+import Mathlib.Algebra.Polynomial.Basic
+import Mathlib.Algebra.Polynomial.Eval.Defs
+import Mathlib.Algebra.Polynomial.Roots
 
 open scoped InnerProductSpace
 open InnerProductSpace
