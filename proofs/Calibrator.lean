@@ -3999,7 +3999,14 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  admit
+  have hA : Matrix.toLin' A = A.mulVecLin := by
+    ext
+    simp [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  have hB : Matrix.toLin' B = B.mulVecLin := by
+    ext
+    simp [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  rw [hA, hB] at h
+  rw [Matrix.rank, Matrix.rank, h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
