@@ -50,6 +50,7 @@ import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
+open InnerProductSpace
 
 open MeasureTheory
 
