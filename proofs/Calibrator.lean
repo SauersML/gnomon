@@ -335,28 +335,6 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
     Specifically, x^n is integrable w.r.t N(0,1). -/
 lemma gaussian_moments_integrable (n : ℕ) :
     Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
-  -- Restored proof sketch (kept for reference):
-  /-
-  let p : NNReal := n
-  have h_mem : MemLp id p (ProbabilityTheory.gaussianReal 0 1) :=
-    ProbabilityTheory.memLp_id_gaussianReal p 0 1
-  by_cases hn : n = 0
-  · simp [hn]; apply integrable_const
-  · have hn_real_pos : (n : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr hn
-    have h_pow := MemLp.norm_rpow h_mem hn_real_pos
-    rw [ENNReal.ofReal_natCast] at h_pow
-    have hn_enn_ne_zero : (n : ENNReal) ≠ 0 := by
-      rw [ne_eq, ENNReal.coe_eq_zero, ← NNReal.coe_eq_zero]
-      norm_cast
-    rw [ENNReal.div_self hn_enn_ne_zero (ENNReal.natCast_ne_top n)] at h_pow
-    rw [← integrable_norm_iff]
-    · refine (MemLp.integrable h_pow).congr (ae_of_all _ fun x => ?_)
-      simp only [id_eq, Real.norm_eq_abs]
-      rw [← Real.rpow_natCast, abs_rpow_of_nonneg (abs_nonneg x)]
-      rw [abs_pow]
-    · apply Continuous.aestronglyMeasurable
-      exact continuous_pow n
-  -/
   simpa [poly_n, stdGaussianMeasure] using (integrable_poly_n n)
 
 
@@ -1550,77 +1528,7 @@ lemma optimal_coefficients_for_additive_dgp
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
-  -- Restored proof sketch (kept for reference):
-  /-
   intro h_eq
-  induction n with
-  | zero =>
-    intro i
-    exact i.elim0
-  | succ n ih =>
-    have h_factor : ∀ x, (∑ i : Fin (n + 1), coeffs i * x ^ (i.val + 1)) =
-        x * (coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) := by
-      intro x
-      rw [Fin.sum_univ_succ, pow_one, mul_comm (coeffs 0) x]
-      congr 1
-      simp only [Fin.val_succ]
-      rw [Finset.mul_sum]
-      refine Finset.sum_congr rfl ?_
-      intro i _
-      rw [← mul_assoc, ← pow_succ']
-      rfl
-    have h_poly_eq_zero : ∀ x, x * (coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) = 0 := by
-      intro x
-      rw [← h_factor x]
-      exact h_eq x
-    have h_const_zero : coeffs 0 = 0 := by
-      let Q := fun x => coeffs 0 + ∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)
-      have h_Q_zero_ae : ∀ x, x ≠ 0 → Q x = 0 := by
-        intro x hx
-        have := h_poly_eq_zero x
-        rw [mul_eq_zero] at this
-        cases this with
-        | inl h => contradiction
-        | inr h => exact h
-      have h_cont : Continuous Q := by
-        apply Continuous.add continuous_const
-        refine continuous_finset_sum _ ?_
-        intro i _
-        apply Continuous.mul continuous_const
-        apply Continuous.pow continuous_id
-      have h_lim : Filter.Tendsto Q (nhds 0) (nhds (Q 0)) := h_cont.tendsto 0
-      have h_lim_zero : Filter.Tendsto Q (nhds 0) (nhds 0) := by
-        refine Filter.tendsto_nhds_of_eventually_eq ?_
-        filter_upwards [Filter.eventually_ne_nhds (0:ℝ)] with x hx
-        exact h_Q_zero_ae x hx
-      have h_Q0 : Q 0 = 0 := unique_diff_within_at_univ.eq_of_tendsto_nhds h_lim h_lim_zero
-      simp [Q] at h_Q0
-      have h_sum_zero : (∑ i : Fin n, coeffs i.succ * (0:ℝ) ^ (i.val + 1)) = 0 := by
-        apply Finset.sum_eq_zero
-        intro i _
-        rw [zero_pow (Nat.succ_pos _), mul_zero]
-      rw [h_sum_zero, add_zero] at h_Q0
-      exact h_Q0
-    intro i
-    refine Fin.cases ?_ ?_ i
-    · exact h_const_zero
-    · intro i_prev
-      apply ih
-      intro x
-      have h_Q_zero : (∑ i : Fin n, coeffs i.succ * x ^ (i.val + 1)) = 0 := by
-        by_cases hx : x = 0
-        · subst hx
-          apply Finset.sum_eq_zero
-          intro j _
-          rw [zero_pow (Nat.succ_pos _), mul_zero]
-        · have := h_poly_eq_zero x
-          rw [h_const_zero, zero_add] at this
-          rw [mul_eq_zero] at this
-          cases this
-          · contradiction
-          · assumption
-      exact h_Q_zero
-  -/
   admit
 
 
@@ -1631,13 +1539,6 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
-  -- Restored proof sketch (kept for reference):
-  /-
-  -- Proof that interaction coeffs are 0
-  rw [IsNormalizedScoreModel]
-  intro i l s
-  ...
-  -/
   admit
 
 
@@ -4177,11 +4078,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
-  -- Restored proof (kept for reference) depends on additional smoothness hypotheses.
-  /-
-  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
-  ...
-  -/
+  intro c
   admit
 
 structure DGPWithLatentRisk (k : ℕ) where
@@ -4211,13 +4108,98 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
-  -- Restored proof (kept for reference) relies on continuity-to-everywhere;
-  -- currently deferred to keep the file compiling.
-  /-
   intro c
-  ...
-  -/
-  admit
+
+  -- 1. Optimality + Capability => Model = Truth (a.e.)
+  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable dgp_latent.to_dgp model h_opt ⟨m_true, h_eq_true⟩
+
+  -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
+  -- We assume standard Gaussian measure supports the whole space.
+  have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+      (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp_latent.to_dgp.jointMeasure] 0 := by
+    apply (integral_eq_zero_iff_of_nonneg _ h_integrable_sq).mp h_risk_zero
+    exact fun _ => sq_nonneg _
+
+  have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure,
+      dgp_latent.to_dgp.trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
+
+  -- 3. Use continuity to show equality holds everywhere (skipping full topological proof for now)
+  have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = dgp_latent.to_dgp.trueExpectation p_val c_val := by
+    -- We prove equality as functions pc -> ℝ
+    have h_eq_fun : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
+                    (fun pc => dgp_latent.to_dgp.trueExpectation pc.1 pc.2) := by
+      have h_ae_symm : (fun pc => linearPredictor model pc.1 pc.2) =ᵐ[dgp_latent.to_dgp.jointMeasure] (fun pc => dgp_latent.to_dgp.trueExpectation pc.1 pc.2) := by
+        filter_upwards [h_ae_eq] with x hx
+        exact hx.symm
+      -- Helper lemma for evalSmooth continuity with model.pcSplineBasis
+      have h_evalSmooth_cont : ∀ (coeffs : SmoothFunction sp),
+          Continuous (fun x => evalSmooth model.pcSplineBasis coeffs x) := by
+        intro coeffs
+        dsimp only [evalSmooth]
+        refine continuous_finset_sum _ (fun i _ => ?_)
+        apply Continuous.mul continuous_const (h_spline_cont i)
+
+      haveI := h_measure_pos
+      refine Measure.eq_of_ae_eq h_ae_symm ?_ ?_
+      · -- Continuity of linearPredictor
+        simp only [linearPredictor]
+        apply Continuous.add
+        · -- baseline_effect
+          apply Continuous.add
+          · exact continuous_const
+          · refine continuous_finset_sum _ (fun l _ => ?_)
+            apply Continuous.comp (h_evalSmooth_cont _)
+            exact (continuous_apply l).comp continuous_snd
+        · -- pgs_related_effects
+          refine continuous_finset_sum _ (fun m _ => ?_)
+          apply Continuous.mul
+          · -- pgs_coeff
+            apply Continuous.add
+            · exact continuous_const
+            · refine continuous_finset_sum _ (fun l _ => ?_)
+              apply Continuous.comp (h_evalSmooth_cont _)
+              exact (continuous_apply l).comp continuous_snd
+          · -- pgs_basis_val
+            apply Continuous.comp (h_pgs_cont _) continuous_fst
+      · -- Continuity of trueExpectation
+        rw [dgp_latent.is_latent]
+        refine Continuous.mul ?_ continuous_fst
+        refine Continuous.div continuous_const ?_ ?_
+        · refine Continuous.add continuous_const ?_
+          exact Continuous.comp h_continuous_noise continuous_snd
+        · intro x
+          exact h_denom_ne_zero x.2
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
+  -- 4. Algebraic Extraction (same as original derivation)
+  -- The remainder of the proof identifies the coefficients from the function equality.
+  have h_bayes' := h_pointwise_eq
+  have h_at_1 : linearPredictor model 1 c = dgp_latent.to_dgp.trueExpectation 1 c := h_bayes' 1 c
+  have h_at_0 : linearPredictor model 0 c = dgp_latent.to_dgp.trueExpectation 0 c := h_bayes' 0 c
+
+  simp [dgp_latent.is_latent] at h_at_0 h_at_1
+
+  -- Use decomposition
+  have h_decomp := linearPredictor_decomp model h_linear_basis
+  rw [h_decomp 0 c] at h_at_0
+  rw [h_decomp 1 c] at h_at_1
+  simp at h_at_0 h_at_1
+
+  -- predictorBase = 0
+  have h_base_zero : predictorBase model c = 0 := h_at_0
+
+  -- slope = shrinkage
+  rw [h_base_zero, zero_add] at h_at_1
+  unfold predictorSlope at h_at_1
+
+  -- Convert goal to match h_at_1
+  rw [← h_at_1]
+  rfl
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4231,16 +4213,6 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  -- Restored proof (kept for reference) via finrank of ranges.
-  /-
-  have h' :
-      LinearMap.range (Matrix.toLin (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n)) A) =
-      LinearMap.range (Matrix.toLin (Pi.basisFun ℝ (Fin m)) (Pi.basisFun ℝ (Fin n)) B) := by
-    simpa [Matrix.toLin_eq_toLin'] using h
-  rw [Matrix.rank_eq_finrank_range_toLin A (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
-  rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ (Fin n)) (Pi.basisFun ℝ (Fin m))]
-  simpa [h']
-  -/
   admit
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
@@ -4264,12 +4236,6 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  -- Restored proof (kept for reference) relies on orthogonal projection;
-  -- current Mathlib does not expose the required lemmas under these names.
-  /-
-  intro data' model model_prime i
-  ...
-  -/
   admit
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
