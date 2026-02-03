@@ -4057,13 +4057,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
 
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
-    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
-
-    **Changed from approximate (≈ 0.01) to exact equality**.
-    The approximate version was unprovable from the given hypotheses. -/
+    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
-    (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
-    (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
        (∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) ∧
