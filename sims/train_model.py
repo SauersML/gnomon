@@ -12,11 +12,10 @@ from pathlib import Path
 # Add current directory to path to allow imports
 sys.path.append(str(Path(__file__).parent))
 
-from prs_tools import BayesR, LDpred2, PRScsx
+from prs_tools import BayesR
 
 SIM_NAME_MAP = {
     1: "confounding",
-    2: "portability",
     3: "sample_imbalance",
 }
 
@@ -58,27 +57,6 @@ def train_and_score(sim_arg, method_name):
             raise FileNotFoundError(f"REQUIRED: Covariate file missing: {covar_file}. BayesR requires PC covariates.")
         eff_file = br.fit(str(train_prefix), str(pheno_file), str(work_dir / "bayesr"), covar_file=str(covar_file))
         res = br.predict(str(test_prefix), eff_file, str(work_dir / "bayesr_pred"))
-        scores = res
-
-    elif method_name == 'LDpred2':
-        ld = LDpred2()
-        # LDpred2 often uses validation set for tuning. We use training set as "val" if no separate val provided?
-        # The wrapper signature is fit(train, pheno, val, out).
-        # We'll pass train as val for simplicity if strictly required by wrapper structure,
-        # or the wrapper handles it.
-        eff_file = ld.fit(str(train_prefix), str(pheno_file), str(train_prefix), str(work_dir / "ldpred2"))
-        res = ld.predict(str(test_prefix), eff_file, str(work_dir / "ldpred2_pred"))
-        scores = res
-
-    elif method_name == 'PRS-CSx':
-        ref_path_env = os.environ.get("PRSCSX_REF")
-        if not ref_path_env:
-             raise RuntimeError("PRSCSX_REF environment variable not set. Cannot run PRS-CSx.")
-
-        cs = PRScsx()
-        eff_file = cs.fit(str(train_prefix), str(pheno_file), str(work_dir / "prscsx"),
-                          ref_dir=ref_path_env)
-        res = cs.predict(str(test_prefix), eff_file, str(work_dir / "prscsx_pred"))
         scores = res
 
     else:

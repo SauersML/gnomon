@@ -387,10 +387,10 @@ def main():
     # Re-order to match keep file if needed, but inner join with scores handles it.
     
     # 2. Load Scores
-    default_methods = ['BayesR', 'LDpred2', 'PRS-CSx']
+    default_methods = ['BayesR']
     available_methods = sorted(p.stem for p in work_dir.glob("*.sscore"))
     # Only evaluate known high-level methods; ignore intermediate artifacts.
-    known_methods = {'BayesR', 'LDpred2', 'PRS-CSx'}
+    known_methods = {'BayesR'}
     methods = [m for m in available_methods if m in known_methods]
     if not methods:
         methods = default_methods

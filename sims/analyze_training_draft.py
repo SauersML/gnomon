@@ -17,7 +17,7 @@ from methods import (
     GAMMethod,
 )
 from metrics import compute_all_metrics, compute_calibration_curve
-from prs_tools import BayesR, LDpred2, PRScsx
+from prs_tools import BayesR
 
 def setup_directories(sim_id):
     """Create work directories."""
@@ -110,34 +110,7 @@ def train_and_score(train_prefix, test_prefix, work_dir, methods_to_run):
         except Exception as e:
             print(f"BayesR failed: {e}")
 
-    # 2. LDpred2
-    if 'LDpred2' in methods_to_run:
-        print("Training LDpred2...")
-        try:
-            ld = LDpred2()
-            # For sim, we use Train as 'Validation' for auto/grid if needed, or pass same.
-            # LDpred2 script handles it.
-            eff_file = ld.fit(str(train_prefix), str(pheno_file), str(train_prefix), str(work_dir / "ldpred2"))
-            res = ld.predict(str(test_prefix), eff_file, str(work_dir / "ldpred2_pred"))
-            scores['LDpred2'] = res.set_index('IID')['PRS']
-        except Exception as e:
-            print(f"LDpred2 failed: {e}")
-
-    # 3. PRS-CSx
-    if 'PRS-CSx' in methods_to_run:
-        print("Training PRS-CSx...")
-        try:
-            # Requires reference dir. If not set, skip gracefully or fail.
-            ref_dir = os.environ.get("PRSCSX_REF", "")
-            if ref_dir and os.path.exists(ref_dir):
-                cs = PRScsx()
-                eff_file = cs.fit(str(train_prefix), str(pheno_file), str(work_dir / "prscsx"), ref_dir)
-                res = cs.predict(str(test_prefix), eff_file, str(work_dir / "prscsx_pred"))
-                scores['PRS-CSx'] = res.set_index('IID')['PRS']
-            else:
-                print("Skipping PRS-CSx: PRSCSX_REF environment variable not set or valid.")
-        except Exception as e:
-            print(f"PRS-CSx failed: {e}")
+    # Only BayesR is supported now.
             
     return pd.DataFrame(scores)
 
@@ -160,9 +133,8 @@ def main():
     train_prefix, test_prefix, test_meta = split_data(sim_id, work_dir)
     
     # Train PRS
-    print("[2/4] Training PRS Models (BayesR, LDpred2)...")
-    # Note: PRS-CSx skipped default unless env var set
-    methods = ['BayesR', 'LDpred2', 'PRS-CSx'] 
+    print("[2/4] Training PRS Models (BayesR)...")
+    methods = ['BayesR']
     prs_scores = train_and_score(train_prefix, test_prefix, work_dir, methods)
     
     if prs_scores.empty:

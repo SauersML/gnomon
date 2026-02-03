@@ -76,19 +76,6 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
         sites=SiteSelectionSpec(maf_min_causal=0.01),
         msprime_recent_gens=50,
     ),
-    # Simulation 2: PGS portability - ancestry-dependent PGS reliability (attenuation + heteroskedastic noise),
-    # with NO ancestry-dependent shift in liability (Y depends on G only + noise). Balanced samples.
-    2: SimulationConfig(
-        sim_id=2,
-        sim_name="portability",
-        seed=202,
-        samples={"AFR": 1300, "EUR": 1300, "ASIA": 1300, "ADMIX": 1300},
-        genome=GENOME,
-        trait=TraitSpec(n_causal=20_000, h2_liability=0.50, prevalence=0.10),
-        pc=PCSpec(n_pca_sites=5_000, maf_min=0.05),
-        sites=SiteSelectionSpec(maf_min_causal=0.01),
-        msprime_recent_gens=50,
-    ),
     # Simulation 3: Sample imbalance - underrepresented population accuracy (imbalanced ancestry distribution, EUR majority).
     3: SimulationConfig(
         sim_id=3,
@@ -524,28 +511,6 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
         extra_vals = (np.full(n_ind, np.nan), np.full(n_ind, np.nan), np.full(n_ind, np.nan))
 
-    elif cfg.sim_id == 2:
-        # Simulation 2:
-        # - NO ancestry-dependent mean shift in liability: Y depends on G_true + noise only.
-        # - P_observed reliability depends on ancestry (attenuation + heteroskedastic noise).
-        eps = rng.normal(0.0, 1.0, size=n_ind).astype(np.float64)
-        eta = 1.10 * G_true + 0.55 * eps
-
-        b0 = _solve_intercept_for_prevalence(cfg.trait.prevalence, eta)
-        p = sigmoid(b0 + eta)
-        y = rng.binomial(1, p).astype(np.int32)
-
-        # Reliability depends on |PC1| distance from center (0).
-        dist = np.abs(pc1)
-        a = 0.95 - 0.45 * (dist**2 / (dist**2 + 0.60))
-        sigma = 0.20 + 0.55 * (dist**1.20)
-
-        P_obs = a * G_true + rng.normal(0.0, sigma).astype(np.float64)
-        P_obs = StandardScaler(with_mean=True, with_std=True).fit_transform(P_obs.reshape(-1, 1)).ravel()
-
-        extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
-        extra_vals = (a, sigma, np.full(n_ind, np.nan))
-
     elif cfg.sim_id == 3:
         # Simulation 3:
         # - Imbalanced ancestry distribution (EUR majority).
@@ -570,6 +535,8 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
         extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
         extra_vals = (a, sigma, np.full(n_ind, center))
+    else:
+        raise RuntimeError(f"Unknown sim_id in config: {cfg.sim_id}")
 
     else:
         raise RuntimeError("Simulation id must be 1, 2, or 3.")
@@ -649,7 +616,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
     # --- Extract Genetic Map for Consistency ---
     # stdpopsim/msprime used a specific map (GRCh38). We must export this so downstream tools
-    # (like LDpred2) use the EXACT same map, rather than approximating it from GRCh37.
+    # use the EXACT same map, rather than approximating it from GRCh37.
     map_path = f"{cfg.sim_name}.cm"
     print(f"[{cfg.sim_name}] Writing {map_path} (Variant ID -> cM) ...")
     
@@ -696,17 +663,15 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
 def main() -> None:
     if len(sys.argv) != 2:
-        raise SystemExit("Provide exactly one argument: 1, 2, or 3.")
+        raise SystemExit("Provide exactly one argument: 1 or 3.")
 
     which = sys.argv[1].strip().lower()
     if which in ("1", "sim1", "confounding"):
         cfg = SIM_CONFIGS[1]
-    elif which in ("2", "sim2", "portability"):
-        cfg = SIM_CONFIGS[2]
     elif which in ("3", "sim3", "sample_imbalance"):
         cfg = SIM_CONFIGS[3]
     else:
-        raise SystemExit("Unknown simulation. Use 1, 2, 3, or the full sim name.")
+        raise SystemExit("Unknown simulation. Use 1, 3, or the full sim name.")
 
     _simulate_dataset(cfg)
     

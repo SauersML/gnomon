@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       methods:
-        description: "JSON array of methods to train (e.g. [\"BayesR\",\"LDpred2\",\"PRS-CSx\"])"
+        description: "JSON array of methods to train (e.g. [\"BayesR\"])"
         required: false
         default: "[\"BayesR\"]"
   push:
@@ -30,7 +30,7 @@ jobs:
       SIM_CACHE_VERSION: v3
     strategy:
       matrix:
-        sim_name: [confounding, portability, sample_imbalance]
+        sim_name: [confounding, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -134,7 +134,7 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        sim_name: [confounding, portability, sample_imbalance]
+        sim_name: [confounding, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -174,94 +174,12 @@ jobs:
           chmod +x /usr/local/bin/gctb
 
 
-      - name: Setup for LDpred2
-        if: matrix.method == 'LDpred2'
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.4.2'
-
-      - name: Set R library path (for caching)
-        if: matrix.method == 'LDpred2'
-        run: |
-          echo "R_LIBS_USER=$HOME/R/Library" >> $GITHUB_ENV
-          mkdir -p "$HOME/R/Library"
-
-      - name: Install system dependencies (LDpred2)
-        if: matrix.method == 'LDpred2'
-        run: |
-          sudo apt-get install -y libcurl4-openssl-dev
-
-      - name: Cache R packages (LDpred2)
-        if: matrix.method == 'LDpred2'
-        id: rpkgs_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/R/Library
-          key: rpkgs-${{ runner.os }}-r43-${{ hashFiles('sims/prs_tools/run_ldpred2.R', 'sims/requirements.txt', '.github/workflows/sim_pops.yml') }}
-          restore-keys: |
-            rpkgs-${{ runner.os }}-r43-
-      
-      - name: Install R Dependencies (LDpred2)
-        if: matrix.method == 'LDpred2' && steps.rpkgs_cache.outputs.cache-hit != 'true'
-        run: |
-          Rscript -e 'install.packages(c("bigsnpr","bigstatsr","data.table","R.utils","R.oo","R.methodsS3"), repos="https://cloud.r-project.org")'
-
-      - name: Save R packages cache (LDpred2)
-        if: matrix.method == 'LDpred2' && steps.rpkgs_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/R/Library
-          key: rpkgs-${{ runner.os }}-r43-${{ hashFiles('sims/prs_tools/run_ldpred2.R', 'sims/requirements.txt', '.github/workflows/sim_pops.yml') }}
-
-      - name: Setup for PRS-CSx
-        if: matrix.method == 'PRS-CSx'
-        run: |
-          set -e
-          # PRS-CSx LD reference generation uses PLINK 1.9-style '--r square' output.
-          # Install PLINK 1.9 and point PRSCSX_PLINK_EXE at it.
-          wget https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20250819.zip -O plink19.zip
-          unzip -o plink19.zip
-          sudo mv -f plink /usr/local/bin/
-          chmod +x /usr/local/bin/plink
-          rm -f plink19.zip
-          plink --version
-
-          command -v plink
-
-          export PRSCSX_PLINK_EXE=/usr/local/bin/plink
-          echo "PRSCSX_PLINK_EXE=/usr/local/bin/plink" >> $GITHUB_ENV
-          export PRSCSX_LD_METHOD=plink
-          export PRSCSX_LD_BFILE=${{ matrix.sim_name }}_work/train
-          export PRSCSX_LD_BLOCK_SIZE=300
-
-          # Generate LD reference from training data
-          rm -rf prscsx_ref
-          mkdir -p prscsx_ref
-          python sims/create_ld_ref.py ${{ matrix.sim_name }}_work/train 22 prscsx_ref
-          echo "PRS-CSx ref_dir contents:"
-          find prscsx_ref -maxdepth 3 -type f -print
-          find prscsx_ref -maxdepth 3 -type d -print
-          echo "PRSCSX_REF=$PWD/prscsx_ref" >> $GITHUB_ENV
-          
-          # Install PRS-CSx
-          git clone https://github.com/getian107/PRScsx.git
-          echo "PRSCSX_PATH=$PWD/PRScsx" >> $GITHUB_ENV
 
       - name: Train & Score ${{ matrix.method }}
         run: |
           set -e
-          # Ensure R.utils is present for bigsnpr
-          if [ "${{ matrix.method }}" == "LDpred2" ]; then
-             Rscript -e 'if(!require("R.utils", quietly=TRUE)) install.packages("R.utils", repos="https://cloud.r-project.org")'
-          fi
-
           echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }}..."
           python sims/train_model.py ${{ matrix.sim_name }} ${{ matrix.method }}
-
-      - name: Save R cache (LDpred2)
-        if: ${{ always() && matrix.method == 'LDpred2' }}
-        run: |
-          echo "R cache ready at $R_LIBS_USER"
 
       - name: Upload Scores
         uses: actions/upload-artifact@v4
@@ -279,7 +197,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        sim_name: [confounding, portability, sample_imbalance]
+        sim_name: [confounding, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
 
@@ -320,23 +238,6 @@ jobs:
           path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
-      - name: Download LDpred2 Scores
-        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'LDpred2') }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: model-scores-${{ matrix.sim_name }}-LDpred2
-          path: ${{ matrix.sim_name }}_work/
-          merge-multiple: true
-
-      - name: Download PRS-CSx Scores
-        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'PRS-CSx') }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: model-scores-${{ matrix.sim_name }}-PRS-CSx
-          path: ${{ matrix.sim_name }}_work/
-          merge-multiple: true
 
 
       - name: Install gnomon (binary release)

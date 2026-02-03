@@ -24,7 +24,7 @@ def generate_summary_report():
     # Header
     lines.append("# 🧬 PGS Calibration Methods Comparison Report")
     lines.append("")
-    lines.append("Comparison of four ancestry-aware polygenic score calibration methods across three simulation scenarios.")
+    lines.append("Comparison of four ancestry-aware polygenic score calibration methods across two simulation scenarios.")
     lines.append("")
     
     # Overview of methods
@@ -46,11 +46,10 @@ def generate_summary_report():
     lines.append("| Simulation | Design | Key Question |")
     lines.append("|------------|--------|--------------|")
     lines.append("| **Sim 1** | Ancestry-correlated liability (PC shifts mean) | Does normalization remove true signal? |")
-    lines.append("| **Sim 2** | Ancestry-dependent accuracy (attenuation + noise) | Can GAM capture non-linear calibration? |")
     lines.append("| **Sim 3** | Imbalanced populations (EUR majority) | Does ancestry-aware calibration help underrepresented groups? |")
     lines.append("")
 
-    sim_names = ["confounding", "portability", "sample_imbalance"]
+    sim_names = ["confounding", "sample_imbalance"]
 
     # Check if any results exist
     has_results = False
@@ -129,7 +128,6 @@ def generate_summary_report():
     lines.append("## 📝 Key Takeaways")
     lines.append("")
     lines.append("- **Simulation 1**: Tests whether phenotype-agnostic normalization removes true ancestry-associated genetic signal")
-    lines.append("- **Simulation 2**: Demonstrates need for non-linear calibration when PGS accuracy varies with ancestry")
     lines.append("- **Simulation 3**: Evaluates performance in underrepresented populations with imbalanced training data")
     lines.append("")
     lines.append("*Generated automatically by GitHub Actions*")

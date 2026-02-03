@@ -19,7 +19,7 @@ def run_plink_conversion(vcf_path: str, out_prefix: str, cm_map_path: str = None
     # Resolve PLINK executable: use PATH or fallback to CI location
     plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
     
-    # stdpopsim outputs chr22, but our downstream tools (PLINK/PRS-CSx pipeline)
+    # stdpopsim outputs chr22, but some downstream tools (PLINK-based pipeline)
     # assume chromosome "22". Some plink2 builds used in CI do not support
     # flags like --set-chr, so we normalize the VCF chromosome column ourselves.
     temp_dir = tempfile.mkdtemp(prefix="plink_vcf_")
