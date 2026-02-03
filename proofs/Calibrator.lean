@@ -1364,8 +1364,6 @@ lemma rawOptimal_implies_orthogonality
     (hP_int : Integrable (fun pc => pc.1) dgp.jointMeasure)
     (hP2_int : Integrable (fun pc => pc.1 ^ 2) dgp.jointMeasure)
     (hYP_int : Integrable (fun pc => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
-    let a := model.γ₀₀
     let b := model.γₘ₀ ⟨0, by norm_num⟩
     -- Orthogonality with 1:
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 - (a + b * pc.1)) ∂dgp.jointMeasure = 0) ∧
@@ -3830,8 +3828,6 @@ theorem raw_score_bias_in_scenario4_simplified
   have h_coeffs : model_raw.γ₀₀ = 0 ∧ model_raw.γₘ₀ 0 = 1 := by
     exact optimal_coefficients_for_additive_dgp model_raw (-0.8) dgp4 h_dgp_add h_opt_raw h_pgs_basis_linear h_indep h_means_zero.1 h_means_zero.2 h_var_p_one hP_int hC_int hP2_int hPC_int hY_int hYP_int h_resid_sq_int
 
-  -- 3. Calculate bias
-  unfold predictionBias
   rw [h_s4]
   dsimp
   rw [h_pred_form p_val c_val]
@@ -4195,6 +4191,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
 
