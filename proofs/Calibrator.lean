@@ -4434,6 +4434,11 @@ lemma rank_eq_of_range_eq {ι₁ ι₂ : Type*} [Fintype ι₁] [Fintype ι₂] 
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
   dsimp [Matrix.rank, LinearMap.rank]
+  have hA : Matrix.toLin' A = A.mulVecLin := by
+    ext; simp [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  have hB : Matrix.toLin' B = B.mulVecLin := by
+    ext; simp [Matrix.toLin'_apply, Matrix.mulVecLin_apply]
+  rw [← hA, ← hB]
   rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
@@ -4461,7 +4466,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       linearPredictor model_prime (data'.p i) (data'.c i) := by
   classical
   intro i
-  rw [h_lambda_zero] at model model_prime
+  have h_lam : lambda = 0 := h_lambda_zero
+  subst h_lam
 
   let X := designMatrix data pgsBasis splineBasis
   let X' := designMatrix data' pgsBasis splineBasis
