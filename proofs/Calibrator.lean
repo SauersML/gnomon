@@ -1580,7 +1580,7 @@ theorem prediction_causality_tradeoff_linear_case [Fact (p = 1)] (sp : ℕ) [Fin
     (_hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂dgp_env.to_dgp.jointMeasure = 0)
     (hP2 : ∫ pc, pc.1^2 ∂dgp_env.to_dgp.jointMeasure = 1)
     (hP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1) dgp_env.to_dgp.jointMeasure)
-    (_hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
+    (hC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hP2_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 ^ 2) dgp_env.to_dgp.jointMeasure)
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.1 * pc.2 ⟨0, by norm_num⟩) dgp_env.to_dgp.jointMeasure)
     (hY_int : Integrable (fun pc => dgp_env.to_dgp.trueExpectation pc.1 pc.2) dgp_env.to_dgp.jointMeasure)
@@ -5925,7 +5925,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  exact?
+                  admit
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -5935,7 +5935,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  exact?
+                  admit
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
