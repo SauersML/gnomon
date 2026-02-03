@@ -4139,8 +4139,7 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
   intro c
   have h_pred_eq := h_pointwise_eq
   have h_decomp := linearPredictor_decomp model h_linear_basis
-  have h0 := h_pred_eq 0 c
-  have h1 := h_pred_eq 1 c
+
   rw [h_decomp 0 c] at h0
   rw [h_decomp 1 c] at h1
   simp only [mul_zero, add_zero] at h0
