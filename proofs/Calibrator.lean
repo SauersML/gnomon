@@ -1529,7 +1529,28 @@ lemma optimal_coefficients_for_additive_dgp
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
   intro h_eq
-  admit
+  let P : Polynomial ℝ := ∑ i, Polynomial.monomial (i.val + 1) (coeffs i)
+  have h_eval : ∀ x, P.eval x = 0 := by
+    intro x
+    simp only [P, Polynomial.eval_finset_sum, Polynomial.eval_monomial]
+    exact h_eq x
+  have h_zero : P = 0 := Polynomial.funext h_eval
+  intro i
+  have h_coeff : P.coeff (i.val + 1) = 0 := by rw [h_zero, Polynomial.coeff_zero]
+  rw [Polynomial.coeff_sum] at h_coeff
+  simp only [Polynomial.coeff_monomial] at h_coeff
+  rw [Finset.sum_eq_single i] at h_coeff
+  · simp only [if_pos rfl] at h_coeff
+    exact h_coeff
+  · intro j _ h_ne
+    simp only [if_neg]
+    intro h_ind
+    apply h_ne
+    apply Fin.eq_of_val_eq
+    simpa using h_ind
+  · intro h_not_mem
+    exfalso
+    exact h_not_mem (Finset.mem_univ i)
 
 
 theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
@@ -1539,7 +1560,76 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
-  admit
+  have h_linear_basis : proj.pgsBasis.B ⟨1, by norm_num⟩ = id := by
+    rw [h_pgs]
+    exact rfl
+
+  have h_eq : ∀ p c, predictorBase proj c + predictorSlope proj c * p = f p + ∑ i, g i (c i) := by
+    intro p c
+    rw [← linearPredictor_decomp proj h_linear_basis p c]
+    rw [h_fit p c, h_true_fn]
+
+  have h_slope_const : ∀ c, predictorSlope proj c = f 1 - f 0 := by
+    intro c
+    have h0 := h_eq 0 c
+    have h1 := h_eq 1 c
+    simp only [mul_zero, add_zero, mul_one] at h0 h1
+    rw [h0] at h1
+    linarith
+
+  let K := f 1 - f 0 - proj.γₘ₀ 0
+  have h_spline_sum : ∀ c, ∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) = K := by
+    intro c
+    have h := h_slope_const c
+    unfold predictorSlope at h
+    linarith
+
+  constructor
+  intro m l s
+  have h_m_0 : m = 0 := by ext; simp
+  rw [h_m_0]
+
+  let c_varying (x : ℝ) : Fin k → ℝ := fun i => if i = l then x else 0
+
+  have h_eval_zero : ∀ i, i ≠ l → evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 i) 0 = 0 := by
+    intro i _
+    unfold evalSmooth
+    simp only [h_spline, polynomialSplineBasis, mul_zero, zero_pow, Nat.succ_ne_zero, Finset.sum_const_zero]
+    apply Finset.sum_eq_zero
+    intro s _
+    simp only [zero_pow (Nat.succ_pos s), mul_zero]
+
+  have h_sum_l : ∀ x, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = K := by
+    intro x
+    have h := h_spline_sum (c_varying x)
+    rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ l)] at h
+    simp only [c_varying, if_pos rfl] at h
+    have h_diff_zero : ∑ i ∈ Finset.univ \ {l}, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 i) (c_varying x i) = 0 := by
+      apply Finset.sum_eq_zero
+      intro i hi
+      have h_ne : i ≠ l := Finset.mem_sdiff.mp hi |>.2
+      simp only [c_varying, if_neg h_ne]
+      exact h_eval_zero i h_ne
+    rw [h_diff_zero, add_zero] at h
+    exact h
+
+  have h_K_zero : K = 0 := by
+    rw [← h_sum_l 0]
+    unfold evalSmooth
+    rw [h_spline]
+    apply Finset.sum_eq_zero
+    intro i _
+    simp only [polynomialSplineBasis, zero_pow (Nat.succ_pos i), mul_zero]
+
+  rw [h_K_zero] at h_sum_l
+
+  have h_poly_zero : ∀ x, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := h_sum_l
+
+  rw [h_spline] at h_poly_zero
+  unfold evalSmooth polynomialSplineBasis at h_poly_zero
+  simp only at h_poly_zero
+
+  apply polynomial_spline_coeffs_unique (proj.fₘₗ 0 l) h_poly_zero s
 
 
 theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
@@ -4079,7 +4169,87 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  admit
+  obtain ⟨m_true, h_true_eq, _, _⟩ := h_capable
+  have h_capable_class : ∃ m : PhenotypeInformedGAM 1 k 1, ∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c := ⟨m_true, h_true_eq⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt h_capable_class
+
+  have h_ae_eq : ∀ᵐ pc ∂(stdNormalProdMeasure k), linearPredictor model pc.1 pc.2 = (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 := by
+    rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero
+    · filter_upwards [h_risk_zero] with pc h_sq
+      rw [sub_eq_zero.mp (sq_eq_zero_iff.mp h_sq)]
+    · intro pc; exact sq_nonneg _
+    · exact h_integrable_sq
+
+  have h_pointwise : ∀ p c, linearPredictor model p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c := by
+    let f := fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2
+    let g := fun pc : ℝ × (Fin k → ℝ) => (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2
+    have h_eq_fun : f = g := by
+      have h_g_cont : Continuous g := by
+         rw [← funext (fun x => h_true_eq x.1 x.2)]
+         apply Continuous.add
+         · apply Continuous.add
+           · exact continuous_const
+           · refine continuous_finset_sum _ (fun l _ => ?_)
+             dsimp [evalSmooth]
+             refine continuous_finset_sum _ (fun i _ => ?_)
+             apply Continuous.mul continuous_const
+             apply Continuous.comp (h_spline_cont i)
+             exact (continuous_apply l).comp continuous_snd
+         · refine continuous_finset_sum _ (fun m _ => ?_)
+           apply Continuous.mul
+           · apply Continuous.add
+             · exact continuous_const
+             · refine continuous_finset_sum _ (fun l _ => ?_)
+               dsimp [evalSmooth]
+               refine continuous_finset_sum _ (fun i _ => ?_)
+               apply Continuous.mul continuous_const
+               apply Continuous.comp (h_spline_cont i)
+               exact (continuous_apply l).comp continuous_snd
+           · apply Continuous.comp (h_pgs_cont _) continuous_fst
+      have h_f_cont : Continuous f := by
+         apply Continuous.add
+         · apply Continuous.add
+           · exact continuous_const
+           · refine continuous_finset_sum _ (fun l _ => ?_)
+             dsimp [evalSmooth]
+             refine continuous_finset_sum _ (fun i _ => ?_)
+             apply Continuous.mul continuous_const
+             apply Continuous.comp (h_spline_cont i)
+             exact (continuous_apply l).comp continuous_snd
+         · refine continuous_finset_sum _ (fun m _ => ?_)
+           apply Continuous.mul
+           · apply Continuous.add
+             · exact continuous_const
+             · refine continuous_finset_sum _ (fun l _ => ?_)
+               dsimp [evalSmooth]
+               refine continuous_finset_sum _ (fun i _ => ?_)
+               apply Continuous.mul continuous_const
+               apply Continuous.comp (h_spline_cont i)
+               exact (continuous_apply l).comp continuous_snd
+           · apply Continuous.comp (h_pgs_cont _) continuous_fst
+
+      haveI := h_measure_pos
+      apply Measure.eq_of_ae_eq h_ae_eq h_f_cont h_g_cont
+
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
+  have h_pred : linearPredictor model 1 c = (dgpMultiplicativeBias scaling_func).trueExpectation 1 c := h_pointwise 1 c
+  have h_pred0 : linearPredictor model 0 c = (dgpMultiplicativeBias scaling_func).trueExpectation 0 c := h_pointwise 0 c
+
+  have h_true_1 : (dgpMultiplicativeBias scaling_func).trueExpectation 1 c = scaling_func c * 1 := rfl
+  have h_true_0 : (dgpMultiplicativeBias scaling_func).trueExpectation 0 c = scaling_func c * 0 := rfl
+
+  rw [linearPredictor_decomp model h_linear_basis] at h_pred
+  rw [linearPredictor_decomp model h_linear_basis] at h_pred0
+
+  rw [h_true_0, mul_zero] at h_pred0
+  rw [mul_zero, add_zero] at h_pred0
+
+  rw [h_pred0, zero_add, h_true_1, mul_one] at h_pred
+
+  unfold predictorSlope at h_pred
+  exact h_pred
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -4231,15 +4401,118 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      unfold Matrix.rank
-      erw [← h_range_eq]
-      unfold Matrix.rank at h_rank
-      exact h_rank
+      apply rank_eq_of_range_eq
+      exact h_range_eq
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  let pred := X.mulVec (packParams model)
+  let pred' := X'.mulVec (packParams model_prime)
+
+  have h_pred_val : pred i = linearPredictor model (data.p i) (data.c i) := by
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model (fit_in_model_class data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank)]
+
+  have h_pred_val' : pred' i = linearPredictor model_prime (data'.p i) (data'.c i) := by
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime (fit_in_model_class data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg _)]
+
+  rw [← h_pred_val, ← h_pred_val']
+
+  let W := LinearMap.range (Matrix.toLin' X)
+  let W' := LinearMap.range (Matrix.toLin' X')
+  have h_space_eq : W = W' := h_range_eq
+
+  have h_min : ∀ v ∈ W, dist data.y pred ≤ dist data.y v := by
+    intro v hv
+    obtain ⟨b, hb⟩ := (Matrix.mem_range_toLin' X v).mp hv
+    have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+    let m_b := unpackParams pgsBasis splineBasis b
+    have h_m_b_class : InModelClass m_b pgsBasis splineBasis := by constructor <;> rfl
+    have h_ineq := h_loss m_b h_m_b_class
+
+    unfold empiricalLoss gaussianPenalizedLoss l2norm_sq at h_ineq
+    rw [h_lambda_zero] at h_ineq
+    simp only [mul_zero, add_zero] at h_ineq
+
+    rw [unpack_pack_eq _ _ _ (fit_in_model_class ...)] at h_ineq
+    rw [unpack_pack_eq m_b pgsBasis splineBasis h_m_b_class] at h_ineq
+
+    have h_Xb : X.mulVec (packParams m_b) = v := by
+      rw [unpack_pack_eq _ _ _ h_m_b_class]
+      rw [← hb]
+      rfl
+
+    have h_dist_sq : ∀ z, Finset.univ.sum (fun i => (data.y i - z i)^2) = (dist data.y z)^2 := by
+      intro z
+      simp [dist, SemiNormedGroup.dist, dist_eq_norm, norm_eq_sqrt_inner, inner_self, Real.sq_sqrt (inner_self_nonneg _)]
+      rfl
+
+    have h_n_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    rw [h_dist_sq pred, h_dist_sq v] at h_ineq
+
+    have h_ineq_sq : (dist data.y pred)^2 ≤ (dist data.y v)^2 := by
+      nlinarith [h_ineq]
+
+    apply Real.sqrt_le_sqrt_iff.mpr at h_ineq_sq
+    simpa using h_ineq_sq
+
+  have h_min' : ∀ v ∈ W', dist data.y pred' ≤ dist data.y v := by
+    intro v hv
+    obtain ⟨b, hb⟩ := (Matrix.mem_range_toLin' X' v).mp hv
+    have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      apply rank_eq_of_range_eq
+      exact h_range_eq
+    )
+    let m_b := unpackParams pgsBasis splineBasis b
+    have h_m_b_class : InModelClass m_b pgsBasis splineBasis := by constructor <;> rfl
+    have h_ineq := h_loss m_b h_m_b_class
+    unfold empiricalLoss gaussianPenalizedLoss l2norm_sq at h_ineq
+    rw [h_lambda_zero] at h_ineq
+    simp only [mul_zero, add_zero] at h_ineq
+
+    rw [unpack_pack_eq _ _ _ (fit_in_model_class ...)] at h_ineq
+    rw [unpack_pack_eq m_b pgsBasis splineBasis h_m_b_class] at h_ineq
+
+    have h_Xb : X'.mulVec (packParams m_b) = v := by
+      rw [unpack_pack_eq _ _ _ h_m_b_class]
+      rw [← hb]
+      rfl
+
+    have h_dist_sq : ∀ z, Finset.univ.sum (fun i => (data.y i - z i)^2) = (dist data.y z)^2 := by
+      intro z
+      simp [dist, SemiNormedGroup.dist, dist_eq_norm, norm_eq_sqrt_inner, inner_self, Real.sq_sqrt (inner_self_nonneg _)]
+      rfl
+
+    have h_n_pos_real : (0 : ℝ) < n := Nat.cast_pos.mpr h_n_pos
+    rw [h_dist_sq pred', h_dist_sq v] at h_ineq
+
+    have h_ineq_sq : (dist data.y pred')^2 ≤ (dist data.y v)^2 := by
+      nlinarith [h_ineq]
+
+    apply Real.sqrt_le_sqrt_iff.mpr at h_ineq_sq
+    simpa using h_ineq_sq
+
+  have h_pred_in_W : pred ∈ W := (Matrix.mem_range_toLin' X pred).mpr ⟨packParams model, rfl⟩
+
+  have h_pred'_in_W' : pred' ∈ W' := (Matrix.mem_range_toLin' X' pred').mpr ⟨packParams model_prime, rfl⟩
+
+  rw [← h_space_eq] at h_pred'_in_W'
+  rw [← h_space_eq] at h_min'
+
+  have h_eq_vec : pred = pred' := by
+    let W_sub : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X)
+    have h_complete : CompleteSpace W_sub := FiniteDimensional.complete W_sub
+    have h_unique : ∃! v, v ∈ W_sub ∧ ∀ w ∈ W_sub, dist data.y v ≤ dist data.y w :=
+      exists_unique_dist_eq_minimal W_sub (by exact h_complete) data.y
+    have h_pred_sat : pred ∈ W_sub ∧ ∀ w ∈ W_sub, dist data.y pred ≤ dist data.y w := ⟨h_pred_in_W, h_min⟩
+    have h_pred'_sat : pred' ∈ W_sub ∧ ∀ w ∈ W_sub, dist data.y pred' ≤ dist data.y w := ⟨h_pred'_in_W', h_min'⟩
+    exact (h_unique.unique h_pred_sat h_pred'_sat)
+
+  rw [h_eq_vec]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
