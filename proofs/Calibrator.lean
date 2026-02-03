@@ -4429,8 +4429,8 @@ set_option maxHeartbeats 2000000 in
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
 
-lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
-    (A B : Matrix (Fin n) (Fin m) ℝ)
+lemma rank_eq_of_range_eq {n : ℕ} {ι : Type*} [Fintype (Fin n)] [Fintype ι] [DecidableEq ι]
+    (A B : Matrix (Fin n) ι ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
   have h_eq_A : Matrix.toLin' A = Matrix.mulVecLin A := by
