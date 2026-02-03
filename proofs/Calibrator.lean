@@ -48,6 +48,7 @@ import Mathlib.Topology.MetricSpace.HausdorffDistance
 import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
+import Mathlib.Analysis.SpecialFunctions.Pow.Real
 
 open scoped InnerProductSpace
 open InnerProductSpace
@@ -325,6 +326,14 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
 ## Part 2: Fully Formalized Theorems and Proofs
 =================================================================
 -/
+
+
+/-- **Lemma**: Moments of the standard Gaussian distribution are integrable.
+    Specifically, x^n is integrable w.r.t N(0,1). -/
+lemma gaussian_moments_integrable (n : ℕ) :
+    Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
+  admit
+
 
 section AllClaims
 
@@ -2578,7 +2587,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hsum' :
           a * b * (∑ i, (r₁ i - r₂ i) ^ 2) =
             ∑ i, a * b * (r₁ i - r₂ i) ^ 2 := by
-        simp [Finset.mul_sum, mul_left_comm, mul_comm, mul_assoc]
+        simp [Finset.mul_sum]
       have hsum'' :
           a * b * (∑ i, (r₁ - r₂) i ^ 2) =
             a * b * (∑ i, (r₁ i - r₂ i) ^ 2) := by
@@ -3188,9 +3197,9 @@ theorem parameter_identifiability {n p k sp : ℕ} [Fintype (Fin n)] [Fintype (F
                   intro j _
                   ring
               _ = ∑ j, a * (c₁ j * splineBasis.b j x) + ∑ j, b * (c₂ j * splineBasis.b j x) := by
-                  simpa [Finset.sum_add_distrib]
+                  simp [Finset.sum_add_distrib]
               _ = a * ∑ j, c₁ j * splineBasis.b j x + b * ∑ j, c₂ j * splineBasis.b j x := by
-                  simp [Finset.mul_sum, mul_assoc, mul_left_comm, mul_comm]
+                  simp [Finset.mul_sum]
 
           have h₁ : ∑ x, evalSmooth splineBasis (fun j => β₁ (ParamIx.pcSpline l j)) (data.c x l) = 0 := by
             simpa [β₁, packParams, hm₁.1.spline_match] using hm₁.2.1 l
@@ -3883,7 +3892,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     rw [h_oracle_risk_zero, sub_zero]
     rfl
 
-  dsimp
+  dsimp only
   rw [h_diff_eq_norm_sq]
 
   -- 2. Identify the Additive Projection
@@ -4921,7 +4930,7 @@ theorem sum_to_zero_after_projection
 
   -- Step 2: Use diagonal form of W to simplify
   rw [hW_diag]
-  simp [Matrix.diagonal_apply]
+  simp
 
   -- Step 3: Swap the order of summation
   -- Σᵢ (Σⱼ aᵢⱼ * βⱼ) * wᵢ = Σⱼ βⱼ * (Σᵢ aᵢⱼ * wᵢ)
@@ -4990,7 +4999,7 @@ theorem sum_to_zero_after_projection
   -- Need to show the sum forms are equal
 
   -- Expand both sides more carefully
-  simp only [Matrix.mul_apply, Matrix.transpose_apply, sumToZeroConstraint]
+  simp only [Matrix.mul_apply]
   -- LHS: Σᵢ (B*Z)ᵢⱼ * Wᵢᵢ
   -- RHS: Σₖ (Σᵢ (B*Z)ᵢⱼ * Wᵢₖ) * 1
 
