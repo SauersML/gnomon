@@ -4045,7 +4045,122 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- Decompose predictor for model_norm
+    have h_norm_decomp : ∀ p c, linearPredictor model_norm p c = predictorBase model_norm c + predictorSlope model_norm c * p :=
+      linearPredictor_decomp model_norm h_linear_basis.1
+
+    -- Simplify slope for normalized model
+    have h_norm_slope : ∀ c, predictorSlope model_norm c = model_norm.γₘ₀ 0 := by
+      intro c
+      unfold predictorSlope
+      simp [h_norm_opt.is_normalized.fₘₗ_zero]
+
+    let B := model_norm.γₘ₀ 0
+    let base := predictorBase model_norm
+    let μC := (stdNormalProdMeasure k).map Prod.snd
+    let μP := (stdNormalProdMeasure k).map Prod.fst
+
+    -- Risk of model_norm
+    have h_risk_norm : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+        ∫ c, (scaling_func c - B)^2 ∂μC + ∫ c, (base c)^2 ∂μC := by
+      unfold expectedSquaredError dgpMultiplicativeBias
+      rw [stdNormalProdMeasure, Measure.integral_prod]
+      swap
+      · admit
+      apply MeasureTheory.integral_congr_ae
+      filter_upwards with c
+      have h_inner : ∫ p, (scaling_func c * p - linearPredictor model_norm p c)^2 ∂μP =
+                     (scaling_func c - B)^2 + (base c)^2 := by
+        rw [h_norm_decomp, h_norm_slope]
+        have h_eq : ∀ p, (scaling_func c * p - (base c + B * p))^2 =
+                         (scaling_func c - B)^2 * p^2 - 2 * (scaling_func c - B) * base c * p + (base c)^2 := by
+          intro p; ring
+        simp_rw [h_eq]
+        rw [integral_add, integral_sub]
+        · rw [integral_const_mul, integral_const_mul, integral_const]
+          have h_gauss_sq : ∫ (x : ℝ), x ^ 2 ∂μP = 1 := by
+             unfold μP stdNormalProdMeasure
+             rw [Measure.map_fst_prod]
+             admit
+          have h_gauss_id : ∫ (x : ℝ), x ∂μP = 0 := by
+             unfold μP stdNormalProdMeasure
+             rw [Measure.map_fst_prod]
+             admit
+          have h_univ : μP Set.univ = 1 := by
+             unfold μP stdNormalProdMeasure
+             rw [Measure.map_fst_prod]
+             simp
+          rw [h_gauss_sq, h_gauss_id, h_univ]
+          ring
+        · admit -- Integrability 1
+        · admit -- Integrability 2
+        · admit -- Integrability 3
+      exact h_inner
+
+    -- Risk of model_star
+    have h_risk_star_val : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
+        ∫ c, (scaling_func c - 1)^2 ∂μC := by
+       unfold expectedSquaredError dgpMultiplicativeBias
+       rw [stdNormalProdMeasure, Measure.integral_prod]
+       swap; admit
+       apply MeasureTheory.integral_congr_ae
+       filter_upwards with c
+       have h_star_decomp : ∀ p, linearPredictor model_star p c = p := by
+         intro p
+         rw [h_star_pred]
+       simp_rw [h_star_decomp]
+       have h_eq : ∀ p, (scaling_func c * p - p)^2 = (scaling_func c - 1)^2 * p^2 := by
+         intro p; ring
+       simp_rw [h_eq]
+       rw [integral_const_mul]
+       have h_gauss_sq : ∫ (x : ℝ), x ^ 2 ∂μP = 1 := by
+          unfold μP stdNormalProdMeasure
+          rw [Measure.map_fst_prod]
+          admit
+       rw [h_gauss_sq, mul_one]
+
+    rw [h_risk_norm, h_risk_star_val]
+
+    have h_ineq_B : ∫ c, (scaling_func c - B)^2 ∂μC ≥ ∫ c, (scaling_func c - 1)^2 ∂μC := by
+      have h_expand_B : ∫ c, (scaling_func c - B)^2 ∂μC = ∫ c, (scaling_func c)^2 ∂μC - 2 * B + B^2 := by
+        have h_expand : ∀ x, (x - B)^2 = x^2 - 2*B*x + B^2 := by intro; ring
+        simp_rw [h_expand]
+        rw [integral_add, integral_sub]
+        · rw [integral_const_mul, integral_const]
+          rw [h_mean_1]
+          have h_univ : μC Set.univ = 1 := by
+             unfold μC stdNormalProdMeasure
+             rw [Measure.map_snd_prod]
+             simp
+          rw [h_univ]
+          ring
+        · admit
+        · admit
+        · admit
+      have h_expand_1 : ∫ c, (scaling_func c - 1)^2 ∂μC = ∫ c, (scaling_func c)^2 ∂μC - 2 * 1 + 1^2 := by
+        have h_expand : ∀ x, (x - 1)^2 = x^2 - 2*1*x + 1^2 := by intro; ring
+        simp_rw [h_expand]
+        rw [integral_add, integral_sub]
+        · rw [integral_const_mul, integral_const]
+          rw [h_mean_1]
+          have h_univ : μC Set.univ = 1 := by
+             unfold μC stdNormalProdMeasure
+             rw [Measure.map_snd_prod]
+             simp
+          rw [h_univ]
+          ring
+        · admit
+        · admit
+        · admit
+      rw [h_expand_B, h_expand_1]
+      ring_nf
+      have h_sq : B^2 - 2*B + 1 = (B-1)^2 := by ring
+      rw [h_sq]
+      exact sq_nonneg (B - 1)
+
+    have h_base_nonneg : ∫ c, (base c)^2 ∂μC ≥ 0 := integral_nonneg (fun _ => sq_nonneg _)
+
+    linarith
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
