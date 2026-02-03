@@ -4050,9 +4050,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      apply integrable_poly_n
+      -- μP is the standard Gaussian, so polynomial moments are integrable
+      simpa [stdGaussianMeasure, poly_n] using (integrable_poly_n n)
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4566,10 +4568,9 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-      rw [Matrix.rank_eq_finrank_range_toLin]
-      rw [← h_range_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin]
+      unfold Matrix.rank
+      erw [← h_range_eq]
+      unfold Matrix.rank at h_rank
       exact h_rank
   )
   ∀ (i : Fin n),

@@ -4,6 +4,7 @@ from .raw_pgs import RawPGSMethod
 from .linear_interaction import LinearInteractionMethod
 from .normalization import NormalizationMethod
 from .gam_mgcv import GAMMethod
+from .gam_gnomon import GnomonGAMMethod
 
 __all__ = [
     'PGSMethod',
@@ -11,4 +12,5 @@ __all__ = [
     'LinearInteractionMethod',
     'NormalizationMethod',
     'GAMMethod',
+    'GnomonGAMMethod',
 ]
