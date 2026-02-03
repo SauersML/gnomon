@@ -1383,7 +1383,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
