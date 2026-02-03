@@ -46,7 +46,6 @@ class SiteSelectionSpec:
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    sim_id: int
     sim_name: str
     seed: int
     samples: Dict[str, int]  # population_name -> number of diploids
@@ -63,10 +62,9 @@ class SimulationConfig:
 
 GENOME = GenomeSpec()
 
-SIM_CONFIGS: Dict[int, SimulationConfig] = {
+SIM_CONFIGS: Dict[str, SimulationConfig] = {
     # Simulation 1: Ancestry confounding - signal preservation when mean liability shifts with ancestry (PC)
-    1: SimulationConfig(
-        sim_id=1,
+    "confounding": SimulationConfig(
         sim_name="confounding",
         seed=101,
         samples={"AFR": 1300, "EUR": 1300, "ASIA": 1300, "ADMIX": 1300},
@@ -78,8 +76,7 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
     ),
     # Simulation 3: Portability - train in EUR, test across ancestries with no PC-driven liability shifts.
     # EUR is 5x each other ancestry so that 20% EUR test ~= each other ancestry size.
-    3: SimulationConfig(
-        sim_id=3,
+    "portability": SimulationConfig(
         sim_name="portability",
         seed=303,
         samples={"AFR": 700, "EUR": 3500, "ASIA": 700, "ADMIX": 700},
@@ -490,13 +487,11 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     # --- Generate observed PGS and phenotype y per simulation design ---
     rng = np.random.default_rng(cfg.seed + 31)
 
-    if cfg.sim_id == 1:
+    if cfg.sim_name == "confounding":
         # Simulation 1:
         # - Liability mean shifts along ancestry axis (PC1), so naive ancestry-only normalization can remove signal.
         # - P_observed is a noisy proxy for G_true (like an imperfect PGS).
-        beta_g = 1.00
-        beta_pc = 0.90
-        eta = beta_g * G_true + beta_pc * pc1
+        eta = G_true + pc1
 
         b0 = _solve_intercept_for_prevalence(cfg.trait.prevalence, eta)
         p = sigmoid(b0 + eta)
@@ -508,10 +503,10 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
         extra_vals = (np.full(n_ind, np.nan), np.full(n_ind, np.nan), np.full(n_ind, np.nan))
 
-    elif cfg.sim_id == 3:
+    elif cfg.sim_name == "portability":
         # Simulation 3:
         # - No ancestry-dependent liability shift (pure genetic liability).
-        eta = 1.05 * G_true
+        eta = G_true
 
         b0 = _solve_intercept_for_prevalence(cfg.trait.prevalence, eta)
         p = sigmoid(b0 + eta)
@@ -523,10 +518,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
         extra_vals = (np.full(n_ind, np.nan), np.full(n_ind, np.nan), np.full(n_ind, np.nan))
     else:
-        raise RuntimeError(f"Unknown sim_id in config: {cfg.sim_id}")
-
-    else:
-        raise RuntimeError("Simulation id must be 1, 2, or 3.")
+        raise RuntimeError(f"Unknown sim_name in config: {cfg.sim_name}")
 
     # --- Build TSV table ---
     pc_cols = [f"pc{i+1}" for i in range(N_PCS)]
@@ -650,15 +642,13 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
 def main() -> None:
     if len(sys.argv) != 2:
-        raise SystemExit("Provide exactly one argument: 1 or 3.")
+        raise SystemExit("Provide exactly one argument: confounding or portability.")
 
     which = sys.argv[1].strip().lower()
-    if which in ("1", "sim1", "confounding"):
-        cfg = SIM_CONFIGS[1]
-    elif which in ("3", "sim3", "portability"):
-        cfg = SIM_CONFIGS[3]
+    if which in SIM_CONFIGS:
+        cfg = SIM_CONFIGS[which]
     else:
-        raise SystemExit("Unknown simulation. Use 1, 3, or the full sim name.")
+        raise SystemExit("Unknown simulation. Use 'confounding' or 'portability'.")
 
     _simulate_dataset(cfg)
     

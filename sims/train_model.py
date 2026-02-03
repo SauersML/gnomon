@@ -1,7 +1,7 @@
 
 """
 Train a specific PRS model and generate scores for the test set.
-Usage: python train_model.py <sim_id> <method_name>
+Usage: python train_model.py <sim_name> <method_name>
 """
 import sys
 import os
@@ -14,21 +14,8 @@ sys.path.append(str(Path(__file__).parent))
 
 from prs_tools import BayesR
 
-SIM_NAME_MAP = {
-    1: "confounding",
-    3: "portability",
-}
-
-
 def _resolve_sim_prefix(sim_arg: str) -> str:
-    # Accept sim id (1/2/3) or sim name
     sim_arg = str(sim_arg).strip()
-    if sim_arg.isdigit():
-        sim_id = int(sim_arg)
-        prefix = SIM_NAME_MAP.get(sim_id, f"sim{sim_id}")
-        if os.path.exists(f"{prefix}_work") or os.path.exists(f"{prefix}.tsv"):
-            return prefix
-        return f"sim{sim_id}"
     return sim_arg
 
 def train_and_score(sim_arg, method_name):
@@ -73,7 +60,7 @@ def train_and_score(sim_arg, method_name):
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python train_model.py <sim_id> <method_name>")
+        print("Usage: python train_model.py <sim_name> <method_name>")
         sys.exit(1)
         
     sim_arg = sys.argv[1]

@@ -13,17 +13,9 @@ from sklearn.model_selection import train_test_split
 
 def _resolve_sim_prefix(sim_arg: str) -> str:
     sim_arg = str(sim_arg).strip()
-    candidates = [sim_arg]
-    if sim_arg.isdigit():
-        candidates.append(f"sim{sim_arg}")
-
-    for prefix in candidates:
-        if os.path.exists(f"{prefix}.tsv"):
-            return prefix
-
-    raise FileNotFoundError(
-        f"Simulation TSV not found. Tried: {[f'{c}.tsv' for c in candidates]}"
-    )
+    if os.path.exists(f"{sim_arg}.tsv"):
+        return sim_arg
+    raise FileNotFoundError(f"Simulation TSV not found: {sim_arg}.tsv")
 
 def setup_directories(sim_arg):
     """Create work directories."""
@@ -200,7 +192,7 @@ def split_data(sim_arg, work_dir):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python split_data.py <sim_name|sim_id>")
+        print("Usage: python split_data.py <sim_name>")
         sys.exit(1)
     
     sim_arg = sys.argv[1]

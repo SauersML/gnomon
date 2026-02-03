@@ -19,21 +19,21 @@ from methods import (
 from metrics import compute_all_metrics, compute_calibration_curve
 from prs_tools import BayesR
 
-def setup_directories(sim_id):
+def setup_directories(sim_name):
     """Create work directories."""
-    work_dir = Path(f"sim{sim_id}_work")
+    work_dir = Path(f"{sim_name}_work")
     if work_dir.exists():
         shutil.rmtree(work_dir)
     work_dir.mkdir()
     return work_dir
 
-def split_data(sim_id, work_dir):
+def split_data(sim_name, work_dir):
     """
     Split PLINK data into Training (EUR) and Test (All).
     Returns paths to PLINK prefixes.
     """
     # Load info from TSV to identify IDs
-    df = pd.read_csv(f"sim{sim_id}.tsv", sep='\t')
+    df = pd.read_csv(f"{sim_name}.tsv", sep='\t')
     
     # Select Training Set: EUR only? Or Imbalanced?
     # User said: "Train in Europeans SPECIFICALLY"
@@ -64,7 +64,7 @@ def split_data(sim_id, work_dir):
     test_ids.to_csv(test_keep, sep='\t', index=False, header=False)
     
     # Make subsets using PLINK2
-    bfile_orig = f"sim{sim_id}"
+    bfile_orig = sim_name
     
     # Training
     cmd_train = [
@@ -119,18 +119,18 @@ def train_and_score(train_prefix, test_prefix, work_dir, methods_to_run):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python analyze_methods.py <sim_id>")
+        print("Usage: python analyze_methods.py <sim_name>")
         sys.exit(1)
         
-    sim_id = int(sys.argv[1])
-    print(f"\nPGS Pipeline: Real Training - Simulation {sim_id}\n")
+    sim_name = sys.argv[1].strip()
+    print(f"\nPGS Pipeline: Real Training - Simulation {sim_name}\n")
     
     # Setup
-    work_dir = setup_directories(sim_id)
+    work_dir = setup_directories(sim_name)
     
     # Data Split
     print("[1/4] Splitting Data (Train=EUR, Test=All)...")
-    train_prefix, test_prefix, test_meta = split_data(sim_id, work_dir)
+    train_prefix, test_prefix, test_meta = split_data(sim_name, work_dir)
     
     # Train PRS
     print("[2/4] Training PRS Models (BayesR)...")

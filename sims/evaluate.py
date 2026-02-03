@@ -1,7 +1,7 @@
 
 """
 Evaluate PRS models: Calibration, AUC, and Plots.
-Usage: python evaluate.py <sim_id>
+Usage: python evaluate.py <sim_name>
 """
 import sys
 import os
@@ -349,16 +349,10 @@ def compute_significance_tests(methods_results, sim_label):
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: python evaluate.py <sim_name|sim_id>")
+        print("Usage: python evaluate.py <sim_name>")
         sys.exit(1)
         
-    sim_arg = sys.argv[1]
-    try:
-        sim_id = int(sim_arg)
-    except ValueError:
-        sim_id = None
-
-    sim_prefix = f"sim{sim_id}" if sim_id is not None else sim_arg
+    sim_prefix = sys.argv[1].strip()
     work_dir = Path(f"{sim_prefix}_work")
     
     # 1. Load Data
