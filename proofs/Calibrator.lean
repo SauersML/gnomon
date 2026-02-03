@@ -4431,6 +4431,12 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     We formalize "flexible enough" as the condition that the design matrix column space
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
+lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
+    (A B : Matrix (Fin n) (Fin m) ℝ)
+    (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
+    Matrix.rank A = Matrix.rank B := by
+  rw [Matrix.rank_eq_finrank_range_toLin, Matrix.rank_eq_finrank_range_toLin, h]
+
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
@@ -4444,12 +4450,161 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [rank_eq_of_range_eq]
+      · exact h_rank
+      · exact h_range_eq
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  classical
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+
+  -- 1. Identify models as minimizers of Euclidean distance
+  have h_min_model := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  have h_min_prime := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      rw [rank_eq_of_range_eq]
+      · exact h_rank
+      · exact h_range_eq
+    )
+
+  -- 2. Predictions as vectors in the range
+  let pred_vec := X.mulVec (packParams model)
+  let pred_vec' := X'.mulVec (packParams model_prime)
+
+  have h_pred_mem : pred_vec ∈ LinearMap.range (Matrix.toLin' X) := by
+    use (packParams model); simp [pred_vec, Matrix.toLin'_apply]
+  have h_pred'_mem : pred_vec' ∈ LinearMap.range (Matrix.toLin' X') := by
+    use (packParams model_prime); simp [pred_vec', Matrix.toLin'_apply]
+
+  -- 3. Equivalence of loss minimization and distance minimization
+  have h_loss_eq_dist : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+      empiricalLoss m data 0 = (1 / n : ℝ) * l2norm_sq (data.y - (designMatrix data pgsBasis splineBasis).mulVec (packParams m)) := by
+    intro m hm
+    simp [empiricalLoss, h_lambda_zero, pointwiseNLL, l2norm_sq]
+    rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m hm]
+    field_simp
+
+  have h_loss_eq_dist' : ∀ (m : PhenotypeInformedGAM p k sp) (hm : InModelClass m pgsBasis splineBasis),
+      empiricalLoss m data' 0 = (1 / n : ℝ) * l2norm_sq (data'.y - (designMatrix data' pgsBasis splineBasis).mulVec (packParams m)) := by
+    intro m hm
+    simp [empiricalLoss, h_lambda_zero, pointwiseNLL, l2norm_sq]
+    rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m hm]
+    field_simp
+
+  -- 4. InModelClass validity
+  have h_in_class : InModelClass model pgsBasis splineBasis := by
+    unfold model fit; exact ⟨rfl, rfl, rfl, rfl⟩
+  have h_in_class' : InModelClass model_prime pgsBasis splineBasis := by
+    unfold model_prime fit; exact ⟨rfl, rfl, rfl, rfl⟩
+
+  -- 5. Cross-optimality
+  let V := LinearMap.range (Matrix.toLin' X)
+
+  -- pred_vec' IS in Range(X)
+  rw [h_range_eq] at h_pred'_mem
+  obtain ⟨beta_alt, h_beta_alt⟩ := (Matrix.range_toLin' X).mem_iff.mp h_pred'_mem
+  let m_alt := unpackParams pgsBasis splineBasis beta_alt
+  have h_m_alt_in : InModelClass m_alt pgsBasis splineBasis := by constructor <;> rfl
+
+  have h_loss_le : empiricalLoss model data 0 ≤ empiricalLoss m_alt data 0 :=
+    h_min_model m_alt h_m_alt_in
+
+  rw [h_loss_eq_dist model h_in_class, h_loss_eq_dist m_alt h_m_alt_in] at h_loss_le
+  rw [h_beta_alt] at h_loss_le
+  -- packParams(unpackParams(beta)) = beta holds definitionally for this struct
+  simp [packParams, unpackParams] at h_loss_le
+
+  -- Symmetrically:
+  rw [← h_range_eq] at h_pred_mem
+  obtain ⟨beta_alt', h_beta_alt'⟩ := (Matrix.range_toLin' X').mem_iff.mp h_pred_mem
+  let m_alt' := unpackParams pgsBasis splineBasis beta_alt'
+  have h_m_alt'_in : InModelClass m_alt' pgsBasis splineBasis := by constructor <;> rfl
+
+  have h_loss_le' : empiricalLoss model_prime data' 0 ≤ empiricalLoss m_alt' data' 0 :=
+    h_min_prime m_alt' h_m_alt'_in
+
+  rw [h_loss_eq_dist' model_prime h_in_class', h_loss_eq_dist' m_alt' h_m_alt'_in] at h_loss_le'
+  rw [h_beta_alt'] at h_loss_le'
+  simp [packParams, unpackParams] at h_loss_le'
+
+  have hn : (0 : ℝ) < n := by exact_mod_cast h_n_pos
+  have hn_inv_pos : (0 : ℝ) < 1/n := one_div_pos.mpr hn
+
+  rw [mul_le_mul_left hn_inv_pos] at h_loss_le h_loss_le'
+
+  -- Uniqueness
+  have h_unique : pred_vec = pred_vec' := by
+    by_contra h_ne
+    -- Strict convexity of v -> l2norm_sq (y - v)
+    let f := fun v : Fin n → ℝ => l2norm_sq (data.y - v)
+    let mid := (1/2 : ℝ) • pred_vec + (1/2 : ℝ) • pred_vec'
+    have h_strict : f mid < (1/2 : ℝ) * f pred_vec + (1/2 : ℝ) * f pred_vec' := by
+       unfold l2norm_sq
+       simp only [Pi.sub_apply, Pi.add_apply, Pi.smul_apply, Finset.sum_add_distrib, Finset.mul_sum]
+       rw [← Finset.sum_add_distrib]
+       apply Finset.sum_lt_sum
+       · intro i _
+         let a := data.y i - pred_vec i
+         let b := data.y i - pred_vec' i
+         have h_mid_val : data.y i - ((1/2 : ℝ) * pred_vec i + (1/2 : ℝ) * pred_vec' i) = (1/2 : ℝ) * a + (1/2 : ℝ) * b := by ring
+         rw [h_mid_val]
+         have h_cvx := strictConvexOn_pow 2 two_ne_zero
+         rw [StrictConvexOn] at h_cvx
+         have h_sq := h_cvx (Set.mem_univ a) (Set.mem_univ b) (fun _ => False.elim) (by norm_num : (0:ℝ) < 1/2) (by norm_num : (0:ℝ) < 1/2) (by norm_num)
+         simp at h_sq
+         exact le_of_lt h_sq
+       · use 0; simp
+         -- Need to show there exists i such that a != b, i.e., pred_vec i != pred_vec' i
+         intro _
+         rw [Function.ne_iff] at h_ne
+         obtain ⟨i, hi⟩ := h_ne
+         let a := data.y i - pred_vec i
+         let b := data.y i - pred_vec' i
+         have h_mid_val : data.y i - ((1/2 : ℝ) * pred_vec i + (1/2 : ℝ) * pred_vec' i) = (1/2 : ℝ) * a + (1/2 : ℝ) * b := by ring
+         rw [h_mid_val]
+         have h_cvx := strictConvexOn_pow 2 two_ne_zero
+         rw [StrictConvexOn] at h_cvx
+         have h_sq := h_cvx (Set.mem_univ a) (Set.mem_univ b) (by simp [a,b]; exact hi) (by norm_num : (0:ℝ) < 1/2) (by norm_num : (0:ℝ) < 1/2) (by norm_num)
+         simp at h_sq
+         exact h_sq
+
+    have h_mid_mem : mid ∈ V := Submodule.convex _ h_pred_mem h_pred'_mem (by norm_num) (by norm_num) (by norm_num)
+    -- Contradiction
+    -- f(pred_vec) <= f(mid) because pred_vec minimizes f on V
+    -- f(pred_vec') <= f(mid) ...
+    have h1 := h_loss_le
+    rw [h_beta_alt] at h1
+    simp [packParams, unpackParams] at h1
+    -- Wait, h_loss_le is loss(pred_vec) <= loss(pred_vec').
+    -- h_loss_le' is loss(pred_vec') <= loss(pred_vec).
+    -- So loss(pred_vec) = loss(pred_vec').
+    have h_eq_val : f pred_vec = f pred_vec' := le_antisymm h_loss_le h_loss_le'
+    rw [h_eq_val] at h_strict
+    ring_nf at h_strict
+    -- f(mid) < f(pred_vec)
+    -- But pred_vec minimizes f on V, and mid in V.
+    -- To show pred_vec minimizes f on V:
+    -- We know empiricalLoss model <= empiricalLoss m_alt
+    -- This means f(pred_vec) <= f(X*beta) for any beta.
+    -- i.e. f(pred_vec) <= f(v) for any v in Range(X).
+    have h_min : f pred_vec ≤ f mid := by
+      -- mid in V implies mid = X * beta_mid
+      obtain ⟨beta_mid, h_beta_mid⟩ := (Matrix.range_toLin' X).mem_iff.mp h_mid_mem
+      let m_mid := unpackParams pgsBasis splineBasis beta_mid
+      have h_m_mid_in : InModelClass m_mid pgsBasis splineBasis := by constructor <;> rfl
+      have h_le := h_min_model m_mid h_m_mid_in
+      rw [h_loss_eq_dist model h_in_class, h_loss_eq_dist m_mid h_m_mid_in] at h_le
+      simp [packParams, unpackParams] at h_le
+      rw [h_beta_mid] at h_le
+      exact (mul_le_mul_left hn_inv_pos).mp h_le
+    linarith
+
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_in_class]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime h_in_class']
+  rw [h_unique]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
