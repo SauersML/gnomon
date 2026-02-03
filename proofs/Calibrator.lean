@@ -332,7 +332,7 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
     Specifically, x^n is integrable w.r.t N(0,1). -/
 lemma gaussian_moments_integrable (n : ℕ) :
     Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
-  admit
+  apply integrable_poly_n
 
 
 section AllClaims
@@ -1380,7 +1380,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
@@ -1413,7 +1413,52 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  -- 1. Obtain orthogonality from Bayes optimality
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  let a := model.γ₀₀
+  let b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  -- 2. Use normal equations (which are separate lemmas)
+  -- First normal equation: a = E[Y]
+  have ha_eq : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure :=
+    optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure
+      (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth_1
+
+  -- Second normal equation: b = E[YP]
+  have hb_eq : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure :=
+    optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure
+      (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  rw [h_dgp] at ha_eq hb_eq
+
+  -- Simplify E[Y]
+  have h_mean_Y : (∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) = 0 := by
+    rw [integral_add hP_int (hC_int.const_mul β_env)]
+    rw [integral_const_mul, hP0, hC0]
+    ring
+
+  -- Simplify E[YP]
+  have h_mean_YP : (∫ pc, (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 ∂dgp.jointMeasure) = 1 := by
+    have h_expand : ∀ pc : ℝ × (Fin 1 → ℝ),
+        (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 = pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc; ring
+    simp only [h_expand]
+    rw [integral_add hP2_int (hPC_int.const_mul β_env)]
+    -- E[PC] = 0 by independence
+    have hPC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+      convert integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0 using 2
+      funext; apply mul_comm
+    rw [integral_const_mul, hPC0, hP2]
+    ring
+
+  constructor
+  · change a = 0
+    rw [ha_eq, h_mean_Y]
+  · change b = 1
+    rw [hb_eq]
+    exact h_mean_YP
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
