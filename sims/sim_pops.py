@@ -94,7 +94,7 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
         sim_id=3,
         sim_name="sample_imbalance",
         seed=303,
-        samples={"AFR": 675, "EUR": 6800, "ASIA": 675, "ADMIX": 675},
+        samples={"AFR": 675, "EUR": 3400, "ASIA": 675, "ADMIX": 675},
         genome=GENOME,
         trait=TraitSpec(n_causal=20_000, h2_liability=0.50, prevalence=0.10),
         pc=PCSpec(n_pca_sites=5_000, maf_min=0.05),
