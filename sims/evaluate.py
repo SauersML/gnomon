@@ -390,7 +390,7 @@ def main():
     default_methods = ['BayesR', 'LDpred2', 'PRS-CSx']
     available_methods = sorted(p.stem for p in work_dir.glob("*.sscore"))
     # Only evaluate known high-level methods; ignore intermediate artifacts.
-    known_methods = {'BayesR', 'BayesR-Mix', 'LDpred2', 'PRS-CSx'}
+    known_methods = {'BayesR', 'LDpred2', 'PRS-CSx'}
     methods = [m for m in available_methods if m in known_methods]
     if not methods:
         methods = default_methods

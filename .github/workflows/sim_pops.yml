@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       methods:
-        description: "JSON array of methods to train (e.g. [\"BayesR\",\"BayesR-Mix\",\"LDpred2\",\"PRS-CSx\"])"
+        description: "JSON array of methods to train (e.g. [\"BayesR\",\"LDpred2\",\"PRS-CSx\"])"
         required: false
-        default: "[\"BayesR\",\"BayesR-Mix\"]"
+        default: "[\"BayesR\"]"
   push:
     paths:
       - "sims/**"
@@ -18,7 +18,7 @@ env:
   OPENBLAS_NUM_THREADS: 4
   VECLIB_MAXIMUM_THREADS: 4
   NUMEXPR_NUM_THREADS: 4
-  TRAIN_METHODS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]' }}
+  TRAIN_METHODS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]' }}
 
 jobs:
   # ------------------------------------------------------------------
@@ -133,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
-        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR","BayesR-Mix"]') }}
+        method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
         sim_name: [confounding, portability, sample_imbalance]
     steps:
       - uses: actions/checkout@v4
@@ -173,14 +173,6 @@ jobs:
           sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
           chmod +x /usr/local/bin/gctb
 
-      - name: Setup for BayesR-Mix
-        if: matrix.method == 'BayesR-Mix'
-        run: |
-          mkdir -p gctb_bin
-          wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
-          unzip gctb_2.03beta_Linux.zip -d gctb_bin
-          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
-          chmod +x /usr/local/bin/gctb
 
       - name: Setup for LDpred2
         if: matrix.method == 'LDpred2'
@@ -346,14 +338,6 @@ jobs:
           path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
-      - name: Download BayesR-Mix Scores
-        if: ${{ contains(fromJSON(env.TRAIN_METHODS), 'BayesR-Mix') }}
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: model-scores-${{ matrix.sim_name }}-BayesR-Mix
-          path: ${{ matrix.sim_name }}_work/
-          merge-multiple: true
 
       - name: Install gnomon (binary release)
         run: |

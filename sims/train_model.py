@@ -12,7 +12,7 @@ from pathlib import Path
 # Add current directory to path to allow imports
 sys.path.append(str(Path(__file__).parent))
 
-from prs_tools import BayesR, LDpred2, PRScsx, BayesRMix
+from prs_tools import BayesR, LDpred2, PRScsx
 
 SIM_NAME_MAP = {
     1: "confounding",
@@ -58,39 +58,6 @@ def train_and_score(sim_arg, method_name):
             raise FileNotFoundError(f"REQUIRED: Covariate file missing: {covar_file}. BayesR requires PC covariates.")
         eff_file = br.fit(str(train_prefix), str(pheno_file), str(work_dir / "bayesr"), covar_file=str(covar_file))
         res = br.predict(str(test_prefix), eff_file, str(work_dir / "bayesr_pred"))
-        scores = res
-
-    elif method_name == 'BayesR-Mix':
-        # Multi-ancestry BayesR stacking
-        brm = BayesRMix(ancestries=['EUR', 'AFR', 'ASIA'])
-        covar_file = work_dir / "train.covar"
-        if not covar_file.exists():
-            raise FileNotFoundError(f"REQUIRED: Covariate file missing: {covar_file}. BayesR-Mix requires PC covariates.")
-
-        # Need metadata file with pop_label for each individual
-        # Load from original TSV
-        tsv_path = f"{sim_prefix}.tsv"
-        if not os.path.exists(tsv_path):
-            raise FileNotFoundError(f"Metadata file not found: {tsv_path}")
-
-        # Create metadata file for train set
-        full_meta = pd.read_csv(tsv_path, sep='\t')
-        full_meta['IID'] = full_meta['individual_id'].astype(str)
-
-        # Get train IDs
-        train_fam = pd.read_csv(f"{train_prefix}.fam", sep=r'\s+', header=None,
-                               names=['FID', 'IID', 'PID', 'MID', 'SEX', 'PHENO'],
-                               dtype={'FID': str, 'IID': str})
-        train_iids = set(train_fam['IID'].astype(str))
-
-        # Filter metadata to train set
-        train_meta = full_meta[full_meta['IID'].isin(train_iids)][['IID', 'pop_label']]
-        metadata_file = work_dir / "train_metadata.tsv"
-        train_meta.to_csv(metadata_file, sep='\t', index=False)
-
-        model_file = brm.fit(str(train_prefix), str(pheno_file), str(work_dir / "bayesr_mix"),
-                            covar_file=str(covar_file), metadata_file=str(metadata_file))
-        res = brm.predict(str(test_prefix), model_file, str(work_dir / "bayesr_mix_pred"))
         scores = res
 
     elif method_name == 'LDpred2':
