@@ -4223,7 +4223,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         -- IsNormalizedScoreModel implies f_ml = 0
         simp [hm_norm.fₘₗ_zero]
 
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
+      have h_B_sq_int : Integrable (fun (pc : ℝ × (Fin k → ℝ)) => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by
         unfold stdNormalProdMeasure
         have h_eq : ∀ p c, (p - linearPredictor m p c)^2 = ((1 - m.γₘ₀ 0) * p - predictorBase m c)^2 := by
           intro p c
@@ -4239,7 +4239,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           rw [memLp_two_iff_integrable_sq h_base_meas] at h_base_L2
           refine h_prod_int (integrable_const 1) h_base_L2
 
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
+      have h_cross_int : Integrable (fun (pc : ℝ × (Fin k → ℝ)) => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by
         unfold stdNormalProdMeasure
         have h_eq : ∀ p c, ((scaling_func c - 1) * p) * (p - linearPredictor m p c) =
             (scaling_func c - 1) * (1 - m.γₘ₀ 0) * p^2 - (scaling_func c - 1) * predictorBase m c * p := by
@@ -4514,7 +4514,14 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
       rw [Matrix.rank_eq_finrank_range_toLin]
-      rw [← h_range_eq]
+      -- We need to unfold data' in the goal to match h_range_eq or use equality logic
+      -- h_range_eq says range(toLin(designMatrix data)) = range(toLin(designMatrix data'))
+      -- where data' in h_range_eq is definitionally equal to data' in the context
+      -- We perform a direct match using the hypothesis
+      have h_rng : LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis)) =
+                   LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) := by
+        exact h_range_eq.symm
+      rw [h_rng]
       rw [← Matrix.rank_eq_finrank_range_toLin]
       exact h_rank
   )
