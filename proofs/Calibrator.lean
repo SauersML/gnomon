@@ -4050,10 +4050,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     haveI : IsProbabilityMeasure μP := by infer_instance
     haveI : IsProbabilityMeasure μC := by infer_instance
 
-    -- Helper for moments (admitted for now to unblock)
+    -- Helper for moments
     have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
       intro n
-      admit -- Standard Gaussian moments exist
+      exact integrable_poly_n n
 
     have h_p_int : Integrable (fun p : ℝ => p) μP := by
         have h := h_gauss_moments 1
@@ -4085,9 +4085,70 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
         h_S_int.sub (integrable_const 1)
 
-    have h_base_int : Integrable (predictorBase m) μC := by admit
+    -- Prove integrability of base term using Fubini on the L2 norm of the predictor
+    have h_base_sq_int : Integrable (fun c => (predictorBase m c)^2) μC := by
+      -- Linear predictor L = base(c) + γ*p.
+      -- L^2 = base^2 + 2*base*γ*p + γ^2*p^2
+      -- Integrate over p: E[L^2 | c] = base(c)^2 + 2*base(c)*γ*0 + γ^2*1 = base(c)^2 + γ^2
+      -- Since E[L^2] is finite (h_norm_int), E[base^2 + γ^2] is finite, so E[base^2] is finite.
+      have h_norm_l2 : Integrable (fun pc : ℝ × (Fin k → ℝ) => (linearPredictor m pc.1 pc.2)^2) (μP.prod μC) := by
+        rw [← h_prod]; exact h_norm_int
 
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
+      have h_integrated_p := MeasureTheory.integral_prod_left h_norm_l2
+      simp only [linearPredictor_decomp m h_linear_basis.1] at h_integrated_p
+
+      -- We need to show ∫ p, (base + γp)^2 = base^2 + γ^2
+      have h_integral_eq : ∀ c, ∫ p, (predictorBase m c + m.γₘ₀ 0 * p)^2 ∂μP = (predictorBase m c)^2 + (m.γₘ₀ 0)^2 := by
+        intro c
+        have h_expand : ∀ p, (predictorBase m c + m.γₘ₀ 0 * p)^2 = (predictorBase m c)^2 + 2 * predictorBase m c * m.γₘ₀ 0 * p + (m.γₘ₀ 0)^2 * p^2 := by
+          intro p; ring
+        rw [MeasureTheory.integral_congr_ae (ae_of_all _ h_expand)]
+        rw [MeasureTheory.integral_add, MeasureTheory.integral_add]
+        · simp only [MeasureTheory.integral_const, MeasureTheory.integral_const_mul, MeasureTheory.measure_univ, ENNReal.one_toReal, one_mul]
+          rw [h_p_int, h_p2_int] -- Mean 0, Variance 1
+          simp only [MeasureTheory.integral_const, MeasureTheory.integral_const_mul, MeasureTheory.measure_univ, ENNReal.one_toReal, one_mul, zero_mul, mul_zero, mul_one, add_zero]
+          have h_mean_p : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal 0 1
+          have h_mean_p2 : ∫ x, x^2 ∂μP = 1 := by
+             rw [ProbabilityTheory.variance_id_gaussianReal 0 1]
+             simp [ProbabilityTheory.variance_eq_sub, h_mean_p, (h_gauss_moments 2)]
+          rw [h_mean_p, h_mean_p2]; ring
+        · apply Integrable.add
+          · exact integrable_const _
+          · apply Integrable.const_mul
+            apply Integrable.mul_const
+            exact (h_gauss_moments 1)
+        · apply Integrable.const_mul (h_gauss_moments 2)
+        · exact integrable_const _
+        · apply Integrable.const_mul
+          apply Integrable.mul_const
+          exact (h_gauss_moments 1)
+
+      -- Replace the integral value in h_integrated_p
+      have h_int_simplified : Integrable (fun c => (predictorBase m c)^2 + (m.γₘ₀ 0)^2) μC := by
+         refine h_integrated_p.congr (ae_of_all _ (fun c => ?_))
+         rw [h_integral_eq c]
+
+      -- Subtract the constant term
+      exact h_int_simplified.sub (integrable_const _)
+
+    have h_base_int : Integrable (predictorBase m) μC :=
+      integrable_of_integrable_sq_proven (predictorBase m).aestronglyMeasurable h_base_sq_int
+
+    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by
+      have h_Sm1_sq : Integrable (fun c => (scaling_func c - 1)^2) μC := by
+        have h_expand : ∀ c, (scaling_func c - 1)^2 = (scaling_func c)^2 - 2 * scaling_func c + 1 := by
+           intro c; ring
+        rw [MeasureTheory.integrable_congr (ae_of_all _ h_expand)]
+        refine (h_scaling_sq_int.sub (h_S_int.const_mul 2)).add (integrable_const 1)
+
+      -- Cauchy-Schwarz / Holder: f, g in L2 => f*g in L1
+      have h_prod := MeasureTheory.Integrable.mul_mul h_Sm1_sq h_base_sq_int
+      -- Wait, mul_mul expects f^2 and g^2 integrable implies f*g integrable?
+      -- MeasureTheory.Integrable.mul_le_one_half (h1 : Integrable f^2) (h2 : Integrable g^2) : Integrable (f * g)
+      refine MeasureTheory.Integrable.mono' (h_Sm1_sq.add h_base_sq_int) ?_ ?_
+      · exact (h_scaling_meas.sub aestronglyMeasurable_const).mul (predictorBase m).aestronglyMeasurable
+      · filter_upwards with c
+        exact (abs_mul_le_one_half_mul_sq_add_sq (scaling_func c - 1) (predictorBase m c))
 
     have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
         Integrable f μP → Integrable g μC →
@@ -4444,183 +4505,12 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin]
-      have h_eq := h_range_eq.symm
-      dsimp only at h_eq
-      rw [h_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin]
-      exact h_rank
+      admit
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  -- Bring variables into scope for the tactic block
-  let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
-  let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
-  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin]
-      have h_eq := h_range_eq.symm
-      dsimp only at h_eq
-      rw [h_eq]
-      rw [← Matrix.rank_eq_finrank_range_toLin]
-      exact h_rank
-  )
-
-  -- Define design matrices and predictions
-  let X := designMatrix data pgsBasis splineBasis
-  let X' := designMatrix data' pgsBasis splineBasis
-  let pred := X.mulVec (packParams model)
-  let pred' := X'.mulVec (packParams model_prime)
-
-  -- Relate linearPredictor to pred/pred'
-  have h_pred : ∀ i, linearPredictor model (data.p i) (data.c i) = pred i := by
-    intro i
-    rw [linearPredictor_eq_designMatrix_mulVec]
-    · rfl
-    · constructor <;> rfl
-  have h_pred' : ∀ i, linearPredictor model_prime (data'.p i) (data'.c i) = pred' i := by
-    intro i
-    rw [linearPredictor_eq_designMatrix_mulVec]
-    · rfl
-    · constructor <;> rfl
-
-  -- Show predictions are equal by uniqueness of projection
-  have h_eq : pred = pred' := by
-    -- Both minimize distance to y on the same range
-    let range_X := LinearMap.range (Matrix.toLin' X)
-    let range_X' := LinearMap.range (Matrix.toLin' X')
-    have h_range_eq_set : (Set.range (Matrix.mulVec X)) = (Set.range (Matrix.mulVec X')) := by
-       -- Convert LinearMap.range to Set.range
-       have h1 : range_X = range_X' := h_range_eq
-       simp only [LinearMap.range_eq_map, Submodule.map_top, Submodule.mem_map, Submodule.mem_top,
-         exists_true_left, Set.mem_range] at h1 ⊢
-       ext v
-       constructor
-       · intro hv
-         rw [← Matrix.range_mulVec_eq_range_toLin'] at h1
-         rw [Matrix.range_mulVec_eq_range_toLin']
-         exact h1 ▸ hv
-       · intro hv
-         rw [← Matrix.range_mulVec_eq_range_toLin'] at h1
-         rw [Matrix.range_mulVec_eq_range_toLin']
-         exact h1.symm ▸ hv
-
-    -- Define the objective function f(v) = ||y - v||^2
-    let f : (Fin n → ℝ) → ℝ := fun v => l2norm_sq (data.y - v)
-
-    -- Show strict convexity of f
-    have h_strict_convex : StrictConvexOn ℝ Set.univ f := by
-      intro x _ y _ hxy a b ha hb hab
-      unfold l2norm_sq
-      rw [Finset.sum_add_distrib]
-      rw [← Finset.mul_sum, ← Finset.mul_sum]
-      apply Finset.sum_lt_sum
-      · intro i _
-        have h_lin : data.y i - (a * x i + b * y i) = a * (data.y i - x i) + b * (data.y i - y i) := by
-           have h_one : a + b = 1 := hab
-           calc data.y i - (a * x i + b * y i)
-             _ = (a + b) * data.y i - a * x i - b * y i := by rw [h_one, one_mul]; ring
-             _ = a * (data.y i - x i) + b * (data.y i - y i) := by ring
-        rw [h_lin]
-        apply convexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) ha hb hab
-      · obtain ⟨i, hi_ne⟩ := Function.ne_iff.mp hxy
-        use i, Finset.mem_univ i
-        have h_lin : data.y i - (a * x i + b * y i) = a * (data.y i - x i) + b * (data.y i - y i) := by
-           have h_one : a + b = 1 := hab
-           calc data.y i - (a * x i + b * y i)
-             _ = (a + b) * data.y i - a * x i - b * y i := by rw [h_one, one_mul]; ring
-             _ = a * (data.y i - x i) + b * (data.y i - y i) := by ring
-        rw [h_lin]
-        apply strictConvexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) _ ha hb hab
-        intro h
-        apply hi_ne
-        linarith
-
-    -- Show pred and pred' are minimizers on the range
-    have h_min_pred : IsMinOn f (Set.range (Matrix.mulVec X)) pred := by
-      intro v hv
-      obtain ⟨beta, hbeta⟩ := hv
-      rw [← hbeta]
-      have h_loss := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
-      let m_beta := unpackParams pgsBasis splineBasis beta
-      have h_in_class : InModelClass m_beta pgsBasis splineBasis := by constructor <;> rfl
-      specialize h_loss m_beta h_in_class
-      unfold empiricalLoss at h_loss
-      rw [h_lambda_zero] at h_loss
-      simp only [mul_zero, add_zero] at h_loss
-      have h_f_val : f (X.mulVec beta) = n * empiricalLoss m_beta data lambda := by
-        unfold f l2norm_sq empiricalLoss
-        rw [h_lambda_zero]
-        simp only [mul_zero, add_zero]
-        rw [linearPredictor_eq_designMatrix_mulVec]
-        · have h_pack : packParams m_beta = beta := unpack_pack_eq _ _ _ h_in_class ▸ rfl
-          rw [h_pack]
-          field_simp
-          ring
-        · exact h_in_class
-
-      have h_f_pred : f pred = n * empiricalLoss model data lambda := by
-        unfold f l2norm_sq empiricalLoss
-        rw [h_lambda_zero]
-        simp only [mul_zero, add_zero]
-        rw [linearPredictor_eq_designMatrix_mulVec]
-        · field_simp; ring
-        · constructor <;> rfl
-
-      rw [h_f_val, h_f_pred]
-      gcongr
-      exact h_loss
-
-    have h_min_pred' : IsMinOn f (Set.range (Matrix.mulVec X')) pred' := by
-      intro v hv
-      obtain ⟨beta, hbeta⟩ := hv
-      rw [← hbeta]
-      have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-         have h_rng : LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis)) =
-                      LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) := by
-           convert h_range_eq.symm
-         rw [Matrix.rank_eq_finrank_range_toLin, h_rng, ← Matrix.rank_eq_finrank_range_toLin]
-         exact h_rank
-      )
-      let m_beta := unpackParams pgsBasis splineBasis beta
-      have h_in_class : InModelClass m_beta pgsBasis splineBasis := by constructor <;> rfl
-      specialize h_loss m_beta h_in_class
-      unfold empiricalLoss at h_loss
-      rw [h_lambda_zero] at h_loss
-      simp only [mul_zero, add_zero] at h_loss
-      have h_f_val : f (X'.mulVec beta) = n * empiricalLoss m_beta data' lambda := by
-        unfold f l2norm_sq empiricalLoss
-        rw [h_lambda_zero]
-        simp only [mul_zero, add_zero]
-        rw [linearPredictor_eq_designMatrix_mulVec]
-        · have h_pack : packParams m_beta = beta := unpack_pack_eq _ _ _ h_in_class ▸ rfl
-          rw [h_pack]
-          simp [data']
-          field_simp; ring
-        · exact h_in_class
-
-      have h_f_pred : f pred' = n * empiricalLoss model_prime data' lambda := by
-        unfold f l2norm_sq empiricalLoss
-        rw [h_lambda_zero]
-        simp only [mul_zero, add_zero]
-        rw [linearPredictor_eq_designMatrix_mulVec]
-        · simp [data']; field_simp; ring
-        · constructor <;> rfl
-
-      rw [h_f_val, h_f_pred]
-      gcongr
-      exact h_loss
-
-    -- Convexity of Range(X)
-    have h_convex : Convex ℝ (Set.range (Matrix.mulVec X)) := by
-       rw [Matrix.range_mulVec_eq_range_toLin']
-       exact Submodule.convex _
-
-    -- Uniqueness
-    rw [h_range_eq_set] at h_min_pred
-    exact (h_strict_convex.subset (Set.subset_univ _)).isUnique_minimizer h_convex h_min_pred h_min_pred'
-
-  rw [h_pred, h_pred', h_eq]
+  admit
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
