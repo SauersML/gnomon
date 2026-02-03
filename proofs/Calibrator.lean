@@ -1,4 +1,5 @@
 import Mathlib.Tactic
+import Mathlib.Algebra.Polynomial.Basic
 import Mathlib.Analysis.Calculus.Deriv.Basic
 import Mathlib.Analysis.Calculus.Deriv.Inv
 import Mathlib.Analysis.Convex.Strict
@@ -1380,7 +1381,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
@@ -1413,12 +1414,62 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  have ha : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure :=
+    optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth_1
+
+  have hb : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure :=
+    optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  rw [h_dgp] at ha hb
+
+  have h_E_Y : ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0 := by
+    rw [integral_add hP_int (hC_int.const_mul β_env)]
+    rw [hP0, integral_const_mul, hC0]
+    ring
+
+  have h_E_YP : ∫ pc, (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 ∂dgp.jointMeasure = 1 := by
+    have h_expand : (fun pc : ℝ × (Fin 1 → ℝ) => (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1) =
+                    (fun pc => pc.1^2 + β_env * (pc.1 * pc.2 ⟨0, by norm_num⟩)) := by
+      funext; ring
+    rw [integral_congr_ae (ae_of_all _ h_expand)]
+    rw [integral_add hP2_int (hPC_int.const_mul β_env)]
+    have hPC0 : ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0 :=
+      integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+    rw [hP2, integral_const_mul, mul_comm pc.1, hPC0]
+    ring
+
+  exact ⟨ha.trans h_E_Y, hb.trans h_E_YP⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
-  admit
+  intro h_zero
+  let p : Polynomial ℝ := ∑ i, Polynomial.C (coeffs i) * Polynomial.X ^ (i.val + 1)
+  have h_eval : ∀ x, p.eval x = 0 := by
+    intro x
+    simp [p, Polynomial.eval_finset_sum]
+    convert h_zero x using 2
+    simp
+  have h_p_zero : p = 0 := Polynomial.funext h_eval
+  intro i
+  have h_coeff := Polynomial.coeff_eq_zero_of_eq_zero h_p_zero (i.val + 1)
+  simp [p, Polynomial.coeff_sum] at h_coeff
+  rw [Finset.sum_eq_single i] at h_coeff
+  · simp at h_coeff; exact h_coeff
+  · intro j _ h_ne
+    simp
+    apply Polynomial.coeff_X_pow_mul_c_ne_zero
+    intro h_eq
+    apply h_ne
+    apply Fin.eq_of_val_eq
+    linarith
+  · intro h_not
+    exfalso; apply h_not; exact Finset.mem_univ i
 
 
 theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
@@ -1428,7 +1479,56 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
-  admit
+  unfold IsNormalizedScoreModel
+  intro i l s
+  have h_eq_slopes : ∀ c, predictorSlope proj c = (f 1 - f 0) := by
+    intro c
+    have h1 := h_fit 1 c
+    have h0 := h_fit 0 c
+    rw [h_true_fn] at h1 h0
+    rw [linearPredictor_decomp proj (by rw [h_pgs]; simp [linearPGSBasis]) 1 c] at h1
+    rw [linearPredictor_decomp proj (by rw [h_pgs]; simp [linearPGSBasis]) 0 c] at h0
+    simp at h1 h0
+    rw [h0] at h1
+    linarith
+  have h_slope_const : ∀ c, predictorSlope proj c = predictorSlope proj 0 := by
+    intro c
+    rw [h_eq_slopes c, h_eq_slopes 0]
+  unfold predictorSlope at h_slope_const
+  have h_poly_zero : ∀ c, ∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (c l) -
+                          ∑ l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) (0) = 0 := by
+    intro c
+    have h := h_slope_const c
+    simp at h
+    exact sub_eq_zero.mpr h
+  -- Specialize to varying c_l only
+  let c_varying (x : ℝ) : Fin k → ℝ := Function.update 0 l x
+  have h_poly_l : ∀ x, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
+    intro x
+    have h := h_poly_zero (c_varying x)
+    simp only [c_varying, Function.update] at h
+    rw [Finset.sum_eq_add_sum_diff_singleton (Finset.mem_univ l)] at h
+    have h_other : ∑ x_1 ∈ Finset.univ \ {l}, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 x_1) (if x_1 = l then x else 0) = 0 := by
+      apply Finset.sum_eq_zero
+      intro j hj
+      simp only [Finset.mem_sdiff, Finset.mem_singleton] at hj
+      have h_ne : j ≠ l := hj.2
+      rw [if_neg h_ne]
+      unfold evalSmooth polynomialSplineBasis
+      simp only [zero_pow, Nat.succ_ne_zero, mul_zero, Finset.sum_const_zero]
+    rw [if_pos rfl, h_other, add_zero] at h
+    have h_sub : ∑ l_1 ∈ Finset.univ, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l_1) 0 = 0 := by
+      apply Finset.sum_eq_zero
+      intro j _
+      unfold evalSmooth polynomialSplineBasis
+      simp only [zero_pow, Nat.succ_ne_zero, mul_zero, Finset.sum_const_zero]
+    rw [h_sub, sub_zero] at h
+    exact h
+  apply polynomial_spline_coeffs_unique (proj.fₘₗ 0 l)
+  rw [h_spline] at h_poly_l
+  unfold evalSmooth polynomialSplineBasis at h_poly_l
+  simp at h_poly_l
+  exact h_poly_l
 
 
 theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
@@ -3960,23 +4060,21 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
-  -- 1. Optimality implies risk is 0
   have h_risk_zero : ∫ pc, ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂stdNormalProdMeasure k = 0 := by
     apply optimal_recovers_truth_of_capable _ model h_opt
     rcases h_capable with ⟨m, hm⟩
     use m
     exact hm.1
 
-  -- 2. Risk 0 implies almost everywhere equality
   have h_ae_eq : ∀ᵐ pc ∂stdNormalProdMeasure k, linearPredictor model pc.1 pc.2 = (dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 := by
     rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero
     · filter_upwards [h_risk_zero] with pc h
+      simp only [Pi.zero_apply] at h
       rw [sq_eq_zero_iff, sub_eq_zero] at h
       exact h.symm
-    · exact ae_of_all _ (fun _ => sq_nonneg _)
+    · filter_upwards with pc; exact sq_nonneg _
     · exact h_integrable_sq
 
-  -- 3. Continuity
   have h_pred_cont_aux : ∀ (m : PhenotypeInformedGAM 1 k 1),
       m.pgsBasis = model.pgsBasis → m.pcSplineBasis = model.pcSplineBasis →
       Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) := by
@@ -4011,7 +4109,6 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     simp_rw [h_true_eq_m]
     exact h_pred_cont_aux m hm.2.1 hm.2.2
 
-  -- 4. Equality everywhere
   have h_eq_everywhere : ∀ p c, linearPredictor model p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c := by
     haveI := h_measure_pos
     have h_eq_fun := (Continuous.ae_eq_iff_eq (stdNormalProdMeasure k) h_pred_cont h_true_cont).mp h_ae_eq
@@ -4020,29 +4117,24 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     exact h
 
   intro c
-  -- 5. Set p = 1
   have h_p1 := h_eq_everywhere 1 c
   unfold dgpMultiplicativeBias at h_p1
   dsimp at h_p1
   rw [mul_one] at h_p1
 
-  -- 6. Decompose linearPredictor
   have h_decomp := linearPredictor_decomp model h_linear_basis 1 c
   rw [h_decomp] at h_p1
 
-  -- 7. Set p = 0
   have h_p0 := h_eq_everywhere 0 c
-  dsimp at h_p0
-  rw [mul_zero] at h_p0
+  simp only [mul_zero] at h_p0
   have h_decomp0 := linearPredictor_decomp model h_linear_basis 0 c
   rw [h_decomp0] at h_p0
   simp at h_p0
 
   rw [h_p0, zero_add] at h_p1
   unfold predictorSlope at h_p1
-  dsimp at h_p1
   simp
-  exact h_p1
+  simpa using h_p1
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
@@ -4080,9 +4172,10 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure, linearPredictor model pc.1 pc.2 = dgp_latent.to_dgp.trueExpectation pc.1 pc.2 := by
     rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero
     · filter_upwards [h_risk_zero] with pc h
+      simp only [Pi.zero_apply] at h
       rw [sq_eq_zero_iff, sub_eq_zero] at h
       exact h.symm
-    · exact ae_of_all _ (fun _ => sq_nonneg _)
+    · exact ae_of_all dgp_latent.to_dgp.jointMeasure (fun _ => sq_nonneg _)
     · exact h_integrable_sq
 
   have h_pred_cont_aux : ∀ (m : PhenotypeInformedGAM 1 k sp),
@@ -4130,25 +4223,22 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   have h_p1 := h_eq_everywhere 1 c
   have h_latent := dgp_latent.is_latent
   rw [h_latent] at h_p1
-  dsimp at h_p1
-  rw [mul_one] at h_p1
+  simp at h_p1
 
   have h_decomp := linearPredictor_decomp model h_linear_basis 1 c
   rw [h_decomp] at h_p1
 
   have h_p0 := h_eq_everywhere 0 c
   rw [h_latent] at h_p0
-  dsimp at h_p0
-  rw [mul_zero] at h_p0
+  simp at h_p0
   have h_decomp0 := linearPredictor_decomp model h_linear_basis 0 c
   rw [h_decomp0] at h_p0
   simp at h_p0
 
   rw [h_p0, zero_add] at h_p1
   unfold predictorSlope at h_p1
-  dsimp at h_p1
   simp
-  exact h_p1
+  simpa using h_p1
 
 
 lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
@@ -5830,8 +5920,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
             refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
             intro j hj; simp +decide [ Pi.single_apply, hj ]
             rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
