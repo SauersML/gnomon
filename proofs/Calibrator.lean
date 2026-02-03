@@ -4444,7 +4444,10 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+      have h_rng : LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis)) =
+                   LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) := by
+        convert h_range_eq.symm
+      rw [Matrix.rank_eq_finrank_range_toLin, h_rng, ← Matrix.rank_eq_finrank_range_toLin]
       exact h_rank
   )
   ∀ (i : Fin n),
@@ -4560,7 +4563,10 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       obtain ⟨beta, hbeta⟩ := hv
       rw [← hbeta]
       have h_loss := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-         rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+         have h_rng : LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis)) =
+                      LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) := by
+           convert h_range_eq.symm
+         rw [Matrix.rank_eq_finrank_range_toLin, h_rng, ← Matrix.rank_eq_finrank_range_toLin]
          exact h_rank
       )
       let m_beta := unpackParams pgsBasis splineBasis beta
