@@ -3,8 +3,6 @@
 Evaluate PRS models: Calibration, AUC, and Plots.
 Usage: python evaluate.py <sim_name>
 """
-import sys
-import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -99,6 +97,24 @@ def plot_calibration_curves(methods_results, sim_label):
     plt.savefig(f'{sim_label}_comparison_calibration.png', dpi=150, bbox_inches='tight')
     plt.close()
 
+def plot_pcs(pc1, pc2, pop_labels, sim_label):
+    """Plot PC1 vs PC2 colored by population."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    unique_pops = sorted(set(pop_labels))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_pops)))
+
+    for pop, color in zip(unique_pops, colors):
+        mask = pop_labels == pop
+        ax.scatter(pc1[mask], pc2[mask], s=12, alpha=0.7, label=str(pop), color=color)
+
+    ax.set_xlabel("PC1", fontsize=12, fontweight='bold')
+    ax.set_ylabel("PC2", fontsize=12, fontweight='bold')
+    ax.set_title("Population Structure (PC1 vs PC2)", fontsize=14, fontweight='bold')
+    ax.legend(loc="best", fontsize=9, frameon=False)
+    ax.grid(True, alpha=0.2)
+    plt.savefig(f"{sim_label}_pcs.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 def create_metrics_table(methods_results, sim_label):
     """Create metrics table."""
     rows = []
@@ -172,6 +188,58 @@ def plot_auc_summary(methods_results, pvals_df, sim_label):
     plt.savefig(f"{sim_label}_comparison_auc.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+def plot_brier_summary(methods_results, pvals_df, sim_label):
+    """Plot Brier summary with p-values vs best (lowest) method."""
+    if not methods_results:
+        return
+
+    brier_rows = []
+    for method_name, result in methods_results.items():
+        brier_rows.append((method_name, result["metrics"]["brier"]["overall"]))
+
+    brier_df = pd.DataFrame(brier_rows, columns=["Method", "Brier"]).sort_values("Brier", ascending=True)
+    best_method = brier_df.iloc[0]["Method"]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(brier_df) * 0.6)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(brier_df)))
+    ax.bar(brier_df["Method"], brier_df["Brier"], color=colors, edgecolor="black", linewidth=0.5)
+
+    min_brier = brier_df["Brier"].min() if not brier_df.empty else 0.0
+    y_offset = max(0.001, min_brier * 0.02)
+
+    for i, (method, brier) in enumerate(brier_df.values):
+        ax.text(i, brier + y_offset, f"{brier:.3f}", ha="center", va="bottom", fontsize=9)
+
+        if pvals_df is not None and method != best_method:
+            p_row = pvals_df[
+                ((pvals_df["Method_1"] == best_method) & (pvals_df["Method_2"] == method)) |
+                ((pvals_df["Method_2"] == best_method) & (pvals_df["Method_1"] == method))
+            ]
+            if not p_row.empty:
+                pval = p_row.iloc[0]["Brier_p_value"]
+                if pd.notna(pval):
+                    ax.text(
+                        i,
+                        brier + y_offset * 2.5,
+                        f"p={pval:.3g}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                        fontweight="bold" if pval < 0.05 else "normal",
+                    )
+
+    ax.set_ylabel("Brier (overall)")
+    ax.set_title(
+        f"Brier Summary - Simulation {sim_label} (p-values vs {best_method})",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(f"{sim_label}_comparison_brier.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 def delong_test(y_true, y_pred1, y_pred2):
     """
     DeLong's test for comparing two correlated ROC curves.
@@ -225,7 +293,7 @@ def delong_test(y_true, y_pred1, y_pred2):
     # Using permutation test as fallback for robustness
     return permutation_test_auc(y_true, y_pred1, y_pred2)
 
-def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000):
+def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=1000):
     """
     Permutation test for comparing AUCs.
 
@@ -264,7 +332,7 @@ def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000):
+def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=1000):
     """
     Permutation test for comparing Brier scores.
 
@@ -293,7 +361,7 @@ def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def compute_significance_tests(methods_results, sim_label):
+def compute_significance_tests(methods_results, sim_label, n_permutations=1000):
     """
     Compute pairwise significance tests for all method comparisons.
 
@@ -321,8 +389,8 @@ def compute_significance_tests(methods_results, sim_label):
 
         # Compute p-values
         print(f"  Testing {method1} vs {method2}...")
-        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=2000)
-        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=2000)
+        p_auc = permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
+        p_brier = permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=n_permutations)
 
         # Get observed metrics
         auc1 = methods_results[method1]['metrics']['auc']['overall']
@@ -348,11 +416,24 @@ def compute_significance_tests(methods_results, sim_label):
     return df
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python evaluate.py <sim_name>")
-        sys.exit(1)
-        
-    sim_prefix = sys.argv[1].strip()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Evaluate PRS calibration and metrics.")
+    parser.add_argument("sim_name", help="Simulation name/prefix (e.g., confounding, portability)")
+    parser.add_argument(
+        "--enable-gnomon",
+        action="store_true",
+        help="Include GAM-gnomon in calibration methods",
+    )
+    parser.add_argument(
+        "--permutations",
+        type=int,
+        default=1000,
+        help="Number of permutations for significance tests",
+    )
+    args = parser.parse_args()
+
+    sim_prefix = args.sim_name.strip()
     work_dir = Path(f"{sim_prefix}_work")
     
     # 1. Load Data
@@ -373,6 +454,14 @@ def main():
     tsv_path = f"{sim_prefix}.tsv"
     full_df = pd.read_csv(tsv_path, sep='\t')
     full_df['individual_id'] = full_df['individual_id'].astype(str)
+
+    if {"pc1", "pc2", "pop_label"}.issubset(full_df.columns):
+        plot_pcs(
+            full_df["pc1"].to_numpy(),
+            full_df["pc2"].to_numpy(),
+            full_df["pop_label"].to_numpy(),
+            sim_prefix,
+        )
     
     # Filter to test set
     test_metadata = full_df[full_df['individual_id'].isin(test_iids)].copy()
@@ -410,13 +499,27 @@ def main():
         NormalizationMethod(n_pcs=5),
         GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True),
     ]
-    try:
-        calibration_methods.append(
-            GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
-        )
-    except FileNotFoundError as e:
-        print(f"Skipping Gnomon GAM: {e}")
-    
+    if args.enable_gnomon:
+        try:
+            calibration_methods.append(
+                GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
+            )
+        except FileNotFoundError as e:
+            print(f"Skipping Gnomon GAM: {e}")
+
+    def _method_label(method) -> str:
+        if isinstance(method, GAMMethod):
+            return "GAM-mgcv"
+        if isinstance(method, GnomonGAMMethod):
+            return "GAM-gnomon"
+        if isinstance(method, RawPGSMethod):
+            return "Raw"
+        if isinstance(method, LinearInteractionMethod):
+            return "Linear"
+        if isinstance(method, NormalizationMethod):
+            return "Normalization"
+        return method.name
+
     for prs_name in prs_scores_df.columns:
         P_raw = analysis_df[prs_name].values
         # Standardize
@@ -428,7 +531,7 @@ def main():
         P_raw = (P_raw - np.mean(P_raw)) / np.std(P_raw)
         
         for cal_method in calibration_methods:
-            name = f"{prs_name} + {cal_method.name.split(' ')[0]}"
+            name = f"{prs_name} + {_method_label(cal_method)}"
             print(f"Evaluating: {name}...")
             
             try:
@@ -459,8 +562,8 @@ def main():
         raise RuntimeError("No results generated!")
         
     # 4. Significance Testing
-    print("\nComputing significance tests (permutation tests, 2000 iterations)...")
-    df_significance = compute_significance_tests(results, sim_prefix)
+    print(f"\nComputing significance tests (permutation tests, {args.permutations} iterations)...")
+    df_significance = compute_significance_tests(results, sim_prefix, n_permutations=args.permutations)
     print("\nPairwise Significance Tests:")
     print(df_significance.to_string(index=False))
 
@@ -469,6 +572,7 @@ def main():
     plot_roc_curves(results, sim_prefix)
     plot_calibration_curves(results, sim_prefix)
     plot_auc_summary(results, df_significance, sim_prefix)
+    plot_brier_summary(results, df_significance, sim_prefix)
     df_metrics = create_metrics_table(results, sim_prefix)
     print(df_metrics.to_string(index=False))
 

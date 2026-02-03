@@ -56,7 +56,7 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
         .tolist()
     )
     sims = SIM_NAMES
-    app_preferred = ["Raw", "Linear", "Normalization", "GAM"]
+    app_preferred = ["Raw", "Linear", "Normalization", "GAM-mgcv", "GAM-gnomon"]
     app_methods = [m for m in app_preferred if m in df["ApplicationMethod"].unique()]
     app_methods += [m for m in df["ApplicationMethod"].unique() if m not in app_methods]
 

@@ -127,7 +127,7 @@ class GAMMethod(PGSMethod):
         # Prepare data frame for R
         data_dict = {'y': y.astype(float), 'P': P.astype(float)}
         
-        n_pcs_actual = min(self.n_pcs, PC.shape[1])
+        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
         for i in range(n_pcs_actual):
             data_dict[f'PC{i+1}'] = PC[:, i].astype(float)
         
@@ -158,7 +158,7 @@ class GAMMethod(PGSMethod):
         
         # Prepare new data
         data_dict = {'P': P.astype(float)}
-        n_pcs_actual = min(self.n_pcs, PC.shape[1])
+        n_pcs_actual = min(self.n_pcs, 5, PC.shape[1])
         for i in range(n_pcs_actual):
             data_dict[f'PC{i+1}'] = PC[:, i].astype(float)
         
