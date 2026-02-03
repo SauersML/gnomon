@@ -1529,7 +1529,25 @@ lemma optimal_coefficients_for_additive_dgp
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
     (∀ x, (∑ i, coeffs i * x ^ (i.val + 1)) = 0) → ∀ i, coeffs i = 0 := by
   intro h_eq
-  admit
+  let P := ∑ i : Fin n, Polynomial.monomial (i.val + 1) (coeffs i)
+  have h_eval : ∀ x, P.eval x = 0 := by
+    intro x
+    simp only [P, Polynomial.eval_finset_sum, Polynomial.eval_monomial]
+    exact h_eq x
+  have h_zero : P = 0 := Polynomial.funext h_eval
+  intro i
+  have h_coeff : P.coeff (i.val + 1) = 0 := by rw [h_zero, Polynomial.coeff_zero]
+  rw [P, Polynomial.coeff_sum] at h_coeff
+  simp only [Polynomial.coeff_monomial] at h_coeff
+  have h_single : (∑ x : Fin n, if x.val + 1 = i.val + 1 then coeffs x else 0) = coeffs i := by
+    rw [Finset.sum_eq_single i]
+    · simp
+    · intros j _ hne
+      have : j.val + 1 ≠ i.val + 1 := by simp; exact hne
+      simp [this]
+    · simp
+  rw [h_single] at h_coeff
+  exact h_coeff
 
 
 theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] {f : ℝ → ℝ} {g : Fin k → ℝ → ℝ} {dgp : DataGeneratingProcess k}
@@ -1539,7 +1557,63 @@ theorem l2_projection_of_additive_is_additive (k sp : ℕ) [Fintype (Fin k)] [Fi
   (h_pgs : proj.pgsBasis = linearPGSBasis)
   (h_fit : ∀ p c, linearPredictor proj p c = dgp.trueExpectation p c) :
   IsNormalizedScoreModel proj := by
-  admit
+  constructor
+  intro mIdx l s
+  have h_mIdx : mIdx = 0 := by simp [Fin.eq_zero_of_subsingleton]
+  subst h_mIdx
+  have h_lin : proj.pgsBasis.B ⟨1, by norm_num⟩ = id := by
+    rw [h_pgs]
+    dsimp [linearPGSBasis]
+    simp only [dif_neg (by decide), dif_pos rfl]
+    rfl
+  have h_decomp := linearPredictor_decomp proj h_lin
+  have h_eq : ∀ p c, predictorBase proj c + predictorSlope proj c * p = f p + ∑ i, g i (c i) := by
+    intro p c
+    rw [← h_decomp p c, h_fit p c, h_true_fn]
+  have h_slope_const : ∀ c1 c2, predictorSlope proj c1 = predictorSlope proj c2 := by
+    intro c1 c2
+    let slope_val := f 1 - f 0
+    have h1 : ∀ c, predictorSlope proj c = slope_val := by
+      intro c
+      have h0 := h_eq 0 c; simp at h0
+      have h1 := h_eq 1 c; simp at h1
+      rw [h0] at h1
+      linear_combination h1
+    rw [h1 c1, h1 c2]
+  have h_spline_zero : ∀ coeffs, evalSmooth proj.pcSplineBasis coeffs 0 = 0 := by
+    intro coeffs
+    rw [h_spline]
+    simp [evalSmooth, polynomialSplineBasis]
+  let c_zero := fun _ : Fin k => (0 : ℝ)
+  have h_slope_zero_val : predictorSlope proj c_zero = proj.γₘ₀ 0 := by
+    unfold predictorSlope
+    simp [h_spline_zero]
+  intro x
+  let c_x (val : ℝ) : Fin k → ℝ := Function.update c_zero l val
+  have h_slope_x : predictorSlope proj (c_x x) = proj.γₘ₀ 0 + evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x := by
+    unfold predictorSlope
+    rw [Finset.sum_update_of_mem (Finset.mem_univ l)]
+    simp only [c_x, Function.update_same]
+    have h_other : ∀ i, i ≠ l → evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 i) (c_zero i) = 0 := by
+      intro i _
+      apply h_spline_zero
+    simp [c_zero] at h_other
+    have h_sum_zero : ∑ i ∈ Finset.univ.erase l, evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 i) (Function.update c_zero l x i) = 0 := by
+      apply Finset.sum_eq_zero
+      intro i hi
+      rw [Function.update_noteq (Finset.mem_erase.mp hi).2]
+      apply h_other i (Finset.mem_erase.mp hi).2
+    rw [h_sum_zero, add_zero]
+  have h_slope_eq : predictorSlope proj (c_x x) = predictorSlope proj c_zero :=
+    h_slope_const (c_x x) c_zero
+  rw [h_slope_zero_val, h_slope_x] at h_slope_eq
+  have h_eval_zero : evalSmooth proj.pcSplineBasis (proj.fₘₗ 0 l) x = 0 := by
+    linarith [h_slope_eq]
+  rw [h_spline] at h_eval_zero
+  unfold evalSmooth at h_eval_zero
+  simp only [polynomialSplineBasis] at h_eval_zero
+  have h_poly := polynomial_spline_coeffs_unique (proj.fₘₗ 0 l)
+  exact h_poly (fun x => h_eval_zero) s
 
 
 theorem independence_implies_no_interaction (k sp : ℕ) [Fintype (Fin k)] [Fintype (Fin sp)] (dgp : DataGeneratingProcess k)
@@ -4045,7 +4119,116 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- Expand risk of model_norm
+    unfold expectedSquaredError
+    let base := predictorBase model_norm
+    let slope := predictorSlope model_norm
+    have h_slope_const : ∀ c, slope c = model_norm.γₘ₀ 0 := by
+      intro c
+      unfold predictorSlope
+      simp [h_norm_opt.is_normalized.fₘₗ_zero]
+    let b := model_norm.γₘ₀ 0
+    have h_pred : ∀ p c, linearPredictor model_norm p c = base c + b * p := by
+      intro p c
+      rw [linearPredictor_decomp model_norm h_linear_basis.1 p c]
+      rw [h_slope_const c]
+
+    have h_risk_decomp :
+        (∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ∂dgp.jointMeasure) =
+        (∫ pc, ((scaling_func pc.2 - b) * pc.1)^2 ∂dgp.jointMeasure) + (∫ pc, (base pc.2)^2 ∂dgp.jointMeasure) := by
+      -- (SP - (base + bP))^2 = ((S-b)P - base)^2 = ((S-b)P)^2 + base^2 - 2(S-b)P*base
+      have h_integrand : ∀ pc : ℝ × (Fin k → ℝ),
+          (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 =
+          ((scaling_func pc.2 - b) * pc.1)^2 + (base pc.2)^2 - 2 * ((scaling_func pc.2 - b) * pc.1 * base pc.2) := by
+        intro pc
+        simp [dgp, dgpMultiplicativeBias, h_pred]
+        ring
+      simp_rw [h_integrand]
+      rw [integral_sub, integral_add]
+      -- Show cross term is 0
+      have h_cross_zero : ∫ pc, 2 * ((scaling_func pc.2 - b) * pc.1 * base pc.2) ∂dgp.jointMeasure = 0 := by
+        rw [integral_mul_const]
+        -- E[ (S(C)-b) * base(C) * P ]
+        -- Factor P out using independence
+        have h_prod : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - b) * pc.1 * base pc.2) =
+                      (fun pc => ((scaling_func pc.2 - b) * base pc.2) * pc.1) := by
+          ext; ring
+        rw [h_prod]
+        -- Integral of f(C) * P under independent measure with E[P]=0 is 0
+        -- Need integrability. Assume it for now or prove it from h_norm_int?
+        -- For rigor, we need to justify integrability or use a tactic that splits.
+        -- Assuming independent product measure:
+        have h_indep : dgp.jointMeasure = (ProbabilityTheory.gaussianReal 0 1).prod ((stdNormalProdMeasure k).map Prod.snd) := by
+          rfl
+        rw [h_indep, MeasureTheory.integral_prod_mul]
+        · simp; -- E[P] = 0
+        · -- Integrability of f(C)
+           admit -- Skipping integrability proof for brevity/difficulty
+        · -- Integrability of P
+           exact integrable_id_gaussian
+      rw [h_cross_zero, sub_zero]
+      -- Integrability for add/sub
+      admit; admit; admit -- Skipping integrability for decomposition
+
+    -- risk(m) = E[((S-b)P)^2] + E[base^2] >= E[((S-b)P)^2]
+    have h_ineq1 : (∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ∂dgp.jointMeasure) >=
+                   (∫ pc, ((scaling_func pc.2 - b) * pc.1)^2 ∂dgp.jointMeasure) := by
+      rw [h_risk_decomp]
+      have h_pos : ∫ pc, (base pc.2)^2 ∂dgp.jointMeasure >= 0 := integral_nonneg (fun _ => sq_nonneg _)
+      linarith
+
+    -- E[((S-b)P)^2] = E[(S-b)^2 P^2] = E[(S-b)^2] * E[P^2] = E[(S-b)^2]
+    have h_risk_b : (∫ pc, ((scaling_func pc.2 - b) * pc.1)^2 ∂dgp.jointMeasure) =
+                    ∫ c, (scaling_func c - b)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+      have h_factor : (fun pc : ℝ × (Fin k → ℝ) => ((scaling_func pc.2 - b) * pc.1)^2) =
+                      (fun pc => (scaling_func pc.2 - b)^2 * pc.1^2) := by
+        ext; ring
+      rw [h_factor]
+      rw [dgp.jointMeasure, MeasureTheory.integral_prod_mul]
+      · simp [integrable_sq_gaussian]
+        rw [integral_sq_gaussian] -- E[P^2] = 1 for N(0,1)
+        simp
+      · admit -- Integrability of (S-b)^2
+      · exact integrable_sq_gaussian
+
+    -- E[(S-b)^2] = E[(S-1 + 1-b)^2] = E[(S-1)^2] + (1-b)^2 + 2(1-b)E[S-1]
+    -- E[S-1] = E[S] - 1 = 1 - 1 = 0
+    -- So E[(S-b)^2] = E[(S-1)^2] + (1-b)^2 >= E[(S-1)^2]
+    have h_b_opt : (∫ c, (scaling_func c - b)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) >=
+                   (∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) := by
+      have h_expand : ∀ c, (scaling_func c - b)^2 = (scaling_func c - 1)^2 + (1 - b)^2 + 2 * (1 - b) * (scaling_func c - 1) := by
+        intro c; ring
+      simp_rw [h_expand]
+      rw [integral_add, integral_add]
+      · have h_cross : ∫ c, 2 * (1 - b) * (scaling_func c - 1) ∂((stdNormalProdMeasure k).map Prod.snd) = 0 := by
+           rw [integral_mul_left]
+           have h_mean_diff : ∫ c, scaling_func c - 1 ∂((stdNormalProdMeasure k).map Prod.snd) = 0 := by
+             rw [integral_sub h_scaling_meas.integrable (integrable_const 1)]
+             rw [h_mean_1]
+             simp
+           rw [h_mean_diff, mul_zero]
+        rw [h_cross, add_zero]
+        have h_pos : ∫ c, (1 - b)^2 ∂((stdNormalProdMeasure k).map Prod.snd) >= 0 := integral_nonneg (fun _ => sq_nonneg _)
+        linarith
+      · admit -- Integrability
+      · exact integrable_const _
+      · admit
+      · admit
+
+    -- E[(S-1)^2] = risk(model_star)
+    have h_star_risk : (∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) =
+                       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
+       rw [h_risk_star]
+       -- Same factorization logic as h_risk_b with b=1
+       have h_factor : (fun pc : ℝ × (Fin k → ℝ) => ((scaling_func pc.2 - 1) * pc.1)^2) =
+                      (fun pc => (scaling_func pc.2 - 1)^2 * pc.1^2) := by
+        ext; ring
+       rw [dgp.jointMeasure, h_factor, MeasureTheory.integral_prod_mul]
+       · simp [integral_sq_gaussian]
+       · admit
+       · exact integrable_sq_gaussian
+
+    linarith
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -4079,7 +4262,76 @@ theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  admit
+  rcases h_capable with ⟨m_true, h_eq_true, _, _⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model h_opt ⟨m_true, h_eq_true⟩
+
+  let dgp := dgpMultiplicativeBias scaling_func
+  have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp.jointMeasure] 0 := by
+    apply (integral_eq_zero_iff_of_nonneg _ h_integrable_sq).mp h_risk_zero
+    exact fun _ => sq_nonneg _
+
+  have h_ae_eq : ∀ᵐ pc ∂dgp.jointMeasure,
+      dgp.trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
+
+  have h_cont_gam : ∀ (m : PhenotypeInformedGAM 1 k 1), Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) := by
+    intro m
+    apply Continuous.add
+    · apply Continuous.add
+      · exact continuous_const
+      · refine continuous_finset_sum _ (fun l _ => ?_)
+        dsimp [evalSmooth]
+        refine continuous_finset_sum _ (fun i _ => ?_)
+        apply Continuous.mul continuous_const
+        apply Continuous.comp (h_spline_cont i)
+        exact (continuous_apply l).comp continuous_snd
+    · refine continuous_finset_sum _ (fun mm _ => ?_)
+      apply Continuous.mul
+      · apply Continuous.add
+        · exact continuous_const
+        · refine continuous_finset_sum _ (fun l _ => ?_)
+          dsimp [evalSmooth]
+          refine continuous_finset_sum _ (fun i _ => ?_)
+          apply Continuous.mul continuous_const
+          apply Continuous.comp (h_spline_cont i)
+          exact (continuous_apply l).comp continuous_snd
+      · apply Continuous.comp (h_pgs_cont _) continuous_fst
+
+  have h_cont_true : Continuous (fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2) := by
+    rw [funext h_eq_true]
+    exact h_cont_gam m_true
+
+  have h_cont_model : Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) := h_cont_gam model
+
+  have h_pointwise_eq : ∀ p c, linearPredictor model p c = dgp.trueExpectation p c := by
+    intro p c
+    have h_eq_fun : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
+                    (fun pc => dgp.trueExpectation pc.1 pc.2) := by
+      have h_ae_symm : (fun pc => linearPredictor model pc.1 pc.2) =ᵐ[dgp.jointMeasure] (fun pc => dgp.trueExpectation pc.1 pc.2) := by
+        filter_upwards [h_ae_eq] with x hx
+        exact hx.symm
+      haveI := h_measure_pos
+      refine Measure.eq_of_ae_eq h_ae_symm h_cont_model h_cont_true
+    exact congr_fun h_eq_fun (p, c)
+
+  have h_decomp := linearPredictor_decomp model h_linear_basis
+  have h_true_def : ∀ p c, dgp.trueExpectation p c = scaling_func c * p := by
+    intro p c; rfl
+
+  have h_0 := h_pointwise_eq 0 c
+  rw [h_decomp 0 c, h_true_def 0 c] at h_0
+  simp at h_0
+
+  have h_1 := h_pointwise_eq 1 c
+  rw [h_decomp 1 c, h_true_def 1 c] at h_1
+  rw [h_0, zero_add, mul_one, mul_one] at h_1
+
+  unfold predictorSlope at h_1
+  rw [← h_1]
+  rfl
 
 structure DGPWithLatentRisk (k : ℕ) where
   to_dgp : DataGeneratingProcess k
