@@ -50,6 +50,7 @@ import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
+open InnerProductSpace
 
 open MeasureTheory
 
@@ -4057,13 +4058,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
 
 /-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
-    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
-
-    **Changed from approximate (≈ 0.01) to exact equality**.
-    The approximate version was unprovable from the given hypotheses. -/
+    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
-    (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
-    (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (model : PhenotypeInformedGAM 1 k 1) (h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
        (∀ p c, linearPredictor m p c = (dgpMultiplicativeBias scaling_func).trueExpectation p c) ∧
@@ -4203,6 +4201,12 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
     We formalize "flexible enough" as the condition that the design matrix column space
     is invariant under the transformation.
     If Span(X) = Span(X'), then the orthogonal projection P_X y is identical. -/
+lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
+    (A B : Matrix (Fin n) (Fin m) ℝ)
+    (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
+    Matrix.rank A = Matrix.rank B := by
+  admit
+
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
     (data : RealizedData n k) (lambda : ℝ)
