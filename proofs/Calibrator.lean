@@ -4433,6 +4433,14 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
+  have h_eq_A : Matrix.toLin' A = Matrix.mulVecLin A := by
+    ext
+    simp [Matrix.toLin'_apply]
+  rw [h_eq_A] at h
+  have h_eq_B : Matrix.toLin' B = Matrix.mulVecLin B := by
+    ext
+    simp [Matrix.toLin'_apply]
+  rw [h_eq_B] at h
   dsimp [Matrix.rank, LinearMap.rank]
   rw [h]
 
