@@ -4120,7 +4120,81 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = dgp_latent.sigma_G_sq / (dgp_latent.sigma_G_sq + dgp_latent.noise_variance_given_pc c) := by
-  admit
+  have h_risk_zero : ∫ pc, (dgp_latent.to_dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2 ∂dgp_latent.to_dgp.jointMeasure = 0 := by
+    apply optimal_recovers_truth_of_capable _ model h_opt
+    rcases h_capable with ⟨m, hm⟩
+    use m
+    exact hm.1
+
+  have h_ae_eq : ∀ᵐ pc ∂dgp_latent.to_dgp.jointMeasure, linearPredictor model pc.1 pc.2 = dgp_latent.to_dgp.trueExpectation pc.1 pc.2 := by
+    rw [integral_eq_zero_iff_of_nonneg] at h_risk_zero
+    · filter_upwards [h_risk_zero] with pc h
+      rw [sq_eq_zero_iff, sub_eq_zero] at h
+      exact h.symm
+    · exact ae_of_all _ (fun _ => sq_nonneg _)
+    · exact h_integrable_sq
+
+  have h_pred_cont_aux : ∀ (m : PhenotypeInformedGAM 1 k sp),
+      m.pgsBasis = model.pgsBasis → m.pcSplineBasis = model.pcSplineBasis →
+      Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor m pc.1 pc.2) := by
+    intro m h_pgs h_spline
+    unfold linearPredictor evalSmooth
+    apply Continuous.add
+    · apply Continuous.add
+      · exact continuous_const
+      · apply continuous_finset_sum; intro l _; apply Continuous.mul
+        · exact continuous_const
+        · rw [h_spline]; exact Continuous.comp (h_spline_cont (m.f₀ₗ l)) (continuous_apply l).snd
+    · apply continuous_finset_sum; intro idx _; apply Continuous.mul
+      · apply Continuous.add
+        · exact continuous_const
+        · apply continuous_finset_sum; intro l _; apply Continuous.mul
+          · exact continuous_const
+          · rw [h_spline]; exact Continuous.comp (h_spline_cont (m.fₘₗ idx l)) (continuous_apply l).snd
+      · rw [h_pgs]; exact Continuous.comp (h_pgs_cont _) continuous_fst
+
+  have h_pred_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) :=
+    h_pred_cont_aux model rfl rfl
+
+  rcases h_capable with ⟨m, hm⟩
+  have h_true_eq_m : ∀ pc : ℝ × (Fin k → ℝ), dgp_latent.to_dgp.trueExpectation pc.fst pc.snd = linearPredictor m pc.fst pc.snd := by
+    intro pc
+    exact (hm.1 pc.fst pc.snd).symm
+
+  have h_true_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => dgp_latent.to_dgp.trueExpectation pc.fst pc.snd) := by
+    simp_rw [h_true_eq_m]
+    exact h_pred_cont_aux m hm.2.1 hm.2.2
+
+  have h_eq_everywhere : ∀ p c, linearPredictor model p c = dgp_latent.to_dgp.trueExpectation p c := by
+    haveI := h_measure_pos
+    have h_eq_fun := (Continuous.ae_eq_iff_eq h_pred_cont h_true_cont).mp h_ae_eq
+    intro p c
+    have h := congr_fun h_eq_fun (p, c)
+    exact h
+
+  intro c
+  have h_p1 := h_eq_everywhere 1 c
+  have h_latent := dgp_latent.is_latent
+  rw [h_latent] at h_p1
+  dsimp at h_p1
+  rw [mul_one] at h_p1
+
+  have h_decomp := linearPredictor_decomp model h_linear_basis 1 c
+  rw [h_decomp] at h_p1
+
+  have h_p0 := h_eq_everywhere 0 c
+  rw [h_latent] at h_p0
+  dsimp at h_p0
+  rw [mul_zero] at h_p0
+  have h_decomp0 := linearPredictor_decomp model h_linear_basis 0 c
+  rw [h_decomp0] at h_p0
+  simp at h_p0
+
+  rw [h_p0, zero_add] at h_p1
+  unfold predictorSlope at h_p1
+  dsimp at h_p1
+  simp
+  exact h_p1
 
 
 lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
@@ -4130,9 +4204,8 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
   simp only [Matrix.rank]
   have h_eq : ∀ M : Matrix (Fin n) (Fin m) ℝ, Matrix.toLin' M = M.mulVecLin := by
     intro M
-    ext v
-    rw [Matrix.toLin'_apply]
-    rfl
+    apply LinearMap.ext; intro v
+    simp [Matrix.toLin', Matrix.mulVecLin, Matrix.toLin'_apply]
   rw [h_eq A, h_eq B] at h
   rw [h]
 
