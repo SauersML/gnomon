@@ -86,7 +86,7 @@ def _simulate_ts(cfg: TwoPopConfig) -> Tuple[msprime.TreeSequence, np.ndarray]:
 
     if cfg.divergence_gens == 0:
         ts = msprime.sim_ancestry(
-            samples=total,
+            samples=[msprime.SampleSet(total, ploidy=2)],
             sequence_length=cfg.sequence_length,
             recombination_rate=cfg.recomb_rate,
             ploidy=2,
