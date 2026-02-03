@@ -3,8 +3,6 @@
 Evaluate PRS models: Calibration, AUC, and Plots.
 Usage: python evaluate.py <sim_name>
 """
-import sys
-import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -295,7 +293,7 @@ def delong_test(y_true, y_pred1, y_pred2):
     # Using permutation test as fallback for robustness
     return permutation_test_auc(y_true, y_pred1, y_pred2)
 
-def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=500):
+def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=1000):
     """
     Permutation test for comparing AUCs.
 
@@ -334,7 +332,7 @@ def permutation_test_auc(y_true, y_pred1, y_pred2, n_permutations=500):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=500):
+def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=1000):
     """
     Permutation test for comparing Brier scores.
 
@@ -363,7 +361,7 @@ def permutation_test_brier(y_true, y_pred1, y_pred2, n_permutations=500):
     p_value = np.mean(np.array(null_diffs) >= obs_diff)
     return p_value
 
-def compute_significance_tests(methods_results, sim_label):
+def compute_significance_tests(methods_results, sim_label, n_permutations=1000):
     """
     Compute pairwise significance tests for all method comparisons.
 
@@ -373,17 +371,11 @@ def compute_significance_tests(methods_results, sim_label):
 
     Returns DataFrame with p-values for all pairwise comparisons.
     """
-    if os.environ.get("SKIP_SIGNIFICANCE", "").strip().lower() in {"1", "true", "yes"}:
-        df = pd.DataFrame()
-        df.to_csv(f"{sim_label}_significance_tests.csv", index=False)
-        return df
-
     method_names = list(methods_results.keys())
 
     # All pairwise combinations
     pairs = list(combinations(method_names, 2))
 
-    n_permutations = int(os.environ.get("SIGNIF_PERMUTATIONS", "500"))
     rows = []
     for method1, method2 in pairs:
         y_true1 = methods_results[method1]['y_true']
@@ -424,11 +416,24 @@ def compute_significance_tests(methods_results, sim_label):
     return df
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python evaluate.py <sim_name>")
-        sys.exit(1)
-        
-    sim_prefix = sys.argv[1].strip()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Evaluate PRS calibration and metrics.")
+    parser.add_argument("sim_name", help="Simulation name/prefix (e.g., confounding, portability)")
+    parser.add_argument(
+        "--enable-gnomon",
+        action="store_true",
+        help="Include GAM-gnomon in calibration methods",
+    )
+    parser.add_argument(
+        "--permutations",
+        type=int,
+        default=1000,
+        help="Number of permutations for significance tests",
+    )
+    args = parser.parse_args()
+
+    sim_prefix = args.sim_name.strip()
     work_dir = Path(f"{sim_prefix}_work")
     
     # 1. Load Data
@@ -494,12 +499,13 @@ def main():
         NormalizationMethod(n_pcs=5),
         GAMMethod(n_pcs=5, k_pgs=10, k_pc=10, use_ti=True),
     ]
-    try:
-        calibration_methods.append(
-            GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
-        )
-    except FileNotFoundError as e:
-        print(f"Skipping Gnomon GAM: {e}")
+    if args.enable_gnomon:
+        try:
+            calibration_methods.append(
+                GnomonGAMMethod(n_pcs=5, pgs_knots=10, pc_knots=10, no_calibration=True)
+            )
+        except FileNotFoundError as e:
+            print(f"Skipping Gnomon GAM: {e}")
 
     def _method_label(method) -> str:
         if isinstance(method, GAMMethod):
@@ -556,8 +562,8 @@ def main():
         raise RuntimeError("No results generated!")
         
     # 4. Significance Testing
-    print("\nComputing significance tests (permutation tests, 2000 iterations)...")
-    df_significance = compute_significance_tests(results, sim_prefix)
+    print(f"\nComputing significance tests (permutation tests, {args.permutations} iterations)...")
+    df_significance = compute_significance_tests(results, sim_prefix, n_permutations=args.permutations)
     print("\nPairwise Significance Tests:")
     print(df_significance.to_string(index=False))
 
