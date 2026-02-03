@@ -27,7 +27,7 @@ jobs:
   simulate:
     runs-on: ubuntu-22.04
     env:
-      SIM_CACHE_VERSION: v2
+      SIM_CACHE_VERSION: v3
     strategy:
       matrix:
         sim_name: [confounding, portability, sample_imbalance]
@@ -355,6 +355,11 @@ jobs:
           path: ${{ matrix.sim_name }}_work/
           merge-multiple: true
 
+      - name: Install gnomon (binary release)
+        run: |
+          bash install.sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Calibration Analysis
         run: |
           set -e
@@ -391,7 +396,12 @@ jobs:
           uv pip install --system -r sims/requirements.txt
           uv pip install --system pandas tabulate
           uv pip install --system pgscatalog-calc
-      
+
+      - name: Install gnomon (binary release)
+        run: |
+          bash install.sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Download all results
         continue-on-error: true
         uses: actions/download-artifact@v4
