@@ -4444,12 +4444,103 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  -- 1. Define loss function and prove strict convexity
+  let loss (u : Fin n → ℝ) := l2norm_sq (data.y - u)
+  have h_loss_strict : StrictConvexOn ℝ Set.univ loss := by
+    intro u v _ _ hne a b ha hb hab
+    unfold loss l2norm_sq
+    obtain ⟨i, hi⟩ : ∃ i, u i ≠ v i := Function.ne_iff.mp hne
+    have h_strict_i : ((data.y - (a • u + b • v)) i)^2 < a * ((data.y - u) i)^2 + b * ((data.y - v) i)^2 := by
+      simp only [Pi.sub_apply, Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+      have h_decomp : data.y i - (a * u i + b * v i) = a * (data.y i - u i) + b * (data.y i - v i) := by
+        rw [← hab, add_mul]; ring
+      rw [h_decomp]
+      apply strictConvexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) ?_ ha hb hab
+      simp [hi]
+    have h_convex_j : ∀ j, ((data.y - (a • u + b • v)) j)^2 ≤ a * ((data.y - u) j)^2 + b * ((data.y - v) j)^2 := by
+      intro j
+      simp only [Pi.sub_apply, Pi.add_apply, Pi.smul_apply, smul_eq_mul]
+      have h_decomp : data.y j - (a * u j + b * v j) = a * (data.y j - u j) + b * (data.y j - v j) := by
+        rw [← hab, add_mul]; ring
+      rw [h_decomp]
+      apply convexOn_sq.2 (Set.mem_univ _) (Set.mem_univ _) ha hb hab
+    let f := fun j => ((data.y - (a • u + b • v)) j)^2
+    let g := fun j => a * ((data.y - u) j)^2 + b * ((data.y - v) j)^2
+    calc
+      ∑ j, f j = f i + ∑ j ∈ Finset.univ.erase i, f j := Finset.add_sum_erase (Finset.mem_univ i) _
+      _ < g i + ∑ j ∈ Finset.univ.erase i, g j := by
+        apply add_lt_add_of_lt_of_le h_strict_i
+        apply Finset.sum_le_sum
+        intro j _; exact h_convex_j j
+      _ = ∑ j, g j := (Finset.add_sum_erase (Finset.mem_univ i) _).symm
+      _ = a * (∑ j, ((data.y - u) j)^2) + b * (∑ j, ((data.y - v) j)^2) := by
+        simp only [g, Finset.sum_add_distrib, ← Finset.mul_sum]
+
+  -- 2. Identify vectors in range
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let V := LinearMap.range (Matrix.toLin' X)
+  let v := X.mulVec (packParams model)
+  let v' := X'.mulVec (packParams model_prime)
+
+  have h_min_v : IsMinOn loss V v := by
+    intro u hu
+    obtain ⟨beta, hbeta⟩ := (Matrix.range_toLin' X).mp hu
+    let m := unpackParams pgsBasis splineBasis beta
+    have hm_class : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_loss_le := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank m hm_class
+    have h_prop : ∀ m' (hm' : InModelClass m' pgsBasis splineBasis),
+        empiricalLoss m' data 0 = (1 / (n : ℝ)) * loss (designMatrix data pgsBasis splineBasis *ᵥ packParams m') := by
+      intro m' hm'
+      unfold empiricalLoss loss l2norm_sq
+      simp [pointwiseNLL, hm'.dist_gaussian, zero_mul, add_zero]
+      rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis m' hm']
+      congr; ext i
+      simp [Pi.sub_apply]
+    rw [h_lambda_zero, h_prop model ⟨rfl, rfl, rfl, rfl⟩, h_prop m hm_class] at h_loss_le
+    simp [v] at h_loss_le
+    have h_beta_back : packParams m = beta := by funext x; cases x <;> rfl
+    rw [h_beta_back, ← hbeta] at h_loss_le
+    apply (mul_le_mul_left _).mp h_loss_le
+    exact one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+
+  have h_min_v' : IsMinOn loss V v' := by
+    rw [h_range_eq]
+    intro u hu
+    obtain ⟨beta, hbeta⟩ := (Matrix.range_toLin' X').mp hu
+    let m := unpackParams pgsBasis splineBasis beta
+    have hm_class : InModelClass m pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_loss_le := fit_minimizes_loss p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+        rw [Matrix.rank_eq_finrank_range_toLin, ← h_range_eq, ← Matrix.rank_eq_finrank_range_toLin]
+        exact h_rank) m hm_class
+    have h_prop : ∀ m' (hm' : InModelClass m' pgsBasis splineBasis),
+        empiricalLoss m' data' 0 = (1 / (n : ℝ)) * loss (designMatrix data' pgsBasis splineBasis *ᵥ packParams m') := by
+      intro m' hm'
+      unfold empiricalLoss loss l2norm_sq
+      simp [pointwiseNLL, hm'.dist_gaussian, zero_mul, add_zero]
+      have h_y : data'.y = data.y := rfl
+      rw [h_y, linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis m' hm']
+      congr; ext i
+      simp [Pi.sub_apply]
+    rw [h_lambda_zero, h_prop model_prime ⟨rfl, rfl, rfl, rfl⟩, h_prop m hm_class] at h_loss_le
+    simp [v'] at h_loss_le
+    have h_beta_back : packParams m = beta := by funext x; cases x <;> rfl
+    rw [h_beta_back, ← hbeta] at h_loss_le
+    apply (mul_le_mul_left _).mp h_loss_le
+    exact one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+
+  -- 3. Uniqueness implies equality
+  have h_unique := h_loss_strict.eq_of_isMinOn (LinearMap.range (Matrix.toLin' X)).convex h_min_v h_min_v'
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model ⟨rfl, rfl, rfl, rfl⟩]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime ⟨rfl, rfl, rfl, rfl⟩]
+  change v i = v' i
+  exact congr_fun h_unique i
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
