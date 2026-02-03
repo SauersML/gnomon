@@ -46,10 +46,10 @@ def generate_summary_report():
     lines.append("| Simulation | Design | Key Question |")
     lines.append("|------------|--------|--------------|")
     lines.append("| **Sim 1** | Ancestry-correlated liability (PC shifts mean) | Does normalization remove true signal? |")
-    lines.append("| **Sim 3** | Imbalanced populations (EUR majority) | Does ancestry-aware calibration help underrepresented groups? |")
+    lines.append("| **Sim 3** | Portability (train EUR, test across ancestries) | Do models transfer across ancestries without confounding? |")
     lines.append("")
 
-    sim_names = ["confounding", "sample_imbalance"]
+    sim_names = ["confounding", "portability"]
 
     # Check if any results exist
     has_results = False

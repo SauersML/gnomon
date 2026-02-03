@@ -16,7 +16,7 @@ from prs_tools import BayesR
 
 SIM_NAME_MAP = {
     1: "confounding",
-    3: "sample_imbalance",
+    3: "portability",
 }
 
 

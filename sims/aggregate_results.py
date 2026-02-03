@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-SIM_NAMES = ["confounding", "sample_imbalance"]
+SIM_NAMES = ["confounding", "portability"]
 
 
 def load_metrics() -> pd.DataFrame:

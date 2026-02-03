@@ -30,7 +30,7 @@ jobs:
       SIM_CACHE_VERSION: v3
     strategy:
       matrix:
-        sim_name: [confounding, sample_imbalance]
+        sim_name: [confounding, portability]
     steps:
       - uses: actions/checkout@v4
 
@@ -134,7 +134,7 @@ jobs:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        sim_name: [confounding, sample_imbalance]
+        sim_name: [confounding, portability]
     steps:
       - uses: actions/checkout@v4
 
@@ -197,7 +197,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        sim_name: [confounding, sample_imbalance]
+        sim_name: [confounding, portability]
     steps:
       - uses: actions/checkout@v4
 

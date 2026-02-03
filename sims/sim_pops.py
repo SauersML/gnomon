@@ -76,12 +76,13 @@ SIM_CONFIGS: Dict[int, SimulationConfig] = {
         sites=SiteSelectionSpec(maf_min_causal=0.01),
         msprime_recent_gens=50,
     ),
-    # Simulation 3: Sample imbalance - underrepresented population accuracy (imbalanced ancestry distribution, EUR majority).
+    # Simulation 3: Portability - train in EUR, test across ancestries with no PC-driven liability shifts.
+    # EUR is 5x each other ancestry so that 20% EUR test ~= each other ancestry size.
     3: SimulationConfig(
         sim_id=3,
-        sim_name="sample_imbalance",
+        sim_name="portability",
         seed=303,
-        samples={"AFR": 675, "EUR": 3400, "ASIA": 675, "ADMIX": 675},
+        samples={"AFR": 700, "EUR": 3500, "ASIA": 700, "ADMIX": 700},
         genome=GENOME,
         trait=TraitSpec(n_causal=20_000, h2_liability=0.50, prevalence=0.10),
         pc=PCSpec(n_pca_sites=5_000, maf_min=0.05),
@@ -495,11 +496,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         # - P_observed is a noisy proxy for G_true (like an imperfect PGS).
         beta_g = 1.00
         beta_pc = 0.90
-
-        # Nonlinear ancestry contribution
-        # This is the "ancestry-correlated liability" part.
-        eps = rng.normal(0.0, 1.0, size=n_ind).astype(np.float64)
-        eta = beta_g * G_true + beta_pc * pc1 + 0.25 * np.tanh(1.5 * pc1) + 0.60 * eps
+        eta = beta_g * G_true + beta_pc * pc1
 
         b0 = _solve_intercept_for_prevalence(cfg.trait.prevalence, eta)
         p = sigmoid(b0 + eta)
@@ -513,28 +510,18 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
     elif cfg.sim_id == 3:
         # Simulation 3:
-        # - Imbalanced ancestry distribution (EUR majority).
-        # - Reliability decreases with distance from the majority ancestry center.
-        eps = rng.normal(0.0, 1.0, size=n_ind).astype(np.float64)
-        eta = 1.05 * G_true + 0.60 * eps
+        # - No ancestry-dependent liability shift (pure genetic liability).
+        eta = 1.05 * G_true
 
         b0 = _solve_intercept_for_prevalence(cfg.trait.prevalence, eta)
         p = sigmoid(b0 + eta)
         y = rng.binomial(1, p).astype(np.int32)
 
-        pop_labels = np.array([_pop_label(model, int(k)) for k in pop_idx], dtype=object)
-        eur_mask = (pop_labels == "EUR")
-        center = float(np.mean(pc1[eur_mask])) if np.any(eur_mask) else float(np.mean(pc1))
-
-        dist = np.abs(pc1 - center)
-        a = 0.98 - 0.50 * (dist**2 / (dist**2 + 0.35))
-        sigma = 0.18 + 0.85 * (dist**1.30)
-
-        P_obs = a * G_true + rng.normal(0.0, sigma).astype(np.float64)
+        P_obs = G_true + rng.normal(0.0, 0.35, size=n_ind).astype(np.float64)
         P_obs = StandardScaler(with_mean=True, with_std=True).fit_transform(P_obs.reshape(-1, 1)).ravel()
 
         extra_cols = ["attenuation_a", "noise_sigma", "center_majority_pc1"]
-        extra_vals = (a, sigma, np.full(n_ind, center))
+        extra_vals = (np.full(n_ind, np.nan), np.full(n_ind, np.nan), np.full(n_ind, np.nan))
     else:
         raise RuntimeError(f"Unknown sim_id in config: {cfg.sim_id}")
 
@@ -668,7 +655,7 @@ def main() -> None:
     which = sys.argv[1].strip().lower()
     if which in ("1", "sim1", "confounding"):
         cfg = SIM_CONFIGS[1]
-    elif which in ("3", "sim3", "sample_imbalance"):
+    elif which in ("3", "sim3", "portability"):
         cfg = SIM_CONFIGS[3]
     else:
         raise SystemExit("Unknown simulation. Use 1, 3, or the full sim name.")

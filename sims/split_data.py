@@ -60,21 +60,21 @@ def split_data(sim_arg, work_dir):
     )
     fam_iid_set = set(fam["IID"].astype(str).tolist())
     
-    # Select Training Set: EUR only
-    train_mask = df['pop_label'] == 'EUR'
-    
-    eur_indices = df[train_mask].index.to_numpy()
-    
-    # Split EUR into 80% Train, 20% Test (Validation within ancestry)
-    if len(eur_indices) > 0:
-        train_idx, test_eur_idx = train_test_split(eur_indices, test_size=0.2, random_state=42)
+    sim_name = sim_prefix
+    if sim_name == "confounding":
+        # Train on all ancestries, 80/20 split overall.
+        train_idx, test_idx = train_test_split(df.index.to_numpy(), test_size=0.2, random_state=42)
     else:
-        print("Warning: No EUR found? Using random 60% split.")
-        train_idx, test_eur_idx = train_test_split(df.index.to_numpy(), test_size=0.4, random_state=42)
-    
-    # Test set = Test EUR + All non-EUR
-    non_eur_idx = df[~df.index.isin(eur_indices)].index.to_numpy()
-    test_idx = np.concatenate([test_eur_idx, non_eur_idx])
+        # Portability: train EUR only; test = 20% EUR + all non-EUR.
+        train_mask = df['pop_label'] == 'EUR'
+        eur_indices = df[train_mask].index.to_numpy()
+        if len(eur_indices) > 0:
+            train_idx, test_eur_idx = train_test_split(eur_indices, test_size=0.2, random_state=42)
+        else:
+            print("Warning: No EUR found? Using random 60% split.")
+            train_idx, test_eur_idx = train_test_split(df.index.to_numpy(), test_size=0.4, random_state=42)
+        non_eur_idx = df[~df.index.isin(eur_indices)].index.to_numpy()
+        test_idx = np.concatenate([test_eur_idx, non_eur_idx])
     
     # Ensure IDs are strings
     df['individual_id'] = df['individual_id'].astype(str)
