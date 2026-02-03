@@ -332,7 +332,7 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
     Specifically, x^n is integrable w.r.t N(0,1). -/
 lemma gaussian_moments_integrable (n : ℕ) :
     Integrable (fun x : ℝ => x ^ n) (ProbabilityTheory.gaussianReal 0 1) := by
-  admit
+  apply integrable_poly_n
 
 
 section AllClaims
