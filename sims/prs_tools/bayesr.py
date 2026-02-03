@@ -11,6 +11,8 @@ import numpy as np
 class BayesR:
     def __init__(self, gctb_path="gctb"):
         self.gctb_path = gctb_path
+        self.max_snps = 300_000
+        self.thin_seed = 42
 
     def _gctb_diagnostics(self) -> str:
         exe_path = shutil.which(self.gctb_path) or self.gctb_path
@@ -29,6 +31,59 @@ class BayesR:
                 f.write(text)
         except Exception:
             pass
+
+    def _count_bim_snps(self, bfile_prefix: str) -> int:
+        bim_path = f"{bfile_prefix}.bim"
+        try:
+            with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
+                return sum(1 for _ in f)
+        except Exception as e:
+            raise RuntimeError(f"Failed to count SNPs in {bim_path}: {e}")
+
+    def _resolve_plink2(self) -> str:
+        plink_exe = shutil.which("plink2") or "/usr/local/bin/plink2"
+        if not os.path.exists(plink_exe) and shutil.which("plink2") is None:
+            raise FileNotFoundError(
+                f"plink2 executable not found on PATH and fallback missing at {plink_exe}"
+            )
+        return plink_exe
+
+    def _maybe_thin_bfile(self, bfile_prefix: str, out_prefix: str) -> str:
+        n_snps = self._count_bim_snps(bfile_prefix)
+        if n_snps <= self.max_snps:
+            print(f"BayesR SNPs={n_snps} (<= {self.max_snps}); no thinning needed.")
+            return bfile_prefix
+
+        thin_prefix = f"{out_prefix}_thin"
+        if Path(f"{thin_prefix}.bed").exists():
+            print(f"BayesR SNPs={n_snps}; using existing thinned bfile={thin_prefix}")
+            return thin_prefix
+
+        print(
+            "BayesR SNPs="
+            f"{n_snps} (> {self.max_snps}); thinning to {self.max_snps} for GCTB memory safety."
+        )
+        plink_exe = self._resolve_plink2()
+        cmd = [
+            plink_exe,
+            "--bfile", bfile_prefix,
+            "--thin-count", str(self.max_snps),
+            "--seed", str(self.thin_seed),
+            "--make-bed",
+            "--out", thin_prefix,
+        ]
+        print(f"Running PLINK2 thinning: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            self._safe_write_text(f"{thin_prefix}.plink2.stdout", result.stdout or "")
+            self._safe_write_text(f"{thin_prefix}.plink2.stderr", result.stderr or "")
+            raise RuntimeError(
+                "PLINK2 thinning failed:\n"
+                f"returncode={result.returncode}\n"
+                f"STDERR:\n{result.stderr}\n\n"
+                f"STDOUT:\n{result.stdout}\n"
+            )
+        return thin_prefix
         
     def fit(self, bfile_train, pheno_file, out_prefix, covar_file):
         """
@@ -45,9 +100,11 @@ class BayesR:
         if not os.path.exists(covar_file):
             raise FileNotFoundError(f"BayesR covariate file does not exist: {covar_file}")
 
+        bfile_train_eff = self._maybe_thin_bfile(bfile_train, out_prefix)
+
         cmd = [
             self.gctb_path,
-            "--bfile", bfile_train,
+            "--bfile", bfile_train_eff,
             "--pheno", pheno_file,
             "--bayes", "R",
             "--covar", covar_file,
