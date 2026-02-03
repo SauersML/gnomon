@@ -2568,6 +2568,17 @@ theorem fit_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] 
     simpa [h_emp_fit, h_emp, h_pack_fit] using h_min'
   simpa [m_fit] using h_min''
 
+/-- The fitted model belongs to the class of GAMs (identity link, Gaussian noise). -/
+lemma fit_in_model_class {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_lambda_nonneg : 0 ≤ lambda)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    InModelClass (fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank) pgsBasis splineBasis := by
+  unfold fit unpackParams
+  constructor <;> rfl
+
 
 /-- The Gaussian penalized loss is strictly convex when X has full rank and lam > 0.
 
