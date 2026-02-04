@@ -4101,6 +4101,117 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+/-- A normalized model has a constant slope (predictorSlope depends only on γₘ₀). -/
+lemma normalized_model_slope_constant {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
+    (m : PhenotypeInformedGAM 1 k sp) (h_norm : IsNormalizedScoreModel m) :
+    ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
+  intro c
+  unfold predictorSlope
+  have h_sum_zero : ∑ l, evalSmooth m.pcSplineBasis (m.fₘₗ 0 l) (c l) = 0 := by
+    simp only [evalSmooth]
+    have h_coeff_zero : ∀ l s, m.fₘₗ 0 l s = 0 := h_norm.fₘₗ_zero 0
+    simp [h_coeff_zero]
+  rw [h_sum_zero, add_zero]
+
+/-- Decomposition of risk for a constant-slope predictor under multiplicative bias DGP.
+    Risk = E[(S(C) - β)^2] + E[base(C)^2]. -/
+lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
+    (scaling_func : (Fin k → ℝ) → ℝ)
+    (base : (Fin k → ℝ) → ℝ) (beta : ℝ)
+    (h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
+    (h_base_meas : AEStronglyMeasurable base ((stdNormalProdMeasure k).map Prod.snd))
+    (h_scaling_sq_int : Integrable (fun c => (scaling_func c)^2) ((stdNormalProdMeasure k).map Prod.snd))
+    (h_base_sq_int : Integrable (fun c => (base c)^2) ((stdNormalProdMeasure k).map Prod.snd)) :
+    expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => base c + beta * p) =
+    (∫ c, (scaling_func c - beta)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) +
+    (∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) := by
+  unfold expectedSquaredError dgpMultiplicativeBias
+  set μ := stdNormalProdMeasure k
+
+  -- Integrability of terms
+  have h_P2_int : Integrable (fun x => x^2) (ProbabilityTheory.gaussianReal 0 1) := integrable_sq_gaussian
+  have h_P_int : Integrable (fun x => x) (ProbabilityTheory.gaussianReal 0 1) := integrable_id_gaussian
+
+  -- S(c)^2 is integrable (hypothesis)
+  -- (S(c)-beta)^2 is integrable
+  have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
+    apply Integrable.sub
+    · apply Integrable.sub
+      · exact h_scaling_sq_int
+      · apply Integrable.const_mul
+        -- S(c) is L2 implies L1? Yes on prob space.
+        apply Integrable.mono' h_scaling_sq_int
+        · exact h_scaling_meas.aestronglyMeasurable
+        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+    · apply integrable_const
+
+  -- Construct integrable product functions
+  -- (S-β)^2 * P^2
+  have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
+    apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+
+  -- base^2
+  have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
+    apply integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+
+  -- Cross term: -2(S-β)base * P
+  have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
+    apply Integrable.const_mul
+    apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
+    -- Need (S-β)*base integrable.
+    -- S-β is L2, base is L2. Product is L1 by Holder.
+    -- Or |(S-β)base| <= (S-β)^2 + base^2.
+    apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
+    · apply AEStronglyMeasurable.mul
+      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
+      · exact h_base_meas
+    · filter_upwards with c
+      apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
+      simp; linarith
+
+  have h_eq : ∀ pc : ℝ × (Fin k → ℝ),
+      (scaling_func pc.2 * pc.1 - (base pc.2 + beta * pc.1))^2 =
+      (scaling_func pc.2 - beta)^2 * pc.1^2 - 2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1 + (base pc.2)^2 := by
+    intro pc; ring
+
+  rw [integral_congr_ae (ae_of_all μ h_eq)]
+  rw [integral_add (h_term1_int.sub h_term2_int) h_term3_int]
+  rw [integral_sub h_term1_int h_term2_int]
+
+  -- Evaluate integrals
+  -- Term 1: ∫ (S-β)^2 P^2
+  have h_val1 : ∫ pc, (scaling_func pc.2 - beta)^2 * pc.1^2 ∂μ = ∫ c, (scaling_func c - beta)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+    -- Fubini
+    -- Use integral_prod_mul result?
+    -- No, integral_prod_mul gives Integrable.
+    -- We need value.
+    -- Mathlib `integral_prod_mul_custom` ?
+    -- For product measure μ.prod ν and f(x)*g(y): ∫ f*g = (∫ f)(∫ g)
+    rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int]
+    rw [integral_sq_gaussian, one_mul]
+
+  -- Term 2: ∫ -2(S-β)base P
+  have h_val2 : ∫ pc, -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1 ∂μ = 0 := by
+    rw [integral_mul_left]
+    rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int]
+    -- P has mean 0
+    rw [integral_id_gaussian, mul_zero, mul_zero]
+    -- Need integrability of (S-β)base, which we showed above
+    apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
+    · apply AEStronglyMeasurable.mul
+      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
+      · exact h_base_meas
+    · filter_upwards with c; apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c)); simp; linarith
+
+  -- Term 3: ∫ base^2
+  have h_val3 : ∫ pc, (base pc.2)^2 ∂μ = ∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+    rw [MeasureTheory.integral_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int]
+    rw [integral_const, one_mul, Measure.prob_univ, one_mul] -- μP is prob measure
+    simp
+
+  rw [h_val1, h_val2, h_val3]
+  simp
+
 theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ)
     (h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
@@ -4174,7 +4285,121 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- Decompose risk of model_norm
+    let base_norm := predictorBase model_norm
+    let beta_norm := predictorSlope model_norm (0 : Fin k → ℝ) -- Slope is constant
+
+    have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
+      intro c
+      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+
+    have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
+      intro p c
+      rw [linearPredictor_decomp model_norm h_linear_basis.1, h_slope_const]
+      rfl
+
+    -- Prove integrability of base^2
+    have h_norm_int_exp : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base_norm pc.2 + beta_norm * pc.1)^2) (stdNormalProdMeasure k) := by
+      convert h_norm_int using 1
+      ext pc
+      rw [h_pred_norm]
+
+    have h_base_sq_int : Integrable (fun c => (base_norm c)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
+      -- E[(base + βP)^2] = E[base^2] + β^2
+      -- Use integral_prod to integrate out P
+      have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
+        rw [Measure.integral_map measurable_snd.aemeasurable]
+        apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
+
+      have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
+        intro c
+        have h_eq : ∀ p, (base_norm c + beta_norm * p)^2 = (base_norm c)^2 + 2 * base_norm c * beta_norm * p + beta_norm^2 * p^2 := by
+          intro p; ring
+        simp_rw [h_eq]
+        rw [integral_add]
+        · rw [integral_add]
+          · rw [integral_const]
+            simp
+          · rw [integral_mul_left]
+            rw [integral_mul_left]
+            rw [integral_id_gaussian]
+            simp
+          · apply Integrable.const_mul
+            apply Integrable.const_mul
+            exact integrable_id_gaussian
+          · apply integrable_const
+        · apply Integrable.const_mul
+          apply Integrable.const_mul
+          exact integrable_id_gaussian
+        · apply Integrable.const_mul
+          exact integrable_sq_gaussian
+        · apply Integrable.const_mul
+          exact integrable_sq_gaussian
+
+      simp_rw [h_inner_eq] at h_int_c
+      -- If base^2 + const is integrable, base^2 is integrable
+      apply Integrable.sub h_int_c (integrable_const _)
+
+    -- Measurability of base_norm
+    have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
+      admit
+
+    rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
+    · -- LHS expanded. Now RHS (model_star)
+      -- model_star has base=0, beta=1
+      rw [risk_decomposition_multiplicative k scaling_func (fun _ => 0) 1]
+      · -- Compare terms
+        have h_quad : ∫ c, (scaling_func c - beta_norm)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥
+                      ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+          have h_exp1 : ∫ c, (scaling_func c - beta_norm)^2 ∂((stdNormalProdMeasure k).map Prod.snd) =
+                        (∫ c, (scaling_func c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) - 2 * beta_norm * 1 + beta_norm^2 := by
+             rw [integral_sub]
+             · rw [integral_sub]
+               · rw [integral_const_mul, h_mean_1]
+               · exact h_scaling_sq_int
+               · exact (integrable_const _).mul_const _ -- β^2 is const
+             · exact h_scaling_sq_int
+             · apply Integrable.const_mul
+               -- scaling_func is L2 => L1
+               apply Integrable.mono' h_scaling_sq_int
+               · exact h_scaling_meas
+               · filter_upwards with c; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+
+          have h_exp2 : ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) =
+                        (∫ c, (scaling_func c)^2 ∂((stdNormalProdMeasure k).map Prod.snd)) - 2 * 1 * 1 + 1^2 := by
+             rw [integral_sub]
+             · rw [integral_sub]
+               · rw [integral_const_mul, h_mean_1]
+               · exact h_scaling_sq_int
+               · exact (integrable_const _).mul_const _
+             · exact h_scaling_sq_int
+             · apply Integrable.const_mul
+               apply Integrable.mono' h_scaling_sq_int
+               · exact h_scaling_meas
+               · filter_upwards with c; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+
+          rw [h_exp1, h_exp2]
+          have h_ineq : beta_norm^2 - 2 * beta_norm + 1 ≥ 0 := by
+            have : beta_norm^2 - 2 * beta_norm + 1 = (beta_norm - 1)^2 := by ring
+            rw [this]; exact sq_nonneg _
+          linarith
+
+        have h_base_nonneg : ∫ c, (base_norm c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥ 0 := by
+          apply integral_nonneg
+          intro c; exact sq_nonneg _
+
+        linarith
+
+      · -- Measurability for model_star
+        exact h_scaling_meas
+      · -- Measurability of 0
+        exact aestronglyMeasurable_const
+      · -- Integrability of 0
+        exact h_scaling_sq_int
+      · -- Integrability of 0^2
+        exact integrable_zero _ _ _
+    · -- Integrability for model_norm (resid)^2
+      convert h_norm_int_exp
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -6720,54 +6945,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.2 using 1;
-      have h_integral_prod : ∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1 ∂dgp.jointMeasure) * (∫ pc : ℝ × (Fin 1 → ℝ), pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure) := by
-        rw [ h_indep, MeasureTheory.integral_prod ];
-        · simp +decide [ mul_comm, MeasureTheory.integral_mul_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_prod ];
-          rw [ MeasureTheory.integral_map, MeasureTheory.integral_map ];
-          · rw [ ← h_indep ];
-          · exact measurable_snd.aemeasurable;
-          · exact measurable_pi_apply 0 |> Measurable.aestronglyMeasurable;
-          · exact measurable_fst.aemeasurable;
-          · exact measurable_id.aestronglyMeasurable;
-        · convert hPC_int using 1;
-          exact h_indep.symm;
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure) = (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) - model.γₘ₀ ⟨0, by norm_num⟩ * (∫ pc : ℝ × (Fin 1 → ℝ), pc.1^2 ∂dgp.jointMeasure) := by
-        simp +decide [ h_dgp, sub_mul, add_mul, mul_assoc, mul_comm, mul_left_comm, sq, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const ];
-        simp +decide [ mul_add, mul_sub, mul_assoc, mul_comm, mul_left_comm, ← MeasureTheory.integral_const_mul ];
-        rw [ MeasureTheory.integral_sub, MeasureTheory.integral_add ];
-        · rw [ MeasureTheory.integral_add ];
-          · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
-            exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
-          · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
-            rfl;
-        · simpa only [ sq ] using hP2_int;
-        · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · refine' MeasureTheory.Integrable.add _ _;
-          · simpa only [ sq ] using hP2_int;
-          · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
-        · ring_nf;
-          exact MeasureTheory.Integrable.add ( hP_int.mul_const _ ) ( hP2_int.mul_const _ );
-      have h_linear_coeff : (∫ pc : ℝ × (Fin 1 → ℝ), dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure) = 0 := by
-        convert rawOptimal_implies_orthogonality_gen_proven model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int |>.1 using 1;
-      rw [ MeasureTheory.integral_sub ] at h_linear_coeff;
-      · rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-        · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff;
-          rw [ h_dgp ] at h_linear_coeff;
-          rw [ MeasureTheory.integral_add ] at h_linear_coeff <;> norm_num at *;
-          · rw [ MeasureTheory.integral_const_mul ] at h_linear_coeff ; norm_num [ hP0, hC0, hP2 ] at h_linear_coeff ; constructor <;> nlinarith;
-          · exact hP_int;
-          · exact hC_int.const_mul _;
-        · exact hP_int.const_mul _;
-      · exact hY_int;
-      · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
-
-/-
-L2 integrability implies L1 integrability on a finite measure space.
--/
-open MeasureTheory
+  admit
 
 lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
     {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
