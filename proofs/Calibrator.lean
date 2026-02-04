@@ -6105,27 +6105,31 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
                   intro f h_diff
                   let s := (Finset.univ : Finset m)
-                  have h_univ : s = Finset.univ := rfl
-                  rw [← h_univ]
-                  induction s using Finset.induction_on with
-                  | empty => simp
-                  | insert hi ih =>
-                    simp only [Finset.prod_insert hi, Finset.sum_insert hi]
-                    rw [deriv_mul]
-                    · rw [ih]
-                      simp only [Finset.mul_sum, Finset.sum_mul]
-                      apply congr_arg₂ (· + ·)
-                      · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hi]
+                  have h_rule : deriv (fun rho => s.prod (fun i => f i rho)) rho = s.sum (fun i => (s.erase i).prod (fun j => f j rho) * deriv (f i) rho) := by
+                    induction s using Finset.induction_on with
+                    | empty => simp
+                    | insert a s ha ih =>
+                      simp [Finset.prod_insert ha, Finset.sum_insert ha]
+                      rw [deriv_mul (h_diff a) (DifferentiableAt.finset_prod (fun i _ => h_diff i))]
+                      rw [ih, Finset.mul_sum]
+                      simp only [Finset.sum_mul]
+                      rw [add_comm]
+                      congr 1
+                      · congr 1
+                        apply Finset.prod_congr rfl
+                        intro j hj
+                        rw [Finset.erase_insert ha]
                       · apply Finset.sum_congr rfl
                         intro j hj
-                        rw [Finset.erase_insert hi, Finset.prod_insert]
-                        · ring
-                        · exact fun h => hi (Finset.mem_erase.mp h).1
-                    · apply DifferentiableAt.finset_prod
-                      intro i _
-                      exact h_diff i
-                    · exact h_diff _
-                apply h_prod_rule
+                        have h_ne : j ≠ a := ne_of_mem_of_not_mem hj ha
+                        rw [Finset.erase_insert_of_ne h_ne, Finset.prod_insert]
+                        · ring_nf
+                        · exact fun h => ha (Finset.mem_erase.mp h).1
+                      · apply DifferentiableAt.finset_prod
+                        intro k hk
+                        exact h_diff k
+                      · exact h_diff a
+                  exact h_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
               have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
