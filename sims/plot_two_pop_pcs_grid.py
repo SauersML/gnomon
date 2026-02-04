@@ -29,13 +29,13 @@ def _pick_seeded_plot(sim: str, gens: int) -> Path | None:
     return sorted(candidates, key=_seed_key)[0]
 
 
-def _collect_images() -> list[tuple[str, Path]]:
-    items: list[tuple[str, Path]] = []
+def _collect_images() -> dict[tuple[str, int], Path]:
+    items: dict[tuple[str, int], Path] = {}
     for sim in SIMS:
         for gens in GENS_LEVELS:
             path = _pick_seeded_plot(sim, gens)
             if path is not None:
-                items.append((f"{sim} g{gens}", path))
+                items[(sim, gens)] = path
     return items
 
 
@@ -53,15 +53,11 @@ def main() -> None:
     if nrows == 1:
         axes = [axes]
 
-    # Build a lookup for quick access
-    img_map = {p.name: (label, p) for label, p in items}
-
     for r, sim in enumerate(SIMS):
         for c, gens in enumerate(GENS_LEVELS):
             ax = axes[r][c]
-            name = f"{sim}_g{gens}_pcs.png"
-            if name in img_map:
-                _, path = img_map[name]
+            path = items.get((sim, gens))
+            if path is not None:
                 img = mpimg.imread(path)
                 ax.imshow(img)
             else:
