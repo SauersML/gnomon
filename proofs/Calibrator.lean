@@ -4425,14 +4425,30 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := inferInstance
+  haveI : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_le (Submodule.le_top)
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  let p' := Submodule.orthogonalProjection K' (equiv y)
+  equiv.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
-lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    iff p minimizes L2 distance to y among all points in K. -/
+lemma orthogonalProjection_eq_of_l2_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  dsimp [orthogonalProjection]
+  let equiv := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map equiv
+  let y' := equiv y
+  let p' := equiv p
+  have h_mem' : p' ∈ K' := Submodule.mem_map_of_mem h_mem
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  have h_eq : p' = Submodule.orthogonalProjection K' y' := by
+    sorry -- Uniqueness of orthogonal projection (requires metric equivalence)
+  apply equiv.injective
+  exact h_eq
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
