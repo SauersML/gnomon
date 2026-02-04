@@ -1024,7 +1024,6 @@ lemma optimal_slope_eq_covariance_of_normalized_p
     refine (h1.add h2).congr ?_
     filter_upwards with pc
     ring_nf
-    simp
   have h0 :
       (∫ pc, Y pc * pc.1 ∂μ) - (∫ pc, (a + b * pc.1) * pc.1 ∂μ) = 0 := by
     -- Expand the orthogonality condition using integral linearity.
@@ -2375,7 +2374,7 @@ noncomputable def fit (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fint
             classical
             simp [S, Matrix.mulVec, dotProduct, Matrix.diagonal_apply,
               Finset.sum_ite_eq', Finset.sum_ite_eq, mul_comm, mul_left_comm, mul_assoc]
-          cases i <;> simp [hSi, s, mul_comm, mul_left_comm, mul_assoc, mul_self_nonneg]
+          cases i <;> simp [hSi, s, mul_comm, mul_left_comm, mul_self_nonneg]
         exact mul_nonneg h_lambda_nonneg hsum_nonneg
       have h_scale :
           (1 / (n : ℝ)) * Finset.univ.sum (fun i => (data.y i - X.mulVec β i) ^ 2)
@@ -2874,7 +2873,7 @@ lemma gaussianPenalizedLoss_strictConvex {ι : Type*} {n : ℕ} [Fintype (Fin n)
       have hneg_i : (X.mulVec (β₂ - β₁)) i = - (X.mulVec (β₁ - β₂)) i := by
         simpa using congrArg (fun f => f i) hneg'
       calc
-        (X.mulVec (β₂ - β₁) i) ^ 2 = (-(X.mulVec (β₁ - β₂) i)) ^ 2 := by simpa [hneg_i]
+        (X.mulVec (β₂ - β₁) i) ^ 2 = (-(X.mulVec (β₁ - β₂) i)) ^ 2 := by simp [hneg_i]
         _ = (X.mulVec (β₁ - β₂) i) ^ 2 := by ring
 
     -- Similarly for the penalty term: a·β₁ᵀSβ₁ + b·β₂ᵀSβ₂ - β_midᵀSβ_mid = a*b*(β₁-β₂)ᵀS(β₁-β₂)
@@ -4066,7 +4065,7 @@ noncomputable def dgpMultiplicativeBias {k : ℕ} [Fintype (Fin k)] (scaling_fun
     (risk of the true expectation) plus the distance from the true expectation. -/
 lemma risk_decomposition {k : ℕ} [Fintype (Fin k)]
     (dgp : DataGeneratingProcess k) (f : ℝ → (Fin k → ℝ) → ℝ)
-    (hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
+    (_hf_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2) dgp.jointMeasure) :
     expectedSquaredError dgp f =
     expectedSquaredError dgp dgp.trueExpectation +
     ∫ pc, (dgp.trueExpectation pc.1 pc.2 - f pc.1 pc.2)^2 ∂dgp.jointMeasure := by
@@ -4482,36 +4481,38 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  let iso := (WithLp.linearEquiv 2 (Fin n → ℝ)).symm
-  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
-  haveI : FiniteDimensional ℝ K' := Module.Finite.iff_fg.mpr (Submodule.fg_of_fg_map_injective (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n)) iso.injective (Module.Finite.iff_fg.mp inferInstance))
+  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let iso_symm := iso.symm
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso_symm : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
+  haveI : FiniteDimensional ℝ K' := inferInstance
   haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
-  iso.symm (InnerProductSpace.orthogonalProjection K' (iso y))
+  iso (InnerProductSpace.orthogonalProjection K' (iso_symm y))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes L2 distance (squared) to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  let iso := (WithLp.linearEquiv 2 (Fin n → ℝ)).symm
-  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
-  haveI : FiniteDimensional ℝ K' := Module.Finite.iff_fg.mpr (Submodule.fg_of_fg_map_injective (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n)) iso.injective (Module.Finite.iff_fg.mp inferInstance))
+  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let iso_symm := iso.symm
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso_symm : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
+  haveI : FiniteDimensional ℝ K' := inferInstance
   haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
 
-  let y' := iso y
-  let p' := iso p
+  let y' := iso_symm y
+  let p' := iso_symm p
 
   have h_mem' : p' ∈ K' := by
     rw [Submodule.mem_map]
     use p, h_mem
-    simp [p', iso]
+    simp [p', iso_symm]
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
     rw [Submodule.mem_map] at hw'
     obtain ⟨w, hw, rfl⟩ := hw'
 
-    have h_norm_eq : ∀ u, l2norm_sq u = ‖iso u‖^2 := by
+    have h_norm_eq : ∀ u, l2norm_sq u = ‖iso_symm u‖^2 := by
       intro u
       -- l2norm_sq matches the square of the L2 norm on EuclideanSpace
       simp [l2norm_sq]
