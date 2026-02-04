@@ -4320,17 +4320,19 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · rw [integral_add]
           · rw [integral_const]
             simp
-          · rw [integral_mul_left]
-            rw [integral_mul_left]
+          · rw [MeasureTheory.integral_const_mul]
+            rw [MeasureTheory.integral_const_mul]
             rw [integral_id_gaussian]
             simp
           · apply Integrable.const_mul
             apply Integrable.const_mul
             exact integrable_id_gaussian
           · apply integrable_const
-        · apply Integrable.const_mul
-          apply Integrable.const_mul
-          exact integrable_id_gaussian
+        · apply Integrable.add
+          · apply integrable_const
+          · apply Integrable.const_mul
+            apply Integrable.const_mul
+            exact integrable_id_gaussian
         · apply Integrable.const_mul
           exact integrable_sq_gaussian
         · apply Integrable.const_mul
