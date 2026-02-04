@@ -331,6 +331,17 @@ theorem fitNormalized_minimizes_loss (p k sp n : ℕ) [Fintype (Fin p)] [Fintype
 =================================================================
 -/
 
+/-
+L2 integrability implies L1 integrability on a finite measure space.
+-/
+open MeasureTheory
+
+lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
+    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
+    (hf_sq : Integrable (fun x => (f x)^2) μ) :
+    Integrable f μ := by
+      refine' MeasureTheory.Integrable.mono' _ _ _;
+      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
 
 /-- **Lemma**: Moments of the standard Gaussian distribution are integrable.
     Specifically, x^n is integrable w.r.t N(0,1). -/
@@ -4579,7 +4590,8 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    change v i ^ 2 = (equiv v i) ^ 2
+    congr 1; rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4588,14 +4600,24 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    rw [← Real.sqrt_sq (norm_nonneg _), ← Real.sqrt_sq (norm_nonneg _)]
+    exact Real.sqrt_le_sqrt h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+    apply Eq.symm
+    apply Submodule.eq_orthogonalProjection_of_mem_orthogonal
     · exact h_mem'
-    · exact h_min'
+    · rw [← Submodule.norm_eq_iInf_iff_inner_eq_zero h_mem']
+      apply le_antisymm
+      · apply le_ciInf
+        intro w
+        rw [dist_eq_norm, dist_eq_norm] at h_min'
+        exact h_min' w w.2
+      · apply ciInf_le
+        use p'
+        exact h_mem'
 
   rw [orthogonalProjection]
   simp only [equiv, y', K', p'] at h_proj ⊢
@@ -4618,6 +4640,78 @@ lemma rank_eq_of_range_eq {n m : Type} [Fintype n] [Fintype m] [DecidableEq n] [
   rw [Matrix.rank_eq_finrank_range_toLin B (Pi.basisFun ℝ n) (Pi.basisFun ℝ m)]
   change Module.finrank ℝ (LinearMap.range (Matrix.toLin' A)) = Module.finrank ℝ (LinearMap.range (Matrix.toLin' B))
   rw [h]
+
+lemma pack_unpack_inverse {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  ext j
+  cases j <;> rfl
+
+lemma empiricalLoss_eq_l2norm_sq {p k sp n : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (model : PhenotypeInformedGAM p k sp)
+    (hm : InModelClass model pgsBasis splineBasis) :
+    empiricalLoss model data 0 = (1 / (n : ℝ)) * l2norm_sq (data.y - (designMatrix data pgsBasis splineBasis).mulVec (packParams model)) := by
+  unfold empiricalLoss
+  simp only [hm.dist_gaussian, pointwiseNLL, zero_mul, add_zero]
+  have h_pred := linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model hm
+  congr 1
+  unfold l2norm_sq
+  simp only [Pi.sub_apply]
+  refine Finset.sum_congr rfl ?_
+  intro i _
+  rw [h_pred]
+  rfl
+
+theorem fit_predicts_projection (p k sp n : ℕ) [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] [Fintype (Fin n)]
+    (data : RealizedData n k) (lambda : ℝ)
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (h_n_pos : n > 0)
+    (h_lambda_nonneg : 0 ≤ lambda)
+    (h_lambda_zero : lambda = 0)
+    (h_rank : Matrix.rank (designMatrix data pgsBasis splineBasis) = Fintype.card (ParamIx p k sp)) :
+    let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+    let X := designMatrix data pgsBasis splineBasis
+    let rangeX := LinearMap.range (Matrix.toLin' X)
+    ∀ i, linearPredictor model (data.p i) (data.c i) = orthogonalProjection rangeX data.y i := by
+  intro model X rangeX i
+
+  have h_in_class := fit_in_model_class data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
+  have h_pred_vec : ∀ i, linearPredictor model (data.p i) (data.c i) = (X.mulVec (packParams model)) i := by
+    exact linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model h_in_class
+
+  let p_vec := X.mulVec (packParams model)
+  have h_pred_eq : (fun i => linearPredictor model (data.p i) (data.c i)) = p_vec := by
+    ext i; rw [h_pred_vec]
+
+  rw [h_pred_vec]
+
+  apply orthogonalProjection_eq_of_dist_le rangeX data.y p_vec
+  · -- p_vec \in rangeX
+    simp only [rangeX, Matrix.range_toLin']
+    use packParams model
+    rfl
+  · -- Optimality
+    intro w hw
+    simp only [rangeX, Matrix.range_toLin'] at hw
+    obtain ⟨beta_w, rfl⟩ := hw
+
+    let model_w := unpackParams pgsBasis splineBasis beta_w
+    have h_in_class_w : InModelClass model_w pgsBasis splineBasis := by
+      apply InModelClass.mk <;> rfl
+
+    have h_min := fit_minimizes_loss p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank model_w h_in_class_w
+
+    rw [h_lambda_zero] at h_min
+    rw [empiricalLoss_eq_l2norm_sq data pgsBasis splineBasis model h_in_class] at h_min
+    rw [empiricalLoss_eq_l2norm_sq data pgsBasis splineBasis model_w h_in_class_w] at h_min
+    rw [pack_unpack_inverse pgsBasis splineBasis beta_w] at h_min
+
+    have hn_pos : 0 < (n : ℝ) := Nat.cast_pos.mpr h_n_pos
+    have h_scale_pos : 0 < 1 / (n : ℝ) := one_div_pos.mpr hn_pos
+    exact (mul_le_mul_left h_scale_pos).mp h_min
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
@@ -4642,7 +4736,22 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  sorry
+  intro data' model model_prime i
+  let X := designMatrix data pgsBasis splineBasis
+  let rangeX := LinearMap.range (Matrix.toLin' X)
+  have h_proj := fit_predicts_projection p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_lambda_zero h_rank i
+
+  let X' := designMatrix data' pgsBasis splineBasis
+  let rangeX' := LinearMap.range (Matrix.toLin' X')
+
+  have h_rank_eq : X.rank = X'.rank := rank_eq_of_range_eq X X' h_range_eq
+  have h_rank' : X'.rank = Fintype.card (ParamIx p k sp) := by rw [← h_rank_eq, h_rank]
+
+  have h_proj' := fit_predicts_projection p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_lambda_zero h_rank' i
+
+  rw [h_proj, h_proj']
+  congr 2
+  exact h_range_eq
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
@@ -6928,7 +7037,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
@@ -6951,14 +7060,3 @@ lemma optimal_coefficients_for_additive_dgp_proven
       · exact hY_int;
       · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
 
-/-
-L2 integrability implies L1 integrability on a finite measure space.
--/
-open MeasureTheory
-
-lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
-    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
-    (hf_sq : Integrable (fun x => (f x)^2) μ) :
-    Integrable f μ := by
-      refine' MeasureTheory.Integrable.mono' _ _ _;
-      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
