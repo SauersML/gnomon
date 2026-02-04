@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -285,6 +286,18 @@ def _simulate_dataset(cfg: TwoPopConfig) -> str:
     return sim_prefix
 
 
+def _final_outputs_exist(sim_prefix: str) -> bool:
+    required = [
+        f"{sim_prefix}.tsv",
+        f"{sim_prefix}_sites.npz",
+        f"{sim_prefix}_pcs.png",
+        f"{sim_prefix}.bed",
+        f"{sim_prefix}.bim",
+        f"{sim_prefix}.fam",
+    ]
+    return all(os.path.exists(p) for p in required)
+
+
 def _build_config(sim_name: str, divergence_gens: int, seed: int | None) -> TwoPopConfig:
     if sim_name not in ("divergence", "bottleneck"):
         raise ValueError("sim_name must be 'divergence' or 'bottleneck'")
@@ -319,6 +332,13 @@ def main() -> None:
     divergence_gens = int(sys.argv[2])
     seed = int(sys.argv[3]) if len(sys.argv) == 4 else None
     cfg = _build_config(sim_name, divergence_gens, seed)
+
+    if os.environ.get("SIM_FORCE", "").lower() not in ("1", "true", "yes"):
+        sim_prefix = f"{cfg.sim_name}_g{cfg.divergence_gens}_s{cfg.seed}"
+        if _final_outputs_exist(sim_prefix):
+            print(f"[{sim_prefix}] Cached outputs found. Skipping simulation.")
+            return
+
     _simulate_dataset(cfg)
 
 

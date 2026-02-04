@@ -17,25 +17,42 @@ SIM_NAMES = ["confounding", "portability"]
 def _apply_plot_style():
     plt.rcParams.update(
         {
-            "figure.dpi": 150,
-            "axes.facecolor": "white",
-            "axes.edgecolor": "#444444",
-            "axes.linewidth": 0.8,
-            "grid.color": "#d0d0d0",
+            "figure.dpi": 160,
+            "axes.facecolor": "#f7f6f2",
+            "figure.facecolor": "white",
+            "axes.edgecolor": "#2f2f2f",
+            "axes.linewidth": 0.9,
+            "grid.color": "#c9c4b8",
             "grid.linestyle": "-",
-            "grid.linewidth": 0.6,
+            "grid.linewidth": 0.7,
             "axes.spines.top": False,
             "axes.spines.right": False,
-            "axes.labelsize": 11,
-            "axes.titlesize": 13,
-            "legend.fontsize": 8,
+            "axes.labelsize": 11.5,
+            "axes.titlesize": 14,
+            "font.size": 11,
+            "legend.fontsize": 9,
         }
     )
 
 
 def _style_axes(ax):
-    ax.grid(axis="y", alpha=0.6)
+    ax.grid(axis="y", alpha=0.7)
     ax.set_axisbelow(True)
+    ax.tick_params(axis="x", labelsize=10)
+    ax.tick_params(axis="y", labelsize=10)
+
+
+def _metric_pval_column(metric: str) -> str | None:
+    if metric.startswith("AUC"):
+        return "AUC_p_value"
+    if metric.startswith("Brier"):
+        return "Brier_p_value"
+    return None
+
+
+def _best_method(df: pd.DataFrame, metric: str) -> str:
+    ascending = metric.startswith("Brier")
+    return df.sort_values(metric, ascending=ascending).iloc[0]["Method"]
 
 
 def _load_seeded_metrics(sim: str) -> pd.DataFrame:
@@ -100,14 +117,78 @@ def load_pvalues() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def _plot_metric_summary(df: pd.DataFrame, metric: str, out_path: Path, title: str) -> None:
+def _plot_metric_summary(
+    df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    pvals_df: pd.DataFrame,
+    metric: str,
+    out_path: Path,
+    title: str,
+) -> None:
     if df.empty or metric not in df.columns:
         return
     _apply_plot_style()
-    df = df.sort_values(metric, ascending=False if metric == "AUC_overall" else True)
+    df = df.sort_values(metric, ascending=metric.startswith("Brier"))
     fig, ax = plt.subplots(figsize=(10, max(5, len(df) * 0.6)))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(df)))
-    ax.bar(df["Method"], df[metric], color=colors, edgecolor="#333333", linewidth=0.6)
+    palette = [
+        "#3e6b8a",
+        "#d87b5a",
+        "#8b6f93",
+        "#4d8c57",
+        "#d0a44b",
+        "#6a88a5",
+        "#b95c7f",
+        "#7f9f6b",
+        "#c06e4d",
+        "#5b7d8a",
+    ]
+    colors = [palette[i % len(palette)] for i in range(len(df))]
+    bars = ax.bar(df["Method"], df[metric], color=colors, edgecolor="#2a2a2a", linewidth=0.7)
+    method_order = df["Method"].tolist()
+    if not raw_df.empty and metric in raw_df.columns:
+        rng = np.random.default_rng(42)
+        for idx, method in enumerate(method_order):
+            vals = raw_df.loc[raw_df["Method"] == method, metric].dropna().to_numpy()
+            if vals.size == 0:
+                continue
+            jitter = rng.uniform(-0.18, 0.18, size=vals.size)
+            ax.scatter(
+                np.full(vals.size, idx) + jitter,
+                vals,
+                color="#141414",
+                alpha=0.55,
+                s=26,
+                linewidth=0.4,
+                edgecolors="#f7f6f2",
+                zorder=3,
+            )
+    best_method = _best_method(df, metric)
+    if not pvals_df.empty:
+        col = _metric_pval_column(metric)
+        if col in pvals_df.columns:
+            for idx, method in enumerate(method_order):
+                if method == best_method:
+                    continue
+                p_row = pvals_df[
+                    ((pvals_df["Method_1"] == best_method) & (pvals_df["Method_2"] == method))
+                    | ((pvals_df["Method_2"] == best_method) & (pvals_df["Method_1"] == method))
+                ]
+                if p_row.empty:
+                    continue
+                pval = p_row.iloc[0][col]
+                if pd.isna(pval):
+                    continue
+                bar_height = bars[idx].get_height()
+                ax.text(
+                    idx,
+                    bar_height + (0.02 if metric.startswith("AUC") else 0.002),
+                    f"p={pval:.3g}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    fontweight="bold" if pval < 0.05 else "normal",
+                    color="#2a2a2a",
+                )
     ax.set_ylabel(metric.replace("_", " "))
     ax.set_title(title, fontweight="bold")
     _style_axes(ax)
@@ -152,8 +233,17 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
 
     _apply_plot_style()
     fig, ax = plt.subplots(figsize=(14, max(6, len(training_order) * len(sims) * 0.5)))
-    colors = plt.get_cmap("tab10")
-    app_color = {app: colors(i % 10) for i, app in enumerate(app_methods)}
+    palette = [
+        "#3e6b8a",
+        "#d87b5a",
+        "#8b6f93",
+        "#4d8c57",
+        "#d0a44b",
+        "#6a88a5",
+        "#b95c7f",
+        "#7f9f6b",
+    ]
+    app_color = {app: palette[i % len(palette)] for i, app in enumerate(app_methods)}
 
     position_map: dict[tuple[str, str, str], float] = {}
     height_map: dict[tuple[str, str, str], float] = {}
@@ -170,6 +260,40 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
         ax.bar(x_pos, auc, width=bar_width, color=app_color[app], label=app)
         position_map[(train, sim, app)] = x_pos
         height_map[(train, sim, app)] = auc
+    # Overlay per-seed points (jittered)
+    raw_frames = []
+    for sim in SIM_NAMES:
+        raw = _load_seeded_metrics(sim)
+        if raw.empty:
+            continue
+        raw = raw.copy()
+        raw["Simulation"] = sim
+        raw_frames.append(raw)
+    if raw_frames:
+        raw_all = pd.concat(raw_frames, ignore_index=True)
+        raw_all["TrainingMethod"] = raw_all["Method"].str.split(" + ", n=1, regex=False).str[0]
+        raw_all["ApplicationMethod"] = raw_all["Method"].str.split(" + ", n=1, regex=False).str[1]
+        rng = np.random.default_rng(42)
+        for (train, sim, app), x_pos in position_map.items():
+            vals = raw_all.loc[
+                (raw_all["TrainingMethod"] == train)
+                & (raw_all["Simulation"] == sim)
+                & (raw_all["ApplicationMethod"] == app),
+                "AUC_overall",
+            ].dropna().to_numpy()
+            if vals.size == 0:
+                continue
+            jitter = rng.uniform(-bar_width * 0.35, bar_width * 0.35, size=vals.size)
+            ax.scatter(
+                np.full(vals.size, x_pos) + jitter,
+                vals,
+                color="#141414",
+                alpha=0.55,
+                s=18,
+                linewidth=0.4,
+                edgecolors="#f7f6f2",
+                zorder=3,
+            )
 
     # Build x tick labels at simulation group centers
     tick_positions = []
@@ -275,27 +399,33 @@ def main() -> None:
     metrics = load_metrics()
     if not metrics.empty:
         metrics.to_csv("all_methods_metrics.tsv", sep="\t", index=False)
+    pvals = load_pvalues()
 
     # Per-simulation mean plots
     for sim in SIM_NAMES:
         sim_df = metrics[metrics["Simulation"] == sim] if not metrics.empty else pd.DataFrame()
         if sim_df.empty:
             continue
+        raw_df = _load_seeded_metrics(sim)
+        pvals_df = pvals[pvals["Simulation"] == sim] if not pvals.empty else pd.DataFrame()
         _plot_metric_summary(
             sim_df,
+            raw_df,
+            pvals_df,
             "AUC_overall",
             Path(f"{sim}_comparison_auc.png"),
             f"AUC Summary - Simulation {sim} (mean over seeds)",
         )
         _plot_metric_summary(
             sim_df,
+            raw_df,
+            pvals_df,
             "Brier_overall",
             Path(f"{sim}_comparison_brier.png"),
             f"Brier Summary - Simulation {sim} (mean over seeds)",
         )
 
     # Aggregate overview plot (no p-values when averaging across seeds)
-    pvals = load_pvalues()
     if not pvals.empty:
         plot_auc_summary(metrics, pvals, Path("all_methods_pvalues.png"))
     else:

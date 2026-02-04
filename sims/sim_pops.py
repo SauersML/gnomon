@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -643,6 +644,18 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     print(f"[{cfg.sim_prefix}] Done.")
 
 
+def _final_outputs_exist(sim_prefix: str) -> bool:
+    required = [
+        f"{sim_prefix}.tsv",
+        f"{sim_prefix}_sites.npz",
+        f"{sim_prefix}_pcs.png",
+        f"{sim_prefix}.bed",
+        f"{sim_prefix}.bim",
+        f"{sim_prefix}.fam",
+    ]
+    return all(os.path.exists(p) for p in required)
+
+
 def main() -> None:
     if len(sys.argv) not in (2, 3):
         raise SystemExit("Usage: python sims/sim_pops.py <confounding|portability> [seed]")
@@ -667,6 +680,11 @@ def main() -> None:
         sites=base_cfg.sites,
         msprime_recent_gens=base_cfg.msprime_recent_gens,
     )
+
+    if os.environ.get("SIM_FORCE", "").lower() not in ("1", "true", "yes"):
+        if _final_outputs_exist(cfg.sim_prefix):
+            print(f"[{cfg.sim_prefix}] Cached outputs found. Skipping simulation.")
+            return
 
     _simulate_dataset(cfg)
     
