@@ -321,3 +321,126 @@ jobs:
             summary.md
             all_methods_metrics.tsv
             all_methods_pvalues.png
+
+  # ------------------------------------------------------------------
+  # JOB 5: TWO-POP SIMS (divergence, bottleneck)
+  # ------------------------------------------------------------------
+  two_pop_simulate_train_eval:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sim_name: [divergence, bottleneck]
+        divergence_gens: [0, 20, 50, 100, 500, 1000, 5000, 10000]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up R for GAM
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+
+      - name: Install Python Dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+          uv pip install --system rpy2
+
+      - name: Install R GAM package
+        run: |
+          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+
+      - name: Install Plink2
+        run: |
+          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
+          unzip plink2.zip
+          sudo mv plink2 /usr/local/bin/
+          rm plink2.zip
+
+      - name: Install GCTB (BayesR)
+        run: |
+          mkdir -p gctb_bin
+          wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
+          unzip gctb_2.03beta_Linux.zip -d gctb_bin
+          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
+          chmod +x /usr/local/bin/gctb
+
+      - name: Install gnomon (binary release)
+        run: |
+          bash install.sh
+
+      - name: Run simulation
+        run: |
+          python sims/sim_two_pop.py ${{ matrix.sim_name }} ${{ matrix.divergence_gens }}
+
+      - name: Split data
+        run: |
+          python sims/split_data.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}
+
+      - name: Train BayesR
+        run: |
+          python sims/train_model.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }} BayesR
+
+      - name: Evaluate calibration methods
+        run: |
+          python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}
+          path: |
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_roc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_calibration.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_auc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_pcs.png
+          if-no-files-found: error
+
+  two_pop_plot_auc:
+    needs: two_pop_simulate_train_eval
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          pip install uv
+          uv pip install --system pandas matplotlib
+
+      - name: Download metrics artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: two-pop-*
+          path: .
+          merge-multiple: true
+
+      - name: Build divergence/bottleneck AUC plot
+        run: |
+          python sims/plot_divergence_auc.py --method "BayesR + Raw"
+
+      - name: Build two-pop PC mega plot
+        run: |
+          python sims/plot_two_pop_pcs_grid.py
+
+      - name: Upload AUC plot
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-pop-auc-plot
+          path: |
+            divergence_bottleneck_auc.csv
+            divergence_bottleneck_auc.png
+            two_pop_pcs_mega.png
+          if-no-files-found: error
