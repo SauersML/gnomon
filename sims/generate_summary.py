@@ -8,6 +8,7 @@ import sys
 import os
 from pathlib import Path
 import pandas as pd
+import glob
 
 
 def generate_summary_report():
@@ -75,6 +76,10 @@ def generate_summary_report():
         
         # Population structure plot (if available in this job's workspace)
         pc_plot = Path(f"{sim_name}_pcs.png")
+        if not pc_plot.exists():
+            candidates = sorted(glob.glob(f"{sim_name}_s*_pcs.png"))
+            if candidates:
+                pc_plot = Path(candidates[0])
         if pc_plot.exists():
             lines.append("### Population Structure")
             lines.append("")
@@ -83,6 +88,10 @@ def generate_summary_report():
         
         # Add metrics table
         metrics_file = Path(f"{sim_name}_metrics.csv")
+        if not metrics_file.exists():
+            candidates = sorted(glob.glob(f"{sim_name}_s*_metrics.csv"))
+            if candidates:
+                metrics_file = Path(candidates[0])
         if metrics_file.exists():
             lines.append("### Performance Metrics")
             lines.append("")
@@ -102,10 +111,19 @@ def generate_summary_report():
         # Plots rendered inline if present
         lines.append("### Visualizations")
         lines.append("")
-        roc_plot = Path(f"{sim_name}_comparison_roc.png")
-        cal_plot = Path(f"{sim_name}_comparison_calibration.png")
-        auc_plot = Path(f"{sim_name}_comparison_auc.png")
-        brier_plot = Path(f"{sim_name}_comparison_brier.png")
+        def _pick_plot(name: str) -> Path:
+            primary = Path(name)
+            if primary.exists():
+                return primary
+            candidates = sorted(glob.glob(name.replace(f"{sim_name}_", f"{sim_name}_s*_")))
+            if candidates:
+                return Path(candidates[0])
+            return primary
+
+        roc_plot = _pick_plot(f"{sim_name}_comparison_roc.png")
+        cal_plot = _pick_plot(f"{sim_name}_comparison_calibration.png")
+        auc_plot = _pick_plot(f"{sim_name}_comparison_auc.png")
+        brier_plot = _pick_plot(f"{sim_name}_comparison_brier.png")
         if roc_plot.exists():
             lines.append(f"![Simulation {sim_name} ROC Curves]({roc_plot.as_posix()})")
             lines.append("")

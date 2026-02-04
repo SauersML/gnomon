@@ -47,6 +47,7 @@ class SiteSelectionSpec:
 @dataclass(frozen=True)
 class SimulationConfig:
     sim_name: str
+    sim_prefix: str
     seed: int
     samples: Dict[str, int]  # population_name -> number of diploids
     genome: GenomeSpec
@@ -66,6 +67,7 @@ SIM_CONFIGS: Dict[str, SimulationConfig] = {
     # Simulation 1: Ancestry confounding - signal preservation when mean liability shifts with ancestry (PC)
     "confounding": SimulationConfig(
         sim_name="confounding",
+        sim_prefix="confounding",
         seed=101,
         samples={"AFR": 1300, "EUR": 1300, "ASIA": 1300, "ADMIX": 1300},
         genome=GENOME,
@@ -78,6 +80,7 @@ SIM_CONFIGS: Dict[str, SimulationConfig] = {
     # EUR is 5x each other ancestry so that 20% EUR test ~= each other ancestry size.
     "portability": SimulationConfig(
         sim_name="portability",
+        sim_prefix="portability",
         seed=303,
         samples={"AFR": 700, "EUR": 3500, "ASIA": 700, "ADMIX": 700},
         genome=GENOME,
@@ -436,17 +439,17 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
       6) generate P_observed and y according to sim 1/2/3
       7) write outputs
     """
-    print(f"[{cfg.sim_name}] Simulating stdpopsim/msprime tree sequence for full {cfg.genome.contig_id} ...")
+    print(f"[{cfg.sim_prefix}] Simulating stdpopsim/msprime tree sequence for full {cfg.genome.contig_id} ...")
     ts, model, contig = _simulate_tree_sequence(cfg)
-    print(f"[{cfg.sim_name}] Done. ts.num_samples={ts.num_samples}, ts.num_sites={ts.num_sites}")
+    print(f"[{cfg.sim_prefix}] Done. ts.num_samples={ts.num_samples}, ts.num_sites={ts.num_sites}")
 
     a_idx, b_idx, pop_idx, ts_ind_id = _diploid_index_pairs(ts)
     n_ind = int(a_idx.shape[0])
-    print(f"[{cfg.sim_name}] Diploids={n_ind} (from {len(cfg.samples)} populations)")
+    print(f"[{cfg.sim_prefix}] Diploids={n_ind} (from {len(cfg.samples)} populations)")
 
     # --- Select sites for PCA and causal effects (streaming, memory-safe) ---
     # Separate seeds so design components don't unintentionally couple.
-    print(f"[{cfg.sim_name}] Selecting PCA sites (n={cfg.pc.n_pca_sites}, maf>={cfg.pc.maf_min}) ...")
+    print(f"[{cfg.sim_prefix}] Selecting PCA sites (n={cfg.pc.n_pca_sites}, maf>={cfg.pc.maf_min}) ...")
     pca_site_ids = _reservoir_sample_sites_for_diploids(
         ts=ts,
         a_idx=a_idx,
@@ -457,7 +460,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     )
 
     n_causal_req = min(cfg.trait.n_causal, max(1, int(ts.num_sites)))
-    print(f"[{cfg.sim_name}] Selecting causal sites (n={n_causal_req}, maf>={cfg.sites.maf_min_causal}) ...")
+    print(f"[{cfg.sim_prefix}] Selecting causal sites (n={n_causal_req}, maf>={cfg.sites.maf_min_causal}) ...")
     causal_site_ids = _reservoir_sample_sites_for_diploids(
         ts=ts,
         a_idx=a_idx,
@@ -469,12 +472,12 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
 
     # --- Compute PCs ---
     N_PCS = 20  # Compute 20 PCs for use as BayesR covariates
-    print(f"[{cfg.sim_name}] Computing {N_PCS} PCs with scikit-learn PCA (features={len(pca_site_ids)}) ...")
+    print(f"[{cfg.sim_prefix}] Computing {N_PCS} PCs with scikit-learn PCA (features={len(pca_site_ids)}) ...")
     pcs = _compute_pcs_from_sites(ts, a_idx, b_idx, pca_site_ids, seed=cfg.seed + 23, n_components=N_PCS)
     pc1 = pcs[0] # Keep pc1 handy for simulation logic
 
     # --- Compute true genetic component ---
-    print(f"[{cfg.sim_name}] Building G_true from {len(causal_site_ids)} causal sites ...")
+    print(f"[{cfg.sim_prefix}] Building G_true from {len(causal_site_ids)} causal sites ...")
     G_true, causal_betas, causal_pos = _make_genetic_component(
         ts=ts,
         a_idx=a_idx,
@@ -578,15 +581,15 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
         rows.append(base)
 
     # --- Write outputs ---
-    trees_path = f"{cfg.sim_name}.trees"
-    tsv_path = f"{cfg.sim_name}.tsv"
-    vcf_path = f"{cfg.sim_name}.vcf"
-    npz_path = f"{cfg.sim_name}_sites.npz"
+    trees_path = f"{cfg.sim_prefix}.trees"
+    tsv_path = f"{cfg.sim_prefix}.tsv"
+    vcf_path = f"{cfg.sim_prefix}.vcf"
+    npz_path = f"{cfg.sim_prefix}_sites.npz"
 
-    print(f"[{cfg.sim_name}] Writing {trees_path} ...")
+    print(f"[{cfg.sim_prefix}] Writing {trees_path} ...")
     ts.dump(trees_path)
 
-    print(f"[{cfg.sim_name}] Writing {vcf_path} (for PLINK conversion) ...")
+    print(f"[{cfg.sim_prefix}] Writing {vcf_path} (for PLINK conversion) ...")
     # Generate individual names matching TSV individual_id so PLINK filtering works
     # PLINK2 doesn't allow sample ID '0', so we use 1-indexed IDs: "ind_1", "ind_2", etc.
     individual_names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
@@ -596,8 +599,8 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     # --- Extract Genetic Map for Consistency ---
     # stdpopsim/msprime used a specific map (GRCh38). We must export this so downstream tools
     # use the EXACT same map, rather than approximating it from GRCh37.
-    map_path = f"{cfg.sim_name}.cm"
-    print(f"[{cfg.sim_name}] Writing {map_path} (Variant ID -> cM) ...")
+    map_path = f"{cfg.sim_prefix}.cm"
+    print(f"[{cfg.sim_prefix}] Writing {map_path} (Variant ID -> cM) ...")
     
     # contig.recombination_map is an msprime.RateMap
     # get_cumulative_mass(x) returns mass in Morgans. Convert to cM.
@@ -615,10 +618,10 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
             f.write(f"{int(pos)}\t{cm:.6f}\n")
 
 
-    print(f"[{cfg.sim_name}] Writing {tsv_path} ...")
+    print(f"[{cfg.sim_prefix}] Writing {tsv_path} ...")
     _write_tsv(tsv_path, header, rows)
 
-    print(f"[{cfg.sim_name}] Writing {npz_path} (reproducibility: causal + PCA site IDs) ...")
+    print(f"[{cfg.sim_prefix}] Writing {npz_path} (reproducibility: causal + PCA site IDs) ...")
     np.savez_compressed(
         npz_path,
         causal_site_id=np.asarray(causal_site_ids, dtype=np.int64),
@@ -633,39 +636,54 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     )
 
     # --- Generate PC plot ---
-    plot_path = f"{cfg.sim_name}_pcs.png"
-    print(f"[{cfg.sim_name}] Plotting PC1 vs PC2 -> {plot_path} ...")
+    plot_path = f"{cfg.sim_prefix}_pcs.png"
+    print(f"[{cfg.sim_prefix}] Plotting PC1 vs PC2 -> {plot_path} ...")
     _plot_pcs(pcs[0], pcs[1], pop_labels, plot_path)
 
-    print(f"[{cfg.sim_name}] Done.")
+    print(f"[{cfg.sim_prefix}] Done.")
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("Provide exactly one argument: confounding or portability.")
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit("Usage: python sims/sim_pops.py <confounding|portability> [seed]")
 
     which = sys.argv[1].strip().lower()
-    if which in SIM_CONFIGS:
-        cfg = SIM_CONFIGS[which]
-    else:
+    if which not in SIM_CONFIGS:
         raise SystemExit("Unknown simulation. Use 'confounding' or 'portability'.")
+
+    seed = int(sys.argv[2]) if len(sys.argv) == 3 else None
+    base_cfg = SIM_CONFIGS[which]
+    final_seed = seed if seed is not None else base_cfg.seed
+    sim_prefix = which if seed is None else f"{which}_s{final_seed}"
+
+    cfg = SimulationConfig(
+        sim_name=base_cfg.sim_name,
+        sim_prefix=sim_prefix,
+        seed=final_seed,
+        samples=base_cfg.samples,
+        genome=base_cfg.genome,
+        trait=base_cfg.trait,
+        pc=base_cfg.pc,
+        sites=base_cfg.sites,
+        msprime_recent_gens=base_cfg.msprime_recent_gens,
+    )
 
     _simulate_dataset(cfg)
     
     # Convert to PLINK format and inject the correct genetic map
     from plink_utils import run_plink_conversion
-    run_plink_conversion(f"{cfg.sim_name}.vcf", cfg.sim_name, cm_map_path=f"{cfg.sim_name}.cm")
+    run_plink_conversion(f"{cfg.sim_prefix}.vcf", cfg.sim_prefix, cm_map_path=f"{cfg.sim_prefix}.cm")
 
     # Cleanup intermediate files to save space
     import os
     # Clean up large intermediate files (fail hard if deletion fails)
-    if os.path.exists(f"{cfg.sim_name}.trees"):
-        os.remove(f"{cfg.sim_name}.trees")
-    if os.path.exists(f"{cfg.sim_name}.vcf"):
-        os.remove(f"{cfg.sim_name}.vcf")
-    if os.path.exists(f"{cfg.sim_name}.cm"):
-        os.remove(f"{cfg.sim_name}.cm")
-    print(f"[{cfg.sim_name}] Cleaned up intermediate files (.trees, .vcf, .cm).")
+    if os.path.exists(f"{cfg.sim_prefix}.trees"):
+        os.remove(f"{cfg.sim_prefix}.trees")
+    if os.path.exists(f"{cfg.sim_prefix}.vcf"):
+        os.remove(f"{cfg.sim_prefix}.vcf")
+    if os.path.exists(f"{cfg.sim_prefix}.cm"):
+        os.remove(f"{cfg.sim_prefix}.cm")
+    print(f"[{cfg.sim_prefix}] Cleaned up intermediate files (.trees, .vcf, .cm).")
 
 
 if __name__ == "__main__":

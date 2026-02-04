@@ -17,6 +17,13 @@ def _resolve_sim_prefix(sim_arg: str) -> str:
         return sim_arg
     raise FileNotFoundError(f"Simulation TSV not found: {sim_arg}.tsv")
 
+def _base_sim_name(sim_prefix: str) -> str:
+    sim_prefix = sim_prefix.strip()
+    for base in ("confounding", "portability"):
+        if sim_prefix == base or sim_prefix.startswith(f"{base}_s"):
+            return base
+    return sim_prefix
+
 def setup_directories(sim_arg):
     """Create work directories."""
     work_dir = Path(f"{sim_arg}_work")
@@ -52,7 +59,7 @@ def split_data(sim_arg, work_dir):
     )
     fam_iid_set = set(fam["IID"].astype(str).tolist())
     
-    sim_name = sim_prefix
+    sim_name = _base_sim_name(sim_prefix)
     if sim_name == "confounding":
         # Train on all ancestries, 80/20 split overall.
         train_idx, test_idx = train_test_split(df.index.to_numpy(), test_size=0.2, random_state=42)

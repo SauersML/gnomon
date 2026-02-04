@@ -31,6 +31,7 @@ jobs:
     strategy:
       matrix:
         sim_name: [confounding, portability]
+        seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -43,16 +44,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            ${{ matrix.sim_name }}_work/
-            ${{ matrix.sim_name }}.tsv
-            ${{ matrix.sim_name }}.bed
-            ${{ matrix.sim_name }}.bim
-            ${{ matrix.sim_name }}.fam
-            ${{ matrix.sim_name }}_sites.npz
-            ${{ matrix.sim_name }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
+          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
           restore-keys: |
-            sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-
+            sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-
 
       - name: Cache status
         run: |
@@ -80,12 +81,12 @@ jobs:
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "Running Simulation ${{ matrix.sim_name }}..."
-          python sims/sim_pops.py ${{ matrix.sim_name }}
+          echo "Running Simulation ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
+          python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }}
 
           # sim_pops.py now deletes .trees and .vcf automatically on success
           # Verify they are gone to save space
-          if [ -f "${{ matrix.sim_name }}.trees" ]; then
+          if [ -f "${{ matrix.sim_name }}_s${{ matrix.seed }}.trees" ]; then
             echo "Error: trees file was not deleted!"
             exit 1
           fi
@@ -94,33 +95,33 @@ jobs:
         if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          echo "Splitting Data for ${{ matrix.sim_name }}..."
-          python sims/split_data.py ${{ matrix.sim_name }}
+          echo "Splitting Data for ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
+          python sims/split_data.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
 
       - name: Save simulation cache
         if: ${{ always() && steps.sim-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
-            ${{ matrix.sim_name }}_work/
-            ${{ matrix.sim_name }}.tsv
-            ${{ matrix.sim_name }}.bed
-            ${{ matrix.sim_name }}.bim
-            ${{ matrix.sim_name }}.fam
-            ${{ matrix.sim_name }}_sites.npz
-            ${{ matrix.sim_name }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
+          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
 
       - name: Upload Simulation Data (Artifact Stream A)
         uses: actions/upload-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim_name }}
+          name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: |
-            ${{ matrix.sim_name }}_work/
-            ${{ matrix.sim_name }}.tsv
-            ${{ matrix.sim_name }}.bed
-            ${{ matrix.sim_name }}.bim
-            ${{ matrix.sim_name }}.fam
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
           if-no-files-found: error
           retention-days: 1
 
@@ -135,6 +136,7 @@ jobs:
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
         sim_name: [confounding, portability]
+        seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -159,7 +161,7 @@ jobs:
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim_name }}
+          name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: .
 
       # --- Method Specific Setup ---
@@ -178,14 +180,14 @@ jobs:
       - name: Train & Score ${{ matrix.method }}
         run: |
           set -e
-          echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }}..."
-          python sims/train_model.py ${{ matrix.sim_name }} ${{ matrix.method }}
+          echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
+          python sims/train_model.py ${{ matrix.sim_name }}_s${{ matrix.seed }} ${{ matrix.method }}
 
       - name: Upload Scores
         uses: actions/upload-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim_name }}-${{ matrix.method }}
-          path: ${{ matrix.sim_name }}_work/*.sscore
+          name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}
+          path: ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/*.sscore
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -198,6 +200,7 @@ jobs:
     strategy:
       matrix:
         sim_name: [confounding, portability]
+        seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -226,7 +229,7 @@ jobs:
       - name: Download Simulation Data
         uses: actions/download-artifact@v4
         with:
-          name: sim-data-${{ matrix.sim_name }}
+          name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: .
 
       - name: Download BayesR Scores
@@ -234,8 +237,8 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: model-scores-${{ matrix.sim_name }}-BayesR
-          path: ${{ matrix.sim_name }}_work/
+          name: model-scores-${{ matrix.sim_name }}-s${{ matrix.seed }}-BayesR
+          path: ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
           merge-multiple: true
 
 
@@ -248,16 +251,16 @@ jobs:
       - name: Calibration Analysis
         run: |
           set -e
-          echo "Running Evaluation for Sim ${{ matrix.sim_name }}..."
-          python sims/evaluate.py ${{ matrix.sim_name }}
+          echo "Running Evaluation for Sim ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
+          python sims/evaluate.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
 
       - name: Upload Results (Stream B)
         uses: actions/upload-artifact@v4
         with:
-          name: sim-results-${{ matrix.sim_name }}
+          name: sim-results-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: |
-            ${{ matrix.sim_name }}_metrics.csv
-            ${{ matrix.sim_name }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
           if-no-files-found: warn
 
   # ------------------------------------------------------------------
@@ -304,14 +307,14 @@ jobs:
           echo "PNG files:"
           ls -la *.png 2>/dev/null || echo "No PNG files found"
       
+      - name: Aggregate metrics & p-values
+        run: |
+          python sims/aggregate_results.py
+      
       - name: Generate consolidated summary
         run: |
           # Ensure generate_summary.py is robust to missing files if some jobs failed
           python sims/generate_summary.py
-
-      - name: Aggregate metrics & p-values
-        run: |
-          python sims/aggregate_results.py
 
       - name: Upload summary as artifact
         uses: actions/upload-artifact@v4

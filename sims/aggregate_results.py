@@ -5,6 +5,7 @@ and generate a combined AUC plot.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -37,15 +38,50 @@ def _style_axes(ax):
     ax.set_axisbelow(True)
 
 
+def _load_seeded_metrics(sim: str) -> pd.DataFrame:
+    seed_re = re.compile(rf"^{sim}_s(\d+)_metrics\.csv$")
+    paths = sorted(Path(".").glob(f"{sim}_s*_metrics.csv"))
+    if not paths:
+        legacy = Path(f"{sim}_metrics.csv")
+        if legacy.exists():
+            paths = [legacy]
+    frames = []
+    for path in paths:
+        df = pd.read_csv(path)
+        match = seed_re.match(path.name)
+        seed_val = int(match.group(1)) if match else None
+        df["Seed"] = seed_val
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _aggregate_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ("Seed",)]
+    agg = df.groupby("Method", as_index=False)[numeric_cols].mean()
+    if "Seed" in df.columns:
+        seed_counts = df.groupby("Method")["Seed"].nunique().reset_index(name="n_seeds")
+        agg = agg.merge(seed_counts, on="Method", how="left")
+    return agg
+
+
 def load_metrics() -> pd.DataFrame:
     frames = []
     for sim in SIM_NAMES:
-        path = Path(f"{sim}_metrics.csv")
-        if not path.exists():
+        df = _load_seeded_metrics(sim)
+        if df.empty:
             continue
-        df = pd.read_csv(path)
-        df.insert(0, "Simulation", sim)
-        frames.append(df)
+        agg = _aggregate_metrics(df)
+        if agg.empty:
+            continue
+        agg.insert(0, "Simulation", sim)
+        frames.append(agg)
+        # Write per-simulation mean metrics for downstream summary
+        agg.to_csv(f"{sim}_metrics.csv", index=False)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -62,6 +98,22 @@ def load_pvalues() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _plot_metric_summary(df: pd.DataFrame, metric: str, out_path: Path, title: str) -> None:
+    if df.empty or metric not in df.columns:
+        return
+    _apply_plot_style()
+    df = df.sort_values(metric, ascending=False if metric == "AUC_overall" else True)
+    fig, ax = plt.subplots(figsize=(10, max(5, len(df) * 0.6)))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(df)))
+    ax.bar(df["Method"], df[metric], color=colors, edgecolor="#333333", linewidth=0.6)
+    ax.set_ylabel(metric.replace("_", " "))
+    ax.set_title(title, fontweight="bold")
+    _style_axes(ax)
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200)
 
 
 def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> None:
@@ -224,8 +276,30 @@ def main() -> None:
     if not metrics.empty:
         metrics.to_csv("all_methods_metrics.tsv", sep="\t", index=False)
 
+    # Per-simulation mean plots
+    for sim in SIM_NAMES:
+        sim_df = metrics[metrics["Simulation"] == sim] if not metrics.empty else pd.DataFrame()
+        if sim_df.empty:
+            continue
+        _plot_metric_summary(
+            sim_df,
+            "AUC_overall",
+            Path(f"{sim}_comparison_auc.png"),
+            f"AUC Summary - Simulation {sim} (mean over seeds)",
+        )
+        _plot_metric_summary(
+            sim_df,
+            "Brier_overall",
+            Path(f"{sim}_comparison_brier.png"),
+            f"Brier Summary - Simulation {sim} (mean over seeds)",
+        )
+
+    # Aggregate overview plot (no p-values when averaging across seeds)
     pvals = load_pvalues()
-    plot_auc_summary(metrics, pvals, Path("all_methods_pvalues.png"))
+    if not pvals.empty:
+        plot_auc_summary(metrics, pvals, Path("all_methods_pvalues.png"))
+    else:
+        plot_auc_summary(metrics, pd.DataFrame(), Path("all_methods_pvalues.png"))
 
 
 if __name__ == "__main__":
