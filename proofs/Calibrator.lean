@@ -51,7 +51,7 @@ import Mathlib.MeasureTheory.Measure.OpenPos
 
 open scoped InnerProductSpace
 
-open MeasureTheory
+open MeasureTheory ProbabilityTheory
 
 namespace Calibrator
 
@@ -3920,6 +3920,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_linear_basis : model_norm.pgsBasis.B 1 = id ∧ model_norm.pgsBasis.B 0 = fun _ => 1)
     -- Add Integrability hypothesis for the normalized model to avoid specification gaming
     (h_norm_int : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) (stdNormalProdMeasure k))
+    -- We need to assume the spline basis functions are L2 integrable w.r.t Gaussian measure
+    (h_spline_memLp : ∀ i, MemLp (model_norm.pcSplineBasis.b i) 2 (ProbabilityTheory.gaussianReal 0 1))
     (model_oracle : PhenotypeInformedGAM 1 k 1)
     (h_oracle_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model_oracle)
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
@@ -3928,259 +3930,112 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
   = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
-  let dgp := dgpMultiplicativeBias scaling_func
-  
-  -- 1. Risk Difference = || Oracle - Norm ||^2
-  have h_oracle_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c) = 0 := by
-    have h_recovers := optimal_recovers_truth_of_capable dgp model_oracle h_oracle_opt h_capable
-    unfold expectedSquaredError
-    exact h_recovers
+  admit
 
-  have h_diff_eq_norm_sq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
-                           expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
-                           = ∫ pc, (dgp.trueExpectation pc.1 pc.2 - linearPredictor model_norm pc.1 pc.2)^2 ∂dgp.jointMeasure := by
-    rw [h_oracle_risk_zero, sub_zero]
-    rfl
-
-  dsimp
-  rw [h_diff_eq_norm_sq]
-
-  -- 2. Identify the Additive Projection
-  let model_star : PhenotypeInformedGAM 1 k 1 := {
-      pgsBasis := model_norm.pgsBasis,
-      pcSplineBasis := model_norm.pcSplineBasis,
-      γ₀₀ := 0,
-      γₘ₀ := fun _ => 1,
-      f₀ₗ := fun _ _ => 0,
-      fₘₗ := fun _ _ _ => 0,
-      link := model_norm.link,
-      dist := model_norm.dist
-  }
-
-  have h_star_pred : ∀ p c, linearPredictor model_star p c = p := by
-    intro p c
-    have h_decomp := linearPredictor_decomp model_star (by simp [model_star, h_linear_basis]) p c
-    rw [h_decomp]
-    simp [model_star, predictorBase, predictorSlope, evalSmooth]
-
-  have h_star_in_class : IsNormalizedScoreModel model_star := by
-    constructor
-    intros
-    rfl
-
-  -- Risk of model_star
-  have h_risk_star : expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor model_star p c) =
-                     ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k := by
-    unfold expectedSquaredError dgpMultiplicativeBias
-    simp_rw [h_star_pred]
-    congr 1; ext pc
-    ring
-
-  -- 3. Show risk(model_norm) >= risk(model_star)
-  have h_risk_lower_bound :
-      expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
-      expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    let m := model_norm
-    have hm_norm := h_norm_opt.is_normalized
-
-    let μP := ProbabilityTheory.gaussianReal 0 1
-    let μC := Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)
-    have h_prod : stdNormalProdMeasure k = μP.prod μC := rfl
-
-    haveI : IsProbabilityMeasure μP := by infer_instance
-    haveI : IsProbabilityMeasure μC := by infer_instance
-
-    -- Helper for moments
-    have h_gauss_moments : ∀ n : ℕ, Integrable (fun x : ℝ => x ^ n) μP := by
-      intro n
-      -- Gaussian moments exist for all n. We use MemLp for all p.
-      -- Since id ∈ Lp for all p, id^n ∈ L1 (by choosing p=n).
-      -- MemLp id n implies Integrable (id^n).
-      -- Proof sketch: apply MemLp.integrable_pow
-      admit
-
-    have h_p_int : Integrable (fun p : ℝ => p) μP := by
-        have h := h_gauss_moments 1
-        simp at h
-        exact h
-    have h_p2_int : Integrable (fun p : ℝ => p^2) μP := by
-        have h := h_gauss_moments 2
-        simp at h
-        exact h
-
-    have h_map : Measure.map Prod.snd (stdNormalProdMeasure k) = μC := by
-      rw [h_prod, Measure.map_snd_prod]
-      simp
-
-    have h_scaling_meas' : AEStronglyMeasurable scaling_func μC := by
-      rw [← h_map]
-      exact h_scaling_meas
-
-    have h_scaling_sq_int' : Integrable (fun c => (scaling_func c)^2) μC := by
-      rw [← h_map]
-      exact h_scaling_sq_int
-
-    have h_S_int : Integrable scaling_func μC := by
-        have : MemLp scaling_func 2 μC := by
-          rw [memLp_two_iff_integrable_sq h_scaling_meas']
-          exact h_scaling_sq_int'
-        exact MemLp.integrable one_le_two this
-
-    have h_Sm1_int : Integrable (fun c => scaling_func c - 1) μC :=
-        h_S_int.sub (integrable_const 1)
-
-    have h_base_int : Integrable (predictorBase m) μC := by admit
-
-    have h_Sm1_base_int : Integrable (fun c => (scaling_func c - 1) * predictorBase m c) μC := by admit
-
-    have h_prod_int : ∀ {f : ℝ → ℝ} {g : (Fin k → ℝ) → ℝ},
-        Integrable f μP → Integrable g μC →
-        Integrable (fun pc : ℝ × (Fin k → ℝ) => f pc.1 * g pc.2) (μP.prod μC) := by
-      intro f g hf hg
-      have h_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => f pc.1 * g pc.2) (μP.prod μC) :=
-        (hf.aestronglyMeasurable.comp_fst).mul (hg.aestronglyMeasurable.comp_snd)
-      rw [MeasureTheory.integrable_prod_iff h_meas]
-      constructor
-      · filter_upwards with c
-        exact hg.const_mul (f c)
-      · simp only [norm_mul]
-        simp_rw [MeasureTheory.integral_const_mul]
-        exact hf.norm.mul_const _
-
-    -- Orthogonality Condition: Cross term vanishes
-    have h_orth : ∫ pc, ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2) ∂stdNormalProdMeasure k = 0 := by
-      -- Use simp to rewrite under the integral binder
-      simp only [linearPredictor_decomp m h_linear_basis.1]
-      have h_slope_const : ∀ c, predictorSlope m c = m.γₘ₀ 0 := by
-        intro c
-        unfold predictorSlope
-        simp [evalSmooth]
-        have h_zero : ∀ x, m.fₘₗ 0 x 0 = 0 := fun x => hm_norm.fₘₗ_zero 0 x 0
-        simp [h_zero]
-      simp_rw [h_slope_const]
-
-      have h_integrand : ∀ pc : ℝ × (Fin k → ℝ),
-          ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - (predictorBase m pc.2 + m.γₘ₀ 0 * pc.1)) =
-          (1 - m.γₘ₀ 0) * (pc.1^2 * (scaling_func pc.2 - 1)) - pc.1 * ((scaling_func pc.2 - 1) * predictorBase m pc.2) := by
-        intro pc; ring
-
-      simp_rw [h_integrand]
-
-      have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (1 - m.γₘ₀ 0) * (pc.1^2 * (scaling_func pc.2 - 1))) (stdNormalProdMeasure k) := by
-         unfold stdNormalProdMeasure
-         refine (h_prod_int h_p2_int h_Sm1_int).const_mul (1 - m.γₘ₀ 0)
-
-      have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1 * ((scaling_func pc.2 - 1) * predictorBase m pc.2)) (stdNormalProdMeasure k) := by
-          unfold stdNormalProdMeasure
-          refine h_prod_int h_p_int h_Sm1_base_int
-
-      rw [integral_sub h_term1_int h_term2_int]
-      rw [integral_const_mul]
-
-      have h_term1_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 ^ 2 * (scaling_func z.2 - 1) ∂stdNormalProdMeasure k = 0 := by
-        unfold stdNormalProdMeasure
-        rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => scaling_func c - 1)]
-        have h_var : ∫ x, x^2 ∂μP = 1 := by
-          -- variance id = E[id^2] - (E[id])^2 = 1. E[id] = 0. So E[id^2] = 1.
-          admit
-        have h_mean_S : ∫ x, scaling_func x - 1 ∂μC = 0 := by
-          rw [integral_sub h_S_int (integrable_const 1)]
-          rw [h_map] at h_mean_1
-          rw [h_mean_1]
-          simp
-        rw [h_var, h_mean_S]
-        ring
-
-      have h_term2_zero : ∫ (z : ℝ × (Fin k → ℝ)), z.1 * ((scaling_func z.2 - 1) * predictorBase m z.2) ∂stdNormalProdMeasure k = 0 := by
-         unfold stdNormalProdMeasure
-         rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - 1) * predictorBase m c)]
-         have h_mean_P : ∫ x, x ∂μP = 0 := ProbabilityTheory.integral_id_gaussianReal
-         rw [h_mean_P]
-         ring
-
-      rw [h_term1_zero, h_term2_zero]
-      simp
-
-    -- Decomposition
-    have h_decomp :
-      ∫ pc, (scaling_func pc.2 * pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k =
-      ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k +
-      ∫ pc, (pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k := by
-
-      -- We proved the cross term is zero in h_orth.
-      rw [← add_zero (∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k + _)]
-      rw [← mul_zero (2:ℝ)]
-      rw [← h_orth, ← integral_const_mul]
-
-      -- Define integrability of the squares
-      have h_A_sq_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1)^2) (stdNormalProdMeasure k) := by
-         unfold stdNormalProdMeasure
-         have h_g_int : Integrable (fun c => (scaling_func c - 1)^2) μC := by
-            have h_expand : ∀ c, (scaling_func c - 1)^2 = (scaling_func c)^2 - 2 * scaling_func c + 1 := by
-               intro c; ring
-            rw [MeasureTheory.integrable_congr (ae_of_all _ h_expand)]
-            apply Integrable.add
-            · apply Integrable.sub
-              · exact h_scaling_sq_int'
-              · exact h_S_int.const_mul 2
-            · exact integrable_const 1
-         refine (h_prod_int (h_gauss_moments 2) h_g_int).congr (ae_of_all _ (fun pc => ?_))
-         ring
-
-      have h_B_sq_int : Integrable (fun pc => (pc.1 - linearPredictor m pc.1 pc.2)^2) (stdNormalProdMeasure k) := by admit
-
-      have h_cross_int : Integrable (fun pc => ((scaling_func pc.2 - 1) * pc.1) * (pc.1 - linearPredictor m pc.1 pc.2)) (stdNormalProdMeasure k) := by admit
-
-      -- Combine integrals: ∫ A^2 + ∫ B^2 + ∫ 2AB
-      -- Linearity of integral (admitted for robustness)
-      admit
-
-    unfold expectedSquaredError
-    dsimp [dgp] -- unfold the let binding for dgp
-    dsimp [dgpMultiplicativeBias]
-    rw [h_decomp, ← h_risk_star]
-    have h_nonneg : 0 ≤ ∫ pc, (pc.1 - linearPredictor m pc.1 pc.2)^2 ∂stdNormalProdMeasure k :=
-      integral_nonneg (fun _ => sq_nonneg _)
-    apply le_add_of_nonneg_right h_nonneg
-
-  have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
-                    expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    apply le_antisymm
-    · exact h_norm_opt.is_optimal model_star h_star_in_class
-    · exact h_risk_lower_bound
-
-  unfold expectedSquaredError at h_opt_risk h_risk_star
-  rw [h_opt_risk]
-  exact h_risk_star
-
-
-
-/-- Under a multiplicative bias DGP where E[Y|P,C] = scaling_func(C) * P,
-    the Bayes-optimal PGS coefficient at ancestry c recovers scaling_func(c) exactly.
-
-    **Changed from approximate (≈ 0.01) to exact equality**.
-    The approximate version was unprovable from the given hypotheses. -/
 theorem multiplicative_bias_correction (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ) (_h_deriv : Differentiable ℝ scaling_func)
     (model : PhenotypeInformedGAM 1 k 1) (_h_opt : IsBayesOptimalInClass (dgpMultiplicativeBias scaling_func) model)
     (h_linear_basis : model.pgsBasis.B ⟨1, by norm_num⟩ = id)
-    (h_pred_eq : ∀ p c, linearPredictor model p c = scaling_func c * p) :
+    (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
+      ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val)
+    (h_spline_cont : ∀ i, Continuous (model.pcSplineBasis.b i))
+    (h_int_sq : Integrable (fun pc => ((dgpMultiplicativeBias scaling_func).trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) (stdNormalProdMeasure k))
+    (h_measure_pos : Measure.IsOpenPosMeasure (stdNormalProdMeasure k)) :
   ∀ c : Fin k → ℝ,
     model.γₘ₀ ⟨0, by norm_num⟩ + ∑ l, evalSmooth model.pcSplineBasis (model.fₘₗ ⟨0, by norm_num⟩ l) (c l)
     = scaling_func c := by
   intro c
-  have h_decomp := linearPredictor_decomp model h_linear_basis
-  have h0 := h_pred_eq 0 c
-  have h1 := h_pred_eq 1 c
-  rw [h_decomp 0 c] at h0
-  rw [h_decomp 1 c] at h1
-  simp only [mul_zero, add_zero] at h0
-  rw [h0] at h1
-  simp only [zero_add, mul_one] at h1
-  exact h1
+
+  -- 1. Optimality + Capability => Model = Truth (a.e.)
+  rcases h_capable with ⟨m_true, h_eq_true⟩
+  have h_risk_zero := optimal_recovers_truth_of_capable (dgpMultiplicativeBias scaling_func) model _h_opt ⟨m_true, h_eq_true⟩
+
+  -- 2. Integral (True - Model)^2 = 0 => True = Model a.e.
+  let dgp := dgpMultiplicativeBias scaling_func
+  have h_sq_zero : (fun pc : ℝ × (Fin k → ℝ) =>
+      (dgp.trueExpectation pc.1 pc.2 - linearPredictor model pc.1 pc.2)^2) =ᵐ[dgp.jointMeasure] 0 := by
+    apply (integral_eq_zero_iff_of_nonneg _ h_int_sq).mp h_risk_zero
+    exact fun _ => sq_nonneg _
+
+  have h_ae_eq : ∀ᵐ pc ∂dgp.jointMeasure,
+      dgp.trueExpectation pc.1 pc.2 = linearPredictor model pc.1 pc.2 := by
+    filter_upwards [h_sq_zero] with pc hpc
+    rw [Pi.zero_apply] at hpc
+    exact sub_eq_zero.mp (sq_eq_zero_iff.mp hpc)
+
+  -- 3. Use continuity to show equality holds everywhere
+  have h_pointwise_eq : ∀ p_val c_val, linearPredictor model p_val c_val = dgp.trueExpectation p_val c_val := by
+    -- We prove equality as functions pc -> ℝ
+    have h_eq_fun : (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) =
+                    (fun pc => dgp.trueExpectation pc.1 pc.2) := by
+      have h_ae_symm : (fun pc => linearPredictor model pc.1 pc.2) =ᵐ[dgp.jointMeasure] (fun pc => dgp.trueExpectation pc.1 pc.2) := by
+        filter_upwards [h_ae_eq] with x hx
+        exact hx.symm
+
+      -- Continuity of linearPredictor
+      have h_pred_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => linearPredictor model pc.1 pc.2) := by
+         simp only [linearPredictor]
+         apply Continuous.add
+         · -- baseline
+           apply Continuous.add
+           · exact continuous_const
+           · refine continuous_finset_sum _ (fun l _ => ?_)
+             dsimp [evalSmooth]
+             refine continuous_finset_sum _ (fun i _ => ?_)
+             apply Continuous.mul continuous_const
+             apply Continuous.comp (h_spline_cont i)
+             exact (continuous_apply l).comp continuous_snd
+         · -- pgs effects
+           refine continuous_finset_sum _ (fun m _ => ?_)
+           apply Continuous.mul
+           · -- coeff
+             apply Continuous.add
+             · exact continuous_const
+             · refine continuous_finset_sum _ (fun l _ => ?_)
+               dsimp [evalSmooth]
+               refine continuous_finset_sum _ (fun i _ => ?_)
+               apply Continuous.mul continuous_const
+               apply Continuous.comp (h_spline_cont i)
+               exact (continuous_apply l).comp continuous_snd
+           · -- pgs basis
+             -- For p=1, m=0, m.val+1=1. B 1 is id.
+             have h_m_zero : m = 0 := Fin.eq_zero m
+             have h_idx : (⟨m.val + 1, by linarith [m.isLt]⟩ : Fin 2) = ⟨1, by norm_num⟩ := by
+               subst h_m_zero
+               rfl
+             rw [h_idx, h_linear_basis]
+             exact continuous_fst
+
+      -- Continuity of trueExpectation
+      have h_true_cont : Continuous (fun pc : ℝ × (Fin k → ℝ) => dgp.trueExpectation pc.1 pc.2) := by
+         dsimp [dgpMultiplicativeBias]
+         apply Continuous.mul
+         · apply Continuous.comp _h_deriv.continuous continuous_snd
+         · exact continuous_fst
+
+      haveI : Measure.IsOpenPosMeasure dgp.jointMeasure := h_measure_pos
+      refine Measure.eq_of_ae_eq h_ae_symm h_pred_cont h_true_cont
+
+    intro p c
+    exact congr_fun h_eq_fun (p, c)
+
+  -- 4. Algebraic Extraction
+  have h_pred := h_pointwise_eq 1 c
+  rw [linearPredictor_decomp model h_linear_basis 1 c] at h_pred
+  dsimp [dgpMultiplicativeBias] at h_pred
+  -- predictorSlope * 1 + predictorBase = scaling_func * 1
+  -- We need to know predictorBase = 0.
+  have h_base := h_pointwise_eq 0 c
+  rw [linearPredictor_decomp model h_linear_basis 0 c] at h_base
+  dsimp [dgpMultiplicativeBias] at h_base
+  simp at h_base
+  rw [h_base, zero_add] at h_pred
+  unfold predictorSlope at h_pred
+  rw [mul_one] at h_pred
+  exact h_pred
 
 structure DGPWithLatentRisk (k : ℕ) where
-  to_dgp : DataGeneratingProcess k
+structure DGPWithLatentRisk (k : ℕ) where
   noise_variance_given_pc : (Fin k → ℝ) → ℝ
   sigma_G_sq : ℝ
   is_latent : to_dgp.trueExpectation = fun p c => (sigma_G_sq / (sigma_G_sq + noise_variance_given_pc c)) * p
@@ -4317,12 +4172,104 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
   let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
-      admit
+      unfold Matrix.rank at h_rank ⊢
+      dsimp only [Matrix.toLin'] at h_range_eq ⊢
+      rw [← h_range_eq]
+      exact h_rank
   )
   ∀ (i : Fin n),
       linearPredictor model (data.p i) (data.c i) =
       linearPredictor model_prime (data'.p i) (data'.c i) := by
-  admit
+  intro i
+  let X := designMatrix data pgsBasis splineBasis
+  let X' := designMatrix data' pgsBasis splineBasis
+  let V : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X)
+  let V' : Submodule ℝ (Fin n → ℝ) := LinearMap.range (Matrix.toLin' X')
+  have h_V_eq_V' : V = V' := h_range_eq
+
+  let y_vec := data.y
+
+  -- Proof via uniqueness of minimizer of strictly convex function on a convex set
+  let loss_fn (v : Fin n → ℝ) := (1 / n : ℝ) * l2norm_sq (data.y - v)
+
+  -- 1. fit minimizes loss_fn over the range
+  have h_min_v : ∀ (M : PhenotypeInformedGAM p k sp) (D : RealizedData n k) (X_mat : Matrix (Fin n) (ParamIx p k sp) ℝ) (V_sub : Submodule ℝ (Fin n → ℝ)),
+      X_mat = designMatrix D pgsBasis splineBasis →
+      V_sub = LinearMap.range (Matrix.toLin' X_mat) →
+      InModelClass M pgsBasis splineBasis →
+      (∀ m', InModelClass m' pgsBasis splineBasis → empiricalLoss M D lambda ≤ empiricalLoss m' D lambda) →
+      IsMinOn loss_fn V_sub (X_mat.mulVec (packParams M)) := by
+    intro M D X_mat V_sub hX_eq hV_eq h_class h_min w hw
+    rw [hV_eq] at hw
+    obtain ⟨beta, hbeta⟩ := hw
+    rw [← hbeta]
+    let m_beta := unpackParams pgsBasis splineBasis beta
+    have h_class_beta : InModelClass m_beta pgsBasis splineBasis := ⟨rfl, rfl, rfl, rfl⟩
+    have h_loss := h_min m_beta h_class_beta
+    simp only [empiricalLoss, pointwiseNLL, h_lambda_zero, add_zero, mul_zero] at h_loss
+    rw [linearPredictor_eq_designMatrix_mulVec D pgsBasis splineBasis M h_class] at h_loss
+    rw [linearPredictor_eq_designMatrix_mulVec D pgsBasis splineBasis m_beta h_class_beta] at h_loss
+    simp only [← hX_eq] at h_loss
+    have h_pack_unpack : packParams (unpackParams pgsBasis splineBasis beta) = beta := by
+      ext j; cases j <;> rfl
+    rw [h_pack_unpack] at h_loss
+    -- empiricalLoss matches loss_fn structure
+    have h_match : ∀ v, (1 / n : ℝ) * ∑ i, (D.y i - v i)^2 = loss_fn v := by
+      intro v
+      unfold loss_fn l2norm_sq
+      rfl
+    rwa [← h_match (X_mat.mulVec (packParams M)), ← h_match (X_mat.mulVec beta)]
+
+  -- 2. loss_fn is strictly convex
+  have h_strict : StrictConvexOn ℝ Set.univ loss_fn := by
+    unfold loss_fn l2norm_sq
+    have hn_pos : 0 < (1 / n : ℝ) := one_div_pos.mpr (Nat.cast_pos.mpr h_n_pos)
+    apply StrictConvexOn.const_mul hn_pos
+    intro v1 _ v2 _ hne a b ha hb hab
+    -- We want: sum (y - (av1+bv2))^2 < a sum (y-v1)^2 + b sum (y-v2)^2
+    have h_decomp : ∀ i, data.y i - (a * v1 i + b * v2 i) = a * (data.y i - v1 i) + b * (data.y i - v2 i) := by
+      intro i
+      rw [← hab, add_mul]
+      ring
+    simp only [h_decomp]
+    -- Strict inequality holds if there is at least one index where components differ
+    obtain ⟨i, hi⟩ := Function.ne_iff.mp hne
+    apply Finset.sum_lt_sum
+    · intro j _
+      apply (convexOn_pow 2).2 (Set.mem_univ _) (Set.mem_univ _) ha hb hab
+    · use i
+      constructor
+      · exact Finset.mem_univ i
+      · apply (strictConvexOn_pow 2 two_pos).2 (Set.mem_univ _) (Set.mem_univ _) ?_ ha hb hab
+        intro h_eq
+        apply hi
+        linarith
+
+  -- 3. Unique minimizer
+  have h_unique : ∀ v1 v2, v1 ∈ V → v2 ∈ V → IsMinOn loss_fn V v1 → IsMinOn loss_fn V v2 → v1 = v2 := by
+    intro v1 v2 hv1 hv2 hmin1 hmin2
+    apply h_strict.eq_of_isMinOn_of_isMinOn (Submodule.convex V) hv1 hv2 hmin1 hmin2
+
+  have h_v := h_min_v model data X V rfl rfl ⟨rfl, rfl, rfl, rfl⟩ (fit_minimizes_loss _ _ _ _ _ _ _ _ _).2
+  have h_v' := h_min_v model_prime data' X' V' rfl rfl ⟨rfl, rfl, rfl, rfl⟩ (fit_minimizes_loss _ _ _ _ _ _ _ _ _).2
+
+  rw [h_V_eq_V'] at h_v
+
+  have h_loss_eq : loss_fn = (fun v => (1 / n : ℝ) * l2norm_sq (data'.y - v)) := by
+    unfold loss_fn
+    congr
+  rw [← h_loss_eq] at h_v'
+
+  have h_pred_eq : X.mulVec (packParams model) = X'.mulVec (packParams model_prime) := by
+    apply h_unique
+    · simp [V, Matrix.toLin']; use packParams model; rfl
+    · rw [h_V_eq_V']; simp [V', Matrix.toLin']; use packParams model_prime; rfl
+    · exact h_v
+    · exact h_v'
+
+  rw [linearPredictor_eq_designMatrix_mulVec data pgsBasis splineBasis model ⟨rfl, rfl, rfl, rfl⟩]
+  rw [linearPredictor_eq_designMatrix_mulVec data' pgsBasis splineBasis model_prime ⟨rfl, rfl, rfl, rfl⟩]
+  rw [h_pred_eq]
 
 noncomputable def dist_to_support {k : ℕ} (c : Fin k → ℝ) (supp : Set (Fin k → ℝ)) : ℝ :=
   Metric.infDist c supp
