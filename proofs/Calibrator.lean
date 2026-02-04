@@ -1383,7 +1383,7 @@ lemma rawOptimal_implies_orthogonality
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) ∂dgp.jointMeasure = 0) ∧
     (∫ pc, (dgp.trueExpectation pc.1 pc.2 -
         (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1)) * pc.1 ∂dgp.jointMeasure = 0) := by
-  admit
+  exact rawOptimal_implies_orthogonality_gen model dgp h_opt h_linear.1 hY_int hP_int hP2_int hYP_int h_resid_sq_int
 
 /-- Combine the normal equations to get the optimal coefficients for additive bias DGP.
 
@@ -1416,7 +1416,40 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  let a := model.γ₀₀
+  let b := model.γₘ₀ ⟨0, by norm_num⟩
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  have ha : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure :=
+    optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth_1
+
+  have hb : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure :=
+    optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  rw [h_dgp] at ha hb
+
+  have ha_val : a = 0 := by
+    rw [ha]
+    rw [integral_add hP_int (hC_int.const_mul β_env)]
+    rw [hP0, integral_const_mul, hC0]
+    ring
+
+  have hb_val : b = 1 := by
+    rw [hb]
+    have h_integrand : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 = pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc; ring
+    simp_rw [h_integrand]
+    rw [integral_add hP2_int (hPC_int.const_mul β_env)]
+    rw [hP2, integral_const_mul]
+    have hPC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+       have h_comm : (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) = (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) := by funext; ring
+       rw [h_comm]
+       exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+    rw [hPC0]
+    ring
+
+  exact ⟨ha_val, hb_val⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
@@ -3999,7 +4032,14 @@ lemma rank_eq_of_range_eq {n m : ℕ} [Fintype (Fin n)] [Fintype (Fin m)]
     (A B : Matrix (Fin n) (Fin m) ℝ)
     (h : LinearMap.range (Matrix.toLin' A) = LinearMap.range (Matrix.toLin' B)) :
     Matrix.rank A = Matrix.rank B := by
-  admit
+  let b_n := Pi.basisFun ℝ (Fin n)
+  let b_m := Pi.basisFun ℝ (Fin m)
+  rw [Matrix.rank_eq_finrank_range_toLin A b_n b_m]
+  rw [Matrix.rank_eq_finrank_range_toLin B b_n b_m]
+  have hA : Matrix.toLin b_m b_n A = Matrix.toLin' A := rfl
+  have hB : Matrix.toLin b_m b_n B = Matrix.toLin' B := rfl
+  rw [hA, hB]
+  rw [h]
 
 theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ} [Fintype (Fin n)] [Fintype (Fin k)] [Fintype (Fin p)] [Fintype (Fin sp)]
     (A : Matrix (Fin k) (Fin k) ℝ) (_hA : IsUnit A.det) (b : Fin k → ℝ)
