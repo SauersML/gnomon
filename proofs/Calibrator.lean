@@ -4093,7 +4093,8 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
-/-- Quantitative Error of Normalization (Multiplicative Case):
+
+/- Quantitative Error of Normalization (Multiplicative Case):
     In a multiplicative bias DGP Y = scaling(C) * P, the error of a normalized (additive) model
     relative to the optimal model is the variance of the interaction term.
 
@@ -4102,6 +4103,7 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+
 /-- A normalized model has a constant slope (predictorSlope depends only on γₘ₀). -/
 lemma normalized_model_slope_constant {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     (m : PhenotypeInformedGAM 1 k sp) (h_norm : IsNormalizedScoreModel m) :
@@ -4136,29 +4138,37 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- S(c)^2 is integrable (hypothesis)
   -- (S(c)-beta)^2 is integrable
   have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
-    apply Integrable.sub
+    have h_eq : ∀ c, (scaling_func c - beta)^2 = (scaling_func c)^2 - 2 * beta * scaling_func c + beta^2 := by intro c; ring
+    simp_rw [h_eq]
+    apply Integrable.add
     · apply Integrable.sub
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
-        -- S(c) is L2 implies L1? Yes on prob space.
-        apply Integrable.mono' h_scaling_sq_int
-        · exact h_scaling_meas.aestronglyMeasurable
-        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+        apply Integrable.mono' h_scaling_sq_int h_scaling_meas.aestronglyMeasurable
+        filter_upwards with c; nlinarith [sq_nonneg (scaling_func c)]
     · apply integrable_const
 
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
-    apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+    have : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) = (fun pc => pc.1^2 * (scaling_func pc.2 - beta)^2) := by
+      ext; apply mul_comm
+    rw [this]
+    apply MeasureTheory.Integrable.mul_prod h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    apply integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+    have : (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) = (fun pc => 1 * (base pc.2)^2) := by simp
+    rw [this]
+    apply MeasureTheory.Integrable.mul_prod (integrable_const 1) h_base_sq_int
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
     apply Integrable.const_mul
-    apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
+    have : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta) * base pc.2 * pc.1) = (fun pc => pc.1 * ((scaling_func pc.2 - beta) * base pc.2)) := by
+       ext; ring
+    rw [this]
+    apply MeasureTheory.Integrable.mul_prod h_P_int
     -- Need (S-β)*base integrable.
     -- S-β is L2, base is L2. Product is L1 by Holder.
     -- Or |(S-β)base| <= (S-β)^2 + base^2.
@@ -4176,8 +4186,13 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
     intro pc; ring
 
   rw [integral_congr_ae (ae_of_all μ h_eq)]
-  rw [integral_add (h_term1_int.sub h_term2_int) h_term3_int]
-  rw [integral_sub h_term1_int h_term2_int]
+  rw [integral_add]
+  · rw [integral_sub]
+    · rfl
+    · exact h_term1_int
+    · exact h_term2_int
+  · exact h_term1_int.sub h_term2_int
+  · exact h_term3_int
 
   -- Evaluate integrals
   -- Term 1: ∫ (S-β)^2 P^2
@@ -4292,7 +4307,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4309,7 +4324,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [Measure.integral_map measurable_snd.aemeasurable]
+        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4317,27 +4332,20 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h_eq : ∀ p, (base_norm c + beta_norm * p)^2 = (base_norm c)^2 + 2 * base_norm c * beta_norm * p + beta_norm^2 * p^2 := by
           intro p; ring
         simp_rw [h_eq]
-        rw [integral_add]
-        · rw [integral_add]
-          · rw [integral_const]
-            simp
-          · rw [MeasureTheory.integral_const_mul]
-            rw [MeasureTheory.integral_const_mul]
-            rw [integral_id_gaussian]
-            simp
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
-          · apply integrable_const
-        · apply Integrable.add
-          · apply integrable_const
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
+        have h1 : Integrable (fun _ : ℝ => (base_norm c)^2) (ProbabilityTheory.gaussianReal 0 1) := integrable_const _
+        have h2 : Integrable (fun p => 2 * base_norm c * beta_norm * p) (ProbabilityTheory.gaussianReal 0 1) := by
+             apply Integrable.const_mul
+             apply Integrable.const_mul
+             exact integrable_id_gaussian
+        have h3 : Integrable (fun p => beta_norm^2 * p^2) (ProbabilityTheory.gaussianReal 0 1) := by
+             apply Integrable.const_mul
+             exact integrable_sq_gaussian
+        rw [integral_add (h1.add h2) h3]
+        rw [integral_add h1 h2]
+        rw [integral_const]
+        rw [MeasureTheory.integral_const_mul, MeasureTheory.integral_const_mul, integral_id_gaussian]
+        rw [MeasureTheory.integral_const_mul, integral_sq_gaussian]
+        simp
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
@@ -4679,7 +4687,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]; rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4688,12 +4696,14 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    rw [← Real.sqrt_sq (norm_nonneg (y' - p')), ← Real.sqrt_sq (norm_nonneg (y' - w'))]
+    apply Real.sqrt_le_sqrt h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+    symm
+    apply orthogonalProjection_eq_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6377,7 +6387,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -6387,12 +6397,12 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                       · apply Finset.sum_congr rfl
                         intro j hj
                         rw [Finset.erase_insert hi, Finset.prod_insert]
-                        · ring
+                        · ring_nf
                         · exact fun h => hi (Finset.mem_erase.mp h).1
                     · apply DifferentiableAt.finset_prod
                       intro i _
                       exact h_diff i
-                    · exact h_diff _
+                    · exact h_diff i
                 apply h_prod_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
@@ -6402,15 +6412,15 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
+                  exact DifferentiableAt.finset_prod (s := Finset.univ) (fun i _ => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
             rw [ Finset.sum_comm ]
             refine' Finset.sum_congr rfl fun i hi => _
-            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
-            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring
+            rw [ Finset.sum_comm, Finset.sum_congr rfl ] ; intros ; simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
+            rw [ Finset.sum_eq_single ( ( ‹Equiv.Perm m› : m → m ) i ) ] <;> simp +decide [ Finset.prod_ite, Finset.filter_ne', Finset.filter_eq' ] ; ring_nf
             intro j hj; simp +decide [ Pi.single_apply, hj ]
             rw [ Finset.prod_eq_zero_iff.mpr ] <;> simp +decide [ hj ]
             exact ⟨ ( ‹Equiv.Perm m›.symm j ), by simp +decide, by simpa [ Equiv.symm_apply_eq ] using hj ⟩
