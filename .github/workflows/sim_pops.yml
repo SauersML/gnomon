@@ -7,6 +7,10 @@ on:
         description: "JSON array of methods to train (e.g. [\"BayesR\"])"
         required: false
         default: "[\"BayesR\"]"
+      enable_gnomon:
+        description: "Enable GAM-gnomon calibration (true/false)"
+        required: false
+        default: "false"
   push:
     paths:
       - "sims/**"
@@ -19,6 +23,7 @@ env:
   VECLIB_MAXIMUM_THREADS: 4
   NUMEXPR_NUM_THREADS: 4
   TRAIN_METHODS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]' }}
+  ENABLE_GNOMON: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_gnomon || 'false' }}
 
 jobs:
   # ------------------------------------------------------------------
@@ -244,6 +249,7 @@ jobs:
 
 
       - name: Install gnomon (binary release)
+        if: ${{ env.ENABLE_GNOMON == 'true' }}
         run: |
           bash install.sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
@@ -252,7 +258,11 @@ jobs:
         run: |
           set -e
           echo "Running Evaluation for Sim ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
-          python sims/evaluate.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
+          if [ "${{ env.ENABLE_GNOMON }}" = "true" ]; then
+            python sims/evaluate.py ${{ matrix.sim_name }}_s${{ matrix.seed }} --enable-gnomon
+          else
+            python sims/evaluate.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
+          fi
 
       - name: Upload Results (Stream B)
         uses: actions/upload-artifact@v4
@@ -286,6 +296,7 @@ jobs:
           uv pip install --system pgscatalog-calc
 
       - name: Install gnomon (binary release)
+        if: ${{ env.ENABLE_GNOMON == 'true' }}
         run: |
           bash install.sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
@@ -376,6 +387,7 @@ jobs:
           chmod +x /usr/local/bin/gctb
 
       - name: Install gnomon (binary release)
+        if: ${{ env.ENABLE_GNOMON == 'true' }}
         run: |
           bash install.sh
 
@@ -393,7 +405,11 @@ jobs:
 
       - name: Evaluate calibration methods
         run: |
-          python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
+          if [ "${{ env.ENABLE_GNOMON }}" = "true" ]; then
+            python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }} --enable-gnomon
+          else
+            python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
