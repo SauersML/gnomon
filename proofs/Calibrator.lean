@@ -4427,7 +4427,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
   haveI : FiniteDimensional ℝ (Fin n → ℝ) := by infer_instance
   haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le le_top
-  haveI : CompleteSpace K := FiniteDimensional.complete K
+  haveI : CompleteSpace K := FiniteDimensional.complete ℝ
   K.subtype (Submodule.orthogonalProjection K y)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
@@ -4437,7 +4437,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     p = orthogonalProjection K y := by
   haveI : FiniteDimensional ℝ (Fin n → ℝ) := by infer_instance
   haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le le_top
-  haveI : CompleteSpace K := FiniteDimensional.complete ℝ K
+  haveI : CompleteSpace K := FiniteDimensional.complete ℝ
   unfold orthogonalProjection
   have h_eq : (⟨p, h_mem⟩ : K) = Submodule.orthogonalProjection K y := by
     apply Submodule.eq_orthogonalProjection_of_dist_le
@@ -4475,7 +4475,8 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
       LinearMap.range (Matrix.toLin' (designMatrix data pgsBasis splineBasis)) = LinearMap.range (Matrix.toLin' (designMatrix data' pgsBasis splineBasis))) :
   let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
   let model := fit p k sp n data lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg h_rank
-  let model_prime := fit p k sp n data' lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+  let model_prime := fit p k sp n { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b } lambda pgsBasis splineBasis h_n_pos h_lambda_nonneg (by
+      let data' : RealizedData n k := { y := data.y, p := data.p, c := fun i => A.mulVec (data.c i) + b }
       let X := designMatrix data pgsBasis splineBasis
       let X' := designMatrix data' pgsBasis splineBasis
       have h_rank_eq : X.rank = X'.rank := by
