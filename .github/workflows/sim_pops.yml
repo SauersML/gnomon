@@ -169,6 +169,16 @@ jobs:
           name: sim-data-${{ matrix.sim_name }}-s${{ matrix.seed }}
           path: .
 
+      - name: Restore model score cache
+        id: score-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/*.sscore
+          key: score-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}-${{ hashFiles('sims/train_model.py', 'sims/plink_utils.py', 'sims/methods/**', 'sims/metrics.py') }}
+          restore-keys: |
+            score-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}-
+
       # --- Method Specific Setup ---
 
       - name: Setup for BayesR
@@ -183,10 +193,19 @@ jobs:
 
 
       - name: Train & Score ${{ matrix.method }}
+        if: steps.score-cache.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "Training ${{ matrix.method }} on ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
           python sims/train_model.py ${{ matrix.sim_name }}_s${{ matrix.seed }} ${{ matrix.method }}
+
+      - name: Save model score cache
+        if: ${{ always() && steps.score-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/*.sscore
+          key: score-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ matrix.method }}-${{ hashFiles('sims/train_model.py', 'sims/plink_utils.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload Scores
         uses: actions/upload-artifact@v4
@@ -246,6 +265,18 @@ jobs:
           path: ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
           merge-multiple: true
 
+      - name: Restore evaluation cache
+        id: eval-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+          key: eval-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ hashFiles('sims/evaluate.py', 'sims/metrics.py', 'sims/methods/**') }}
+          restore-keys: |
+            eval-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-
+
 
 
       - name: Install gnomon (binary release)
@@ -255,6 +286,7 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Calibration Analysis
+        if: steps.eval-cache.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "Running Evaluation for Sim ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
@@ -263,6 +295,16 @@ jobs:
           else
             python sims/evaluate.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
           fi
+
+      - name: Save evaluation cache
+        if: ${{ always() && steps.eval-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_s${{ matrix.seed }}_significance_tests.csv
+          key: eval-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ hashFiles('sims/evaluate.py', 'sims/metrics.py', 'sims/methods/**') }}
 
       - name: Upload Results (Stream B)
         uses: actions/upload-artifact@v4
@@ -391,25 +433,63 @@ jobs:
         run: |
           bash install.sh
 
+      - name: Restore two-pop cache
+        id: two-pop-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.fam
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_sites.npz
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_pcs.png
+          key: two-pop-${{ runner.os }}-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/evaluate.py', 'sims/methods/**', 'sims/metrics.py') }}
+          restore-keys: |
+            two-pop-${{ runner.os }}-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}-
+
       - name: Run simulation
+        if: steps.two-pop-cache.outputs.cache-hit != 'true'
         run: |
           python sims/sim_two_pop.py ${{ matrix.sim_name }} ${{ matrix.divergence_gens }} ${{ matrix.seed }}
 
       - name: Split data
+        if: steps.two-pop-cache.outputs.cache-hit != 'true'
         run: |
           python sims/split_data.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
 
       - name: Train BayesR
+        if: steps.two-pop-cache.outputs.cache-hit != 'true'
         run: |
           python sims/train_model.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }} BayesR
 
       - name: Evaluate calibration methods
+        if: steps.two-pop-cache.outputs.cache-hit != 'true'
         run: |
           if [ "${{ env.ENABLE_GNOMON }}" = "true" ]; then
             python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }} --enable-gnomon
           else
             python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
           fi
+
+      - name: Save two-pop cache
+        if: ${{ always() && steps.two-pop-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.tsv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.bed
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.bim
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}.fam
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_sites.npz
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_work/
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_*.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_pcs.png
+          key: two-pop-${{ runner.os }}-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/evaluate.py', 'sims/methods/**', 'sims/metrics.py') }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
