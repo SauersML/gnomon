@@ -153,7 +153,6 @@ def main() -> None:
             sub = sub_df[sub_df["scenario"] == scenario].sort_values("gens")
             if sub.empty:
                 continue
-            std = sub["std_auc"].fillna(0.0).to_numpy()
             ax.plot(
                 sub["gens"],
                 sub["mean_auc"],
@@ -163,15 +162,6 @@ def main() -> None:
                 linestyle=line_styles.get(scenario, "-"),
                 label=f"{method_name} ({scenario})",
             )
-            if (std > 0).any():
-                ax.fill_between(
-                    sub["gens"],
-                    sub["mean_auc"] - std,
-                    sub["mean_auc"] + std,
-                    color=color_map[method_name],
-                    alpha=0.12,
-                    linewidth=0,
-                )
 
     ax.set_xlabel("Divergence (generations, log scale)")
     ax.set_ylabel("Mean AUC (overall)")
