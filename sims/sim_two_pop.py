@@ -76,6 +76,8 @@ def _build_demography_bottleneck(split_time: int, ne: int, bottle_ne: int) -> ms
             end = max(0, start - 1)
         dem.add_population_parameters_change(time=start, population="pop0", initial_size=bottle_ne)
         dem.add_population_parameters_change(time=end, population="pop0", initial_size=ne)
+    # msprime requires events to be time-sorted; our inserts can be out of order.
+    dem.sort_events()
     return dem
 
 
