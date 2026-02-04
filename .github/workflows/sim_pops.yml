@@ -431,6 +431,10 @@ jobs:
         run: |
           python sims/plot_divergence_auc.py --method "Raw PGS"
 
+      - name: Build two-pop PC mega plot
+        run: |
+          python sims/plot_two_pop_pcs_grid.py
+
       - name: Upload AUC plot
         uses: actions/upload-artifact@v4
         with:
@@ -438,4 +442,5 @@ jobs:
           path: |
             divergence_bottleneck_auc.csv
             divergence_bottleneck_auc.png
+            two_pop_pcs_mega.png
           if-no-files-found: error
