@@ -4174,7 +4174,134 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- We show that model_star achieves the minimum risk among all normalized models
+    -- given that E[scaling_func] = 1.
+
+    let slope_m := model_norm.γₘ₀ 0
+    let base_m := predictorBase model_norm
+    let μ := dgp.jointMeasure
+    let μC := (stdNormalProdMeasure k).map Prod.snd
+    let S := scaling_func
+
+    -- Integral identities needed for the proof
+    have h_diff : (∫ c, (S c - slope_m)^2 ∂μC) - (∫ c, (S c - 1)^2 ∂μC) = (slope_m - 1)^2 := by
+      have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
+      have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+
+      simp only [sub_sq]
+      repeat rw [integral_sub, integral_add]
+      repeat rw [integral_mul_left]
+      repeat rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
+      rw [h_mean_1]
+      ring
+      -- Discharge integrability goals
+      all_goals (try exact hS2)
+      all_goals (try exact hS.const_mul _)
+      all_goals (try exact integrable_const _)
+      all_goals (try exact (hS.const_mul _).sub (integrable_const _))
+      all_goals (try exact hS2.sub (hS.const_mul _))
+      all_goals (try exact (hS2.sub (hS.const_mul _)).add (integrable_const _))
+
+    -- Define the risk as a function of slope and base function
+    let risk_param (s : ℝ) (b : (Fin k → ℝ) → ℝ) : ℝ :=
+        ∫ pc, (S pc.2 * pc.1 - (b pc.2 + s * pc.1))^2 ∂μ
+
+    have h_risk_eq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+                     risk_param slope_m base_m := by
+        unfold expectedSquaredError dgpMultiplicativeBias risk_param
+        apply MeasureTheory.integral_congr_ae
+        filter_upwards with pc
+        rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
+        dsimp [dgp]
+        rfl
+
+    have h_risk_star_eq : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
+                          risk_param 1 (fun _ => 0) := by
+        unfold expectedSquaredError dgpMultiplicativeBias risk_param
+        apply MeasureTheory.integral_congr_ae
+        filter_upwards with pc
+        simp [h_star_pred]
+
+    rw [h_risk_eq, h_risk_star_eq]
+
+    have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
+    have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+
+    have h_risk_split : risk_param slope_m base_m = (∫ c, (S c - slope_m)^2 ∂μC) + (∫ c, (base_m c)^2 ∂μC) := by
+      let s := slope_m
+      let b := base_m
+      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - s)^2 * p^2 + (b c)^2 - 2 * ((S c - s) * b c) * p := by
+        intro p c; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+
+      have h_Ss_sq_int : Integrable (fun c => (S c - s)^2) μC := by
+        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+
+      have h_b_sq_int : Integrable (fun c => (b c)^2) μC := by
+        have h_pred_sq : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) μ := h_norm_int
+        have h_b_sq_prod : Integrable (fun pc => (b pc.2)^2) μ := by
+           have h_diff : (fun pc => b pc.2) = (fun pc => linearPredictor model_norm pc.1 pc.2 - s * pc.1) := by
+             funext pc
+             rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
+             dsimp; ring
+           rw [h_diff]
+           apply Integrable.pow
+           apply Integrable.sub
+           · apply integrable_of_integrable_sq_proven h_pred_meas h_norm_int
+           · apply Integrable.const_mul
+             apply integral_prod_mul (fun _ => 1) (fun p => p) (integrable_const 1) (integrable_id_gaussian)
+           exact 2
+        convert MeasureTheory.Integrable.snd h_b_sq_prod
+
+      -- Intermediate term integrability: (S-s)b
+      have h_cross_int : Integrable (fun c => (S c - s) * b c) μC := by
+        refine Integrable.mono' (h_Ss_sq_int.add h_b_sq_int) (AEStronglyMeasurable.mul (h_Ss_sq_int.aestronglyMeasurable.sqrt) (h_b_sq_int.aestronglyMeasurable.sqrt)) ?_
+        filter_upwards with c
+        rw [Real.norm_eq_abs, abs_mul]
+        have ineq := abs_mul_le_add_pow_two ((S c - s)) (b c)
+        linarith [ineq]
+
+      -- Split integrals
+      rw [integral_sub, integral_add]
+      -- Term 1
+      rw [integral_prod_mul (fun c => (S c - s)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
+      rw [integral_sq_gaussian, mul_one]
+      -- Term 2
+      rw [integral_prod_mul (fun c => (b c)^2) (fun _ => 1) h_b_sq_int (integrable_const 1)]
+      rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
+      -- Term 3
+      rw [integral_mul_left]
+      rw [integral_prod_mul (fun c => (S c - s) * b c) (fun p => p) h_cross_int integrable_id_gaussian]
+      rw [integral_id_gaussian, mul_zero, sub_zero]
+
+      -- Integrability for split
+      · apply integral_prod_mul _ _ h_Ss_sq_int integrable_sq_gaussian
+      · apply Integrable.sub
+        · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
+        · apply Integrable.const_mul
+          apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
+      · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
+      · apply Integrable.const_mul
+        apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
+
+    have h_risk_star_split : risk_param 1 (fun _ => 0) = ∫ c, (S c - 1)^2 ∂μC := by
+      let s := 1
+      let b := (fun (_:Fin k → ℝ) => (0:ℝ))
+      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - 1)^2 * p^2 := by
+        intro p c; simp [s, b]; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+
+      have h_Ss_sq_int : Integrable (fun c => (S c - 1)^2) μC := by
+        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+
+      rw [integral_prod_mul (fun c => (S c - 1)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
+      rw [integral_sq_gaussian, mul_one]
+
+    rw [h_risk_split, h_risk_star_split]
+
+    have h_base_nonneg : 0 ≤ ∫ c, (base_m c)^2 ∂μC := integral_nonneg (fun _ => sq_nonneg _)
+
+    linarith [h_diff, sq_nonneg (slope_m - 1)]
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
