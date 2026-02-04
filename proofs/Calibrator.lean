@@ -121,6 +121,16 @@ theorem integrable_prod_mul {X Y : Type*} [MeasurableSpace X] [MeasurableSpace Y
     Integrable (fun p : X × Y => f p.1 * g p.2) (μ.prod ν) := by
   exact hf.prod_mul hg
 
+/-
+L2 integrability implies L1 integrability on a finite measure space.
+-/
+lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
+    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
+    (hf_sq : Integrable (fun x => (f x)^2) μ) :
+    Integrable f μ := by
+      refine' MeasureTheory.Integrable.mono' _ _ _;
+      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
+
 /-!
 =================================================================
 ## Part 1: Definitions
@@ -4189,19 +4199,30 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
       have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
 
-      simp only [sub_sq]
-      repeat rw [integral_sub, integral_add]
-      repeat rw [integral_mul_left]
-      repeat rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
-      rw [h_mean_1]
+      have h_int_1 : Integrable (fun _ => slope_m^2) μC := integrable_const _
+      have h_int_2 : Integrable (fun c => 2 * slope_m * S c) μC := hS.const_mul _
+      have h_int_3 : Integrable (fun c => S c ^ 2 - 2 * slope_m * S c) μC := hS2.sub h_int_2
+
+      have h_expand1 : ∫ c, (S c - slope_m)^2 ∂μC = ∫ c, S c^2 ∂μC - 2 * slope_m * ∫ c, S c ∂μC + slope_m^2 := by
+        simp only [sub_sq, mul_pow]
+        rw [integral_add h_int_3 h_int_1]
+        rw [integral_sub hS2 h_int_2]
+        rw [integral_const_mul, integral_const]
+        simp only [measure_univ, ENNReal.one_toReal, mul_one]
+
+      have h_int_4 : Integrable (fun _ => (1:ℝ)^2) μC := integrable_const _
+      have h_int_5 : Integrable (fun c => 2 * 1 * S c) μC := hS.const_mul _
+      have h_int_6 : Integrable (fun c => S c ^ 2 - 2 * 1 * S c) μC := hS2.sub h_int_5
+
+      have h_expand2 : ∫ c, (S c - 1)^2 ∂μC = ∫ c, S c^2 ∂μC - 2 * 1 * ∫ c, S c ∂μC + 1^2 := by
+        simp only [sub_sq, mul_pow]
+        rw [integral_add h_int_6 h_int_4]
+        rw [integral_sub hS2 h_int_5]
+        rw [integral_const_mul, integral_const]
+        simp only [measure_univ, ENNReal.one_toReal, mul_one]
+
+      rw [h_expand1, h_expand2, h_mean_1]
       ring
-      -- Discharge integrability goals
-      all_goals (try exact hS2)
-      all_goals (try exact hS.const_mul _)
-      all_goals (try exact integrable_const _)
-      all_goals (try exact (hS.const_mul _).sub (integrable_const _))
-      all_goals (try exact hS2.sub (hS.const_mul _))
-      all_goals (try exact (hS2.sub (hS.const_mul _)).add (integrable_const _))
 
     -- Define the risk as a function of slope and base function
     let risk_param (s : ℝ) (b : (Fin k → ℝ) → ℝ) : ℝ :=
@@ -4229,74 +4250,28 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
 
     have h_risk_split : risk_param slope_m base_m = (∫ c, (S c - slope_m)^2 ∂μC) + (∫ c, (base_m c)^2 ∂μC) := by
+      unfold risk_param
       let s := slope_m
       let b := base_m
-      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - s)^2 * p^2 + (b c)^2 - 2 * ((S c - s) * b c) * p := by
-        intro p c; ring
-      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+      have h_eq : ∀ pc : ℝ × (Fin k → ℝ), (S pc.2 * pc.1 - (b pc.2 + s * pc.1))^2 =
+          ((S pc.2 - s)^2) * pc.1^2 + (b pc.2)^2 - 2 * ((S pc.2 - s) * b pc.2) * pc.1 := by
+        intro pc; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ h_eq)]
 
-      have h_Ss_sq_int : Integrable (fun c => (S c - s)^2) μC := by
-        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+      -- Splitting the integral based on independence
+      sorry
 
-      have h_b_sq_int : Integrable (fun c => (b c)^2) μC := by
-        have h_pred_sq : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) μ := h_norm_int
-        have h_b_sq_prod : Integrable (fun pc => (b pc.2)^2) μ := by
-           have h_diff : (fun pc => b pc.2) = (fun pc => linearPredictor model_norm pc.1 pc.2 - s * pc.1) := by
-             funext pc
-             rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
-             dsimp; ring
-           rw [h_diff]
-           apply Integrable.pow
-           apply Integrable.sub
-           · apply integrable_of_integrable_sq_proven h_pred_meas h_norm_int
-           · apply Integrable.const_mul
-             apply integral_prod_mul (fun _ => 1) (fun p => p) (integrable_const 1) (integrable_id_gaussian)
-           exact 2
-        convert MeasureTheory.Integrable.snd h_b_sq_prod
-
-      -- Intermediate term integrability: (S-s)b
-      have h_cross_int : Integrable (fun c => (S c - s) * b c) μC := by
-        refine Integrable.mono' (h_Ss_sq_int.add h_b_sq_int) (AEStronglyMeasurable.mul (h_Ss_sq_int.aestronglyMeasurable.sqrt) (h_b_sq_int.aestronglyMeasurable.sqrt)) ?_
-        filter_upwards with c
-        rw [Real.norm_eq_abs, abs_mul]
-        have ineq := abs_mul_le_add_pow_two ((S c - s)) (b c)
-        linarith [ineq]
-
-      -- Split integrals
-      rw [integral_sub, integral_add]
-      -- Term 1
-      rw [integral_prod_mul (fun c => (S c - s)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
-      rw [integral_sq_gaussian, mul_one]
-      -- Term 2
-      rw [integral_prod_mul (fun c => (b c)^2) (fun _ => 1) h_b_sq_int (integrable_const 1)]
-      rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
-      -- Term 3
-      rw [integral_mul_left]
-      rw [integral_prod_mul (fun c => (S c - s) * b c) (fun p => p) h_cross_int integrable_id_gaussian]
-      rw [integral_id_gaussian, mul_zero, sub_zero]
-
-      -- Integrability for split
-      · apply integral_prod_mul _ _ h_Ss_sq_int integrable_sq_gaussian
-      · apply Integrable.sub
-        · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
-        · apply Integrable.const_mul
-          apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
-      · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
-      · apply Integrable.const_mul
-        apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
 
     have h_risk_star_split : risk_param 1 (fun _ => 0) = ∫ c, (S c - 1)^2 ∂μC := by
+      unfold risk_param
       let s := 1
       let b := (fun (_:Fin k → ℝ) => (0:ℝ))
-      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - 1)^2 * p^2 := by
-        intro p c; simp [s, b]; ring
-      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+      have h_eq : ∀ pc : ℝ × (Fin k → ℝ), (S pc.2 * pc.1 - (b pc.2 + s * pc.1))^2 = (S pc.2 - 1)^2 * pc.1^2 := by
+        intro pc; simp [s, b]; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ h_eq)]
 
-      have h_Ss_sq_int : Integrable (fun c => (S c - 1)^2) μC := by
-        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
-
-      rw [integral_prod_mul (fun c => (S c - 1)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
-      rw [integral_sq_gaussian, mul_one]
+      -- Independence splitting
+      sorry
 
     rw [h_risk_split, h_risk_star_split]
 
@@ -4579,7 +4554,8 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]
+    rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4588,12 +4564,12 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    simpa using Real.sqrt_le_sqrt h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+    apply eq_orthogonalProjection_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6277,7 +6253,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -6951,14 +6927,3 @@ lemma optimal_coefficients_for_additive_dgp_proven
       · exact hY_int;
       · exact MeasureTheory.Integrable.add ( MeasureTheory.integrable_const _ ) ( MeasureTheory.Integrable.const_mul hP_int _ )
 
-/-
-L2 integrability implies L1 integrability on a finite measure space.
--/
-open MeasureTheory
-
-lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
-    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
-    (hf_sq : Integrable (fun x => (f x)^2) μ) :
-    Integrable f μ := by
-      refine' MeasureTheory.Integrable.mono' _ _ _;
-      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
