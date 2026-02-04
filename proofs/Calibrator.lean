@@ -4093,15 +4093,6 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
-/-- Quantitative Error of Normalization (Multiplicative Case):
-    In a multiplicative bias DGP Y = scaling(C) * P, the error of a normalized (additive) model
-    relative to the optimal model is the variance of the interaction term.
-
-    Error = || Oracle - Norm ||^2 = E[ ( (scaling(C) - 1) * P )^2 ]
-
-    Assumption: E[scaling(C)] = 1 (centered scaling).
-    Then the additive projection of scaling(C)*P is 1*P.
-    The residual is (scaling(C) - 1)*P. -/
 /-- A normalized model has a constant slope (predictorSlope depends only on γₘ₀). -/
 lemma normalized_model_slope_constant {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     (m : PhenotypeInformedGAM 1 k sp) (h_norm : IsNormalizedScoreModel m) :
@@ -4133,22 +4124,31 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   have h_P2_int : Integrable (fun x => x^2) (ProbabilityTheory.gaussianReal 0 1) := integrable_sq_gaussian
   have h_P_int : Integrable (fun x => x) (ProbabilityTheory.gaussianReal 0 1) := integrable_id_gaussian
 
+  have h_map_snd : Measure.map Prod.snd μ = Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) :=
+    Measure.map_snd_prod (ProbabilityTheory.gaussianReal 0 1) _
+  rw [h_map_snd] at h_scaling_sq_int h_base_sq_int h_scaling_meas h_base_meas
+
   -- S(c)^2 is integrable (hypothesis)
   -- (S(c)-beta)^2 is integrable
-  have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
-    apply Integrable.sub
+  have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) (Measure.map Prod.snd μ) := by
+    rw [h_map_snd]
+    have h_scal_int : Integrable scaling_func (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) :=
+      Integrable.mono' (h_scaling_sq_int.add (integrable_const 1)) h_scaling_meas.aestronglyMeasurable
+      (by filter_upwards; intro c; simp; apply le_trans (abs_le_sq_add_one (scaling_func c)); linarith)
+    have : (fun c => (scaling_func c - beta)^2) = (fun c => scaling_func c ^ 2 - 2 * beta * scaling_func c + beta ^ 2) := by
+      ext; ring
+    rw [this]
+    apply Integrable.add
     · apply Integrable.sub
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
-        -- S(c) is L2 implies L1? Yes on prob space.
-        apply Integrable.mono' h_scaling_sq_int
-        · exact h_scaling_meas.aestronglyMeasurable
-        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+        exact h_scal_int
     · apply integrable_const
 
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
+    rw [h_map_snd] at h_S_beta_sq_int
     apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
 
   -- base^2
@@ -4157,6 +4157,7 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
+    rw [h_map_snd] at h_S_beta_sq_int
     apply Integrable.const_mul
     apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
     -- Need (S-β)*base integrable.
@@ -4231,6 +4232,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     (h_capable : ∃ (m : PhenotypeInformedGAM 1 k 1),
       ∀ p_val c_val, linearPredictor m p_val c_val = (dgpMultiplicativeBias scaling_func).trueExpectation p_val c_val) :
   let dgp := dgpMultiplicativeBias scaling_func
+
+  have h_map_snd : Measure.map Prod.snd (stdNormalProdMeasure k) = Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) :=
+    Measure.map_snd_prod (ProbabilityTheory.gaussianReal 0 1) _
+  rw [h_map_snd] at h_scaling_meas h_scaling_sq_int h_mean_1
+
   expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) -
   expectedSquaredError dgp (fun p c => linearPredictor model_oracle p c)
   = ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂dgp.jointMeasure := by
@@ -4292,7 +4298,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      unfold beta_norm
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized c]
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized 0]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4309,7 +4317,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [Measure.integral_map measurable_snd.aemeasurable]
+        rw [h_map_snd]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4321,8 +4329,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · rw [integral_add]
           · rw [integral_const]
             simp
-          · rw [MeasureTheory.integral_const_mul]
-            rw [MeasureTheory.integral_const_mul]
+          · rw [integral_const_mul]
+            rw [integral_const_mul]
             rw [integral_id_gaussian]
             simp
           · apply Integrable.const_mul
@@ -4345,8 +4353,17 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     -- Measurability of base_norm
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
-      admit
+      rw [h_map_snd]
+      have h_p_meas : AEStronglyMeasurable (fun pc : ℝ × (Fin k → ℝ) => pc.1) (stdNormalProdMeasure k) :=
+         measurable_fst.aestronglyMeasurable
+      have h_base_comp_meas : AEStronglyMeasurable (fun pc => base_norm pc.2) (stdNormalProdMeasure k) := by
+        have h_eq : (fun pc => base_norm pc.2) = (fun pc => linearPredictor model_norm pc.1 pc.2 - beta_norm * pc.1) := by
+           ext pc; rw [h_pred_norm]; ring
+        rw [h_eq]
+        apply AEStronglyMeasurable.sub h_pred_meas (h_p_meas.const_mul _)
+      exact (measurable_snd.aestronglyMeasurable_map_iff).mpr h_base_comp_meas
 
+    simp_rw [h_pred_norm]
     rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
     · -- LHS expanded. Now RHS (model_star)
       -- model_star has base=0, beta=1
@@ -4679,7 +4696,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4688,12 +4705,13 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    rw [← Real.sqrt_le_sqrt_iff (sq_nonneg _) (sq_nonneg _), Real.sqrt_sq (norm_nonneg _), Real.sqrt_sq (norm_nonneg _)]
+    exact h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+    apply eq_orthogonalProjection_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6377,7 +6395,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -7005,9 +7023,86 @@ lemma optimal_coefficients_for_additive_dgp_proven
     (hPC_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) dgp.jointMeasure)
     (hY_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2) dgp.jointMeasure)
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
-    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
+    (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure)
+    (h_spline_zero : ∀ i, model.pcSplineBasis.b i 0 = 0)
+    (h_capable_linear : ∃ coeffs, ∀ x, evalSmooth model.pcSplineBasis coeffs x = x)
+    (h_basis_cont : ∀ i, Continuous (model.pcSplineBasis.b i)) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  let c0 := (⟨0, by norm_num⟩ : Fin 1)
+  let p0 := (⟨1, by norm_num⟩ : Fin 2) -- Wait, pgsBasis index?
+
+  -- Construct perfect model
+  obtain ⟨coeffs_lin, h_lin_fit⟩ := h_capable_linear
+  let model_perf : PhenotypeInformedGAM 1 1 1 := {
+    pgsBasis := model.pgsBasis
+    pcSplineBasis := model.pcSplineBasis
+    γ₀₀ := 0
+    γₘ₀ := fun _ => 1
+    f₀ₗ := fun _ _ => β_env * coeffs_lin c0 -- scale coeffs
+    fₘₗ := fun _ _ _ => 0
+    link := model.link
+    dist := model.dist
+  }
+
+  -- Check predictions of perfect model
+  have h_perf_slope : ∀ c, predictorSlope model_perf c = 1 := by
+    intro c
+    unfold predictorSlope
+    dsimp [model_perf]
+    simp [evalSmooth]
+
+  have h_perf_base : ∀ c, predictorBase model_perf c = β_env * c c0 := by
+    intro c
+    unfold predictorBase
+    simp only [model_perf, zero_add]
+    rw [Fin.sum_univ_one]
+    unfold evalSmooth
+    simp_rw [mul_assoc, ← Finset.mul_sum, h_lin_fit]
+    rfl
+
+  -- Risk of perfect model
+  have h_perf_risk : expectedSquaredError dgp (fun p c => linearPredictor model_perf p c) = 0 := by
+    unfold expectedSquaredError
+    rw [integral_eq_zero_iff_of_nonneg (fun _ => sq_nonneg _) (by admit)] -- integrability
+    filter_upwards
+    intro pc
+    rw [h_dgp]
+    rw [Calibrator.linearPredictor_decomp model_perf h_linear]
+    rw [h_perf_slope, h_perf_base]
+    have : (0 : Fin 1) = c0 := rfl
+    rw [← this]
+    ring
+
+  -- Optimality implies model risk is 0
+  have h_perf_raw : IsRawScoreModel model_perf := by admit
+  have h_model_risk_zero : expectedSquaredError dgp (fun p c => linearPredictor model p c) = 0 := by
+    have h_le := h_opt.2 model_perf h_perf_raw
+    rw [h_perf_risk] at h_le
+    have h_nonneg : 0 ≤ expectedSquaredError dgp (fun p c => linearPredictor model p c) :=
+       integral_nonneg (fun _ => sq_nonneg _)
+    linarith
+
+  -- Deduce slope and base match a.e.
+  have h_slope_ae : ∀ᵐ c ∂(dgp.jointMeasure.map Prod.snd), predictorSlope model c = 1 := by admit
+  have h_base_ae : ∀ᵐ c ∂(dgp.jointMeasure.map Prod.snd), predictorBase model c = β_env * c c0 := by admit
+
+  -- Evaluation at 0
+  have h_slope_0 : predictorSlope model (fun _ => 0) = 1 := by admit
+  have h_base_0 : predictorBase model (fun _ => 0) = 0 := by admit
+
+  -- Deduce coefficients
+  have h_spline_0 : ∀ f, evalSmooth model.pcSplineBasis f 0 = 0 := by
+    intro f; unfold evalSmooth; simp [h_spline_zero]
+
+  constructor
+  · -- γ₀₀
+    unfold predictorBase at h_base_0
+    simp only [h_spline_0, add_zero, Finset.sum_const_zero] at h_base_0
+    exact h_base_0
+  · -- γₘ₀
+    unfold predictorSlope at h_slope_0
+    simp only [h_spline_0, add_zero, Finset.sum_const_zero] at h_slope_0
+    exact h_slope_0
 
 lemma integrable_of_integrable_sq_proven {α : Type*} [MeasureSpace α] {μ : Measure α} [IsFiniteMeasure μ]
     {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
