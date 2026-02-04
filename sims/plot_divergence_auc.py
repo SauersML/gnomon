@@ -24,11 +24,6 @@ def _normalize_method(method: str) -> str:
     return method
 
 
-def _slugify(text: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", text.strip())
-    return slug.strip("-").lower() or "method"
-
-
 def _set_gens_scale(ax: plt.Axes) -> None:
     if 0 in GENS_LEVELS:
         ax.set_xscale("symlog", linthresh=1)
@@ -105,29 +100,39 @@ def main() -> None:
     df.to_csv(csv_path, index=False)
 
     methods = sorted(df["method"].unique())
-    plot_paths: list[Path] = []
+    fig, ax = plt.subplots(figsize=(12, 7))
+    colors = plt.get_cmap("tab10")
+    color_map = {method_name: colors(i % 10) for i, method_name in enumerate(methods)}
+    line_styles = {"divergence": "-", "bottleneck": "--"}
+
     for method_name in methods:
         sub_df = df[df["method"] == method_name]
-        fig, ax = plt.subplots(figsize=(10, 6))
         for scenario in SCENARIOS:
             sub = sub_df[sub_df["scenario"] == scenario].sort_values("gens")
             if sub.empty:
                 continue
-            ax.plot(sub["gens"], sub["auc"], marker="o", linewidth=2, label=scenario)
+            ax.plot(
+                sub["gens"],
+                sub["auc"],
+                marker="o",
+                linewidth=2,
+                color=color_map[method_name],
+                linestyle=line_styles.get(scenario, "-"),
+                label=f"{method_name} ({scenario})",
+            )
 
-        ax.set_xlabel("Divergence (generations, log scale)")
-        ax.set_ylabel(f"AUC (method: {method_name})")
-        ax.set_title("AUC vs Divergence for Two-Population Sims")
-        _set_gens_scale(ax)
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
-        plot_path = Path(f"{args.out_prefix}_{_slugify(method_name)}.png")
-        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        plot_paths.append(plot_path)
+    ax.set_xlabel("Divergence (generations, log scale)")
+    ax.set_ylabel("AUC (overall)")
+    ax.set_title("AUC vs Divergence for Two-Population Sims")
+    _set_gens_scale(ax)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    plot_path = Path(f"{args.out_prefix}.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-    print(f"Wrote {csv_path} and {len(plot_paths)} plot(s).")
+    print(f"Wrote {csv_path} and {plot_path}")
 
 
 if __name__ == "__main__":
