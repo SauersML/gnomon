@@ -45,6 +45,7 @@ import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
@@ -4174,7 +4175,134 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   have h_risk_lower_bound :
       expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) ≥
       expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
-    admit
+    -- We show that model_star achieves the minimum risk among all normalized models
+    -- given that E[scaling_func] = 1.
+
+    let slope_m := model_norm.γₘ₀ 0
+    let base_m := predictorBase model_norm
+    let μ := dgp.jointMeasure
+    let μC := (stdNormalProdMeasure k).map Prod.snd
+    let S := scaling_func
+
+    -- Integral identities needed for the proof
+    have h_diff : (∫ c, (S c - slope_m)^2 ∂μC) - (∫ c, (S c - 1)^2 ∂μC) = (slope_m - 1)^2 := by
+      have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
+      have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+
+      simp only [sub_sq]
+      repeat rw [integral_sub, integral_add]
+      repeat rw [integral_mul_left]
+      repeat rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
+      rw [h_mean_1]
+      ring
+      -- Discharge integrability goals
+      all_goals (try exact hS2)
+      all_goals (try exact hS.const_mul _)
+      all_goals (try exact integrable_const _)
+      all_goals (try exact (hS.const_mul _).sub (integrable_const _))
+      all_goals (try exact hS2.sub (hS.const_mul _))
+      all_goals (try exact (hS2.sub (hS.const_mul _)).add (integrable_const _))
+
+    -- Define the risk as a function of slope and base function
+    let risk_param (s : ℝ) (b : (Fin k → ℝ) → ℝ) : ℝ :=
+        ∫ pc, (S pc.2 * pc.1 - (b pc.2 + s * pc.1))^2 ∂μ
+
+    have h_risk_eq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
+                     risk_param slope_m base_m := by
+        unfold expectedSquaredError dgpMultiplicativeBias risk_param
+        apply MeasureTheory.integral_congr_ae
+        filter_upwards with pc
+        rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
+        dsimp [dgp]
+        rfl
+
+    have h_risk_star_eq : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
+                          risk_param 1 (fun _ => 0) := by
+        unfold expectedSquaredError dgpMultiplicativeBias risk_param
+        apply MeasureTheory.integral_congr_ae
+        filter_upwards with pc
+        simp [h_star_pred]
+
+    rw [h_risk_eq, h_risk_star_eq]
+
+    have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
+    have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+
+    have h_risk_split : risk_param slope_m base_m = (∫ c, (S c - slope_m)^2 ∂μC) + (∫ c, (base_m c)^2 ∂μC) := by
+      let s := slope_m
+      let b := base_m
+      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - s)^2 * p^2 + (b c)^2 - 2 * ((S c - s) * b c) * p := by
+        intro p c; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+
+      have h_Ss_sq_int : Integrable (fun c => (S c - s)^2) μC := by
+        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+
+      have h_b_sq_int : Integrable (fun c => (b c)^2) μC := by
+        have h_pred_sq : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) μ := h_norm_int
+        have h_b_sq_prod : Integrable (fun pc => (b pc.2)^2) μ := by
+           have h_diff : (fun pc => b pc.2) = (fun pc => linearPredictor model_norm pc.1 pc.2 - s * pc.1) := by
+             funext pc
+             rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
+             dsimp; ring
+           rw [h_diff]
+           apply Integrable.pow
+           apply Integrable.sub
+           · apply integrable_of_integrable_sq_proven h_pred_meas h_norm_int
+           · apply Integrable.const_mul
+             apply integral_prod_mul (fun _ => 1) (fun p => p) (integrable_const 1) (integrable_id_gaussian)
+           exact 2
+        convert MeasureTheory.Integrable.snd h_b_sq_prod
+
+      -- Intermediate term integrability: (S-s)b
+      have h_cross_int : Integrable (fun c => (S c - s) * b c) μC := by
+        refine Integrable.mono' (h_Ss_sq_int.add h_b_sq_int) (AEStronglyMeasurable.mul (h_Ss_sq_int.aestronglyMeasurable.sqrt) (h_b_sq_int.aestronglyMeasurable.sqrt)) ?_
+        filter_upwards with c
+        rw [Real.norm_eq_abs, abs_mul]
+        have ineq := abs_mul_le_add_pow_two ((S c - s)) (b c)
+        linarith [ineq]
+
+      -- Split integrals
+      rw [integral_sub, integral_add]
+      -- Term 1
+      rw [integral_prod_mul (fun c => (S c - s)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
+      rw [integral_sq_gaussian, mul_one]
+      -- Term 2
+      rw [integral_prod_mul (fun c => (b c)^2) (fun _ => 1) h_b_sq_int (integrable_const 1)]
+      rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
+      -- Term 3
+      rw [integral_mul_left]
+      rw [integral_prod_mul (fun c => (S c - s) * b c) (fun p => p) h_cross_int integrable_id_gaussian]
+      rw [integral_id_gaussian, mul_zero, sub_zero]
+
+      -- Integrability for split
+      · apply integral_prod_mul _ _ h_Ss_sq_int integrable_sq_gaussian
+      · apply Integrable.sub
+        · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
+        · apply Integrable.const_mul
+          apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
+      · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
+      · apply Integrable.const_mul
+        apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
+
+    have h_risk_star_split : risk_param 1 (fun _ => 0) = ∫ c, (S c - 1)^2 ∂μC := by
+      let s := 1
+      let b := (fun (_:Fin k → ℝ) => (0:ℝ))
+      have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - 1)^2 * p^2 := by
+        intro p c; simp [s, b]; ring
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+
+      have h_Ss_sq_int : Integrable (fun c => (S c - 1)^2) μC := by
+        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+
+      rw [integral_prod_mul (fun c => (S c - 1)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
+      rw [integral_sq_gaussian, mul_one]
+
+    rw [h_risk_split, h_risk_star_split]
+
+    have h_base_nonneg : 0 ≤ ∫ c, (base_m c)^2 ∂μC := integral_nonneg (fun _ => sq_nonneg _)
+
+    linarith [h_diff, sq_nonneg (slope_m - 1)]
 
   have h_opt_risk : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                     expectedSquaredError dgp (fun p c => linearPredictor model_star p c) := by
@@ -4425,14 +4553,54 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let y' := equiv y
+  let K' := K.map equiv
+  haveI : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_le le_top
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  let p' := Submodule.orthogonalProjection K' y'
+  equiv.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let y' := equiv y
+  let p' := equiv p
+  let K' := K.map equiv
+  haveI : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_le le_top
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+
+  have h_norm_sq : ∀ v : Fin n → ℝ, l2norm_sq v = (norm (equiv v)) ^ 2 := by
+    intro v
+    unfold l2norm_sq
+    rw [PiLp.norm_eq_of_L2 (equiv v)]
+    simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
+    congr; ext i
+    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw'
+    have h := h_min w hw
+    rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
+    rw [map_sub, map_sub] at h
+    rw [dist_eq_norm, dist_eq_norm]
+    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+
+  have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
+
+  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    · exact h_mem'
+    · exact h_min'
+
+  rw [orthogonalProjection]
+  simp only [equiv, y', K', p'] at h_proj ⊢
+  rw [← h_proj]
+  exact (LinearEquiv.symm_apply_apply equiv p).symm
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,19 +6271,38 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f h_diff
+                  let s := (Finset.univ : Finset m)
+                  have h_univ : s = Finset.univ := rfl
+                  rw [← h_univ]
+                  induction s using Finset.induction_on with
+                  | empty => simp
+                  | insert hi ih =>
+                    simp only [Finset.prod_insert hi, Finset.sum_insert hi]
+                    rw [deriv_mul]
+                    · rw [ih]
+                      simp only [Finset.mul_sum, Finset.sum_mul]
+                      apply congr_arg₂ (· + ·)
+                      · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hi]
+                      · apply Finset.sum_congr rfl
+                        intro j hj
+                        rw [Finset.erase_insert hi, Finset.prod_insert]
+                        · ring
+                        · exact fun h => hi (Finset.mem_erase.mp h).1
+                    · apply DifferentiableAt.finset_prod
+                      intro i _
+                      exact h_diff i
+                    · exact h_diff _
                 apply h_prod_rule
                 intro i
-                exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
+                exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
               have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                 have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                   intro σ
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
-                    exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                    exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
+                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
