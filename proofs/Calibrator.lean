@@ -4185,13 +4185,8 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
     intro pc; ring
 
   rw [integral_congr_ae (ae_of_all μ h_eq)]
-  rw [integral_add]
-  · rw [integral_sub]
-    · rfl
-    · exact h_term1_int
-    · exact h_term2_pos_int
-  · exact h_term1_int.sub h_term2_pos_int
-  · exact h_term3_int
+  rw [integral_add (h_term1_int.sub h_term2_pos_int) h_term3_int]
+  rw [integral_sub h_term1_int h_term2_pos_int]
 
   -- Evaluate integrals
   -- Term 1: ∫ (S-β)^2 P^2
@@ -4307,7 +4302,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
       rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
-      unfold beta_norm predictorSlope; rfl
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4335,7 +4330,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h2 : Integrable (fun p => 2 * base_norm c * beta_norm * p) (ProbabilityTheory.gaussianReal 0 1) := by
              apply Integrable.const_mul
              apply Integrable.const_mul
-             exact integrable_id_gaussian
+             exact (integrable_id_gaussian : Integrable (fun x => x) _)
         have h3 : Integrable (fun p => beta_norm^2 * p^2) (ProbabilityTheory.gaussianReal 0 1) := by
              apply Integrable.const_mul
              exact integrable_sq_gaussian
@@ -4355,6 +4350,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
       admit
 
+    simp_rw [h_pred_norm]
     rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
     · -- LHS expanded. Now RHS (model_star)
       -- model_star has base=0, beta=1
@@ -4701,9 +4697,8 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
-  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
+  have h_proj : (⟨p', h_mem'⟩ : K') = Submodule.orthogonalProjection K' y' := by
     rw [← orthogonalProjection_eq_of_dist_le]
-    · exact h_mem'
     · exact h_min'
 
   rw [orthogonalProjection]
