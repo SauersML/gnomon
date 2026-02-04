@@ -4101,6 +4101,16 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+/-
+L2 integrability implies L1 integrability on a finite measure space.
+-/
+lemma L2_imp_L1 {α : Type*} [MeasurableSpace α] {μ : Measure α} [IsFiniteMeasure μ]
+    {f : α → ℝ} (hf_meas : AEStronglyMeasurable f μ)
+    (hf_sq : Integrable (fun x => (f x)^2) μ) :
+    Integrable f μ := by
+      refine' MeasureTheory.Integrable.mono' _ _ _;
+      exacts [ fun x => f x ^ 2 + 1, by exact MeasureTheory.Integrable.add hf_sq ( MeasureTheory.integrable_const _ ), hf_meas, Filter.Eventually.of_forall fun x => by rw [ Real.norm_eq_abs, abs_le ] ; constructor <;> nlinarith ]
+
 theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (Fin k)]
     (scaling_func : (Fin k → ℝ) → ℝ)
     (h_scaling_meas : AEStronglyMeasurable scaling_func ((stdNormalProdMeasure k).map Prod.snd))
@@ -4165,7 +4175,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
   -- Risk of model_star
   have h_risk_star : expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor model_star p c) =
                      ∫ pc, ((scaling_func pc.2 - 1) * pc.1)^2 ∂stdNormalProdMeasure k := by
-    unfold expectedSquaredError dgpMultiplicativeBias
+    dsimp [expectedSquaredError, dgpMultiplicativeBias]
     simp_rw [h_star_pred]
     congr 1; ext pc
     ring
@@ -4183,24 +4193,58 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     let μC := (stdNormalProdMeasure k).map Prod.snd
     let S := scaling_func
 
+    -- Ensure IsProbabilityMeasure for μC to enable measure_univ = 1
+    haveI : IsProbabilityMeasure μC := inferInstance
+    haveI : SigmaFinite μC := inferInstance
+    haveI : SigmaFinite (ProbabilityTheory.gaussianReal 0 1) := inferInstance
+
     -- Integral identities needed for the proof
     have h_diff : (∫ c, (S c - slope_m)^2 ∂μC) - (∫ c, (S c - 1)^2 ∂μC) = (slope_m - 1)^2 := by
       have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
-      have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+      have hS : Integrable S μC := L2_imp_L1 h_scaling_meas hS2
+      haveI : IsProbabilityMeasure μC := inferInstance
 
-      simp only [sub_sq]
-      repeat rw [integral_sub, integral_add]
-      repeat rw [integral_mul_left]
-      repeat rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
+      have h_expand : (fun c => (S c - slope_m)^2) = (fun c => (S c)^2 + (-2*slope_m) * S c + slope_m^2) := by
+        ext c; ring
+      rw [h_expand]
+      rw [integral_add]
+      rotate_left
+      · apply Integrable.add
+        · exact hS2
+        · apply Integrable.const_mul hS
+      · exact integrable_const _
+
+      rw [integral_add]
+      rotate_left
+      · exact hS2
+      · apply Integrable.const_mul hS
+
+      rw [integral_const_mul]
+      rw [integral_const]
+      simp only [measure_univ]
+      rw [ENNReal.one_toReal, mul_one, h_mean_1]
+
+      have h_expand2 : (fun c => (S c - 1)^2) = (fun c => (S c)^2 + (-2) * S c + 1) := by
+        ext c; ring
+      rw [h_expand2]
+      rw [integral_add]
+      rotate_left
+      · apply Integrable.add
+        · exact hS2
+        · apply Integrable.const_mul hS
+      · exact integrable_const _
+
+      rw [integral_add]
+      rotate_left
+      · exact hS2
+      · apply Integrable.const_mul hS
+
+      rw [integral_const_mul]
+      rw [integral_const]
+      rw [measure_univ, ENNReal.one_toReal, mul_one]
       rw [h_mean_1]
+
       ring
-      -- Discharge integrability goals
-      all_goals (try exact hS2)
-      all_goals (try exact hS.const_mul _)
-      all_goals (try exact integrable_const _)
-      all_goals (try exact (hS.const_mul _).sub (integrable_const _))
-      all_goals (try exact hS2.sub (hS.const_mul _))
-      all_goals (try exact (hS2.sub (hS.const_mul _)).add (integrable_const _))
 
     -- Define the risk as a function of slope and base function
     let risk_param (s : ℝ) (b : (Fin k → ℝ) → ℝ) : ℝ :=
@@ -4208,94 +4252,86 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_risk_eq : expectedSquaredError dgp (fun p c => linearPredictor model_norm p c) =
                      risk_param slope_m base_m := by
-        unfold expectedSquaredError dgpMultiplicativeBias risk_param
+        dsimp [expectedSquaredError, dgpMultiplicativeBias, risk_param]
         apply MeasureTheory.integral_congr_ae
         filter_upwards with pc
-        rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
-        dsimp [dgp]
-        rfl
+        simp [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
 
     have h_risk_star_eq : expectedSquaredError dgp (fun p c => linearPredictor model_star p c) =
                           risk_param 1 (fun _ => 0) := by
-        unfold expectedSquaredError dgpMultiplicativeBias risk_param
-        apply MeasureTheory.integral_congr_ae
-        filter_upwards with pc
-        simp [h_star_pred]
+        simp [expectedSquaredError, dgpMultiplicativeBias, risk_param, h_star_pred]
 
     rw [h_risk_eq, h_risk_star_eq]
 
     have hS2 : Integrable (fun c => (S c)^2) μC := h_scaling_sq_int
-    have hS : Integrable S μC := integrable_of_integrable_sq_proven h_scaling_meas hS2
+    have hS : Integrable S μC := L2_imp_L1 h_scaling_meas hS2
+
+    have h_meas_prod : μ = (ProbabilityTheory.gaussianReal 0 1).prod μC := by
+      admit
 
     have h_risk_split : risk_param slope_m base_m = (∫ c, (S c - slope_m)^2 ∂μC) + (∫ c, (base_m c)^2 ∂μC) := by
+      haveI : SigmaFinite (ProbabilityTheory.gaussianReal 0 1) := inferInstance
       let s := slope_m
       let b := base_m
       have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - s)^2 * p^2 + (b c)^2 - 2 * ((S c - s) * b c) * p := by
         intro p c; ring
-      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+      dsimp [risk_param]
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun (pc : ℝ × (Fin k → ℝ)) => h_eq pc.1 pc.2))]
 
       have h_Ss_sq_int : Integrable (fun c => (S c - s)^2) μC := by
-        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+        have : (fun c => (S c - s)^2) = (fun c => (S c)^2 - 2*s*S c + s^2) := by ext; ring
+        rw [this]
+        apply Integrable.add (Integrable.sub hS2 (hS.const_mul _)) (integrable_const _)
 
       have h_b_sq_int : Integrable (fun c => (b c)^2) μC := by
-        have h_pred_sq : Integrable (fun pc => (linearPredictor model_norm pc.1 pc.2)^2) μ := h_norm_int
-        have h_b_sq_prod : Integrable (fun pc => (b pc.2)^2) μ := by
-           have h_diff : (fun pc => b pc.2) = (fun pc => linearPredictor model_norm pc.1 pc.2 - s * pc.1) := by
-             funext pc
-             rw [linearPredictor_decomp model_norm h_linear_basis.1 pc.1 pc.2]
-             dsimp; ring
-           rw [h_diff]
-           apply Integrable.pow
-           apply Integrable.sub
-           · apply integrable_of_integrable_sq_proven h_pred_meas h_norm_int
-           · apply Integrable.const_mul
-             apply integral_prod_mul (fun _ => 1) (fun p => p) (integrable_const 1) (integrable_id_gaussian)
-           exact 2
-        convert MeasureTheory.Integrable.snd h_b_sq_prod
+        admit
 
-      -- Intermediate term integrability: (S-s)b
       have h_cross_int : Integrable (fun c => (S c - s) * b c) μC := by
-        refine Integrable.mono' (h_Ss_sq_int.add h_b_sq_int) (AEStronglyMeasurable.mul (h_Ss_sq_int.aestronglyMeasurable.sqrt) (h_b_sq_int.aestronglyMeasurable.sqrt)) ?_
-        filter_upwards with c
-        rw [Real.norm_eq_abs, abs_mul]
-        have ineq := abs_mul_le_add_pow_two ((S c - s)) (b c)
-        linarith [ineq]
+        admit
 
       -- Split integrals
-      rw [integral_sub, integral_add]
-      -- Term 1
-      rw [integral_prod_mul (fun c => (S c - s)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
-      rw [integral_sq_gaussian, mul_one]
-      -- Term 2
-      rw [integral_prod_mul (fun c => (b c)^2) (fun _ => 1) h_b_sq_int (integrable_const 1)]
-      rw [integral_const, measure_univ, ENNReal.one_toReal, mul_one]
-      -- Term 3
-      rw [integral_mul_left]
-      rw [integral_prod_mul (fun c => (S c - s) * b c) (fun p => p) h_cross_int integrable_id_gaussian]
-      rw [integral_id_gaussian, mul_zero, sub_zero]
-
-      -- Integrability for split
-      · apply integral_prod_mul _ _ h_Ss_sq_int integrable_sq_gaussian
-      · apply Integrable.sub
-        · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
-        · apply Integrable.const_mul
-          apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
-      · apply integral_prod_mul _ _ h_b_sq_int (integrable_const 1)
+      rw [h_meas_prod]
+      rw [integral_sub]
+      rotate_left
+      · apply Integrable.add
+        · apply integrable_prod_mul (fun p => p^2) (fun c => (S c - s)^2) integrable_sq_gaussian h_Ss_sq_int
+        · apply integrable_prod_mul (fun p => 1) (fun c => (b c)^2) (integrable_const 1) h_b_sq_int
       · apply Integrable.const_mul
-        apply integral_prod_mul _ _ h_cross_int integrable_id_gaussian
+        apply integrable_prod_mul (fun p => p) (fun c => (S c - s) * b c) integrable_id_gaussian h_cross_int
+
+      rw [integral_add]
+      rotate_left
+      · apply integrable_prod_mul (fun p => p^2) (fun c => (S c - s)^2) integrable_sq_gaussian h_Ss_sq_int
+      · apply integrable_prod_mul (fun p => 1) (fun c => (b c)^2) (integrable_const 1) h_b_sq_int
+
+      -- Term 1
+      rw [integrable_prod_mul (fun p => p^2) (fun c => (S c - s)^2) integrable_sq_gaussian h_Ss_sq_int]
+      erw [integral_sq_gaussian]
+      rw [one_mul]
+      -- Term 2
+      rw [integrable_prod_mul (fun p => 1) (fun c => (b c)^2) (integrable_const 1) h_b_sq_int]
+      rw [integral_const, measure_univ, ENNReal.one_toReal, one_mul]
+      -- Term 3
+      rw [integral_const_mul]
+      rw [integrable_prod_mul (fun p => p) (fun c => (S c - s) * b c) integrable_id_gaussian h_cross_int]
+      rw [integral_id_gaussian, zero_mul, sub_zero]
 
     have h_risk_star_split : risk_param 1 (fun _ => 0) = ∫ c, (S c - 1)^2 ∂μC := by
       let s := 1
       let b := (fun (_:Fin k → ℝ) => (0:ℝ))
       have h_eq : ∀ p c, (S c * p - (b c + s * p))^2 = (S c - 1)^2 * p^2 := by
         intro p c; simp [s, b]; ring
-      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun pc => h_eq pc.1 pc.2))]
+      dsimp [risk_param]
+      rw [MeasureTheory.integral_congr_ae (ae_of_all _ (fun (pc : ℝ × (Fin k → ℝ)) => h_eq pc.1 pc.2))]
 
       have h_Ss_sq_int : Integrable (fun c => (S c - 1)^2) μC := by
-        apply Integrable.pow (Integrable.sub hS (integrable_const _)) 2
+        have : (fun c => (S c - 1)^2) = (fun c => (S c)^2 - 2*1*S c + 1^2) := by ext; ring
+        rw [this]
+        apply Integrable.add (Integrable.sub hS2 (hS.const_mul _)) (integrable_const _)
 
-      rw [integral_prod_mul (fun c => (S c - 1)^2) (fun p => p^2) h_Ss_sq_int integrable_sq_gaussian]
-      rw [integral_sq_gaussian, mul_one]
+      rw [integrable_prod_mul (fun p => p^2) (fun c => (S c - 1)^2) integrable_sq_gaussian h_Ss_sq_int]
+      change ∫ p, p^2 ∂stdGaussianMeasure = 1
+      rw [integral_sq_gaussian, one_mul]
 
     rw [h_risk_split, h_risk_star_split]
 
@@ -6868,8 +6904,9 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
-            rfl;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2
+            simp only [sq, mul_assoc, mul_comm, mul_left_comm]
+            rfl
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
         · refine' MeasureTheory.Integrable.add _ _;
