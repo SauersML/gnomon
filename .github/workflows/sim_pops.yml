@@ -423,6 +423,7 @@ jobs:
       - name: Download metrics artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: two-pop-*
           path: .
           merge-multiple: true
 
