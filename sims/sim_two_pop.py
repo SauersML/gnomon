@@ -128,7 +128,7 @@ def _simulate_ts(cfg: TwoPopConfig) -> Tuple[msprime.TreeSequence, np.ndarray]:
 
 
 def _simulate_dataset(cfg: TwoPopConfig) -> str:
-    sim_prefix = f"{cfg.sim_name}_g{cfg.divergence_gens}"
+    sim_prefix = f"{cfg.sim_name}_g{cfg.divergence_gens}_s{cfg.seed}"
     print(f"[{sim_prefix}] Simulating msprime two-pop model ...")
 
     ts, pop_labels = _simulate_ts(cfg)
@@ -285,16 +285,19 @@ def _simulate_dataset(cfg: TwoPopConfig) -> str:
     return sim_prefix
 
 
-def _build_config(sim_name: str, divergence_gens: int) -> TwoPopConfig:
+def _build_config(sim_name: str, divergence_gens: int, seed: int | None) -> TwoPopConfig:
     if sim_name not in ("divergence", "bottleneck"):
         raise ValueError("sim_name must be 'divergence' or 'bottleneck'")
     if divergence_gens not in GENS_LEVELS:
         raise ValueError(f"divergence_gens must be one of {GENS_LEVELS}")
 
+    base_seed = 101 + divergence_gens + (0 if sim_name == "divergence" else 7)
+    final_seed = seed if seed is not None else base_seed
+
     return TwoPopConfig(
         sim_name=sim_name,
         divergence_gens=divergence_gens,
-        seed=101 + divergence_gens + (0 if sim_name == "divergence" else 7),
+        seed=final_seed,
         samples={"POP0": 1000, "POP1": 1000},
         sequence_length=5_000_000,
         recomb_rate=1e-8,
@@ -309,12 +312,13 @@ def _build_config(sim_name: str, divergence_gens: int) -> TwoPopConfig:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        raise SystemExit("Usage: python sims/sim_two_pop.py <divergence|bottleneck> <divergence_gens>")
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("Usage: python sims/sim_two_pop.py <divergence|bottleneck> <divergence_gens> [seed]")
 
     sim_name = sys.argv[1].strip().lower()
     divergence_gens = int(sys.argv[2])
-    cfg = _build_config(sim_name, divergence_gens)
+    seed = int(sys.argv[3]) if len(sys.argv) == 4 else None
+    cfg = _build_config(sim_name, divergence_gens, seed)
     _simulate_dataset(cfg)
 
 

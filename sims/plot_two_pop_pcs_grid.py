@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import math
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
@@ -15,13 +16,25 @@ GENS_LEVELS = [0, 20, 50, 100, 500, 1000, 5000, 10_000]
 SIMS = ["divergence", "bottleneck"]
 
 
+def _pick_seeded_plot(sim: str, gens: int) -> Path | None:
+    pattern = f"{sim}_g{gens}_s*_pcs.png"
+    candidates = sorted(Path(".").glob(pattern))
+    if not candidates:
+        legacy = Path(f"{sim}_g{gens}_pcs.png")
+        return legacy if legacy.exists() else None
+    seed_re = re.compile(r"_s(\d+)_pcs\.png$")
+    def _seed_key(p: Path) -> int:
+        match = seed_re.search(p.name)
+        return int(match.group(1)) if match else 1_000_000
+    return sorted(candidates, key=_seed_key)[0]
+
+
 def _collect_images() -> list[tuple[str, Path]]:
     items: list[tuple[str, Path]] = []
     for sim in SIMS:
         for gens in GENS_LEVELS:
-            name = f"{sim}_g{gens}_pcs.png"
-            path = Path(name)
-            if path.exists():
+            path = _pick_seeded_plot(sim, gens)
+            if path is not None:
                 items.append((f"{sim} g{gens}", path))
     return items
 

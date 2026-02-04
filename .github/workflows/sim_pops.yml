@@ -332,6 +332,7 @@ jobs:
       matrix:
         sim_name: [divergence, bottleneck]
         divergence_gens: [0, 20, 50, 100, 500, 1000, 5000, 10000]
+        seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -377,30 +378,30 @@ jobs:
 
       - name: Run simulation
         run: |
-          python sims/sim_two_pop.py ${{ matrix.sim_name }} ${{ matrix.divergence_gens }}
+          python sims/sim_two_pop.py ${{ matrix.sim_name }} ${{ matrix.divergence_gens }} ${{ matrix.seed }}
 
       - name: Split data
         run: |
-          python sims/split_data.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}
+          python sims/split_data.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
 
       - name: Train BayesR
         run: |
-          python sims/train_model.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }} BayesR
+          python sims/train_model.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }} BayesR
 
       - name: Evaluate calibration methods
         run: |
-          python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}
+          python sims/evaluate.py ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}
+          name: two-pop-${{ matrix.sim_name }}-g${{ matrix.divergence_gens }}-s${{ matrix.seed }}
           path: |
-            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_metrics.csv
-            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_roc.png
-            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_calibration.png
-            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_comparison_auc.png
-            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_pcs.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_metrics.csv
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_roc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_calibration.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_comparison_auc.png
+            ${{ matrix.sim_name }}_g${{ matrix.divergence_gens }}_s${{ matrix.seed }}_pcs.png
           if-no-files-found: error
 
   two_pop_plot_auc:

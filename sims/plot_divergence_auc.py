@@ -1,5 +1,5 @@
 """
-Aggregate AUC across divergence levels and plot divergence vs bottleneck.
+Aggregate mean AUC across divergence levels and plot divergence vs bottleneck.
 
 Usage:
   python sims/plot_divergence_auc.py
@@ -50,23 +50,34 @@ def main() -> None:
     for sim_name in SCENARIOS:
         for gens in GENS_LEVELS:
             sim_prefix = f"{sim_name}_g{gens}"
-            metrics_path = Path(f"{sim_prefix}_metrics.csv")
-            if not metrics_path.exists():
-                missing_files.append(metrics_path.name)
+            pattern = f"{sim_prefix}_s*_metrics.csv"
+            metrics_paths = sorted(Path(".").glob(pattern))
+            if not metrics_paths:
+                legacy = Path(f"{sim_prefix}_metrics.csv")
+                if legacy.exists():
+                    metrics_paths = [legacy]
+            if not metrics_paths:
+                missing_files.append(f"{sim_prefix}_metrics.csv")
                 continue
-            df = pd.read_csv(metrics_path)
-            if "Method" not in df.columns or "AUC_overall" not in df.columns:
-                missing_methods[metrics_path.name] = sorted(set(df.get("Method", [])))
-                continue
-            for _, row in df.iterrows():
-                rows.append(
-                    {
-                        "scenario": sim_name,
-                        "gens": gens,
-                        "method": row["Method"],
-                        "auc": row["AUC_overall"],
-                    }
-                )
+
+            seed_re = re.compile(r"_s(\d+)_metrics\.csv$")
+            for metrics_path in metrics_paths:
+                df = pd.read_csv(metrics_path)
+                if "Method" not in df.columns or "AUC_overall" not in df.columns:
+                    missing_methods[metrics_path.name] = sorted(set(df.get("Method", [])))
+                    continue
+                seed_match = seed_re.search(metrics_path.name)
+                seed_val = int(seed_match.group(1)) if seed_match else None
+                for _, row in df.iterrows():
+                    rows.append(
+                        {
+                            "scenario": sim_name,
+                            "gens": gens,
+                            "seed": seed_val,
+                            "method": row["Method"],
+                            "auc": row["AUC_overall"],
+                        }
+                    )
 
     if not rows:
         details = []
@@ -95,25 +106,36 @@ def main() -> None:
             raise SystemExit(
                 f"Method '{method}' not found. Available methods: {', '.join(available)}"
             )
-    df = df.sort_values(["method", "scenario", "gens"])
-    csv_path = Path(f"{args.out_prefix}.csv")
-    df.to_csv(csv_path, index=False)
+    df = df.sort_values(["method", "scenario", "gens", "seed"])
 
-    methods = sorted(df["method"].unique())
+    agg = (
+        df.groupby(["scenario", "gens", "method"], as_index=False)
+        .agg(
+            mean_auc=("auc", "mean"),
+            std_auc=("auc", "std"),
+            n_seeds=("auc", "count"),
+        )
+        .sort_values(["method", "scenario", "gens"])
+    )
+
+    csv_path = Path(f"{args.out_prefix}.csv")
+    agg.to_csv(csv_path, index=False)
+
+    methods = sorted(agg["method"].unique())
     fig, ax = plt.subplots(figsize=(12, 7))
     colors = plt.get_cmap("tab10")
     color_map = {method_name: colors(i % 10) for i, method_name in enumerate(methods)}
     line_styles = {"divergence": "-", "bottleneck": "--"}
 
     for method_name in methods:
-        sub_df = df[df["method"] == method_name]
+        sub_df = agg[agg["method"] == method_name]
         for scenario in SCENARIOS:
             sub = sub_df[sub_df["scenario"] == scenario].sort_values("gens")
             if sub.empty:
                 continue
             ax.plot(
                 sub["gens"],
-                sub["auc"],
+                sub["mean_auc"],
                 marker="o",
                 linewidth=2,
                 color=color_map[method_name],
@@ -122,8 +144,8 @@ def main() -> None:
             )
 
     ax.set_xlabel("Divergence (generations, log scale)")
-    ax.set_ylabel("AUC (overall)")
-    ax.set_title("AUC vs Divergence for Two-Population Sims")
+    ax.set_ylabel("Mean AUC (overall)")
+    ax.set_title("Mean AUC vs Divergence for Two-Population Sims")
     _set_gens_scale(ax)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, ncol=2)
