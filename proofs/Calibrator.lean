@@ -4437,12 +4437,14 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     p = orthogonalProjection K y := by
   haveI : FiniteDimensional ℝ (Fin n → ℝ) := by infer_instance
   haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le le_top
-  haveI : CompleteSpace K := FiniteDimensional.complete K
+  haveI : CompleteSpace K := FiniteDimensional.complete ℝ K
   unfold orthogonalProjection
-  apply Subtype.ext
-  apply eq_orthogonalProjection_of_dist_le
-  intro w
-  exact h_min w w.2
+  have h_eq : (⟨p, h_mem⟩ : K) = Submodule.orthogonalProjection K y := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    intro w
+    exact h_min w w.2
+  rw [← h_eq]
+  rfl
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -4499,7 +4501,7 @@ theorem prediction_is_invariant_to_affine_pc_transform_rigorous {n k p sp : ℕ}
     -- fit minimizes ||y - Xβ||^2.
     -- range X = range X'.
     -- So predictions are equal.
-    admit
+    sorry
 
   exact congr_fun h_pred_eq i
 
@@ -6231,7 +6233,7 @@ theorem laml_gradient_is_exact
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
   -- Verification follows from multivariable chain rule application.
-  admit
+  sorry
 
 end GradientDescentVerification
 
