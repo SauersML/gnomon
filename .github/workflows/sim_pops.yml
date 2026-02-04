@@ -32,9 +32,84 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
+  # JOB 0: TOOL CACHE (Populate once, then reuse)
+  # ------------------------------------------------------------------
+  tool_cache:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore tool cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
+
+      - name: Set up Python
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Set up R
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4.2"
+
+      - name: Install base dependencies
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+          uv pip install --system rpy2
+          Rscript -e 'install.packages("mgcv", repos="https://cloud.r-project.org")'
+
+      - name: Install Plink2
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          wget https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
+          unzip plink2.zip
+          sudo mv plink2 /usr/local/bin/
+          rm plink2.zip
+
+      - name: Install GCTB (BayesR)
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p gctb_bin
+          wget https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip
+          unzip gctb_2.03beta_Linux.zip -d gctb_bin
+          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
+          chmod +x /usr/local/bin/gctb
+
+      - name: Save tool cache
+        if: ${{ always() && steps.tools-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
+
+  # ------------------------------------------------------------------
   # JOB 1: SIMULATE & SPLIT (Generate Data)
   # ------------------------------------------------------------------
   simulate:
+    needs: tool_cache
     runs-on: ubuntu-22.04
     env:
       SIM_CACHE_VERSION: v3
@@ -55,7 +130,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -70,7 +144,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -85,7 +158,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -100,7 +172,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -115,7 +186,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -220,7 +290,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -229,7 +298,7 @@ jobs:
   # JOB 2: TRAIN MODELS (Matrix Strategy)
   # ------------------------------------------------------------------
   train:
-    needs: simulate
+    needs: [tool_cache, simulate]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false # Let other methods finish if one fails
@@ -319,7 +388,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -328,7 +396,7 @@ jobs:
   # JOB 3: EVALUATE & CALIBRATE
   # ------------------------------------------------------------------
   evaluate:
-    needs: [simulate, train]
+    needs: [tool_cache, simulate, train]
     if: ${{ always() && needs.simulate.result == 'success' }}
     runs-on: ubuntu-22.04
     strategy:
@@ -435,7 +503,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -445,7 +512,7 @@ jobs:
   # ------------------------------------------------------------------
   report:
     runs-on: ubuntu-22.04
-    needs: evaluate
+    needs: [tool_cache, evaluate]
     if: always()
     steps:
       - uses: actions/checkout@v4
@@ -513,7 +580,6 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -522,6 +588,7 @@ jobs:
   # JOB 5: TWO-POP SIMS (divergence, bottleneck)
   # ------------------------------------------------------------------
   two_pop_simulate_train_eval:
+    needs: tool_cache
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -653,13 +720,12 @@ jobs:
             ~/.cache/stdpopsim
             ~/.cache/R
             ~/.local/lib/R
-            ~/.local/bin/gnomon
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
   two_pop_plot_auc:
-    needs: two_pop_simulate_train_eval
+    needs: [tool_cache, two_pop_simulate_train_eval]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
