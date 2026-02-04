@@ -108,7 +108,7 @@ log_header "Checking Latest Binary Release"
 # This skips model-only releases (e.g., models-v1) automatically
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
 
-CURL_ARGS=(-sL)
+CURL_ARGS=(-sL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 5 --max-time 20)
 if [ -n "$GITHUB_TOKEN" ]; then
     log_info "Using GITHUB_TOKEN for authenticated API request."
     CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
@@ -127,7 +127,7 @@ for ((i=1; i<=MAX_RETRIES; i++)); do
         log_info "Fetching releases from GitHub (Attempt $i/$MAX_RETRIES)..."
     fi
 
-    RESPONSE=$(curl "${CURL_ARGS[@]}" "${API_URL}")
+    RESPONSE=$(curl "${CURL_ARGS[@]}" "${API_URL}" || true)
 
     # Find the first release that contains the target asset
     DOWNLOAD_URL=$(echo "$RESPONSE" | \
@@ -164,7 +164,7 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 ARCHIVE_PATH="${TEMP_DIR}/${TARGET_ASSET}"
 
 log_info "${ICON_PKG} Downloading..."
-curl -L --progress-bar -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"
+curl -L --progress-bar --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 10 --max-time 300 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL"
 
 log_info "Extracting..."
 if [[ "$TARGET_ASSET" == *.zip ]]; then
