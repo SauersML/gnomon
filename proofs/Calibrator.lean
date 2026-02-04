@@ -1416,7 +1416,72 @@ lemma optimal_coefficients_for_additive_dgp
     (hYP_int : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => dgp.trueExpectation pc.1 pc.2 * pc.1) dgp.jointMeasure)
     (h_resid_sq_int : Integrable (fun pc => (dgp.trueExpectation pc.1 pc.2 - (model.γ₀₀ + model.γₘ₀ ⟨0, by norm_num⟩ * pc.1))^2) dgp.jointMeasure) :
     model.γ₀₀ = 0 ∧ model.γₘ₀ ⟨0, by norm_num⟩ = 1 := by
-  admit
+  -- 1. Get orthogonality conditions
+  have h_orth := rawOptimal_implies_orthogonality model dgp h_opt h_linear hY_int hP_int hP2_int hYP_int h_resid_sq_int
+  obtain ⟨h_orth_1, h_orth_P⟩ := h_orth
+
+  -- Let a = γ₀₀ and b = γₘ₀[0]
+  set a := model.γ₀₀
+  set b := model.γₘ₀ ⟨0, by norm_num⟩
+
+  -- 2. First normal equation: a = E[Y]
+  have ha : a = ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure :=
+    optimal_intercept_eq_mean_of_zero_mean_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hP0 h_orth_1
+
+  -- 3. Calculate E[Y]
+  -- Y = P + β*C
+  -- E[Y] = E[P] + β*E[C] = 0 + β*0 = 0
+  have h_mean_Y : ∫ pc, dgp.trueExpectation pc.1 pc.2 ∂dgp.jointMeasure = 0 := by
+    rw [h_dgp]
+    change ∫ pc, pc.1 + β_env * pc.2 ⟨0, by norm_num⟩ ∂dgp.jointMeasure = 0
+    rw [integral_add hP_int (hC_int.const_mul _)]
+    rw [hP0, integral_const_mul, hC0]
+    simp
+
+  rw [h_mean_Y] at ha
+
+  -- 4. Second normal equation: b = E[YP]
+  have hb : b = ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure :=
+    optimal_slope_eq_covariance_of_normalized_p dgp.jointMeasure (fun pc => dgp.trueExpectation pc.1 pc.2) a b hY_int hP_int hYP_int hP2_int hP0 hP2 h_orth_P
+
+  -- 5. Calculate E[YP]
+  -- YP = (P + βC)P = P² + βCP
+  -- E[YP] = E[P²] + βE[CP]
+  -- E[CP] = 0 by independence (integral_mul_fst_snd_eq_zero)
+  -- E[YP] = 1 + 0 = 1
+  have h_cov_Y : ∫ pc, dgp.trueExpectation pc.1 pc.2 * pc.1 ∂dgp.jointMeasure = 1 := by
+    rw [h_dgp]
+    -- Use simplify to expand terms
+    have h_split : ∀ pc : ℝ × (Fin 1 → ℝ), (pc.1 + β_env * pc.2 ⟨0, by norm_num⟩) * pc.1 =
+                   pc.1 ^ 2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) := by
+      intro pc
+      ring
+    simp only [h_split]
+
+    change ∫ pc, pc.1^2 + β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure = 1
+
+    have hPC_int' : Integrable (fun pc : ℝ × (Fin 1 → ℝ) => β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1)) dgp.jointMeasure :=
+      hPC_int.const_mul _
+
+    rw [integral_add hP2_int hPC_int']
+    rw [hP2]
+
+    have hPC : ∫ pc, β_env * (pc.2 ⟨0, by norm_num⟩ * pc.1) ∂dgp.jointMeasure = 0 := by
+      rw [integral_const_mul]
+      have h_zero : ∫ pc, pc.2 ⟨0, by norm_num⟩ * pc.1 ∂dgp.jointMeasure = 0 := by
+         have h_eq : (fun pc : ℝ × (Fin 1 → ℝ) => pc.2 ⟨0, by norm_num⟩ * pc.1) = (fun pc => pc.1 * pc.2 ⟨0, by norm_num⟩) := by
+            funext; ring
+         rw [h_eq]
+         exact integral_mul_fst_snd_eq_zero dgp.jointMeasure h_indep hP0 hC0
+      rw [h_zero]
+      simp
+
+    rw [hPC]
+    simp
+
+  rw [h_cov_Y] at hb
+
+  exact ⟨ha, hb⟩
 
 
 lemma polynomial_spline_coeffs_unique {n : ℕ} (coeffs : Fin n → ℝ) :
