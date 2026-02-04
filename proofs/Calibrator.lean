@@ -6110,25 +6110,25 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                     | empty => simp
                     | insert a s ha ih =>
                       simp [Finset.prod_insert ha, Finset.sum_insert ha]
-                      rw [deriv_mul (h_diff a) (DifferentiableAt.finset_prod (fun i _ => h_diff i))]
-                      rw [ih, Finset.mul_sum]
-                      simp only [Finset.sum_mul]
-                      rw [add_comm]
-                      congr 1
-                      · congr 1
-                        apply Finset.prod_congr rfl
-                        intro j hj
-                        rw [Finset.erase_insert ha]
-                      · apply Finset.sum_congr rfl
-                        intro j hj
-                        have h_ne : j ≠ a := ne_of_mem_of_not_mem hj ha
-                        rw [Finset.erase_insert_of_ne h_ne, Finset.prod_insert]
-                        · ring_nf
-                        · exact fun h => ha (Finset.mem_erase.mp h).1
-                      · apply DifferentiableAt.finset_prod
-                        intro k hk
-                        exact h_diff k
+                      rw [deriv_mul]
+                      · rw [ih, Finset.mul_sum]
+                        simp only [Finset.sum_mul]
+                        rw [add_comm]
+                        congr 1
+                        · congr 1
+                          apply Finset.prod_congr rfl
+                          intro j hj
+                          rw [Finset.erase_insert ha]
+                        · apply Finset.sum_congr rfl
+                          intro j hj
+                          have h_ne : j ≠ a := ne_of_mem_of_not_mem hj ha
+                          rw [Finset.erase_insert_of_ne h_ne, Finset.prod_insert]
+                          · ring_nf
+                          · exact fun h => ha (Finset.mem_erase.mp h).1
                       · exact h_diff a
+                      · apply DifferentiableAt.finset_prod
+                        intros k _
+                        exact h_diff k
                   exact h_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
@@ -6138,7 +6138,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
+                  exact DifferentiableAt.finset_prod (s := Finset.univ) (fun i _ => h_diff i)
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
