@@ -13,6 +13,30 @@ import matplotlib.pyplot as plt
 SIM_NAMES = ["confounding", "portability"]
 
 
+def _apply_plot_style():
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "axes.facecolor": "white",
+            "axes.edgecolor": "#444444",
+            "axes.linewidth": 0.8,
+            "grid.color": "#d0d0d0",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.6,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 11,
+            "axes.titlesize": 13,
+            "legend.fontsize": 8,
+        }
+    )
+
+
+def _style_axes(ax):
+    ax.grid(axis="y", alpha=0.6)
+    ax.set_axisbelow(True)
+
+
 def load_metrics() -> pd.DataFrame:
     frames = []
     for sim in SIM_NAMES:
@@ -74,6 +98,7 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
             x += gap_sim
         x += gap_train
 
+    _apply_plot_style()
     fig, ax = plt.subplots(figsize=(14, max(6, len(training_order) * len(sims) * 0.5)))
     colors = plt.get_cmap("tab10")
     app_color = {app: colors(i % 10) for i, app in enumerate(app_methods)}
@@ -113,7 +138,7 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
     max_bracket_y = max_bar
     ax.set_ylim(0, 1)
     ax.set_title("Overall AUC by Training Method and Simulation")
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    _style_axes(ax)
 
     if not pvals.empty:
         pvals = pvals.copy()
@@ -188,7 +213,7 @@ def plot_auc_summary(df: pd.DataFrame, pvals: pd.DataFrame, out_path: Path) -> N
     # Deduplicate legend entries
     handles, labels = ax.get_legend_handles_labels()
     dedup = dict(zip(labels, handles))
-    ax.legend(dedup.values(), dedup.keys(), loc="upper right")
+    ax.legend(dedup.values(), dedup.keys(), loc="upper right", frameon=False, title="Calibration")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)

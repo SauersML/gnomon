@@ -64,14 +64,22 @@ def main() -> None:
                 _, path = img_map[name]
                 img = mpimg.imread(path)
                 ax.imshow(img)
-                ax.set_title(f"{sim} g{gens}", fontsize=10)
             else:
                 ax.text(0.5, 0.5, "missing", ha="center", va="center", fontsize=10)
-                ax.set_title(f"{sim} g{gens}", fontsize=10)
             ax.axis("off")
 
-    fig.suptitle("Two-Population PC Plots", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+    # Column labels (gens)
+    for c, gens in enumerate(GENS_LEVELS):
+        axes[0][c].set_title(f"g{gens}", fontsize=11, fontweight="bold", pad=6)
+
+    fig.suptitle("Two-Population PC Plots (Seeded Example)", fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0.04, 0.02, 1, 0.93])
+
+    # Row labels (scenarios) after layout for accurate positioning
+    for r, sim in enumerate(SIMS):
+        pos = axes[r][0].get_position()
+        y_center = (pos.y0 + pos.y1) / 2
+        fig.text(0.015, y_center, sim, fontsize=12, rotation=90, va="center")
     out_path = Path("two_pop_pcs_mega.png")
     fig.savefig(out_path, dpi=150)
     plt.close(fig)

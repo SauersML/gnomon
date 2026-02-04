@@ -28,6 +28,28 @@ from metrics import compute_all_metrics, compute_calibration_curve
 N_PERMUTATIONS = 1000
 MAX_WORKERS = 8
 
+def _apply_plot_style():
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "axes.facecolor": "white",
+            "axes.edgecolor": "#444444",
+            "axes.linewidth": 0.8,
+            "grid.color": "#d0d0d0",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.6,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 11,
+            "axes.titlesize": 13,
+            "legend.fontsize": 8,
+        }
+    )
+
+def _style_axes(ax):
+    ax.grid(True, alpha=0.6)
+    ax.set_axisbelow(True)
+
 def load_scores(work_dir, methods):
     """Load scores. At least ONE method must succeed."""
     scores_dict = {}
@@ -66,58 +88,69 @@ def load_scores(work_dir, methods):
 def plot_roc_curves(methods_results, sim_label):
     """Plot ROC curves."""
     from sklearn.metrics import roc_curve
-    fig, ax = plt.subplots(figsize=(10, 8))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(methods_results)))
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(9, 7))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(methods_results))))
     
     for (method_name, result), color in zip(methods_results.items(), colors):
         y_true = result['y_true']
         y_pred = result['y_pred']
         fpr, tpr, _ = roc_curve(y_true, y_pred)
         auc = result['metrics']['auc']['overall']
-        ax.plot(fpr, tpr, label=f"{method_name} (AUC={auc:.3f})", color=color, linewidth=2)
+        ax.plot(fpr, tpr, label=f"{method_name} (AUC={auc:.3f})", color=color, linewidth=2.2)
     
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Random')
-    ax.set_title(f'ROC Curves - Simulation {sim_label}', fontsize=14, fontweight='bold')
-    ax.legend(loc='lower right')
-    ax.grid(True, alpha=0.3)
-    plt.savefig(f'{sim_label}_comparison_roc.png', dpi=150, bbox_inches='tight')
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.4, label='Random')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f'ROC Curves - Simulation {sim_label}', fontweight='bold')
+    _style_axes(ax)
+    ax.legend(loc='lower right', frameon=False)
+    plt.savefig(f'{sim_label}_comparison_roc.png', dpi=200, bbox_inches='tight')
     plt.close()
 
 def plot_calibration_curves(methods_results, sim_label):
     """Plot calibration curves."""
-    fig, ax = plt.subplots(figsize=(10, 8))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(methods_results)))
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(9, 7))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(1, len(methods_results))))
     
     for (method_name, result), color in zip(methods_results.items(), colors):
         y_true = result['y_true']
         y_pred = result['y_pred']
         bin_edges, observed, predicted = compute_calibration_curve(y_true, y_pred, n_bins=10)
         mask = ~np.isnan(observed)
-        ax.plot(predicted[mask], observed[mask], 'o-', label=method_name, color=color, linewidth=2)
+        ax.plot(predicted[mask], observed[mask], 'o-', label=method_name, color=color, linewidth=2, markersize=4)
     
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_title(f'Calibration Curves - Simulation {sim_label}', fontsize=14, fontweight='bold')
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
-    plt.savefig(f'{sim_label}_comparison_calibration.png', dpi=150, bbox_inches='tight')
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.4, label="Perfect")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Predicted Probability")
+    ax.set_ylabel("Observed Frequency")
+    ax.set_title(f'Calibration Curves - Simulation {sim_label}', fontweight='bold')
+    _style_axes(ax)
+    ax.legend(loc='upper left', frameon=False)
+    plt.savefig(f'{sim_label}_comparison_calibration.png', dpi=200, bbox_inches='tight')
     plt.close()
 
 def plot_pcs(pc1, pc2, pop_labels, sim_label):
     """Plot PC1 vs PC2 colored by population."""
-    fig, ax = plt.subplots(figsize=(10, 8))
+    _apply_plot_style()
+    fig, ax = plt.subplots(figsize=(8.5, 6.5))
     unique_pops = sorted(set(pop_labels))
     colors = plt.cm.tab10(np.linspace(0, 1, len(unique_pops)))
 
     for pop, color in zip(unique_pops, colors):
         mask = pop_labels == pop
-        ax.scatter(pc1[mask], pc2[mask], s=12, alpha=0.7, label=str(pop), color=color)
+        ax.scatter(pc1[mask], pc2[mask], s=12, alpha=0.7, label=str(pop), color=color, edgecolors="none")
 
-    ax.set_xlabel("PC1", fontsize=12, fontweight='bold')
-    ax.set_ylabel("PC2", fontsize=12, fontweight='bold')
-    ax.set_title("Population Structure (PC1 vs PC2)", fontsize=14, fontweight='bold')
-    ax.legend(loc="best", fontsize=9, frameon=False)
-    ax.grid(True, alpha=0.2)
-    plt.savefig(f"{sim_label}_pcs.png", dpi=150, bbox_inches="tight")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title("Population Structure (PC1 vs PC2)", fontweight='bold')
+    _style_axes(ax)
+    ax.legend(loc="best", frameon=False, title="Population")
+    plt.savefig(f"{sim_label}_pcs.png", dpi=200, bbox_inches="tight")
     plt.close()
 
 def create_metrics_table(methods_results, sim_label):
@@ -152,9 +185,10 @@ def plot_auc_summary(methods_results, pvals_df, sim_label):
     auc_df = pd.DataFrame(auc_rows, columns=["Method", "AUC"]).sort_values("AUC", ascending=False)
     best_method = auc_df.iloc[0]["Method"]
 
+    _apply_plot_style()
     fig, ax = plt.subplots(figsize=(10, max(5, len(auc_df) * 0.6)))
     colors = plt.cm.tab10(np.linspace(0, 1, len(auc_df)))
-    ax.bar(auc_df["Method"], auc_df["AUC"], color=colors, edgecolor="black", linewidth=0.5)
+    ax.bar(auc_df["Method"], auc_df["AUC"], color=colors, edgecolor="#333333", linewidth=0.6)
 
     max_auc = auc_df["AUC"].max() if not auc_df.empty else 1.0
     y_offset = max(0.01, max_auc * 0.02)
@@ -184,13 +218,12 @@ def plot_auc_summary(methods_results, pvals_df, sim_label):
     ax.set_ylabel("AUC (overall)")
     ax.set_title(
         f"AUC Summary - Simulation {sim_label} (p-values vs {best_method})",
-        fontsize=13,
         fontweight="bold",
     )
-    ax.grid(axis="y", alpha=0.3)
+    _style_axes(ax)
     plt.xticks(rotation=25, ha="right")
     plt.tight_layout()
-    plt.savefig(f"{sim_label}_comparison_auc.png", dpi=150, bbox_inches="tight")
+    plt.savefig(f"{sim_label}_comparison_auc.png", dpi=200, bbox_inches="tight")
     plt.close()
 
 def plot_brier_summary(methods_results, pvals_df, sim_label):
@@ -205,9 +238,10 @@ def plot_brier_summary(methods_results, pvals_df, sim_label):
     brier_df = pd.DataFrame(brier_rows, columns=["Method", "Brier"]).sort_values("Brier", ascending=True)
     best_method = brier_df.iloc[0]["Method"]
 
+    _apply_plot_style()
     fig, ax = plt.subplots(figsize=(10, max(5, len(brier_df) * 0.6)))
     colors = plt.cm.tab10(np.linspace(0, 1, len(brier_df)))
-    ax.bar(brier_df["Method"], brier_df["Brier"], color=colors, edgecolor="black", linewidth=0.5)
+    ax.bar(brier_df["Method"], brier_df["Brier"], color=colors, edgecolor="#333333", linewidth=0.6)
 
     min_brier = brier_df["Brier"].min() if not brier_df.empty else 0.0
     y_offset = max(0.001, min_brier * 0.02)
@@ -236,13 +270,12 @@ def plot_brier_summary(methods_results, pvals_df, sim_label):
     ax.set_ylabel("Brier (overall)")
     ax.set_title(
         f"Brier Summary - Simulation {sim_label} (p-values vs {best_method})",
-        fontsize=13,
         fontweight="bold",
     )
-    ax.grid(axis="y", alpha=0.3)
+    _style_axes(ax)
     plt.xticks(rotation=25, ha="right")
     plt.tight_layout()
-    plt.savefig(f"{sim_label}_comparison_brier.png", dpi=150, bbox_inches="tight")
+    plt.savefig(f"{sim_label}_comparison_brier.png", dpi=200, bbox_inches="tight")
     plt.close()
 
 def delong_test(y_true, y_pred1, y_pred2):

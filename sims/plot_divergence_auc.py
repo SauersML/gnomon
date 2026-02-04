@@ -33,6 +33,25 @@ def _set_gens_scale(ax: plt.Axes) -> None:
     ax.set_xticklabels([str(g) for g in GENS_LEVELS])
 
 
+def _apply_style() -> None:
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "axes.facecolor": "white",
+            "axes.edgecolor": "#444444",
+            "axes.linewidth": 0.8,
+            "grid.color": "#d0d0d0",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.6,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 11,
+            "axes.titlesize": 13,
+            "legend.fontsize": 8,
+        }
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -118,6 +137,7 @@ def main() -> None:
         .sort_values(["method", "scenario", "gens"])
     )
 
+    _apply_style()
     csv_path = Path(f"{args.out_prefix}.csv")
     agg.to_csv(csv_path, index=False)
 
@@ -133,6 +153,7 @@ def main() -> None:
             sub = sub_df[sub_df["scenario"] == scenario].sort_values("gens")
             if sub.empty:
                 continue
+            std = sub["std_auc"].fillna(0.0).to_numpy()
             ax.plot(
                 sub["gens"],
                 sub["mean_auc"],
@@ -142,13 +163,22 @@ def main() -> None:
                 linestyle=line_styles.get(scenario, "-"),
                 label=f"{method_name} ({scenario})",
             )
+            if (std > 0).any():
+                ax.fill_between(
+                    sub["gens"],
+                    sub["mean_auc"] - std,
+                    sub["mean_auc"] + std,
+                    color=color_map[method_name],
+                    alpha=0.12,
+                    linewidth=0,
+                )
 
     ax.set_xlabel("Divergence (generations, log scale)")
     ax.set_ylabel("Mean AUC (overall)")
     ax.set_title("Mean AUC vs Divergence for Two-Population Sims")
     _set_gens_scale(ax)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.6)
+    ax.legend(ncol=2, frameon=False)
     fig.tight_layout()
     plot_path = Path(f"{args.out_prefix}.png")
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
