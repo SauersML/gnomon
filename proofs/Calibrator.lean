@@ -4163,7 +4163,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     intro p c
     have h_decomp := linearPredictor_decomp model_star (by simp [model_star, h_linear_basis]) p c
     rw [h_decomp]
-    simp [model_star, predictorBase, predictorSlope, evalSmooth]
+    unfold predictorBase predictorSlope evalSmooth
+    dsimp [model_star]
+    simp
 
   have h_star_in_class : IsNormalizedScoreModel model_star := by
     constructor
@@ -4480,7 +4482,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let iso := (WithLp.linearEquiv 2 (Fin n → ℝ)).symm
   let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
   haveI : FiniteDimensional ℝ K' := Module.Finite.iff_fg.mpr (Submodule.fg_of_fg_map_injective (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n)) iso.injective (Module.Finite.iff_fg.mp inferInstance))
   haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
@@ -4491,7 +4493,7 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let iso := (WithLp.linearEquiv 2 (Fin n → ℝ)).symm
   let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n))
   haveI : FiniteDimensional ℝ K' := Module.Finite.iff_fg.mpr (Submodule.fg_of_fg_map_injective (iso : (Fin n → ℝ) →ₗ[ℝ] EuclideanSpace ℝ (Fin n)) iso.injective (Module.Finite.iff_fg.mp inferInstance))
   haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
@@ -4627,7 +4629,7 @@ theorem extrapolation_error_bound_lipschitz {n k p sp : ℕ} [Fintype (Fin n)] [
 theorem context_specificity {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)] (dgp1 dgp2 : DGPWithEnvironment k)
     (h_same_genetics : dgp1.trueGeneticEffect = dgp2.trueGeneticEffect ∧ dgp1.to_dgp.jointMeasure = dgp2.to_dgp.jointMeasure)
     (h_diff_env : dgp1.environmentalEffect ≠ dgp2.environmentalEffect)
-    (model1 : PhenotypeInformedGAM p k sp) (h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
+    (model1 : PhenotypeInformedGAM p k sp) (_h_opt1 : IsBayesOptimalInClass dgp1.to_dgp model1)
     (h_repr :
       IsBayesOptimalInClass dgp2.to_dgp model1 →
         dgp1.to_dgp.trueExpectation = dgp2.to_dgp.trueExpectation) :
@@ -6558,8 +6560,8 @@ open Calibrator
 lemma integral_mul_fst_snd_eq_zero_proven_v2
     (μ : Measure (ℝ × (Fin 1 → ℝ))) [IsProbabilityMeasure μ]
     (h_indep : μ = (μ.map Prod.fst).prod (μ.map Prod.snd))
-    (hP_int : Integrable (fun pc => pc.1) μ)
-    (hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
+    (_hP_int : Integrable (fun pc => pc.1) μ)
+    (_hC_int : Integrable (fun pc => pc.2 ⟨0, by norm_num⟩) μ)
     (hP0 : ∫ pc, pc.1 ∂μ = 0)
     (hC0 : ∫ pc, pc.2 ⟨0, by norm_num⟩ ∂μ = 0) :
     ∫ pc, pc.1 * pc.2 ⟨0, by norm_num⟩ ∂μ = 0 := by
