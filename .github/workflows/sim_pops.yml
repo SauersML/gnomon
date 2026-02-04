@@ -134,62 +134,6 @@ jobs:
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
       
-      - name: Restore tool cache
-        id: tools-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
-            /usr/local/bin/plink2
-            /usr/local/bin/gctb
-          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
-
-      - name: Restore tool cache
-        id: tools-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
-            /usr/local/bin/plink2
-            /usr/local/bin/gctb
-          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
-
-      - name: Restore tool cache
-        id: tools-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
-            /usr/local/bin/plink2
-            /usr/local/bin/gctb
-          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
-
-      - name: Restore tool cache
-        id: tools-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
-            /usr/local/bin/plink2
-            /usr/local/bin/gctb
-          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
-
       - name: Show git revision
         run: |
           git rev-parse HEAD
@@ -309,6 +253,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore tool cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -405,6 +363,20 @@ jobs:
         seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore tool cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
       - name: Set up R for GAM
         uses: r-lib/actions/setup-r@v2
@@ -517,6 +489,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: Restore tool cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -598,6 +584,20 @@ jobs:
         seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore tool cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/stdpopsim
+            ~/.cache/R
+            ~/.local/lib/R
+            /usr/local/bin/plink2
+            /usr/local/bin/gctb
+          key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
