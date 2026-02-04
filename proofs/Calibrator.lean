@@ -4093,7 +4093,8 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
-/-- Quantitative Error of Normalization (Multiplicative Case):
+
+/- Quantitative Error of Normalization (Multiplicative Case):
     In a multiplicative bias DGP Y = scaling(C) * P, the error of a normalized (additive) model
     relative to the optimal model is the variance of the interaction term.
 
@@ -4102,6 +4103,7 @@ theorem optimal_recovers_truth_of_capable {p k sp : ℕ} [Fintype (Fin p)] [Fint
     Assumption: E[scaling(C)] = 1 (centered scaling).
     Then the additive projection of scaling(C)*P is 1*P.
     The residual is (scaling(C) - 1)*P. -/
+
 /-- A normalized model has a constant slope (predictorSlope depends only on γₘ₀). -/
 lemma normalized_model_slope_constant {k sp : ℕ} [Fintype (Fin k)] [Fintype (Fin sp)]
     (m : PhenotypeInformedGAM 1 k sp) (h_norm : IsNormalizedScoreModel m) :
