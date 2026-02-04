@@ -4124,8 +4124,10 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   have h_P2_int : Integrable (fun x => x^2) (ProbabilityTheory.gaussianReal 0 1) := integrable_sq_gaussian
   have h_P_int : Integrable (fun x => x) (ProbabilityTheory.gaussianReal 0 1) := integrable_id_gaussian
 
-  have h_map_snd : Measure.map Prod.snd μ = Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) :=
-    Measure.map_snd_prod (ProbabilityTheory.gaussianReal 0 1) _
+  have h_map_snd : Measure.map Prod.snd μ = Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1) := by
+    rw [Measure.map_snd_prod]
+    simp only [Measure.measure_univ, one_smul]
+
   rw [h_map_snd] at h_scaling_sq_int h_base_sq_int h_scaling_meas h_base_meas
 
   -- S(c)^2 is integrable (hypothesis)
@@ -4133,8 +4135,21 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) (Measure.map Prod.snd μ) := by
     rw [h_map_snd]
     have h_scal_int : Integrable scaling_func (Measure.pi (fun (_ : Fin k) => ProbabilityTheory.gaussianReal 0 1)) :=
-      Integrable.mono' (h_scaling_sq_int.add (integrable_const 1)) h_scaling_meas.aestronglyMeasurable
-      (by filter_upwards; intro c; simp; apply le_trans (abs_le_sq_add_one (scaling_func c)); linarith)
+      Integrable.mono' (h_scaling_sq_int.add (integrable_const 1)) h_scaling_meas.1
+      (by
+        filter_upwards
+        intro c
+        simp only [norm_eq_abs, Pi.add_apply, Pi.pow_apply, Pi.const_apply]
+        have : |scaling_func c| ≤ scaling_func c ^ 2 + 1 := by
+          by_cases h : |scaling_func c| ≤ 1
+          · linarith [sq_nonneg (scaling_func c)]
+          · have : 1 < |scaling_func c| := by linarith
+            have : |scaling_func c| < |scaling_func c|^2 := by
+              rw [sq_abs]
+              exact lt_sq_of_one_lt_abs this
+            linarith
+        exact this
+      )
     have : (fun c => (scaling_func c - beta)^2) = (fun c => scaling_func c ^ 2 - 2 * beta * scaling_func c + beta ^ 2) := by
       ext; ring
     rw [this]
@@ -4165,11 +4180,14 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
     -- Or |(S-β)base| <= (S-β)^2 + base^2.
     apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
     · apply AEStronglyMeasurable.mul
-      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
-      · exact h_base_meas
+      · apply AEStronglyMeasurable.sub h_scaling_meas.1 aestronglyMeasurable_const
+      · exact h_base_meas.1
     · filter_upwards with c
-      apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
-      simp; linarith
+      have : |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 := by
+        have : 2 * |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 :=
+          two_mul_abs_le_sq_add_sq (scaling_func c - beta) (base c)
+        linarith
+      simp only [norm_eq_abs, Pi.add_apply, Pi.mul_apply, Pi.pow_apply, this]
 
   have h_eq : ∀ pc : ℝ × (Fin k → ℝ),
       (scaling_func pc.2 * pc.1 - (base pc.2 + beta * pc.1))^2 =
@@ -4183,33 +4201,57 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- Evaluate integrals
   -- Term 1: ∫ (S-β)^2 P^2
   have h_val1 : ∫ pc, (scaling_func pc.2 - beta)^2 * pc.1^2 ∂μ = ∫ c, (scaling_func c - beta)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
-    -- Fubini
-    -- Use integral_prod_mul result?
-    -- No, integral_prod_mul gives Integrable.
-    -- We need value.
-    -- Mathlib `integral_prod_mul_custom` ?
-    -- For product measure μ.prod ν and f(x)*g(y): ∫ f*g = (∫ f)(∫ g)
-    rw [MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int]
-    rw [integral_sq_gaussian, one_mul]
+    rw [h_map_snd] at h_S_beta_sq_int
+    have h_prod := MeasureTheory.integral_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+    rw [mul_comm] at h_prod
+    rw [h_prod]
+    rw [integral_sq_gaussian, mul_one]
 
   -- Term 2: ∫ -2(S-β)base P
   have h_val2 : ∫ pc, -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1 ∂μ = 0 := by
-    rw [integral_mul_left]
-    rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int]
-    -- P has mean 0
-    rw [integral_id_gaussian, mul_zero, mul_zero]
-    -- Need integrability of (S-β)base, which we showed above
+    rw [integral_const_mul]
+    have h_prod : ∫ (a : ℝ × (Fin k → ℝ)), (scaling_func a.2 - beta) * base a.2 * a.1 ∂μ =
+                  (∫ (x : ℝ), x ∂ProbabilityTheory.gaussianReal 0 1) * ∫ (c : Fin k → ℝ), (scaling_func c - beta) * base c ∂(stdNormalProdMeasure k).map Prod.snd := by
+       rw [h_map_snd] at h_S_beta_sq_int h_base_sq_int h_base_meas h_scaling_meas
+       -- (S-β)*base is integrable
+       have h_mix_int : Integrable (fun c => (scaling_func c - beta) * base c) ((stdNormalProdMeasure k).map Prod.snd) := by
+         rw [h_map_snd]
+         apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
+         · apply AEStronglyMeasurable.mul
+           · apply AEStronglyMeasurable.sub h_scaling_meas.1 aestronglyMeasurable_const
+           · exact h_base_meas.1
+         · filter_upwards with c
+           have : |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 := by
+             have : 2 * |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 :=
+               two_mul_abs_le_sq_add_sq (scaling_func c - beta) (base c)
+             linarith
+           simp only [norm_eq_abs, Pi.add_apply, Pi.pow_apply, this]
+       have h := MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int h_mix_int
+       rw [mul_comm] at h
+       exact h
+    rw [h_prod, integral_id_gaussian, zero_mul, mul_zero]
+    -- Integrability for const_mul
+    apply Integrable.const_mul
+    apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
+    rw [h_map_snd] at h_S_beta_sq_int h_base_sq_int h_base_meas h_scaling_meas
     apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
     · apply AEStronglyMeasurable.mul
-      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
-      · exact h_base_meas
-    · filter_upwards with c; apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c)); simp; linarith
+      · apply AEStronglyMeasurable.sub h_scaling_meas.1 aestronglyMeasurable_const
+      · exact h_base_meas.1
+    · filter_upwards with c
+      have : |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 := by
+        have : 2 * |(scaling_func c - beta) * base c| ≤ (scaling_func c - beta)^2 + (base c)^2 :=
+          two_mul_abs_le_sq_add_sq (scaling_func c - beta) (base c)
+        linarith
+      simp only [norm_eq_abs, Pi.add_apply, Pi.pow_apply, this]
 
   -- Term 3: ∫ base^2
   have h_val3 : ∫ pc, (base pc.2)^2 ∂μ = ∫ c, (base c)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
-    rw [MeasureTheory.integral_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int]
-    rw [integral_const, one_mul, Measure.prob_univ, one_mul] -- μP is prob measure
-    simp
+    rw [h_map_snd] at h_base_sq_int
+    have h := MeasureTheory.integral_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+    rw [mul_comm] at h
+    rw [h]
+    rw [integral_const, one_mul, Measure.prob_univ, mul_one] -- μP is prob measure
 
   rw [h_val1, h_val2, h_val3]
   simp
@@ -4705,13 +4747,15 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    rw [← Real.sqrt_le_sqrt_iff (sq_nonneg _) (sq_nonneg _), Real.sqrt_sq (norm_nonneg _), Real.sqrt_sq (norm_nonneg _)]
+    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _)
+    rw [Real.sq_sqrt (norm_nonneg _), Real.sq_sqrt (norm_nonneg _)]
     exact h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply eq_orthogonalProjection_of_dist_le
+    apply Eq.symm
+    apply Submodule.orthogonalProjection_eq_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6397,7 +6441,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   | empty => simp
                   | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
-                    rw [deriv_mul]
+                    rw [deriv_mul (h_diff i) (DifferentiableAt.finset_prod (fun j hj => h_diff j))]
                     · rw [ih]
                       simp only [Finset.mul_sum, Finset.sum_mul]
                       apply congr_arg₂ (· + ·)
@@ -7071,6 +7115,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
     rw [h_perf_slope, h_perf_base]
     have : (0 : Fin 1) = c0 := rfl
     rw [← this]
+    simp
     ring
 
   -- Optimality implies model risk is 0
