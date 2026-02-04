@@ -429,7 +429,7 @@ jobs:
 
       - name: Build divergence/bottleneck AUC plot
         run: |
-          python sims/plot_divergence_auc.py --method "BayesR + Raw"
+          python sims/plot_divergence_auc.py
 
       - name: Build two-pop PC mega plot
         run: |
@@ -441,6 +441,6 @@ jobs:
           name: two-pop-auc-plot
           path: |
             divergence_bottleneck_auc.csv
-            divergence_bottleneck_auc.png
+            divergence_bottleneck_auc_*.png
             two_pop_pcs_mega.png
           if-no-files-found: error

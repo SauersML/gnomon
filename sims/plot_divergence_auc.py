@@ -2,16 +2,19 @@
 Aggregate AUC across divergence levels and plot divergence vs bottleneck.
 
 Usage:
+  python sims/plot_divergence_auc.py
   python sims/plot_divergence_auc.py --method "BayesR + Raw"
 """
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
 GENS_LEVELS = [0, 20, 50, 100, 500, 1000, 5000, 10_000]
+SCENARIOS = ("divergence", "bottleneck")
 
 
 def _normalize_method(method: str) -> str:
@@ -21,46 +24,54 @@ def _normalize_method(method: str) -> str:
     return method
 
 
-def _load_auc(sim_prefix: str, method: str) -> float | None:
-    metrics_path = Path(f"{sim_prefix}_metrics.csv")
-    if not metrics_path.exists():
-        return None
-    df = pd.read_csv(metrics_path)
-    row = df[df["Method"] == method]
-    if row.empty:
-        return None
-    return float(row.iloc[0]["AUC_overall"])
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text.strip())
+    return slug.strip("-").lower() or "method"
+
+
+def _set_gens_scale(ax: plt.Axes) -> None:
+    if 0 in GENS_LEVELS:
+        ax.set_xscale("symlog", linthresh=1)
+    else:
+        ax.set_xscale("log")
+    ax.set_xticks(GENS_LEVELS)
+    ax.set_xticklabels([str(g) for g in GENS_LEVELS])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--method",
-        default="BayesR + Raw",
-        help="Exact Method name from metrics table, e.g. 'BayesR + Raw'.",
+        default=None,
+        help="Exact Method name from metrics table. Omit to plot all methods.",
     )
     parser.add_argument("--out-prefix", default="divergence_bottleneck_auc", help="Output prefix")
     args = parser.parse_args()
-    method = _normalize_method(args.method)
+    method = _normalize_method(args.method) if args.method else None
 
-    rows = []
+    rows: list[dict[str, object]] = []
     missing_files: list[str] = []
     missing_methods: dict[str, list[str]] = {}
-    for sim_name in ("divergence", "bottleneck"):
+    for sim_name in SCENARIOS:
         for gens in GENS_LEVELS:
             sim_prefix = f"{sim_name}_g{gens}"
             metrics_path = Path(f"{sim_prefix}_metrics.csv")
             if not metrics_path.exists():
                 missing_files.append(metrics_path.name)
                 continue
-            auc = _load_auc(sim_prefix, method)
-            if auc is None:
-                df = pd.read_csv(metrics_path)
-                available = sorted(set(df.get("Method", [])))
-                if available:
-                    missing_methods[metrics_path.name] = available
+            df = pd.read_csv(metrics_path)
+            if "Method" not in df.columns or "AUC_overall" not in df.columns:
+                missing_methods[metrics_path.name] = sorted(set(df.get("Method", [])))
                 continue
-            rows.append({"scenario": sim_name, "gens": gens, "auc": auc})
+            for _, row in df.iterrows():
+                rows.append(
+                    {
+                        "scenario": sim_name,
+                        "gens": gens,
+                        "method": row["Method"],
+                        "auc": row["AUC_overall"],
+                    }
+                )
 
     if not rows:
         details = []
@@ -78,29 +89,45 @@ def main() -> None:
             )
         detail_msg = "\n".join(details) if details else "No metrics files or methods found."
         raise SystemExit(
-            f"No metrics found for divergence/bottleneck sims using method '{method}'.\n{detail_msg}"
+            "No metrics found for divergence/bottleneck sims.\n" + detail_msg
         )
 
-    df = pd.DataFrame(rows).sort_values(["scenario", "gens"])
+    df = pd.DataFrame(rows)
+    if method:
+        df = df[df["method"] == method]
+        if df.empty:
+            available = sorted(set(pd.DataFrame(rows)["method"].tolist()))
+            raise SystemExit(
+                f"Method '{method}' not found. Available methods: {', '.join(available)}"
+            )
+    df = df.sort_values(["method", "scenario", "gens"])
     csv_path = Path(f"{args.out_prefix}.csv")
     df.to_csv(csv_path, index=False)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for scenario in df["scenario"].unique():
-        sub = df[df["scenario"] == scenario].sort_values("gens")
-        ax.plot(sub["gens"], sub["auc"], marker="o", linewidth=2, label=scenario)
+    methods = sorted(df["method"].unique())
+    plot_paths: list[Path] = []
+    for method_name in methods:
+        sub_df = df[df["method"] == method_name]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for scenario in SCENARIOS:
+            sub = sub_df[sub_df["scenario"] == scenario].sort_values("gens")
+            if sub.empty:
+                continue
+            ax.plot(sub["gens"], sub["auc"], marker="o", linewidth=2, label=scenario)
 
-    ax.set_xlabel("Divergence (generations)")
-    ax.set_ylabel(f"AUC (method: {method})")
-    ax.set_title("AUC vs Divergence for Two-Population Sims")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    plot_path = Path(f"{args.out_prefix}.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        ax.set_xlabel("Divergence (generations, log scale)")
+        ax.set_ylabel(f"AUC (method: {method_name})")
+        ax.set_title("AUC vs Divergence for Two-Population Sims")
+        _set_gens_scale(ax)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        plot_path = Path(f"{args.out_prefix}_{_slugify(method_name)}.png")
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        plot_paths.append(plot_path)
 
-    print(f"Wrote {csv_path} and {plot_path}")
+    print(f"Wrote {csv_path} and {len(plot_paths)} plot(s).")
 
 
 if __name__ == "__main__":
