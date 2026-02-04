@@ -45,6 +45,7 @@ import Mathlib.MeasureTheory.Constructions.BorelSpace.Basic
 import Mathlib.Topology.Algebra.Module.FiniteDimension
 import Mathlib.Topology.Order.Compact
 import Mathlib.Topology.MetricSpace.HausdorffDistance
+import Mathlib.Analysis.Calculus.Deriv.Mul
 import Mathlib.Topology.MetricSpace.ProperSpace
 import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.MeasureTheory.Measure.OpenPos
@@ -4425,14 +4426,54 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let equiv := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let y' := equiv y
+  let K' := K.map equiv
+  haveI : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_le le_top
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  let p' := Submodule.orthogonalProjection K' y'
+  equiv.symm p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let equiv := (WithLp.linearEquiv 2 ℝ (Fin n → ℝ)).symm
+  let y' := equiv y
+  let p' := equiv p
+  let K' := K.map equiv
+  haveI : FiniteDimensional ℝ K' := Submodule.finiteDimensional_of_le le_top
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+
+  have h_norm_sq : ∀ v : Fin n → ℝ, l2norm_sq v = (norm (equiv v)) ^ 2 := by
+    intro v
+    unfold l2norm_sq
+    rw [PiLp.norm_eq_of_L2 (equiv v)]
+    simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
+    congr; ext i
+    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw'
+    have h := h_min w hw
+    rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
+    rw [map_sub, map_sub] at h
+    rw [dist_eq_norm, dist_eq_norm]
+    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+
+  have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
+
+  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
+    apply Submodule.eq_orthogonalProjection_of_dist_le
+    · exact h_mem'
+    · exact h_min'
+
+  rw [orthogonalProjection]
+  simp only [equiv, y', K', p'] at h_proj ⊢
+  rw [← h_proj]
+  exact (LinearEquiv.symm_apply_apply equiv p).symm
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6103,8 +6144,11 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf
+                  rw [deriv_finset_prod hf]
+                  apply Finset.sum_congr rfl
+                  intro i _
+                  mul_comm
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
@@ -6114,9 +6158,11 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
-                norm_num [ h_diff ]
+                  exact DifferentiableAt.finset_prod h_diff
+                rw [deriv_sum (fun σ _ => DifferentiableAt.const_mul (h_diff σ))]
+                apply Finset.sum_congr rfl
+                intro σ _
+                rw [deriv_const_mul _ (h_diff σ)]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
             simp +decide [ Finset.sum_mul _ _ _, Matrix.updateRow_apply ]
