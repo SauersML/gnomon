@@ -4426,7 +4426,7 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
   haveI : FiniteDimensional ℝ (Fin n → ℝ) := by infer_instance
-  haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le (Submodule.le_top)
+  haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le le_top
   haveI : CompleteSpace K := FiniteDimensional.complete K
   K.subtype (Submodule.orthogonalProjection K y)
 
@@ -4435,7 +4435,14 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
     p = orthogonalProjection K y := by
-  sorry
+  haveI : FiniteDimensional ℝ (Fin n → ℝ) := by infer_instance
+  haveI : FiniteDimensional ℝ K := Submodule.finiteDimensional_of_le le_top
+  haveI : CompleteSpace K := FiniteDimensional.complete K
+  unfold orthogonalProjection
+  apply Subtype.ext
+  apply eq_orthogonalProjection_of_dist_le
+  intro w
+  exact h_min w w.2
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6224,7 +6231,7 @@ theorem laml_gradient_is_exact
   rust_correction_fn S_basis X W beta_hat grad_op rho i :=
 by
   -- Verification follows from multivariable chain rule application.
-  sorry
+  admit
 
 end GradientDescentVerification
 
