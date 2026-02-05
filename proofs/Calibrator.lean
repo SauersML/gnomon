@@ -4167,23 +4167,23 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
     simp_rw [mul_comm]
-    unfold stdNormalProdMeasure
+    dsimp only [stdNormalProdMeasure]
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    simp_rw [← one_mul ((base _) ^ 2)]
-    unfold stdNormalProdMeasure
+    rw [← one_mul ((base _) ^ 2)]
+    dsimp only [stdNormalProdMeasure]
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod (integrable_const 1) h_base_sq_int
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
-    change Integrable (fun pc => -2 * ((scaling_func pc.2 - beta) * base pc.2 * pc.1)) μ
+    simp_rw [mul_assoc]
     apply Integrable.const_mul
     simp_rw [mul_comm _ pc.1, mul_assoc]
-    unfold stdNormalProdMeasure
+    dsimp only [stdNormalProdMeasure]
     haveI : IsProbabilityMeasure (ProbabilityTheory.gaussianReal 0 1) := inferInstance
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod h_P_int
@@ -4200,7 +4200,7 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
 
   have h_eq : ∀ pc : ℝ × (Fin k → ℝ),
       (scaling_func pc.2 * pc.1 - (base pc.2 + beta * pc.1))^2 =
-      (scaling_func pc.2 - beta)^2 * pc.1^2 - 2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1 + (base pc.2)^2 := by
+      (scaling_func pc.2 - beta)^2 * pc.1^2 + (-2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) + (base pc.2)^2 := by
     intro pc; ring
 
   rw [integral_congr_ae (ae_of_all μ h_eq)]
