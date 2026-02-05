@@ -4146,25 +4146,25 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
         -- S(c) is L2 implies L1? Yes on prob space.
-        apply Integrable.mono' h_scaling_sq_int
-        · exact h_scaling_meas.aestronglyMeasurable
-        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+        apply Integrable.mono' (h_scaling_sq_int.add (integrable_const 1))
+        · exact h_scaling_meas
+        · filter_upwards with c; rw [Real.norm_eq_abs]; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
     · apply integrable_const
 
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
     simp_rw [mul_comm]
-    apply Integrable.mul_prod h_P2_int h_S_beta_sq_int
+    exact Integrable.mul_prod h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    rw [← one_mul ((base _) ^ 2)]
-    apply Integrable.mul_prod (integrable_const 1) h_base_sq_int
+    simp_rw [← one_mul ((base _) ^ 2)]
+    exact Integrable.mul_prod (integrable_const 1) h_base_sq_int
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
-    apply Integrable.const_mul
+    apply Integrable.const_mul (-2)
     simp_rw [mul_comm (base _) _]
     simp_rw [mul_assoc]
     apply Integrable.mul_prod h_P_int
