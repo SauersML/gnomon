@@ -4181,9 +4181,10 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
     change Integrable (fun pc => -2 * ((scaling_func pc.2 - beta) * base pc.2 * pc.1)) μ
-    apply Integrable.const_mul (-2 : ℝ)
+    apply Integrable.const_mul
     simp_rw [mul_comm _ pc.1, mul_assoc]
     unfold stdNormalProdMeasure
+    haveI : IsProbabilityMeasure (ProbabilityTheory.gaussianReal 0 1) := inferInstance
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod h_P_int
     -- Need (S-β)*base integrable.
@@ -4319,7 +4320,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized (c := c)]
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized (c := 0)]
       rfl
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
@@ -4337,7 +4339,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
+        rw [integral_map measurable_snd.aemeasurable]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
