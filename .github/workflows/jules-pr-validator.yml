@@ -22,10 +22,22 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const labels = context.payload.pull_request.labels.map(l => l.name);
-            const isJulesPR = labels.includes('jules-loop');
+            const hasJulesLabel = labels.includes('jules-loop');
+            const branchName = context.payload.pull_request.head.ref;
+            
+            // Jules API creates branches like: fix-calibrator-build-errors-1706132021149205343
+            // Our script creates branches like: jules-improvement-20260205-120000
+            const julesApiBranchPattern = /^fix-(calibrator|proofs|build).*-\d+$/;
+            const julesScriptBranchPattern = /^jules-improvement-\d{8}-\d{6}$/;
+            const hasJulesBranch = julesApiBranchPattern.test(branchName) || julesScriptBranchPattern.test(branchName);
+            
+            const isJulesPR = hasJulesLabel || hasJulesBranch;
 
             console.log('PR Labels:', labels);
-            console.log('Is Jules Loop PR:', isJulesPR);
+            console.log('Branch Name:', branchName);
+            console.log('Has Jules Label:', hasJulesLabel);
+            console.log('Has Jules Branch Pattern:', hasJulesBranch);
+            console.log('Is Jules PR:', isJulesPR);
 
             if (isJulesPR) {
               console.log('✓ This is a Jules Loop PR - will validate');

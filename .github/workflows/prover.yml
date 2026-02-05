@@ -208,7 +208,8 @@ jobs:
   auto-close-failed-proof-pr:
     runs-on: ubuntu-latest
     needs: prove
-    if: github.event_name == 'pull_request'
+    # IMPORTANT: always() ensures this job runs even if prove fails
+    if: always() && github.event_name == 'pull_request'
     steps:
       - name: Close PR if proofs/ or Lean rules violated
         uses: actions/github-script@v7
@@ -253,12 +254,20 @@ jobs:
               const name = (c.commit && c.commit.author && c.commit.author.name) || '';
               return name.toLowerCase().includes('jules');
             });
+            
+            // Also detect Jules PRs by branch name pattern
+            const branchName = pr.head.ref;
+            const julesApiBranchPattern = /^fix-(calibrator|proofs|build).*-\d+$/;
+            const julesScriptBranchPattern = /^jules-improvement-\d{8}-\d{6}$/;
+            const hasJulesBranch = julesApiBranchPattern.test(branchName) || julesScriptBranchPattern.test(branchName);
+            const isJulesPR = hasJulesCommit || hasJulesBranch;
 
             const proverFailed = '${{ needs.prove.result }}' === 'failure';
 
+            // Close if: (touches proofs AND failed) OR (is Jules PR AND failed) OR (adds new files to Lean paths)
             const shouldClose =
               (touchesProofs && proverFailed) ||
-              (touchesProofs && hasJulesCommit) ||
+              (isJulesPR && proverFailed) ||
               (touchesLean && addsNewFiles);
 
             if (!shouldClose) {
@@ -270,9 +279,12 @@ jobs:
               '## ❌ Lean Prover CI Failed',
               '',
               'This PR was auto-closed due to one or more rules:',
-              `- Touches \`proofs/\` and Lean Prover CI failed: ${proverFailed ? 'yes' : 'no'}`,
-              `- Touches \`proofs/\` and includes a commit author with "jules" in the name: ${hasJulesCommit ? 'yes' : 'no'}`,
+              `- Touches \`proofs/\` and Lean Prover CI failed: ${touchesProofs && proverFailed ? 'yes' : 'no'}`,
+              `- Jules PR (detected by branch pattern or commit author) and build failed: ${isJulesPR && proverFailed ? 'yes' : 'no'}`,
               `- Touches Lean-related files and adds new files: ${touchesLean && addsNewFiles ? 'yes' : 'no'}`,
+              '',
+              `Branch: \`${branchName}\``,
+              `Jules PR detected: ${isJulesPR ? 'yes' : 'no'} (branch pattern: ${hasJulesBranch}, commit author: ${hasJulesCommit})`,
               '',
               'Please fix the issue(s) and reopen when ready.',
             ].join('\n');

@@ -429,9 +429,13 @@ def main():
     with open("jules.patch", "w") as f:
         f.write(patch)
 
-    # Ensure we are on main branch
+    # Create a branch for the PR
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch_name = f"jules-improvement-{timestamp}"
+    
     run_command("git fetch origin main")
-    run_command("git checkout -B main origin/main")
+    run_command(f"git checkout -B {branch_name} origin/main")
 
     out, err, code = run_command("git apply jules.patch")
     if code != 0:
@@ -472,18 +476,45 @@ def main():
         # Optionally verify to log current state
         verify_lean_build()
 
-    print("\n--- Committing and Pushing ---")
+    print("\n--- Committing and Creating PR ---")
     print(f"Commit message: {msg}")
 
     run_command(['git', 'commit', '-m', msg], check=True)
 
-    print("Pulling latest changes to avoid non-fast-forward...")
-    run_command("git pull --rebase origin main", check=True)
+    print(f"Pushing branch {branch_name}...")
+    run_command(f"git push origin {branch_name}", check=True)
 
-    print("Pushing changes...")
-    run_command("git push origin main", check=True)
-
-    print("Push complete. Waiting for next CRON schedule.")
+    # Create PR using gh CLI
+    print("Creating PR...")
+    pr_title = msg.split('\n')[0][:80]  # First line of commit message, truncated
+    pr_body = f"Automated improvement by Jules Loop.\n\nCommit message:\n```\n{msg}\n```"
+    
+    # Authenticate gh CLI
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if github_token:
+        subprocess.run(
+            ['gh', 'auth', 'login', '--with-token'],
+            input=github_token,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    
+    out, err, code = run_command([
+        'gh', 'pr', 'create',
+        '--title', pr_title,
+        '--body', pr_body,
+        '--base', 'main',
+        '--head', branch_name,
+        '--label', 'jules-loop'
+    ])
+    
+    if code != 0:
+        print(f"Failed to create PR: {err}")
+        sys.exit(1)
+    
+    print(f"✅ PR created: {out}")
+    print("Done. PR will be validated by jules-pr-validator workflow.")
 
 
 if __name__ == "__main__":
