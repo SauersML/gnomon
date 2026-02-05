@@ -4147,37 +4147,43 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
       · apply Integrable.const_mul
         -- S(c) is L2 implies L1? Yes on prob space.
         apply Integrable.mono' h_scaling_sq_int
-        · exact h_scaling_meas.aestronglyMeasurable
-        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+        · exact h_scaling_meas
+        · filter_upwards with c; rw [Real.norm_eq_abs, sq_abs]; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
     · apply integrable_const
 
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
     simp_rw [mul_comm]
+    rw [Measure.map_snd_prod] at h_S_beta_sq_int
     apply Integrable.mul_prod h_P2_int h_S_beta_sq_int
+    exact stdNormalProdMeasure_is_prob
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
     rw [← one_mul ((base _) ^ 2)]
+    rw [Measure.map_snd_prod] at h_base_sq_int
     apply Integrable.mul_prod (integrable_const 1) h_base_sq_int
+    exact stdNormalProdMeasure_is_prob
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
-    apply Integrable.const_mul
-    simp_rw [mul_comm (base _) _]
-    simp_rw [mul_assoc]
-    apply Integrable.mul_prod h_P_int
-    -- Need (S-β)*base integrable.
-    -- S-β is L2, base is L2. Product is L1 by Holder.
-    -- Or |(S-β)base| <= (S-β)^2 + base^2.
-    apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
-    · apply AEStronglyMeasurable.mul
-      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
-      · exact h_base_meas
-    · filter_upwards with c
-      apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
-      simp; linarith
+    have h_prod : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
+      simp_rw [mul_assoc]
+      have h_f : Integrable (fun c => (scaling_func c - beta) * base c) ((stdNormalProdMeasure k).map Prod.snd) := by
+        apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
+        · apply AEStronglyMeasurable.mul
+          · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
+          · exact h_base_meas
+        · filter_upwards with c
+          rw [Real.norm_eq_abs]
+          apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
+          simp; linarith
+      simp_rw [mul_comm ((scaling_func _) - _), mul_assoc]
+      rw [Measure.map_snd_prod] at h_f
+      apply Integrable.mul_prod h_P_int h_f
+      exact stdNormalProdMeasure_is_prob
+    apply Integrable.const_mul h_prod
 
   have h_eq : ∀ pc : ℝ × (Fin k → ℝ),
       (scaling_func pc.2 * pc.1 - (base pc.2 + beta * pc.1))^2 =
@@ -4202,7 +4208,7 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
 
   -- Term 2: ∫ -2(S-β)base P
   have h_val2 : ∫ pc, -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1 ∂μ = 0 := by
-    rw [integral_mul_left]
+    rw [MeasureTheory.integral_const_mul]
     rw [MeasureTheory.integral_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int]
     -- P has mean 0
     rw [integral_id_gaussian, mul_zero, mul_zero]
@@ -4301,7 +4307,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      simp only [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4318,7 +4324,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [Measure.integral_map measurable_snd.aemeasurable]
+        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4688,7 +4694,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]; rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4697,12 +4703,12 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    refine Real.le_of_pow_le_pow_left 2 (by norm_num) (norm_nonneg _) h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+    apply eq_orthogonalProjection_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6386,7 +6392,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -6398,10 +6404,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                         rw [Finset.erase_insert hi, Finset.prod_insert]
                         · ring
                         · exact fun h => hi (Finset.mem_erase.mp h).1
-                    · apply DifferentiableAt.finset_prod
-                      intro i _
-                      exact h_diff i
-                    · exact h_diff _
+                    · convert DifferentiableAt.finset_prod (fun j _ => h_diff j) using 1
+                    · exact h_diff i
                 apply h_prod_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
@@ -6891,8 +6895,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [MeasureTheory.integral_const_mul, hP0] at h_orth_P
+      rw [MeasureTheory.integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
