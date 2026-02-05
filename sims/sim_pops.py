@@ -657,14 +657,24 @@ def _final_outputs_exist(sim_prefix: str) -> bool:
 
 
 def main() -> None:
-    if len(sys.argv) not in (2, 3):
-        raise SystemExit("Usage: python sims/sim_pops.py <confounding|portability> [seed]")
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python sims/sim_pops.py <confounding|portability> [seed] [--force]")
 
     which = sys.argv[1].strip().lower()
     if which not in SIM_CONFIGS:
         raise SystemExit("Unknown simulation. Use 'confounding' or 'portability'.")
 
-    seed = int(sys.argv[2]) if len(sys.argv) == 3 else None
+    force = False
+    seed: Optional[int] = None
+    for arg in sys.argv[2:]:
+        arg = arg.strip().lower()
+        if arg in ("--force", "-f"):
+            force = True
+            continue
+        if seed is not None:
+            raise SystemExit("Usage: python sims/sim_pops.py <confounding|portability> [seed] [--force]")
+        seed = int(arg)
+
     base_cfg = SIM_CONFIGS[which]
     final_seed = seed if seed is not None else base_cfg.seed
     sim_prefix = which if seed is None else f"{which}_s{final_seed}"
@@ -681,7 +691,7 @@ def main() -> None:
         msprime_recent_gens=base_cfg.msprime_recent_gens,
     )
 
-    if os.environ.get("SIM_FORCE", "").lower() not in ("1", "true", "yes"):
+    if not force:
         if _final_outputs_exist(cfg.sim_prefix):
             print(f"[{cfg.sim_prefix}] Cached outputs found. Skipping simulation.")
             return
@@ -692,8 +702,6 @@ def main() -> None:
     from plink_utils import run_plink_conversion
     run_plink_conversion(f"{cfg.sim_prefix}.vcf", cfg.sim_prefix, cm_map_path=f"{cfg.sim_prefix}.cm")
 
-    # Cleanup intermediate files to save space
-    import os
     # Clean up large intermediate files (fail hard if deletion fails)
     if os.path.exists(f"{cfg.sim_prefix}.trees"):
         os.remove(f"{cfg.sim_prefix}.trees")
