@@ -4330,9 +4330,10 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · rw [integral_add]
           · rw [integral_const]
             simp
-          · rw [MeasureTheory.integral_const_mul integrable_id_gaussian]
+          · rw [MeasureTheory.integral_mul_const]
             rw [integral_id_gaussian]
             simp
+            exact integrable_id_gaussian
           · exact integrable_id_gaussian.const_mul _
           · apply integrable_const
         · apply Integrable.add
@@ -4343,7 +4344,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
-      apply Integrable.sub h_int_c (integrable_const _)
+      have h_const : Integrable (fun _ : Fin k → ℝ => beta_norm^2) ((stdNormalProdMeasure k).map Prod.snd) := integrable_const _
+      apply Integrable.sub h_int_c h_const
 
     -- Measurability of base_norm
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
@@ -4697,7 +4699,6 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    symm
     apply orthogonalProjection_eq_of_dist_le
     · exact h_mem'
     · exact h_min'
@@ -6407,7 +6408,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  convert DifferentiableAt.finset_prod (s := Finset.univ) (fun i _ => h_diff i)
+                  convert DifferentiableAt.finset_prod (fun i _ => h_diff i)
                   simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
