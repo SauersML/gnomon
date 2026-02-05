@@ -4319,8 +4319,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
+      unfold beta_norm
       rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
-      rfl
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4337,7 +4338,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
+        rw [Measure.map_snd_prod]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4367,7 +4368,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
-      apply Integrable.sub h_int_c (integrable_const _)
+      convert Integrable.sub h_int_c (integrable_const (beta_norm^2))
+      simp
 
     -- Measurability of base_norm
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
@@ -4377,7 +4379,15 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
     · -- LHS expanded. Now RHS (model_star)
       -- model_star has base=0, beta=1
-      rw [risk_decomposition_multiplicative k scaling_func (fun _ => 0) 1]
+      -- We need to help rewrite match the goal structure exactly
+      have h_decomp_star :
+          expectedSquaredError (dgpMultiplicativeBias scaling_func) (fun p c => linearPredictor model_star p c) =
+          ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) +
+          ∫ c, (0 : ℝ)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
+        simp only [h_star_pred]
+        convert risk_decomposition_multiplicative k scaling_func (fun _ => 0) 1 h_scaling_meas aestronglyMeasurable_const h_scaling_sq_int (integrable_zero _ _ _) using 1
+        simp
+      rw [h_decomp_star]
       · -- Compare terms
         have h_quad : ∫ c, (scaling_func c - beta_norm)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥
                       ∫ c, (scaling_func c - 1)^2 ∂((stdNormalProdMeasure k).map Prod.snd) := by
@@ -4715,13 +4725,13 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    rw [← sq_le_sq]
-    simp; exact h
+    rw [Real.norm_eq_abs, Real.norm_eq_abs]
+    apply sq_le_sq.mpr h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = orthogonalProjection K' y' := by
-    rw [orthogonalProjection_eq_of_dist_le]
+    rw [orthogonalProjection_eq_of_dist_le K' y' p']
     · exact h_mem'
     · exact h_min'
 
@@ -6405,7 +6415,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                | insert i s hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
