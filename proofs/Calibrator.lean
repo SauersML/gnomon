@@ -54,6 +54,18 @@ import Mathlib.Algebra.Polynomial.Basic
 import Mathlib.Algebra.Polynomial.Eval.Defs
 import Mathlib.Algebra.Polynomial.Roots
 
+lemma abs_le_sq_add_one (x : ℝ) : |x| ≤ x^2 + 1 := by
+  by_cases h : |x| ≤ 1
+  · calc |x| ≤ 1 := h
+         _ ≤ x^2 + 1 := le_add_of_nonneg_left (sq_nonneg x)
+  · have h1 : 1 < |x| := not_le.mp h
+    have h2 : |x| < x^2 := by
+      rw [sq, ← abs_mul_abs_self]
+      nth_rw 1 [← mul_one |x|]
+      gcongr
+    calc |x| ≤ x^2 := le_of_lt h2
+         _ ≤ x^2 + 1 := le_add_of_nonneg_right zero_le_one
+
 open scoped InnerProductSpace
 open InnerProductSpace
 
