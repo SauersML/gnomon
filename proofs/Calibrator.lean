@@ -4167,19 +4167,28 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
     simp_rw [mul_comm]
-    exact Integrable.mul_prod h_P2_int h_S_beta_sq_int
+    convert Integrable.mul_prod h_P2_int h_S_beta_sq_int using 1
+    unfold stdNormalProdMeasure
+    rw [Measure.map_snd_prod]
+    infer_instance
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
     simp_rw [← one_mul ((base _) ^ 2)]
-    exact Integrable.mul_prod (integrable_const 1) h_base_sq_int
+    convert Integrable.mul_prod (integrable_const 1) h_base_sq_int using 1
+    unfold stdNormalProdMeasure
+    rw [Measure.map_snd_prod]
+    infer_instance
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
-    apply Integrable.const_mul (-2)
+    apply Integrable.const_mul (-2 : ℝ)
     simp_rw [mul_comm (base _) _]
     simp_rw [mul_assoc]
-    apply Integrable.mul_prod h_P_int
+    convert Integrable.mul_prod h_P_int _ using 1
+    · unfold stdNormalProdMeasure
+      rw [Measure.map_snd_prod]
+      infer_instance
     -- Need (S-β)*base integrable.
     -- S-β is L2, base is L2. Product is L1 by Holder.
     -- Or |(S-β)base| <= (S-β)^2 + base^2.
