@@ -4338,13 +4338,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
             rw [integral_id_gaussian]
             simp
           · apply Integrable.const_mul
-            apply Integrable.const_mul
             exact integrable_id_gaussian
           · apply integrable_const
         · apply Integrable.add
           · apply integrable_const
           · apply Integrable.const_mul
-            apply Integrable.const_mul
             exact integrable_id_gaussian
         · apply Integrable.const_mul
           exact integrable_sq_gaussian
@@ -4353,6 +4351,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
+      rw [Measure.map_snd_prod] at h_int_c
       apply Integrable.sub h_int_c (integrable_const _)
 
     -- Measurability of base_norm
@@ -4362,7 +4361,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       have h_diff : AEStronglyMeasurable (fun pc => f pc - g pc) (stdNormalProdMeasure k) := by
         apply AEStronglyMeasurable.sub h_pred_meas
         apply AEStronglyMeasurable.const_mul
-        exact measurable_fst.aemeasurable
+        exact measurable_fst.aestronglyMeasurable
       have h_eq : ∀ pc, f pc - g pc = base_norm pc.2 := by
         intro pc; rw [h_pred_norm]; ring
       have h_base_lift : AEStronglyMeasurable (fun pc => base_norm pc.2) (stdNormalProdMeasure k) :=
@@ -4733,8 +4732,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   rw [orthogonalProjection]
   dsimp
-  rw [← h_proj]
-  exact (LinearEquiv.symm_apply_apply equiv p).symm
+  congr
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6412,7 +6410,19 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   induction s using Finset.induction_on with
                   | empty => simp
                   | insert x s hx ih =>
-                    sorry
+                    simp only [Finset.prod_insert hx, Finset.sum_insert hx]
+                    have h_diff_prod : DifferentiableAt ℝ (fun rho => ∏ j ∈ s, f j rho) rho := by
+                      convert DifferentiableAt.finset_prod (fun j (_ : j ∈ s) => h_diff j); simp
+                    rw [deriv_mul (h_diff x) h_diff_prod]
+                    rw [ih]
+                    simp only [Finset.mul_sum, Finset.sum_mul]
+                    apply congr_arg₂ (· + ·)
+                    · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hx]
+                    · apply Finset.sum_congr rfl
+                      intro j hj
+                      rw [Finset.erase_insert hx, Finset.prod_insert]
+                      · ring
+                      · exact fun h => hx (Finset.mem_erase.mp h).1
                 apply h_prod_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
