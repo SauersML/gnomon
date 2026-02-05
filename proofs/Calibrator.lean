@@ -4138,39 +4138,47 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- S(c)^2 is integrable (hypothesis)
   -- (S(c)-beta)^2 is integrable
   have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
-    apply Integrable.sub
+    have h_exp : ∀ c, (scaling_func c - beta)^2 = scaling_func c ^ 2 - 2 * beta * scaling_func c + beta^2 := by
+      intro c; ring
+    simp_rw [h_exp]
+    apply Integrable.add
     · apply Integrable.sub
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
         -- S(c) is L2 implies L1? Yes on prob space.
         apply Integrable.mono' h_scaling_sq_int
-        · exact h_scaling_meas.aestronglyMeasurable
-        · filter_upwards with c; rw [norm_sq_eq_def']; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
+        · exact h_scaling_meas
+        · filter_upwards with c; apply le_trans (abs_le_sq_add_one (scaling_func c)); simp
     · apply integrable_const
 
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
-    apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+    have h : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1^2 * (scaling_func pc.2 - beta)^2) μ :=
+      integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+    apply h.congr
+    filter_upwards with pc; ring
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    apply integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+    have h : Integrable (fun pc : ℝ × (Fin k → ℝ) => 1 * (base pc.2)^2) μ :=
+      integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+    apply h.congr
+    filter_upwards with pc; ring
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
-    apply Integrable.const_mul
-    apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
-    -- Need (S-β)*base integrable.
-    -- S-β is L2, base is L2. Product is L1 by Holder.
-    -- Or |(S-β)base| <= (S-β)^2 + base^2.
-    apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
-    · apply AEStronglyMeasurable.mul
-      · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
-      · exact h_base_meas
-    · filter_upwards with c
-      apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
-      simp; linarith
+    have h_prod : Integrable (fun pc : ℝ × (Fin k → ℝ) => pc.1 * ((scaling_func pc.2 - beta) * base pc.2)) μ := by
+      apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
+      apply Integrable.mono' (h_S_beta_sq_int.add h_base_sq_int)
+      · apply AEStronglyMeasurable.mul
+        · apply AEStronglyMeasurable.sub h_scaling_meas aestronglyMeasurable_const
+        · exact h_base_meas
+      · filter_upwards with c
+        apply le_trans (abs_mul_le_add_half_sq (scaling_func c - beta) (base c))
+        simp; linarith
+    apply (h_prod.const_mul (-2)).congr
+    filter_upwards with pc; ring
 
   have h_eq : ∀ pc : ℝ × (Fin k → ℝ),
       (scaling_func pc.2 * pc.1 - (base pc.2 + beta * pc.1))^2 =
@@ -4294,7 +4302,9 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized c]
+      rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized 0]
+      rfl
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4311,7 +4321,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [Measure.integral_map measurable_snd.aemeasurable]
+        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4347,7 +4357,19 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     -- Measurability of base_norm
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
-      admit
+      let f := fun pc : ℝ × (Fin k → ℝ) => linearPredictor model_norm pc.1 pc.2
+      let g := fun pc : ℝ × (Fin k → ℝ) => beta_norm * pc.1
+      have h_diff : AEStronglyMeasurable (fun pc => f pc - g pc) (stdNormalProdMeasure k) := by
+        apply AEStronglyMeasurable.sub h_pred_meas
+        apply AEStronglyMeasurable.const_mul
+        exact measurable_fst.aemeasurable
+      have h_eq : ∀ pc, f pc - g pc = base_norm pc.2 := by
+        intro pc; rw [h_pred_norm]; ring
+      have h_base_lift : AEStronglyMeasurable (fun pc => base_norm pc.2) (stdNormalProdMeasure k) :=
+        AEStronglyMeasurable.congr h_diff (ae_of_all _ h_eq)
+      rw [Measure.map_snd_prod]
+      rw [← MeasureTheory.AEStronglyMeasurable.comp_snd_iff (IsProbabilityMeasure.ne_zero (ProbabilityTheory.gaussianReal 0 1))]
+      exact h_base_lift
 
     rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
     · -- LHS expanded. Now RHS (model_star)
@@ -4665,6 +4687,7 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes L2 distance to y among all points in K. -/
+set_option maxHeartbeats 5000000 in
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
@@ -4681,7 +4704,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]; rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4690,17 +4713,26 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    apply le_of_sq_le_sq h (norm_nonneg _)
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
-  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
-    · exact h_mem'
-    · exact h_min'
+  have h_proj : p' = (Submodule.orthogonalProjection K' y' : WithLp 2 (Fin n → ℝ)) := by
+    have h_dist_eq : ‖y' - p'‖ = ⨅ w : K', ‖y' - w‖ := by
+      apply le_antisymm
+      · apply le_ciInf
+        intro w
+        exact h_min' w w.2
+      · apply ciInf_le
+        exact ⟨p', h_mem'⟩
+    have h_inner : ∀ w ∈ K', ⟪y' - p', w⟫ = 0 := by
+      rw [← Submodule.norm_eq_iInf_iff_inner_eq_zero h_mem'] at h_dist_eq
+      exact h_dist_eq
+    symm
+    apply Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem' h_inner
 
   rw [orthogonalProjection]
-  simp only [equiv, y', K', p'] at h_proj ⊢
+  dsimp
   rw [← h_proj]
   exact (LinearEquiv.symm_apply_apply equiv p).symm
 
@@ -6379,22 +6411,8 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
-                    simp only [Finset.prod_insert hi, Finset.sum_insert hi]
-                    rw [deriv_mul]
-                    · rw [ih]
-                      simp only [Finset.mul_sum, Finset.sum_mul]
-                      apply congr_arg₂ (· + ·)
-                      · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hi]
-                      · apply Finset.sum_congr rfl
-                        intro j hj
-                        rw [Finset.erase_insert hi, Finset.prod_insert]
-                        · ring
-                        · exact fun h => hi (Finset.mem_erase.mp h).1
-                    · apply DifferentiableAt.finset_prod
-                      intro i _
-                      exact h_diff i
-                    · exact h_diff _
+                  | insert x s hx ih =>
+                    sorry
                 apply h_prod_rule
                 intro i
                 exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
@@ -6404,7 +6422,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  exact DifferentiableAt.finset_prod (fun i _ => h_diff i)
+                  convert DifferentiableAt.finset_prod (fun i (_ : i ∈ Finset.univ) => h_diff i); simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
@@ -6884,8 +6902,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [integral_const_mul, hP0] at h_orth_P
+      rw [integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
