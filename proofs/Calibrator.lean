@@ -4138,7 +4138,10 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- S(c)^2 is integrable (hypothesis)
   -- (S(c)-beta)^2 is integrable
   have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
-    apply Integrable.sub
+    have h_expand : ∀ c, (scaling_func c - beta)^2 = scaling_func c ^ 2 - 2 * beta * scaling_func c + beta^2 := by
+      intro c; ring
+    simp_rw [h_expand]
+    apply Integrable.add
     · apply Integrable.sub
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
@@ -4151,15 +4154,27 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
+    have h_rw : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) =
+                (fun pc => pc.1^2 * (scaling_func pc.2 - beta)^2) := by ext; apply mul_comm
+    rw [h_rw]
     apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
+    have h_rw : (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) =
+                (fun pc => 1 * (base pc.2)^2) := by ext; simp
+    rw [h_rw]
     apply integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
+    have h_rw : (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) =
+                (fun pc => -2 * ((scaling_func pc.2 - beta) * base pc.2 * pc.1)) := by ext; ring
+    rw [h_rw]
     apply Integrable.const_mul
+    have h_rw2 : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta) * base pc.2 * pc.1) =
+                 (fun pc => pc.1 * ((scaling_func pc.2 - beta) * base pc.2)) := by ext; ring
+    rw [h_rw2]
     apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
     -- Need (S-β)*base integrable.
     -- S-β is L2, base is L2. Product is L1 by Holder.
@@ -4178,8 +4193,8 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
     intro pc; ring
 
   rw [integral_congr_ae (ae_of_all μ h_eq)]
-  rw [integral_add (h_term1_int.sub h_term2_int) h_term3_int]
-  rw [integral_sub h_term1_int h_term2_int]
+  rw [integral_add (h_term1_int.add h_term2_int) h_term3_int]
+  rw [integral_add h_term1_int h_term2_int]
 
   -- Evaluate integrals
   -- Term 1: ∫ (S-β)^2 P^2
@@ -4294,7 +4309,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
-      apply normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      have h_slope := normalized_model_slope_constant model_norm h_norm_opt.is_normalized
+      rw [h_slope c, h_slope 0]
 
     have h_pred_norm : ∀ p c, linearPredictor model_norm p c = base_norm c + beta_norm * p := by
       intro p c
@@ -4311,7 +4327,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       -- E[(base + βP)^2] = E[base^2] + β^2
       -- Use integral_prod to integrate out P
       have h_int_c : Integrable (fun c => ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1)) ((stdNormalProdMeasure k).map Prod.snd) := by
-        rw [Measure.integral_map measurable_snd.aemeasurable]
+        rw [MeasureTheory.integral_map measurable_snd.aemeasurable]
         apply MeasureTheory.Integrable.integral_prod_right h_norm_int_exp
 
       have h_inner_eq : ∀ c, ∫ p, (base_norm c + beta_norm * p)^2 ∂(ProbabilityTheory.gaussianReal 0 1) = (base_norm c)^2 + beta_norm^2 := by
@@ -4319,30 +4335,22 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         have h_eq : ∀ p, (base_norm c + beta_norm * p)^2 = (base_norm c)^2 + 2 * base_norm c * beta_norm * p + beta_norm^2 * p^2 := by
           intro p; ring
         simp_rw [h_eq]
-        rw [integral_add]
-        · rw [integral_add]
-          · rw [integral_const]
-            simp
-          · rw [MeasureTheory.integral_const_mul]
-            rw [MeasureTheory.integral_const_mul]
-            rw [integral_id_gaussian]
-            simp
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
-          · apply integrable_const
-        · apply Integrable.add
-          · apply integrable_const
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
+        have h_int1 : Integrable (fun p => (base_norm c)^2) (ProbabilityTheory.gaussianReal 0 1) := integrable_const _
+        have h_int2 : Integrable (fun p => 2 * base_norm c * beta_norm * p) (ProbabilityTheory.gaussianReal 0 1) := by
+          apply Integrable.const_mul; apply Integrable.const_mul; exact integrable_id_gaussian
+        have h_int3 : Integrable (fun p => beta_norm^2 * p^2) (ProbabilityTheory.gaussianReal 0 1) := by
+          apply Integrable.const_mul; exact integrable_sq_gaussian
+        rw [integral_add (h_int1.add h_int2) h_int3]
+        rw [integral_add h_int1 h_int2]
+        rw [integral_const, MeasureTheory.integral_const_mul, MeasureTheory.integral_const_mul, MeasureTheory.integral_const_mul]
+        rw [integral_id_gaussian, integral_sq_gaussian]
+        simp; ring
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
+      have h_rw : (fun c => (base_norm c)^2) = (fun c => (base_norm c)^2 + beta_norm^2) - (fun c => beta_norm^2) := by
+        ext; ring
+      rw [h_rw]
       apply Integrable.sub h_int_c (integrable_const _)
 
     -- Measurability of base_norm
@@ -4681,7 +4689,7 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [PiLp.norm_eq_of_L2 (equiv v)]
     simp only [Real.sq_sqrt (Finset.sum_nonneg fun i _ => sq_nonneg _)]
     congr; ext i
-    simp only [WithLp.equiv_symm_pi_apply, Real.norm_eq_abs, sq_abs]
+    simp only [Real.norm_eq_abs, sq_abs]; rfl
 
   have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
     intro w' hw'
@@ -4690,12 +4698,12 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    apply Real.le_of_sq_le_sq (norm_nonneg _) (norm_nonneg _) h
+    exact (sq_le_sq (norm_nonneg _) (norm_nonneg _)).mp h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
-  have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply Submodule.eq_orthogonalProjection_of_dist_le
+  have h_proj : p' = orthogonalProjection K' y' := by
+    apply eq_orthogonalProjection_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6379,7 +6387,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -6391,9 +6399,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                         rw [Finset.erase_insert hi, Finset.prod_insert]
                         · ring
                         · exact fun h => hi (Finset.mem_erase.mp h).1
-                    · apply DifferentiableAt.finset_prod
-                      intro i _
-                      exact h_diff i
+                    · convert DifferentiableAt.finset_prod (fun j _ => h_diff j) using 1
                     · exact h_diff _
                 apply h_prod_rule
                 intro i
