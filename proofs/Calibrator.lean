@@ -4331,21 +4331,21 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         simp_rw [h_eq]
         rw [integral_add]
         · rw [integral_add]
-          · rw [integral_const]
-            simp
-          · rw [MeasureTheory.integral_const_mul]
-            rw [MeasureTheory.integral_const_mul]
-            rw [integral_id_gaussian]
-            simp
-          · apply (integrable_id_gaussian.mul_const _).const_mul
+          · simp only [integral_const, measure_univ, ENNReal.one_toReal, one_mul]
+          · -- Integrability of middle term: 2 * base * beta * p
+            apply Integrable.const_mul
+            exact integrable_id_gaussian
+          · -- Integrability of last term: beta^2 * p^2
+            apply Integrable.const_mul
+            exact integrable_sq_gaussian
+        · -- Integrability of first two terms
+          apply Integrable.add
           · apply integrable_const
-        · apply Integrable.add
-          · apply integrable_const
-          · apply (integrable_id_gaussian.mul_const _).const_mul
-        · rw [MeasureTheory.integral_const_mul]
-          · rw [integral_sq_gaussian]; simp
-          · exact integrable_sq_gaussian
-        · apply integrable_sq_gaussian.const_mul
+          · apply Integrable.const_mul
+            exact integrable_id_gaussian
+        · -- Integrability of last term
+          apply Integrable.const_mul
+          exact integrable_sq_gaussian
 
       rw [Measure.map_snd_prod] at h_int_c
       simp_rw [h_inner_eq] at h_int_c
@@ -4733,7 +4733,8 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
 
   rw [orthogonalProjection]
   dsimp
-  congr
+  rw [← h_proj]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6416,9 +6417,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                       convert DifferentiableAt.finset_prod (fun j (_ : j ∈ s) => h_diff j); simp
                     erw [deriv_mul (h_diff x) h_diff_prod]
                     rw [ih]
-                    simp only [Finset.mul_sum, Finset.sum_mul, Finset.mul_add]
+                    simp only [Finset.mul_sum, Finset.sum_mul, mul_add]
                     apply congr_arg₂ (· + ·)
-                    · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hx]
+                    · congr 1; rw [Finset.erase_insert hx]
                     · apply Finset.sum_congr rfl
                       intro j hj
                       rw [Finset.erase_insert hx, Finset.prod_insert]
