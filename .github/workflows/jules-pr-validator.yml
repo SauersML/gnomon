@@ -130,6 +130,29 @@ jobs:
             echo "validation_passed=true" >> $GITHUB_OUTPUT
           fi
 
+          # Calculate line additions and deletions for auto-merge decision
+          STATS=$(git diff --stat $BASE_SHA...$HEAD_SHA | tail -1)
+          echo "Stats: $STATS"
+          
+          # Extract insertions and deletions from stats line like "1 file changed, 10 insertions(+), 3 deletions(-)"
+          ADDITIONS=$(echo "$STATS" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0")
+          DELETIONS=$(echo "$STATS" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo "0")
+          
+          # Handle empty values
+          ADDITIONS=${ADDITIONS:-0}
+          DELETIONS=${DELETIONS:-0}
+          
+          echo "Additions: $ADDITIONS, Deletions: $DELETIONS"
+          echo "additions=$ADDITIONS" >> $GITHUB_OUTPUT
+          echo "deletions=$DELETIONS" >> $GITHUB_OUTPUT
+          
+          # Check if no new files were created
+          if [ -z "$CREATED_FILES" ]; then
+            echo "no_new_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "no_new_files=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Close PR if file validation failed
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'false'
         uses: actions/github-script@v7
@@ -241,15 +264,58 @@ jobs:
 
             core.setFailed('Lean build failed');
 
-      - name: PR validation passed
+      - name: Check auto-merge eligibility and merge
         if: steps.check-jules.outputs.is_jules_pr == 'true' && steps.validate-files.outputs.validation_passed == 'true' && steps.lean-build.outputs.build_passed == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `## ✅ Jules Loop PR Validation Passed\n\n**All checks passed:**\n- ✓ No files created or deleted\n- ✓ Only modified files in \`proofs/\` directory\n- ✓ Lean build passed\n\nThis PR is ready for review!`
-            });
+            const additions = parseInt('${{ steps.validate-files.outputs.additions }}') || 0;
+            const deletions = parseInt('${{ steps.validate-files.outputs.deletions }}') || 0;
+            const noNewFiles = '${{ steps.validate-files.outputs.no_new_files }}' === 'true';
+            
+            // Auto-merge criteria:
+            // 1. No new files created
+            // 2. Additions > 3x deletions (minimal deletions)
+            // 3. Build passed (already checked in the if condition)
+            const minimalDeletions = deletions === 0 || additions > (deletions * 3);
+            const canAutoMerge = noNewFiles && minimalDeletions;
+            
+            console.log(`Additions: ${additions}, Deletions: ${deletions}`);
+            console.log(`No new files: ${noNewFiles}`);
+            console.log(`Minimal deletions (additions > 3x deletions): ${minimalDeletions}`);
+            console.log(`Can auto-merge: ${canAutoMerge}`);
+            
+            if (canAutoMerge) {
+              // Comment before merging
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## ✅ Jules Loop PR Auto-Merged\n\n**All checks passed:**\n- ✓ No files created or deleted\n- ✓ Only modified files in \`proofs/\` directory\n- ✓ Lean build passed\n- ✓ Minimal deletions (${additions} additions, ${deletions} deletions)\n\nThis PR has been automatically merged.`
+              });
+              
+              // Merge the PR
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                merge_method: 'squash'
+              });
+              
+              console.log('✅ PR auto-merged successfully!');
+            } else {
+              // Just comment, don't merge
+              let reason = [];
+              if (!noNewFiles) reason.push('creates new files');
+              if (!minimalDeletions) reason.push(`too many deletions (${deletions} deletions vs ${additions} additions, need additions > 3x deletions)`);
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## ✅ Jules Loop PR Validation Passed\n\n**All checks passed:**\n- ✓ No files created or deleted\n- ✓ Only modified files in \`proofs/\` directory\n- ✓ Lean build passed\n\n**Not auto-merged because:** ${reason.join(', ')}\n\nThis PR is ready for manual review!`
+              });
+              
+              console.log('PR passed validation but not auto-merged: ' + reason.join(', '));
+            }
