@@ -4167,14 +4167,15 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
     simp_rw [mul_comm]
-    dsimp only [stdNormalProdMeasure]
+    unfold stdNormalProdMeasure
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    rw [← one_mul ((base _) ^ 2)]
-    dsimp only [stdNormalProdMeasure]
+    have : (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) = (fun pc => 1 * (base pc.2)^2) := by ext; simp
+    rw [this]
+    unfold stdNormalProdMeasure
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod (integrable_const 1) h_base_sq_int
 
@@ -4182,8 +4183,11 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
     simp_rw [mul_assoc]
     apply Integrable.const_mul
-    simp_rw [mul_comm _ pc.1, mul_assoc]
-    dsimp only [stdNormalProdMeasure]
+    have h_reorder : (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta) * base pc.2 * pc.1) =
+                     (fun pc => pc.1 * ((scaling_func pc.2 - beta) * base pc.2)) := by
+      ext pc; ring
+    rw [h_reorder]
+    unfold stdNormalProdMeasure
     haveI : IsProbabilityMeasure (ProbabilityTheory.gaussianReal 0 1) := inferInstance
     rw [Measure.map_snd_prod]
     apply Integrable.mul_prod h_P_int
@@ -4320,6 +4324,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
     have h_slope_const : ∀ c, predictorSlope model_norm c = beta_norm := by
       intro c
+      unfold beta_norm
       rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized (c := c)]
       rw [normalized_model_slope_constant model_norm h_norm_opt.is_normalized (c := 0)]
       rfl
@@ -4369,6 +4374,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
+      have h_base_sq_eq : (fun c => (base_norm c)^2) = (fun c => (base_norm c)^2 + beta_norm^2 - beta_norm^2) := by ext; ring
+      rw [h_base_sq_eq]
       apply Integrable.sub h_int_c (integrable_const _)
 
     -- Measurability of base_norm
@@ -4379,6 +4386,11 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
     rw [risk_decomposition_multiplicative k scaling_func base_norm beta_norm h_scaling_meas h_base_meas h_scaling_sq_int h_base_sq_int]
     · -- LHS expanded. Now RHS (model_star)
       -- model_star has base=0, beta=1
+      have h_star_eq : (fun p c => linearPredictor model_star p c) = (fun p c => 0 + 1 * p) := by
+         ext p c
+         rw [h_star_pred]
+         ring
+      rw [h_star_eq]
       rw [risk_decomposition_multiplicative k scaling_func (fun _ => 0) 1]
       · -- Compare terms
         have h_quad : ∫ c, (scaling_func c - beta_norm)^2 ∂((stdNormalProdMeasure k).map Prod.snd) ≥
@@ -4717,17 +4729,18 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    rw [← sq_le_sq]
-    simp; exact h
+    rw [sq_le_sq] at h
+    simp at h
+    exact h
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = orthogonalProjection K' y' := by
-    rw [orthogonalProjection_eq_of_dist_le]
+    rw [eq_orthogonalProjection_of_dist_le]
     · exact h_mem'
     · exact h_min'
 
-  rw [orthogonalProjection]
+  unfold orthogonalProjection
   simp only [equiv, y', K', p'] at h_proj ⊢
   rw [← h_proj]
   exact (LinearEquiv.symm_apply_apply equiv p).symm
@@ -6407,7 +6420,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                | insert i s hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
