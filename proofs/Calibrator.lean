@@ -4333,7 +4333,7 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
           · rw [MeasureTheory.integral_mul_const]
             rw [integral_id_gaussian]
             simp
-            exact integrable_id_gaussian
+            exact ProbabilityTheory.integrable_id_gaussian _ _
           · exact integrable_id_gaussian.const_mul _
           · apply integrable_const
         · apply Integrable.add
@@ -4345,7 +4345,8 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
       have h_const : Integrable (fun _ : Fin k → ℝ => beta_norm^2) ((stdNormalProdMeasure k).map Prod.snd) := integrable_const _
-      apply Integrable.sub h_int_c h_const
+      apply Integrable.congr (Integrable.sub h_int_c h_const)
+      simp
 
     -- Measurability of base_norm
     have h_base_meas : AEStronglyMeasurable base_norm ((stdNormalProdMeasure k).map Prod.snd) := by
@@ -4699,7 +4700,8 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
   have h_proj : p' = Submodule.orthogonalProjection K' y' := by
-    apply orthogonalProjection_eq_of_dist_le
+    rw [eq_comm]
+    apply eq_orthogonalProjection_of_dist_le
     · exact h_mem'
     · exact h_min'
 
@@ -6385,7 +6387,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   | empty => simp
                   | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
-                    rw [deriv_mul]
+                    rw [deriv_mul (h_diff i) (DifferentiableAt.finset_prod (fun i _ => h_diff i))]
                     · rw [ih]
                       simp only [Finset.mul_sum, Finset.sum_mul]
                       apply congr_arg₂ (· + ·)
@@ -6408,8 +6410,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  convert DifferentiableAt.finset_prod (fun i _ => h_diff i)
-                  simp
+                  convert DifferentiableAt.finset_prod (fun i _ => h_diff i) using 1
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
