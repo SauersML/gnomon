@@ -4138,7 +4138,10 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- S(c)^2 is integrable (hypothesis)
   -- (S(c)-beta)^2 is integrable
   have h_S_beta_sq_int : Integrable (fun c => (scaling_func c - beta)^2) ((stdNormalProdMeasure k).map Prod.snd) := by
-    apply Integrable.sub
+    have h_expand : ∀ c, (scaling_func c - beta)^2 = scaling_func c ^ 2 - 2 * beta * scaling_func c + beta^2 := by
+      intro c; ring
+    simp_rw [h_expand]
+    apply Integrable.add
     · apply Integrable.sub
       · exact h_scaling_sq_int
       · apply Integrable.const_mul
@@ -4151,16 +4154,20 @@ lemma risk_decomposition_multiplicative (k : ℕ) [Fintype (Fin k)]
   -- Construct integrable product functions
   -- (S-β)^2 * P^2
   have h_term1_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (scaling_func pc.2 - beta)^2 * pc.1^2) μ := by
-    apply integrable_prod_mul (fun p => p^2) (fun c => (scaling_func c - beta)^2) h_P2_int h_S_beta_sq_int
+    simp_rw [mul_comm]
+    apply Integrable.mul_prod h_P2_int h_S_beta_sq_int
 
   -- base^2
   have h_term3_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => (base pc.2)^2) μ := by
-    apply integrable_prod_mul (fun _ => 1) (fun c => (base c)^2) (integrable_const 1) h_base_sq_int
+    rw [← one_mul ((base _) ^ 2)]
+    apply Integrable.mul_prod (integrable_const 1) h_base_sq_int
 
   -- Cross term: -2(S-β)base * P
   have h_term2_int : Integrable (fun pc : ℝ × (Fin k → ℝ) => -2 * (scaling_func pc.2 - beta) * base pc.2 * pc.1) μ := by
     apply Integrable.const_mul
-    apply integrable_prod_mul (fun p => p) (fun c => (scaling_func c - beta) * base c) h_P_int
+    simp_rw [mul_comm (base _) _]
+    simp_rw [mul_assoc]
+    apply Integrable.mul_prod h_P_int
     -- Need (S-β)*base integrable.
     -- S-β is L2, base is L2. Product is L1 by Holder.
     -- Or |(S-β)base| <= (S-β)^2 + base^2.
