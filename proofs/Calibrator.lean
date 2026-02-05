@@ -4337,21 +4337,19 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
             rw [MeasureTheory.integral_const_mul]
             rw [integral_id_gaussian]
             simp
-          · apply Integrable.const_mul
-            exact integrable_id_gaussian
+          · apply (integrable_id_gaussian.mul_const _).const_mul
           · apply integrable_const
         · apply Integrable.add
           · apply integrable_const
-          · apply Integrable.const_mul
-            exact integrable_id_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
+          · apply (integrable_id_gaussian.mul_const _).const_mul
+        · rw [MeasureTheory.integral_const_mul]
+          · rw [integral_sq_gaussian]; simp
+          · exact integrable_sq_gaussian
+        · apply integrable_sq_gaussian.const_mul
 
+      rw [Measure.map_snd_prod] at h_int_c
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
-      rw [Measure.map_snd_prod] at h_int_c
       apply Integrable.sub h_int_c (integrable_const _)
 
     -- Measurability of base_norm
@@ -4363,9 +4361,12 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         apply AEStronglyMeasurable.const_mul
         exact measurable_fst.aestronglyMeasurable
       have h_eq : ∀ pc, f pc - g pc = base_norm pc.2 := by
-        intro pc; rw [h_pred_norm]; ring
+        intro pc; dsimp [f, g]; rw [h_pred_norm]; ring
       have h_base_lift : AEStronglyMeasurable (fun pc => base_norm pc.2) (stdNormalProdMeasure k) :=
         AEStronglyMeasurable.congr h_diff (ae_of_all _ h_eq)
+      -- The goal is AEStronglyMeasurable base_norm (Measure.map Prod.snd ...)
+      -- h_base_lift is AEStronglyMeasurable (base_norm ∘ Prod.snd) ...
+      -- We need to apply comp_snd_iff first
       rw [Measure.map_snd_prod]
       rw [← MeasureTheory.AEStronglyMeasurable.comp_snd_iff (IsProbabilityMeasure.ne_zero (ProbabilityTheory.gaussianReal 0 1))]
       exact h_base_lift
@@ -4684,9 +4685,9 @@ noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → �
   let p' := Submodule.orthogonalProjection K' y'
   equiv.symm p'
 
+set_option maxHeartbeats 5000000 in
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes L2 distance to y among all points in K. -/
-set_option maxHeartbeats 5000000 in
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
     (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
@@ -6413,9 +6414,9 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                     simp only [Finset.prod_insert hx, Finset.sum_insert hx]
                     have h_diff_prod : DifferentiableAt ℝ (fun rho => ∏ j ∈ s, f j rho) rho := by
                       convert DifferentiableAt.finset_prod (fun j (_ : j ∈ s) => h_diff j); simp
-                    rw [deriv_mul (h_diff x) h_diff_prod]
+                    erw [deriv_mul (h_diff x) h_diff_prod]
                     rw [ih]
-                    simp only [Finset.mul_sum, Finset.sum_mul]
+                    simp only [Finset.mul_sum, Finset.sum_mul, Finset.mul_add]
                     apply congr_arg₂ (· + ·)
                     · congr 1; apply Finset.prod_congr rfl; intro j hj; rw [Finset.erase_insert hx]
                     · apply Finset.sum_congr rfl
