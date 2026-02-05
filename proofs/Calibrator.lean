@@ -4330,23 +4330,16 @@ theorem quantitative_error_of_normalization_multiplicative (k : ℕ) [Fintype (F
         · rw [integral_add]
           · rw [integral_const]
             simp
-          · rw [MeasureTheory.integral_const_mul]
-            rw [MeasureTheory.integral_const_mul]
+          · rw [MeasureTheory.integral_const_mul integrable_id_gaussian]
             rw [integral_id_gaussian]
             simp
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
+          · exact integrable_id_gaussian.const_mul _
           · apply integrable_const
         · apply Integrable.add
           · apply integrable_const
-          · apply Integrable.const_mul
-            apply Integrable.const_mul
-            exact integrable_id_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
-        · apply Integrable.const_mul
-          exact integrable_sq_gaussian
+          · exact integrable_id_gaussian.const_mul _
+        · exact integrable_sq_gaussian.const_mul _
+        · exact integrable_sq_gaussian.const_mul _
 
       simp_rw [h_inner_eq] at h_int_c
       -- If base^2 + const is integrable, base^2 is integrable
@@ -4697,7 +4690,9 @@ lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n →
     rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h
     rw [map_sub, map_sub] at h
     rw [dist_eq_norm, dist_eq_norm]
-    refine Real.sqrt_le_sqrt h
+    have h_sqrt := Real.sqrt_le_sqrt h
+    simp only [Real.sqrt_sq (norm_nonneg _)] at h_sqrt
+    exact h_sqrt
 
   have h_mem' : p' ∈ K' := (Submodule.mem_map).mpr ⟨p, h_mem, rfl⟩
 
@@ -6387,7 +6382,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   rw [← h_univ]
                   induction s using Finset.induction_on with
                   | empty => simp
-                  | insert hi ih =>
+                  | insert i s hi ih =>
                     simp only [Finset.prod_insert hi, Finset.sum_insert hi]
                     rw [deriv_mul]
                     · rw [ih]
@@ -6412,7 +6407,7 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
                   have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
                     intro i
                     exact differentiableAt_pi.1 (differentiableAt_pi.1 hM_diff ((σ : m → m) i)) i
-                  convert DifferentiableAt.finset_prod (fun i _ => h_diff i)
+                  convert DifferentiableAt.finset_prod (s := Finset.univ) (fun i _ => h_diff i)
                   simp
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
