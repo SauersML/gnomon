@@ -4425,14 +4425,61 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' : EuclideanSpace ℝ (Fin n) := iso y
+  let p' := Submodule.orthogonalProjection K' y'
+  iso.symm p'
 
+set_option maxHeartbeats 10000000 in
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' : EuclideanSpace ℝ (Fin n) := iso y
+  let p' : EuclideanSpace ℝ (Fin n) := iso p
+  have h_mem' : p' ∈ K' := by
+    rw [Submodule.mem_map]
+    use p, h_mem
+    rfl
+
+  have h_dist_sq : ∀ (a b : Fin n → ℝ), dist (iso a) (iso b) ^ 2 = l2norm_sq (a - b) := by
+    intro a b
+    rw [dist_eq_norm, sq, ← inner_self_eq_norm_mul_norm]
+    simp only [map_sub]
+    rw [PiLp.inner_apply]
+    unfold l2norm_sq
+    rfl
+
+  have h_min' : ∀ w' : K', dist y' p' ≤ dist y' w' := by
+    intro w'
+    rcases (Submodule.mem_map).mp w'.2 with ⟨w, hw, hw_eq⟩
+    rw [← hw_eq]
+    have h := h_min w hw
+    rw [← h_dist_sq y p, ← h_dist_sq y w] at h
+    apply Real.sqrt_le_sqrt at h
+    simp only [Real.sqrt_sq dist_nonneg] at h
+    exact h
+
+  have h_dist_eq : ‖y' - p'‖ = ⨅ (w : K'), ‖y' - w‖ := by
+    apply le_antisymm
+    · apply le_ciInf
+      intro w
+      simp only [← dist_eq_norm]
+      exact h_min' w
+    · apply ciInf_le
+      use ⟨p', h_mem'⟩
+      simp
+  have h_ortho : ∀ w ∈ K', ⟪y' - p', w⟫ = 0 :=
+    (Submodule.norm_eq_iInf_iff_inner_eq_zero K' h_mem').mp h_dist_eq
+  have h_eq_proj := Submodule.eq_orthogonalProjection_of_mem_of_inner_eq_zero h_mem' h_ortho
+  unfold orthogonalProjection
+  rw [h_eq_proj]
+  simp [p', iso]
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
