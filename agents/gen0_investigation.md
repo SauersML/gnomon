@@ -282,3 +282,8 @@ All experiments are in [`experiments_gen0.py`](experiments_gen0.py). Raw data CS
 | 4. P\_observed across gens | Oracle PRS removes the artifact | Linear&minus;Raw = 0.00 at gen 0 |
 | 5. R&sup2; across gens | How PC&ndash;G correlation changes | Stays ~0.04&ndash;0.13 across all gens |
 | 6. BayesR vs P\_observed | The definitive comparison | +0.12 gap with BayesR, 0.00 with P\_observed |
+
+
+<img width="1122" height="487" alt="Screenshot 2026-02-06 at 10 16 12 AM" src="https://github.com/user-attachments/assets/387e9b46-39c8-4a69-97c1-70293a254db3" />
+
+<img width="1115" height="197" alt="Screenshot 2026-02-06 at 10 17 30 AM" src="https://github.com/user-attachments/assets/c907ef8b-92cb-41e9-961e-5bad3a15c485" />
