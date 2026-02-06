@@ -6103,19 +6103,21 @@ theorem derivative_log_det_H_matrix (A B : Matrix m m ℝ)
               have h_jacobi : ∀ σ : Equiv.Perm m, deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ i : m, (∏ j ∈ Finset.univ.erase i, M rho ((σ : m → m) j) j) * deriv (fun rho => M rho ((σ : m → m) i) i) rho := by
                 intro σ
                 have h_prod_rule : ∀ (f : m → ℝ → ℝ), (∀ i, DifferentiableAt ℝ (f i) rho) → deriv (fun rho => ∏ i, f i rho) rho = ∑ i, (∏ j ∈ Finset.univ.erase i, f j rho) * deriv (f i) rho := by
-                  -- exact?
-                  admit
+                  intro f hf_diff
+                  have h_diff' : ∀ i ∈ Finset.univ, DifferentiableAt ℝ (fun rho => f i rho) rho := fun i _ => hf_diff i
+                  convert deriv_finset_prod h_diff' using 1
+                  apply Finset.sum_congr rfl
+                  intro i _
+                  rw [mul_comm]
                 apply h_prod_rule
                 intro i
                 exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
               have h_deriv_sum : deriv (fun rho => ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * ∏ i : m, M rho ((σ : m → m) i) i) rho = ∑ σ : Equiv.Perm m, (↑(↑((Equiv.Perm.sign : Equiv.Perm m → ℤˣ) σ) : ℤ) : ℝ) * deriv (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                 have h_diff : ∀ σ : Equiv.Perm m, DifferentiableAt ℝ (fun rho => ∏ i : m, M rho ((σ : m → m) i) i) rho := by
                   intro σ
-                  have h_diff : ∀ i : m, DifferentiableAt ℝ (fun rho => M rho ((σ : m → m) i) i) rho := by
-                    intro i
-                    exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
-                  -- exact?
-                  admit
+                  refine DifferentiableAt.finset_prod ?_
+                  intro i _
+                  exact DifferentiableAt.comp rho ( differentiableAt_pi.1 ( differentiableAt_pi.1 hM_diff _ ) _ ) differentiableAt_id
                 norm_num [ h_diff ]
               simpa only [ h_jacobi ] using h_deriv_sum
             simp +decide only [h_jacobi, Finset.mul_sum _ _ _]
