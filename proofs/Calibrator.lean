@@ -4425,14 +4425,53 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let proj : EuclideanSpace ℝ (Fin n) := ↑(Submodule.orthogonalProjection K' (iso y))
+  iso.symm proj
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' := K.map iso
+  let y' := iso y
+  let p' := iso p
+  have h_mem' : p' ∈ K' := by
+    simp [K', p', iso, Submodule.mem_map]
+    use p, h_mem
+    rfl
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, hw_eq⟩ := Submodule.mem_map.mp hw'
+    subst hw_eq
+    have h_le := h_min w hw
+    -- relate l2norm_sq to dist in EuclideanSpace
+    -- l2norm_sq v = dist (iso v) 0 ^ 2 = ‖iso v‖^2
+    have h_norm_sq : ∀ v, l2norm_sq v = ‖WithLp.equiv 2 (Fin n → ℝ) v‖^2 := by
+      intro v
+      simp [l2norm_sq, iso]
+      rw [EuclideanSpace.norm_eq]
+      simp [Real.norm_eq_abs]
+      congr
+      ext i
+      rw [abs_pow_two]
+    rw [h_norm_sq (y - p), h_norm_sq (y - w)] at h_le
+    rw [map_sub, map_sub] at h_le
+    -- dist a b = ‖a - b‖
+    rw [dist_eq_norm, dist_eq_norm]
+    refine (sq_le_sq (norm_nonneg _) (norm_nonneg _)).mpr h_le
+
+  -- map back
+  rw [orthogonalProjection]
+  simp [iso]
+  apply iso.injective
+  -- Use orthogonalProjection_eq_of_dist_le from Mathlib if available, or just use the property
+  -- that orthogonalProjection is the unique minimizer.
+  rw [← eq_orthogonalProjection_of_dist_le h_mem' h_min']
+  rfl
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
