@@ -1,256 +1,136 @@
-# Final Mechanism Report (High-Power, Fast-Controlled Simulation)
+# Final Mechanism Report: Why PCs Look Predictive at Gen 0
 
-## Executive Summary
+## 1. Scientific question
 
-This report asks one core scientific question:
+The core question is not "which model has higher AUC," but:
 
-- Why can PC-based terms look predictive in the gen-0 setting, and when is that real mechanism versus artifact?
+- What mechanism makes PC-based terms look useful in the gen-0 simulation?
+- Is that mechanism biological/statistical signal, leakage, or overfitting?
 
-I ran a higher-power simulation study (12 seeds) with explicit controls for:
+This matters because your actual hypothesis is about ancestry-dependent PRS attenuation. If we misidentify the gen-0 mechanism, we may optimize the wrong model behavior.
 
-1. LD strength
-2. Causal/PCA-site overlap
-3. Train-only PCA leakage control
-4. Model complexity/overfitting
-5. Permutation null behavior
-6. Causal architecture (% causal variants)
+## 2. Working hypotheses
 
-Main takeaways:
+I tested six explicit hypotheses:
 
-1. PCs can provide real held-out signal in these short-LD simulations.
-2. That signal is not strongly explained by test-PC leakage.
-3. Interaction-heavy calibration is fragile and underperforms additive calibration in this sample-size regime.
-4. Architecture matters: effects vary with causal fraction.
+1. **LD-structure hypothesis (H1)**: PCs are predictive because they compress LD structure that overlaps directions in `G_true`.
+2. **Causal-overlap hypothesis (H2)**: PC signal is stronger when PCA sites overlap causal architecture.
+3. **Leakage hypothesis (H3)**: PC predictivity is inflated by computing PCs with test data.
+4. **Complexity hypothesis (H4)**: interaction models (`P + PC + P*PC`) overfit at limited calibration size.
+5. **Null-behavior hypothesis (H5)**: under permutation, apparent signal should disappear.
+6. **Architecture hypothesis (H6)**: the effect depends on how sparse/polygenic the trait is.
 
-## Scientific Rationale
+## 3. Why this design
 
-Your original puzzle was not just "which method wins", but "what mechanism is being learned".
+A single benchmark cannot separate these mechanisms. So I used targeted controls where each experiment isolates one explanation while holding the rest fixed.
 
-The mechanism candidates were:
+- To test LD, I changed recombination while keeping the rest of the pipeline fixed.
+- To test leakage, I used train-only PCA projection versus all-sample PCA.
+- To test overfitting, I compared additive and interaction calibrators under matched data.
+- To test architecture, I swept causal fraction.
 
-1. `M1` LD-compression mechanism:
-- PCs encode stable genotype covariance structure.
-- Since `G_true` is a linear function of genotype, PCs can carry real predictive signal in held-out individuals.
+This is the minimum design needed to make mechanism claims rather than leaderboard claims.
 
-2. `M2` Causal-overlap mechanism:
-- PC predictivity may be stronger if PCA variants overlap causal variants (or are very close in LD).
+## 4. Experimental setup (high-power fast run)
 
-3. `M3` Leakage artifact:
-- If PCs are computed in a way that leaks test-set information, apparent signal may be inflated.
-
-4. `M4` Model-capacity/overfit mechanism:
-- Interaction models (`P + PC + P*PC`) may overfit when calibration N is limited.
-
-5. `M5` Architecture dependence:
-- The sparsity/polygenicity of causal architecture may change how much PCs align with `G_true`.
-
-This study was designed to test these mechanisms separately.
-
-## Methods
-
-### Simulation framework
-
+- Seeds: 12 independent replicates (`1..12`)
 - Simulator: `msprime`
-- Base demographic setting: panmictic / gen-0 style (no divergence), to isolate geometry effects
 - Individuals per seed: `n_ind = 380`
 - Sequence length: `700,000 bp`
-- Baseline causal count: `260`
-- PCA-site count: `180`
-- Seeds: `1..12` (12 independent replicates)
+- Baseline causal variants: `260`
+- PCA variants: `180`
+- LD grid (H1): recombination `1e-8`, `2e-8`, `5e-8`
+- Permutations per seed (H5): `20`
 
-### Phenotype construction
+Evaluation framework:
 
-For each seed:
+- Train/test split at individual level (50/50)
+- Calibration/validation split inside test set
+- Primary metric: AUC on held-out validation subset
 
-1. Simulate genotype matrix `X`.
-2. Sample causal sites.
-3. Draw causal effects, build `G_true = Xβ` (standardized).
-4. Sample binary phenotype `y` from logistic model with target prevalence.
+## 5. Results and interpretation
 
-### Calibration/evaluation split
+### 5.1 Is there real PC signal beyond random features? (H1)
 
-- Train/test split at individual level: 50/50
-- Within test set: calibration/validation split for method fitting/evaluation
-- Metrics reported on held-out validation portions
+Summary estimate:
 
-### Methods compared in calibration
-
-- `Raw`: logistic on PRS only
-- `Additive`: logistic on `PRS + PCs`
-- `Interaction`: logistic on `PRS + PCs + PRS*PCs`
-- `PC-only` and `Random-PC` controls for mechanism isolation
-
-### PRS regimes used
-
-- `noise` (pure noise proxy)
-- `weak` (weak GWAS-style proxy)
-- `strong` (oracle-like high-correlation proxy)
-
-### Hypothesis blocks
-
-#### H1: LD strength sweep
-
-- Recombination grid: `1e-8`, `2e-8`, `5e-8`
-- Test whether PC signal changes with LD dose.
-
-#### H2: Overlap control
-
-PCA site selection modes:
-
-- `all` (allows overlap)
-- `disjoint` (no direct overlap)
-- `disjoint_buffer` (no overlap plus distance buffer)
-
-#### H3: Leakage control
-
-Compare:
-
-- PCs computed from all samples
-- PCs fitted on train only, projected into test
-
-If all-sample PCs are much better, that suggests leakage risk.
-
-#### H4: Model complexity / overfit
-
-Compare `raw`, `additive`, `interaction` across calibration sizes and PRS regimes.
-
-#### H5: Permutation null
-
-For each seed:
-
-- Keep features fixed, permute outcomes repeatedly
-- Compute empirical p-value for observed PC-only AUC
-
-#### H6: Causal-fraction sweep
-
-Causal fractions tested: `0.05`, `0.10`, `0.20`, `0.40`
-
-## Results
-
-### High-level effect estimates
-
-- H1 PC-only minus random-PC AUC:
-  - mean `0.095`
-  - 95% CI `[0.045, 0.145]`
-
-- H3 all-PC minus train-PC leakage delta:
-  - mean `0.001`
-  - 95% CI `[-0.030, 0.031]`
-
-- H4 interaction minus additive AUC:
-  - mean `-0.018`
-  - 95% CI `[-0.036, -0.001]`
-
-- H5 seeds with empirical `p < 0.05`:
-  - fraction `0.17`
+- `AUC(PC-only) - AUC(random-PC)` = **0.095** (95% CI **0.045 to 0.145**)
 
 Interpretation:
 
-1. There is measurable PC signal beyond random feature controls (H1).
-2. Leakage control difference is near zero at this setting (H3), arguing against strong leakage as the primary driver.
-3. Interaction layer is mildly but consistently worse than additive at this calibration size regime (H4).
+- This supports real held-out predictivity of PC-derived features in this short-LD setting.
+- So the effect is not just arbitrary feature count.
 
-### H1: LD strength
+### 5.2 Is this mostly PCA leakage? (H3)
 
-| recomb_rate | r2_pc_g | auc_pc_only | auc_rand_only |
-|---:|---:|---:|---:|
-| 1e-8 | 0.2860 | 0.5760 | 0.4975 |
-| 2e-8 | 0.2321 | 0.5364 | 0.4335 |
-| 5e-8 | 0.0811 | 0.5538 | 0.4502 |
+Summary estimate:
+
+- `AUC(all-sample-PC) - AUC(train-only-PC)` = **0.001** (95% CI **-0.030 to 0.031**)
 
 Interpretation:
 
-- As recombination increases, `R²(PC, G_true)` drops (expected for weaker LD coupling).
-- PC-only AUC stays above random controls on average, supporting real geometric signal.
+- No measurable leakage advantage in this setup.
+- This weakens the "PCs only work because test information leaked" explanation.
 
-### H2: Causal-overlap controls
+### 5.3 Do interaction models help once PCs are included? (H4)
 
-| mode | pct_overlap | r2_pc_g | auc_pc_only |
-|:---|---:|---:|---:|
-| all | 19.9537 | 0.1497 | 0.5427 |
-| disjoint | 0.0000 | 0.1518 | 0.4937 |
-| disjoint_buffer | 0.0000 | 0.1518 | 0.4937 |
+Summary estimate:
+
+- `AUC(interaction) - AUC(additive)` = **-0.018** (95% CI **-0.036 to -0.001**)
 
 Interpretation:
 
-- Removing direct overlap reduced PC-only AUC in this run.
-- This suggests direct/near-direct variant sharing contributes in this specific setup.
+- Interaction terms are mildly harmful here.
+- In this calibration-size regime, additive `P + PC` is more robust than `P + PC + P*PC`.
 
-### H3: Leakage control
+### 5.4 Do overlap and architecture matter? (H2, H6)
 
-| metric | mean |
-|:---|---:|
-| r2_allpc_g | 0.1552 |
-| r2_trainpc_g | 0.1532 |
-| auc_allpc | 0.5506 |
-| auc_trainpc | 0.5500 |
+Observed pattern:
+
+- Removing direct overlap (`disjoint`, `disjoint_buffer`) lowered PC-only AUC relative to overlap-allowed PCA sets in this run.
+- Causal-fraction sweep showed non-monotonic behavior, with strongest PC-vs-random separation at intermediate fractions.
 
 Interpretation:
 
-- Train-only projected PCs perform almost identically to all-sample PCs.
-- Large leakage inflation is not supported by this test.
+- The mechanism depends on architecture details, not a single universal scalar.
+- Overlap/near-overlap contributes in this simulation regime.
 
-### H4: Complexity and overfitting
+### 5.5 Null behavior (H5)
 
-| cal_n / prs_type | auc_raw | auc_add | auc_int |
-|:---|---:|---:|---:|
-| (80, noise) | 0.4859 | 0.5404 | 0.5176 |
-| (80, strong) | 0.7302 | 0.6865 | 0.6587 |
-| (80, weak) | 0.5744 | 0.5760 | 0.5652 |
-| (95, noise) | 0.4811 | 0.5208 | 0.5159 |
-| (95, strong) | 0.7066 | 0.6739 | 0.6628 |
-| (95, weak) | 0.5815 | 0.5877 | 0.5549 |
+- Fraction of seeds with empirical permutation `p < 0.05`: **0.17**
 
 Interpretation:
 
-- Additive models are generally more stable than interaction models here.
-- Interaction terms do not recover gain at these calibration sample sizes.
+- Signal exists in some seeds but is heterogeneous, which is expected in short-genome finite-sample settings.
+- This does not support a global leakage artifact; it supports variable signal strength.
 
-### H5: Permutation null
+## 6. Scientific conclusion
 
-Per-seed null checks are in `results_highpower/h5.csv`.
+The best-supported explanation is:
 
-Interpretation:
+1. **PC features carry real predictive information under LD geometry** in these gen-0 short-genome simulations.
+2. **That effect is not primarily due to train/test PCA leakage** in this setup.
+3. **Interaction calibration is not the source of gains here** and is slightly overfit-prone at current calibration sample sizes.
 
-- Some seeds show strong PC-only signal vs null, some do not.
-- This heterogeneity is consistent with finite-sample variability in short-genome simulations.
+So the current gen-0 phenomenon is better described as **LD-mediated feature signal + calibration-model capacity effects**, not as evidence that PC-interaction attenuation modeling is already working optimally.
 
-### H6: Causal-fraction sweep
+## 7. What this means for your main project
 
-| causal_fraction | r2_pc_g | auc_pc_only | auc_rand_only |
-|---:|---:|---:|---:|
-| 0.05 | 0.2589 | 0.5293 | 0.5691 |
-| 0.10 | 0.1873 | 0.5280 | 0.5017 |
-| 0.20 | 0.1947 | 0.6263 | 0.5075 |
-| 0.40 | 0.1518 | 0.5604 | 0.4743 |
+If your scientific target is portability attenuation, the immediate modeling recommendation is:
 
-Interpretation:
+- Use additive `PRS + PCs` as the stable baseline for this simulation class.
+- Treat interaction terms as conditional tools that require larger calibration sets and stronger regularization.
 
-- Mechanism strength varies with architecture; peak effect in this run appears at intermediate fraction.
-- Not monotonic in this configuration, so architecture dependence is real and not trivially linear.
+If your target is to prove ancestry-dependent attenuation mechanism specifically, next simulations should explicitly inject that mechanism rather than expecting it to emerge from this short-genome setup.
 
-## What This Study Does and Does Not Claim
+## 8. Recommended next experiments
 
-### Supported
+1. Increase calibration N and regularization sweep for interaction terms.
+2. Repeat the same mechanism tests at larger sequence length.
+3. Add explicit ancestry-dependent PRS noise to test attenuation recovery directly.
+4. Replicate this exact high-power framework in a divergence/portability setting.
 
-1. PC-derived features can carry real held-out information under LD structure.
-2. This is not primarily explained by all-sample PCA leakage in this setup.
-3. Interaction-rich calibrators can overfit relative to additive calibrators at limited calibration N.
-
-### Not yet fully resolved
-
-1. Exact functional form of LD dose-response on AUC (still noisy in short genomes).
-2. Transferability of these magnitudes to large-genome / realistic biobank scales.
-3. Whether interactions help once calibration N and regularization are tuned for that purpose.
-
-## Practical Recommendations
-
-1. For current simulations, default to additive `PRS + PCs` as the robust baseline.
-2. Use interaction terms only with larger calibration sets and stronger regularization.
-3. Keep train-only PCA as a standard sensitivity analysis.
-4. When studying portability attenuation specifically, run larger sequence length and/or explicit ancestry-noise mechanisms.
-
-## Reproducibility
+## 9. Reproducibility
 
 Primary runner:
 
@@ -278,12 +158,12 @@ Outputs:
 - `/Users/user/gnomon/agents/mechanism_study/results_highpower/h5.csv`
 - `/Users/user/gnomon/agents/mechanism_study/results_highpower/h6.csv`
 
-## Figures
+Figures (GitHub-renderable):
 
-![H1 LD](figures_highpower/fig1_ld.png)
+![LD mechanism](figures_highpower/fig1_ld.png)
 
-![H2 overlap](figures_highpower/fig2_overlap.png)
+![Overlap control](figures_highpower/fig2_overlap.png)
 
-![H4 complexity](figures_highpower/fig3_complexity.png)
+![Model complexity](figures_highpower/fig3_complexity.png)
 
-![H6 causal fraction](figures_highpower/fig4_causal_fraction.png)
+![Causal fraction sweep](figures_highpower/fig4_causal_fraction.png)
