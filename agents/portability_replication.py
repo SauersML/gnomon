@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import math
 import os
 import sys
@@ -70,7 +71,7 @@ N_CAUSAL_LEVELS = [50, 200, 1000, 5000]
 DIVERGENCE_LEVELS = [0, 100, 500, 1000, 5000, 10_000]
 SCENARIOS = ["divergence", "bottleneck"]
 SEEDS = [1, 2, 3]
-N_PER_POP = 3000
+N_PER_POP = 2000
 SEQ_LEN = 5_000_000
 RECOMB_RATE = 1e-8
 MUT_RATE = 1e-8
@@ -80,6 +81,7 @@ PREVALENCE = 0.10
 N_ARRAY_SITES = 2000  # for array variant
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "portability_results")
+N_WORKERS = max(1, min(6, (os.cpu_count() or 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,7 @@ def simulate_two_pop(cfg: Config) -> SimResult:
             ploidy=2,
             population_size=cfg.ne,
             random_seed=cfg.seed,
-            model="dtwf",
+            model="hudson",
         )
         ts = msprime.sim_mutations(ts, rate=cfg.mut_rate, random_seed=cfg.seed + 1)
         # Arbitrary split into two "populations"
@@ -135,7 +137,7 @@ def simulate_two_pop(cfg: Config) -> SimResult:
             recombination_rate=cfg.recomb_rate,
             ploidy=2,
             random_seed=cfg.seed,
-            model="dtwf",
+            model="hudson",
         )
         ts = msprime.sim_mutations(ts, rate=cfg.mut_rate, random_seed=cfg.seed + 1)
 
@@ -286,40 +288,18 @@ def safe_r2(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1] ** 2)
 
 
-def run_single_config(cfg: Config) -> Optional[PortabilityResult]:
-    """Run a single simulation config and return portability metrics."""
-    try:
-        sim = simulate_two_pop(cfg)
-    except Exception as e:
-        print(f"  [SKIP] {cfg.scenario} g={cfg.divergence_gens} nc={cfg.n_causal} "
-              f"s={cfg.seed} array={cfg.n_array_sites>0}: {e}")
-        return None
-
-    pop0 = np.where(sim.pop_idx == 0)[0]
-    pop1 = np.where(sim.pop_idx == 1)[0]
-
-    # Split POP0 into train (70%) and holdout (30%)
-    rng_split = np.random.default_rng(cfg.seed + 100)
-    shuffled = rng_split.permutation(pop0)
-    n_train = int(0.7 * len(pop0))
-    train_idx = shuffled[:n_train]
-    holdout_idx = shuffled[n_train:]
-
-    use_array = cfg.n_array_sites > 0
-
-    # --- Determine variant subset ---
-    if use_array:
-        # Evenly-spaced "array" sites
-        n_total = sim.X.shape[1]
-        step = max(1, n_total // cfg.n_array_sites)
-        array_mask = np.arange(0, n_total, step)[:cfg.n_array_sites]
-        variant_mask = array_mask
-    else:
-        variant_mask = None
-
+def _score_given_variant_mask(
+    sim: SimResult,
+    train_idx: np.ndarray,
+    holdout_idx: np.ndarray,
+    pop1: np.ndarray,
+    variant_mask: Optional[np.ndarray],
+    use_array: bool,
+    cfg: Config,
+) -> PortabilityResult:
+    """Score one simulated dataset under either full-sequence or array mask."""
     n_variants_used = len(variant_mask) if variant_mask is not None else sim.X.shape[1]
 
-    # --- Marginal regression PRS (all variants) ---
     prs_holdout, beta_hat = build_marginal_prs(
         sim.X, sim.G_true, train_idx, holdout_idx, variant_mask
     )
@@ -331,7 +311,6 @@ def run_single_config(cfg: Config) -> Optional[PortabilityResult]:
     r2_gwas_p1 = safe_r2(prs_pop1, sim.G_true[pop1])
     ratio_gwas = r2_gwas_p1 / r2_gwas_h if r2_gwas_h > 1e-6 else float("nan")
 
-    # --- Thresholded PRS (top 5% by |beta|) ---
     abs_beta = np.abs(beta_hat)
     thresh = np.percentile(abs_beta, 95)
     keep_mask = abs_beta >= thresh
@@ -356,23 +335,16 @@ def run_single_config(cfg: Config) -> Optional[PortabilityResult]:
         r2_t_p1 = 0.0
     ratio_thresh = r2_t_p1 / r2_t_h if r2_t_h > 1e-6 else float("nan")
 
-    # --- Oracle PRS ---
     oracle_holdout = build_oracle_prs(sim.X, sim.causal_idx, sim.causal_betas, holdout_idx)
     oracle_pop1 = build_oracle_prs(sim.X, sim.causal_idx, sim.causal_betas, pop1)
     r2_o_h = safe_r2(oracle_holdout, sim.G_true[holdout_idx])
     r2_o_p1 = safe_r2(oracle_pop1, sim.G_true[pop1])
     ratio_oracle = r2_o_p1 / r2_o_h if r2_o_h > 1e-6 else float("nan")
 
-    # --- Diagnostic: median tag-causal distance ---
-    if use_array:
+    if use_array and variant_mask is not None and len(variant_mask) > 0:
         causal_positions = sim.pos[sim.causal_idx]
         array_positions = sim.pos[variant_mask]
-        # For each array site, distance to nearest causal
-        dists = []
-        for ap in array_positions:
-            d = np.min(np.abs(causal_positions - ap))
-            dists.append(d)
-        median_dist = float(np.median(dists))
+        median_dist = float(np.median([np.min(np.abs(causal_positions - ap)) for ap in array_positions]))
     else:
         median_dist = 0.0
 
@@ -384,7 +356,7 @@ def run_single_config(cfg: Config) -> Optional[PortabilityResult]:
         use_array=use_array,
         n_variants=sim.X.shape[1],
         n_variants_used=n_variants_used,
-        n_train=n_train,
+        n_train=len(train_idx),
         r2_gwas_holdout=r2_gwas_h,
         r2_gwas_pop1=r2_gwas_p1,
         portability_ratio_gwas=ratio_gwas,
@@ -399,57 +371,97 @@ def run_single_config(cfg: Config) -> Optional[PortabilityResult]:
     )
 
 
+def run_single_config(cfg: Config) -> List[PortabilityResult]:
+    """Run one simulation and produce both full-seq and array PRS results."""
+    try:
+        sim = simulate_two_pop(cfg)
+    except Exception as e:
+        print(f"  [SKIP] {cfg.scenario} g={cfg.divergence_gens} nc={cfg.n_causal} s={cfg.seed}: {e}")
+        return []
+
+    pop0 = np.where(sim.pop_idx == 0)[0]
+    pop1 = np.where(sim.pop_idx == 1)[0]
+
+    # Split POP0 into train (70%) and holdout (30%)
+    rng_split = np.random.default_rng(cfg.seed + 100)
+    shuffled = rng_split.permutation(pop0)
+    n_train = int(0.7 * len(pop0))
+    train_idx = shuffled[:n_train]
+    holdout_idx = shuffled[n_train:]
+
+    n_total = sim.X.shape[1]
+    step = max(1, n_total // cfg.n_array_sites)
+    array_mask = np.arange(0, n_total, step)[:cfg.n_array_sites]
+
+    full_res = _score_given_variant_mask(
+        sim, train_idx, holdout_idx, pop1, None, False, cfg
+    )
+    array_res = _score_given_variant_mask(
+        sim, train_idx, holdout_idx, pop1, array_mask, True, cfg
+    )
+    return [full_res, array_res]
+
+
 # ---------------------------------------------------------------------------
 # Section E: Sweep orchestration
 # ---------------------------------------------------------------------------
 
 def build_all_configs() -> List[Config]:
-    """Build the full parameter sweep."""
+    """Build one simulation config per scenario/divergence/n_causal/seed."""
     configs = []
     for scenario in SCENARIOS:
         for n_causal in N_CAUSAL_LEVELS:
             for div_gens in DIVERGENCE_LEVELS:
                 for seed in SEEDS:
-                    for n_array in [0, N_ARRAY_SITES]:
-                        configs.append(Config(
-                            scenario=scenario,
-                            divergence_gens=div_gens,
-                            n_causal=n_causal,
-                            n_per_pop=N_PER_POP,
-                            seq_len=SEQ_LEN,
-                            recomb_rate=RECOMB_RATE,
-                            mut_rate=MUT_RATE,
-                            ne=NE,
-                            h2=H2,
-                            prevalence=PREVALENCE,
-                            n_array_sites=n_array,
-                            seed=seed,
-                        ))
+                    configs.append(Config(
+                        scenario=scenario,
+                        divergence_gens=div_gens,
+                        n_causal=n_causal,
+                        n_per_pop=N_PER_POP,
+                        seq_len=SEQ_LEN,
+                        recomb_rate=RECOMB_RATE,
+                        mut_rate=MUT_RATE,
+                        ne=NE,
+                        h2=H2,
+                        prevalence=PREVALENCE,
+                        n_array_sites=N_ARRAY_SITES,
+                        seed=seed,
+                    ))
     return configs
 
 
 def run_sweep() -> pd.DataFrame:
     """Run the full sweep, return DataFrame of results."""
     configs = build_all_configs()
-    print(f"Total configurations: {len(configs)}")
+    print(f"Total simulations: {len(configs)} (each yields full-seq + array)")
+    print(f"Workers: {N_WORKERS}")
 
     results = []
     t0 = time.time()
-
-    for i, cfg in enumerate(configs):
-        label = (f"{cfg.scenario} g={cfg.divergence_gens} nc={cfg.n_causal} "
-                 f"s={cfg.seed} array={'yes' if cfg.n_array_sites>0 else 'no'}")
-        if (i + 1) % 10 == 0 or i == 0:
+    completed = 0
+    with cf.ProcessPoolExecutor(max_workers=N_WORKERS) as ex:
+        fut_to_cfg = {ex.submit(run_single_config, cfg): cfg for cfg in configs}
+        for fut in cf.as_completed(fut_to_cfg):
+            cfg = fut_to_cfg[fut]
+            completed += 1
             elapsed = time.time() - t0
-            eta = elapsed / (i + 1) * (len(configs) - i - 1) if i > 0 else 0
-            print(f"[{i+1}/{len(configs)}] {label}  (elapsed={elapsed:.0f}s, ETA={eta:.0f}s)")
-
-        res = run_single_config(cfg)
-        if res is not None:
-            results.append(res)
+            eta = elapsed / completed * (len(configs) - completed) if completed > 0 else 0
+            print(
+                f"[{completed}/{len(configs)}] {cfg.scenario} g={cfg.divergence_gens} "
+                f"nc={cfg.n_causal} s={cfg.seed} (elapsed={elapsed:.0f}s, ETA={eta:.0f}s)"
+            )
+            try:
+                res_list = fut.result()
+                if res_list:
+                    results.extend(res_list)
+            except Exception as e:
+                print(
+                    f"  [FAIL] {cfg.scenario} g={cfg.divergence_gens} nc={cfg.n_causal} "
+                    f"s={cfg.seed}: {e}"
+                )
 
     elapsed = time.time() - t0
-    print(f"\nSweep complete: {len(results)} results in {elapsed:.0f}s")
+    print(f"\nSweep complete: {len(results)} scored rows in {elapsed:.0f}s")
 
     rows = []
     for r in results:
@@ -722,8 +734,12 @@ def main():
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Parameters: n_per_pop={N_PER_POP}, seq_len={SEQ_LEN/1e6:.0f}Mb, "
           f"h2={H2}, Ne={NE}")
-    print(f"Sweep: {len(N_CAUSAL_LEVELS)} n_causal x {len(DIVERGENCE_LEVELS)} div_gens "
-          f"x {len(SCENARIOS)} scenarios x {len(SEEDS)} seeds x 2 (array/seq)")
+    n_sims = len(N_CAUSAL_LEVELS) * len(DIVERGENCE_LEVELS) * len(SCENARIOS) * len(SEEDS)
+    print(
+        f"Sweep: {len(N_CAUSAL_LEVELS)} n_causal x {len(DIVERGENCE_LEVELS)} div_gens "
+        f"x {len(SCENARIOS)} scenarios x {len(SEEDS)} seeds = {n_sims} simulations"
+    )
+    print(f"Expected scored rows: {n_sims * 2} (full-seq + array)")
     print()
 
     df = run_sweep()
