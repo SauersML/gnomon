@@ -4423,16 +4423,59 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+set_option maxHeartbeats 10000000
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y' := iso.symm y
+  let K' := K.map iso.symm
+  let p' := Submodule.orthogonalProjection K' y'
+  iso p'
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, @dist (EuclideanSpace ℝ (Fin n)) (inferInstance)
+                           (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) p) ≤
+                      @dist (EuclideanSpace ℝ (Fin n)) (inferInstance)
+                           (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) w)) :
     p = orthogonalProjection K y := by
-  sorry
+  dsimp [orthogonalProjection]
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let y' := iso.symm y
+  let p' := iso.symm p
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso.symm
+
+  have h_mem' : p' ∈ K' := Submodule.mem_map_of_mem h_mem
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases Submodule.mem_map.mp hw' with ⟨w, hw, rfl⟩
+    specialize h_min w hw
+    exact h_min
+
+  have h_norm_min : ‖y' - p'‖ = ⨅ w : K', ‖y' - w‖ := by
+    apply le_antisymm
+    · apply le_ciInf
+      intro w
+      rw [← dist_eq_norm]
+      exact h_min' w w.prop
+    · apply ciInf_le ⟨0, Set.forall_mem_range.2 fun _ => norm_nonneg _⟩
+      use p', h_mem'
+      rfl
+
+  rw [Submodule.norm_eq_iInf_iff_inner_eq_zero h_mem'] at h_norm_min
+  have h_eq : (K'.orthogonalProjection y' : EuclideanSpace ℝ (Fin n)) = p' := by
+    rw [Submodule.coe_orthogonalProjection_apply]
+    apply Submodule.eq_starProjection_of_mem_of_inner_eq_zero h_mem'
+    intro w hw
+    rw [real_inner_comm]
+    exact h_norm_min w hw
+
+  apply iso.symm.injective
+  rw [← h_eq]
+  rfl
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
