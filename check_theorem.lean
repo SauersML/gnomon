@@ -1,0 +1,5 @@
+import Mathlib.Analysis.InnerProductSpace.Projection.Basic
+open scoped InnerProductSpace
+open InnerProductSpace
+
+#check eq_orthogonalProjection_of_dist_le

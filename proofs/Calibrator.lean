@@ -4423,16 +4423,94 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
+set_option maxHeartbeats 10000000
+
+/-- L2 distance on Fin n → ℝ. -/
+noncomputable def distL2 {n : ℕ} (x y : Fin n → ℝ) : ℝ :=
+  @dist (EuclideanSpace ℝ (Fin n)) _ (WithLp.equiv 2 (Fin n → ℝ) x) (WithLp.equiv 2 (Fin n → ℝ) y)
+
+/-- Orthogonal projection onto a finite-dimensional subspace (L2). -/
+noncomputable def orthogonalProjectionL2 {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' : EuclideanSpace ℝ (Fin n) := iso y
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := inferInstance
+  haveI : FiniteDimensional ℝ K' := inferInstance
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+  let p' := K'.orthogonalProjection y'
+  iso.symm p'
+
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  orthogonalProjectionL2 K y
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, distL2 y p ≤ distL2 y w) :
     p = orthogonalProjection K y := by
-  sorry
+  rw [orthogonalProjection, orthogonalProjectionL2]
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let K' : Submodule ℝ (EuclideanSpace ℝ (Fin n)) := K.map iso
+  let y' : EuclideanSpace ℝ (Fin n) := iso y
+  let p' : EuclideanSpace ℝ (Fin n) := iso p
+
+  haveI : FiniteDimensional ℝ (EuclideanSpace ℝ (Fin n)) := inferInstance
+  haveI : FiniteDimensional ℝ K' := inferInstance
+  haveI : CompleteSpace K' := FiniteDimensional.complete ℝ K'
+
+  have h_mem' : p' ∈ K' := by
+    apply Submodule.mem_map_of_mem
+    exact h_mem
+
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    rcases (Submodule.mem_map.mp hw') with ⟨w, hw, hw_eq⟩
+    rw [← hw_eq]
+    have : (iso : (Fin n → ℝ) → EuclideanSpace ℝ (Fin n)) = WithLp.equiv 2 (Fin n → ℝ) := rfl
+    rw [this] at *
+    specialize h_min w hw
+    unfold distL2 at h_min
+    exact h_min
+
+  -- Use norm_eq_iInf_iff_real_inner_eq_zero to show orthogonality
+  have h_orth : ∀ w' ∈ K', ⟪y' - p', w'⟫_ℝ = 0 := by
+    rw [← Submodule.norm_eq_iInf_iff_real_inner_eq_zero K' h_mem']
+    apply le_antisymm
+    · apply le_ciInf
+      intro w'
+      exact h_min' w' w'.2
+    · apply ciInf_le
+      use ⟨p', h_mem'⟩
+
+  have h_eq : p' = K'.orthogonalProjection y' := by
+    -- Decompose y' into p' + (y' - p')
+    have h_decomp : y' = p' + (y' - p') := by ring
+    have h_orth_perp : y' - p' ∈ K'.orthogonal := by
+      intro w' hw'
+      rw [real_inner_comm]
+      exact h_orth w' hw'
+
+    -- Apply linearity of projection
+    rw [h_decomp, map_add]
+
+    -- K'.orthogonalProjection p' = p' (since p' ∈ K')
+    have h_proj_p : (K'.orthogonalProjection p' : EuclideanSpace ℝ (Fin n)) = p' := by
+      rw [Submodule.orthogonalProjection_mem_subspace_eq_self h_mem']
+
+    -- K'.orthogonalProjection (y' - p') = 0 (since y' - p' ∈ K'ᗮ)
+    have h_proj_orth : (K'.orthogonalProjection (y' - p') : EuclideanSpace ℝ (Fin n)) = 0 := by
+      rw [Submodule.orthogonalProjection_orthogonal_apply_eq_zero h_orth_perp]
+      simp
+
+    -- Combine
+    have h_sum : (↑(K'.orthogonalProjection p' + K'.orthogonalProjection (y' - p')) : EuclideanSpace ℝ (Fin n)) =
+                 (↑(K'.orthogonalProjection p') : EuclideanSpace ℝ (Fin n)) + (↑(K'.orthogonalProjection (y' - p')) : EuclideanSpace ℝ (Fin n)) := rfl
+    rw [h_sum, h_proj_p, h_proj_orth, add_zero]
+
+  apply iso.injective
+  rw [← h_eq]
+  simp
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
@@ -6595,8 +6673,8 @@ lemma optimal_slope_eq_covariance_of_normalized_p_proven
   rw [h_sub] at h_orth_P
   rw [integral_sub] at h_orth_P
   · rw [integral_sub] at h_orth_P
-    · rw [integral_mul_left, hP0] at h_orth_P
-      rw [integral_mul_left, hP2] at h_orth_P
+    · rw [integral_const_mul, hP0] at h_orth_P
+      rw [integral_const_mul, hP2] at h_orth_P
       simp at h_orth_P
       linarith
     · exact hYP
@@ -6741,7 +6819,7 @@ lemma optimal_coefficients_for_additive_dgp_proven
           · simp +decide [ mul_assoc, MeasureTheory.integral_const_mul, MeasureTheory.integral_mul_const, hP0, hC0, h_integral_prod ];
             exact Or.inr ( by simpa only [ mul_comm ] using h_integral_prod.trans ( by simp +decide [ hP0, hC0 ] ) );
           · exact hP_int.mul_const _;
-          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring;
+          · convert hP2_int.mul_const ( model.γₘ₀ ⟨ 0, by norm_num ⟩ ) using 2 ; ring_nf;
             rfl;
         · simpa only [ sq ] using hP2_int;
         · exact MeasureTheory.Integrable.const_mul ( by simpa only [ mul_comm ] using hPC_int ) _;
