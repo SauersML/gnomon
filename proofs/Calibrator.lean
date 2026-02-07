@@ -4423,18 +4423,46 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
   rw [← h_at_1]
   rfl
 
-/-- Orthogonal projection onto a finite-dimensional subspace. -/
+/-- Pack and unpack are inverses. -/
+lemma pack_unpack_eq {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fintype (Fin sp)]
+    (pgsBasis : PGSBasis p) (splineBasis : SplineBasis sp)
+    (β : ParamVec p k sp) :
+    packParams (unpackParams pgsBasis splineBasis β) = β := by
+  ext j
+  cases j <;> simp [packParams, unpackParams]
+
+/-- Orthogonal projection onto a finite-dimensional subspace using L2 metric. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  iso.symm (Submodule.orthogonalProjection (K.map iso) (iso y))
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
-    iff p minimizes distance to y among all points in K. -/
+    iff p minimizes L2 distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K)
+    (h_min : ∀ w ∈ K, dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) p) ≤
+                      dist (WithLp.equiv 2 (Fin n → ℝ) y) (WithLp.equiv 2 (Fin n → ℝ) w)) :
     p = orthogonalProjection K y := by
-  sorry
+  let iso := WithLp.linearEquiv 2 (Fin n → ℝ)
+  let K' := K.map iso
+  let y' := iso y
+  let p' := iso p
+  have h_mem' : p' ∈ K' := by
+    simp only [K', p', iso, Submodule.mem_map, LinearEquiv.coe_coe]
+    use p
+    simp [h_mem]
+  have h_min' : ∀ w' ∈ K', dist y' p' ≤ dist y' w' := by
+    intro w' hw'
+    obtain ⟨w, hw, rfl⟩ := (Submodule.mem_map).mp hw'
+    convert h_min w hw
+  have h_eq' := eq_orthogonalProjection_of_dist_le K' y' p' h_mem' h_min'
+  rw [orthogonalProjection]
+  simp only [iso]
+  apply iso.injective
+  rw [iso.apply_symm_apply]
+  exact h_eq'
 
-set_option maxHeartbeats 2000000 in
+set_option maxHeartbeats 10000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
     PROVIDED the model class is flexible enough to capture the transformation.
 
