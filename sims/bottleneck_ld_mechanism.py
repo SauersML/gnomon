@@ -97,7 +97,7 @@ def simulate(cfg: Config) -> Sim:
             ploidy=2,
             population_size=cfg.ne,
             random_seed=cfg.seed,
-            model="hudson",
+            model="dtwf",
         )
         ts = msprime.sim_mutations(ts, rate=cfg.mut, random_seed=cfg.seed + 1)
         pop_idx = np.array([0] * n0 + [1] * n1, dtype=np.int32)
@@ -116,7 +116,7 @@ def simulate(cfg: Config) -> Sim:
             recombination_rate=cfg.recomb,
             ploidy=2,
             random_seed=cfg.seed,
-            model="hudson",
+            model="dtwf",
         )
         ts = msprime.sim_mutations(ts, rate=cfg.mut, random_seed=cfg.seed + 1)
         _, _, pi, _ = _diploid_index_pairs(ts)

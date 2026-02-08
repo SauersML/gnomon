@@ -69,10 +69,12 @@ def _build_demography_bottleneck(split_time: int, ne: int, bottle_ne: int) -> ms
     dem.add_population(name="ancestral", initial_size=ne)
     dem.add_population_split(time=split_time, derived=["pop0", "pop1"], ancestral="ancestral")
 
-    # Bottleneck after split (more recent than split), then recover to NE by present.
+    # Bottleneck starts shortly after split, with fixed maximum duration to keep
+    # bottleneck severity comparable across different split-time scenarios.
     if split_time > 0:
-        start = max(1, int(round(split_time * 0.5)))
-        end = max(0, int(round(split_time * 0.1)))
+        start = max(1, split_time - 1)
+        duration = min(200, max(5, split_time - 2))
+        end = max(0, start - duration)
         if end >= start:
             end = max(0, start - 1)
         dem.add_population_parameters_change(time=start, population="pop0", initial_size=bottle_ne)

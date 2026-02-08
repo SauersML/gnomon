@@ -138,7 +138,7 @@ def simulate_seed(cfg: Config, seed: int) -> Dict[str, np.ndarray]:
         ploidy=2,
         population_size=cfg.ne,
         random_seed=seed,
-        model="hudson",
+        model="dtwf",
     )
     ts = msprime.sim_mutations(ts, rate=cfg.mut, random_seed=seed + 1)
 
