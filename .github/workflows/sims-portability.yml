@@ -43,6 +43,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
+          fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
           if [ "${SIM_PROFILE}" = "full" ]; then
             echo "seed_start=${{ matrix.chunk.seed_start_full }}" >> "$GITHUB_OUTPUT"
             echo "seed_end=${{ matrix.chunk.seed_end_full }}" >> "$GITHUB_OUTPUT"
@@ -109,7 +114,15 @@ jobs:
           SEQ_LEN="${{ steps.gen0_params.outputs.seq_len }}"
           N_CAUSAL="${{ steps.gen0_params.outputs.n_causal }}"
           N_PCA="${{ steps.gen0_params.outputs.n_pca }}"
+          WORKERS="${{ steps.gen0_params.outputs.workers }}"
           BAYESR_MAX=$((SEED_END - SEED_START + 1))
+
+          # Avoid nested thread oversubscription when using process workers.
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
 
           OUT_DIR="sims/results_gen0/chunks"
           mkdir -p "$OUT_DIR"
@@ -123,6 +136,7 @@ jobs:
             --n-pca-sites "$N_PCA" \
             --include-bayesr \
             --bayesr-max-seeds "$BAYESR_MAX" \
+            --workers "$WORKERS" \
             --out-dir "$OUT_DIR/chunk_${{ matrix.chunk.name }}"
 
           cp "$OUT_DIR/chunk_${{ matrix.chunk.name }}/gen0_orthogonalization_results.csv" "$OUT_DIR/gen0_chunk_${{ matrix.chunk.name }}.csv"

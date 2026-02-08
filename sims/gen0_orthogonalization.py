@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import math
 import os
 import subprocess
@@ -244,36 +245,52 @@ def calibrated_auc_with_optional_orth(prs: np.ndarray, pcs: np.ndarray, g: np.nd
     return out
 
 
-def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, bayesr_max_seeds: int) -> pd.DataFrame:
+def _run_seed(cfg: Config, seed: int, include_bayesr_for_seed: bool) -> List[Dict[str, float]]:
     rows: List[Dict[str, float]] = []
 
-    for seed in seeds:
-        sim = simulate_seed(cfg, seed)
+    sim = simulate_seed(cfg, seed)
+    y = sim["y_test"]
+    g = sim["g_test"]
+    pcs = sim["pcs_test"]
+
+    weak_orig = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=False)
+    weak_orth = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=True)
+    strong_orig = calibrated_auc_with_optional_orth(sim["prs_strong"], pcs, g, y, orth=False)
+
+    rows.append({"seed": seed, "condition": "weak_original", **weak_orig})
+    rows.append({"seed": seed, "condition": "weak_orthogonalized", **weak_orth})
+    rows.append({"seed": seed, "condition": "strong_original", **strong_orig})
+
+    if include_bayesr_for_seed:
+        sim = simulate_bayesr_seed(seed)
         y = sim["y_test"]
         g = sim["g_test"]
         pcs = sim["pcs_test"]
+        prs = sim["prs_bayesr"]
 
-        weak_orig = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=False)
-        weak_orth = calibrated_auc_with_optional_orth(sim["prs_weak"], pcs, g, y, orth=True)
-        strong_orig = calibrated_auc_with_optional_orth(sim["prs_strong"], pcs, g, y, orth=False)
+        bayesr_orig = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=False)
+        bayesr_orth = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=True)
 
-        rows.append({"seed": seed, "condition": "weak_original", **weak_orig})
-        rows.append({"seed": seed, "condition": "weak_orthogonalized", **weak_orth})
-        rows.append({"seed": seed, "condition": "strong_original", **strong_orig})
+        rows.append({"seed": seed, "condition": "bayesr_original", **bayesr_orig})
+        rows.append({"seed": seed, "condition": "bayesr_orthogonalized", **bayesr_orth})
+    return rows
 
-    if include_bayesr:
-        for seed in seeds[:bayesr_max_seeds]:
-            sim = simulate_bayesr_seed(seed)
-            y = sim["y_test"]
-            g = sim["g_test"]
-            pcs = sim["pcs_test"]
-            prs = sim["prs_bayesr"]
 
-            bayesr_orig = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=False)
-            bayesr_orth = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=True)
+def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, bayesr_max_seeds: int, workers: int) -> pd.DataFrame:
+    rows: List[Dict[str, float]] = []
+    bayesr_seed_set = set(seeds[:bayesr_max_seeds]) if include_bayesr else set()
 
-            rows.append({"seed": seed, "condition": "bayesr_original", **bayesr_orig})
-            rows.append({"seed": seed, "condition": "bayesr_orthogonalized", **bayesr_orth})
+    if workers <= 1:
+        for seed in seeds:
+            rows.extend(_run_seed(cfg, seed, seed in bayesr_seed_set))
+    else:
+        with cf.ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(_run_seed, cfg, seed, seed in bayesr_seed_set)
+                for seed in seeds
+            ]
+            for fut in cf.as_completed(futs):
+                rows.extend(fut.result())
 
     df = pd.DataFrame(rows)
     df["gap_additive_minus_raw"] = df["auc_additive"] - df["auc_raw"]
@@ -537,6 +554,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--input-csv", type=Path, default=None)
     ap.add_argument("--include-bayesr", action="store_true")
     ap.add_argument("--bayesr-max-seeds", type=int, default=32)
+    ap.add_argument("--workers", type=int, default=1)
     return ap.parse_args()
 
 
@@ -572,6 +590,7 @@ def main() -> None:
         out_dir,
         include_bayesr=args.include_bayesr,
         bayesr_max_seeds=max(1, args.bayesr_max_seeds),
+        workers=max(1, args.workers),
     )
     summarize(df, out_dir)
     print(f"Done: {out_dir}")
