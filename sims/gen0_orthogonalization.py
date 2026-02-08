@@ -368,21 +368,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path, pvals: Dict[str, float]) -> None
     yvals = df["gap_additive_minus_raw"].to_numpy(dtype=float)
     ytop = float(np.nanmax(yvals)) if len(yvals) else 0.1
     yrange = max(0.12, float(np.nanmax(yvals) - np.nanmin(yvals)) if len(yvals) else 0.12)
-    y_base = ytop + 0.04 * yrange
     y_step = 0.11 * yrange
-
-    for test_id, cond in [("H1", "weak_original"), ("H3", "strong_original"), ("H5", "bayesr_original")]:
-        if cond in xpos and test_id in pvals:
-            ax.text(
-                xpos[cond],
-                y_base,
-                format_p(pvals[test_id]),
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.8),
-            )
-            y_base += 0.45 * y_step
 
     bracket_level = 0
     for test_id, c1, c2 in [
@@ -393,7 +379,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path, pvals: Dict[str, float]) -> None
             y = ytop + 0.7 * y_step + bracket_level * y_step
             add_bracket(ax, xpos[c1], xpos[c2], y=y, h=0.22 * y_step, label=format_p(pvals[test_id]))
             bracket_level += 1
-    ax.set_ylim(top=ytop + (2.6 + bracket_level) * y_step)
+    ax.set_ylim(top=ytop + (1.8 + bracket_level) * y_step)
 
     ax = axes[1]
     coupling_order = [
