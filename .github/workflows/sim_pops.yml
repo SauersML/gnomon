@@ -11,10 +11,8 @@ on:
         description: "Enable GAM-gnomon calibration (true/false)"
         required: false
         default: "false"
-  push:
-    paths:
-      - "sims/**"
-      - ".github/workflows/sim_pops.yml"
+  schedule:
+    - cron: "0 7 * * *"
 
 env:
   OMP_NUM_THREADS: 4

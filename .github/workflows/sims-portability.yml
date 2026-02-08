@@ -11,11 +11,8 @@ on:
         options:
           - quick
           - full
-  push:
-    paths:
-      - "sims/gen0_orthogonalization.py"
-      - "sims/bottleneck_ld_mechanism.py"
-      - ".github/workflows/sims-portability.yml"
+  schedule:
+    - cron: "30 7 * * *"
 
 env:
   PYTHONUNBUFFERED: "1"
