@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -34,6 +36,65 @@ class Config:
     n_pca_sites: int
     prevalence: float
     h2: float
+
+
+def _run(cmd: List[str], env: Dict[str, str] | None = None) -> None:
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDERR:\n{r.stderr}\nSTDOUT:\n{r.stdout}")
+
+
+def _load_train_test_from_prefix(prefix: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    work_dir = Path(f"{prefix}_work")
+    if not (work_dir / "test.keep").exists():
+        env = {**os.environ, "PYTHONPATH": "sims"}
+        _run(["python", "sims/split_data.py", prefix], env=env)
+
+    tsv = pd.read_csv(f"{prefix}.tsv", sep="\t")
+    tsv["individual_id"] = tsv["individual_id"].astype(str)
+    test_keep = pd.read_csv(work_dir / "test.keep", sep="\t", header=None, names=["FID", "IID"])
+    test_iids = set(test_keep["IID"].astype(str))
+
+    test_df = tsv[tsv["individual_id"].isin(test_iids)].copy().set_index("individual_id")
+    train_df = tsv[~tsv["individual_id"].isin(test_iids)].copy().set_index("individual_id")
+    return train_df, test_df
+
+
+def simulate_bayesr_seed(seed: int) -> Dict[str, np.ndarray]:
+    """
+    Reuse the same BayesR pipeline used in agents/ experiments:
+    sim_two_pop(divergence, gen0) -> split -> train BayesR -> score test.
+    """
+    prefix = f"divergence_g0_s{seed}"
+    env = {**os.environ, "PYTHONPATH": "sims"}
+
+    if not Path(f"{prefix}.tsv").exists():
+        _run(["python", "sims/sim_two_pop.py", "divergence", "0", str(seed)], env=env)
+
+    work_dir = Path(f"{prefix}_work")
+    if not (work_dir / "test.keep").exists():
+        _run(["python", "sims/split_data.py", prefix], env=env)
+
+    if not (work_dir / "BayesR.sscore").exists():
+        _run(["python", "sims/train_model.py", prefix, "BayesR"], env=env)
+
+    _, test_df = _load_train_test_from_prefix(prefix)
+    scores = pd.read_csv(work_dir / "BayesR.sscore", sep="\t")
+    scores["IID"] = scores["IID"].astype(str)
+    test_df = test_df.join(scores.set_index("IID")["PRS"], how="inner")
+
+    y = test_df["y"].values.astype(np.int8)
+    g = test_df["G_true"].values.astype(float)
+    pcs = test_df[[f"pc{i+1}" for i in range(5)]].values.astype(float)
+    prs = std(test_df["PRS"].values.astype(float))
+    pcs = StandardScaler().fit_transform(pcs)
+
+    return {
+        "y_test": y,
+        "g_test": g,
+        "prs_bayesr": prs,
+        "pcs_test": pcs,
+    }
 
 
 def std(v: np.ndarray) -> np.ndarray:
@@ -183,7 +244,7 @@ def calibrated_auc_with_optional_orth(prs: np.ndarray, pcs: np.ndarray, g: np.nd
     return out
 
 
-def run(cfg: Config, seeds: List[int], out_dir: Path) -> pd.DataFrame:
+def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, bayesr_max_seeds: int) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
 
     for seed in seeds:
@@ -199,6 +260,20 @@ def run(cfg: Config, seeds: List[int], out_dir: Path) -> pd.DataFrame:
         rows.append({"seed": seed, "condition": "weak_original", **weak_orig})
         rows.append({"seed": seed, "condition": "weak_orthogonalized", **weak_orth})
         rows.append({"seed": seed, "condition": "strong_original", **strong_orig})
+
+    if include_bayesr:
+        for seed in seeds[:bayesr_max_seeds]:
+            sim = simulate_bayesr_seed(seed)
+            y = sim["y_test"]
+            g = sim["g_test"]
+            pcs = sim["pcs_test"]
+            prs = sim["prs_bayesr"]
+
+            bayesr_orig = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=False)
+            bayesr_orth = calibrated_auc_with_optional_orth(prs, pcs, g, y, orth=True)
+
+            rows.append({"seed": seed, "condition": "bayesr_original", **bayesr_orig})
+            rows.append({"seed": seed, "condition": "bayesr_orthogonalized", **bayesr_orth})
 
     df = pd.DataFrame(rows)
     df["gap_additive_minus_raw"] = df["auc_additive"] - df["auc_raw"]
@@ -220,22 +295,33 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "axes.titleweight": "bold",
     })
 
-    order = ["weak_original", "weak_orthogonalized", "strong_original"]
+    order = [
+        "weak_original",
+        "weak_orthogonalized",
+        "bayesr_original",
+        "bayesr_orthogonalized",
+        "strong_original",
+    ]
     labels = {
         "weak_original": "Weak PRS + Original PCs",
         "weak_orthogonalized": "Weak PRS + Orthogonalized PCs",
+        "bayesr_original": "BayesR PRS + Original PCs",
+        "bayesr_orthogonalized": "BayesR PRS + Orthogonalized PCs",
         "strong_original": "Strong PRS + Original PCs",
     }
     colors = {
         "weak_original": "#1f77b4",
         "weak_orthogonalized": "#ff7f0e",
+        "bayesr_original": "#9467bd",
+        "bayesr_orthogonalized": "#8c564b",
         "strong_original": "#2ca02c",
     }
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
 
     ax = axes[0]
-    for i, cond in enumerate(order):
+    present_order = [c for c in order if c in set(df["condition"])]
+    for i, cond in enumerate(present_order):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
         jitter = np.linspace(-0.08, 0.08, len(sub)) if len(sub) > 1 else np.array([0.0])
@@ -243,8 +329,8 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         m, lo, hi = mean_ci(sub["gap_additive_minus_raw"].values)
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
     ax.axhline(0, color="gray", ls=":")
-    ax.set_xticks([0, 1, 2])
-    ax.set_xticklabels([labels[c] for c in order], rotation=15, ha="right")
+    ax.set_xticks(list(range(len(present_order))))
+    ax.set_xticklabels([labels[c] for c in present_order], rotation=15, ha="right")
     ax.set_ylabel("AUC gain (Additive - Raw)")
     ax.set_title("Gen0 artifact: additive PC gain")
     ax.grid(True)
@@ -381,13 +467,52 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             "p_value_type": "one-sided",
         },
     ])
+
+    if "bayesr_original" in set(df["condition"]) and "bayesr_orthogonalized" in set(df["condition"]):
+        bro = df[df["condition"] == "bayesr_original"].sort_values("seed")
+        broh = df[df["condition"] == "bayesr_orthogonalized"].sort_values("seed")
+        g_bro = bro["gap_additive_minus_raw"].values
+        g_broh = broh["gap_additive_minus_raw"].values
+        tb1 = ttest_1samp(g_bro, popmean=0.0, nan_policy="omit")
+        pb1 = _p_one_sided_from_ttest(float(tb1.pvalue), float(tb1.statistic), "greater")
+        tb2 = ttest_rel(g_bro, g_broh, nan_policy="omit")
+        pb2 = _p_one_sided_from_ttest(float(tb2.pvalue), float(tb2.statistic), "greater")
+        mb, lb, ub = mean_ci(g_bro)
+        tests = pd.concat(
+            [
+                tests,
+                pd.DataFrame([
+                    {
+                        "test_id": "H5",
+                        "contrast": "bayesr_original_gap_additive_minus_raw_gt_0",
+                        "estimate_mean": mb,
+                        "estimate_ci_lo": lb,
+                        "estimate_ci_hi": ub,
+                        "t_stat": float(tb1.statistic),
+                        "p_value": pb1,
+                        "p_value_type": "one-sided",
+                    },
+                    {
+                        "test_id": "H6",
+                        "contrast": "bayesr_original_gap_gt_bayesr_orthogonalized_gap",
+                        "estimate_mean": float(np.mean(g_bro - g_broh)),
+                        "estimate_ci_lo": np.nan,
+                        "estimate_ci_hi": np.nan,
+                        "t_stat": float(tb2.statistic),
+                        "p_value": pb2,
+                        "p_value_type": "one-sided",
+                    },
+                ]),
+            ],
+            ignore_index=True,
+        )
     tests.to_csv(out_dir / "gen0_hypothesis_tests.csv", index=False)
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Rigorous replication of Gen0 PC orthogonalization artifact")
     ap.add_argument("--seed-start", type=int, default=1)
-    ap.add_argument("--seed-end", type=int, default=20)
+    ap.add_argument("--seed-end", type=int, default=32)
     ap.add_argument("--n-ind", type=int, default=2200)
     ap.add_argument("--seq-len", type=int, default=5_000_000)
     ap.add_argument("--n-causal", type=int, default=5000)
@@ -395,6 +520,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out-dir", type=Path, default=Path("sims/results_gen0"))
     ap.add_argument("--summary-only", action="store_true")
     ap.add_argument("--input-csv", type=Path, default=None)
+    ap.add_argument("--include-bayesr", action="store_true")
+    ap.add_argument("--bayesr-max-seeds", type=int, default=32)
     return ap.parse_args()
 
 
@@ -424,7 +551,13 @@ def main() -> None:
     )
 
     print(f"Running Gen0 orthogonalization: seeds={seeds[0]}..{seeds[-1]} n={len(seeds)}")
-    df = run(cfg, seeds, out_dir)
+    df = run(
+        cfg,
+        seeds,
+        out_dir,
+        include_bayesr=args.include_bayesr,
+        bayesr_max_seeds=max(1, args.bayesr_max_seeds),
+    )
     summarize(df, out_dir)
     print(f"Done: {out_dir}")
 

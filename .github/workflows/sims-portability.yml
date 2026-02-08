@@ -31,10 +31,10 @@ jobs:
       fail-fast: false
       matrix:
         chunk:
-          - { name: "a", seed_start_quick: 1, seed_end_quick: 2, seed_start_full: 1, seed_end_full: 6 }
-          - { name: "b", seed_start_quick: 3, seed_end_quick: 4, seed_start_full: 7, seed_end_full: 12 }
-          - { name: "c", seed_start_quick: 5, seed_end_quick: 6, seed_start_full: 13, seed_end_full: 18 }
-          - { name: "d", seed_start_quick: 7, seed_end_quick: 8, seed_start_full: 19, seed_end_full: 24 }
+          - { name: "a", seed_start_quick: 1, seed_end_quick: 2, seed_start_full: 1, seed_end_full: 8 }
+          - { name: "b", seed_start_quick: 3, seed_end_quick: 4, seed_start_full: 9, seed_end_full: 16 }
+          - { name: "c", seed_start_quick: 5, seed_end_quick: 6, seed_start_full: 17, seed_end_full: 24 }
+          - { name: "d", seed_start_quick: 7, seed_end_quick: 8, seed_start_full: 25, seed_end_full: 32 }
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +49,23 @@ jobs:
           pip install uv
           uv pip install --system -r sims/requirements.txt
 
+      - name: Install Plink2
+        run: |
+          set -euo pipefail
+          wget -q https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
+          unzip -q plink2.zip
+          sudo mv plink2 /usr/local/bin/
+          rm -f plink2.zip
+
+      - name: Install GCTB
+        run: |
+          set -euo pipefail
+          wget -q https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip -O gctb.zip
+          unzip -q gctb.zip -d gctb_bin
+          sudo mv gctb_bin/gctb_2.03beta_Linux/gctb /usr/local/bin/
+          chmod +x /usr/local/bin/gctb
+          rm -rf gctb.zip gctb_bin
+
       - name: Run Gen0 orthogonalization chunk
         run: |
           set -euo pipefail
@@ -60,6 +77,7 @@ jobs:
             SEQ_LEN=5000000
             N_CAUSAL=5000
             N_PCA=2000
+            BAYESR_MAX=$((SEED_END - SEED_START + 1))
           else
             SEED_START="${{ matrix.chunk.seed_start_quick }}"
             SEED_END="${{ matrix.chunk.seed_end_quick }}"
@@ -67,6 +85,7 @@ jobs:
             SEQ_LEN=2000000
             N_CAUSAL=1200
             N_PCA=700
+            BAYESR_MAX=$((SEED_END - SEED_START + 1))
           fi
 
           OUT_DIR="sims/results_gen0/chunks"
@@ -79,6 +98,8 @@ jobs:
             --seq-len "$SEQ_LEN" \
             --n-causal "$N_CAUSAL" \
             --n-pca-sites "$N_PCA" \
+            --include-bayesr \
+            --bayesr-max-seeds "$BAYESR_MAX" \
             --out-dir "$OUT_DIR/chunk_${{ matrix.chunk.name }}"
 
           cp "$OUT_DIR/chunk_${{ matrix.chunk.name }}/gen0_orthogonalization_results.csv" "$OUT_DIR/gen0_chunk_${{ matrix.chunk.name }}.csv"
