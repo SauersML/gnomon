@@ -252,7 +252,8 @@ def _simulate_dataset(cfg: TwoPopConfig) -> str:
     print(f"[{sim_prefix}] Writing {vcf_path} (for PLINK conversion) ...")
     individual_names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
     with open(vcf_path, "w") as f:
-        ts.write_vcf(f, individual_names=individual_names)
+        # Ensure VCF positions are 1-based and avoid invalid position 0 records.
+        ts.write_vcf(f, individual_names=individual_names, position_transform=lambda x: 1 + x)
 
     print(f"[{sim_prefix}] Writing {npz_path} (reproducibility: causal + PCA site IDs) ...")
     np.savez_compressed(
