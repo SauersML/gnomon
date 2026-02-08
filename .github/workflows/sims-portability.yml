@@ -311,7 +311,9 @@ jobs:
         id: bottleneck_cache_restore
         uses: actions/cache/restore@v4
         with:
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
           key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds_key }}-${{ steps.bottleneck_params.outputs.gens_key }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.min_tags }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/sim_two_pop.py', 'sims/requirements.txt') }}
 
       - name: Set up Python
@@ -366,14 +368,18 @@ jobs:
         if: steps.bottleneck_cache_restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
           key: ${{ steps.bottleneck_cache_restore.outputs.cache-primary-key }}
 
       - name: Upload bottleneck chunk artifact
         uses: actions/upload-artifact@v4
         with:
           name: bottleneck-chunk-${{ matrix.scenario }}-${{ matrix.gens.name }}
-          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          path: |
+            sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+            sims/results_bottleneck_ld_mechanism/hetero_sweeps/${{ matrix.scenario }}_${{ matrix.gens.name }}_hetero_sweep.csv
           if-no-files-found: error
           retention-days: 7
 
@@ -407,6 +413,7 @@ jobs:
           set -euo pipefail
           python sims/bottleneck_ld_mechanism.py summarize \
             --glob "sims/results_bottleneck_ld_mechanism/chunks/*.csv" \
+            --sweep-glob "sims/results_bottleneck_ld_mechanism/hetero_sweeps/*_hetero_sweep.csv" \
             --out-dir sims/results_bottleneck_ld_mechanism
 
       - name: Upload bottleneck report artifacts
@@ -419,10 +426,12 @@ jobs:
             sims/results_bottleneck_ld_mechanism/bottleneck_paired_deltas.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_hypothesis_tests.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_diagnostics.csv
+            sims/results_bottleneck_ld_mechanism/bottleneck_heterozygosity_sweep_results.csv
             sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
             sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
             sims/results_bottleneck_ld_mechanism/fig4_heterozygosity_distributions.png
+            sims/results_bottleneck_ld_mechanism/fig5_heterozygosity_manipulation_sweep.png
           if-no-files-found: error
           retention-days: 14
 

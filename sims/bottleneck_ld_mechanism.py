@@ -234,7 +234,34 @@ def ld_destroyed_matrix(X: np.ndarray, score_idx: np.ndarray, tags: np.ndarray, 
     return Xs
 
 
-def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
+def _safe_clip_p(p: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(p, dtype=float), 1e-4, 1.0 - 1e-4)
+
+
+def _mean_heterozygosity(p: np.ndarray) -> float:
+    p = _safe_clip_p(p)
+    return float(np.mean(2.0 * p * (1.0 - p)))
+
+
+def _odds_scale_freq(p: np.ndarray, scale: float) -> np.ndarray:
+    p = _safe_clip_p(p)
+    logit = np.log(p / (1.0 - p))
+    p_new = 1.0 / (1.0 + np.exp(-scale * logit))
+    return _safe_clip_p(p_new)
+
+
+def _ld_corr_change(X_before: np.ndarray, X_after: np.ndarray) -> float:
+    if X_before.shape[1] < 2 or X_before.shape[0] < 4:
+        return np.nan
+    c0 = np.corrcoef(X_before, rowvar=False)
+    c1 = np.corrcoef(X_after, rowvar=False)
+    if c0.ndim != 2 or c1.ndim != 2:
+        return np.nan
+    iu = np.triu_indices(c0.shape[0], k=1)
+    return float(np.nanmean(np.abs(c1[iu] - c0[iu])))
+
+
+def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     sim = simulate(cfg)
 
     pop0 = np.where(sim.pop_idx == 0)[0]
@@ -307,7 +334,7 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
     ratio_far_het = r2_far_1_het / r2_far_0 if r2_far_0 > 1e-8 else np.nan
     ratio_far_ld = r2_far_1_ld / r2_far_0 if r2_far_0 > 1e-8 else np.nan
 
-    return {
+    base_row = {
         "scenario": cfg.scenario,
         "divergence_gens": cfg.gens,
         "seed": cfg.seed,
@@ -338,14 +365,100 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
         "mean_abs_maf_diff_far": float(np.mean(np.abs(p1_far - p0_far))),
     }
 
+    sweep_rows: List[Dict[str, float]] = []
+    scales = [0.55, 0.70, 0.85, 1.00, 1.20, 1.45, 1.80]
+
+    X_train_all = sim.X[np.ix_(train0, all_tags)].astype(float)
+    X_test_all = sim.X[np.ix_(test0, all_tags)].astype(float)
+    X_target_all = sim.X[np.ix_(pop1, all_tags)].astype(float)
+    p_train = X_train_all.mean(axis=0) / 2.0
+    p_target = X_target_all.mean(axis=0) / 2.0
+
+    # Divergence scenario: lower target heterozygosity across a broad range.
+    if cfg.scenario == "divergence":
+        Xt = X_train_all
+        mu_t = Xt.mean(axis=0)
+        sd_t = Xt.std(axis=0)
+        sd_t[sd_t == 0] = 1.0
+        Xt_z = (Xt - mu_t) / sd_t
+        gt = sim.g_true[train0]
+        b = Xt_z.T @ (gt - gt.mean()) / len(train0)
+        r2_holdout = safe_r2(((X_test_all - mu_t) / sd_t) @ b, sim.g_true[test0])
+
+        for scale in [x for x in scales if x >= 1.0]:
+            p_target_new = _odds_scale_freq(p_target, scale)
+            delta = 2.0 * (p_target_new - p_target)
+            X_target_new = X_target_all + delta
+            prs_target = ((X_target_new - mu_t) / sd_t) @ b
+            r2_target = safe_r2(prs_target, sim.g_true[pop1])
+            ratio = r2_target / r2_holdout if r2_holdout > 1e-8 else np.nan
+            sweep_rows.append(
+                {
+                    "scenario": cfg.scenario,
+                    "divergence_gens": cfg.gens,
+                    "seed": cfg.seed,
+                    "intervention": "decrease_target_heterozygosity",
+                    "odds_scale": scale,
+                    "mean_heterozygosity_training": _mean_heterozygosity(p_train),
+                    "mean_heterozygosity_target": _mean_heterozygosity(p_target_new),
+                    "heterozygosity_shift_target_minus_training": _mean_heterozygosity(p_target_new) - _mean_heterozygosity(p_train),
+                    "r2_training_holdout": r2_holdout,
+                    "r2_target_population": r2_target,
+                    "transfer_ratio": ratio,
+                    "ld_absolute_change": _ld_corr_change(X_target_all, X_target_new),
+                }
+            )
+
+    # Bottleneck scenario: raise training heterozygosity across a broad range.
+    if cfg.scenario == "bottleneck":
+        for scale in [x for x in scales if x <= 1.0]:
+            p_train_new = _odds_scale_freq(p_train, scale)
+            delta = 2.0 * (p_train_new - p_train)
+            X_train_new = X_train_all + delta
+            X_test_new = X_test_all + delta
+
+            mu_t = X_train_new.mean(axis=0)
+            sd_t = X_train_new.std(axis=0)
+            sd_t[sd_t == 0] = 1.0
+            Xt_z = (X_train_new - mu_t) / sd_t
+            gt = sim.g_true[train0]
+            b = Xt_z.T @ (gt - gt.mean()) / len(train0)
+
+            prs_holdout = ((X_test_new - mu_t) / sd_t) @ b
+            prs_target = ((X_target_all - mu_t) / sd_t) @ b
+            r2_holdout = safe_r2(prs_holdout, sim.g_true[test0])
+            r2_target = safe_r2(prs_target, sim.g_true[pop1])
+            ratio = r2_target / r2_holdout if r2_holdout > 1e-8 else np.nan
+
+            sweep_rows.append(
+                {
+                    "scenario": cfg.scenario,
+                    "divergence_gens": cfg.gens,
+                    "seed": cfg.seed,
+                    "intervention": "increase_training_heterozygosity",
+                    "odds_scale": scale,
+                    "mean_heterozygosity_training": _mean_heterozygosity(p_train_new),
+                    "mean_heterozygosity_target": _mean_heterozygosity(p_target),
+                    "heterozygosity_shift_target_minus_training": _mean_heterozygosity(p_target) - _mean_heterozygosity(p_train_new),
+                    "r2_training_holdout": r2_holdout,
+                    "r2_target_population": r2_target,
+                    "transfer_ratio": ratio,
+                    "ld_absolute_change": _ld_corr_change(X_train_all, X_train_new),
+                }
+            )
+
+    return base_row, sweep_rows
+
 
 def parse_int_list(text: str) -> List[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
-def run_chunk(args: argparse.Namespace) -> Path:
+def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    sweep_dir = out_dir.parent / "hetero_sweeps"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
 
     scenarios = [args.scenario] if args.scenario != "both" else ["divergence", "bottleneck"]
     seeds = parse_int_list(args.seeds)
@@ -372,20 +485,25 @@ def run_chunk(args: argparse.Namespace) -> Path:
                 )
 
     rows: List[Dict[str, float]] = []
+    sweep_rows: List[Dict[str, float]] = []
     with cf.ProcessPoolExecutor(max_workers=args.workers) as ex:
         futs = [ex.submit(one_run, cfg, args.min_tags) for cfg in cfgs]
         for fut in cf.as_completed(futs):
-            rows.append(fut.result())
+            base_row, sweep_part = fut.result()
+            rows.append(base_row)
+            sweep_rows.extend(sweep_part)
 
     df = pd.DataFrame(rows).sort_values(["scenario", "divergence_gens", "seed"]).reset_index(drop=True)
 
     chunk_name = args.chunk_name or f"chunk_{args.scenario}_g{'-'.join(map(str, gens))}_s{'-'.join(map(str, seeds))}"
     path = out_dir / f"{chunk_name}.csv"
     df.to_csv(path, index=False)
-    return path
+    sweep_path = sweep_dir / f"{chunk_name}_hetero_sweep.csv"
+    pd.DataFrame(sweep_rows).sort_values(["scenario", "divergence_gens", "seed", "odds_scale"]).to_csv(sweep_path, index=False)
+    return path, sweep_path
 
 
-def summarize(df: pd.DataFrame, out_dir: Path) -> None:
+def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "bottleneck_ld_mechanism_results.csv", index=False)
 
@@ -590,6 +708,68 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_dir / "fig4_heterozygosity_distributions.png", dpi=220)
     plt.close(fig)
 
+    if len(sweep_df) > 0:
+        sweep_df.to_csv(out_dir / "bottleneck_heterozygosity_sweep_results.csv", index=False)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8.5, 5.0), constrained_layout=True)
+        for (sc, intervention), color, marker in [
+            (("divergence", "decrease_target_heterozygosity"), "#1f77b4", "o"),
+            (("bottleneck", "increase_training_heterozygosity"), "#d62728", "s"),
+        ]:
+            z = sweep_df[(sweep_df["scenario"] == sc) & (sweep_df["intervention"] == intervention)]
+            if len(z) == 0:
+                continue
+            grp = (
+                z.groupby("odds_scale", as_index=False)
+                .agg(
+                    mean_heterozygosity=("mean_heterozygosity_target", "mean"),
+                    transfer_ratio_mean=("transfer_ratio", "mean"),
+                    transfer_ratio_sd=("transfer_ratio", "std"),
+                    n=("transfer_ratio", "count"),
+                    ld_abs_change_mean=("ld_absolute_change", "mean"),
+                )
+                .sort_values("mean_heterozygosity")
+            )
+            if intervention == "increase_training_heterozygosity":
+                grp = (
+                    z.groupby("odds_scale", as_index=False)
+                    .agg(
+                        mean_heterozygosity=("mean_heterozygosity_training", "mean"),
+                        transfer_ratio_mean=("transfer_ratio", "mean"),
+                        transfer_ratio_sd=("transfer_ratio", "std"),
+                        n=("transfer_ratio", "count"),
+                        ld_abs_change_mean=("ld_absolute_change", "mean"),
+                    )
+                    .sort_values("mean_heterozygosity")
+                )
+
+            sem = grp["transfer_ratio_sd"].fillna(0.0) / np.sqrt(np.maximum(grp["n"], 1))
+            lo = grp["transfer_ratio_mean"] - 1.96 * sem
+            hi = grp["transfer_ratio_mean"] + 1.96 * sem
+            label = (
+                "divergence: lower target heterozygosity"
+                if sc == "divergence"
+                else "bottleneck: raise training heterozygosity"
+            )
+            ax.plot(
+                grp["mean_heterozygosity"],
+                grp["transfer_ratio_mean"],
+                marker=marker,
+                color=color,
+                linewidth=2.2,
+                markersize=6,
+                label=label,
+            )
+            ax.fill_between(grp["mean_heterozygosity"], lo, hi, color=color, alpha=0.12)
+        ax.axhline(1.0, color="gray", ls=":")
+        ax.set_xlabel("Mean heterozygosity of manipulated population")
+        ax.set_ylabel("Transfer ratio\n(target population R^2 / same-ancestry holdout R^2)")
+        ax.set_title("Heterozygosity-manipulation sweep with linkage structure preserved")
+        ax.grid(True)
+        ax.legend(frameon=False, fontsize=8)
+        fig.savefig(out_dir / "fig5_heterozygosity_manipulation_sweep.png", dpi=220)
+        plt.close(fig)
+
     m_nf, l_nf, u_nf = mean_ci(d_nf)
     m_het, l_het, u_het = mean_ci(d_het)
     m_ld, l_ld, u_ld = mean_ci(d_ld)
@@ -665,7 +845,9 @@ def merge_and_summarize(args: argparse.Namespace) -> None:
 
     dfs = [pd.read_csv(p) for p in csvs]
     df = pd.concat(dfs, ignore_index=True)
-    summarize(df, out_dir)
+    sweep_csvs = sorted(Path(".").glob(args.sweep_glob))
+    sweep_df = pd.concat([pd.read_csv(p) for p in sweep_csvs], ignore_index=True) if sweep_csvs else pd.DataFrame()
+    summarize(df, sweep_df, out_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -686,6 +868,7 @@ def parse_args() -> argparse.Namespace:
 
     ap_merge = sub.add_parser("summarize")
     ap_merge.add_argument("--glob", type=str, default="sims/results_bottleneck_ld_mechanism/chunks/*.csv")
+    ap_merge.add_argument("--sweep-glob", type=str, default="sims/results_bottleneck_ld_mechanism/hetero_sweeps/*_hetero_sweep.csv")
     ap_merge.add_argument("--out-dir", type=str, default="sims/results_bottleneck_ld_mechanism")
 
     return ap.parse_args()
@@ -695,8 +878,9 @@ def main() -> None:
     args = parse_args()
 
     if args.cmd == "run-chunk":
-        path = run_chunk(args)
+        path, sweep_path = run_chunk(args)
         print(f"Wrote chunk: {path}")
+        print(f"Wrote heterozygosity sweep chunk: {sweep_path}")
         return
 
     if args.cmd == "summarize":
