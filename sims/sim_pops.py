@@ -596,7 +596,7 @@ def _simulate_dataset(cfg: SimulationConfig) -> None:
     individual_names = [f"ind_{i+1}" for i in range(ts.num_individuals)]
     with open(vcf_path, "w") as f:
         # Ensure VCF positions are 1-based and avoid invalid position 0 records.
-        ts.write_vcf(f, individual_names=individual_names, position_transform=lambda x: 1 + x)
+        ts.write_vcf(f, individual_names=individual_names, position_transform=lambda x: np.asarray(x) + 1)
 
     # --- Extract Genetic Map for Consistency ---
     # stdpopsim/msprime used a specific map (GRCh38). We must export this so downstream tools
