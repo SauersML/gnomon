@@ -422,6 +422,7 @@ jobs:
             sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
             sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
+            sims/results_bottleneck_ld_mechanism/fig4_heterozygosity_distributions.png
           if-no-files-found: error
           retention-days: 14
 

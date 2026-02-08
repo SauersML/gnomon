@@ -562,6 +562,34 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_dir / "fig3_added_harm_correlates.png", dpi=220)
     plt.close(fig)
 
+    fig, ax = plt.subplots(1, 1, figsize=(7.8, 4.8), constrained_layout=True)
+    for sc, color in [("divergence", "#1f77b4"), ("bottleneck", "#d62728")]:
+        vals = (
+            df[df["scenario"] == sc]["delta_heterozygosity_alltags_target_minus_training"]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+            .values
+        )
+        if len(vals) < 2:
+            continue
+        sd = float(np.std(vals, ddof=1))
+        if sd <= 1e-12:
+            continue
+        n = len(vals)
+        bw = 1.06 * sd * (n ** (-1.0 / 5.0))
+        xs = np.linspace(float(vals.min() - 3 * bw), float(vals.max() + 3 * bw), 400)
+        dens = np.exp(-0.5 * ((xs[:, None] - vals[None, :]) / bw) ** 2).sum(axis=1)
+        dens /= (n * bw * np.sqrt(2 * np.pi))
+        ax.plot(xs, dens, color=color, linewidth=2.2, label=sc)
+        ax.fill_between(xs, 0, dens, color=color, alpha=0.12)
+    ax.set_xlabel("Heterozygosity shift (target population - training population)")
+    ax.set_ylabel("Density")
+    ax.set_title("Heterozygosity distribution by scenario")
+    ax.grid(True)
+    ax.legend(frameon=False, fontsize=9)
+    fig.savefig(out_dir / "fig4_heterozygosity_distributions.png", dpi=220)
+    plt.close(fig)
+
     m_nf, l_nf, u_nf = mean_ci(d_nf)
     m_het, l_het, u_het = mean_ci(d_het)
     m_ld, l_ld, u_ld = mean_ci(d_ld)
