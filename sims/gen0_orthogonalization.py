@@ -336,16 +336,26 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.grid(True)
 
     ax = axes[1]
-    coupling_order = ["weak_original", "weak_orthogonalized"]
+    coupling_order = [
+        "bayesr_original",
+        "bayesr_orthogonalized",
+        "weak_original",
+        "weak_orthogonalized",
+    ]
     coupling_labels = {
-        "weak_original": "Original PCs",
-        "weak_orthogonalized": "Orthogonalized PCs",
+        "bayesr_original": "Original PCs (BayesR)",
+        "bayesr_orthogonalized": "Orthogonalized PCs (BayesR)",
+        "weak_original": "Original PCs (Weak PRS)",
+        "weak_orthogonalized": "Orthogonalized PCs (Weak PRS)",
     }
     coupling_colors = {
+        "bayesr_original": "#9467bd",
+        "bayesr_orthogonalized": "#8c564b",
         "weak_original": "#1f77b4",
         "weak_orthogonalized": "#ff7f0e",
     }
-    for i, cond in enumerate(coupling_order):
+    present_coupling = [c for c in coupling_order if c in set(df["condition"])]
+    for i, cond in enumerate(present_coupling):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
         jitter = np.linspace(-0.08, 0.08, len(sub)) if len(sub) > 1 else np.array([0.0])
@@ -360,10 +370,10 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         )
         m, lo, hi = mean_ci(sub["r2_pc_g_val"].values)
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels([coupling_labels[c] for c in coupling_order], rotation=15, ha="right")
+    ax.set_xticks(list(range(len(present_coupling))))
+    ax.set_xticklabels([coupling_labels[c] for c in present_coupling], rotation=15, ha="right")
     ax.set_ylabel("R²(PCs, G_true) on validation")
-    ax.set_title("PC-G coupling (weak PRS only)")
+    ax.set_title("PC-G coupling")
     ax.grid(True)
 
     fig.tight_layout()
@@ -387,7 +397,12 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     summary.to_csv(out_dir / "gen0_orthogonalization_summary.csv", index=False)
 
     coupling_summary = (
-        df[df["condition"].isin(["weak_original", "weak_orthogonalized"])]
+        df[df["condition"].isin([
+            "bayesr_original",
+            "bayesr_orthogonalized",
+            "weak_original",
+            "weak_orthogonalized",
+        ])]
         .groupby("condition")
         .agg(
             n=("seed", "count"),
