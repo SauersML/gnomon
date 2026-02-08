@@ -1,0 +1,272 @@
+name: Sims (Gen0 + Bottleneck)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Run profile"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - quick
+          - full
+  push:
+    paths:
+      - "sims/gen0_orthogonalization.py"
+      - "sims/bottleneck_ld_mechanism.py"
+      - ".github/workflows/sims-portability.yml"
+
+env:
+  PYTHONUNBUFFERED: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "2"
+  VECLIB_MAXIMUM_THREADS: "2"
+  NUMEXPR_NUM_THREADS: "2"
+  SIM_PROFILE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.profile || 'quick' }}
+
+jobs:
+  gen0_chunks:
+    name: "Gen0 chunk ${{ matrix.chunk.name }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk:
+          - { name: "a", seed_start_quick: 1, seed_end_quick: 2, seed_start_full: 1, seed_end_full: 6 }
+          - { name: "b", seed_start_quick: 3, seed_end_quick: 4, seed_start_full: 7, seed_end_full: 12 }
+          - { name: "c", seed_start_quick: 5, seed_end_quick: 6, seed_start_full: 13, seed_end_full: 18 }
+          - { name: "d", seed_start_quick: 7, seed_end_quick: 8, seed_start_full: 19, seed_end_full: 24 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Run Gen0 orthogonalization chunk
+        run: |
+          set -euo pipefail
+
+          if [ "${SIM_PROFILE}" = "full" ]; then
+            SEED_START="${{ matrix.chunk.seed_start_full }}"
+            SEED_END="${{ matrix.chunk.seed_end_full }}"
+            N_IND=2200
+            SEQ_LEN=5000000
+            N_CAUSAL=5000
+            N_PCA=2000
+          else
+            SEED_START="${{ matrix.chunk.seed_start_quick }}"
+            SEED_END="${{ matrix.chunk.seed_end_quick }}"
+            N_IND=1000
+            SEQ_LEN=2000000
+            N_CAUSAL=1200
+            N_PCA=700
+          fi
+
+          OUT_DIR="sims/results_gen0/chunks"
+          mkdir -p "$OUT_DIR"
+
+          python sims/gen0_orthogonalization.py \
+            --seed-start "$SEED_START" \
+            --seed-end "$SEED_END" \
+            --n-ind "$N_IND" \
+            --seq-len "$SEQ_LEN" \
+            --n-causal "$N_CAUSAL" \
+            --n-pca-sites "$N_PCA" \
+            --out-dir "$OUT_DIR/chunk_${{ matrix.chunk.name }}"
+
+          cp "$OUT_DIR/chunk_${{ matrix.chunk.name }}/gen0_orthogonalization_results.csv" "$OUT_DIR/gen0_chunk_${{ matrix.chunk.name }}.csv"
+
+      - name: Upload Gen0 chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gen0-chunk-${{ matrix.chunk.name }}
+          path: sims/results_gen0/chunks/gen0_chunk_${{ matrix.chunk.name }}.csv
+          if-no-files-found: error
+          retention-days: 7
+
+  gen0_summarize:
+    name: "Gen0 summarize"
+    runs-on: ubuntu-22.04
+    needs: gen0_chunks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Download chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gen0-chunk-*
+          path: sims/results_gen0/chunks
+          merge-multiple: true
+
+      - name: Merge and summarize Gen0
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          chunk_dir = Path("sims/results_gen0/chunks")
+          files = sorted(chunk_dir.glob("gen0_chunk_*.csv"))
+          if not files:
+            raise SystemExit("No gen0 chunk files found")
+          df = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
+          merged = Path("sims/results_gen0/gen0_orthogonalization_merged.csv")
+          merged.parent.mkdir(parents=True, exist_ok=True)
+          df.to_csv(merged, index=False)
+          print(f"Wrote {merged}")
+          PY
+
+          python sims/gen0_orthogonalization.py \
+            --summary-only \
+            --input-csv sims/results_gen0/gen0_orthogonalization_merged.csv \
+            --out-dir sims/results_gen0
+
+      - name: Upload Gen0 report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gen0-report
+          path: |
+            sims/results_gen0/gen0_orthogonalization_merged.csv
+            sims/results_gen0/gen0_orthogonalization_summary.csv
+            sims/results_gen0/GEN0_ORTHOGONALIZATION_REPORT.txt
+            sims/results_gen0/fig_gen0_orthogonalization.png
+          if-no-files-found: error
+          retention-days: 14
+
+  bottleneck_chunks:
+    name: "Bottleneck chunk ${{ matrix.scenario }}-${{ matrix.gens.name }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [divergence, bottleneck]
+        gens:
+          - { name: "g0to200", quick: "0,20,50,100,200", full: "0,20,50,100,200" }
+          - { name: "g500to1000", quick: "500,1000", full: "500,1000" }
+          - { name: "g2000to5000", quick: "2000,5000", full: "2000,5000" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Run bottleneck mechanism chunk
+        run: |
+          set -euo pipefail
+
+          if [ "${SIM_PROFILE}" = "full" ]; then
+            SEEDS="1,2,3,4,5,6,7,8,9,10"
+            GENS="${{ matrix.gens.full }}"
+            N_PER_POP=2000
+            SEQ_LEN=5000000
+            N_CAUSAL=400
+            MIN_TAGS=80
+            WORKERS=4
+          else
+            SEEDS="1,2,3,4"
+            GENS="${{ matrix.gens.quick }}"
+            N_PER_POP=900
+            SEQ_LEN=2500000
+            N_CAUSAL=220
+            MIN_TAGS=45
+            WORKERS=3
+          fi
+
+          CHUNK_DIR="sims/results_bottleneck_ld_mechanism/chunks"
+          mkdir -p "$CHUNK_DIR"
+
+          python sims/bottleneck_ld_mechanism.py run-chunk \
+            --scenario "${{ matrix.scenario }}" \
+            --gens "$GENS" \
+            --seeds "$SEEDS" \
+            --workers "$WORKERS" \
+            --n-per-pop "$N_PER_POP" \
+            --seq-len "$SEQ_LEN" \
+            --n-causal "$N_CAUSAL" \
+            --min-tags "$MIN_TAGS" \
+            --out-dir "$CHUNK_DIR" \
+            --chunk-name "${{ matrix.scenario }}_${{ matrix.gens.name }}"
+
+      - name: Upload bottleneck chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-chunk-${{ matrix.scenario }}-${{ matrix.gens.name }}
+          path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
+          if-no-files-found: error
+          retention-days: 7
+
+  bottleneck_summarize:
+    name: "Bottleneck summarize"
+    runs-on: ubuntu-22.04
+    needs: bottleneck_chunks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv pip install --system -r sims/requirements.txt
+
+      - name: Download bottleneck chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bottleneck-chunk-*
+          path: sims/results_bottleneck_ld_mechanism/chunks
+          merge-multiple: true
+
+      - name: Summarize bottleneck mechanism analysis
+        run: |
+          set -euo pipefail
+          python sims/bottleneck_ld_mechanism.py summarize \
+            --glob "sims/results_bottleneck_ld_mechanism/chunks/*.csv" \
+            --out-dir sims/results_bottleneck_ld_mechanism
+
+      - name: Upload bottleneck report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottleneck-report
+          path: |
+            sims/results_bottleneck_ld_mechanism/bottleneck_ld_mechanism_results.csv
+            sims/results_bottleneck_ld_mechanism/bottleneck_ld_mechanism_summary.csv
+            sims/results_bottleneck_ld_mechanism/bottleneck_paired_deltas.csv
+            sims/results_bottleneck_ld_mechanism/BOTTLENECK_LD_MECHANISM_REPORT.txt
+            sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
+            sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
+            sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
+          if-no-files-found: error
+          retention-days: 14
