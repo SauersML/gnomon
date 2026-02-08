@@ -320,11 +320,11 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "strong_original",
     ]
     labels = {
-        "weak_original": "Weak polygenic risk score + original principal components",
-        "weak_orthogonalized": "Weak polygenic risk score + orthogonalized principal components",
-        "bayesr_original": "BayesR polygenic risk score + original principal components",
-        "bayesr_orthogonalized": "BayesR polygenic risk score + orthogonalized principal components",
-        "strong_original": "Strong polygenic risk score + original principal components",
+        "weak_original": "Weak PGS + original principal components",
+        "weak_orthogonalized": "Weak PGS + orthogonalized principal components",
+        "bayesr_original": "BayesR PGS + original principal components",
+        "bayesr_orthogonalized": "BayesR PGS + orthogonalized principal components",
+        "strong_original": "Strong PGS + original principal components",
     }
     colors = {
         "weak_original": "#1f77b4",
@@ -348,8 +348,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.axhline(0, color="gray", ls=":")
     ax.set_xticks(list(range(len(present_order))))
     ax.set_xticklabels([labels[c] for c in present_order], rotation=15, ha="right")
-    ax.set_ylabel("Difference in area under the receiver operating characteristic curve (additive model minus raw score model)")
-    ax.set_title("Generation zero result: gain from adding principal components")
+    ax.set_ylabel("AUC gain from adding PCs")
     ax.grid(True)
 
     ax = axes[1]
@@ -389,8 +388,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
     ax.set_xticks(list(range(len(present_coupling))))
     ax.set_xticklabels([coupling_labels[c] for c in present_coupling], rotation=15, ha="right")
-    ax.set_ylabel("Proportion of variance in true genetic liability explained by principal components on validation set")
-    ax.set_title("Coupling between principal components and true genetic liability")
+    ax.set_ylabel("R^2 between true genetic liability and PCs")
     ax.grid(True)
 
     fig.tight_layout()
