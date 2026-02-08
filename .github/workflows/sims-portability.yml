@@ -405,15 +405,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: bottleneck-chunk-*
-          path: sims/results_bottleneck_ld_mechanism/chunks
+          path: artifacts/bottleneck-chunks
           merge-multiple: true
 
       - name: Summarize bottleneck mechanism analysis
         run: |
           set -euo pipefail
           python sims/bottleneck_ld_mechanism.py summarize \
-            --glob "sims/results_bottleneck_ld_mechanism/chunks/*.csv" \
-            --sweep-glob "sims/results_bottleneck_ld_mechanism/hetero_sweeps/*_hetero_sweep.csv" \
+            --glob "artifacts/bottleneck-chunks/**/chunks/*.csv" \
+            --sweep-glob "artifacts/bottleneck-chunks/**/hetero_sweeps/*_hetero_sweep.csv" \
             --out-dir sims/results_bottleneck_ld_mechanism
 
       - name: Upload bottleneck report artifacts
