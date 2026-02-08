@@ -458,7 +458,7 @@ jobs:
 
           lines.append("")
           lines.append("Artifacts: `gen0-report`, `bottleneck-report`")
-          out.write_text("\\n".join(lines))
+          out.write_text("\n".join(lines))
           print(out.read_text())
           PY
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
