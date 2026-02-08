@@ -473,17 +473,20 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_dir / "fig1_near_vs_far.png", dpi=220)
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), sharey=True, constrained_layout=True)
-    for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
+    fig, ax = plt.subplots(1, 1, figsize=(12.5, 5.0), constrained_layout=True)
+    max_gen = 0
+    for sc, color in [("divergence", "#1f77b4"), ("bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         gens_sorted = sorted(z["divergence_gens"].unique())
+        if gens_sorted:
+            max_gen = max(max_gen, int(max(gens_sorted)))
         for metric, style, label in [
-            ("ratio_far", "o-", "Distant marker tags, baseline"),
-            ("ratio_far_het", "s--", "Distant marker tags, target standardized by target distribution"),
-            ("ratio_far_ld_destroy", "d:", "Distant marker tags, target linkage structure destroyed"),
+            ("ratio_far", "o-", "baseline"),
+            ("ratio_far_het", "s--", "target standardized by target distribution"),
+            ("ratio_far_ld_destroy", "d:", "target linkage structure destroyed"),
         ]:
             xs, ms, lo, hi = [], [], [], []
-            for g in sorted(z["divergence_gens"].unique()):
+            for g in gens_sorted:
                 vals = z[z["divergence_gens"] == g][metric].dropna().values
                 if len(vals) == 0:
                     continue
@@ -492,21 +495,23 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
                 ms.append(m)
                 lo.append(l)
                 hi.append(h)
-            line_color = color if metric != "ratio_far_ld_destroy" else "#555555"
-            ax.plot(xs, ms, style, color=line_color, linewidth=2.1, markersize=6, label=label)
-            ax.fill_between(xs, lo, hi, color=line_color, alpha=0.08)
-        ax.axhline(1.0, color="gray", ls=":")
-        ax.set_xscale("symlog", linthresh=20)
-        if gens_sorted:
-            xmax = float(max(gens_sorted))
-            ax.set_xlim(left=0, right=max(1.0, xmax * 1.1))
-            ax.set_xticks(gens_sorted)
-        ax.set_title(f"{sc}: intervention comparison")
-        ax.set_xlabel("Population split age (generations)")
-        ax.grid(True)
-        ax.set_ylim(bottom=-0.05)
-    axes[0].set_ylabel("Transfer ratio for distant marker tags\n(target population R^2 / same-ancestry holdout R^2)")
-    axes[0].legend(frameon=False, fontsize=8)
+            if not xs:
+                continue
+            full_label = f"{sc}, {label}"
+            ax.plot(xs, ms, style, color=color, linewidth=2.1, markersize=6, label=full_label)
+            ax.fill_between(xs, lo, hi, color=color, alpha=0.08)
+    ax.axhline(1.0, color="gray", ls=":")
+    ax.set_xscale("symlog", linthresh=20)
+    if max_gen > 0:
+        ticks = sorted(df["divergence_gens"].unique())
+        ax.set_xlim(left=0, right=max(1.0, float(max_gen) * 1.1))
+        ax.set_xticks(ticks)
+    ax.set_title("Intervention comparison for distant marker tags")
+    ax.set_xlabel("Population split age (generations)")
+    ax.set_ylabel("Transfer ratio for distant marker tags\n(target population R^2 / same-ancestry holdout R^2)")
+    ax.grid(True)
+    ax.set_ylim(bottom=-0.05)
+    ax.legend(frameon=False, fontsize=8, ncol=2)
     fig.savefig(out_dir / "fig2_ld_vs_hetero_interventions.png", dpi=220)
     plt.close(fig)
 
