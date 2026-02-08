@@ -297,23 +297,23 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
         "seed": cfg.seed,
         "n_near_tags": len(near_tags),
         "n_far_tags": len(far_tags),
-        "r2_near_pop0": r2_near_0,
-        "r2_near_pop1": r2_near_1,
+        "r2_near_training_holdout": r2_near_0,
+        "r2_near_target_population": r2_near_1,
         "ratio_near": ratio_near,
-        "r2_far_pop0": r2_far_0,
-        "r2_far_pop1": r2_far_1,
+        "r2_distant_training_holdout": r2_far_0,
+        "r2_distant_target_population": r2_far_1,
         "ratio_far": ratio_far,
-        "r2_far_pop1_het": r2_far_1_het,
+        "r2_distant_target_standardized_by_target": r2_far_1_het,
         "ratio_far_het": ratio_far_het,
-        "r2_far_pop1_ld_destroy": r2_far_1_ld,
+        "r2_distant_target_with_destroyed_linkage": r2_far_1_ld,
         "ratio_far_ld_destroy": ratio_far_ld,
         "delta_near_minus_far": ratio_near - ratio_far if np.isfinite(ratio_near) and np.isfinite(ratio_far) else np.nan,
         "delta_het_minus_baseline": ratio_far_het - ratio_far if np.isfinite(ratio_far_het) and np.isfinite(ratio_far) else np.nan,
         "delta_lddestroy_minus_baseline": ratio_far_ld - ratio_far if np.isfinite(ratio_far_ld) and np.isfinite(ratio_far) else np.nan,
-        "r2_null_pop0": safe_r2(prs_null_0, sim.g_true[test0]),
-        "r2_null_pop1": safe_r2(prs_null_1, sim.g_true[pop1]),
-        "beta_corr_far_pop0_vs_pop1": beta_corr_far,
-        "delta_hetero_far_pop1_minus_pop0": h1_far - h0_far,
+        "r2_null_training_holdout": safe_r2(prs_null_0, sim.g_true[test0]),
+        "r2_null_target_population": safe_r2(prs_null_1, sim.g_true[pop1]),
+        "beta_corr_distant_training_vs_target": beta_corr_far,
+        "delta_heterozygosity_distant_target_minus_training": h1_far - h0_far,
         "mean_abs_maf_diff_far": float(np.mean(np.abs(p1_far - p0_far))),
     }
 
@@ -374,7 +374,7 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         ratio_far_mean=("ratio_far", "mean"),
         ratio_far_het_mean=("ratio_far_het", "mean"),
         ratio_far_ld_destroy_mean=("ratio_far_ld_destroy", "mean"),
-        beta_corr_far_mean=("beta_corr_far_pop0_vs_pop1", "mean"),
+        beta_corr_far_mean=("beta_corr_distant_training_vs_target", "mean"),
     ).reset_index()
     summary.to_csv(out_dir / "bottleneck_ld_mechanism_summary.csv", index=False)
 
@@ -388,8 +388,13 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
 
     paired = pd.DataFrame(index=common).reset_index()
     paired["added_harm_far"] = div["ratio_far"].values - bot["ratio_far"].values
-    paired["beta_decorrelation"] = div["beta_corr_far_pop0_vs_pop1"].values - bot["beta_corr_far_pop0_vs_pop1"].values
-    paired["hetero_shift_delta"] = div["delta_hetero_far_pop1_minus_pop0"].values - bot["delta_hetero_far_pop1_minus_pop0"].values
+    paired["beta_decorrelation"] = (
+        div["beta_corr_distant_training_vs_target"].values - bot["beta_corr_distant_training_vs_target"].values
+    )
+    paired["hetero_shift_delta"] = (
+        div["delta_heterozygosity_distant_target_minus_training"].values
+        - bot["delta_heterozygosity_distant_target_minus_training"].values
+    )
     paired.to_csv(out_dir / "bottleneck_paired_deltas.csv", index=False)
 
     corr = np.nan
@@ -413,8 +418,8 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     t_het = ttest_1samp(d_het, 0.0, nan_policy="omit")
     t_ld = ttest_1samp(d_ld, 0.0, nan_policy="omit")
 
-    null0 = df["r2_null_pop0"].mean()
-    null1 = df["r2_null_pop1"].mean()
+    null0 = df["r2_null_training_holdout"].mean()
+    null1 = df["r2_null_target_population"].mean()
 
     # Figures
     plt.rcParams.update({
@@ -569,13 +574,13 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             "ci_hi": np.nan,
         },
         {
-            "metric": "null_r2_pop0_mean",
+            "metric": "null_r2_training_holdout_mean",
             "value": float(null0),
             "ci_lo": np.nan,
             "ci_hi": np.nan,
         },
         {
-            "metric": "null_r2_pop1_mean",
+            "metric": "null_r2_target_population_mean",
             "value": float(null1),
             "ci_lo": np.nan,
             "ci_hi": np.nan,

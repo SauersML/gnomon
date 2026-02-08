@@ -359,8 +359,8 @@ jobs:
           for key in [
               "corr_added_harm_vs_beta_decorrelation",
               "corr_added_harm_vs_heterozygosity_shift_delta",
-              "null_r2_pop0_mean",
-              "null_r2_pop1_mean",
+              "null_r2_training_holdout_mean",
+              "null_r2_target_population_mean",
           ]:
               r = dmap[key]
               clo = r["ci_lo"]
