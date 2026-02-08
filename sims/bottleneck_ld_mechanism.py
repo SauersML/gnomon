@@ -518,39 +518,70 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig.savefig(out_dir / "fig3_added_harm_correlates.png", dpi=220)
     plt.close(fig)
 
-    report = []
-    report.append("# Bottleneck LD-Mechanism Replication\n")
-    report.append("## What this tests\n")
-    report.append("1. Near-vs-far tags: far tags should lose portability faster if LD-tagging decay is causal.\n")
-    report.append("2. LD vs heterozygosity interventions: heterozygosity normalization should not rescue, LD destruction should collapse.\n")
-    report.append("3. Paired divergence-vs-bottleneck added harm should track beta decorrelation strongly.\n")
-
     m_nf, l_nf, u_nf = mean_ci(d_nf)
     m_het, l_het, u_het = mean_ci(d_het)
     m_ld, l_ld, u_ld = mean_ci(d_ld)
+    tests = pd.DataFrame([
+        {
+            "test_id": "H1",
+            "contrast": "near_ratio_minus_far_ratio_ne_0",
+            "estimate_mean": m_nf,
+            "estimate_ci_lo": l_nf,
+            "estimate_ci_hi": u_nf,
+            "t_stat": float(t_nf.statistic),
+            "p_value": float(t_nf.pvalue),
+            "p_value_type": "two-sided",
+        },
+        {
+            "test_id": "H2",
+            "contrast": "heterozygosity_normalized_far_minus_baseline_far_ne_0",
+            "estimate_mean": m_het,
+            "estimate_ci_lo": l_het,
+            "estimate_ci_hi": u_het,
+            "t_stat": float(t_het.statistic),
+            "p_value": float(t_het.pvalue),
+            "p_value_type": "two-sided",
+        },
+        {
+            "test_id": "H3",
+            "contrast": "ld_destroyed_far_minus_baseline_far_ne_0",
+            "estimate_mean": m_ld,
+            "estimate_ci_lo": l_ld,
+            "estimate_ci_hi": u_ld,
+            "t_stat": float(t_ld.statistic),
+            "p_value": float(t_ld.pvalue),
+            "p_value_type": "two-sided",
+        },
+    ])
+    tests.to_csv(out_dir / "bottleneck_hypothesis_tests.csv", index=False)
 
-    report.append("\n## Primary Quantitative Results\n")
-    report.append(f"- Near minus far portability delta: {m_nf:.4f} (95% CI {l_nf:.4f}, {u_nf:.4f}), t={t_nf.statistic:.3f}, p={t_nf.pvalue:.4g}\n")
-    report.append(f"- Heterozygosity intervention effect (far): {m_het:.4f} (95% CI {l_het:.4f}, {u_het:.4f}), t={t_het.statistic:.3f}, p={t_het.pvalue:.4g}\n")
-    report.append(f"- LD-destroy intervention effect (far): {m_ld:.4f} (95% CI {l_ld:.4f}, {u_ld:.4f}), t={t_ld.statistic:.3f}, p={t_ld.pvalue:.4g}\n")
-    report.append(f"- Null PRS controls: mean R²(pop0)={null0:.5f}, mean R²(pop1)={null1:.5f}\n")
-
-    report.append("\n## Bottleneck Added Harm Mechanism\n")
-    report.append(f"- Corr(added harm, beta decorrelation) = {corr:.3f} (95% CI {corr_lo:.3f}, {corr_hi:.3f})\n")
-    report.append(f"- Corr(added harm, heterozygosity shift delta) = {corr_het:.3f}\n")
-    report.append("If the first correlation is markedly stronger than the second, the evidence supports LD-tagging failure over heterozygosity shifts.\n")
-
-    report.append("\n## Conclusion\n")
-    report.append("Across paired divergence/bottleneck simulations, portability loss is dominated by LD-tagging failure: far tags decay faster, LD destruction collapses transfer, heterozygosity normalization does not recover performance, and bottleneck-added harm scales with marginal-beta decorrelation.\n")
-
-    report.append("\n## Outputs\n")
-    report.append("- `bottleneck_ld_mechanism_results.csv`\n")
-    report.append("- `bottleneck_paired_deltas.csv`\n")
-    report.append("- `fig1_near_vs_far.png`\n")
-    report.append("- `fig2_ld_vs_hetero_interventions.png`\n")
-    report.append("- `fig3_added_harm_correlates.png`\n")
-
-    (out_dir / "BOTTLENECK_LD_MECHANISM_REPORT.txt").write_text("\n".join(report))
+    diagnostics = pd.DataFrame([
+        {
+            "metric": "corr_added_harm_vs_beta_decorrelation",
+            "value": corr,
+            "ci_lo": corr_lo,
+            "ci_hi": corr_hi,
+        },
+        {
+            "metric": "corr_added_harm_vs_heterozygosity_shift_delta",
+            "value": corr_het,
+            "ci_lo": np.nan,
+            "ci_hi": np.nan,
+        },
+        {
+            "metric": "null_r2_pop0_mean",
+            "value": float(null0),
+            "ci_lo": np.nan,
+            "ci_hi": np.nan,
+        },
+        {
+            "metric": "null_r2_pop1_mean",
+            "value": float(null1),
+            "ci_lo": np.nan,
+            "ci_hi": np.nan,
+        },
+    ])
+    diagnostics.to_csv(out_dir / "bottleneck_diagnostics.csv", index=False)
 
 
 def merge_and_summarize(args: argparse.Namespace) -> None:

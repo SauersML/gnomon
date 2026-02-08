@@ -149,7 +149,7 @@ jobs:
           path: |
             sims/results_gen0/gen0_orthogonalization_merged.csv
             sims/results_gen0/gen0_orthogonalization_summary.csv
-            sims/results_gen0/GEN0_ORTHOGONALIZATION_REPORT.txt
+            sims/results_gen0/gen0_hypothesis_tests.csv
             sims/results_gen0/fig_gen0_orthogonalization.png
           if-no-files-found: error
           retention-days: 14
@@ -264,7 +264,8 @@ jobs:
             sims/results_bottleneck_ld_mechanism/bottleneck_ld_mechanism_results.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_ld_mechanism_summary.csv
             sims/results_bottleneck_ld_mechanism/bottleneck_paired_deltas.csv
-            sims/results_bottleneck_ld_mechanism/BOTTLENECK_LD_MECHANISM_REPORT.txt
+            sims/results_bottleneck_ld_mechanism/bottleneck_hypothesis_tests.csv
+            sims/results_bottleneck_ld_mechanism/bottleneck_diagnostics.csv
             sims/results_bottleneck_ld_mechanism/fig1_near_vs_far.png
             sims/results_bottleneck_ld_mechanism/fig2_ld_vs_hetero_interventions.png
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png

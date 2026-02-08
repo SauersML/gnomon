@@ -305,30 +305,39 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
 
     make_plots(df, out_dir)
 
-    report = []
-    report.append("# Gen0 Orthogonalization Replication\n")
-    report.append("## Hypotheses\n")
-    report.append("1. Weak PRS + original PCs shows positive PC-model gain over raw PRS.\n")
-    report.append("2. Orthogonalizing PCs against G_true removes that gain.\n")
-    report.append("3. With strong PRS, additive PC gain is near zero.\n")
-
-    report.append("\n## Main Estimates (AUC additive minus raw)\n")
-    report.append(f"- Weak+Original: {m1:.4f} (95% CI {l1:.4f}, {u1:.4f})\n")
-    report.append(f"- Weak+Orthogonalized: {m2:.4f} (95% CI {l2:.4f}, {u2:.4f})\n")
-    report.append(f"- Strong+Original: {m3:.4f} (95% CI {l3:.4f}, {u3:.4f})\n")
-
-    report.append("\n## Hypothesis Tests\n")
-    report.append(f"- H1 (Weak+Original gain > 0): t={t1.statistic:.3f}, one-sided p={p1:.4g}\n")
-    report.append(f"- H2 (Weak+Original gain > Weak+Orth gain): paired t={t2.statistic:.3f}, one-sided p={p2:.4g}\n")
-    report.append(f"- H3 (Strong+Original gain != 0): t={t3.statistic:.3f}, two-sided p={t3.pvalue:.4g}\n")
-
-    report.append("\n## Condition Table\n")
-    report.append(summary.to_markdown(index=False, floatfmt=".4f"))
-
-    report.append("\n## Figure\n")
-    report.append("[Figure: fig_gen0_orthogonalization.png]\n")
-
-    (out_dir / "GEN0_ORTHOGONALIZATION_REPORT.txt").write_text("\n".join(report))
+    tests = pd.DataFrame([
+        {
+            "test_id": "H1",
+            "contrast": "weak_original_gap_additive_minus_raw_gt_0",
+            "estimate_mean": m1,
+            "estimate_ci_lo": l1,
+            "estimate_ci_hi": u1,
+            "t_stat": float(t1.statistic),
+            "p_value": p1,
+            "p_value_type": "one-sided",
+        },
+        {
+            "test_id": "H2",
+            "contrast": "weak_original_gap_gt_weak_orthogonalized_gap",
+            "estimate_mean": float(np.mean(g1 - g2)),
+            "estimate_ci_lo": np.nan,
+            "estimate_ci_hi": np.nan,
+            "t_stat": float(t2.statistic),
+            "p_value": p2,
+            "p_value_type": "one-sided",
+        },
+        {
+            "test_id": "H3",
+            "contrast": "strong_original_gap_additive_minus_raw_ne_0",
+            "estimate_mean": m3,
+            "estimate_ci_lo": l3,
+            "estimate_ci_hi": u3,
+            "t_stat": float(t3.statistic),
+            "p_value": float(t3.pvalue),
+            "p_value_type": "two-sided",
+        },
+    ])
+    tests.to_csv(out_dir / "gen0_hypothesis_tests.csv", index=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -373,7 +382,7 @@ def main() -> None:
     print(f"Running Gen0 orthogonalization: seeds={seeds[0]}..{seeds[-1]} n={len(seeds)}")
     df = run(cfg, seeds, out_dir)
     summarize(df, out_dir)
-    print(f"Done: {out_dir / 'GEN0_ORTHOGONALIZATION_REPORT.txt'}")
+    print(f"Done: {out_dir}")
 
 
 if __name__ == "__main__":

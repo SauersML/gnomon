@@ -53,15 +53,16 @@ Interpretation:
 
 ## Artifacts Produced
 - `gen0-report` artifact:
-  - `GEN0_ORTHOGONALIZATION_REPORT.txt`
   - `gen0_orthogonalization_merged.csv`
   - `gen0_orthogonalization_summary.csv`
+  - `gen0_hypothesis_tests.csv`
   - `fig_gen0_orthogonalization.png`
 - `bottleneck-report` artifact:
-  - `BOTTLENECK_LD_MECHANISM_REPORT.txt`
   - `bottleneck_ld_mechanism_results.csv`
   - `bottleneck_ld_mechanism_summary.csv`
   - `bottleneck_paired_deltas.csv`
+  - `bottleneck_hypothesis_tests.csv`
+  - `bottleneck_diagnostics.csv`
   - `fig1_near_vs_far.png`
   - `fig2_ld_vs_hetero_interventions.png`
   - `fig3_added_harm_correlates.png`
