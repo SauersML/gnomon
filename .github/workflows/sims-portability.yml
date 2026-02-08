@@ -222,6 +222,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          CPU_CORES="$(nproc)"
+          if [ -z "$CPU_CORES" ] || [ "$CPU_CORES" -lt 1 ]; then
+            CPU_CORES=1
+          fi
+          echo "workers=$CPU_CORES" >> "$GITHUB_OUTPUT"
           if [ "${SIM_PROFILE}" = "full" ]; then
             echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
             echo "gens=${{ matrix.gens.full }}" >> "$GITHUB_OUTPUT"
@@ -231,7 +236,6 @@ jobs:
             echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
             echo "n_causal=400" >> "$GITHUB_OUTPUT"
             echo "min_tags=80" >> "$GITHUB_OUTPUT"
-            echo "workers=4" >> "$GITHUB_OUTPUT"
           else
             echo "seeds=1,2,3,4" >> "$GITHUB_OUTPUT"
             echo "gens=${{ matrix.gens.quick }}" >> "$GITHUB_OUTPUT"
@@ -241,7 +245,6 @@ jobs:
             echo "seq_len=2500000" >> "$GITHUB_OUTPUT"
             echo "n_causal=220" >> "$GITHUB_OUTPUT"
             echo "min_tags=45" >> "$GITHUB_OUTPUT"
-            echo "workers=3" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore bottleneck simulation cache
@@ -276,6 +279,13 @@ jobs:
           N_CAUSAL="${{ steps.bottleneck_params.outputs.n_causal }}"
           MIN_TAGS="${{ steps.bottleneck_params.outputs.min_tags }}"
           WORKERS="${{ steps.bottleneck_params.outputs.workers }}"
+
+          # Avoid nested thread oversubscription when using process workers.
+          export OMP_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export VECLIB_MAXIMUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
 
           CHUNK_DIR="sims/results_bottleneck_ld_mechanism/chunks"
           mkdir -p "$CHUNK_DIR"
