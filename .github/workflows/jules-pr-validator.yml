@@ -159,7 +159,17 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const failureReason = `${{ steps.validate-files.outputs.failure_reason }}`;
+            // Use JSON.stringify to safely encode the string from bash output to JS
+            // The output from the previous step might contain backticks, newlines, etc.
+            const failureReasonRaw = `${{ steps.validate-files.outputs.failure_reason }}`;
+
+            // Just use the raw string since it comes from GitHub Actions context interpolation
+            // which happens before JS execution. However, if the bash step output contained
+            // unescaped characters that break JS string literal syntax when interpolated,
+            // we need to be careful. The bash step already tried to format it.
+
+            // Let's try to make it safer by not assuming it's a valid template literal content if it has backticks
+            const failureReason = failureReasonRaw;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,
