@@ -269,3 +269,87 @@ jobs:
             sims/results_bottleneck_ld_mechanism/fig3_added_harm_correlates.png
           if-no-files-found: error
           retention-days: 14
+
+  ui_summary:
+    name: "Workflow summary"
+    runs-on: ubuntu-22.04
+    needs: [gen0_summarize, bottleneck_summarize]
+    steps:
+      - name: Download Gen0 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gen0-report
+          path: artifacts/gen0
+
+      - name: Download bottleneck artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bottleneck-report
+          path: artifacts/bottleneck
+
+      - name: Write GitHub UI summary
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          out = Path("summary.md")
+          gtests = Path("artifacts/gen0/gen0_hypothesis_tests.csv")
+          btests = Path("artifacts/bottleneck/bottleneck_hypothesis_tests.csv")
+          bdiag = Path("artifacts/bottleneck/bottleneck_diagnostics.csv")
+
+          def read_csv(path):
+              with open(path, newline="") as f:
+                  return list(csv.DictReader(f))
+
+          g = read_csv(gtests)
+          b = read_csv(btests)
+          d = read_csv(bdiag)
+
+          dmap = {r["metric"]: r for r in d}
+
+          lines = []
+          lines.append("# Sims (Gen0 + Bottleneck) Summary")
+          lines.append("")
+          lines.append("## Gen0 hypothesis tests")
+          lines.append("")
+          lines.append("| Test | Contrast | Estimate | p-value |")
+          lines.append("|---|---|---:|---:|")
+          for r in g:
+              lines.append(
+                  f"| {r['test_id']} | `{r['contrast']}` | {float(r['estimate_mean']):.4f} | {float(r['p_value']):.4g} |"
+              )
+
+          lines.append("")
+          lines.append("## Bottleneck hypothesis tests")
+          lines.append("")
+          lines.append("| Test | Contrast | Estimate | p-value |")
+          lines.append("|---|---|---:|---:|")
+          for r in b:
+              lines.append(
+                  f"| {r['test_id']} | `{r['contrast']}` | {float(r['estimate_mean']):.4f} | {float(r['p_value']):.4g} |"
+              )
+
+          lines.append("")
+          lines.append("## Bottleneck diagnostics")
+          lines.append("")
+          lines.append("| Metric | Value | CI |")
+          lines.append("|---|---:|---|")
+          for key in [
+              "corr_added_harm_vs_beta_decorrelation",
+              "corr_added_harm_vs_heterozygosity_shift_delta",
+              "null_r2_pop0_mean",
+              "null_r2_pop1_mean",
+          ]:
+              r = dmap[key]
+              clo = r["ci_lo"]
+              chi = r["ci_hi"]
+              ci = "-" if (clo == "" or chi == "") else f"[{float(clo):.3f}, {float(chi):.3f}]"
+              lines.append(f"| `{key}` | {float(r['value']):.4f} | {ci} |")
+
+          lines.append("")
+          lines.append("Artifacts: `gen0-report`, `bottleneck-report`")
+          out.write_text("\\n".join(lines))
+          print(out.read_text())
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
