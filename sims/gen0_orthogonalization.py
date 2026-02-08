@@ -250,17 +250,34 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.grid(True)
 
     ax = axes[1]
-    for i, cond in enumerate(order):
+    coupling_order = ["weak_original", "weak_orthogonalized"]
+    coupling_labels = {
+        "weak_original": "Original PCs",
+        "weak_orthogonalized": "Orthogonalized PCs",
+    }
+    coupling_colors = {
+        "weak_original": "#1f77b4",
+        "weak_orthogonalized": "#ff7f0e",
+    }
+    for i, cond in enumerate(coupling_order):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
         jitter = np.linspace(-0.08, 0.08, len(sub)) if len(sub) > 1 else np.array([0.0])
-        ax.scatter(x + jitter, sub["r2_pc_g_val"], s=36, alpha=0.8, color=colors[cond], edgecolor="white", linewidth=0.4)
+        ax.scatter(
+            x + jitter,
+            sub["r2_pc_g_val"],
+            s=36,
+            alpha=0.8,
+            color=coupling_colors[cond],
+            edgecolor="white",
+            linewidth=0.4,
+        )
         m, lo, hi = mean_ci(sub["r2_pc_g_val"].values)
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
-    ax.set_xticks([0, 1, 2])
-    ax.set_xticklabels([labels[c] for c in order], rotation=15, ha="right")
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels([coupling_labels[c] for c in coupling_order], rotation=15, ha="right")
     ax.set_ylabel("R²(PCs, G_true) on validation")
-    ax.set_title("Orthogonalization removes PC-G coupling")
+    ax.set_title("PC-G coupling (weak PRS only)")
     ax.grid(True)
 
     fig.tight_layout()
@@ -283,6 +300,18 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     ).reset_index()
     summary.to_csv(out_dir / "gen0_orthogonalization_summary.csv", index=False)
 
+    coupling_summary = (
+        df[df["condition"].isin(["weak_original", "weak_orthogonalized"])]
+        .groupby("condition")
+        .agg(
+            n=("seed", "count"),
+            r2_pc_g_val_mean=("r2_pc_g_val", "mean"),
+            r2_pc_g_val_std=("r2_pc_g_val", "std"),
+        )
+        .reset_index()
+    )
+    coupling_summary.to_csv(out_dir / "gen0_pcg_coupling_summary.csv", index=False)
+
     weak_orig = df[df["condition"] == "weak_original"].sort_values("seed")
     weak_orth = df[df["condition"] == "weak_orthogonalized"].sort_values("seed")
     strong_orig = df[df["condition"] == "strong_original"].sort_values("seed")
@@ -298,6 +327,11 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     p2 = _p_one_sided_from_ttest(float(t2.pvalue), float(t2.statistic), "greater")
 
     t3 = ttest_1samp(g3, popmean=0.0, nan_policy="omit")
+
+    r2_weak_orig = weak_orig["r2_pc_g_val"].values
+    r2_weak_orth = weak_orth["r2_pc_g_val"].values
+    t4 = ttest_rel(r2_weak_orig, r2_weak_orth, nan_policy="omit")
+    p4 = _p_one_sided_from_ttest(float(t4.pvalue), float(t4.statistic), "greater")
 
     m1, l1, u1 = mean_ci(g1)
     m2, l2, u2 = mean_ci(g2)
@@ -335,6 +369,16 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             "t_stat": float(t3.statistic),
             "p_value": float(t3.pvalue),
             "p_value_type": "two-sided",
+        },
+        {
+            "test_id": "H4",
+            "contrast": "r2_pcg_weak_original_gt_r2_pcg_weak_orthogonalized",
+            "estimate_mean": float(np.mean(r2_weak_orig - r2_weak_orth)),
+            "estimate_ci_lo": np.nan,
+            "estimate_ci_hi": np.nan,
+            "t_stat": float(t4.statistic),
+            "p_value": p4,
+            "p_value_type": "one-sided",
         },
     ])
     tests.to_csv(out_dir / "gen0_hypothesis_tests.csv", index=False)

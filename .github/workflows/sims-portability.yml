@@ -149,6 +149,7 @@ jobs:
           path: |
             sims/results_gen0/gen0_orthogonalization_merged.csv
             sims/results_gen0/gen0_orthogonalization_summary.csv
+            sims/results_gen0/gen0_pcg_coupling_summary.csv
             sims/results_gen0/gen0_hypothesis_tests.csv
             sims/results_gen0/fig_gen0_orthogonalization.png
           if-no-files-found: error
