@@ -242,12 +242,15 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
     train0, test0 = split_pop0(pop0, cfg.seed)
 
     near_tags, far_tags = match_near_far_tags(sim, cfg.seed, min_tags=min_tags)
+    all_tags = np.sort(np.unique(np.concatenate([near_tags, far_tags]))).astype(int)
 
     prs_near_0, b_near = build_marginal_prs(sim.X, sim.g_true, train0, test0, near_tags, use_score_stats=False)
     prs_near_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, near_tags, use_score_stats=False)
 
     prs_far_0, b_far = build_marginal_prs(sim.X, sim.g_true, train0, test0, far_tags, use_score_stats=False)
     prs_far_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, far_tags, use_score_stats=False)
+    prs_all_0, b_all = build_marginal_prs(sim.X, sim.g_true, train0, test0, all_tags, use_score_stats=False)
+    prs_all_1, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, all_tags, use_score_stats=False)
 
     prs_far_1_het, _ = build_marginal_prs(sim.X, sim.g_true, train0, pop1, far_tags, use_score_stats=True)
 
@@ -268,9 +271,15 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
     # Compare marginal betas trained in pop0 vs pop1 (same panel)
     pop1_train = pop1[:len(train0)] if len(pop1) >= len(train0) else pop1
     _, b_far_pop1 = build_marginal_prs(sim.X, sim.g_true, pop1_train, pop1_train, far_tags, use_score_stats=False)
+    _, b_all_pop1 = build_marginal_prs(sim.X, sim.g_true, pop1_train, pop1_train, all_tags, use_score_stats=False)
     beta_corr_far = (
         float(np.corrcoef(b_far, b_far_pop1)[0, 1])
         if np.std(b_far) > 1e-12 and np.std(b_far_pop1) > 1e-12
+        else np.nan
+    )
+    beta_corr_all = (
+        float(np.corrcoef(b_all, b_all_pop1)[0, 1])
+        if np.std(b_all) > 1e-12 and np.std(b_all_pop1) > 1e-12
         else np.nan
     )
 
@@ -278,16 +287,23 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
     p1_far = sim.X[np.ix_(pop1, far_tags)].mean(axis=0) / 2.0
     h0_far = float(np.mean(2 * p0_far * (1 - p0_far)))
     h1_far = float(np.mean(2 * p1_far * (1 - p1_far)))
+    p0_all = sim.X[np.ix_(train0, all_tags)].mean(axis=0) / 2.0
+    p1_all = sim.X[np.ix_(pop1, all_tags)].mean(axis=0) / 2.0
+    h0_all = float(np.mean(2 * p0_all * (1 - p0_all)))
+    h1_all = float(np.mean(2 * p1_all * (1 - p1_all)))
 
     r2_near_0 = safe_r2(prs_near_0, sim.g_true[test0])
     r2_near_1 = safe_r2(prs_near_1, sim.g_true[pop1])
     r2_far_0 = safe_r2(prs_far_0, sim.g_true[test0])
     r2_far_1 = safe_r2(prs_far_1, sim.g_true[pop1])
+    r2_all_0 = safe_r2(prs_all_0, sim.g_true[test0])
+    r2_all_1 = safe_r2(prs_all_1, sim.g_true[pop1])
     r2_far_1_het = safe_r2(prs_far_1_het, sim.g_true[pop1])
     r2_far_1_ld = safe_r2(prs_far_1_ld, sim.g_true[pop1])
 
     ratio_near = r2_near_1 / r2_near_0 if r2_near_0 > 1e-8 else np.nan
     ratio_far = r2_far_1 / r2_far_0 if r2_far_0 > 1e-8 else np.nan
+    ratio_all = r2_all_1 / r2_all_0 if r2_all_0 > 1e-8 else np.nan
     ratio_far_het = r2_far_1_het / r2_far_0 if r2_far_0 > 1e-8 else np.nan
     ratio_far_ld = r2_far_1_ld / r2_far_0 if r2_far_0 > 1e-8 else np.nan
 
@@ -303,6 +319,9 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
         "r2_distant_training_holdout": r2_far_0,
         "r2_distant_target_population": r2_far_1,
         "ratio_far": ratio_far,
+        "r2_alltags_training_holdout": r2_all_0,
+        "r2_alltags_target_population": r2_all_1,
+        "ratio_alltags": ratio_all,
         "r2_distant_target_standardized_by_target": r2_far_1_het,
         "ratio_far_het": ratio_far_het,
         "r2_distant_target_with_destroyed_linkage": r2_far_1_ld,
@@ -313,7 +332,9 @@ def one_run(cfg: Config, min_tags: int) -> Dict[str, float]:
         "r2_null_training_holdout": safe_r2(prs_null_0, sim.g_true[test0]),
         "r2_null_target_population": safe_r2(prs_null_1, sim.g_true[pop1]),
         "beta_corr_distant_training_vs_target": beta_corr_far,
+        "beta_corr_alltags_training_vs_target": beta_corr_all,
         "delta_heterozygosity_distant_target_minus_training": h1_far - h0_far,
+        "delta_heterozygosity_alltags_target_minus_training": h1_all - h0_all,
         "mean_abs_maf_diff_far": float(np.mean(np.abs(p1_far - p0_far))),
     }
 
@@ -387,27 +408,27 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     bot = bot.loc[common]
 
     paired = pd.DataFrame(index=common).reset_index()
-    paired["added_harm_far"] = div["ratio_far"].values - bot["ratio_far"].values
+    paired["added_harm_alltags"] = div["ratio_alltags"].values - bot["ratio_alltags"].values
     paired["beta_decorrelation"] = (
-        div["beta_corr_distant_training_vs_target"].values - bot["beta_corr_distant_training_vs_target"].values
+        div["beta_corr_alltags_training_vs_target"].values - bot["beta_corr_alltags_training_vs_target"].values
     )
     paired["hetero_shift_delta"] = (
-        div["delta_heterozygosity_distant_target_minus_training"].values
-        - bot["delta_heterozygosity_distant_target_minus_training"].values
+        div["delta_heterozygosity_alltags_target_minus_training"].values
+        - bot["delta_heterozygosity_alltags_target_minus_training"].values
     )
     paired.to_csv(out_dir / "bottleneck_paired_deltas.csv", index=False)
 
     corr = np.nan
     corr_lo, corr_hi = np.nan, np.nan
-    tmp = paired[["added_harm_far", "beta_decorrelation"]].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(tmp) > 3 and np.std(tmp["added_harm_far"]) > 1e-12 and np.std(tmp["beta_decorrelation"]) > 1e-12:
-        corr = float(np.corrcoef(tmp["added_harm_far"], tmp["beta_decorrelation"])[0, 1])
+    tmp = paired[["added_harm_alltags", "beta_decorrelation"]].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(tmp) > 3 and np.std(tmp["added_harm_alltags"]) > 1e-12 and np.std(tmp["beta_decorrelation"]) > 1e-12:
+        corr = float(np.corrcoef(tmp["added_harm_alltags"], tmp["beta_decorrelation"])[0, 1])
         corr_lo, corr_hi = fisher_ci(corr, len(tmp))
 
-    tmp2 = paired[["added_harm_far", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
+    tmp2 = paired[["added_harm_alltags", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
     corr_het = np.nan
-    if len(tmp2) > 3 and np.std(tmp2["added_harm_far"]) > 1e-12 and np.std(tmp2["hetero_shift_delta"]) > 1e-12:
-        corr_het = float(np.corrcoef(tmp2["added_harm_far"], tmp2["hetero_shift_delta"])[0, 1])
+    if len(tmp2) > 3 and np.std(tmp2["added_harm_alltags"]) > 1e-12 and np.std(tmp2["hetero_shift_delta"]) > 1e-12:
+        corr_het = float(np.corrcoef(tmp2["added_harm_alltags"], tmp2["hetero_shift_delta"])[0, 1])
 
     # Tests for requested claims
     d_nf = df["delta_near_minus_far"].dropna().values
@@ -516,21 +537,21 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0), constrained_layout=True)
-    t = paired[["added_harm_far", "beta_decorrelation"]].replace([np.inf, -np.inf], np.nan).dropna()
-    axes[0].scatter(t["beta_decorrelation"], t["added_harm_far"], s=28, alpha=0.75, color="#1f77b4", edgecolor="white", linewidth=0.4)
+    t = paired[["added_harm_alltags", "beta_decorrelation"]].replace([np.inf, -np.inf], np.nan).dropna()
+    axes[0].scatter(t["beta_decorrelation"], t["added_harm_alltags"], s=28, alpha=0.75, color="#1f77b4", edgecolor="white", linewidth=0.4)
     if len(t) > 3 and np.std(t["beta_decorrelation"]) > 1e-12:
-        b = np.polyfit(t["beta_decorrelation"], t["added_harm_far"], 1)
+        b = np.polyfit(t["beta_decorrelation"], t["added_harm_alltags"], 1)
         xx = np.linspace(t["beta_decorrelation"].min(), t["beta_decorrelation"].max(), 200)
         axes[0].plot(xx, b[0] * xx + b[1], color="#1f77b4", ls="--", linewidth=1.8)
-    axes[0].set_xlabel("Difference in marginal effect-size correlation\n(divergence - bottleneck)")
-    axes[0].set_ylabel("Additional bottleneck harm\n(divergence distant-tag ratio - bottleneck distant-tag ratio)")
+    axes[0].set_xlabel("Difference in marker-effect correlation\n(divergence - bottleneck)")
+    axes[0].set_ylabel("Additional bottleneck harm\n(divergence all-tag ratio - bottleneck all-tag ratio)")
     axes[0].set_title(f"Additional bottleneck harm vs effect-size decorrelation\n(correlation={corr:.3f})")
     axes[0].grid(True)
 
-    t = paired[["added_harm_far", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
-    axes[1].scatter(t["hetero_shift_delta"], t["added_harm_far"], s=28, alpha=0.75, color="#d62728", edgecolor="white", linewidth=0.4)
+    t = paired[["added_harm_alltags", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
+    axes[1].scatter(t["hetero_shift_delta"], t["added_harm_alltags"], s=28, alpha=0.75, color="#d62728", edgecolor="white", linewidth=0.4)
     if len(t) > 3 and np.std(t["hetero_shift_delta"]) > 1e-12:
-        b = np.polyfit(t["hetero_shift_delta"], t["added_harm_far"], 1)
+        b = np.polyfit(t["hetero_shift_delta"], t["added_harm_alltags"], 1)
         xx = np.linspace(t["hetero_shift_delta"].min(), t["hetero_shift_delta"].max(), 200)
         axes[1].plot(xx, b[0] * xx + b[1], color="#d62728", ls="--", linewidth=1.8)
     axes[1].set_xlabel("Difference in heterozygosity shift\n(divergence - bottleneck)")
