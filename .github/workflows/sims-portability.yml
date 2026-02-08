@@ -71,6 +71,38 @@ jobs:
           path: sims/results_gen0/chunks/gen0_chunk_${{ matrix.chunk.name }}.csv
           key: gen0-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.chunk.name }}-${{ steps.gen0_params.outputs.seed_start }}-${{ steps.gen0_params.outputs.seed_end }}-${{ steps.gen0_params.outputs.n_ind }}-${{ steps.gen0_params.outputs.seq_len }}-${{ steps.gen0_params.outputs.n_causal }}-${{ steps.gen0_params.outputs.n_pca }}-${{ hashFiles('sims/gen0_orthogonalization.py', 'sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/requirements.txt') }}
 
+      - name: Restore Gen0 BayesR intermediate cache
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        id: gen0_bayesr_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            divergence_g0_s*.tsv
+            divergence_g0_s*.bed
+            divergence_g0_s*.bim
+            divergence_g0_s*.fam
+            divergence_g0_s*_sites.npz
+            divergence_g0_s*_pcs.png
+            divergence_g0_s*_work/**
+          key: gen0-bayesr-${{ runner.os }}-${{ matrix.chunk.name }}-${{ steps.gen0_params.outputs.seed_start }}-${{ steps.gen0_params.outputs.seed_end }}-plink2_20260110-gctb_2_03beta-${{ hashFiles('sims/sim_two_pop.py', 'sims/split_data.py', 'sims/train_model.py', 'sims/plink_utils.py', 'sims/requirements.txt') }}
+
+      - name: Check Gen0 BayesR cache completeness
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        id: gen0_bayesr_ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEED_START="${{ steps.gen0_params.outputs.seed_start }}"
+          SEED_END="${{ steps.gen0_params.outputs.seed_end }}"
+          READY=true
+          for s in $(seq "$SEED_START" "$SEED_END"); do
+            if [ ! -f "divergence_g0_s${s}.tsv" ] || [ ! -f "divergence_g0_s${s}_work/BayesR.sscore" ]; then
+              READY=false
+              break
+            fi
+          done
+          echo "ready=$READY" >> "$GITHUB_OUTPUT"
+
       - name: Set up Python
         if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
         uses: actions/setup-python@v5
@@ -85,7 +117,7 @@ jobs:
           uv pip install --system -r sims/requirements.txt
 
       - name: Install Plink2
-        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_ready.outputs.ready != 'true'
         run: |
           set -euo pipefail
           wget -q https://s3.amazonaws.com/plink2-assets/plink2_linux_avx2_20260110.zip -O plink2.zip
@@ -94,7 +126,7 @@ jobs:
           rm -f plink2.zip
 
       - name: Install GCTB
-        if: steps.gen0_cache_restore.outputs.cache-hit != 'true'
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_ready.outputs.ready != 'true'
         run: |
           set -euo pipefail
           wget -q https://cnsgenomics.com/software/gctb/download/gctb_2.03beta_Linux.zip -O gctb.zip
@@ -147,6 +179,20 @@ jobs:
         with:
           path: sims/results_gen0/chunks/gen0_chunk_${{ matrix.chunk.name }}.csv
           key: ${{ steps.gen0_cache_restore.outputs.cache-primary-key }}
+
+      - name: Save Gen0 BayesR intermediate cache
+        if: steps.gen0_cache_restore.outputs.cache-hit != 'true' && steps.gen0_bayesr_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            divergence_g0_s*.tsv
+            divergence_g0_s*.bed
+            divergence_g0_s*.bim
+            divergence_g0_s*.fam
+            divergence_g0_s*_sites.npz
+            divergence_g0_s*_pcs.png
+            divergence_g0_s*_work/**
+          key: ${{ steps.gen0_bayesr_cache_restore.outputs.cache-primary-key }}
 
       - name: Upload Gen0 chunk artifact
         uses: actions/upload-artifact@v4
