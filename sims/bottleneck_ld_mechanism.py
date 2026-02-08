@@ -432,7 +432,7 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         "axes.titleweight": "bold",
     })
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), sharey=True, constrained_layout=True)
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         for metric, style, label in [
@@ -453,17 +453,16 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             ax.fill_between(xs, lo, hi, color=color, alpha=0.12 if metric == "ratio_near" else 0.08)
         ax.axhline(1.0, color="gray", ls=":")
         ax.set_xscale("symlog", linthresh=20)
-        ax.set_title(f"{sc}: transfer performance for nearby versus distant marker tags")
+        ax.set_title(f"{sc}: nearby vs distant marker-tag transfer")
         ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
         ax.set_ylim(bottom=0.15)
-    axes[0].set_ylabel("Transfer performance ratio (target population divided by same-ancestry holdout)")
+    axes[0].set_ylabel("Transfer ratio\n(target population / same-ancestry holdout)")
     axes[0].legend(frameon=False, fontsize=8)
-    fig.tight_layout()
     fig.savefig(out_dir / "fig1_near_vs_far.png", dpi=220)
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), sharey=True, constrained_layout=True)
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         for metric, style, label in [
@@ -490,22 +489,21 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
         ax.set_ylim(bottom=-0.05)
-    axes[0].set_ylabel("Transfer performance ratio for distant marker tags")
+    axes[0].set_ylabel("Transfer ratio for\ndistant marker tags")
     axes[0].legend(frameon=False, fontsize=8)
-    fig.tight_layout()
     fig.savefig(out_dir / "fig2_ld_vs_hetero_interventions.png", dpi=220)
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.0), constrained_layout=True)
     t = paired[["added_harm_far", "beta_decorrelation"]].replace([np.inf, -np.inf], np.nan).dropna()
     axes[0].scatter(t["beta_decorrelation"], t["added_harm_far"], s=28, alpha=0.75, color="#1f77b4", edgecolor="white", linewidth=0.4)
     if len(t) > 3 and np.std(t["beta_decorrelation"]) > 1e-12:
         b = np.polyfit(t["beta_decorrelation"], t["added_harm_far"], 1)
         xx = np.linspace(t["beta_decorrelation"].min(), t["beta_decorrelation"].max(), 200)
         axes[0].plot(xx, b[0] * xx + b[1], color="#1f77b4", ls="--", linewidth=1.8)
-    axes[0].set_xlabel("Difference in marginal effect-size correlation (divergence minus bottleneck)")
-    axes[0].set_ylabel("Additional bottleneck harm (divergence distant-tag ratio minus bottleneck distant-tag ratio)")
-    axes[0].set_title(f"Additional bottleneck harm versus marginal effect-size decorrelation (correlation={corr:.3f})")
+    axes[0].set_xlabel("Difference in marginal effect-size correlation\n(divergence - bottleneck)")
+    axes[0].set_ylabel("Additional bottleneck harm\n(divergence distant-tag ratio - bottleneck distant-tag ratio)")
+    axes[0].set_title(f"Additional bottleneck harm vs effect-size decorrelation\n(correlation={corr:.3f})")
     axes[0].grid(True)
 
     t = paired[["added_harm_far", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
@@ -514,12 +512,11 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         b = np.polyfit(t["hetero_shift_delta"], t["added_harm_far"], 1)
         xx = np.linspace(t["hetero_shift_delta"].min(), t["hetero_shift_delta"].max(), 200)
         axes[1].plot(xx, b[0] * xx + b[1], color="#d62728", ls="--", linewidth=1.8)
-    axes[1].set_xlabel("Difference in heterozygosity shift (divergence minus bottleneck)")
+    axes[1].set_xlabel("Difference in heterozygosity shift\n(divergence - bottleneck)")
     axes[1].set_ylabel("Additional bottleneck harm")
-    axes[1].set_title(f"Additional bottleneck harm versus heterozygosity shift (correlation={corr_het:.3f})")
+    axes[1].set_title(f"Additional bottleneck harm vs heterozygosity shift\n(correlation={corr_het:.3f})")
     axes[1].grid(True)
 
-    fig.tight_layout()
     fig.savefig(out_dir / "fig3_added_harm_correlates.png", dpi=220)
     plt.close(fig)
 
