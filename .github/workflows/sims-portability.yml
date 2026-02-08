@@ -225,6 +225,8 @@ jobs:
           if [ "${SIM_PROFILE}" = "full" ]; then
             echo "seeds=1,2,3,4,5,6,7,8,9,10" >> "$GITHUB_OUTPUT"
             echo "gens=${{ matrix.gens.full }}" >> "$GITHUB_OUTPUT"
+            echo "seeds_key=1_2_3_4_5_6_7_8_9_10" >> "$GITHUB_OUTPUT"
+            echo "gens_key=$(echo '${{ matrix.gens.full }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
             echo "n_per_pop=2000" >> "$GITHUB_OUTPUT"
             echo "seq_len=5000000" >> "$GITHUB_OUTPUT"
             echo "n_causal=400" >> "$GITHUB_OUTPUT"
@@ -233,6 +235,8 @@ jobs:
           else
             echo "seeds=1,2,3,4" >> "$GITHUB_OUTPUT"
             echo "gens=${{ matrix.gens.quick }}" >> "$GITHUB_OUTPUT"
+            echo "seeds_key=1_2_3_4" >> "$GITHUB_OUTPUT"
+            echo "gens_key=$(echo '${{ matrix.gens.quick }}' | tr ',' '_')" >> "$GITHUB_OUTPUT"
             echo "n_per_pop=900" >> "$GITHUB_OUTPUT"
             echo "seq_len=2500000" >> "$GITHUB_OUTPUT"
             echo "n_causal=220" >> "$GITHUB_OUTPUT"
@@ -245,7 +249,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: sims/results_bottleneck_ld_mechanism/chunks/${{ matrix.scenario }}_${{ matrix.gens.name }}.csv
-          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds }}-${{ steps.bottleneck_params.outputs.gens }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.min_tags }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/requirements.txt') }}
+          key: bottleneck-sim-${{ runner.os }}-${{ env.SIM_PROFILE }}-${{ matrix.scenario }}-${{ matrix.gens.name }}-${{ steps.bottleneck_params.outputs.seeds_key }}-${{ steps.bottleneck_params.outputs.gens_key }}-${{ steps.bottleneck_params.outputs.n_per_pop }}-${{ steps.bottleneck_params.outputs.seq_len }}-${{ steps.bottleneck_params.outputs.n_causal }}-${{ steps.bottleneck_params.outputs.min_tags }}-${{ hashFiles('sims/bottleneck_ld_mechanism.py', 'sims/requirements.txt') }}
 
       - name: Set up Python
         if: steps.bottleneck_cache_restore.outputs.cache-hit != 'true'
