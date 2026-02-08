@@ -131,6 +131,19 @@ def mean_ci(x: np.ndarray) -> Tuple[float, float, float]:
     return m, m - z * se, m + z * se
 
 
+def format_p(p: float) -> str:
+    if np.isnan(p):
+        return "p=n/a"
+    if p < 1e-4:
+        return "p<1e-4"
+    return f"p={p:.3g}"
+
+
+def add_bracket(ax: plt.Axes, x1: float, x2: float, y: float, h: float, label: str) -> None:
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=1.0)
+    ax.text((x1 + x2) / 2.0, y + h, label, ha="center", va="bottom", fontsize=8)
+
+
 def simulate_seed(cfg: Config, seed: int) -> Dict[str, np.ndarray]:
     ts = msprime.sim_ancestry(
         samples=[msprime.SampleSet(cfg.n_ind, ploidy=2)],
@@ -301,7 +314,7 @@ def run(cfg: Config, seeds: List[int], out_dir: Path, include_bayesr: bool, baye
     return df
 
 
-def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
+def make_plots(df: pd.DataFrame, out_dir: Path, pvals: Dict[str, float]) -> None:
     plt.rcParams.update({
         "figure.dpi": 180,
         "axes.facecolor": "#fafafa",
@@ -338,6 +351,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
 
     ax = axes[0]
     present_order = [c for c in order if c in set(df["condition"])]
+    xpos = {c: i for i, c in enumerate(present_order)}
     for i, cond in enumerate(present_order):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
@@ -350,6 +364,36 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.set_xticklabels([labels[c] for c in present_order], rotation=15, ha="right")
     ax.set_ylabel("AUC gain from adding PCs")
     ax.grid(True)
+
+    yvals = df["gap_additive_minus_raw"].to_numpy(dtype=float)
+    ytop = float(np.nanmax(yvals)) if len(yvals) else 0.1
+    yrange = max(0.12, float(np.nanmax(yvals) - np.nanmin(yvals)) if len(yvals) else 0.12)
+    y_base = ytop + 0.04 * yrange
+    y_step = 0.11 * yrange
+
+    for test_id, cond in [("H1", "weak_original"), ("H3", "strong_original"), ("H5", "bayesr_original")]:
+        if cond in xpos and test_id in pvals:
+            ax.text(
+                xpos[cond],
+                y_base,
+                format_p(pvals[test_id]),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.8),
+            )
+            y_base += 0.45 * y_step
+
+    bracket_level = 0
+    for test_id, c1, c2 in [
+        ("H2", "weak_original", "weak_orthogonalized"),
+        ("H6", "bayesr_original", "bayesr_orthogonalized"),
+    ]:
+        if c1 in xpos and c2 in xpos and test_id in pvals:
+            y = ytop + 0.7 * y_step + bracket_level * y_step
+            add_bracket(ax, xpos[c1], xpos[c2], y=y, h=0.22 * y_step, label=format_p(pvals[test_id]))
+            bracket_level += 1
+    ax.set_ylim(top=ytop + (2.6 + bracket_level) * y_step)
 
     ax = axes[1]
     coupling_order = [
@@ -371,6 +415,7 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "weak_orthogonalized": "#ff7f0e",
     }
     present_coupling = [c for c in coupling_order if c in set(df["condition"])]
+    xpos_c = {c: i for i, c in enumerate(present_coupling)}
     for i, cond in enumerate(present_coupling):
         sub = df[df["condition"] == cond]
         x = np.full(len(sub), i, dtype=float)
@@ -390,6 +435,21 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.set_xticklabels([coupling_labels[c] for c in present_coupling], rotation=15, ha="right")
     ax.set_ylabel("R^2 between true genetic liability and PCs")
     ax.grid(True)
+
+    y2 = df[df["condition"].isin(present_coupling)]["r2_pc_g_val"].to_numpy(dtype=float)
+    y2_top = float(np.nanmax(y2)) if len(y2) else 0.1
+    y2_range = max(0.08, float(np.nanmax(y2) - np.nanmin(y2)) if len(y2) else 0.08)
+    y2_step = 0.14 * y2_range
+    blevel = 0
+    for test_id, c1, c2 in [
+        ("H7", "bayesr_original", "bayesr_orthogonalized"),
+        ("H4", "weak_original", "weak_orthogonalized"),
+    ]:
+        if c1 in xpos_c and c2 in xpos_c and test_id in pvals:
+            y = y2_top + 0.45 * y2_step + blevel * y2_step
+            add_bracket(ax, xpos_c[c1], xpos_c[c2], y=y, h=0.24 * y2_step, label=format_p(pvals[test_id]))
+            blevel += 1
+    ax.set_ylim(top=y2_top + (1.8 + blevel) * y2_step)
 
     fig.tight_layout()
     fig.savefig(out_dir / "fig_gen0_orthogonalization.png", dpi=220)
@@ -453,8 +513,6 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     m2, l2, u2 = mean_ci(g2)
     m3, l3, u3 = mean_ci(g3)
 
-    make_plots(df, out_dir)
-
     tests = pd.DataFrame([
         {
             "test_id": "H1",
@@ -508,6 +566,10 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         tb2 = ttest_rel(g_bro, g_broh, nan_policy="omit")
         pb2 = _p_one_sided_from_ttest(float(tb2.pvalue), float(tb2.statistic), "greater")
         mb, lb, ub = mean_ci(g_bro)
+        r2_bro = bro["r2_pc_g_val"].values
+        r2_broh = broh["r2_pc_g_val"].values
+        tb3 = ttest_rel(r2_bro, r2_broh, nan_policy="omit")
+        pb3 = _p_one_sided_from_ttest(float(tb3.pvalue), float(tb3.statistic), "greater")
         tests = pd.concat(
             [
                 tests,
@@ -532,11 +594,23 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
                         "p_value": pb2,
                         "p_value_type": "one-sided",
                     },
+                    {
+                        "test_id": "H7",
+                        "contrast": "r2_pcg_bayesr_original_gt_r2_pcg_bayesr_orthogonalized",
+                        "estimate_mean": float(np.mean(r2_bro - r2_broh)),
+                        "estimate_ci_lo": np.nan,
+                        "estimate_ci_hi": np.nan,
+                        "t_stat": float(tb3.statistic),
+                        "p_value": pb3,
+                        "p_value_type": "one-sided",
+                    },
                 ]),
             ],
             ignore_index=True,
         )
     tests.to_csv(out_dir / "gen0_hypothesis_tests.csv", index=False)
+    pval_map = {str(r["test_id"]): float(r["p_value"]) for _, r in tests.iterrows()}
+    make_plots(df, out_dir, pval_map)
 
 
 def parse_args() -> argparse.Namespace:
