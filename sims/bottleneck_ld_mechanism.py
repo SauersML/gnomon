@@ -431,8 +431,8 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         for metric, style, label in [
-            ("ratio_near", "o-", "Near tags (<=5kb)"),
-            ("ratio_far", "s--", "Far tags (50-250kb)"),
+            ("ratio_near", "o-", "Marker tags near causal variants (within 5,000 base pairs)"),
+            ("ratio_far", "s--", "Marker tags far from causal variants (50,000 to 250,000 base pairs)"),
         ]:
             xs, ms, lo, hi = [], [], [], []
             for g in sorted(z["divergence_gens"].unique()):
@@ -448,11 +448,11 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             ax.fill_between(xs, lo, hi, color=color, alpha=0.12 if metric == "ratio_near" else 0.08)
         ax.axhline(1.0, color="gray", ls=":")
         ax.set_xscale("symlog", linthresh=20)
-        ax.set_title(f"{sc}: near vs far portability")
-        ax.set_xlabel("Divergence generations")
+        ax.set_title(f"{sc}: transfer performance for nearby versus distant marker tags")
+        ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
         ax.set_ylim(bottom=0.15)
-    axes[0].set_ylabel("Portability ratio (POP1/POP0-holdout)")
+    axes[0].set_ylabel("Transfer performance ratio (target population divided by same-ancestry holdout)")
     axes[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(out_dir / "fig1_near_vs_far.png", dpi=220)
@@ -462,9 +462,9 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
         for metric, style, label in [
-            ("ratio_far", "o-", "Far baseline"),
-            ("ratio_far_het", "s--", "Heterozygosity-normalized"),
-            ("ratio_far_ld_destroy", "d:", "LD-destroyed target"),
+            ("ratio_far", "o-", "Distant marker tags, baseline"),
+            ("ratio_far_het", "s--", "Distant marker tags, target standardized by target distribution"),
+            ("ratio_far_ld_destroy", "d:", "Distant marker tags, target linkage structure destroyed"),
         ]:
             xs, ms, lo, hi = [], [], [], []
             for g in sorted(z["divergence_gens"].unique()):
@@ -481,11 +481,11 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             ax.fill_between(xs, lo, hi, color=line_color, alpha=0.08)
         ax.axhline(1.0, color="gray", ls=":")
         ax.set_xscale("symlog", linthresh=20)
-        ax.set_title(f"{sc}: intervention test")
-        ax.set_xlabel("Divergence generations")
+        ax.set_title(f"{sc}: intervention comparison")
+        ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
         ax.set_ylim(bottom=-0.05)
-    axes[0].set_ylabel("Far-tag portability ratio")
+    axes[0].set_ylabel("Transfer performance ratio for distant marker tags")
     axes[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(out_dir / "fig2_ld_vs_hetero_interventions.png", dpi=220)
@@ -498,9 +498,9 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         b = np.polyfit(t["beta_decorrelation"], t["added_harm_far"], 1)
         xx = np.linspace(t["beta_decorrelation"].min(), t["beta_decorrelation"].max(), 200)
         axes[0].plot(xx, b[0] * xx + b[1], color="#1f77b4", ls="--", linewidth=1.8)
-    axes[0].set_xlabel("Beta decorrelation (div - bottleneck)")
-    axes[0].set_ylabel("Added bottleneck harm (div far ratio - bott far ratio)")
-    axes[0].set_title(f"Added harm vs beta decorrelation (r={corr:.3f})")
+    axes[0].set_xlabel("Difference in marginal effect-size correlation (divergence minus bottleneck)")
+    axes[0].set_ylabel("Additional bottleneck harm (divergence distant-tag ratio minus bottleneck distant-tag ratio)")
+    axes[0].set_title(f"Additional bottleneck harm versus marginal effect-size decorrelation (correlation={corr:.3f})")
     axes[0].grid(True)
 
     t = paired[["added_harm_far", "hetero_shift_delta"]].replace([np.inf, -np.inf], np.nan).dropna()
@@ -509,9 +509,9 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
         b = np.polyfit(t["hetero_shift_delta"], t["added_harm_far"], 1)
         xx = np.linspace(t["hetero_shift_delta"].min(), t["hetero_shift_delta"].max(), 200)
         axes[1].plot(xx, b[0] * xx + b[1], color="#d62728", ls="--", linewidth=1.8)
-    axes[1].set_xlabel("Heterozygosity shift delta (div - bottleneck)")
-    axes[1].set_ylabel("Added bottleneck harm")
-    axes[1].set_title(f"Added harm vs heterozygosity (r={corr_het:.3f})")
+    axes[1].set_xlabel("Difference in heterozygosity shift (divergence minus bottleneck)")
+    axes[1].set_ylabel("Additional bottleneck harm")
+    axes[1].set_title(f"Additional bottleneck harm versus heterozygosity shift (correlation={corr_het:.3f})")
     axes[1].grid(True)
 
     fig.tight_layout()

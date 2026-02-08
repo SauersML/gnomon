@@ -303,11 +303,11 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "strong_original",
     ]
     labels = {
-        "weak_original": "Weak PRS + Original PCs",
-        "weak_orthogonalized": "Weak PRS + Orthogonalized PCs",
-        "bayesr_original": "BayesR PRS + Original PCs",
-        "bayesr_orthogonalized": "BayesR PRS + Orthogonalized PCs",
-        "strong_original": "Strong PRS + Original PCs",
+        "weak_original": "Weak polygenic risk score + original principal components",
+        "weak_orthogonalized": "Weak polygenic risk score + orthogonalized principal components",
+        "bayesr_original": "BayesR polygenic risk score + original principal components",
+        "bayesr_orthogonalized": "BayesR polygenic risk score + orthogonalized principal components",
+        "strong_original": "Strong polygenic risk score + original principal components",
     }
     colors = {
         "weak_original": "#1f77b4",
@@ -331,8 +331,8 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
     ax.axhline(0, color="gray", ls=":")
     ax.set_xticks(list(range(len(present_order))))
     ax.set_xticklabels([labels[c] for c in present_order], rotation=15, ha="right")
-    ax.set_ylabel("AUC gain (Additive - Raw)")
-    ax.set_title("Gen0 artifact: additive PC gain")
+    ax.set_ylabel("Difference in area under the receiver operating characteristic curve (additive model minus raw score model)")
+    ax.set_title("Generation zero result: gain from adding principal components")
     ax.grid(True)
 
     ax = axes[1]
@@ -343,10 +343,10 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         "weak_orthogonalized",
     ]
     coupling_labels = {
-        "bayesr_original": "Original PCs (BayesR)",
-        "bayesr_orthogonalized": "Orthogonalized PCs (BayesR)",
-        "weak_original": "Original PCs (Weak PRS)",
-        "weak_orthogonalized": "Orthogonalized PCs (Weak PRS)",
+        "bayesr_original": "Original principal components (BayesR score)",
+        "bayesr_orthogonalized": "Orthogonalized principal components (BayesR score)",
+        "weak_original": "Original principal components (weak score)",
+        "weak_orthogonalized": "Orthogonalized principal components (weak score)",
     }
     coupling_colors = {
         "bayesr_original": "#9467bd",
@@ -372,8 +372,8 @@ def make_plots(df: pd.DataFrame, out_dir: Path) -> None:
         ax.errorbar([i], [m], yerr=[[m - lo], [hi - m]], fmt="o", color="black", capsize=4, linewidth=1.3)
     ax.set_xticks(list(range(len(present_coupling))))
     ax.set_xticklabels([coupling_labels[c] for c in present_coupling], rotation=15, ha="right")
-    ax.set_ylabel("R²(PCs, G_true) on validation")
-    ax.set_title("PC-G coupling")
+    ax.set_ylabel("Proportion of variance in true genetic liability explained by principal components on validation set")
+    ax.set_title("Coupling between principal components and true genetic liability")
     ax.grid(True)
 
     fig.tight_layout()
