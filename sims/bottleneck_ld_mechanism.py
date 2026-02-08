@@ -435,6 +435,7 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), sharey=True, constrained_layout=True)
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
+        gens_sorted = sorted(z["divergence_gens"].unique())
         for metric, style, label in [
             ("ratio_near", "o-", "Marker tags near causal variants (within 5,000 base pairs)"),
             ("ratio_far", "s--", "Marker tags far from causal variants (50,000 to 250,000 base pairs)"),
@@ -453,6 +454,10 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             ax.fill_between(xs, lo, hi, color=color, alpha=0.12 if metric == "ratio_near" else 0.08)
         ax.axhline(1.0, color="gray", ls=":")
         ax.set_xscale("symlog", linthresh=20)
+        if gens_sorted:
+            xmax = float(max(gens_sorted))
+            ax.set_xlim(left=0, right=max(1.0, xmax * 1.1))
+            ax.set_xticks(gens_sorted)
         ax.set_title(f"{sc}: nearby vs distant marker-tag transfer")
         ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
@@ -465,6 +470,7 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), sharey=True, constrained_layout=True)
     for ax, sc, color in [(axes[0], "divergence", "#1f77b4"), (axes[1], "bottleneck", "#d62728")]:
         z = df[df["scenario"] == sc]
+        gens_sorted = sorted(z["divergence_gens"].unique())
         for metric, style, label in [
             ("ratio_far", "o-", "Distant marker tags, baseline"),
             ("ratio_far_het", "s--", "Distant marker tags, target standardized by target distribution"),
@@ -485,6 +491,10 @@ def summarize(df: pd.DataFrame, out_dir: Path) -> None:
             ax.fill_between(xs, lo, hi, color=line_color, alpha=0.08)
         ax.axhline(1.0, color="gray", ls=":")
         ax.set_xscale("symlog", linthresh=20)
+        if gens_sorted:
+            xmax = float(max(gens_sorted))
+            ax.set_xlim(left=0, right=max(1.0, xmax * 1.1))
+            ax.set_xticks(gens_sorted)
         ax.set_title(f"{sc}: intervention comparison")
         ax.set_xlabel("Population split age (generations)")
         ax.grid(True)
