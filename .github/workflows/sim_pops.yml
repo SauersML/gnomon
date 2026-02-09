@@ -120,53 +120,34 @@ jobs:
   # ------------------------------------------------------------------
   simulate:
     needs: tool_cache
-    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
     runs-on: ubuntu-22.04
     env:
       SIM_CACHE_VERSION: v3
     strategy:
       fail-fast: false
       matrix:
-        include:
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
           - sim_name: confounding
-            seed: 1
-          - sim_name: confounding
-            seed: 2
-          - sim_name: confounding
-            seed: 3
-          - sim_name: confounding
-            seed: 4
-          - sim_name: confounding
-            seed: 5
-          - sim_name: portability
-            seed: 1
-          - sim_name: portability
-            seed: 2
-          - sim_name: portability
-            seed: 3
-          - sim_name: portability
-            seed: 4
-          - sim_name: portability
-            seed: 5
-          - sim_name: portability
             seed: 6
-          - sim_name: portability
+          - sim_name: confounding
             seed: 7
-          - sim_name: portability
+          - sim_name: confounding
             seed: 8
-          - sim_name: portability
+          - sim_name: confounding
             seed: 9
-          - sim_name: portability
+          - sim_name: confounding
             seed: 10
-          - sim_name: portability
+          - sim_name: confounding
             seed: 11
-          - sim_name: portability
+          - sim_name: confounding
             seed: 12
-          - sim_name: portability
+          - sim_name: confounding
             seed: 13
-          - sim_name: portability
+          - sim_name: confounding
             seed: 14
-          - sim_name: portability
+          - sim_name: confounding
             seed: 15
     steps:
       - uses: actions/checkout@v4
@@ -362,52 +343,33 @@ jobs:
   # ------------------------------------------------------------------
   train:
     needs: [tool_cache, simulate]
-    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false # Let other methods finish if one fails
       matrix:
         method: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.methods || '["BayesR"]') }}
-        include:
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
           - sim_name: confounding
-            seed: 1
-          - sim_name: confounding
-            seed: 2
-          - sim_name: confounding
-            seed: 3
-          - sim_name: confounding
-            seed: 4
-          - sim_name: confounding
-            seed: 5
-          - sim_name: portability
-            seed: 1
-          - sim_name: portability
-            seed: 2
-          - sim_name: portability
-            seed: 3
-          - sim_name: portability
-            seed: 4
-          - sim_name: portability
-            seed: 5
-          - sim_name: portability
             seed: 6
-          - sim_name: portability
+          - sim_name: confounding
             seed: 7
-          - sim_name: portability
+          - sim_name: confounding
             seed: 8
-          - sim_name: portability
+          - sim_name: confounding
             seed: 9
-          - sim_name: portability
+          - sim_name: confounding
             seed: 10
-          - sim_name: portability
+          - sim_name: confounding
             seed: 11
-          - sim_name: portability
+          - sim_name: confounding
             seed: 12
-          - sim_name: portability
+          - sim_name: confounding
             seed: 13
-          - sim_name: portability
+          - sim_name: confounding
             seed: 14
-          - sim_name: portability
+          - sim_name: confounding
             seed: 15
     steps:
       - uses: actions/checkout@v4
@@ -518,51 +480,33 @@ jobs:
   # ------------------------------------------------------------------
   evaluate:
     needs: [tool_cache, simulate, train]
-    if: ${{ always() && needs.simulate.result == 'success' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
+    if: ${{ always() && needs.simulate.result == 'success' }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        include:
+        sim_name: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && '["portability"]' || '["confounding","portability"]') }}
+        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        exclude:
           - sim_name: confounding
-            seed: 1
-          - sim_name: confounding
-            seed: 2
-          - sim_name: confounding
-            seed: 3
-          - sim_name: confounding
-            seed: 4
-          - sim_name: confounding
-            seed: 5
-          - sim_name: portability
-            seed: 1
-          - sim_name: portability
-            seed: 2
-          - sim_name: portability
-            seed: 3
-          - sim_name: portability
-            seed: 4
-          - sim_name: portability
-            seed: 5
-          - sim_name: portability
             seed: 6
-          - sim_name: portability
+          - sim_name: confounding
             seed: 7
-          - sim_name: portability
+          - sim_name: confounding
             seed: 8
-          - sim_name: portability
+          - sim_name: confounding
             seed: 9
-          - sim_name: portability
+          - sim_name: confounding
             seed: 10
-          - sim_name: portability
+          - sim_name: confounding
             seed: 11
-          - sim_name: portability
+          - sim_name: confounding
             seed: 12
-          - sim_name: portability
+          - sim_name: confounding
             seed: 13
-          - sim_name: portability
+          - sim_name: confounding
             seed: 14
-          - sim_name: portability
+          - sim_name: confounding
             seed: 15
     steps:
       - uses: actions/checkout@v4
