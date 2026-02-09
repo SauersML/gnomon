@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -16,11 +16,10 @@ import matplotlib.pyplot as plt
 import msprime
 import numpy as np
 import pandas as pd
-from scipy.special import expit
 from scipy.stats import ttest_1samp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sim_pops import _diploid_index_pairs, _solve_intercept_for_prevalence
+from sim_pops import _diploid_index_pairs
 from sim_two_pop import _build_demography_bottleneck, _build_demography_divergence
 
 
@@ -36,17 +35,14 @@ class Config:
     ne: int
     n_causal: int
     h2: float
-    prevalence: float
 
 
 @dataclass
 class Sim:
     X: np.ndarray
-    pos: np.ndarray
     maf: np.ndarray
     pop_idx: np.ndarray
     g_true: np.ndarray
-    y: np.ndarray
     causal_idx: np.ndarray
 
 
@@ -122,13 +118,11 @@ def simulate(cfg: Config) -> Sim:
         raise RuntimeError(f"Too few variants ({m})")
 
     X = np.empty((total, m), dtype=np.int8)
-    pos = np.empty(m, dtype=np.float64)
     maf = np.empty(m, dtype=np.float64)
     for j, var in enumerate(ts.variants()):
         gh = var.genotypes.astype(np.int16)
         gd = gh[0::2] + gh[1::2]
         X[:, j] = gd.astype(np.int8)
-        pos[j] = ts.site(var.site.id).position
         p = gd.mean() / 2.0
         maf[j] = min(p, 1.0 - p)
 
@@ -139,10 +133,7 @@ def simulate(cfg: Config) -> Sim:
 
     g_raw = X[:, cidx].astype(float) @ betas
     g_true = (g_raw - g_raw.mean()) / (g_raw.std() if g_raw.std() > 1e-12 else 1.0)
-    b0 = _solve_intercept_for_prevalence(cfg.prevalence, g_true)
-    y = np.random.default_rng(cfg.seed + 31).binomial(1, expit(b0 + g_true)).astype(np.int8)
-
-    return Sim(X=X, pos=pos, maf=maf, pop_idx=pop_idx.astype(np.int32), g_true=g_true, y=y, causal_idx=cidx)
+    return Sim(X=X, maf=maf, pop_idx=pop_idx.astype(np.int32), g_true=g_true, causal_idx=cidx)
 
 
 def split_pop0(pop0: np.ndarray, seed: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -461,7 +452,6 @@ def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
                         ne=10_000,
                         n_causal=args.n_causal,
                         h2=0.5,
-                        prevalence=0.1,
                     )
                 )
 
@@ -701,7 +691,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
                     transfer_ratio_mean=("transfer_ratio", "mean"),
                     transfer_ratio_sd=("transfer_ratio", "std"),
                     n=("transfer_ratio", "count"),
-                    ld_abs_change_mean=("ld_absolute_change", "mean"),
                 )
             else:
                 z = z[z["mean_heterozygosity_target"] <= z["baseline_heterozygosity_target"]]
@@ -711,7 +700,6 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
                     transfer_ratio_mean=("transfer_ratio", "mean"),
                     transfer_ratio_sd=("transfer_ratio", "std"),
                     n=("transfer_ratio", "count"),
-                    ld_abs_change_mean=("ld_absolute_change", "mean"),
                 )
 
             if len(grp) == 0:
