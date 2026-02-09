@@ -253,12 +253,36 @@ def _odds_scale_freq(p: np.ndarray, scale: float) -> np.ndarray:
 def _ld_corr_change(X_before: np.ndarray, X_after: np.ndarray) -> float:
     if X_before.shape[1] < 2 or X_before.shape[0] < 4:
         return np.nan
-    c0 = np.corrcoef(X_before, rowvar=False)
-    c1 = np.corrcoef(X_after, rowvar=False)
-    if c0.ndim != 2 or c1.ndim != 2:
-        return np.nan
+
+    def corr_no_divide_warnings(X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=float)
+        n, p = X.shape
+        out = np.full((p, p), np.nan, dtype=float)
+        sd = X.std(axis=0, ddof=1)
+        valid = sd > 1e-12
+        if not np.any(valid):
+            return out
+
+        Xv = X[:, valid]
+        Xv = Xv - Xv.mean(axis=0)
+        cov = (Xv.T @ Xv) / max(1, n - 1)
+        denom = np.outer(sd[valid], sd[valid])
+        corr = cov / denom
+        corr = np.clip(corr, -1.0, 1.0)
+        np.fill_diagonal(corr, 1.0)
+
+        idx = np.where(valid)[0]
+        out[np.ix_(idx, idx)] = corr
+        return out
+
+    c0 = corr_no_divide_warnings(X_before)
+    c1 = corr_no_divide_warnings(X_after)
     iu = np.triu_indices(c0.shape[0], k=1)
-    return float(np.nanmean(np.abs(c1[iu] - c0[iu])))
+    d = np.abs(c1[iu] - c0[iu])
+    d = d[np.isfinite(d)]
+    if len(d) == 0:
+        return np.nan
+    return float(np.mean(d))
 
 
 def one_run(cfg: Config, min_tags: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
