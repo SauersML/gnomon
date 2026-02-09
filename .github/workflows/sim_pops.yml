@@ -171,6 +171,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup:"
+          df -h
+
       - name: Restore tool cache
         id: tools-cache
         uses: actions/cache/restore@v4
@@ -188,26 +201,6 @@ jobs:
       - name: Show git revision
         run: |
           git rev-parse HEAD
-
-      - name: Restore simulation cache
-        id: sim-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
-          restore-keys: |
-            sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-
-
-      - name: Cache status
-        run: |
-          echo "sim cache-hit=${{ steps.sim-cache.outputs.cache-hit }} for ${{ matrix.sim_name }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -228,7 +221,6 @@ jobs:
           rm plink2.zip
 
       - name: Run Simulation ${{ matrix.sim_name }}
-        if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           echo "Running Simulation ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
@@ -257,25 +249,10 @@ jobs:
           fi
 
       - name: Split Data (Train/Test)
-        if: steps.sim-cache.outputs.cache-hit != 'true'
         run: |
           set -e
           echo "Splitting Data for ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
           python sims/split_data.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
-
-      - name: Save simulation cache
-        if: ${{ always() && steps.sim-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_sites.npz
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}_pcs.png
-          key: sim-${{ runner.os }}-${{ matrix.sim_name }}-s${{ matrix.seed }}-${{ env.SIM_CACHE_VERSION }}-${{ hashFiles('sims/sim_pops.py', 'sims/split_data.py', 'sims/plink_utils.py') }}
 
       - name: Upload Simulation Data (Artifact Stream A)
         uses: actions/upload-artifact@v4
@@ -778,6 +755,19 @@ jobs:
         seed: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          echo "Disk before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean || true
+          echo "Disk after cleanup:"
+          df -h
 
       - name: Restore tool cache
         id: tools-cache
