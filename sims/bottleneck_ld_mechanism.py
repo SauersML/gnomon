@@ -35,6 +35,7 @@ class Config:
     ne: int
     n_causal: int
     h2: float
+    bottleneck_frac: float = 0.10
 
 
 @dataclass
@@ -96,7 +97,8 @@ def simulate(cfg: Config) -> Sim:
         if cfg.scenario == "divergence":
             dem = _build_demography_divergence(cfg.gens, cfg.ne)
         elif cfg.scenario == "bottleneck":
-            dem = _build_demography_bottleneck(cfg.gens, cfg.ne, max(100, cfg.ne // 10))
+            bottle_ne = max(100, int(round(cfg.ne * float(cfg.bottleneck_frac))))
+            dem = _build_demography_bottleneck(cfg.gens, cfg.ne, bottle_ne)
         else:
             raise ValueError(cfg.scenario)
 
@@ -349,6 +351,7 @@ def one_run(
         "scenario": cfg.scenario,
         "divergence_gens": cfg.gens,
         "seed": cfg.seed,
+        "bottleneck_frac": float(cfg.bottleneck_frac),
         "n_tags": len(tags),
         "r2_alltags_training_holdout": r2_all_0,
         "r2_alltags_target_population": r2_all_1,
@@ -501,6 +504,10 @@ def parse_int_list(text: str) -> List[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def parse_float_list(text: str) -> List[float]:
+    return [float(x.strip()) for x in text.split(",") if x.strip()]
+
+
 def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -527,6 +534,7 @@ def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
                         ne=10_000,
                         n_causal=args.n_causal,
                         h2=0.5,
+                        bottleneck_frac=float(args.bottleneck_frac),
                     )
                 )
 
@@ -548,13 +556,76 @@ def run_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
             rows.append(base_row)
             sweep_rows.extend(sweep_part)
 
-    df = pd.DataFrame(rows).sort_values(["scenario", "divergence_gens", "seed"]).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values(
+        ["scenario", "divergence_gens", "bottleneck_frac", "seed"]
+    ).reset_index(drop=True)
 
     chunk_name = args.chunk_name or f"chunk_{args.scenario}_g{'-'.join(map(str, gens))}_s{'-'.join(map(str, seeds))}"
     path = out_dir / f"{chunk_name}.csv"
     df.to_csv(path, index=False)
     sweep_path = sweep_dir / f"{chunk_name}_hetero_sweep.csv"
     pd.DataFrame(sweep_rows).sort_values(["scenario", "divergence_gens", "seed", "resample_strength"]).to_csv(sweep_path, index=False)
+    return path, sweep_path
+
+
+def run_strength_chunk(args: argparse.Namespace) -> Tuple[Path, Path]:
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sweep_dir = out_dir.parent / "strength_sweeps"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    seeds = parse_int_list(args.seeds)
+    bottleneck_fracs = parse_float_list(args.bottleneck_fracs)
+    if not bottleneck_fracs:
+        raise SystemExit("No bottleneck fractions provided")
+
+    cfgs: List[Config] = []
+    for frac in bottleneck_fracs:
+        for seed in seeds:
+            cfgs.append(
+                Config(
+                    scenario="bottleneck",
+                    gens=int(args.gens),
+                    seed=seed,
+                    n_per_pop=args.n_per_pop,
+                    seq_len=args.seq_len,
+                    recomb=1e-8,
+                    mut=1e-8,
+                    ne=10_000,
+                    n_causal=args.n_causal,
+                    h2=0.5,
+                    bottleneck_frac=float(frac),
+                )
+            )
+
+    rows: List[Dict[str, float]] = []
+    sweep_rows: List[Dict[str, float]] = []
+    with cf.ProcessPoolExecutor(max_workers=args.workers) as ex:
+        futs = [
+            ex.submit(
+                one_run,
+                cfg,
+                args.n_array_sites,
+                args.min_resample_ess_frac,
+                args.min_resample_ess_count,
+            )
+            for cfg in cfgs
+        ]
+        for fut in cf.as_completed(futs):
+            base_row, sweep_part = fut.result()
+            rows.append(base_row)
+            sweep_rows.extend(sweep_part)
+
+    df = pd.DataFrame(rows).sort_values(["bottleneck_frac", "seed"]).reset_index(drop=True)
+    chunk_name = args.chunk_name or f"strength_g{int(args.gens)}_s{'-'.join(map(str, seeds))}"
+    path = out_dir / f"{chunk_name}.csv"
+    df.to_csv(path, index=False)
+
+    sweep_df = pd.DataFrame(sweep_rows)
+    sweep_path = sweep_dir / f"{chunk_name}_strength_sweep.csv"
+    if len(sweep_df) > 0:
+        sweep_df = sweep_df.sort_values(["bottleneck_frac", "seed", "resample_strength"]).reset_index(drop=True)
+    sweep_df.to_csv(sweep_path, index=False)
     return path, sweep_path
 
 
@@ -909,6 +980,221 @@ def summarize(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
     diagnostics.to_csv(out_dir / "bottleneck_diagnostics.csv", index=False)
 
 
+def summarize_strength(df: pd.DataFrame, sweep_df: pd.DataFrame, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    req_cols = {"scenario", "divergence_gens", "seed", "bottleneck_frac"}
+    missing = sorted(req_cols - set(df.columns))
+    if missing:
+        raise SystemExit(f"Strength summary missing required columns: {missing}")
+
+    z = df[(df["scenario"] == "bottleneck") & (df["divergence_gens"] == 300)].copy()
+    if len(z) == 0:
+        raise SystemExit("No bottleneck-strength rows at divergence_gens=300")
+
+    z = z.sort_values(["bottleneck_frac", "seed"]).reset_index(drop=True)
+    z["bottleneck_pct"] = z["bottleneck_frac"] * 100.0
+    z.to_csv(out_dir / "bottleneck_strength_portability_results.csv", index=False)
+
+    summary_rows: List[Dict[str, float]] = []
+    metric_defs = [
+        ("ratio_alltags", "Transfer ratio (target R^2 / holdout R^2)"),
+        ("r2_alltags_target_population", "Target R^2"),
+        ("r2_alltags_training_holdout", "Training holdout R^2"),
+        ("beta_corr_alltags_training_vs_target", "Marker-effect correlation"),
+        ("delta_heterozygosity_alltags_target_minus_training", "Heterozygosity shift (target - training)"),
+        ("delta_lddestroy_minus_baseline", "Destroyed-linkage delta"),
+    ]
+    for frac in sorted(z["bottleneck_frac"].dropna().unique()):
+        grp = z[z["bottleneck_frac"] == frac]
+        for metric, label in metric_defs:
+            vals = grp[metric].replace([np.inf, -np.inf], np.nan).dropna().values
+            m, lo, hi = mean_ci(vals)
+            summary_rows.append(
+                {
+                    "bottleneck_frac": float(frac),
+                    "bottleneck_pct": float(frac) * 100.0,
+                    "metric": metric,
+                    "metric_label": label,
+                    "n": int(len(vals)),
+                    "mean": m,
+                    "ci_lo": lo,
+                    "ci_hi": hi,
+                }
+            )
+
+    summary = pd.DataFrame(summary_rows).sort_values(["metric", "bottleneck_frac"]).reset_index(drop=True)
+    summary.to_csv(out_dir / "bottleneck_strength_portability_summary.csv", index=False)
+
+    plt.rcParams.update(
+        {
+            "figure.dpi": 180,
+            "axes.facecolor": "#fafafa",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "grid.color": "#d0d0d0",
+            "grid.alpha": 0.5,
+            "axes.titleweight": "bold",
+        }
+    )
+
+    x_vals = sorted(summary["bottleneck_frac"].dropna().unique())
+    x_labels = [f"{int(round(x * 100.0))}%" for x in x_vals]
+
+    def _plot_single(metric: str, y_label: str, out_name: str, ref_value: float | None = None) -> None:
+        s = summary[summary["metric"] == metric].copy()
+        s = s.set_index("bottleneck_frac").reindex(x_vals).reset_index()
+        y = s["mean"].astype(float).values
+        lo = s["ci_lo"].astype(float).values
+        hi = s["ci_hi"].astype(float).values
+        err_lo = y - lo
+        err_hi = hi - y
+        x = np.arange(len(x_vals))
+        fig, ax = plt.subplots(1, 1, figsize=(8.8, 4.8), constrained_layout=True)
+        ax.errorbar(
+            x,
+            y,
+            yerr=np.vstack([err_lo, err_hi]),
+            fmt="o-",
+            color="#1f77b4",
+            ecolor="#1f77b4",
+            elinewidth=1.4,
+            capsize=3.5,
+            markersize=5.5,
+            linewidth=2.0,
+        )
+        if ref_value is not None:
+            ax.axhline(float(ref_value), color="gray", linestyle=":", linewidth=1.2)
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels)
+        ax.set_xlabel("Bottleneck size as fraction of baseline population size")
+        ax.set_ylabel(y_label)
+        ax.grid(True)
+        fig.savefig(out_dir / out_name, dpi=220)
+        plt.close(fig)
+
+    _plot_single(
+        "ratio_alltags",
+        "Transfer ratio\n(target R^2 / holdout R^2)",
+        "fig_strength_transfer_ratio.png",
+        ref_value=1.0,
+    )
+    _plot_single(
+        "beta_corr_alltags_training_vs_target",
+        "Marker-effect correlation",
+        "fig_strength_beta_correlation.png",
+        ref_value=1.0,
+    )
+    _plot_single(
+        "delta_heterozygosity_alltags_target_minus_training",
+        "Heterozygosity shift\n(target - training)",
+        "fig_strength_heterozygosity_shift.png",
+        ref_value=0.0,
+    )
+    _plot_single(
+        "delta_lddestroy_minus_baseline",
+        "Destroyed-linkage ratio delta\n(destroyed-linkage - baseline)",
+        "fig_strength_ld_destroy_delta.png",
+        ref_value=0.0,
+    )
+
+    rr = summary[summary["metric"].isin(["r2_alltags_training_holdout", "r2_alltags_target_population"])].copy()
+    rr = rr.sort_values(["metric", "bottleneck_frac"])
+    fig, ax = plt.subplots(1, 1, figsize=(8.8, 4.8), constrained_layout=True)
+    for metric, color, label in [
+        ("r2_alltags_training_holdout", "#1f77b4", "Holdout R^2"),
+        ("r2_alltags_target_population", "#d62728", "Target R^2"),
+    ]:
+        s = rr[rr["metric"] == metric].set_index("bottleneck_frac").reindex(x_vals).reset_index()
+        y = s["mean"].astype(float).values
+        lo = s["ci_lo"].astype(float).values
+        hi = s["ci_hi"].astype(float).values
+        x = np.arange(len(x_vals))
+        ax.errorbar(
+            x,
+            y,
+            yerr=np.vstack([y - lo, hi - y]),
+            fmt="o-",
+            color=color,
+            ecolor=color,
+            elinewidth=1.3,
+            capsize=3.2,
+            markersize=5.0,
+            linewidth=1.9,
+            label=label,
+        )
+    ax.set_xticks(np.arange(len(x_vals)))
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("Bottleneck size as fraction of baseline population size")
+    ax.set_ylabel("R^2")
+    ax.grid(True)
+    ax.legend(frameon=False, fontsize=9)
+    fig.savefig(out_dir / "fig_strength_target_vs_holdout_r2.png", dpi=220)
+    plt.close(fig)
+
+    if len(sweep_df) > 0:
+        sweep = sweep_df[
+            (sweep_df["scenario"] == "bottleneck")
+            & (sweep_df["divergence_gens"] == 300)
+            & sweep_df["bottleneck_frac"].notna()
+        ].copy()
+        if len(sweep) > 0:
+            sweep.to_csv(out_dir / "bottleneck_strength_sweep_results.csv", index=False)
+            grp = (
+                sweep.groupby(["bottleneck_frac", "resample_strength"], as_index=False)
+                .agg(
+                    mean_transfer_ratio=("transfer_ratio", "mean"),
+                    sd_transfer_ratio=("transfer_ratio", "std"),
+                    n=("transfer_ratio", "count"),
+                )
+                .sort_values(["bottleneck_frac", "resample_strength"])
+            )
+            fig, ax = plt.subplots(1, 1, figsize=(9.0, 5.0), constrained_layout=True)
+            cmap = plt.get_cmap("viridis", len(x_vals))
+            for idx, frac in enumerate(x_vals):
+                g = grp[grp["bottleneck_frac"] == frac]
+                if len(g) == 0:
+                    continue
+                sem = g["sd_transfer_ratio"].fillna(0.0) / np.sqrt(np.maximum(g["n"], 1))
+                lo = g["mean_transfer_ratio"] - 1.96 * sem
+                hi = g["mean_transfer_ratio"] + 1.96 * sem
+                label = f"{int(round(frac * 100.0))}%"
+                ax.plot(
+                    g["resample_strength"],
+                    g["mean_transfer_ratio"],
+                    marker="o",
+                    linewidth=1.8,
+                    markersize=4.5,
+                    color=cmap(idx),
+                    label=label,
+                )
+                ax.fill_between(g["resample_strength"], lo, hi, color=cmap(idx), alpha=0.12)
+            ax.axhline(1.0, color="gray", linestyle=":", linewidth=1.1)
+            ax.set_xlabel("Heterozygosity resampling strength")
+            ax.set_ylabel("Transfer ratio\n(target R^2 / holdout R^2)")
+            ax.grid(True)
+            ax.legend(title="Bottleneck size", frameon=False, fontsize=8)
+            fig.savefig(out_dir / "fig_strength_heterozygosity_sweep.png", dpi=220)
+            plt.close(fig)
+            return
+
+    pd.DataFrame(
+        columns=[
+            "scenario",
+            "divergence_gens",
+            "seed",
+            "bottleneck_frac",
+            "intervention",
+            "resample_strength",
+            "transfer_ratio",
+        ]
+    ).to_csv(out_dir / "bottleneck_strength_sweep_results.csv", index=False)
+    fig, ax = plt.subplots(1, 1, figsize=(9.0, 5.0), constrained_layout=True)
+    ax.axis("off")
+    ax.text(0.5, 0.5, "No sweep data available", ha="center", va="center")
+    fig.savefig(out_dir / "fig_strength_heterozygosity_sweep.png", dpi=220)
+    plt.close(fig)
+
+
 def merge_and_summarize(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     pattern = args.glob
@@ -921,6 +1207,20 @@ def merge_and_summarize(args: argparse.Namespace) -> None:
     sweep_csvs = sorted(Path(".").glob(args.sweep_glob))
     sweep_df = pd.concat([pd.read_csv(p) for p in sweep_csvs], ignore_index=True) if sweep_csvs else pd.DataFrame()
     summarize(df, sweep_df, out_dir)
+
+
+def merge_and_summarize_strength(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out_dir)
+    pattern = args.glob
+    csvs = sorted(Path(".").glob(pattern))
+    if not csvs:
+        raise SystemExit(f"No files matched: {pattern}")
+
+    dfs = [pd.read_csv(p) for p in csvs]
+    df = pd.concat(dfs, ignore_index=True)
+    sweep_csvs = sorted(Path(".").glob(args.sweep_glob))
+    sweep_df = pd.concat([pd.read_csv(p) for p in sweep_csvs], ignore_index=True) if sweep_csvs else pd.DataFrame()
+    summarize_strength(df, sweep_df, out_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -938,6 +1238,7 @@ def parse_args() -> argparse.Namespace:
     ap_run.add_argument("--seq-len", type=int, default=5_000_000)
     ap_run.add_argument("--n-causal", type=int, default=400)
     ap_run.add_argument("--n-array-sites", type=int, default=2000)
+    ap_run.add_argument("--bottleneck-frac", type=float, default=0.10)
     ap_run.add_argument(
         "--min-resample-ess-frac",
         type=float,
@@ -956,6 +1257,29 @@ def parse_args() -> argparse.Namespace:
     ap_merge.add_argument("--sweep-glob", type=str, default="sims/results_bottleneck_ld_mechanism/hetero_sweeps/*_hetero_sweep.csv")
     ap_merge.add_argument("--out-dir", type=str, default="sims/results_bottleneck_ld_mechanism")
 
+    ap_run_strength = sub.add_parser("run-strength-chunk")
+    ap_run_strength.add_argument("--gens", type=int, default=300)
+    ap_run_strength.add_argument("--bottleneck-fracs", type=str, default="0.1,0.2,0.5,0.7,1.0")
+    ap_run_strength.add_argument("--seeds", type=str, default="1,2,3,4,5,6,7,8,9,10")
+    ap_run_strength.add_argument("--chunk-name", type=str, default="")
+    ap_run_strength.add_argument("--out-dir", type=str, default="sims/results_bottleneck_strength/chunks")
+    ap_run_strength.add_argument("--workers", type=int, default=max(1, min(6, (os.cpu_count() or 1))))
+    ap_run_strength.add_argument("--n-per-pop", type=int, default=2000)
+    ap_run_strength.add_argument("--seq-len", type=int, default=5_000_000)
+    ap_run_strength.add_argument("--n-causal", type=int, default=400)
+    ap_run_strength.add_argument("--n-array-sites", type=int, default=2000)
+    ap_run_strength.add_argument("--min-resample-ess-frac", type=float, default=0.6)
+    ap_run_strength.add_argument("--min-resample-ess-count", type=int, default=300)
+
+    ap_merge_strength = sub.add_parser("summarize-strength")
+    ap_merge_strength.add_argument("--glob", type=str, default="sims/results_bottleneck_strength/chunks/*.csv")
+    ap_merge_strength.add_argument(
+        "--sweep-glob",
+        type=str,
+        default="sims/results_bottleneck_strength/strength_sweeps/*_strength_sweep.csv",
+    )
+    ap_merge_strength.add_argument("--out-dir", type=str, default="sims/results_bottleneck_strength")
+
     return ap.parse_args()
 
 
@@ -971,6 +1295,17 @@ def main() -> None:
     if args.cmd == "summarize":
         merge_and_summarize(args)
         print(f"Summary complete in {args.out_dir}")
+        return
+
+    if args.cmd == "run-strength-chunk":
+        path, sweep_path = run_strength_chunk(args)
+        print(f"Wrote strength chunk: {path}")
+        print(f"Wrote strength sweep chunk: {sweep_path}")
+        return
+
+    if args.cmd == "summarize-strength":
+        merge_and_summarize_strength(args)
+        print(f"Strength summary complete in {args.out_dir}")
         return
 
     raise SystemExit(f"Unknown command: {args.cmd}")
