@@ -11,6 +11,11 @@ on:
         description: "Enable GAM-gnomon calibration (true/false)"
         required: false
         default: "false"
+      stdpopsim_only:
+        description: "Run only stdpopsim chr22 pipeline (skip two-pop jobs)"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 7 * * *"
 
@@ -51,9 +56,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -65,16 +67,8 @@ jobs:
           python-version: "3.11"
           cache: 'pip'
 
-      - name: Set up R
-        id: setup-r
+      - name: Install R (apt)
         if: steps.tools-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.2"
-
-      - name: Fallback install R (if setup-r timed out)
-        if: steps.tools-cache.outputs.cache-hit != 'true' && steps.setup-r.outcome != 'success'
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -117,9 +111,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -133,6 +124,7 @@ jobs:
     env:
       SIM_CACHE_VERSION: v3
     strategy:
+      fail-fast: false
       matrix:
         include:
           - sim_name: confounding
@@ -198,9 +190,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -299,9 +288,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -367,9 +353,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -460,9 +443,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -475,6 +455,7 @@ jobs:
     if: ${{ always() && needs.simulate.result == 'success' }}
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         include:
           - sim_name: confounding
@@ -527,22 +508,11 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
-      - name: Set up R for GAM
-        id: setup-r-evaluate
-        continue-on-error: true
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.4.2'
-
-      - name: Fallback install R for GAM (evaluate)
-        if: steps.setup-r-evaluate.outcome != 'success'
+      - name: Install R for GAM (apt)
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -660,9 +630,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -684,9 +651,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -798,9 +762,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -810,6 +771,7 @@ jobs:
   # ------------------------------------------------------------------
   two_pop_simulate_train_eval:
     needs: tool_cache
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.stdpopsim_only != 'true' }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -840,9 +802,6 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
@@ -853,15 +812,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Set up R for GAM
-        id: setup-r-two-pop
-        continue-on-error: true
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.2"
-
-      - name: Fallback install R for GAM (two-pop)
-        if: steps.setup-r-two-pop.outcome != 'success'
+      - name: Install R for GAM (apt)
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -994,15 +945,13 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.cache/pip
-            ~/.cache/stdpopsim
-            ~/.cache/R
-            ~/.local/lib/R
             /usr/local/bin/plink2
             /usr/local/bin/gctb
           key: tools-${{ runner.os }}-${{ env.TOOL_CACHE_VERSION }}
 
   two_pop_plot_auc:
     needs: [tool_cache, two_pop_simulate_train_eval]
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.stdpopsim_only != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
