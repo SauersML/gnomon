@@ -11,8 +11,8 @@ on:
         description: "Enable GAM-gnomon calibration (true/false)"
         required: false
         default: "false"
-      stdpopsim_only:
-        description: "Run only stdpopsim chr22 pipeline (skip two-pop jobs)"
+      portability_only:
+        description: "Run only portability simulation/analysis (skip confounding and two-pop jobs)"
         required: false
         type: boolean
         default: false
@@ -120,6 +120,7 @@ jobs:
   # ------------------------------------------------------------------
   simulate:
     needs: tool_cache
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
     runs-on: ubuntu-22.04
     env:
       SIM_CACHE_VERSION: v3
@@ -361,6 +362,7 @@ jobs:
   # ------------------------------------------------------------------
   train:
     needs: [tool_cache, simulate]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false # Let other methods finish if one fails
@@ -516,7 +518,7 @@ jobs:
   # ------------------------------------------------------------------
   evaluate:
     needs: [tool_cache, simulate, train]
-    if: ${{ always() && needs.simulate.result == 'success' }}
+    if: ${{ always() && needs.simulate.result == 'success' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.portability_only == 'true' && matrix.sim_name != 'portability') }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -835,7 +837,7 @@ jobs:
   # ------------------------------------------------------------------
   two_pop_simulate_train_eval:
     needs: tool_cache
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.stdpopsim_only != 'true' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.portability_only != 'true' }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -1015,7 +1017,7 @@ jobs:
 
   two_pop_plot_auc:
     needs: [tool_cache, two_pop_simulate_train_eval]
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.stdpopsim_only != 'true' }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.portability_only != 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
