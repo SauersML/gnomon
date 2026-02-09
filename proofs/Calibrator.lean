@@ -4425,14 +4425,91 @@ theorem shrinkage_effect {p k sp : ℕ} [Fintype (Fin p)] [Fintype (Fin k)] [Fin
 
 /-- Orthogonal projection onto a finite-dimensional subspace. -/
 noncomputable def orthogonalProjection {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y : Fin n → ℝ) : Fin n → ℝ :=
-  0  -- Placeholder; proper implementation would use Mathlib's orthogonalProjection
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let E := EuclideanSpace ℝ (Fin n)
+  let K' : Submodule ℝ E := K.map iso.symm
+  let p' := Submodule.orthogonalProjection K' (iso.symm y)
+  iso (p' : E)
 
 /-- A point p in subspace K equals the orthogonal projection of y onto K
     iff p minimizes distance to y among all points in K. -/
 lemma orthogonalProjection_eq_of_dist_le {n : ℕ} (K : Submodule ℝ (Fin n → ℝ)) (y p : Fin n → ℝ)
-    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, dist y p ≤ dist y w) :
+    (h_mem : p ∈ K) (h_min : ∀ w ∈ K, l2norm_sq (y - p) ≤ l2norm_sq (y - w)) :
     p = orthogonalProjection K y := by
+  let iso := WithLp.linearEquiv 2 ℝ (Fin n → ℝ)
+  let E := EuclideanSpace ℝ (Fin n)
+  let K' : Submodule ℝ E := K.map iso.symm
+  let y_E := iso.symm y
+  let p_E := iso.symm p
+
   sorry
+
+  /-
+  have h_mem_E : p_E ∈ K' := by
+    rw [Submodule.mem_map]
+    use p
+    simp [iso, p_E, h_mem]
+
+  have h_min_E : ∀ w_E ∈ K', dist y_E p_E ≤ dist y_E w_E := by
+    intro w_E hw_E
+    let w := iso w_E
+    have hw : w ∈ K := by
+       rw [Submodule.mem_map] at hw_E
+       rcases hw_E with ⟨k, hk, rfl⟩
+       simp [iso]
+       exact hk
+
+    specialize h_min w hw
+
+    have h_norm_p : l2norm_sq (y - p) = dist y_E p_E ^ 2 := by
+      unfold l2norm_sq
+      rw [dist_eq_norm, sq]
+      have h_norm_sq : ‖y_E - p_E‖^2 = ∑ i, ‖(y_E - p_E) i‖^2 := by
+        have := PiLp.norm_eq_of_nat 2 (y_E - p_E) (by norm_num)
+        rw [this]
+        rw [Real.sqrt_eq_rpow, ← Real.rpow_mul (by apply Finset.sum_nonneg; intros; apply Real.rpow_nonneg; apply norm_nonneg) ]
+        norm_num
+      rw [h_norm_sq]
+      apply Finset.sum_congr rfl
+      intro i _
+      simp only [Real.norm_eq_abs, sq_abs]
+      rfl
+
+    have h_norm_w : l2norm_sq (y - w) = dist y_E w_E ^ 2 := by
+      unfold l2norm_sq
+      rw [dist_eq_norm, sq]
+      have h_norm_sq : ‖y_E - w_E‖^2 = ∑ i, ‖(y_E - w_E) i‖^2 := by
+        have := PiLp.norm_eq_of_nat 2 (y_E - w_E) (by norm_num)
+        rw [this]
+        rw [Real.sqrt_eq_rpow, ← Real.rpow_mul (by apply Finset.sum_nonneg; intros; apply Real.rpow_nonneg; apply norm_nonneg) ]
+        norm_num
+      rw [h_norm_sq]
+      apply Finset.sum_congr rfl
+      intro i _
+      simp only [Real.norm_eq_abs, sq_abs]
+      rfl
+
+    rw [h_norm_p, h_norm_w] at h_min
+    apply Real.sqrt_le_sqrt h_min
+
+  let proj := Submodule.orthogonalProjection K' y_E
+  have h_proj_min := Submodule.orthogonalProjection_is_minimizer K' y_E
+
+  have h_eq : p_E = proj := by
+    apply eq_of_dist_eq_dist
+    · exact Submodule.convex K'
+    · exact InnerProductSpace.strictConvex ℝ E
+    · exact h_mem_E
+    · exact Submodule.orthogonalProjection_mem K' y_E
+    · intro z hz
+      exact h_min_E z hz
+    · intro z hz
+      exact h_proj_min z hz
+
+  dsimp [orthogonalProjection]
+  rw [← h_eq]
+  simp [iso]
+  -/
 
 set_option maxHeartbeats 2000000 in
 /-- Predictions are invariant under affine transformations of ancestry coordinates,
