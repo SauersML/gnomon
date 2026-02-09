@@ -524,6 +524,163 @@ def _plot_portability_eur_minus_non_eur_proper(
     fig.savefig(out_plot, dpi=220)
 
 
+def _plot_portability_auc_by_ancestry_hierarchical(
+    metrics_df: pd.DataFrame,
+    prob_df: pd.DataFrame,
+) -> None:
+    """
+    Portability ancestry-specific AUC with hierarchical 95% CI:
+    - within-seed variance from Hanley-McNeil AUC variance
+    - between-seed variance from random-effects pooling
+    """
+    if metrics_df.empty or prob_df.empty:
+        return
+    req = {"Method", "Seed", "AUC_AFR", "AUC_EUR", "AUC_ASIA", "AUC_ADMIX"}
+    if not req.issubset(metrics_df.columns):
+        return
+
+    base = prob_df[["Seed", "IID", "pop_label", "y_true"]].drop_duplicates()
+    pop_counts = (
+        base.groupby(["Seed", "pop_label"], as_index=False)["y_true"]
+        .agg(n="count", n_pos="sum")
+    )
+    pop_counts["n_neg"] = pop_counts["n"] - pop_counts["n_pos"]
+
+    count_wide = (
+        pop_counts.pivot(index="Seed", columns="pop_label", values=["n_pos", "n_neg"])
+        .sort_index(axis=1)
+    )
+    count_wide.columns = [f"{a}_{b}" for a, b in count_wide.columns]
+    count_wide = count_wide.reset_index()
+    count_wide.to_csv("portability_test_group_counts.csv", index=False)
+
+    ancestries = ["AFR", "EUR", "ASIA", "ADMIX"]
+    per_seed_rows = []
+    for row in metrics_df.itertuples(index=False):
+        seed = int(row.Seed)
+        method = row.Method
+        for anc in ancestries:
+            col = f"AUC_{anc}"
+            if not hasattr(row, col):
+                continue
+            auc_val = getattr(row, col)
+            if pd.isna(auc_val):
+                continue
+            n_pos_s = pop_counts.loc[
+                (pop_counts["Seed"] == seed) & (pop_counts["pop_label"] == anc),
+                "n_pos",
+            ]
+            n_neg_s = pop_counts.loc[
+                (pop_counts["Seed"] == seed) & (pop_counts["pop_label"] == anc),
+                "n_neg",
+            ]
+            if n_pos_s.empty or n_neg_s.empty:
+                continue
+            v = _auc_var_hanley_mcneil(float(auc_val), int(n_pos_s.iloc[0]), int(n_neg_s.iloc[0]))
+            if not np.isfinite(v):
+                continue
+            per_seed_rows.append(
+                {
+                    "Seed": seed,
+                    "Method": method,
+                    "Ancestry": anc,
+                    "AUC": float(auc_val),
+                    "var_within": float(v),
+                    "se_within": float(np.sqrt(v)),
+                    "n_pos": int(n_pos_s.iloc[0]),
+                    "n_neg": int(n_neg_s.iloc[0]),
+                }
+            )
+
+    if not per_seed_rows:
+        return
+
+    per_seed_df = pd.DataFrame(per_seed_rows).sort_values(["Method", "Ancestry", "Seed"])
+    per_seed_df.to_csv("portability_auc_by_ancestry_hierarchical_per_seed.csv", index=False)
+
+    summary_rows = []
+    for (method, anc), g in per_seed_df.groupby(["Method", "Ancestry"]):
+        meta = _random_effects_meta(g["AUC"].to_numpy(), g["var_within"].to_numpy())
+        summary_rows.append(
+            {
+                "Method": method,
+                "Ancestry": anc,
+                "mean_auc_re": meta["mu"],
+                "se_re": meta["se"],
+                "ci95_half": 1.96 * meta["se"] if np.isfinite(meta["se"]) else np.nan,
+                "tau2_between_seed": meta["tau2"],
+                "k_seeds": meta["k"],
+                "mean_auc_unweighted": float(g["AUC"].mean()),
+                "sd_auc_unweighted": float(g["AUC"].std(ddof=1)) if len(g) > 1 else np.nan,
+            }
+        )
+    summary_df = pd.DataFrame(summary_rows).sort_values(["Method", "Ancestry"])
+    summary_df.to_csv("portability_auc_by_ancestry_95ci_hierarchical.csv", index=False)
+
+    _apply_plot_style()
+    plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False})
+    fig, ax = plt.subplots(figsize=(11, 6))
+    method_order = (
+        summary_df.groupby("Method", as_index=False)["mean_auc_re"]
+        .mean()
+        .sort_values("mean_auc_re", ascending=False)["Method"]
+        .tolist()
+    )
+    anc_order = ["AFR", "EUR", "ASIA", "ADMIX"]
+    colors = {"AFR": "#d87b5a", "EUR": "#3e6b8a", "ASIA": "#4d8c57", "ADMIX": "#8b6f93"}
+    x = np.arange(len(method_order))
+    offsets = np.linspace(-0.27, 0.27, len(anc_order))
+    for off, anc in zip(offsets, anc_order):
+        sdf = summary_df[summary_df["Ancestry"] == anc].set_index("Method").reindex(method_order)
+        y = sdf["mean_auc_re"].to_numpy()
+        e = sdf["ci95_half"].to_numpy()
+        ax.errorbar(
+            x + off,
+            y,
+            yerr=e,
+            fmt="o",
+            capsize=4,
+            markersize=6,
+            linewidth=1.7,
+            color=colors[anc],
+            label=anc,
+        )
+
+    rng = np.random.default_rng(42)
+    for i, method in enumerate(method_order):
+        for off, anc in zip(offsets, anc_order):
+            vals = per_seed_df.loc[
+                (per_seed_df["Method"] == method) & (per_seed_df["Ancestry"] == anc),
+                "AUC",
+            ].dropna().to_numpy()
+            if vals.size == 0:
+                continue
+            jitter = rng.uniform(-0.04, 0.04, size=vals.size)
+            ax.scatter(
+                np.full(vals.size, i + off) + jitter,
+                vals,
+                s=18,
+                color=colors[anc],
+                alpha=0.35,
+                edgecolors="none",
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [m.split(" + ", n=1)[1] if " + " in m else m for m in method_order],
+        rotation=20,
+        ha="right",
+    )
+    ax.set_ylabel("AUC")
+    ax.set_ylim(0.35, 0.70)
+    _style_axes(ax)
+    ax.legend(title="Ancestry", frameon=False, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.08))
+    fig.tight_layout()
+    fig.savefig("portability_auc_by_ancestry_95ci_hierarchical.png", dpi=220)
+    # Keep legacy/expected filename in sync for downstream use.
+    fig.savefig("portability_auc_by_ancestry_95ci.png", dpi=220)
+
+
 def _plot_metric_summary(
     df: pd.DataFrame,
     raw_df: pd.DataFrame,
@@ -848,6 +1005,10 @@ def main() -> None:
         portability_metrics,
         portability_probs,
         Path("portability_eur_minus_non_eur_gap_proper_test_all_pvals.png"),
+    )
+    _plot_portability_auc_by_ancestry_hierarchical(
+        portability_metrics,
+        portability_probs,
     )
 
 

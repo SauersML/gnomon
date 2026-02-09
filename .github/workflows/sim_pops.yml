@@ -762,7 +762,11 @@ jobs:
             portability_eur_minus_non_eur_gap_proper_test_all_pvals.png \
             portability_eur_minus_non_eur_proper_per_seed.csv \
             portability_eur_minus_non_eur_proper_summary.csv \
-            portability_test_group_counts.csv
+            portability_test_group_counts.csv \
+            portability_auc_by_ancestry_95ci.png \
+            portability_auc_by_ancestry_95ci_hierarchical.png \
+            portability_auc_by_ancestry_95ci_hierarchical.csv \
+            portability_auc_by_ancestry_hierarchical_per_seed.csv
           do
             if [ -f "$f" ]; then
               cp "$f" bundle/
