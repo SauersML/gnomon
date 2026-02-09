@@ -35,7 +35,14 @@ jobs:
   tool_cache:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (primary)
+        id: checkout-primary
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Checkout (retry)
+        if: steps.checkout-primary.outcome != 'success'
+        uses: actions/checkout@v4
 
       - name: Restore tool cache
         id: tools-cache
@@ -254,6 +261,14 @@ jobs:
           echo "Splitting Data for ${{ matrix.sim_name }} (seed=${{ matrix.seed }})..."
           python sims/split_data.py ${{ matrix.sim_name }}_s${{ matrix.seed }}
 
+      - name: Remove large source PLINK files (keep split train/test only)
+        run: |
+          set -euo pipefail
+          prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
+          rm -f "${prefix}.bed" "${prefix}.bim" "${prefix}.fam"
+          echo "Disk after cleanup:"
+          df -h
+
       - name: Upload Simulation Data (Artifact Stream A)
         id: upload-sim-data-primary
         continue-on-error: true
@@ -263,9 +278,6 @@ jobs:
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
             ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
           if-no-files-found: error
           retention-days: 1
 
@@ -277,9 +289,6 @@ jobs:
           path: |
             ${{ matrix.sim_name }}_s${{ matrix.seed }}_work/
             ${{ matrix.sim_name }}_s${{ matrix.seed }}.tsv
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bed
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.bim
-            ${{ matrix.sim_name }}_s${{ matrix.seed }}.fam
           if-no-files-found: error
           retention-days: 1
 
