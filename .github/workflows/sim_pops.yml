@@ -231,14 +231,34 @@ jobs:
           prefix="${{ matrix.sim_name }}_s${{ matrix.seed }}"
           echo "Disk before simulation:"
           df -h
+
+          # Heartbeat diagnostics while simulation is running.
+          # Keep output lightweight to avoid log bloat while still surfacing
+          # impending disk exhaustion before an abrupt runner crash.
+          _diag_heartbeat() {
+            while true; do
+              echo "---- heartbeat $(date -u +%Y-%m-%dT%H:%M:%SZ) ${prefix} ----"
+              df -h / /home || true
+              du -sh . 2>/dev/null || true
+              find . -maxdepth 2 -type f -exec ls -lh {} + 2>/dev/null | sort -k5 -h | tail -n 12 || true
+              sleep 120
+            done
+          }
+
           ok=0
           for attempt in 1 2 3; do
             echo "Simulation attempt ${attempt}/3 for ${prefix}"
             rm -f "${prefix}.trees" "${prefix}.vcf" "${prefix}.cm"
+            _diag_heartbeat &
+            HB_PID=$!
             if python sims/sim_pops.py ${{ matrix.sim_name }} ${{ matrix.seed }} --force; then
+              kill "$HB_PID" 2>/dev/null || true
+              wait "$HB_PID" 2>/dev/null || true
               ok=1
               break
             fi
+            kill "$HB_PID" 2>/dev/null || true
+            wait "$HB_PID" 2>/dev/null || true
             echo "Simulation attempt ${attempt} failed for ${prefix}"
             echo "Debug disk usage after failed attempt:"
             df -h || true
